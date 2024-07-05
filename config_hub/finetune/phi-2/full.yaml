@@ -14,12 +14,6 @@ devices: 2
 # How many nodes to use. (type: int, default: 1)
 num_nodes: 1
 
-# Path to a checkpoint directory to resume from in case training was interrupted, or ``True`` to resume
-# from the latest checkpoint in ``out_dir``. An error will be raised if no checkpoint is found. Passing
-# ``'auto'`` will resume from the latest checkpoint but not error if no checkpoint exists.
-# (type: Union[bool, Literal["auto"], Path], default: False)
-resume: false
-
 # Data-related arguments. If not provided, the default is ``litgpt.data.Alpaca``.
 data:
   class_path: litgpt.data.Alpaca2k
