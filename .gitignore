@@ -24,3 +24,7 @@ events.out.tfevents*
 **/custom_finetuning_dataset.json
 client.py
 **/custom_texts/
+
+# custom
+ckpt/
+eval_results/

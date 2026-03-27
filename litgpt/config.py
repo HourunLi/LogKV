@@ -24,6 +24,16 @@ def find_multiple(n: int, k: int) -> int:
 
 @dataclass
 class Config:
+    # ==========================================
+    # 🌟 你的新 Research 专属参数
+    # ==========================================
+    use_research: bool = False
+    research_enable_flash_attn: bool = True  # must be true for our method
+    research_swa_size: int = 512
+    research_prefill_swa_layers: list[int] = [0,2,4,6,8,10,12,14,16,18,20,22,24,26]
+    research_prefill_identity_layers: list[int] = [1,3,5,7,9,11,13,15,17,19,21,23,25,27]
+    research_breakpoint_schedule: str | None = None
+    # ==========================================
     name: str = ""
     hf_config: dict = field(default_factory=dict)
     # General size parameters
