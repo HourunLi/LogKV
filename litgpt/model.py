@@ -18,6 +18,11 @@ from typing_extensions import Self
 from litgpt.config import Config
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    flash_attn_func = None
+
 
 class GPT(nn.Module):
     def __init__(self, config: Config) -> None:
@@ -344,13 +349,13 @@ class Block(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor],
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor]:
         """
         Non-parallel residual       Parallel residual
            ┌─ x                     ┌─ x ──────────────────┐             Note: if `shared_attention_norm` is True,
@@ -435,6 +440,10 @@ class CausalSelfAttention(nn.Module):
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
+        use_swa: bool = False,
+        swa_size: int | None = None,
+        replacing_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        replacing_kv_mask: torch.Tensor | None = None,  # B,T: 1->prefill; 0->decode
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
@@ -477,6 +486,24 @@ class CausalSelfAttention(nn.Module):
         key_size = value_size = n_query_groups * head_size
         # Split qkv into query, key and value matrices.
         q, k, v = qkv.split((query_size, key_size, value_size), dim=-1)  # 3x(B, T, C*)
+
+        # Replace current prefill K/V during training when a mask is provided.
+        if self.training and replacing_kv is not None and replacing_kv_mask is not None:
+            replacing_k, replacing_v = replacing_kv
+            if replacing_k.shape != k.shape or replacing_v.shape != v.shape:
+                raise ValueError(
+                    "replacing_kv tensors must match current k/v shape before head reshape: "
+                    f"expected {k.shape}, got k={replacing_k.shape}, v={replacing_v.shape}"
+                )
+            if replacing_kv_mask.dim() != 2 or replacing_kv_mask.shape != (B, T):
+                raise ValueError(
+                    f"replacing_kv_mask must have shape (B, T)=({B}, {T}), got {tuple(replacing_kv_mask.shape)}"
+                )
+
+            # mask=1 -> prefill token uses replacing kv; mask=0 -> keep current kv
+            kv_mask = replacing_kv_mask.to(device=k.device, dtype=torch.bool).unsqueeze(-1)
+            k = torch.where(kv_mask, replacing_k.to(device=k.device, dtype=k.dtype), k)
+            v = torch.where(kv_mask, replacing_v.to(device=v.device, dtype=v.dtype), v)
 
         if self.config.norm_qk and self.config.norm_qk_type == "olmo2":
             q = self.norm_q(q)
@@ -538,7 +565,7 @@ class CausalSelfAttention(nn.Module):
             k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
             v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
 
-        if self.apply_sliding_window_attention:
+        if self.apply_sliding_window_attention:  # not used. we use flashattn instead
             """
                   Global Window              Sliding window             Sliding window
                   attention mask      +            bias          =      attention mask
@@ -565,7 +592,10 @@ class CausalSelfAttention(nn.Module):
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        y = self.scaled_dot_product_attention(q, k, v, mask)
+        if self.config.use_research and self.config.research_enable_flash_attn:
+            y = self.scaled_dot_product_attention_flash_attn(q, k, v, mask, use_swa=use_swa, swa_window=swa_size)
+        else:
+            y = self.scaled_dot_product_attention(q, k, v, mask)
 
         # Re-assemble all head outputs side by side.
         y = y.reshape(B, T, head_size * n_head)
@@ -573,6 +603,73 @@ class CausalSelfAttention(nn.Module):
         # Output projection.
         return self.proj(y)  # (B, T, C)
 
+    def scaled_dot_product_attention_flash_attn(
+        self, 
+        q: torch.Tensor, 
+        k: torch.Tensor, 
+        v: torch.Tensor, 
+        mask: torch.Tensor | None = None,
+        use_swa: bool = False,         # 🌟 新增参数
+        swa_window: int = 512          # 🌟 新增参数
+    ) -> torch.Tensor:
+        scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
+        scale = scale * self.mscale * self.mscale
+
+        # ===================================================================
+        # 🚀 路径 1: 极速 SWA (Sliding Window Attention) 走 Flash Attention 2
+        # ===================================================================
+        if use_swa:
+            if flash_attn_func is None:
+                raise ImportError("🚨 必须安装 flash-attn 库才能使用极速 SWA！(运行: pip install flash-attn --no-build-isolation)")
+            
+            # PyTorch SDPA 格式: (B, nh, T, hs) -> Flash Attn 格式: (B, T, nh, hs)
+            q_fa = q.transpose(1, 2)
+            k_fa = k.transpose(1, 2)
+            v_fa = v.transpose(1, 2)
+
+            # 获取 softcap 值 (Flash Attention 2.5+ 原生支持 softcapping)
+            softcap_val = self.config.attention_logit_softcapping or 0.0
+
+            # 调用 Flash Attention 底层 C++ CUDA 算子
+            y_fa = flash_attn_func(
+                q_fa, 
+                k_fa, 
+                v_fa, 
+                dropout_p=0.0, 
+                softmax_scale=scale,
+                causal=True, 
+                window_size=(swa_window, -1), # 左侧看 swa_window, 右侧不看 (causal=True 强制为 0)
+                softcap=softcap_val
+            )
+            
+            # y_fa 出来的 shape 是 (B, T, nh, hs)
+            # 为了和下方原版逻辑统一，先转回 (B, nh, T, hs)，统一在最后 return 时翻转
+            y = y_fa.transpose(1, 2)
+
+        # ===================================================================
+        # 🐢 路径 2: 带有 Softcapping 的慢速 Math 路径 (如 Gemma 模型会用到)
+        # ===================================================================
+        elif self.config.attention_logit_softcapping is not None:
+            scores = q @ k.mT * scale
+            scores = do_softcapping(scores, self.config.attention_logit_softcapping)
+            if mask is None:
+                mask = torch.ones(q.size(2), q.size(2), dtype=q.dtype, device=q.device).triu(diagonal=1)
+                mask.masked_fill_(mask.bool(), torch.finfo(q.dtype).min)
+            scores = scores + mask
+            scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
+            y = scores @ v
+
+        # ===================================================================
+        # ⚡ 路径 3: 默认的 Full Attention，走 PyTorch 原生极速 SDPA
+        # ===================================================================
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
+            )
+            
+        # 最终统一把 shape 转换成外层需要的 (B, T, nh * hs) 的前置形态 (B, T, nh, hs) 返回
+        return y.transpose(1, 2)
+    
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
