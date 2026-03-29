@@ -1,0 +1,16 @@
+# ==========================================
+# Loss 收敛探测模式 (用于观察架构的真实学习能力)
+# ==========================================
+config: base.yaml
+
+# 训练超参
+global_batch_size: 128      # 保证梯度的稳定性
+micro_batch_size: 4        # 假设你的显存能吃下 4096 长度的 batch=4
+max_steps: 300             # 跑 300 步，足够在 TensorBoard/终端 画出一条明显的下降曲线
+num_devices: 2
+
+# 数据与 IO
+dataset_name: "debug"
+dataset_dir: "data"
+num_workers: 0
+save_ckpt: false

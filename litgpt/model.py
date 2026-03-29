@@ -31,13 +31,23 @@ class GPT(nn.Module):
         self.config = config
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
-                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+        if config.use_research and config.research_separate_parameter:
+            self.transformer = nn.ModuleDict(
+                dict(
+                    wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
+                    h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
+                    h_prefill=nn.ModuleList(Block(config, block_idx) for block_idx in config.research_prefill_swa_layers),
+                    ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+                )
             )
-        )
+        else:
+            self.transformer = nn.ModuleDict(
+                dict(
+                    wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
+                    h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
+                    ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+                )
+            )
         self.mask_cache: torch.Tensor | None = None
         self.max_seq_length = self.config.block_size
 
@@ -93,6 +103,7 @@ class GPT(nn.Module):
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
         lm_head_chunk_size: int = 0,
+        prefill_mask: torch.Tensor = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -161,18 +172,42 @@ class GPT(nn.Module):
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
-        for block_idx, block in enumerate(self.transformer.h):
-            if self.config.rope_indices is not None:
-                x = block(
-                    x,
-                    cos[..., self.config.rope_indices[block_idx]],
-                    sin[..., self.config.rope_indices[block_idx]],
-                    mask,
-                    input_pos,
-                    input_pos_maxp1,
-                )
-            else:
-                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+        # prefill: SWA mode, Identity mode
+        # decode: replacing-kv mode
+        block_index_to_idx = {x: i for i, x in enumerate(self.config.research_prefill_swa_layers)}
+        prefill_kv = None
+        prefill_hidden = None
+        if self.config.use_research:
+            assert prefill_mask is not None
+            for block_idx, block in enumerate(self.transformer.h):
+                if self.config.rope_indices is not None:
+                    cos_, sin_ = cos[..., self.config.rope_indices[block_idx]], sin[..., self.config.rope_indices[block_idx]]
+                else:
+                    cos_, sin_ = cos, sin
+                # prefill
+                if block_idx in self.config.research_prefill_swa_layers:
+                    if self.config.research_separate_parameter:
+                        block_prefill: Block = self.transformer.h_prefill[block_index_to_idx[block_idx]]
+                    else:
+                        block_prefill: Block = block
+                    x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
+                    prefill_hidden = x_prefill
+                # decode
+                x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
+                x = torch.where(prefill_mask.unsqueeze(-1), prefill_hidden, x_decode)
+        else:
+            for block_idx, block in enumerate(self.transformer.h):
+                if self.config.rope_indices is not None:
+                    x = block(
+                        x,
+                        cos[..., self.config.rope_indices[block_idx]],
+                        sin[..., self.config.rope_indices[block_idx]],
+                        mask,
+                        input_pos,
+                        input_pos_maxp1,
+                    )
+                else:
+                    x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -355,6 +390,7 @@ class Block(nn.Module):
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
+        **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor]:
         """
         Non-parallel residual       Parallel residual
@@ -378,7 +414,11 @@ class Block(nn.Module):
         """
 
         x_normed = self.norm_1(x)
-        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1)
+        return_kv = kwargs.get('return_kv', False)
+        if return_kv:
+            attention_output, prefill_kv = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1, **kwargs)
+        else:
+            attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1, **kwargs)
         attention_output = self.post_attention_norm(attention_output)
 
         if self.config.parallel_residual:
@@ -389,7 +429,10 @@ class Block(nn.Module):
             x = attention_output + x
             x_normed = self.norm_2(x)
 
-        return self.post_mlp_norm(self.mlp(x_normed)) + x
+        if return_kv:
+            return self.post_mlp_norm(self.mlp(x_normed)) + x, prefill_kv
+        else:
+            return self.post_mlp_norm(self.mlp(x_normed)) + x
 
 
 class CausalSelfAttention(nn.Module):
@@ -440,11 +483,13 @@ class CausalSelfAttention(nn.Module):
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
+        # added
         use_swa: bool = False,
         swa_size: int | None = None,
         replacing_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         replacing_kv_mask: torch.Tensor | None = None,  # B,T: 1->prefill; 0->decode
-    ) -> torch.Tensor:
+        return_kv: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor]]:
         # Notation:
         # - B          | batch size
         # - T          | time-step (sequence length)
@@ -487,6 +532,8 @@ class CausalSelfAttention(nn.Module):
         # Split qkv into query, key and value matrices.
         q, k, v = qkv.split((query_size, key_size, value_size), dim=-1)  # 3x(B, T, C*)
 
+        # save kv
+        k_save, v_save = k, v
         # Replace current prefill K/V during training when a mask is provided.
         if self.training and replacing_kv is not None and replacing_kv_mask is not None:
             replacing_k, replacing_v = replacing_kv
@@ -601,7 +648,11 @@ class CausalSelfAttention(nn.Module):
         y = y.reshape(B, T, head_size * n_head)
 
         # Output projection.
-        return self.proj(y)  # (B, T, C)
+        o = self.proj(y) # (B, T, C)
+        if return_kv:
+            return o, (k_save, v_save)
+        else:
+            return o
 
     def scaled_dot_product_attention_flash_attn(
         self, 

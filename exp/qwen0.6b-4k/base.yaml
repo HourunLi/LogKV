@@ -1,0 +1,27 @@
+# ==========================================
+# Loss 收敛探测模式 (用于观察架构的真实学习能力)
+# ==========================================
+# 基础配置
+arch_name: "Qwen/Qwen3-0.6B-Base"
+context_length: 4096
+
+# 训练超参 (真实负载)
+global_batch_size: 128      # 保证梯度的稳定性
+micro_batch_size: 4        # 假设你的显存能吃下 4096 长度的 batch=4
+max_steps: 300             # 跑 300 步，足够在 TensorBoard/终端 画出一条明显的下降曲线
+learning_rate: 2e-5
+weight_decay: 0.1
+num_devices: 1
+
+# 数据与 IO
+dataset_name: "debug"
+dataset_dir: "data"
+num_workers: 0
+save_ckpt: false
+save_path: "./ckpt/qwen0.6b-4k-debug"
+
+# 架构魔改参数
+use_research: true
+research_swa_size: 512
+research_swa_layers_str: "0,2,4,6,8,10,12,14,16,18,20,22,24,26"
+research_identity_layers_str: "1,3,5,7,9,11,13,15,17,19,21,23,25,27"

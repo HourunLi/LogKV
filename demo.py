@@ -17,75 +17,136 @@ from litgpt.utils import chunked_cross_entropy
 from jsonargparse import CLI
 from datasets import load_dataset, concatenate_datasets, Dataset
 import pyarrow.parquet as pq
-
-# ==========================================
-# 🌟 全新升级：基于 Parquet 的流式数据集
-# ==========================================
-class CPTParquetIterableDataset(IterableDataset):
-    """
-    流式读取 Parquet 文件，动态 Tokenize 并打包为固定长度 (seq_len)。
-    完美兼容 10MB 的 Debug 数据和 10TB 的全量数据，内存占用极低。
-    """
-    def __init__(self, parquet_path: str, tokenizer: Tokenizer, seq_len: int):
-        self.parquet_path = parquet_path
-        self.tokenizer = tokenizer
-        self.seq_len = seq_len
-        self.chunk_size = seq_len + 1  # +1 为了错位生成 inputs 和 targets
-
-    def __iter__(self):
-        # 建立一个 Token 缓冲区
-        buffer = torch.tensor([], dtype=torch.long)
-        parquet_file = pq.ParquetFile(self.parquet_path)
-
-        # 流式读取：每次只加载 8192 行数据到内存
-        for batch in parquet_file.iter_batches(batch_size=8192, columns=["text"]):
-            for text in batch.to_pandas()["text"]:
-                # Tokenize: CPT 的黄金法则 -> bos=False, eos=True，隔断两篇文章的上下文
-                tokens = self.tokenizer.encode(text, bos=False, eos=True)
-                
-                # 将新生成的 token 追加进缓冲区
-                buffer = torch.cat([buffer, tokens])
-
-                # 只要缓冲区满了，就切出一个完整的 chunk 喂给模型
-                while buffer.size(0) >= self.chunk_size:
-                    chunk = buffer[:self.chunk_size]
-                    # 缓冲区丢弃已被读取的部分
-                    buffer = buffer[self.chunk_size:]
-                    
-                    # 返回 inputs (0 到 N-1) 和 targets (1 到 N)
-                    yield chunk[:-1], chunk[1:]
-                    
-        parquet_file.close()
+import random
+from litgpt.tokenizer import Tokenizer
+from tqdm import tqdm
+import numpy as np
 
 torch.set_float32_matmul_precision('high')
 
-def prepare_data(data_dir, dataset_name):
-    print("⏳ 正在下载和准备数据...")
+# set random seeds
+def set_random_seeds(seed):
+    torch.manual_seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+# ==========================================
+# 🚀 满血形态：基于 Memmap 的二进制数据集
+# ==========================================
+class CPTBinDataset(torch.utils.data.Dataset):
+    """
+    极速读取预编译的 .bin 文件。CPU 开销几乎为 0。
+    """
+    def __init__(self, bin_path: str, seq_len: int):
+        # 魔法所在：memmap 不会把大文件一次性读进内存，而是按需在硬盘和内存间滑动
+        self.data = np.memmap(bin_path, dtype=np.int32, mode='r')
+        self.seq_len = seq_len
+        self.chunk_size = seq_len + 1
+        
+        # 精确计算这个文件一共能切出多少个完整的 Batch
+        self.total_chunks = len(self.data) // self.chunk_size
+
+    def __len__(self):
+        # 现在 Dataloader 终于知道你有多少数据了！
+        return self.total_chunks
+
+    def __getitem__(self, idx: int):
+        # 直接用索引在极速数组上切片
+        start_idx = idx * self.chunk_size
+        end_idx = start_idx + self.chunk_size
+        
+        # 截取数据并转为 int64 张量 (PyTorch Embedding 层的硬性要求)
+        chunk = self.data[start_idx:end_idx]
+        chunk_tensor = torch.from_numpy(chunk.astype(np.int64))
+        
+        # 返回 inputs 和 targets
+        return chunk_tensor[:-1], chunk_tensor[1:]
+
+
+def prepare_data(data_dir, dataset_name, model_dir):
+    """
+    全自动数据准备流水线：下载 -> Parquet 缓存 -> Tokenize 编译为 .bin
+    """
+    print("⏳ 正在检查和准备数据...")
     os.makedirs(data_dir, exist_ok=True)
     parquet_path = os.path.join(data_dir, f"{dataset_name}.parquet")
+    bin_path = os.path.join(data_dir, f"{dataset_name}.bin")
     
-    # 如果 Parquet 文件已经存在，直接跳过下载 (方便反复 Debug)
-    if os.path.exists(parquet_path):
-        print(f"📦 发现已存在的数据集: {parquet_path}，直接使用！")
-        return parquet_path
+    # ==========================================
+    # 🌟 拦截点 1：如果最终的 .bin 已经存在，直接起飞！
+    # ==========================================
+    if os.path.exists(bin_path):
+        print(f"🚀 发现已预编译的高性能二进制数据集: {bin_path}，直接使用！")
+        return bin_path
 
-    if dataset_name == 'debug':
-        print("🌐 正在拉取完全开源的 FineWeb-Edu (跳过所有权限验证)...")
-        
-        # 只用不需要任何认证的 FineWeb，流式读取
-        eng_stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-        
-        print("📥 正在极速抽取 10000 条长文用于架构 Debug...")
-        eng_list = list(eng_stream.take(10000))
-        
-        mixed_dataset = Dataset.from_list(eng_list)
-        mixed_dataset = mixed_dataset.select_columns(["text"])
-
-        print(f"💾 正在导出为高性能 Parquet 格式至 {parquet_path}...")
-        mixed_dataset.to_parquet(parquet_path)
-        return parquet_path
+    # ==========================================
+    # 🌟 拦截点 2：如果没有 Parquet，就去下载
+    # ==========================================
+    if not os.path.exists(parquet_path):
+        if dataset_name == 'debug':
+            print("🌐 正在拉取完全开源的 FineWeb-Edu (跳过所有权限验证)...")
+            eng_stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+            print("📥 正在极速抽取 10000 条长文用于架构 Debug...")
+            eng_list = list(eng_stream.take(10000))
+            mixed_dataset = Dataset.from_list(eng_list)
+            mixed_dataset = mixed_dataset.select_columns(["text"])
+            print(f"💾 正在导出为 Parquet 格式至 {parquet_path}...")
+            mixed_dataset.to_parquet(parquet_path)
+        else:
+            raise NotImplementedError(f"数据集 {dataset_name} 的准备逻辑尚未实现")
     else:
-        raise NotImplementedError(f"数据集 {dataset_name} 的准备逻辑尚未实现")
+        print(f"📦 发现已存在的 Parquet 文件: {parquet_path}，跳过下载。")
+
+    # ==========================================
+    # 🌟 拦截点 3：将 Parquet 实时 Tokenize 并编译为 .bin
+    # ==========================================
+    print(f"⚙️ 正在将文本 Tokenize 并编译为二进制文件 (这可能需要几分钟，但只执行一次)...")
+    tokenizer = Tokenizer(model_dir)
+    parquet_file = pq.ParquetFile(parquet_path)
+    
+    all_tokens = []
+    # 使用 tqdm 加上进度条，避免编译时看着屏幕发呆
+    for batch in tqdm(parquet_file.iter_batches(batch_size=8192, columns=["text"]), desc="Tokenizing"):
+        for text in batch.to_pandas()["text"]:
+            # 严格遵守 CPT 的隔断法则：bos=False, eos=True
+            tokens = tokenizer.encode(text, bos=False, eos=True).tolist()
+            all_tokens.extend(tokens)
+            
+    print("💾 正在写入硬盘...")
+    # Qwen 词表超 15 万，必须用 int32！
+    arr = np.array(all_tokens, dtype=np.int32)
+    arr.tofile(bin_path)
+    print(f"✅ 编译完成！共 {len(arr)} 个 Token，极速引擎准备就绪！")
+    
+    return bin_path
+
+# ==========================================
+# 🌟 你的专属 Schedule 逻辑
+# ==========================================
+def generate_step_driven_mask(batch_size, seq_len, current_step, total_steps, device, schedule=None):
+    """
+    基于当前训练 Iter 的动态断点生成器
+    一条序列只有一个断点。断点之前为 False (Prefill)，断点之后为 True (Decode)
+    """
+    progress = current_step / max(1, total_steps)
+    
+    # 动态计算当前的上下界
+    min_prefill_ratio = progress * 0.1
+    max_prefill_ratio = progress * 0.9
+    
+    # 为 Batch 中的【每一条序列】独立地均匀随机生成一个断点
+    breakpoints = [int(random.uniform(min_prefill_ratio, max_prefill_ratio) * seq_len) for _ in range(batch_size)]
+    
+    breakpoints_tensor = torch.tensor(breakpoints, device=device).unsqueeze(1) # [B, 1]
+    
+    # 创造一个形状为 [B, T] 的递增索引矩阵
+    seq_indices = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
+    
+    # 🌟 魔法广播：只要索引 < 断点，就是 Prefill (True)
+    prefill_mask = seq_indices < breakpoints_tensor
+    
+    return prefill_mask
 
 # ==========================================
 # CPT 主训练循环
@@ -95,11 +156,13 @@ def main(
         arch_name: str = "Qwen/Qwen3-0.6B-Base",
         context_length: int = 4096,
         # TRAINING
-        global_batch_size: int = 128,
+        global_batch_size: int = 32,
         micro_batch_size: int = 4,
-        num_epochs: int = 2,
+        num_epochs: int = 10,
+        max_steps: int = 10,
         learning_rate: float = 2e-5,
         weight_decay: float = 0.1,
+        num_devices: int = 1,
         # DATA
         dataset_name: str = "debug",
         dataset_dir: str = "data",
@@ -110,15 +173,17 @@ def main(
         # RESEARCH
         use_research: bool = False,
         research_swa_size: int = 512,
-        research_prefill_swa_layers: list[int] = [1,3,5,7,9,11,13,15,17,19,21,23,25,27],
-        research_prefill_identity_layers: list[int] = [2,4,6,8,10,12,14,16,18,20,22,24,26,28],
+        research_swa_layers_str: str = "0,2,4,6,8,10,12,14,16,18,20,22,24,26",
+        research_identity_layers_str: str = "1,3,5,7,9,11,13,15,17,19,21,23,25,27",
         research_breakpoint_schedule: str | None = None,
+        research_separate_parameter: bool = True,
 ):
-    # 1. 准备数据并获取 Parquet 路径
-    parquet_path = prepare_data(dataset_dir, dataset_name)
+
+    # 1. set seeds
+    set_random_seeds(42)
     
     # 2. 这里的 Fabric 逻辑保持不变...
-    fabric = L.Fabric(accelerator="cuda", devices=2, precision="bf16-true")
+    fabric = L.Fabric(accelerator="cuda", devices=num_devices, precision="bf16-true")
     fabric.launch()
 
     config = Config.from_name(arch_name) 
@@ -126,9 +191,11 @@ def main(
     config.block_size = context_length
     config.use_research = use_research
     config.research_swa_size = research_swa_size
-    config.research_prefill_swa_layers = research_prefill_swa_layers
-    config.research_prefill_identity_layers = research_prefill_identity_layers
-    config.research_breakpoint_schedule = research_breakpoint_schedule
+    swa_layers = [int(x.strip()) for x in research_swa_layers_str.split(",")] if research_swa_layers_str else []
+    identity_layers = [int(x.strip()) for x in research_identity_layers_str.split(",")] if research_identity_layers_str else []
+    config.research_prefill_swa_layers = swa_layers
+    config.research_prefill_identity_layers = identity_layers
+    config.research_separate_parameter = research_separate_parameter
     fabric.print(f"⚙️ 模型 Config 初始化完成: {config.name}")
 
     with fabric.init_module(empty_init=True):
@@ -136,19 +203,47 @@ def main(
 
     checkpoint_dir = f"checkpoints/{arch_name}"
     fabric.print(f"🔄 正在从 {checkpoint_dir} 加载预训练 Checkpoint...")
-    model.load_state_dict(torch.load(f"{checkpoint_dir}/lit_model.pth"), strict=False)
-    fabric.print("✅ 真实权重加载成功！")
+    # 1. 先把原版权重字典加载到内存里
+    state_dict = torch.load(f"{checkpoint_dir}/lit_model.pth")
+    
+    # 2. 🌟 核心拦截：Block 级别的映射与克隆
+    if config.use_research and config.research_separate_parameter:
+        fabric.print("🔀 检测到 Block 级参数独立！正在为 h_prefill 组装预训练权重...")
+        prefill_weights = {}
+
+        # 遍历配置中的 SWA 层列表
+        # i 是在 h_prefill ModuleList 中的物理索引 (0, 1, 2...)
+        # block_idx 是在原版 h 中的逻辑层号 (0, 2, 4...)
+        for i, block_idx in enumerate(config.research_prefill_swa_layers):
+            orig_prefix = f"transformer.h.{block_idx}."
+            new_prefix = f"transformer.h_prefill.{i}."
+
+            # 遍历寻找属于原版 block_idx 的所有权重，并改名挂载到 h_prefill 下
+            for key, value in state_dict.items():
+                if key.startswith(orig_prefix):
+                    # 极其精准的前缀替换
+                    new_key = key.replace(orig_prefix, new_prefix, 1)
+                    prefill_weights[new_key] = value
+
+        # 将克隆出的 prefill 分支权重合并入主字典
+        state_dict.update(prefill_weights)
+        fabric.print(f"✅ 成功映射并注入了 {len(prefill_weights)} 个 Block 级别的张量！")
+
+    # 3. 严格度降低，因为我们凭空造了全新的网络分支
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    if len(missing_keys) > 0:
+        fabric.print(f"⚠️ 未加载的参数 (通常为 buffer): {missing_keys[:5]}...")
+        
+    fabric.print("✅ 真实权重加载成功！所有分支已完成 Pre-trained 初始化。")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     model, optimizer = fabric.setup(model, optimizer)
 
     # 🌟 3. 初始化新的流式 Parquet 数据集
-    tokenizer = Tokenizer(checkpoint_dir)
-    dataset = CPTParquetIterableDataset(
-        parquet_path=parquet_path,
-        tokenizer=tokenizer,
-        seq_len=config.block_size,
-    )
+    # tokenizer = Tokenizer(checkpoint_dir)
+    bin_data_path = prepare_data(dataset_dir, dataset_name, checkpoint_dir)
+    dataset = CPTBinDataset(bin_path=bin_data_path, seq_len=context_length)
     
     # 🌟 修改点：IterableDataset 不支持 shuffle=True 和 drop_last=True
     # 因为数据已经是流式了，我们在 prepare_data 阶段已经做过了全局 Shuffle
@@ -164,14 +259,35 @@ def main(
     step_start_time = datetime.now()
     global_step_loss_sum = 0.0
     global_step_micro_count = 0
+    global_step = 0
+    total_steps = max_steps
+    training_finished = False
     
     for epoch in range(epochs):
         for batch_idx, (inputs, targets) in enumerate(dataloader):
             is_accumulating = (batch_idx + 1) % gradient_accumulation_steps != 0
 
+            prefill_mask = generate_step_driven_mask(
+                batch_size=inputs.size(0), 
+                seq_len=inputs.size(1), 
+                current_step=global_step, 
+                total_steps=total_steps, 
+                device=fabric.device,
+                schedule=research_breakpoint_schedule
+            )
+            
             with fabric.no_backward_sync(model, enabled=is_accumulating):
-                logits = model(inputs)
-                loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+                logits = model(inputs, prefill_mask=prefill_mask)
+
+                # ==========================================
+                # 🌟 核心拦截：利用 Mask 屏蔽 Prefill 部分的 Loss
+                # ==========================================
+                # 假设你的 prefill_mask 中：True 表示 Prefill，False 表示 Decode
+                
+                # masked_fill 会把 mask 为 True 的位置全部替换成 -100
+                masked_targets = targets.masked_fill(prefill_mask == True, -100)
+
+                loss = chunked_cross_entropy(logits, masked_targets, chunk_size=0)
 
                 # 记录未缩放 loss，用于统计当前 global step 的平均训练损失
                 global_step_loss_sum += loss.detach().item()
@@ -190,12 +306,20 @@ def main(
                 global_step_loss = global_step_loss_sum / max(1, global_step_micro_count)
                 fabric.print(
                     f"[{now.strftime('%H:%M:%S')}] "
-                    f"Epoch {epoch+1} | Global Step {batch_idx//gradient_accumulation_steps} | "
+                    f"Epoch {epoch+1} | Global Step {global_step + 1} | "
                     f"Loss: {global_step_loss:.4f} | "
                     f"Step Time: {step_time:.2f}s"
                 )
                 global_step_loss_sum = 0.0
                 global_step_micro_count = 0
+                global_step += 1
+                if global_step >= max_steps:
+                    fabric.print(f"🚨 已达到最大训练步数 {max_steps}，提前结束训练！")
+                    training_finished = True
+                    break
+        
+        if training_finished:
+            break
 
     if save_ckpt:
         os.makedirs(save_path, exist_ok=True)
