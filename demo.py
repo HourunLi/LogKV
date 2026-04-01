@@ -21,6 +21,7 @@ import random
 from litgpt.tokenizer import Tokenizer
 from tqdm import tqdm
 import numpy as np
+from lightning.fabric.loggers import TensorBoardLogger
 
 torch.set_float32_matmul_precision('high')
 
@@ -127,7 +128,7 @@ def prepare_data(data_dir, dataset_name, model_dir):
 def generate_step_driven_mask(batch_size, seq_len, current_step, total_steps, device, schedule=None):
     """
     基于当前训练 Iter 的动态断点生成器
-    一条序列只有一个断点。断点之前为 False (Prefill)，断点之后为 True (Decode)
+    一条序列只有一个断点。断点之前为 True (Prefill)，断点之后为 False (Decode)
     """
     progress = current_step / max(1, total_steps)
     
@@ -170,7 +171,9 @@ def main(
         # IO
         save_ckpt: bool = False,
         save_path: str = "./ckpt/cpt",
+        enable_tensorboard: bool = True,
         # RESEARCH
+        expid: str = 'debug',
         use_research: bool = False,
         research_swa_size: int = 512,
         research_swa_layers_str: str = "0,2,4,6,8,10,12,14,16,18,20,22,24,26",
@@ -181,9 +184,12 @@ def main(
 
     # 1. set seeds
     set_random_seeds(42)
+    timestr = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tb_logger = TensorBoardLogger(root_dir="tb", name=f"{expid}_{arch_name.replace('/', '-')}_{timestr}")
+    loggers = [tb_logger] if enable_tensorboard else []
     
     # 2. 这里的 Fabric 逻辑保持不变...
-    fabric = L.Fabric(accelerator="cuda", devices=num_devices, precision="bf16-true")
+    fabric = L.Fabric(accelerator="cuda", devices=num_devices, precision="bf16-true", loggers=loggers)
     fabric.launch()
 
     config = Config.from_name(arch_name) 
@@ -310,6 +316,7 @@ def main(
                     f"Loss: {global_step_loss:.4f} | "
                     f"Step Time: {step_time:.2f}s"
                 )
+                fabric.log("train/loss", global_step_loss, step=global_step + 1)
                 global_step_loss_sum = 0.0
                 global_step_micro_count = 0
                 global_step += 1

@@ -13,3 +13,4 @@ dataset_name: "debug"
 dataset_dir: "data"
 num_workers: 0
 save_ckpt: false           # Debug 阶段绝对不保存权重，省时间
+enable_tensorboard: false  # Debug 阶段不使用 TensorBoard，避免额外开销
