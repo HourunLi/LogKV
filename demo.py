@@ -9,7 +9,7 @@ from dataclasses import asdict
 import torch
 import lightning as L
 from datetime import datetime
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, ConcatDataset
 from litgpt import Config
 from litgpt.model import GPT
 from litgpt.tokenizer import Tokenizer
@@ -64,63 +64,73 @@ class CPTBinDataset(torch.utils.data.Dataset):
         # 返回 inputs 和 targets
         return chunk_tensor[:-1], chunk_tensor[1:]
 
-
-def prepare_data(data_dir, dataset_name, model_dir):
-    """
-    全自动数据准备流水线：下载 -> Parquet 缓存 -> Tokenize 编译为 .bin
-    """
+def prepare_data(data_dir, dataset_name, model_dir, data_path=None):
     print("⏳ 正在检查和准备数据...")
     os.makedirs(data_dir, exist_ok=True)
-    parquet_path = os.path.join(data_dir, f"{dataset_name}.parquet")
-    bin_path = os.path.join(data_dir, f"{dataset_name}.bin")
     
     # ==========================================
-    # 🌟 拦截点 1：如果最终的 .bin 已经存在，直接起飞！
+    # 🌟 核心升级：为当前模型创建专属的 .bin 缓存目录
+    # 如果 model_dir 是 "checkpoints/Qwen/Qwen3-0.6B-Base"
+    # model_name 就会是 "Qwen3-0.6B-Base"
     # ==========================================
-    if os.path.exists(bin_path):
-        print(f"🚀 发现已预编译的高性能二进制数据集: {bin_path}，直接使用！")
-        return bin_path
+    model_name = os.path.basename(os.path.normpath(model_dir))
+    bin_cache_dir = os.path.join(data_dir, f"bins_{model_name}", dataset_name)
+    os.makedirs(bin_cache_dir, exist_ok=True)
+    
+    bin_paths = []
+    parquet_files = []
 
-    # ==========================================
-    # 🌟 拦截点 2：如果没有 Parquet，就去下载
-    # ==========================================
-    if not os.path.exists(parquet_path):
-        if dataset_name == 'debug':
-            print("🌐 正在拉取完全开源的 FineWeb-Edu (跳过所有权限验证)...")
-            eng_stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-            print("📥 正在极速抽取 10000 条长文用于架构 Debug...")
-            eng_list = list(eng_stream.take(10000))
-            mixed_dataset = Dataset.from_list(eng_list)
-            mixed_dataset = mixed_dataset.select_columns(["text"])
-            print(f"💾 正在导出为 Parquet 格式至 {parquet_path}...")
-            mixed_dataset.to_parquet(parquet_path)
-        else:
-            raise NotImplementedError(f"数据集 {dataset_name} 的准备逻辑尚未实现")
+    # 1. 获取 Parquet 列表 (逻辑保持不变)
+    if data_path and os.path.isdir(data_path):
+        print(f"📂 检测到本地数据集目录: {data_path}")
+        parquet_files = sorted(glob.glob(os.path.join(data_path, "*.parquet")))
+        if not parquet_files:
+            raise FileNotFoundError(f"❌ 在 {data_path} 下没有找到任何 .parquet 文件！")
     else:
-        print(f"📦 发现已存在的 Parquet 文件: {parquet_path}，跳过下载。")
+        single_parquet = os.path.join(data_dir, f"{dataset_name}.parquet")
+        if not os.path.exists(single_parquet):
+            if dataset_name == 'debug':
+                print("🌐 正在拉取完全开源的 FineWeb-Edu...")
+                eng_stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
+                eng_list = list(eng_stream.take(10000))
+                mixed_dataset = Dataset.from_list(eng_list)
+                mixed_dataset = mixed_dataset.select_columns(["text"])
+                mixed_dataset.to_parquet(single_parquet)
+            else:
+                raise NotImplementedError(f"数据集 {dataset_name} 尚未实现")
+        parquet_files = [single_parquet]
 
-    # ==========================================
-    # 🌟 拦截点 3：将 Parquet 实时 Tokenize 并编译为 .bin
-    # ==========================================
-    print(f"⚙️ 正在将文本 Tokenize 并编译为二进制文件 (这可能需要几分钟，但只执行一次)...")
+    # 2. Tokenize 并写入专属目录
     tokenizer = Tokenizer(model_dir)
-    parquet_file = pq.ParquetFile(parquet_path)
-    
-    all_tokens = []
-    # 使用 tqdm 加上进度条，避免编译时看着屏幕发呆
-    for batch in tqdm(parquet_file.iter_batches(batch_size=8192, columns=["text"]), desc="Tokenizing"):
-        for text in batch.to_pandas()["text"]:
-            # 严格遵守 CPT 的隔断法则：bos=False, eos=True
-            tokens = tokenizer.encode(text, bos=False, eos=True).tolist()
-            all_tokens.extend(tokens)
-            
-    print("💾 正在写入硬盘...")
-    # Qwen 词表超 15 万，必须用 int32！
-    arr = np.array(all_tokens, dtype=np.int32)
-    arr.tofile(bin_path)
-    print(f"✅ 编译完成！共 {len(arr)} 个 Token，极速引擎准备就绪！")
-    
-    return bin_path
+
+    for pq_file in parquet_files:
+        base_name = os.path.basename(pq_file).replace(".parquet", "")
+        
+        # 🌟 修改点：把 bin 文件存进该模型专属的 bin_cache_dir 里！
+        bin_file = os.path.join(bin_cache_dir, f"{base_name}.bin")
+        bin_paths.append(bin_file)
+
+        # 已经在这套 Tokenizer 下编译过，完美跳过！
+        if os.path.exists(bin_file):
+            print(f"🚀 命中专属缓存: 已发现 {model_name} 的就绪文件 {bin_file}")
+            continue
+
+        print(f"\n⚙️ 正在使用 {model_name} 的词表编译: {base_name}.parquet -> .bin")
+        parquet_file = pq.ParquetFile(pq_file)
+        
+        total_tokens = 0
+        with open(bin_file, "wb") as f:
+            for batch in tqdm(parquet_file.iter_batches(batch_size=8192, columns=["text"]), desc=f"Tokenizing {base_name}"):
+                batch_tokens = []
+                for text in batch.to_pandas()["text"]:
+                    tokens = tokenizer.encode(text, bos=False, eos=True).tolist()
+                    batch_tokens.extend(tokens)
+                
+                arr = np.array(batch_tokens, dtype=np.int32)
+                f.write(arr.tobytes())
+                total_tokens += len(arr)
+
+    return bin_paths
 
 # ==========================================
 # 🌟 你的专属 Schedule 逻辑
@@ -167,6 +177,7 @@ def main(
         # DATA
         dataset_name: str = "debug",
         dataset_dir: str = "data",
+        data_dir: str = "data",
         num_workers: int = 0, # 🌟 流式读取暂设为 0，防止多进程读取重复数据
         # IO
         save_ckpt: bool = False,
@@ -248,8 +259,14 @@ def main(
 
     # 🌟 3. 初始化新的流式 Parquet 数据集
     # tokenizer = Tokenizer(checkpoint_dir)
-    bin_data_path = prepare_data(dataset_dir, dataset_name, checkpoint_dir)
-    dataset = CPTBinDataset(bin_path=bin_data_path, seq_len=context_length)
+    bin_data_paths = prepare_data(
+        data_dir=data_dir, 
+        dataset_name=dataset_name, 
+        model_dir=checkpoint_dir, 
+        data_path=dataset_dir # 或者你新增一个命令行参数传进来
+    )
+    datasets = [CPTBinDataset(bin_path=bp, seq_len=context_length) for bp in bin_data_paths]
+    dataset = ConcatDataset(datasets)
     
     # 🌟 修改点：IterableDataset 不支持 shuffle=True 和 drop_last=True
     # 因为数据已经是流式了，我们在 prepare_data 阶段已经做过了全局 Shuffle
