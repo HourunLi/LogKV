@@ -16,6 +16,7 @@ num_devices: 1
 # 数据与 IO
 dataset_name: "debug"
 dataset_dir: "data"
+data_dir: "data"
 num_workers: 0
 save_ckpt: false
 save_path: "./ckpt/qwen0.6b-4k-debug"
