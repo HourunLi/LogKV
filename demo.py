@@ -426,6 +426,7 @@ def main(
                 fabric.log("train/loss", global_step_loss, step=global_step + 1)
                 fabric.log("train/compariable_loss", global_step_compariable_loss, step=global_step + 1)
                 global_step_loss_sum = 0.0
+                global_step_compariable_loss_sum = 0.0
                 global_step_micro_count = 0
                 global_step += 1
                 if global_step >= max_steps:
