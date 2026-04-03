@@ -22,6 +22,7 @@ from litgpt.tokenizer import Tokenizer
 from tqdm import tqdm
 import numpy as np
 from lightning.fabric.loggers import TensorBoardLogger
+import math
 
 torch.set_float32_matmul_precision('high')
 
@@ -64,9 +65,9 @@ class CPTBinDataset(torch.utils.data.Dataset):
         # 返回 inputs 和 targets
         return chunk_tensor[:-1], chunk_tensor[1:]
 
-def prepare_data(data_dir, dataset_name, model_dir, data_path=None):
+def prepare_data(dataset_dir, dataset_name, model_dir, data_dir=None):
     print("⏳ 正在检查和准备数据...")
-    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(dataset_dir, exist_ok=True)
     
     # ==========================================
     # 🌟 核心升级：为当前模型创建专属的 .bin 缓存目录
@@ -74,20 +75,20 @@ def prepare_data(data_dir, dataset_name, model_dir, data_path=None):
     # model_name 就会是 "Qwen3-0.6B-Base"
     # ==========================================
     model_name = os.path.basename(os.path.normpath(model_dir))
-    bin_cache_dir = os.path.join(data_dir, f"bins_{model_name}", dataset_name)
+    bin_cache_dir = os.path.join(data_dir, f"bins_{model_name}")
     os.makedirs(bin_cache_dir, exist_ok=True)
     
     bin_paths = []
     parquet_files = []
 
     # 1. 获取 Parquet 列表 (逻辑保持不变)
-    if data_path and os.path.isdir(data_path):
-        print(f"📂 检测到本地数据集目录: {data_path}")
-        parquet_files = sorted(glob.glob(os.path.join(data_path, "*.parquet")))
+    if data_dir and os.path.isdir(data_dir):
+        print(f"📂 检测到本地数据集目录: {data_dir}")
+        parquet_files = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
         if not parquet_files:
-            raise FileNotFoundError(f"❌ 在 {data_path} 下没有找到任何 .parquet 文件！")
+            raise FileNotFoundError(f"❌ 在 {data_dir} 下没有找到任何 .parquet 文件！")
     else:
-        single_parquet = os.path.join(data_dir, f"{dataset_name}.parquet")
+        single_parquet = os.path.join(dataset_dir, f"{dataset_name}.parquet")
         if not os.path.exists(single_parquet):
             if dataset_name == 'debug':
                 print("🌐 正在拉取完全开源的 FineWeb-Edu...")
@@ -99,6 +100,7 @@ def prepare_data(data_dir, dataset_name, model_dir, data_path=None):
             else:
                 raise NotImplementedError(f"数据集 {dataset_name} 尚未实现")
         parquet_files = [single_parquet]
+        bin_cache_dir = os.path.join(dataset_dir, f"bins_{model_name}")
 
     # 2. Tokenize 并写入专属目录
     tokenizer = Tokenizer(model_dir)
@@ -131,6 +133,29 @@ def prepare_data(data_dir, dataset_name, model_dir, data_path=None):
                 total_tokens += len(arr)
 
     return bin_paths
+
+def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
+    """
+    大厂标准 LR 调度器：前段线性 Warmup，后段余弦退火 (Cosine Decay)
+    """
+    # 1. Warmup 阶段：从 0 线性爬升到 max_lr
+    if current_step < warmup_steps:
+        # 防止除零错误，最少给极小值
+        return max_lr * (current_step + 1) / warmup_steps
+        
+    # 2. 如果超出了最大训练步数，保持最小学习率
+    if current_step > total_steps:
+        return min_lr
+        
+    # 3. 余弦退火阶段：从 max_lr 极其平滑地滑落到 min_lr
+    decay_ratio = (current_step - warmup_steps) / (total_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    
+    # math.cos 接收弧度 (0 到 pi)，产出 1 到 -1
+    # 经过 0.5 * (1 + ...) 变换后，coeff 会从 1 平滑下降到 0
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) 
+    
+    return min_lr + coeff * (max_lr - min_lr)
 
 # ==========================================
 # 🌟 你的专属 Schedule 逻辑
@@ -166,6 +191,7 @@ def main(
         # MODEL
         arch_name: str = "Qwen/Qwen3-0.6B-Base",
         context_length: int = 4096,
+        ckpt_dir: str | None = None,
         # TRAINING
         global_batch_size: int = 32,
         micro_batch_size: int = 4,
@@ -174,6 +200,8 @@ def main(
         learning_rate: float = 2e-5,
         weight_decay: float = 0.1,
         num_devices: int = 1,
+        warmup_steps: int = 5,
+        min_lr: float = 2e-6,
         # DATA
         dataset_name: str = "debug",
         dataset_dir: str = "data",
@@ -219,6 +247,8 @@ def main(
         model = GPT(config)
 
     checkpoint_dir = f"checkpoints/{arch_name}"
+    if ckpt_dir is not None:
+        checkpoint_dir = ckpt_dir
     fabric.print(f"🔄 正在从 {checkpoint_dir} 加载预训练 Checkpoint...")
     # 1. 先把原版权重字典加载到内存里
     state_dict = torch.load(f"{checkpoint_dir}/lit_model.pth")
@@ -254,17 +284,68 @@ def main(
         
     fabric.print("✅ 真实权重加载成功！所有分支已完成 Pre-trained 初始化。")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    # ==========================================
+    # 🌟 工业级优化器初始化：Weight Decay 分组过滤
+    # ==========================================
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+            
+        # 核心逻辑：矩阵（2维及以上）加 WD，向量（1维）不加 WD
+        if param.dim() >= 2:
+            decay_params.append(param)
+        else:
+            no_decay_params.append(param)
+
+    # 打印出来心里有底
+    fabric.print(f"⚙️ 施加 Weight Decay 的参数组 (如 Linear): {len(decay_params)} 个张量")
+    fabric.print(f"⚙️ 豁免 Weight Decay 的参数组 (如 Norm, Bias): {len(no_decay_params)} 个张量")
+
+    # 组装成包含两组字典的列表喂给优化器
+    optim_groups = [
+        {"params": decay_params, "weight_decay": weight_decay},    # 🌟 黄金默认值 0.1
+        {"params": no_decay_params, "weight_decay": 0.0}  # 绝对不能压缩
+    ]
+
+    # 这里假设你配置文件里的 learning_rate 是 2e-5 之类的 CPT 常用学习率
+    optimizer = torch.optim.AdamW(
+        optim_groups, 
+        lr=learning_rate, 
+        betas=(0.9, 0.95),  # LLM 预训练标配的 betas
+        eps=1e-8
+    )
     model, optimizer = fabric.setup(model, optimizer)
 
     # 🌟 3. 初始化新的流式 Parquet 数据集
     # tokenizer = Tokenizer(checkpoint_dir)
+    # ==========================================
+    # 🌟 工业级多卡同步：预编译安全锁
+    # ==========================================
+    # 1. 只让老大 (Rank 0) 去干苦力编译
+    if fabric.global_rank == 0:
+        fabric.print("👑 [Rank 0] 正在独占执行数据预编译，其他进程请等待...")
+        bin_data_paths = prepare_data(
+            data_dir=data_dir, 
+            dataset_dir=dataset_dir,
+            dataset_name=dataset_name, 
+            model_dir=checkpoint_dir, 
+        )
+    # 2. 绝对屏障 (Barrier)：所有走到这里的显卡，必须停下脚步等 Rank 0！
+    fabric.barrier()
+
+    # 3. 🌟 核心修复点：拿取劳动成果 (所有人一起拿)
+    # 因为 Rank 0 刚才已经把文件写进硬盘了
+    # 现在所有人调用这个函数，都会瞬间打印 "命中专属缓存" 并返回路径列表！
     bin_data_paths = prepare_data(
         data_dir=data_dir, 
+        dataset_dir=dataset_dir,
         dataset_name=dataset_name, 
         model_dir=checkpoint_dir, 
-        data_path=dataset_dir # 或者你新增一个命令行参数传进来
     )
+
     datasets = [CPTBinDataset(bin_path=bp, seq_len=context_length) for bp in bin_data_paths]
     dataset = ConcatDataset(datasets)
     
@@ -320,6 +401,11 @@ def main(
                 fabric.backward(loss)
 
             if not is_accumulating:
+                current_lr = get_lr(global_step, total_steps, warmup_steps, learning_rate, min_lr)
+                # 遍历优化器里的每一个参数组 (包括我们刚才拆分的带 decay 和不带 decay 的组)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
