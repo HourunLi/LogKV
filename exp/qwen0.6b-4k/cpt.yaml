@@ -4,9 +4,9 @@ expid: debug
 
 ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-0.6B-Base/
 
-global_batch_size: 128
+global_batch_size: 256
 micro_batch_size: 2
-max_steps: 2000
+max_steps: 5000
 warmup_steps: 0
 learning_rate: 2e-5
 min_lr: 2e-6
