@@ -362,6 +362,7 @@ def main(
     optimizer.zero_grad(set_to_none=True) 
     step_start_time = datetime.now()
     global_step_loss_sum = 0.0
+    global_step_compariable_loss_sum = 0.0
     global_step_micro_count = 0
     global_step = 0
     total_steps = max_steps
@@ -387,14 +388,16 @@ def main(
                 # 🌟 核心拦截：利用 Mask 屏蔽 Prefill 部分的 Loss
                 # ==========================================
                 # 假设你的 prefill_mask 中：True 表示 Prefill，False 表示 Decode
-                
-                # masked_fill 会把 mask 为 True 的位置全部替换成 -100
                 masked_targets = targets.masked_fill(prefill_mask == True, -100)
-
-                loss = chunked_cross_entropy(logits, masked_targets, chunk_size=0)
+                compariable_decode_loss = chunked_cross_entropy(logits, masked_targets, chunk_size=0)
+                if use_research:
+                    loss = compariable_decode_loss
+                else:
+                    loss = chunked_cross_entropy(logits, targets, chunk_size=0)
 
                 # 记录未缩放 loss，用于统计当前 global step 的平均训练损失
                 global_step_loss_sum += loss.detach().item()
+                global_step_compariable_loss_sum += compariable_decode_loss.detach().item()
                 global_step_micro_count += 1
 
                 loss = loss / gradient_accumulation_steps
@@ -413,6 +416,7 @@ def main(
                 step_time = (now - step_start_time).total_seconds()
                 step_start_time = now
                 global_step_loss = global_step_loss_sum / max(1, global_step_micro_count)
+                global_step_compariable_loss = global_step_compariable_loss_sum / max(1, global_step_micro_count)
                 fabric.print(
                     f"[{now.strftime('%H:%M:%S')}] "
                     f"Epoch {epoch+1} | Global Step {global_step + 1} | "
@@ -420,6 +424,7 @@ def main(
                     f"Step Time: {step_time:.2f}s"
                 )
                 fabric.log("train/loss", global_step_loss, step=global_step + 1)
+                fabric.log("train/compariable_loss", global_step_compariable_loss, step=global_step + 1)
                 global_step_loss_sum = 0.0
                 global_step_micro_count = 0
                 global_step += 1
