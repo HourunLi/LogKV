@@ -211,6 +211,7 @@ def main(
         save_ckpt: bool = False,
         save_path: str = "./ckpt/cpt",
         enable_tensorboard: bool = True,
+        tensorboard_root: str = './tb',
         # RESEARCH
         expid: str = 'debug',
         use_research: bool = False,
@@ -223,12 +224,19 @@ def main(
 
     # 1. set seeds
     set_random_seeds(42)
-    timestr = datetime.now().strftime("%Y%m%d-%H%M%S")
-    tb_logger = TensorBoardLogger(root_dir="tb", name=f"{expid}_{arch_name.replace('/', '-')}_{timestr}")
+    # timestr = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tb_logger = TensorBoardLogger(root_dir=tensorboard_root, name=f"{expid}_{arch_name.replace('/', '-')}")
     loggers = [tb_logger] if enable_tensorboard else []
     
     # 2. 这里的 Fabric 逻辑保持不变...
-    fabric = L.Fabric(accelerator="cuda", devices=num_devices, precision="bf16-true", loggers=loggers)
+    fabric = L.Fabric(
+        accelerator="cuda", 
+        devices=num_devices, 
+        num_nodes=int(os.environ.get("GROUP_WORLD_SIZE", 1)), # 兼容单机和多机
+        strategy="ddp", # 🌟 明确告诉 Fabric 使用 DistributedDataParallel
+        precision="bf16-true", 
+        loggers=loggers
+    )
     fabric.launch()
 
     config = Config.from_name(arch_name) 
@@ -351,7 +359,7 @@ def main(
     
     # 🌟 修改点：IterableDataset 不支持 shuffle=True 和 drop_last=True
     # 因为数据已经是流式了，我们在 prepare_data 阶段已经做过了全局 Shuffle
-    dataloader = DataLoader(dataset, batch_size=micro_batch_size, num_workers=num_workers)
+    dataloader = DataLoader(dataset, batch_size=micro_batch_size, num_workers=num_workers, shuffle=True)
     dataloader = fabric.setup_dataloaders(dataloader)
 
     fabric.print("🚀 开始 Continue Pretraining...")
@@ -425,6 +433,7 @@ def main(
                 )
                 fabric.log("train/loss", global_step_loss, step=global_step + 1)
                 fabric.log("train/compariable_loss", global_step_compariable_loss, step=global_step + 1)
+                fabric.log("train/learning_rate", current_lr, step=global_step + 1)
                 global_step_loss_sum = 0.0
                 global_step_compariable_loss_sum = 0.0
                 global_step_micro_count = 0
@@ -440,8 +449,17 @@ def main(
     if save_ckpt:
         os.makedirs(save_path, exist_ok=True)
         fabric.print(f"💾 正在保存模型至 {save_path}")
-        state_dict = {"model": model.state_dict()}
-        fabric.save(f"{save_path}/lit_model.pth", state_dict)
+        
+        # 🌟 直接传对象引用！不需要显式调用 model.state_dict()
+        # 甚至可以顺手把 optimizer 的状态也存进去，方便中断后继续训练
+        state = {
+            "model": model, 
+            "optimizer": optimizer, 
+            "global_step": global_step
+        }
+        
+        # fabric.save 底层会安全地萃取出没有 module. 前缀的纯净权重
+        fabric.save(f"{save_path}/lit_model.pth", state)
 
         for file_path in glob.glob(f"{checkpoint_dir}/*.json") + glob.glob(f"{checkpoint_dir}/*.model"):
             shutil.copy(file_path, save_path)

@@ -1,0 +1,4 @@
+config: cpt.yaml
+
+expid: base
+use_research: false

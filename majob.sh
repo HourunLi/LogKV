@@ -36,6 +36,14 @@ MASTER_PORT=${MASTER_PORT:-6000}
 NODE_RANK=${VC_TASK_INDEX:-0}
 
 pip install tensorboard
-python demo.py --config ./exp/qwen0.6b-4k/cpt.yaml --expid majob-debug
+echo "🌍 正在启动多机多卡训练: Node ${NODE_RANK} / ${NUM_NODES}"
+echo "🔗 Master 地址: ${MASTER_ADDR}:${MASTER_PORT}"
+torchrun \
+    --nnodes=${NUM_NODES} \
+    --nproc_per_node=${GPUS_PER_NODE} \
+    --node_rank=${NODE_RANK} \
+    --master_addr=${MASTER_ADDR} \
+    --master_port=${MASTER_PORT} \
+    "$@"
 
 set +x
