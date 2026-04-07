@@ -1,0 +1,28 @@
+config: base.yaml
+
+expid: cpt
+
+ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-0.6B-Base/
+
+global_batch_size: 256
+micro_batch_size: 2
+max_steps: 5000
+warmup_steps: 0
+learning_rate: 2e-5
+min_lr: 2e-6
+weight_decay: 0.1
+num_devices: 1
+
+data_dir: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/fineweb-edu/sample/100BT/"
+num_workers: 0
+save_ckpt: false
+save_path: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/ckpt/qwen0.6b-100BT-4k-cpt"
+
+enable_tensorboard: true
+tensorboard_root: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/tb"
+
+use_research: true
+research_swa_size: 512
+research_swa_layers_str: "0,2,4,6,8,10,12,14,16,18,20,22,24,26"
+research_identity_layers_str: "1,3,5,7,9,11,13,15,17,19,21,23,25,27"
+research_separate_parameter: true
