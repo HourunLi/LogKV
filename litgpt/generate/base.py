@@ -79,9 +79,10 @@ def next_token(
     input_pos: torch.Tensor,
     x: torch.Tensor,
     input_pos_maxp1: int | None = None,
+    prefill_mask: torch.Tensor | None = None,
     **sample_kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    logits = model(x, input_pos, input_pos_maxp1=input_pos_maxp1)
+    logits = model(x, input_pos, input_pos_maxp1=input_pos_maxp1, prefill_mask=prefill_mask)
     _next = sample(logits, **sample_kwargs).to(dtype=torch.int64)
     return _next
 
@@ -180,17 +181,70 @@ def generate_fn(
     # input_pos_maxp1 introduces data-dependent shapes and control flow.
     # We want to skip if ThunderModules are involved, either directly or wrapped in LightningModule etc.
     input_pos_maxp1 = prompt_size if all(m.__class__.__name__ != "ThunderModule" for m in model.modules()) else None
+
+    # 🌟 提前准备好 Decode 阶段专用的 Mask (永远是 False)
+    decode_mask = torch.zeros((1, 1), dtype=torch.bool, device=device)
+    is_research = getattr(model.config, 'use_research', False)
+
     for current_idx in range(max_returned_tokens - prompt_size):
-        # Generate the token
-        token = next_token(
-            model,
-            input_pos,
-            token.view(1, -1),
-            input_pos_maxp1=input_pos_maxp1,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        )
+        # ==========================================
+        # 🌟 核心拦截：对首个生成的 Token 实施 T-1 隔离策略
+        # ==========================================
+        if prefill_token:
+            if is_research and prompt_size > 1:
+                # 1. 剥离前 T-1 个 token
+                input_pos_prefill = torch.arange(0, prompt_size - 1, device=device, dtype=torch.int64)
+                prefill_mask_init = torch.ones((1, prompt_size - 1), dtype=torch.bool, device=device)
+                
+                # 强行跑一次前向传播，把 T-1 的内容砸进 KV Cache (SWA/LayerDrop 分支)
+                model(
+                    prompt[:-1].view(1, -1), 
+                    input_pos_prefill, 
+                    input_pos_maxp1=(input_pos_maxp1 - 1) if input_pos_maxp1 is not None else None,
+                    prefill_mask=prefill_mask_init
+                )
+                
+                # 2. 构造第 T 个 token 的参数，准备喂给下面的 next_token
+                cur_input_pos = torch.tensor([prompt_size - 1], device=device, dtype=torch.int64)
+                cur_x = prompt[-1:].view(1, -1)
+            else:
+                # 兜底：如果 prompt 真的只有一个字
+                cur_input_pos = input_pos
+                cur_x = token.view(1, -1)
+            # 3. 传入最后 1 个 token 算 Full Attention，拿到首字生成！
+            token = next_token(
+                model,
+                cur_input_pos,
+                cur_x,
+                input_pos_maxp1=input_pos_maxp1,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                prefill_mask=decode_mask, # 🌟 强制走 Decode 分支
+            )
+            
+            # 状态更新，进入自回归模式
+            prefill_token = False
+            input_pos = torch.tensor([prompt_size], device=device, dtype=torch.int64)
+        else:
+            # ==========================================
+            # 🌟 正常的逐字 Decode 生成逻辑
+            # ==========================================
+            token = next_token(
+                model,
+                input_pos,
+                token.view(1, -1),
+                input_pos_maxp1=input_pos_maxp1,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                prefill_mask=decode_mask, # 🌟 强制走 Decode 分支
+            )
+            input_pos.add_(1)
+            
+        if input_pos_maxp1 is not None:
+            input_pos_maxp1 += 1
+        
         tokens.append(token)
         int_token = token.item()
 
