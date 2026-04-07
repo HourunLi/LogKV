@@ -1,6 +1,12 @@
 import os
-import ssl
-import urllib3
+import yaml
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+import numpy as np
+from pathlib import Path
+from jsonargparse import CLI
+import tqdm
 
 if 'HF_DATASETS_CACHE' not in os.environ:
     print("设置环境变量...")
@@ -9,28 +15,18 @@ if 'HF_DATASETS_CACHE' not in os.environ:
     os.environ['HF_EVALUATE_CACHE'] = '/data/zys/data/hf_cache/evaluate'
     os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
     os.environ['HF_DATASETS_OFFLINE'] = '1'
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     # os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
     # os.environ['CURL_CA_BUNDLE'] = ''
     # os.environ['REQUESTS_CA_BUNDLE'] = ''
     # urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     # ssl._create_default_https_context = ssl._create_unverified_context
 
-import yaml
-import torch
-import torch.nn.functional as F
-from pathlib import Path
-from jsonargparse import CLI
-
-# 引入你的模型和工具
 from litgpt.config import Config
 from litgpt.model import GPT
 from litgpt.tokenizer import Tokenizer
-
-# 引入 lm-eval 核心库
 from lm_eval import evaluator
 from lm_eval.api.model import LM
-
-# 引入我们接下来要修改的 generate 函数
 from litgpt.generate.base import generate as litgpt_generate
 
 class CustomResearchLM(LM):
@@ -40,6 +36,9 @@ class CustomResearchLM(LM):
         self.checkpoint_dir = checkpoint_dir
         self.tokenizer = Tokenizer(checkpoint_dir)
         
+        # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
+        is_master = not dist.is_initialized() or dist.get_rank() == 0
+
         # ==========================================
         # 🌟 智能 Config 路由加载 (YAML 版本)
         # ==========================================
@@ -47,7 +46,7 @@ class CustomResearchLM(LM):
         config_path = os.path.join(checkpoint_dir, "model_config.yaml")
         
         if os.path.exists(config_path):
-            print(f"📄 发现专属架构 YAML 配置文件: {config_path}，正在自动同步架构...")
+            if is_master: print(f"📄 发现专属架构 YAML 配置文件: {config_path}，正在自动同步架构...")
             with open(config_path, "r", encoding="utf-8") as f:
                 # 使用 safe_load 是读取 yaml 的最佳安全实践
                 config_dict = yaml.safe_load(f)
@@ -59,7 +58,7 @@ class CustomResearchLM(LM):
             self.use_research = getattr(self.config, 'use_research', False)
             
         else:
-            print("⚠️ 未发现训练期保存的 YAML 配置文件，正在使用备用参数初始化...")
+            if is_master: print("⚠️ 未发现训练期保存的 YAML 配置文件，正在使用备用参数初始化...")
             self.use_research = use_research
             self.config = Config.from_name(
                 name=checkpoint_dir.split("/")[-1],
@@ -73,33 +72,59 @@ class CustomResearchLM(LM):
 
         # ==========================================
         
-        print(f"🔧 正在初始化 Transformer (Research模式: {self.use_research})...")
+        if is_master: print(f"🔧 正在初始化 Transformer (Research模式: {self.use_research})...")
         self.model = GPT(self.config).to(device).bfloat16()
         
-        print(f"🔄 正在加载权重...")
-        state_dict = torch.load(f"{checkpoint_dir}/lit_model.pth")
+        if is_master: print(f"🔄 正在加载权重...")
+        state_dict = torch.load(f"{checkpoint_dir}/lit_model.pth", map_location=device)
         
         self.model.load_state_dict(state_dict, strict=False) 
         self.model.eval()
-        print("✅ 模型就绪！")
+        if is_master: print("✅ 模型就绪！")
 
     # ==========================================
-    # 🌟 核心 1：PPL 与 选择题评测 (完美适配你的 forward)
+    # 🌟 分布式结果收集
+    # ==========================================
+    def all_gather_results(self, local_result_list: list):
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return local_result_list
+            
+        dp_size = dist.get_world_size()
+        all_results_list = [None for _ in range(dp_size)]
+        dist.all_gather_object(all_results_list, local_result_list)
+        
+        final_results = []
+        max_load = max(len(r) for r in all_results_list)
+        for i in range(max_load):
+            for rank_id in range(dp_size):
+                if i < len(all_results_list[rank_id]):
+                    final_results.append(all_results_list[rank_id][i])
+        return final_results
+
+    # ==========================================
+    # 🌟 核心 1：PPL 与 选择题评测 (完美适配你的 forward + 并行)
     # ==========================================
     def loglikelihood(self, requests):
+        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        dp_size = dist.get_world_size() if dist.is_initialized() else 1
+        
+        local_requests = requests[dp_rank::dp_size]
         results = []
-        for req in requests:
+        disable_tqdm = (dp_rank != 0)
+        
+        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
             context, continuation = req.args[0], req.args[1]
             
             ctx_enc = self.tokenizer.encode(context).tolist()
             cont_enc = self.tokenizer.encode(continuation).tolist()
+            
             # 🌟 安全阀：如果 题干 + 选项 > 4096，必须切掉题干最前面的部分
             max_len = self.model.max_seq_length
             if len(ctx_enc) + len(cont_enc) > max_len:
                 # 保留完整的选项，切断 context 的头部
                 keep_ctx_len = max_len - len(cont_enc)
                 ctx_enc = ctx_enc[-keep_ctx_len:]
-                print(f"⚠️ 警告: 触发截断，剩余 context 长度: {len(ctx_enc)}")
+                print(f"⚠️ [Rank {dp_rank}] 警告: 触发截断，剩余 context 长度: {len(ctx_enc)}")
             
             if len(ctx_enc) == 0:
                 ctx_enc = [self.tokenizer.bos_id]
@@ -133,14 +158,20 @@ class CustomResearchLM(LM):
             is_greedy = (cont_logits.argmax(dim=-1) == cont_targets).all().item()
             results.append((token_log_probs.sum().item(), is_greedy))
             
-        return results
+        return self.all_gather_results(results)
 
     # ==========================================
     # 🌟 核心 2：自回归生成任务 (LongBench)
     # ==========================================
     def generate_until(self, requests):
+        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        dp_size = dist.get_world_size() if dist.is_initialized() else 1
+        
+        local_requests = requests[dp_rank::dp_size]
         results = []
-        for req in requests:
+        disable_tqdm = (dp_rank != 0)
+        
+        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
             prompt = req.args[0]
             gen_args = req.args[1] 
             
@@ -158,7 +189,7 @@ class CustomResearchLM(LM):
             if prompt_tensor.size(0) + max_new_tokens > max_len:
                 keep_prompt_len = max_len - max_new_tokens
                 prompt_tensor = prompt_tensor[-keep_prompt_len:]
-                print(f"⚠️ 警告: 触发生成截断，Prompt 被切至: {keep_prompt_len}")
+                print(f"⚠️ [Rank {dp_rank}] 警告: 触发生成截断，Prompt 被切至: {keep_prompt_len}")
             
             with torch.no_grad():
                 # 调用我们马上要在 base.py 里修改的 generate 函数
@@ -176,7 +207,7 @@ class CustomResearchLM(LM):
             decoded = self.tokenizer.decode(generated_tokens)
             results.append(decoded)
             
-        return results
+        return self.all_gather_results(results)
 
     def loglikelihood_rolling(self, requests): pass
     @property
@@ -196,16 +227,29 @@ def main(
     checkpoint_dir: str = "checkpoints/Qwen/Qwen3-0.6B-Base",
     benchmark: str = "debug",  
 ):
-    print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
-    lm_model = CustomResearchLM(checkpoint_dir)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    
+    if world_size > 1 and not dist.is_initialized():
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        
+    device = f"cuda:{local_rank}"
+    
+    if local_rank == 0:
+        print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
+        
+    lm_model = CustomResearchLM(checkpoint_dir, device=device)
+    
     results = evaluator.simple_evaluate(
         model=lm_model,
         tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
         batch_size=1,
-        device="cuda"
     )
-    from lm_eval.utils import make_table
-    print(make_table(results))
+    
+    if local_rank == 0:
+        from lm_eval.utils import make_table
+        print(make_table(results))
 
 if __name__ == "__main__":
     CLI(main)
