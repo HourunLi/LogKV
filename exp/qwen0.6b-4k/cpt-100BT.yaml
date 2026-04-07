@@ -11,12 +11,12 @@ warmup_steps: 0
 learning_rate: 2e-5
 min_lr: 2e-6
 weight_decay: 0.1
-num_devices: 8
+num_devices: 1
 
-data_dir: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/fineweb-edu/sample/10BT/"
+data_dir: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/fineweb-edu/sample/100BT/"
 num_workers: 0
 save_ckpt: false
-save_path: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/ckpt/qwen0.6b-4k-cpt"
+save_path: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/ckpt/qwen0.6b-100BT-4k-cpt"
 
 enable_tensorboard: true
 tensorboard_root: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/tb"
