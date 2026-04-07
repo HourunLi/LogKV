@@ -160,16 +160,16 @@ def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
 # ==========================================
 # 🌟 你的专属 Schedule 逻辑
 # ==========================================
-def generate_step_driven_mask(batch_size, seq_len, current_step, total_steps, device, schedule=None):
+def generate_step_driven_mask(batch_size, seq_len, current_step, total_steps, device, stable=0, schedule=None):
     """
     基于当前训练 Iter 的动态断点生成器
     一条序列只有一个断点。断点之前为 True (Prefill)，断点之后为 False (Decode)
     """
-    progress = current_step / max(1, total_steps)
+    progress = min(current_step / max(1, total_steps - stable), 1)
     
     # 动态计算当前的上下界
-    min_prefill_ratio = progress * 0.1
-    max_prefill_ratio = progress * 0.9
+    min_prefill_ratio = 0.01 + progress * 0.1
+    max_prefill_ratio = 0.05 + progress * 0.9
     
     # 为 Batch 中的【每一条序列】独立地均匀随机生成一个断点
     breakpoints = [int(random.uniform(min_prefill_ratio, max_prefill_ratio) * seq_len) for _ in range(batch_size)]
@@ -206,7 +206,7 @@ def main(
         dataset_name: str = "debug",
         dataset_dir: str = "data",
         data_dir: str = "data",
-        num_workers: int = 0, # 🌟 流式读取暂设为 0，防止多进程读取重复数据
+        num_workers: int = 16,
         # IO
         save_ckpt: bool = False,
         save_path: str = "./ckpt/cpt",
@@ -219,6 +219,7 @@ def main(
         research_swa_layers_str: str = "0,2,4,6,8,10,12,14,16,18,20,22,24,26",
         research_identity_layers_str: str = "1,3,5,7,9,11,13,15,17,19,21,23,25,27",
         research_breakpoint_schedule: str | None = None,
+        research_breakpoint_schedule_stable: int = 0,
         research_separate_parameter: bool = True,
 ):
 
@@ -386,7 +387,8 @@ def main(
                 current_step=global_step, 
                 total_steps=total_steps, 
                 device=fabric.device,
-                schedule=research_breakpoint_schedule
+                schedule=research_breakpoint_schedule,
+                stable=research_breakpoint_schedule_stable,
             )
             
             with fabric.no_backward_sync(model, enabled=is_accumulating):
