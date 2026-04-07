@@ -1,4 +1,4 @@
-python 3.10
+# 首先安装 python 3.10
 pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 or -f https://mirrors.aliyun.com/pytorch-wheels/cu128/ 
 pip install -e '.[all]' --index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/
