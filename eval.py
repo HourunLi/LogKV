@@ -1,4 +1,20 @@
 import os
+import ssl
+import urllib3
+
+if 'HF_DATASETS_CACHE' not in os.environ:
+    print("设置环境变量...")
+    os.environ['HF_HOME'] = '/data/zys/data/hf_cache'
+    os.environ['HF_DATASETS_CACHE'] = '/data/zys/data/hf_cache/hf_cache'
+    os.environ['HF_EVALUATE_CACHE'] = '/data/zys/data/hf_cache/evaluate'
+    os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
+    os.environ['HF_DATASETS_OFFLINE'] = '1'
+    # os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+    # os.environ['CURL_CA_BUNDLE'] = ''
+    # os.environ['REQUESTS_CA_BUNDLE'] = ''
+    # urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    # ssl._create_default_https_context = ssl._create_unverified_context
+
 import yaml
 import torch
 import torch.nn.functional as F
