@@ -16,7 +16,7 @@ num_devices: 8
 data_dir: "/workspace/fineweb-edu/sample/10BT/"
 num_workers: 0
 save_ckpt: false
-save_path: "./ckpt/qwen0.6b-4k-cpt"
+save_path: "/workspace/ckpt/qwen0.6b-4k-cpt"
 
 enable_tensorboard: true
 tensorboard_root: "/workspace/tb"
