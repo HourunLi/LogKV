@@ -56,6 +56,8 @@ class CustomResearchLM(LM):
             
             # 确保对象的开关属性被正确覆盖
             self.use_research = getattr(self.config, 'use_research', False)
+            # self.use_research = False
+            # self.config.use_research = False
             
         else:
             if is_master: print("⚠️ 未发现训练期保存的 YAML 配置文件，正在使用备用参数初始化...")
@@ -76,11 +78,23 @@ class CustomResearchLM(LM):
         self.model = GPT(self.config).to(device).bfloat16()
         
         if is_master: print(f"🔄 正在加载权重...")
-        state_dict = torch.load(f"{checkpoint_dir}/lit_model.pth", map_location=device)
+        checkpoint = torch.load(f"{checkpoint_dir}/lit_model.pth", map_location=device)
         
-        self.model.load_state_dict(state_dict, strict=False) 
+        # 🌟 核心修复：检查是不是被包裹过的 checkpoint 字典
+        if "model" in checkpoint:
+            state_dict = checkpoint["model"]
+            if is_master: print("📦 检测到 Fabric Checkpoint，已自动提取 model 权重。")
+        else:
+            state_dict = checkpoint
+        
+        # 🌟 强烈建议：捕获并打印一下加载结果，看看是不是真的加载成功了！
+        load_result = self.model.load_state_dict(state_dict, strict=False) 
+        
+        if is_master: 
+            print(f"✅ 权重加载完毕！缺失的 keys: {len(load_result.missing_keys)} 个")
+            # 如果 missing_keys 极其多（比如几百个），说明加载又失败了
+            
         self.model.eval()
-        if is_master: print("✅ 模型就绪！")
 
     # ==========================================
     # 🌟 分布式结果收集
