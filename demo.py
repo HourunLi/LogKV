@@ -439,9 +439,9 @@ def main(
     load_dir = checkpoint_dir if resume_dir is None else resume_dir
     fabric.print(f"🔄 正在从 {load_dir} 加载预训练 Checkpoint...")
     # 1. 先把原版权重字典加载到内存里
-    state_dict = torch.load(f"{load_dir}/lit_model.pth")
-    if "model" in state_dict:
-        state_dict = state_dict["model"]
+    raw_ckpt = torch.load(f"{load_dir}/lit_model.pth", map_location='cpu')
+    state_dict = raw_ckpt['model'] if 'model' in raw_ckpt else raw_ckpt
+    del raw_ckpt
     
     # 2. 🌟 核心拦截：Block 级别的映射与克隆
     if config.use_research and config.research_separate_parameter:
