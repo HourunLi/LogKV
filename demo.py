@@ -27,6 +27,37 @@ from datetime import timedelta
 
 torch.set_float32_matmul_precision('high')
 
+
+class MicroStepMeanStats:
+    """
+    同一 global step 内按 micro batch 累加；每个指标各自维护 sum / count。
+    accumulate 里没传的指标本步不更新；averages() 只返回本 step 内至少收到过一次样本的指标。
+    构造时的名字仅用于预置键（reset 后会清空，之后仍可在 accumulate 里动态出现新键名）。
+    """
+
+    def __init__(self, *metric_names: str) -> None:
+        self._sums: dict[str, float] = {}
+        self._counts: dict[str, int] = {}
+        for k in metric_names:
+            self._sums[k] = 0.0
+            self._counts[k] = 0
+
+    def accumulate(self, **values: float) -> None:
+        for k, v in values.items():
+            if k not in self._sums:
+                self._sums[k] = 0.0
+                self._counts[k] = 0
+            self._sums[k] += float(v)
+            self._counts[k] += 1
+
+    def averages(self) -> dict[str, float]:
+        return {k: self._sums[k] / self._counts[k] for k in self._sums if self._counts[k] > 0}
+
+    def reset(self) -> None:
+        self._sums.clear()
+        self._counts.clear()
+
+
 # set random seeds
 def set_random_seeds(seed):
     torch.manual_seed(seed)
@@ -271,6 +302,32 @@ def generate_step_driven_mask(batch_size, seq_len, current_step, total_steps, de
     
     return prefill_mask
 
+
+def decode_prefix_mean_ce(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    prefill_mask: torch.Tensor,
+    k: int,
+    ignore_index: int = -100,
+) -> float | None:
+    """prefill True=Prefill；每条样本 decode 段前 k 个位置的 CE，在 batch 上取平均；无有效位置返回 None。"""
+    if k <= 0:
+        return None
+    B, T, V = logits.shape
+    ce = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, V),
+        targets.reshape(-1),
+        ignore_index=ignore_index,
+        reduction="none",
+    ).view(B, T)
+    bp = prefill_mask.sum(dim=1, keepdim=True)
+    t_idx = torch.arange(T, device=logits.device).view(1, -1)
+    m = (t_idx >= bp) & (t_idx < bp + k) & (targets != ignore_index)
+    if not m.any():
+        return None
+    return ce[m].mean()
+
+
 # ==========================================
 # CPT 主训练循环
 # ==========================================
@@ -308,6 +365,7 @@ def main(
         research_breakpoint_schedule: str | None = None,
         research_breakpoint_schedule_stable: int = 0,
         research_separate_parameter: bool = True,
+        research_decode_prefix_tokens: int = 8,
 ):
 
     # 1. set seeds
@@ -482,9 +540,7 @@ def main(
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
     optimizer.zero_grad(set_to_none=True) 
     step_start_time = datetime.now()
-    global_step_loss_sum = 0.0
-    global_step_compariable_loss_sum = 0.0
-    global_step_micro_count = 0
+    step_stats = MicroStepMeanStats("loss", "compariable_loss")
     global_step = 0
     total_steps = max_steps
     training_finished = False
@@ -518,9 +574,17 @@ def main(
                     loss = chunked_cross_entropy(logits, targets, chunk_size=0)
 
                 # 记录未缩放 loss，用于统计当前 global step 的平均训练损失
-                global_step_loss_sum += loss.detach().item()
-                global_step_compariable_loss_sum += compariable_decode_loss.detach().item()
-                global_step_micro_count += 1
+                metrics = {
+                    "loss": loss.detach().item(),
+                    "compariable_loss": compariable_decode_loss.detach().item(),
+                }
+                if research_decode_prefix_tokens > 0:
+                    dp = decode_prefix_mean_ce(
+                        logits.detach(), targets, prefill_mask, research_decode_prefix_tokens
+                    )
+                    if dp is not None:
+                        metrics["decode_prefix_loss"] = dp.detach().item()
+                step_stats.accumulate(**metrics)
 
                 loss = loss / gradient_accumulation_steps
                 fabric.backward(loss)
@@ -537,20 +601,20 @@ def main(
                 now = datetime.now()
                 step_time = (now - step_start_time).total_seconds()
                 step_start_time = now
-                global_step_loss = global_step_loss_sum / max(1, global_step_micro_count)
-                global_step_compariable_loss = global_step_compariable_loss_sum / max(1, global_step_micro_count)
+                avgs = step_stats.averages()
+                metrics_txt = " | ".join(f"{k}: {v:.4f}" for k, v in sorted(avgs.items()))
+                if metrics_txt:
+                    metrics_txt = metrics_txt + " | "
                 fabric.print(
                     f"[{now.strftime('%H:%M:%S')}] "
                     f"Epoch {epoch+1} | Global Step {global_step + 1} | "
-                    f"Loss: {global_step_loss:.4f} | "
+                    f"{metrics_txt}"
                     f"Step Time: {step_time:.2f}s"
                 )
-                fabric.log("train/loss", global_step_loss, step=global_step + 1)
-                fabric.log("train/compariable_loss", global_step_compariable_loss, step=global_step + 1)
+                for name, val in avgs.items():
+                    fabric.log(f"train/{name}", val, step=global_step + 1)
                 fabric.log("train/learning_rate", current_lr, step=global_step + 1)
-                global_step_loss_sum = 0.0
-                global_step_compariable_loss_sum = 0.0
-                global_step_micro_count = 0
+                step_stats.reset()
                 global_step += 1
                 if global_step >= max_steps:
                     fabric.print(f"🚨 已达到最大训练步数 {max_steps}，提前结束训练！")
