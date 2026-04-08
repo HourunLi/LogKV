@@ -1,6 +1,6 @@
 config: base.yaml
 
-expid: cpt
+expid: cpt-prefix
 
 ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-0.6B-Base/
 
