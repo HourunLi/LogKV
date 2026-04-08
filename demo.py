@@ -22,6 +22,8 @@ from tqdm import tqdm
 import numpy as np
 from lightning.fabric.loggers import TensorBoardLogger
 import math
+from lightning.fabric.strategies import DDPStrategy
+from datetime import timedelta
 
 torch.set_float32_matmul_precision('high')
 
@@ -186,10 +188,9 @@ def prepare_data(dataset_dir, dataset_name, model_dir, data_dir=None, rank=0, lo
     for pq_file, bin_file, base_name in compile_jobs:
         parquet_file = pq.ParquetFile(pq_file)
         tmp_bin_file = f"{bin_file}.rank{rank}.tmp"
-        if os.path.exists(tmp_bin_file):
-            os.replace(tmp_bin_file, bin_file)
-            continue
-
+        # if os.path.exists(tmp_bin_file):
+        #     os.replace(tmp_bin_file, bin_file)
+        #     continue
 
         total_batches = parquet_file.metadata.num_rows // 8192
         if parquet_file.metadata.num_rows % 8192 != 0:
@@ -320,7 +321,9 @@ def main(
         accelerator="cuda", 
         devices=num_devices, 
         num_nodes=int(os.environ.get("GROUP_WORLD_SIZE", 1)), # 兼容单机和多机
-        strategy="ddp", # 🌟 明确告诉 Fabric 使用 DistributedDataParallel
+        strategy=DDPStrategy(
+            timeout=timedelta(days=3650)   # 例如 10 年，基本等价于“无限等”
+        ),  
         precision="bf16-true", 
         loggers=loggers
     )
