@@ -614,6 +614,8 @@ def main(
                 }
                 if research_decode_prefix_tokens > 0:
                     ks = [research_decode_prefix_tokens, 8, 16]
+                    if 1 not in ks:
+                        ks.insert(0, 1)
                     prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=ks)
                     if len(prefix_losses) > 0:
                         for k, prefix_loss in prefix_losses.items():
