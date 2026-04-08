@@ -16,7 +16,7 @@ num_devices: 8
 data_dir: "/workspace/fineweb-edu/sample/10BT/"
 num_workers: 16
 save_ckpt: true
-save_path: "/workspace/ckpt/qwen0.6b-4k-cpt"
+save_path: "/workspace/ckpt/qwen0.6b-4k-cpt-prefix"
 
 enable_tensorboard: true
 tensorboard_root: "/workspace/tb"
@@ -28,4 +28,4 @@ research_identity_layers_str: "1,3,5,7,9,11,13,15,17,19,21,23,25,27"
 research_separate_parameter: true
 research_breakpoint_schedule_stable: 1000
 research_decode_prefix_tokens: 1
-research_decode_prefix_loss_weight: 10
+research_decode_prefix_loss_weight: 0.05
