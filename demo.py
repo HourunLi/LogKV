@@ -303,29 +303,58 @@ def generate_step_driven_mask(batch_size, seq_len, current_step, total_steps, de
     return prefill_mask
 
 
-def decode_prefix_mean_ce(
+def decode_prefix_mean_ce_multi_k(
     logits: torch.Tensor,
     targets: torch.Tensor,
     prefill_mask: torch.Tensor,
-    k: int,
+    ks: list[int],
     ignore_index: int = -100,
-) -> float | None:
-    """prefill True=Prefill；每条样本 decode 段前 k 个位置的 CE，在 batch 上取平均；无有效位置返回 None。"""
-    if k <= 0:
-        return None
+) -> dict[int, torch.Tensor | None]:
+    """
+    监控 Decode 阶段的上下文休克。
+    支持传入多个 k 值，计算每条样本 decode 段前 k 个位置的平均 CE。
+    
+    Args:
+        ks: 一个包含多个 k 值的列表，例如 [1, 5, 10]
+        
+    Returns:
+        dict: 形如 {1: tensor(11.9), 5: tensor(8.2), 10: tensor(5.4)}
+    """
+    if not ks:
+        return {}
+
     B, T, V = logits.shape
+    
+    # 1. 🌟 算力节约：无论传入多少个 k，全量的 CE 只计算这一次！
     ce = torch.nn.functional.cross_entropy(
         logits.reshape(-1, V),
         targets.reshape(-1),
         ignore_index=ignore_index,
         reduction="none",
     ).view(B, T)
+    
+    # 2. 定位断点，并缓存时间步矩阵和有效 target 矩阵
     bp = prefill_mask.sum(dim=1, keepdim=True)
     t_idx = torch.arange(T, device=logits.device).view(1, -1)
-    m = (t_idx >= bp) & (t_idx < bp + k) & (targets != ignore_index)
-    if not m.any():
-        return None
-    return ce[m].mean()
+    valid_targets_mask = (targets != ignore_index)
+    
+    results = {}
+    
+    # 3. 🌟 极速提取：只遍历纯布尔运算
+    for k in ks:
+        if k <= 0:
+            results[k] = None
+            continue
+            
+        # 组合掩码：≥断点 且 <断点+k 且 不是 Padding
+        m = (t_idx >= bp) & (t_idx < bp + k) & valid_targets_mask
+        
+        if not m.any():
+            results[k] = None
+        else:
+            results[k] = ce[m].mean()
+            
+    return results
 
 
 # ==========================================
@@ -336,6 +365,7 @@ def main(
         arch_name: str = "Qwen/Qwen3-0.6B-Base",
         context_length: int = 4096,
         ckpt_dir: str | None = None,
+        resume_dir: str | None = None,
         # TRAINING
         global_batch_size: int = 32,
         micro_batch_size: int = 4,
@@ -365,7 +395,8 @@ def main(
         research_breakpoint_schedule: str | None = None,
         research_breakpoint_schedule_stable: int = 0,
         research_separate_parameter: bool = True,
-        research_decode_prefix_tokens: int = 8,
+        research_decode_prefix_tokens: int = 1,
+        research_decode_prefix_loss_weight: float = 0,
 ):
 
     # 1. set seeds
@@ -405,9 +436,12 @@ def main(
     checkpoint_dir = f"checkpoints/{arch_name}"
     if ckpt_dir is not None:
         checkpoint_dir = ckpt_dir
-    fabric.print(f"🔄 正在从 {checkpoint_dir} 加载预训练 Checkpoint...")
+    load_dir = checkpoint_dir if resume_dir is None else resume_dir
+    fabric.print(f"🔄 正在从 {load_dir} 加载预训练 Checkpoint...")
     # 1. 先把原版权重字典加载到内存里
-    state_dict = torch.load(f"{checkpoint_dir}/lit_model.pth")
+    state_dict = torch.load(f"{load_dir}/lit_model.pth")
+    if "model" in state_dict:
+        state_dict = state_dict["model"]
     
     # 2. 🌟 核心拦截：Block 级别的映射与克隆
     if config.use_research and config.research_separate_parameter:
@@ -426,7 +460,8 @@ def main(
                 if key.startswith(orig_prefix):
                     # 极其精准的前缀替换
                     new_key = key.replace(orig_prefix, new_prefix, 1)
-                    prefill_weights[new_key] = value
+                    if new_key not in state_dict.keys():
+                        prefill_weights[new_key] = value
 
         # 将克隆出的 prefill 分支权重合并入主字典
         state_dict.update(prefill_weights)
@@ -540,7 +575,7 @@ def main(
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
     optimizer.zero_grad(set_to_none=True) 
     step_start_time = datetime.now()
-    step_stats = MicroStepMeanStats("loss", "compariable_loss")
+    step_stats = MicroStepMeanStats()
     global_step = 0
     total_steps = max_steps
     training_finished = False
@@ -575,15 +610,17 @@ def main(
 
                 # 记录未缩放 loss，用于统计当前 global step 的平均训练损失
                 metrics = {
-                    "loss": loss.detach().item(),
                     "compariable_loss": compariable_decode_loss.detach().item(),
                 }
                 if research_decode_prefix_tokens > 0:
-                    dp = decode_prefix_mean_ce(
-                        logits.detach(), targets, prefill_mask, research_decode_prefix_tokens
-                    )
-                    if dp is not None:
-                        metrics["decode_prefix_loss"] = dp.detach().item()
+                    ks = [research_decode_prefix_tokens, 8, 16]
+                    prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=ks)
+                    if len(prefix_losses) > 0:
+                        for k, prefix_loss in prefix_losses.items():
+                            metrics[f"prefix_loss_{k}"] = prefix_loss.detach().item()
+                        if use_research:
+                            loss += (prefix_losses[research_decode_prefix_tokens] * research_decode_prefix_loss_weight)
+                metrics['loss'] = loss.detach().item()
                 step_stats.accumulate(**metrics)
 
                 loss = loss / gradient_accumulation_steps
@@ -607,9 +644,9 @@ def main(
                     metrics_txt = metrics_txt + " | "
                 fabric.print(
                     f"[{now.strftime('%H:%M:%S')}] "
-                    f"Epoch {epoch+1} | Global Step {global_step + 1} | "
+                    f"Epoch {epoch+1} | Step {global_step + 1} | "
                     f"{metrics_txt}"
-                    f"Step Time: {step_time:.2f}s"
+                    f"Time: {step_time:.2f}s"
                 )
                 for name, val in avgs.items():
                     fabric.log(f"train/{name}", val, step=global_step + 1)
