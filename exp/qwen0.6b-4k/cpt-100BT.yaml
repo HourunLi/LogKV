@@ -16,10 +16,10 @@ num_devices: 8
 data_dir: "/workspace/fineweb-edu/sample/100BT"
 num_workers: 0
 save_ckpt: false
-save_path: "/workspace/ckpt/qwen0.6b-100BT-4k-cpt"
+save_path: "/workspace/${MY_REAL_NAME-default}/ckpt/qwen0.6b-100BT-4k-cpt"
 
 enable_tensorboard: true
-tensorboard_root: "/workspace/tb"
+tensorboard_root: "/workspace/${MY_REAL_NAME-default}/tb"
 
 use_research: true
 research_swa_size: 512

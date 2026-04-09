@@ -62,7 +62,8 @@ echo "🔍 正在从 $CONFIG_FILE 中提取配置..."
 
 # 🌟 核心魔法：使用 Python 一行流提取 yaml 里的 save_path
 # 假设你的 yaml 里写的键名叫 save_path。如果是其他的，把下面单引号里的名字改掉
-SAVE_DIR=$(python -c "import yaml; print(yaml.safe_load(open('${CONFIG_FILE}'))['save_path'])")
+RAW_SAVE_DIR=$(python -c "import yaml; print(yaml.safe_load(open('${CONFIG_FILE}'))['save_path'])")
+eval SAVE_DIR="\"${RAW_SAVE_DIR}\""
 
 # 安全检查：如果没提取到，立刻报错退出
 if [ -z "$SAVE_DIR" ] || [ "$SAVE_DIR" == "None" ]; then
