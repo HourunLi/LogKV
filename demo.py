@@ -97,76 +97,6 @@ class CPTBinDataset(torch.utils.data.Dataset):
         # 返回 inputs 和 targets
         return chunk_tensor[:-1], chunk_tensor[1:]
 
-# def prepare_data(dataset_dir, dataset_name, model_dir, data_dir=None):
-#     print("⏳ 正在检查和准备数据...")
-#     os.makedirs(dataset_dir, exist_ok=True)
-    
-#     # ==========================================
-#     # 🌟 核心升级：为当前模型创建专属的 .bin 缓存目录
-#     # 如果 model_dir 是 "checkpoints/Qwen/Qwen3-0.6B-Base"
-#     # model_name 就会是 "Qwen3-0.6B-Base"
-#     # ==========================================
-#     model_name = os.path.basename(os.path.normpath(model_dir))
-#     bin_cache_dir = os.path.join(data_dir, f"bins_{model_name}")
-#     os.makedirs(bin_cache_dir, exist_ok=True)
-    
-#     bin_paths = []
-#     parquet_files = []
-
-#     # 1. 获取 Parquet 列表 (逻辑保持不变)
-#     if data_dir and os.path.isdir(data_dir):
-#         print(f"📂 检测到本地数据集目录: {data_dir}")
-#         parquet_files = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
-#         if not parquet_files:
-#             raise FileNotFoundError(f"❌ 在 {data_dir} 下没有找到任何 .parquet 文件！")
-#     else:
-#         single_parquet = os.path.join(dataset_dir, f"{dataset_name}.parquet")
-#         if not os.path.exists(single_parquet):
-#             if dataset_name == 'debug':
-#                 print("🌐 正在拉取完全开源的 FineWeb-Edu...")
-#                 eng_stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-#                 eng_list = list(eng_stream.take(10000))
-#                 mixed_dataset = Dataset.from_list(eng_list)
-#                 mixed_dataset = mixed_dataset.select_columns(["text"])
-#                 mixed_dataset.to_parquet(single_parquet)
-#             else:
-#                 raise NotImplementedError(f"数据集 {dataset_name} 尚未实现")
-#         parquet_files = [single_parquet]
-#         bin_cache_dir = os.path.join(dataset_dir, f"bins_{model_name}")
-
-#     # 2. Tokenize 并写入专属目录
-#     tokenizer = Tokenizer(model_dir)
-
-#     for pq_file in parquet_files:
-#         base_name = os.path.basename(pq_file).replace(".parquet", "")
-        
-#         # 🌟 修改点：把 bin 文件存进该模型专属的 bin_cache_dir 里！
-#         bin_file = os.path.join(bin_cache_dir, f"{base_name}.bin")
-#         bin_paths.append(bin_file)
-
-#         # 已经在这套 Tokenizer 下编译过，完美跳过！
-#         if os.path.exists(bin_file):
-#             print(f"🚀 命中专属缓存: 已发现 {model_name} 的就绪文件 {bin_file}")
-#             continue
-
-#         print(f"\n⚙️ 正在使用 {model_name} 的词表编译: {base_name}.parquet -> .bin")
-#         parquet_file = pq.ParquetFile(pq_file)
-        
-#         total_tokens = 0
-#         with open(bin_file, "wb") as f:
-#             for batch in tqdm(parquet_file.iter_batches(batch_size=8192, columns=["text"]), desc=f"Tokenizing {base_name}"):
-#                 batch_tokens = []
-#                 for text in batch.to_pandas()["text"]:
-#                     tokens = tokenizer.encode(text, bos=False, eos=True).tolist()
-#                     batch_tokens.extend(tokens)
-                
-#                 arr = np.array(batch_tokens, dtype=np.int32)
-#                 f.write(arr.tobytes())
-#                 total_tokens += len(arr)
-
-#     return bin_paths
-
-
 def prepare_data(dataset_dir, dataset_name, model_dir, data_dir=None, rank=0, local_rank=0, world_size=1):
     print(f"[Rank {rank}] ⏳ 正在检查和准备数据...")
     os.makedirs(dataset_dir, exist_ok=True)
@@ -324,7 +254,6 @@ def decode_prefix_mean_ce_multi_k(
         return {}
 
     B, T, V = logits.shape
-    
     # 1. 🌟 算力节约：无论传入多少个 k，全量的 CE 只计算这一次！
     ce = torch.nn.functional.cross_entropy(
         logits.reshape(-1, V),
@@ -339,21 +268,17 @@ def decode_prefix_mean_ce_multi_k(
     valid_targets_mask = (targets != ignore_index)
     
     results = {}
-    
     # 3. 🌟 极速提取：只遍历纯布尔运算
     for k in ks:
         if k <= 0:
             results[k] = None
             continue
-            
         # 组合掩码：≥断点 且 <断点+k 且 不是 Padding
         m = (t_idx >= bp) & (t_idx < bp + k) & valid_targets_mask
-        
         if not m.any():
             results[k] = None
         else:
             results[k] = ce[m].mean()
-            
     return results
 
 
@@ -537,28 +462,6 @@ def main(
         raise RuntimeError(f"[Rank {fabric.global_rank}] 这些 bin 文件不存在: {missing_bins}")
 
     print(f"[Rank {fabric.global_rank}] 数据预编译完成，共 {len(bin_data_paths)} 个 bin 文件")
-
-    # # 1. 只让老大 (Rank 0) 去干苦力编译
-    # if fabric.global_rank == 0:
-    #     fabric.print("👑 [Rank 0] 正在独占执行数据预编译，其他进程请等待...")
-    #     bin_data_paths = prepare_data(
-    #         data_dir=data_dir, 
-    #         dataset_dir=dataset_dir,
-    #         dataset_name=dataset_name, 
-    #         model_dir=checkpoint_dir, 
-    #     )
-    # # 2. 绝对屏障 (Barrier)：所有走到这里的显卡，必须停下脚步等 Rank 0！
-    # fabric.barrier()
-
-    # # 3. 🌟 核心修复点：拿取劳动成果 (所有人一起拿)
-    # # 因为 Rank 0 刚才已经把文件写进硬盘了
-    # # 现在所有人调用这个函数，都会瞬间打印 "命中专属缓存" 并返回路径列表！
-    # bin_data_paths = prepare_data(
-    #     data_dir=data_dir, 
-    #     dataset_dir=dataset_dir,
-    #     dataset_name=dataset_name, 
-    #     model_dir=checkpoint_dir, 
-    # )
 
     datasets = [CPTBinDataset(bin_path=bp, seq_len=context_length) for bp in bin_data_paths]
     dataset = ConcatDataset(datasets)
