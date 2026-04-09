@@ -1,5 +1,6 @@
 config: base.yaml
 
+# 尝试使用不均匀分布的SWA
 expid: cpt-altswa
 
 ckpt_dir: /workspace/checkpoints/Qwen/Qwen3-0.6B-Base/
