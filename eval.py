@@ -30,7 +30,7 @@ from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
 
 class CustomResearchLM(LM):
-    def __init__(self, checkpoint_dir: str, device="cuda", use_research: bool = True):
+    def __init__(self, checkpoint_dir: str, device="cuda", use_research: bool = True, map_branch=False):
         super().__init__()
         self._device = device
         self.checkpoint_dir = checkpoint_dir
@@ -87,6 +87,29 @@ class CustomResearchLM(LM):
         else:
             state_dict = checkpoint
         
+        if map_branch and self.config.use_research and self.config.research_separate_parameter:
+            print("🔀 检测到 Block 级参数独立！正在为 h_prefill 组装预训练权重...")
+            prefill_weights = {}
+
+            # 遍历配置中的 SWA 层列表
+            # i 是在 h_prefill ModuleList 中的物理索引 (0, 1, 2...)
+            # block_idx 是在原版 h 中的逻辑层号 (0, 2, 4...)
+            for i, block_idx in enumerate(self.config.research_prefill_swa_layers):
+                orig_prefix = f"transformer.h.{block_idx}."
+                new_prefix = f"transformer.h_prefill.{i}."
+
+                # 遍历寻找属于原版 block_idx 的所有权重，并改名挂载到 h_prefill 下
+                for key, value in state_dict.items():
+                    if key.startswith(orig_prefix):
+                        # 极其精准的前缀替换
+                        new_key = key.replace(orig_prefix, new_prefix, 1)
+                        if new_key not in state_dict.keys():
+                            prefill_weights[new_key] = value
+
+            # 将克隆出的 prefill 分支权重合并入主字典
+            state_dict.update(prefill_weights)
+            print(f"✅ 成功映射并注入了 {len(prefill_weights)} 个 Block 级别的张量！")
+            
         # 🌟 强烈建议：捕获并打印一下加载结果，看看是不是真的加载成功了！
         load_result = self.model.load_state_dict(state_dict, strict=False) 
         
@@ -240,6 +263,7 @@ class CustomResearchLM(LM):
 def main(
     checkpoint_dir: str = "checkpoints/Qwen/Qwen3-0.6B-Base",
     benchmark: str = "debug",  
+    map_branch: bool = False,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -253,7 +277,7 @@ def main(
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
         
-    lm_model = CustomResearchLM(checkpoint_dir, device=device)
+    lm_model = CustomResearchLM(checkpoint_dir, device=device, map_branch=map_branch)
     
     results = evaluator.simple_evaluate(
         model=lm_model,
