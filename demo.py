@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import glob
 # os.environ['https_proxy'] = '127.0.0.1:7897'
@@ -27,6 +28,35 @@ from datetime import timedelta
 
 torch.set_float32_matmul_precision('high')
 
+
+def env_var_constructor(loader, node):
+    value = loader.construct_scalar(node)
+    pattern = re.compile(r'\$\{([^}^{]+)\}')
+    
+    def replace_fn(match):
+        inner = match.group(1)
+        if ':-' in inner:
+            var_name, default_val = inner.split(':-', 1)
+        elif '-' in inner:
+            var_name, default_val = inner.split('-', 1)
+        else:
+            var_name, default_val = inner, ""
+        return os.environ.get(var_name, default_val)
+
+    return pattern.sub(replace_fn, value)
+
+# 强制绑定到 SafeLoader
+yaml.SafeLoader.add_implicit_resolver('!env_var', re.compile(r'.*\$\{([^}^{]+)\}.*'), None)
+yaml.SafeLoader.add_constructor('!env_var', env_var_constructor)
+
+# （如果你机器上安装了 ruamel.yaml，jsonargparse 可能会优先用它。
+#   为了绝对的安全，我们顺手把 ruamel.yaml 也安排上）
+try:
+    from ruamel.yaml import SafeConstructor  # pyright: ignore[reportMissingImports]
+    SafeConstructor.add_implicit_resolver('!env_var', re.compile(r'.*\$\{([^}^{]+)\}.*'), None)
+    SafeConstructor.add_constructor('!env_var', env_var_constructor)
+except ImportError:
+    pass
 
 class MicroStepMeanStats:
     """
