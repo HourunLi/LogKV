@@ -372,6 +372,7 @@ def main(
         loggers=loggers
     )
     fabric.launch()
+    fabric.print("Tensorboard root:", tensorboard_root)
 
     config = Config.from_name(arch_name) 
     assert config is not None
