@@ -25,75 +25,9 @@ from lightning.fabric.loggers import TensorBoardLogger
 import math
 from lightning.fabric.strategies import DDPStrategy
 from datetime import timedelta
+from utils import *
 
 torch.set_float32_matmul_precision('high')
-
-
-def env_var_constructor(loader, node):
-    value = loader.construct_scalar(node)
-    pattern = re.compile(r'\$\{([^}^{]+)\}')
-    
-    def replace_fn(match):
-        inner = match.group(1)
-        if ':-' in inner:
-            var_name, default_val = inner.split(':-', 1)
-        elif '-' in inner:
-            var_name, default_val = inner.split('-', 1)
-        else:
-            var_name, default_val = inner, ""
-        return os.environ.get(var_name, default_val)
-
-    return pattern.sub(replace_fn, value)
-
-# 强制绑定到 SafeLoader
-yaml.SafeLoader.add_implicit_resolver('!env_var', re.compile(r'.*\$\{([^}^{]+)\}.*'), None)
-yaml.SafeLoader.add_constructor('!env_var', env_var_constructor)
-
-# （如果你机器上安装了 ruamel.yaml，jsonargparse 可能会优先用它。
-#   为了绝对的安全，我们顺手把 ruamel.yaml 也安排上）
-try:
-    from ruamel.yaml import SafeConstructor  # pyright: ignore[reportMissingImports]
-    SafeConstructor.add_implicit_resolver('!env_var', re.compile(r'.*\$\{([^}^{]+)\}.*'), None)
-    SafeConstructor.add_constructor('!env_var', env_var_constructor)
-except ImportError:
-    pass
-
-class MicroStepMeanStats:
-    """
-    同一 global step 内按 micro batch 累加；每个指标各自维护 sum / count。
-    accumulate 里没传的指标本步不更新；averages() 只返回本 step 内至少收到过一次样本的指标。
-    构造时的名字仅用于预置键（reset 后会清空，之后仍可在 accumulate 里动态出现新键名）。
-    """
-
-    def __init__(self, *metric_names: str) -> None:
-        self._sums: dict[str, float] = {}
-        self._counts: dict[str, int] = {}
-        for k in metric_names:
-            self._sums[k] = 0.0
-            self._counts[k] = 0
-
-    def accumulate(self, **values: float) -> None:
-        for k, v in values.items():
-            if k not in self._sums:
-                self._sums[k] = 0.0
-                self._counts[k] = 0
-            self._sums[k] += float(v)
-            self._counts[k] += 1
-
-    def averages(self) -> dict[str, float]:
-        return {k: self._sums[k] / self._counts[k] for k in self._sums if self._counts[k] > 0}
-
-    def reset(self) -> None:
-        self._sums.clear()
-        self._counts.clear()
-
-
-# set random seeds
-def set_random_seeds(seed):
-    torch.manual_seed(seed)
-    random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 # ==========================================
 # 🚀 满血形态：基于 Memmap 的二进制数据集
@@ -315,6 +249,7 @@ def decode_prefix_mean_ce_multi_k(
 # ==========================================
 # CPT 主训练循环
 # ==========================================
+@auto_expand_env_vars
 def main(
         # MODEL
         arch_name: str = "Qwen/Qwen3-0.6B-Base",
@@ -352,6 +287,7 @@ def main(
         research_separate_parameter: bool = True,
         research_decode_prefix_tokens: int = 1,
         research_decode_prefix_loss_weight: float = 0,
+        research_prefill_supervise: bool = False,
 ):
 
     # 1. set seeds
@@ -537,7 +473,7 @@ def main(
                 # 假设你的 prefill_mask 中：True 表示 Prefill，False 表示 Decode
                 masked_targets = targets.masked_fill(prefill_mask == True, -100)
                 compariable_decode_loss = chunked_cross_entropy(logits, masked_targets, chunk_size=0)
-                if use_research:
+                if use_research and not research_prefill_supervise:
                     loss = compariable_decode_loss
                 else:
                     loss = chunked_cross_entropy(logits, targets, chunk_size=0)
@@ -557,6 +493,7 @@ def main(
                         if use_research:
                             loss += (prefix_losses[research_decode_prefix_tokens] * research_decode_prefix_loss_weight)
                 metrics['loss'] = loss.detach().item()
+                metrics['prefill_ratio'] = (prefill_mask.sum() / prefill_mask.numel()).item()
                 step_stats.accumulate(**metrics)
 
                 loss = loss / gradient_accumulation_steps

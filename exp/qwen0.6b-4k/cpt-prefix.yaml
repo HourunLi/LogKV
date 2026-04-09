@@ -13,13 +13,13 @@ min_lr: 5e-5
 weight_decay: 0.1
 num_devices: 8
 
-data_dir: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/fineweb-edu/sample/10BT/"
+data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/fineweb-edu/sample/10BT/
 num_workers: 16
 save_ckpt: true
-save_path: "/home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt/qwen0.6b-4k-cpt-prefix-0.5"
+save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt/qwen0.6b-4k-cpt-prefix-0.5
 
 enable_tensorboard: true
-tensorboard_root: "/home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb"
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb
 
 use_research: true
 research_swa_size: 1024

@@ -2,4 +2,4 @@ config: cpt.yaml
 
 expid: base
 use_research: false
-save_path: "/home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt/qwen0.6b-4k-cpt-base"
+save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt/qwen0.6b-4k-cpt-base
