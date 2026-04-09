@@ -1,5 +1,6 @@
 config: cpt-prefix.yaml
 
+# 尝试用更多数据（80B）训练，采用first token loss，weight 0.05
 expid: cpt-prefix-100BT
 max_steps: 20000
 research_breakpoint_schedule_stable: 19000

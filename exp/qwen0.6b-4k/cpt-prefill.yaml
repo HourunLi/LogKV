@@ -1,5 +1,6 @@
 config: base.yaml
 
+# 尝试用NTP监督prefill阶段，因为prefill的hidden发生了显著偏移而且decode的前几个token的loss很高
 expid: cpt-prefill
 
 ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-0.6B-Base/
