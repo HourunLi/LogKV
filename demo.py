@@ -12,14 +12,9 @@ from datetime import datetime
 from torch.utils.data import DataLoader, IterableDataset, ConcatDataset
 from litgpt import Config
 from litgpt.model import GPT
-from litgpt.tokenizer import Tokenizer
 from litgpt.utils import chunked_cross_entropy
 from jsonargparse import CLI
-from datasets import load_dataset, concatenate_datasets, Dataset
-import pyarrow.parquet as pq
 import random
-from litgpt.tokenizer import Tokenizer
-from tqdm import tqdm
 import numpy as np
 from lightning.fabric.loggers import TensorBoardLogger
 import math
@@ -60,91 +55,6 @@ class CPTBinDataset(torch.utils.data.Dataset):
         
         # 返回 inputs 和 targets
         return chunk_tensor[:-1], chunk_tensor[1:]
-
-def prepare_data(dataset_dir, dataset_name, model_dir, data_dir=None, rank=0, local_rank=0, world_size=1):
-    print(f"[Rank {rank}] ⏳ 正在检查和准备数据...")
-    os.makedirs(dataset_dir, exist_ok=True)
-
-    model_name = os.path.basename(os.path.normpath(model_dir))
-    bin_cache_dir = os.path.join(data_dir, f"bins_{model_name}") if data_dir else os.path.join(dataset_dir, f"bins_{model_name}")
-    os.makedirs(bin_cache_dir, exist_ok=True)
-
-    bin_paths = []
-    parquet_files = []
-
-    # 1. 找 parquet 文件
-    if data_dir and os.path.isdir(data_dir):
-        print(f"[Rank {rank}] 📂 检测到本地数据集目录: {data_dir}")
-        parquet_files = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
-        if not parquet_files:
-            raise FileNotFoundError(f"❌ 在 {data_dir} 下没有找到任何 .parquet 文件！")
-    else:
-        single_parquet = os.path.join(dataset_dir, f"{dataset_name}.parquet")
-        if not os.path.exists(single_parquet):
-            if dataset_name == "debug":
-                print(f"[Rank {rank}] 🌐 正在拉取 FineWeb-Edu...")
-                eng_stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-100BT", split="train", streaming=True)
-                eng_list = list(eng_stream.take(10000))
-                mixed_dataset = Dataset.from_list(eng_list).select_columns(["text"])
-                mixed_dataset.to_parquet(single_parquet)
-            else:
-                raise NotImplementedError(f"数据集 {dataset_name} 尚未实现")
-        parquet_files = [single_parquet]
-
-    # 2. 先把所有目标 bin 路径算出来，所有 rank 都返回同样的 bin_paths
-    compile_jobs = []
-    for file_idx, pq_file in enumerate(parquet_files):
-        rel_path = os.path.relpath(pq_file, data_dir)
-        base_name = rel_path.replace(os.sep, "__").replace(".parquet", "")
-        bin_file = os.path.join(bin_cache_dir, f"{base_name}.bin")
-        bin_paths.append(bin_file)
-
-        if os.path.exists(bin_file):
-            continue
-
-        if file_idx % world_size == rank:
-            compile_jobs.append((pq_file, bin_file, base_name))
-
-    # 3. 当前 rank 只编译自己那部分
-    if compile_jobs:
-        tokenizer = Tokenizer(model_dir)
-
-
-    for pq_file, bin_file, base_name in compile_jobs:
-        parquet_file = pq.ParquetFile(pq_file)
-        tmp_bin_file = f"{bin_file}.rank{rank}.tmp"
-        # if os.path.exists(tmp_bin_file):
-        #     os.replace(tmp_bin_file, bin_file)
-        #     continue
-
-        total_batches = parquet_file.metadata.num_rows // 8192
-        if parquet_file.metadata.num_rows % 8192 != 0:
-            total_batches += 1
-
-        with open(tmp_bin_file, "wb") as f:
-            pbar = tqdm(
-                parquet_file.iter_batches(batch_size=8192, columns=["text"]),
-                total=total_batches,
-                desc=f"[Rank {rank}] {base_name}",
-                position=local_rank,
-                leave=True,
-                dynamic_ncols=True,
-                mininterval=0.5,
-            )
-
-            for batch in pbar:
-                batch_tokens = []
-                for text in batch.to_pandas()["text"]:
-                    tokens = tokenizer.encode(text, bos=False, eos=True).tolist()
-                    batch_tokens.extend(tokens)
-
-                arr = np.array(batch_tokens, dtype=np.int32)
-                f.write(arr.tobytes())
-
-        os.replace(tmp_bin_file, bin_file)
-
-    return bin_paths
-
 
 def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     """
@@ -288,6 +198,8 @@ def main(
         research_decode_prefix_tokens: int = 1,
         research_decode_prefix_loss_weight: float = 0,
         research_prefill_supervise: bool = False,
+        research_remove_order_str: str = "",
+        research_remove_interval: int = 0,
 ):
 
     # 1. set seeds
@@ -302,7 +214,8 @@ def main(
         devices=num_devices, 
         num_nodes=int(os.environ.get("GROUP_WORLD_SIZE", 1)), # 兼容单机和多机
         strategy=DDPStrategy(
-            timeout=timedelta(days=3650)   # 例如 10 年，基本等价于“无限等”
+            timeout=timedelta(days=3650),
+            find_unused_parameters=True     # 支持动态移除层，某些参数可能不参与前向传播
         ),  
         precision="bf16-true", 
         loggers=loggers
@@ -310,16 +223,17 @@ def main(
     fabric.launch()
     fabric.print("Tensorboard root:", tensorboard_root)
 
+    swa_layers = [int(x.strip()) for x in research_swa_layers_str.split(",")] if research_swa_layers_str else []
+    research_remove_order = [int(x.strip()) for x in research_remove_order_str.split(",")] if research_remove_order_str else []
+
     config = Config.from_name(arch_name) 
     assert config is not None
     config.block_size = context_length
     config.use_research = use_research
     config.research_swa_size = research_swa_size
-    swa_layers = [int(x.strip()) for x in research_swa_layers_str.split(",")] if research_swa_layers_str else []
-    identity_layers = [int(x.strip()) for x in research_identity_layers_str.split(",")] if research_identity_layers_str else []
     config.research_prefill_swa_layers = swa_layers
-    config.research_prefill_identity_layers = identity_layers
     config.research_separate_parameter = research_separate_parameter
+    config.research_removed_layers = []
     fabric.print(f"⚙️ 模型 Config 初始化完成: {config.name}")
 
     with fabric.init_module(empty_init=True):
@@ -457,7 +371,7 @@ def main(
             prefill_mask = generate_step_driven_mask(
                 batch_size=inputs.size(0), 
                 seq_len=inputs.size(1), 
-                current_step=global_step, 
+                current_step=global_step + 1, 
                 total_steps=total_steps, 
                 device=fabric.device,
                 schedule=research_breakpoint_schedule,
@@ -524,13 +438,21 @@ def main(
                 for name, val in avgs.items():
                     fabric.log(f"train/{name}", val, step=global_step + 1)
                 fabric.log("train/learning_rate", current_lr, step=global_step + 1)
+
                 step_stats.reset()
                 global_step += 1
                 if global_step >= max_steps:
                     fabric.print(f"🚨 已达到最大训练步数 {max_steps}，提前结束训练！")
                     training_finished = True
                     break
-        
+                
+                if research_remove_interval > 0 and global_step % research_remove_interval == 0:
+                    remove_index = global_step // research_remove_interval
+                    if remove_index <= len(research_remove_order):
+                        remove_index = research_remove_order[remove_index - 1]
+                        config.research_removed_layers.append(remove_index)
+                        fabric.print(f"🔥 已移除层 {remove_index}，当前所有已移除层为 {config.research_removed_layers}")
+                
         if training_finished:
             break
 
