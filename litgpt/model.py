@@ -185,7 +185,7 @@ class GPT(nn.Module):
                 else:
                     cos_, sin_ = cos, sin
                 # prefill
-                if block_idx in self.config.research_prefill_swa_layers:
+                if block_idx in self.config.research_prefill_swa_layers and block_idx not in self.config.research_removed_layers:
                     if self.config.research_separate_parameter:
                         block_prefill: Block = self.transformer.h_prefill[block_index_to_idx[block_idx]]
                     else:
