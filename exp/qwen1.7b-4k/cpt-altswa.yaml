@@ -3,10 +3,10 @@ config: base.yaml
 # 尝试使用不均匀分布的SWA
 expid: cpt-altswa
 
-ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-0.6B-Base/
+ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
 
 global_batch_size: 1024
-micro_batch_size: 2
+micro_batch_size: 1
 max_steps: 2000
 warmup_steps: 0
 learning_rate: 5e-5
@@ -19,7 +19,7 @@ num_workers: 16
 save_ckpt: true
 save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt/qwen0.6b-4k-cpt-altswa
 
-enable_tensorboard: true
+enable_tensorboard: false
 tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb
 
 use_research: true
