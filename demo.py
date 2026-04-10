@@ -20,6 +20,7 @@ from lightning.fabric.loggers import TensorBoardLogger
 import math
 from lightning.fabric.strategies import DDPStrategy
 from datetime import timedelta
+from contextlib import nullcontext
 from utils import *
 
 torch.set_float32_matmul_precision('high')
@@ -218,7 +219,7 @@ def main(
         num_nodes=int(os.environ.get("GROUP_WORLD_SIZE", 1)), # 兼容单机和多机
         strategy=DDPStrategy(
             timeout=timedelta(days=3650),
-            find_unused_parameters=True     # 支持动态移除层，某些参数可能不参与前向传播
+            find_unused_parameters=True if len(research_remove_order_str) > 0 else False
         ),  
         precision="bf16-true", 
         loggers=loggers
@@ -403,11 +404,14 @@ def main(
                     ks = [research_decode_prefix_tokens, 8, 16]
                     if 1 not in ks:
                         ks.insert(0, 1)
-                    prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=ks)
+                    # 如果 weight 为 0，只需要观察指标而不需要梯度，使用 no_grad 加速
+                    grad_ctx = torch.no_grad() if research_decode_prefix_loss_weight == 0 else nullcontext()
+                    with grad_ctx:
+                        prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=ks)
                     if len(prefix_losses) > 0:
                         for k, prefix_loss in prefix_losses.items():
                             metrics[f"prefix_loss_{k}"] = prefix_loss.detach().item()
-                        if use_research:
+                        if use_research and research_decode_prefix_loss_weight > 0:
                             loss += (prefix_losses[research_decode_prefix_tokens] * research_decode_prefix_loss_weight)
                 metrics['loss'] = loss.detach().item()
                 metrics['prefill_ratio'] = (prefill_mask.sum() / prefill_mask.numel()).item()
