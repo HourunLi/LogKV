@@ -29,4 +29,4 @@ research_separate_parameter: true
 research_breakpoint_schedule_stable: -1
 
 research_remove_order_str: "15,13,17,11,19,9,21,7,23,5"
-research_remove_interval: 20
+research_remove_interval: 100
