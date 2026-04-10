@@ -87,7 +87,10 @@ def generate_step_driven_mask(batch_size, seq_len, current_step, total_steps, de
     基于当前训练 Iter 的动态断点生成器
     一条序列只有一个断点。断点之前为 True (Prefill)，断点之后为 False (Decode)
     """
-    progress = min(current_step / max(1, total_steps - stable), 1)
+    if stable == -1:
+        progress = 1
+    else:
+        progress = min(current_step / max(1, total_steps - stable), 1)
     
     # 动态计算当前的上下界
     min_prefill_ratio = 0.01 + progress * 0.1
