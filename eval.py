@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 import os
+
 import yaml
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import numpy as np
-from pathlib import Path
+from typing import Any
+
 from jsonargparse import CLI
 import tqdm
 
@@ -29,8 +33,44 @@ from lm_eval import evaluator
 from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
 
+
+def _parse_csv_ints(s: str) -> list[int]:
+    return [int(x.strip()) for x in str(s).split(",") if x.strip()]
+
+
+def _normalize_training_config_dict(d: dict[str, Any]) -> tuple[dict[str, Any], list[int] | None]:
+    """训练 exp / CLI 里常用 research_*_layers_str；Config 只接受 research_prefill_swa_layers 等。"""
+    out = dict(d)
+    identity_layers: list[int] | None = None
+    if "research_identity_layers_str" in out:
+        identity_layers = _parse_csv_ints(out.pop("research_identity_layers_str"))
+    if "research_swa_layers_str" in out:
+        out["research_prefill_swa_layers"] = _parse_csv_ints(out.pop("research_swa_layers_str"))
+    return out, identity_layers
+
+
+def _config_from_yaml_and_overrides(config_path: str, overrides: dict[str, Any] | None) -> Config:
+    with open(config_path, encoding="utf-8") as f:
+        base = yaml.safe_load(f)
+    if base is None:
+        raise ValueError(f"{config_path} is empty or invalid YAML.")
+    merged = {**base, **(overrides or {})}
+    merged, identity_layers = _normalize_training_config_dict(merged)
+    cfg = Config(**merged)
+    if identity_layers is not None:
+        cfg.research_prefill_identity_layers = identity_layers
+    return cfg
+
+
 class CustomResearchLM(LM):
-    def __init__(self, checkpoint_dir: str, device="cuda", use_research: bool = True, map_branch=False):
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        device="cuda",
+        use_research: bool = True,
+        map_branch=False,
+        config_overrides: dict[str, Any] | None = None,
+    ):
         super().__init__()
         self._device = device
         self.checkpoint_dir = checkpoint_dir
@@ -47,12 +87,8 @@ class CustomResearchLM(LM):
         
         if os.path.exists(config_path):
             if is_master: print(f"📄 发现专属架构 YAML 配置文件: {config_path}，正在自动同步架构...")
-            with open(config_path, "r", encoding="utf-8") as f:
-                # 使用 safe_load 是读取 yaml 的最佳安全实践
-                config_dict = yaml.safe_load(f)
-            
-            # 🌟 核心：直接用字典解包重建 Config
-            self.config = Config(**config_dict)
+            # 合并 YAML + overrides，并把 research_*_layers_str 转成 Config 合法字段
+            self.config = _config_from_yaml_and_overrides(config_path, config_overrides)
             
             # 确保对象的开关属性被正确覆盖
             self.use_research = getattr(self.config, 'use_research', False)
@@ -62,15 +98,19 @@ class CustomResearchLM(LM):
         else:
             if is_master: print("⚠️ 未发现训练期保存的 YAML 配置文件，正在使用备用参数初始化...")
             self.use_research = use_research
-            self.config = Config.from_name(
+            fallback_kw: dict[str, Any] = dict(
                 name=checkpoint_dir.split("/")[-1],
                 use_research=use_research,
                 research_separate_parameter=True if use_research else False,
                 research_swa_layers_str="0,2,4,6,8,10,12,14,16,18,20,22,24,26",
-                research_identity_layers_str="1,3,5,7,9,11,13,15,17,19,21,23,25,27"
+                research_identity_layers_str="1,3,5,7,9,11,13,15,17,19,21,23,25,27",
             )
-            self.config.research_prefill_swa_layers = [int(x) for x in self.config.research_swa_layers_str.split(",")]
-            self.config.research_prefill_identity_layers = [int(x) for x in self.config.research_identity_layers_str.split(",")]
+            if config_overrides:
+                fallback_kw.update(config_overrides)
+            fallback_kw, identity_layers = _normalize_training_config_dict(fallback_kw)
+            self.config = Config.from_name(**fallback_kw)
+            if identity_layers is not None:
+                self.config.research_prefill_identity_layers = identity_layers
 
         # ==========================================
         
@@ -262,8 +302,9 @@ class CustomResearchLM(LM):
 
 def main(
     checkpoint_dir: str = "checkpoints/Qwen/Qwen3-0.6B-Base",
-    benchmark: str = "debug",  
+    benchmark: str = "debug",
     map_branch: bool = False,
+    config_overrides: dict[str, Any] | None = None,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -276,8 +317,13 @@ def main(
     
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
-        
-    lm_model = CustomResearchLM(checkpoint_dir, device=device, map_branch=map_branch)
+
+    lm_model = CustomResearchLM(
+        checkpoint_dir,
+        device=device,
+        map_branch=map_branch,
+        config_overrides=config_overrides,
+    )
     
     results = evaluator.simple_evaluate(
         model=lm_model,
