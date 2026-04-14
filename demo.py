@@ -207,6 +207,7 @@ def main(
         # EVAL
         run_eval: str = "",  # "before" | "after" | "both"
         eval_benchmark: str = "debug",
+        eval_map_branch: bool = False,
 ):
 
     # 1. set seeds
@@ -325,7 +326,7 @@ def main(
 
     def _run_eval(ckpt):
         from eval import main as eval_main
-        eval_main(checkpoint_dir=ckpt, benchmark=eval_benchmark, config_overrides=asdict(config))
+        eval_main(checkpoint_dir=ckpt, benchmark=eval_benchmark, map_branch=eval_map_branch, config_overrides=asdict(config))
 
     if run_eval in ("before", "both"):
         _run_eval(load_dir)
