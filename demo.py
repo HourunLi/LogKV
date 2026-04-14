@@ -204,6 +204,9 @@ def main(
         research_prefill_supervise: bool = False,
         research_remove_order_str: str = "",
         research_remove_interval: int = 0,
+        # EVAL
+        run_eval: str = "",  # "before" | "after" | "both"
+        eval_benchmark: str = "debug",
 ):
 
     # 1. set seeds
@@ -319,6 +322,13 @@ def main(
         eps=1e-8
     )
     model, optimizer = fabric.setup(model, optimizer)
+
+    def _run_eval(ckpt):
+        from eval import main as eval_main
+        eval_main(checkpoint_dir=ckpt, benchmark=eval_benchmark, config_overrides=asdict(config))
+
+    if run_eval in ("before", "both"):
+        _run_eval(load_dir)
 
     # 🌟 3. 初始化新的流式 Parquet 数据集
     # tokenizer = Tokenizer(checkpoint_dir)
@@ -485,6 +495,9 @@ def main(
             
         fabric.print(f"📦 Tokenizer 和 Config 已自动同步至 {save_path}")
     
+    if run_eval in ("after", "both"):
+        _run_eval(save_path)
+
     fabric.print("🎉 训练运行结束！")
 
 if __name__ == "__main__":
