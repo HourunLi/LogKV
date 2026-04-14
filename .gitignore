@@ -29,3 +29,4 @@ client.py
 ckpt/
 eval_results/
 tb/
+local.yaml
