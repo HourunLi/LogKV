@@ -26,6 +26,8 @@ if 'HF_DATASETS_CACHE' not in os.environ:
     # urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     # ssl._create_default_https_context = ssl._create_unverified_context
 
+import dataclasses
+
 from litgpt.config import Config
 from litgpt.model import GPT
 from litgpt.tokenizer import Tokenizer
@@ -33,9 +35,18 @@ from lm_eval import evaluator
 from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
 
+_CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
+
 
 def _parse_csv_ints(s: str) -> list[int]:
     return [int(x.strip()) for x in str(s).split(",") if x.strip()]
+
+
+def _filter_config_dict(d: dict[str, Any]) -> dict[str, Any]:
+    dropped = sorted(k for k in d if k not in _CONFIG_FIELDS)
+    if dropped:
+        print(f"[eval] 过滤掉非 Config 字段: {dropped}")
+    return {k: v for k, v in d.items() if k in _CONFIG_FIELDS}
 
 
 def _normalize_training_config_dict(d: dict[str, Any]) -> tuple[dict[str, Any], list[int] | None]:
@@ -56,6 +67,7 @@ def _config_from_yaml_and_overrides(config_path: str, overrides: dict[str, Any] 
         raise ValueError(f"{config_path} is empty or invalid YAML.")
     merged = {**base, **(overrides or {})}
     merged, identity_layers = _normalize_training_config_dict(merged)
+    merged = _filter_config_dict(merged)
     cfg = Config(**merged)
     if identity_layers is not None:
         cfg.research_prefill_identity_layers = identity_layers
@@ -108,6 +120,7 @@ class CustomResearchLM(LM):
             if config_overrides:
                 fallback_kw.update(config_overrides)
             fallback_kw, identity_layers = _normalize_training_config_dict(fallback_kw)
+            fallback_kw = _filter_config_dict(fallback_kw)
             self.config = Config.from_name(**fallback_kw)
             if identity_layers is not None:
                 self.config.research_prefill_identity_layers = identity_layers
