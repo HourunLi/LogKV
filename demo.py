@@ -1,3 +1,4 @@
+from eval import main as eval_main
 import os
 import re
 import shutil
@@ -325,7 +326,6 @@ def main(
     model, optimizer = fabric.setup(model, optimizer)
 
     def _run_eval(ckpt):
-        from eval import main as eval_main
         eval_main(checkpoint_dir=ckpt, benchmark=eval_benchmark, map_branch=eval_map_branch, config_overrides=asdict(config))
 
     if run_eval in ("before", "both"):
