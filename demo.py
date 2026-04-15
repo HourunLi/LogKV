@@ -18,45 +18,14 @@ from jsonargparse import CLI
 import random
 import numpy as np
 from lightning.fabric.loggers import TensorBoardLogger
+from litgpt.model import Block
 import math
-from lightning.fabric.strategies import DDPStrategy
+from lightning.fabric.strategies import DDPStrategy, FSDPStrategy
 from datetime import timedelta
 from contextlib import nullcontext
 from utils import *
 
 torch.set_float32_matmul_precision('high')
-
-# ==========================================
-# 🚀 满血形态：基于 Memmap 的二进制数据集
-# ==========================================
-class CPTBinDataset(torch.utils.data.Dataset):
-    """
-    极速读取预编译的 .bin 文件。CPU 开销几乎为 0。
-    """
-    def __init__(self, bin_path: str, seq_len: int):
-        # 魔法所在：memmap 不会把大文件一次性读进内存，而是按需在硬盘和内存间滑动
-        self.data = np.memmap(bin_path, dtype=np.int32, mode='r')
-        self.seq_len = seq_len
-        self.chunk_size = seq_len + 1
-        
-        # 精确计算这个文件一共能切出多少个完整的 Batch
-        self.total_chunks = len(self.data) // self.chunk_size
-
-    def __len__(self):
-        # 现在 Dataloader 终于知道你有多少数据了！
-        return self.total_chunks
-
-    def __getitem__(self, idx: int):
-        # 直接用索引在极速数组上切片
-        start_idx = idx * self.chunk_size
-        end_idx = start_idx + self.chunk_size
-        
-        # 截取数据并转为 int64 张量 (PyTorch Embedding 层的硬性要求)
-        chunk = self.data[start_idx:end_idx]
-        chunk_tensor = torch.from_numpy(chunk.astype(np.int64))
-        
-        # 返回 inputs 和 targets
-        return chunk_tensor[:-1], chunk_tensor[1:]
 
 def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     """
@@ -218,14 +187,28 @@ def main(
     loggers = [tb_logger] if enable_tensorboard else []
     
     # 2. 这里的 Fabric 逻辑保持不变...
+    find_unused_parameters = True if len(research_remove_order_str) > 0 else False
+    use_fsdp = (context_length > 4096)
+    fabric.print("Use FSDP:", use_fsdp)
+    if not use_fsdp:
+        strategy = DDPStrategy(
+            timeout=timedelta(days=3650),
+            find_unused_parameters=find_unused_parameters
+        )
+    else:
+        strategy = FSDPStrategy(
+            # FULL_SHARD 等价于 DeepSpeed ZeRO-3，切分权重、梯度和优化器状态
+            # 如果显存依然吃紧，可以保持 FULL_SHARD；如果计算通信比瓶颈明显，可改为 SHARD_GRAD_OP (ZeRO-2)
+            sharding_strategy="SHARD_GRAD_OP", 
+            auto_wrap_policy={Block}, 
+            activation_checkpointing_policy={Block}, 
+            timeout=timedelta(days=3650)
+        )
     fabric = L.Fabric(
         accelerator="cuda", 
         devices=num_devices, 
         num_nodes=int(os.environ.get("GROUP_WORLD_SIZE", 1)), # 兼容单机和多机
-        strategy=DDPStrategy(
-            timeout=timedelta(days=3650),
-            find_unused_parameters=True if len(research_remove_order_str) > 0 else False
-        ),  
+        strategy=strategy,  
         precision="bf16-true", 
         loggers=loggers
     )
@@ -276,19 +259,21 @@ def main(
                     # 极其精准的前缀替换
                     new_key = key.replace(orig_prefix, new_prefix, 1)
                     if new_key not in state_dict.keys():
-                        prefill_weights[new_key] = value
+                        prefill_weights[new_key] = value.clone()
 
         # 将克隆出的 prefill 分支权重合并入主字典
         state_dict.update(prefill_weights)
         fabric.print(f"✅ 成功映射并注入了 {len(prefill_weights)} 个 Block 级别的张量！")
 
     # 3. 严格度降低，因为我们凭空造了全新的网络分支
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False, assign=True if use_fsdp else False)
     
     if len(missing_keys) > 0:
         fabric.print(f"⚠️ 未加载的参数 (通常为 buffer): {missing_keys[:5]}...")
         
     fabric.print("✅ 真实权重加载成功！所有分支已完成 Pre-trained 初始化。")
+
+    model = fabric.setup_module(model)
 
     # ==========================================
     # 🌟 工业级优化器初始化：Weight Decay 分组过滤
@@ -296,15 +281,15 @@ def main(
     decay_params = []
     no_decay_params = []
 
+    no_decay_keywords = ["bias", "norm", "ln_"] 
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-            
-        # 核心逻辑：矩阵（2维及以上）加 WD，向量（1维）不加 WD
-        if param.dim() >= 2:
-            decay_params.append(param)
-        else:
+        if any(nd in name.lower() for nd in no_decay_keywords):
             no_decay_params.append(param)
+        else:
+            decay_params.append(param)
 
     # 打印出来心里有底
     fabric.print(f"⚙️ 施加 Weight Decay 的参数组 (如 Linear): {len(decay_params)} 个张量")
@@ -323,7 +308,7 @@ def main(
         betas=(0.9, 0.95),  # LLM 预训练标配的 betas
         eps=1e-8
     )
-    model, optimizer = fabric.setup(model, optimizer)
+    optimizer = fabric.setup_optimizers(optimizer)
 
     def _run_eval(ckpt):
         eval_main(checkpoint_dir=ckpt, benchmark=eval_benchmark, map_branch=eval_map_branch, config_overrides=asdict(config))
@@ -341,26 +326,32 @@ def main(
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    bin_data_paths = prepare_data(
-        data_dir=data_dir,
-        dataset_dir=dataset_dir,
-        dataset_name=dataset_name,
-        model_dir=checkpoint_dir,
-        rank=fabric.global_rank,
-        local_rank=local_rank,
-        world_size=fabric.world_size,
-    )
-    fabric.barrier()
+    if dataset_name == 'longabc':
+        jsonl_data_paths = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
+        fabric.print(f"找到jsonl文件路径：{jsonl_data_paths}")
+        datasets = [CPTOnlineJsonlDataset(jsonl_path=path, model_dir=checkpoint_dir, seq_len=context_length) for path in jsonl_data_paths]
+        dataset = ConcatDataset(datasets)
+    else:
+        bin_data_paths = prepare_data(
+            data_dir=data_dir,
+            dataset_dir=dataset_dir,
+            dataset_name=dataset_name,
+            model_dir=checkpoint_dir,
+            rank=fabric.global_rank,
+            local_rank=local_rank,
+            world_size=fabric.world_size,
+        )
+        fabric.barrier()
 
-    # 再做一次校验，确保所有 bin 都已经存在
-    missing_bins = [p for p in bin_data_paths if not os.path.exists(p)]
-    if missing_bins:
-        raise RuntimeError(f"[Rank {fabric.global_rank}] 这些 bin 文件不存在: {missing_bins}")
+        # 再做一次校验，确保所有 bin 都已经存在
+        missing_bins = [p for p in bin_data_paths if not os.path.exists(p)]
+        if missing_bins:
+            raise RuntimeError(f"[Rank {fabric.global_rank}] 这些 bin 文件不存在: {missing_bins}")
 
-    print(f"[Rank {fabric.global_rank}] 数据预编译完成，共 {len(bin_data_paths)} 个 bin 文件")
+        fabric.print(f"[Rank {fabric.global_rank}] 数据预编译完成，共 {len(bin_data_paths)} 个 bin 文件")
 
-    datasets = [CPTBinDataset(bin_path=bp, seq_len=context_length) for bp in bin_data_paths]
-    dataset = ConcatDataset(datasets)
+        datasets = [CPTBinDataset(bin_path=bp, seq_len=context_length) for bp in bin_data_paths]
+        dataset = ConcatDataset(datasets)
     
     # 🌟 修改点：IterableDataset 不支持 shuffle=True 和 drop_last=True
     # 因为数据已经是流式了，我们在 prepare_data 阶段已经做过了全局 Shuffle
