@@ -26,6 +26,7 @@ from contextlib import nullcontext
 from utils import *
 
 torch.set_float32_matmul_precision('high')
+torch.cuda.memory._record_memory_history(True)
 
 def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     """
@@ -166,6 +167,7 @@ def main(
         num_devices: int = 1,
         warmup_steps: int = 5,
         min_lr: float = 2e-6,
+        entropy_chunk_size: int = 0,
         # DATA
         dataset_name: str = "debug",
         dataset_dir: str = "data",
@@ -205,7 +207,7 @@ def main(
     # 2. 这里的 Fabric 逻辑保持不变...
     find_unused_parameters = True if len(research_remove_order_str) > 0 else False
     use_fsdp = (context_length > 4096)
-    fabric.print("Use FSDP:", use_fsdp)
+    print("Use FSDP:", use_fsdp)
     if not use_fsdp:
         strategy = DDPStrategy(
             timeout=timedelta(days=3650),
@@ -218,15 +220,15 @@ def main(
             sharding_strategy="SHARD_GRAD_OP", 
             auto_wrap_policy={Block}, 
             activation_checkpointing_policy={Block}, 
-            timeout=timedelta(days=3650)
+            timeout=timedelta(days=3650),
         )
     fabric = L.Fabric(
         accelerator="cuda", 
         devices=num_devices, 
         num_nodes=int(os.environ.get("GROUP_WORLD_SIZE", 1)), # 兼容单机和多机
-        strategy=strategy,  
-        precision="bf16-true", 
-        loggers=loggers
+        strategy=strategy,
+        precision='bf16-true',
+        loggers=loggers,
     )
     fabric.launch()
     fabric.print("Tensorboard root:", tensorboard_root)
@@ -408,11 +410,11 @@ def main(
                 # ==========================================
                 # 假设你的 prefill_mask 中：True 表示 Prefill，False 表示 Decode
                 masked_targets = targets.masked_fill(prefill_mask == True, -100)
-                compariable_decode_loss = chunked_cross_entropy(logits, masked_targets, chunk_size=0)
+                compariable_decode_loss = chunked_cross_entropy(logits, masked_targets, chunk_size=entropy_chunk_size)
                 if use_research and not research_prefill_supervise:
                     loss = compariable_decode_loss
                 else:
-                    loss = chunked_cross_entropy(logits, targets, chunk_size=0)
+                    loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
 
                 # 记录未缩放 loss，用于统计当前 global step 的平均训练损失
                 metrics = {
@@ -436,7 +438,13 @@ def main(
                 step_stats.accumulate(**metrics)
 
                 loss = loss / gradient_accumulation_steps
-                fabric.backward(loss)
+                torch.cuda.memory._dump_snapshot("./pre_backward.pickle")
+                try:
+                    fabric.backward(loss)
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        torch.cuda.memory._dump_snapshot("./oom_snapshot.pickle")
+                    raise e
 
             if not is_accumulating:
                 current_lr = get_lr(global_step, total_steps, warmup_steps, learning_rate, min_lr)
