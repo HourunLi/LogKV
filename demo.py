@@ -91,6 +91,9 @@ def decode_prefix_mean_ce_multi_k(
     """
     监控 Decode 阶段的上下文休克。
     支持传入多个 k 值，计算每条样本 decode 段前 k 个位置的平均 CE。
+
+    仅在每个样本断点后的 [bp, bp + max(ks)) 窗口上算 CE，避免对整段 T 做
+    (B*T, V) 的 cross_entropy（长上下文下即使用 no_grad 也会 OOM）。
     
     Args:
         ks: 一个包含多个 k 值的列表，例如 [1, 5, 10]
@@ -102,31 +105,44 @@ def decode_prefix_mean_ce_multi_k(
         return {}
 
     B, T, V = logits.shape
-    # 1. 🌟 算力节约：无论传入多少个 k，全量的 CE 只计算这一次！
-    ce = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, V),
-        targets.reshape(-1),
+    device = logits.device
+    positive_ks = [k for k in ks if k > 0]
+    results: dict[int, torch.Tensor | None] = {k: None for k in ks if k <= 0}
+    if not positive_ks:
+        return results
+
+    k_max = max(positive_ks)
+    bp = prefill_mask.sum(dim=1, keepdim=True).to(dtype=torch.long, device=device)  # (B, 1)
+    offsets = torch.arange(k_max, device=device, dtype=torch.long).view(1, -1).expand(B, -1)
+    t_sel = bp + offsets  # (B, k_max) 绝对位置
+    in_bounds = t_sel < T
+    t_clamped = t_sel.clamp(max=T - 1)
+
+    b_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(t_clamped)
+    logit_win = logits[b_idx, t_clamped]  # (B, k_max, V)
+    tgt_for_ce = torch.where(
+        in_bounds,
+        targets[b_idx, t_clamped],
+        torch.tensor(ignore_index, device=device, dtype=targets.dtype),
+    )
+    ce_win = torch.nn.functional.cross_entropy(
+        logit_win.reshape(-1, V),
+        tgt_for_ce.reshape(-1),
         ignore_index=ignore_index,
         reduction="none",
-    ).view(B, T)
-    
-    # 2. 定位断点，并缓存时间步矩阵和有效 target 矩阵
-    bp = prefill_mask.sum(dim=1, keepdim=True)
-    t_idx = torch.arange(T, device=logits.device).view(1, -1)
-    valid_targets_mask = (targets != ignore_index)
-    
-    results = {}
-    # 3. 🌟 极速提取：只遍历纯布尔运算
+    ).view(B, k_max)
+
+    rel = offsets  # 0 .. k_max-1，对应断点后第几个 decode token
+    valid_targets_win = in_bounds & (targets[b_idx, t_clamped] != ignore_index)
+
     for k in ks:
         if k <= 0:
-            results[k] = None
             continue
-        # 组合掩码：≥断点 且 <断点+k 且 不是 Padding
-        m = (t_idx >= bp) & (t_idx < bp + k) & valid_targets_mask
+        m = (rel < k) & valid_targets_win
         if not m.any():
             results[k] = None
         else:
-            results[k] = ce[m].mean()
+            results[k] = ce_win[m].mean()
     return results
 
 
