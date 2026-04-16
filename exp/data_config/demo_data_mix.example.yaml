@@ -1,0 +1,11 @@
+# 传给 demo.py: --data_mix_yaml demo_data_mix.example.yaml
+# paths: 各语料经 python data.py 得到的 LitData 目录（litdata_*_ctx*）
+paths:
+  - data/litdata_xxxxxxxxxxxxxxxx_ctx4096
+  - data/litdata_yyyyyyyyyyyyyyyy_ctx4096
+# weights: 采样比例，会自动归一化
+weights: [0.7, 0.3]
+
+# 以下为可选
+# base_dir: data          # 若写相对路径，可先拼到 base_dir 再解析为绝对路径
+# iterate_over_all: false  # 与 litgpt TinyLlama 默认一致：按权重混合

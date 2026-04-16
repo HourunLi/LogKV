@@ -23,7 +23,12 @@ import math
 from lightning.fabric.strategies import DDPStrategy, FSDPStrategy
 from datetime import timedelta
 from contextlib import nullcontext
-from litdata.streaming import StreamingDataLoader, StreamingDataset, TokensLoader
+from litdata.streaming import (
+    CombinedStreamingDataset,
+    StreamingDataLoader,
+    StreamingDataset,
+    TokensLoader,
+)
 
 from data import litdata_chunks_dir
 from utils import *
@@ -147,6 +152,72 @@ def decode_prefix_mean_ce_multi_k(
     return results
 
 
+def build_train_dataset(
+    *,
+    context_length: int,
+    seed: int,
+    tok_dir: str,
+    data_dir: str,
+    dataset_dir: str,
+    data_mix_yaml: str | None,
+) -> StreamingDataset | CombinedStreamingDataset:
+    """无 ``data_mix_yaml`` → ``litdata_chunks_dir`` 单源；有 → YAML 里 ``paths`` + ``weights`` → ``CombinedStreamingDataset``。"""
+    block = context_length + 1
+
+    def _stream(path: str) -> StreamingDataset:
+        return StreamingDataset(
+            input_dir=path,
+            item_loader=TokensLoader(block_size=block),
+            shuffle=True,
+            seed=seed,
+        )
+
+    if not data_mix_yaml:
+        chunks = litdata_chunks_dir(tok_dir, data_dir, dataset_dir, context_length)
+        if not os.path.isdir(chunks) or not any(os.scandir(chunks)):
+            raise FileNotFoundError(
+                f"未找到 LitData 缓存: {chunks}\n请先: python data.py ... --context_length {context_length}"
+            )
+        return _stream(chunks)
+
+    yml = os.path.normpath(os.path.expanduser(data_mix_yaml))
+    with open(yml, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"数据配比 YAML 须为 dict: {yml}")
+    try:
+        raw_paths, raw_w = cfg["paths"], cfg["weights"]
+    except KeyError as e:
+        raise ValueError(f"数据配比 YAML 必须包含 paths 与 weights: {yml}") from e
+    if len(raw_paths) != len(raw_w):
+        raise ValueError("paths 与 weights 长度须相同")
+    base = cfg.get("base_dir")
+    base = os.path.abspath(os.path.expanduser(str(base))) if base else ""
+    dirs: list[str] = []
+    for p in raw_paths:
+        p = os.path.expanduser(str(p))
+        full = os.path.join(base, p) if base else p
+        full = os.path.abspath(full)
+        if not os.path.isdir(full) or not any(os.scandir(full)):
+            raise FileNotFoundError(f"LitData 目录无效（需已 data.py optimize）: {full}")
+        dirs.append(full)
+
+    s = float(sum(raw_w))
+    if s <= 0:
+        raise ValueError("weights 之和须为正")
+    weights = tuple(float(w) / s for w in raw_w)
+    iterate = bool(cfg.get("iterate_over_all", False))
+
+    if len(dirs) == 1:
+        return _stream(dirs[0])
+    return CombinedStreamingDataset(
+        datasets=[_stream(d) for d in dirs],
+        seed=seed,
+        weights=weights,
+        iterate_over_all=iterate,
+    )
+
+
 @auto_expand_env_vars
 def main(
         # MODEL
@@ -171,6 +242,7 @@ def main(
         data_dir: str = "data",
         tokenizer_dir: str | None = None,
         data_shuffle_seed: int = 42,
+        data_mix_yaml: str | None = None,
         num_workers: int = 16,
         # IO
         save_ckpt: bool = False,
@@ -333,25 +405,21 @@ def main(
     if run_eval in ("before", "both"):
         _run_eval(load_dir)
 
-    # 3. LitData 流式 chunks（请先运行 python data.py 完成 optimize）
+    # 3. LitData：单源目录 或 CombinedStreamingDataset 配比多源
     tok_dir = tokenizer_dir if tokenizer_dir is not None else load_dir
-    chunks_dir = litdata_chunks_dir(tok_dir, data_dir, dataset_dir, context_length)
-    fabric.print(f"[Rank {fabric.global_rank}] LitData 目录 tokenizer_dir={tok_dir} → {chunks_dir}")
-
-    if not os.path.isdir(chunks_dir) or not any(os.scandir(chunks_dir)):
-        raise FileNotFoundError(
-            f"未找到 LitData 缓存（非空目录）: {chunks_dir}\n"
-            "请先执行: python data.py --tokenizer_dir <与训练一致> --dataset_dir ... --data_dir ... "
-            f"--context_length {context_length}"
-        )
-    fabric.barrier()
-
-    train_dataset = StreamingDataset(
-        input_dir=chunks_dir,
-        item_loader=TokensLoader(block_size=context_length + 1),
-        shuffle=True,
+    train_dataset = build_train_dataset(
+        context_length=context_length,
         seed=data_shuffle_seed,
+        tok_dir=tok_dir,
+        data_dir=data_dir,
+        dataset_dir=dataset_dir,
+        data_mix_yaml=data_mix_yaml,
     )
+    if isinstance(train_dataset, CombinedStreamingDataset):
+        fabric.print(f"[Rank {fabric.global_rank}] 训练数据: CombinedStreamingDataset（多源配比）")
+    else:
+        fabric.print(f"[Rank {fabric.global_rank}] 训练数据: StreamingDataset（单源）")
+    fabric.barrier()
     dataloader = StreamingDataLoader(
         train_dataset,
         batch_size=micro_batch_size,
