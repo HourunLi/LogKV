@@ -12,6 +12,7 @@ max_steps: 300             # 跑 300 步，足够在 TensorBoard/终端 画出�
 learning_rate: 2e-5
 weight_decay: 0.1
 num_devices: 1
+entropy_chunk_size: 128
 
 # 数据与 IO
 dataset_name: "debug"
