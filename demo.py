@@ -10,7 +10,7 @@ from dataclasses import asdict
 import torch
 import lightning as L
 from datetime import datetime
-from torch.utils.data import DataLoader, IterableDataset, ConcatDataset
+from torch.utils.data import DataLoader
 from litgpt import Config
 from litgpt.model import GPT
 from litgpt.utils import chunked_cross_entropy
@@ -23,6 +23,9 @@ import math
 from lightning.fabric.strategies import DDPStrategy, FSDPStrategy
 from datetime import timedelta
 from contextlib import nullcontext
+from litdata.streaming import StreamingDataLoader, StreamingDataset, TokensLoader
+
+from data import litdata_chunks_dir
 from utils import *
 
 torch.set_float32_matmul_precision('high')
@@ -167,6 +170,7 @@ def main(
         dataset_dir: str = "data",
         data_dir: str = "data",
         tokenizer_dir: str | None = None,
+        data_shuffle_seed: int = 42,
         num_workers: int = 16,
         # IO
         save_ckpt: bool = False,
@@ -329,30 +333,37 @@ def main(
     if run_eval in ("before", "both"):
         _run_eval(load_dir)
 
-    # 3. 读取离线预处理好的 .bin（与模型无关，仅与 tokenizer 一致即可；请先运行 python data.py）
+    # 3. LitData 流式 chunks（请先运行 python data.py 完成 optimize）
     tok_dir = tokenizer_dir if tokenizer_dir is not None else load_dir
-    fabric.print(f"[Rank {fabric.global_rank}] 加载 tokenizer 缓存下的 .bin（tokenizer_dir={tok_dir}）...")
+    chunks_dir = litdata_chunks_dir(tok_dir, data_dir, dataset_dir, context_length)
+    fabric.print(f"[Rank {fabric.global_rank}] LitData 目录 tokenizer_dir={tok_dir} → {chunks_dir}")
 
-    bin_data_paths = list_tokenized_bin_paths(
-        tokenizer_dir=tok_dir,
-        dataset_dir=dataset_dir,
-        dataset_name=dataset_name,
-        data_dir=data_dir,
-    )
+    if not os.path.isdir(chunks_dir) or not any(os.scandir(chunks_dir)):
+        raise FileNotFoundError(
+            f"未找到 LitData 缓存（非空目录）: {chunks_dir}\n"
+            "请先执行: python data.py --tokenizer_dir <与训练一致> --dataset_dir ... --data_dir ... "
+            f"--context_length {context_length}"
+        )
     fabric.barrier()
 
-    fabric.print(f"[Rank {fabric.global_rank}] 共 {len(bin_data_paths)} 个 bin 分片")
-
-    datasets = [CPTBinDataset(bin_path=bp, seq_len=context_length) for bp in bin_data_paths]
-    dataset = ConcatDataset(datasets)
-    
-    dataloader = DataLoader(dataset, batch_size=micro_batch_size, num_workers=num_workers, shuffle=True)
+    train_dataset = StreamingDataset(
+        input_dir=chunks_dir,
+        item_loader=TokensLoader(block_size=context_length + 1),
+        shuffle=True,
+        seed=data_shuffle_seed,
+    )
+    dataloader = StreamingDataLoader(
+        train_dataset,
+        batch_size=micro_batch_size,
+        pin_memory=True,
+        num_workers=num_workers,
+        drop_last=True,
+    )
     dataloader = fabric.setup_dataloaders(dataloader)
 
     fabric.print("🚀 开始 Continue Pretraining...")
     model.train()
 
-    epochs = num_epochs
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
     optimizer.zero_grad(set_to_none=True) 
     step_start_time = datetime.now()
@@ -360,101 +371,105 @@ def main(
     global_step = 0
     total_steps = max_steps
     training_finished = False
-    
-    for epoch in range(epochs):
-        for batch_idx, (inputs, targets) in enumerate(dataloader):
-            is_accumulating = (batch_idx + 1) % gradient_accumulation_steps != 0
+    micro_batch_idx = 0
+    data_epoch = 1
+    loader_iter = iter(dataloader)
 
-            prefill_mask = generate_step_driven_mask(
-                batch_size=inputs.size(0), 
-                seq_len=inputs.size(1), 
-                current_step=global_step + 1, 
-                total_steps=total_steps, 
-                device=fabric.device,
-                schedule=research_breakpoint_schedule,
-                stable=research_breakpoint_schedule_stable,
+    while global_step < max_steps and not training_finished:
+        try:
+            train_data = next(loader_iter)
+        except StopIteration:
+            data_epoch += 1
+            if data_epoch > num_epochs:
+                fabric.print(f"🛑 已遍历数据 {num_epochs} 个 epoch，未达到 max_steps={max_steps}，停止。")
+                break
+            loader_iter = iter(dataloader)
+            continue
+
+        inputs = train_data[:, 0:context_length].contiguous().long()
+        targets = train_data[:, 1 : context_length + 1].contiguous().long()
+        is_accumulating = (micro_batch_idx + 1) % gradient_accumulation_steps != 0
+        micro_batch_idx += 1
+
+        prefill_mask = generate_step_driven_mask(
+            batch_size=inputs.size(0),
+            seq_len=inputs.size(1),
+            current_step=global_step + 1,
+            total_steps=total_steps,
+            device=fabric.device,
+            schedule=research_breakpoint_schedule,
+            stable=research_breakpoint_schedule_stable,
+        )
+
+        with fabric.no_backward_sync(model, enabled=is_accumulating):
+            logits = model(inputs, prefill_mask=prefill_mask)
+
+            masked_targets = targets.masked_fill(prefill_mask == True, -100)
+            compariable_decode_loss = chunked_cross_entropy(logits, masked_targets, chunk_size=entropy_chunk_size)
+            if use_research and not research_prefill_supervise:
+                loss = compariable_decode_loss
+            else:
+                loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
+
+            metrics = {
+                "compariable_loss": compariable_decode_loss.detach().item(),
+            }
+            if research_decode_prefix_tokens > 0:
+                ks = [research_decode_prefix_tokens, 8, 16]
+                if 1 not in ks:
+                    ks.insert(0, 1)
+                grad_ctx = torch.no_grad() if research_decode_prefix_loss_weight == 0 else nullcontext()
+                with grad_ctx:
+                    prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=ks)
+                if len(prefix_losses) > 0:
+                    for k, prefix_loss in prefix_losses.items():
+                        metrics[f"prefix_loss_{k}"] = prefix_loss.detach().item()
+                    if use_research and research_decode_prefix_loss_weight > 0:
+                        loss += prefix_losses[research_decode_prefix_tokens] * research_decode_prefix_loss_weight
+            metrics["loss"] = loss.detach().item()
+            metrics["prefill_ratio"] = (prefill_mask.sum() / prefill_mask.numel()).item()
+            step_stats.accumulate(**metrics)
+
+            loss = loss / gradient_accumulation_steps
+            fabric.backward(loss)
+
+        if not is_accumulating:
+            current_lr = get_lr(global_step, total_steps, warmup_steps, learning_rate, min_lr)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = current_lr
+
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            now = datetime.now()
+            step_time = (now - step_start_time).total_seconds()
+            step_start_time = now
+            avgs = step_stats.averages()
+            metrics_txt = " | ".join(f"{k}: {v:.4f}" for k, v in sorted(avgs.items()))
+            if metrics_txt:
+                metrics_txt = metrics_txt + " | "
+            fabric.print(
+                f"[{now.strftime('%H:%M:%S')}] "
+                f"Epoch {data_epoch} | Step {global_step + 1} | "
+                f"{metrics_txt}"
+                f"Time: {step_time:.2f}s"
             )
-            
-            with fabric.no_backward_sync(model, enabled=is_accumulating):
-                logits = model(inputs, prefill_mask=prefill_mask)
+            for name, val in avgs.items():
+                fabric.log(f"train/{name}", val, step=global_step + 1)
+            fabric.log("train/learning_rate", current_lr, step=global_step + 1)
 
-                # ==========================================
-                # 🌟 核心拦截：利用 Mask 屏蔽 Prefill 部分的 Loss
-                # ==========================================
-                # 假设你的 prefill_mask 中：True 表示 Prefill，False 表示 Decode
-                masked_targets = targets.masked_fill(prefill_mask == True, -100)
-                compariable_decode_loss = chunked_cross_entropy(logits, masked_targets, chunk_size=entropy_chunk_size)
-                if use_research and not research_prefill_supervise:
-                    loss = compariable_decode_loss
-                else:
-                    loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
+            step_stats.reset()
+            global_step += 1
+            if global_step >= max_steps:
+                fabric.print(f"🚨 已达到最大训练步数 {max_steps}，提前结束训练！")
+                training_finished = True
 
-                # 记录未缩放 loss，用于统计当前 global step 的平均训练损失
-                metrics = {
-                    "compariable_loss": compariable_decode_loss.detach().item(),
-                }
-                if research_decode_prefix_tokens > 0:
-                    ks = [research_decode_prefix_tokens, 8, 16]
-                    if 1 not in ks:
-                        ks.insert(0, 1)
-                    # 如果 weight 为 0，只需要观察指标而不需要梯度，使用 no_grad 加速
-                    grad_ctx = torch.no_grad() if research_decode_prefix_loss_weight == 0 else nullcontext()
-                    with grad_ctx:
-                        prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=ks)
-                    if len(prefix_losses) > 0:
-                        for k, prefix_loss in prefix_losses.items():
-                            metrics[f"prefix_loss_{k}"] = prefix_loss.detach().item()
-                        if use_research and research_decode_prefix_loss_weight > 0:
-                            loss += (prefix_losses[research_decode_prefix_tokens] * research_decode_prefix_loss_weight)
-                metrics['loss'] = loss.detach().item()
-                metrics['prefill_ratio'] = (prefill_mask.sum() / prefill_mask.numel()).item()
-                step_stats.accumulate(**metrics)
-
-                loss = loss / gradient_accumulation_steps
-                fabric.backward(loss)
-
-            if not is_accumulating:
-                current_lr = get_lr(global_step, total_steps, warmup_steps, learning_rate, min_lr)
-                # 遍历优化器里的每一个参数组 (包括我们刚才拆分的带 decay 和不带 decay 的组)
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = current_lr
-
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
-                now = datetime.now()
-                step_time = (now - step_start_time).total_seconds()
-                step_start_time = now
-                avgs = step_stats.averages()
-                metrics_txt = " | ".join(f"{k}: {v:.4f}" for k, v in sorted(avgs.items()))
-                if metrics_txt:
-                    metrics_txt = metrics_txt + " | "
-                fabric.print(
-                    f"[{now.strftime('%H:%M:%S')}] "
-                    f"Epoch {epoch+1} | Step {global_step + 1} | "
-                    f"{metrics_txt}"
-                    f"Time: {step_time:.2f}s"
-                )
-                for name, val in avgs.items():
-                    fabric.log(f"train/{name}", val, step=global_step + 1)
-                fabric.log("train/learning_rate", current_lr, step=global_step + 1)
-
-                step_stats.reset()
-                global_step += 1
-                if global_step >= max_steps:
-                    fabric.print(f"🚨 已达到最大训练步数 {max_steps}，提前结束训练！")
-                    training_finished = True
-                    break
-                
-                if research_remove_interval > 0 and global_step % research_remove_interval == 0:
-                    remove_index = global_step // research_remove_interval
-                    if remove_index <= len(research_remove_order):
-                        remove_index = research_remove_order[remove_index - 1]
-                        config.research_removed_layers.append(remove_index)
-                        fabric.print(f"🔥 已移除层 {remove_index}，当前所有已移除层为 {config.research_removed_layers}")
-                
-        if training_finished:
-            break
+            if research_remove_interval > 0 and global_step % research_remove_interval == 0:
+                remove_index = global_step // research_remove_interval
+                if remove_index <= len(research_remove_order):
+                    remove_index = research_remove_order[remove_index - 1]
+                    config.research_removed_layers.append(remove_index)
+                    fabric.print(f"🔥 已移除层 {remove_index}，当前所有已移除层为 {config.research_removed_layers}")
 
     if save_ckpt:
         os.makedirs(save_path, exist_ok=True)

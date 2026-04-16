@@ -8,8 +8,6 @@ import random
 import numpy as np
 from litgpt.tokenizer import Tokenizer
 
-from data import list_tokenized_bin_paths
-
 def _expand_single_string(text: str) -> str:
     """底层的单字符串替换逻辑"""
     def replace_fn(match):
