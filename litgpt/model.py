@@ -639,7 +639,7 @@ class CausalSelfAttention(nn.Module):
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        if self.config.use_research and self.config.research_enable_flash_attn:
+        if self.config.research_enable_flash_attn:
             y = self.scaled_dot_product_attention_flash_attn(q, k, v, mask, use_swa=use_swa, swa_window=swa_size)
         else:
             y = self.scaled_dot_product_attention(q, k, v, mask)
@@ -714,9 +714,26 @@ class CausalSelfAttention(nn.Module):
         # ⚡ 路径 3: 默认的 Full Attention，走 PyTorch 原生极速 SDPA
         # ===================================================================
         else:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
+            if flash_attn_func is None:
+                raise ImportError("🚨 必须安装 flash-attn 库！(运行: pip install flash-attn --no-build-isolation)")
+            
+            # PyTorch SDPA 格式: (B, nh, T, hs) -> Flash Attn 格式: (B, T, nh, hs)
+            q_fa = q.transpose(1, 2)
+            k_fa = k.transpose(1, 2)
+            v_fa = v.transpose(1, 2)
+
+            # 调用 Flash Attention (全域注意力，不限制 window_size)
+            y_fa = flash_attn_func(
+                q_fa, 
+                k_fa, 
+                v_fa, 
+                dropout_p=0.0, 
+                softmax_scale=scale,
+                causal=(mask is None)  # 如果没有传入特定的 mask，默认开启 causal 掩码
             )
+            
+            # 转回 (B, nh, T, hs)
+            y = y_fa.transpose(1, 2)
             
         # 最终统一把 shape 转换成外层需要的 (B, T, nh * hs) 的前置形态 (B, T, nh, hs) 返回
         return y.transpose(1, 2)

@@ -2,6 +2,7 @@ import os
 import json
 import re
 import functools
+import shutil
 from typing import Any
 import torch
 import random
@@ -89,90 +90,201 @@ def set_random_seeds(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def prepare_data(dataset_dir, dataset_name, model_dir, data_dir=None, rank=0, local_rank=0, world_size=1):
-    print(f"[Rank {rank}] ⏳ 正在检查和准备数据...")
-    os.makedirs(dataset_dir, exist_ok=True)
+import os
+import glob
+import json
+import numpy as np
+import pyarrow.parquet as pq
+import shutil
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+from datasets import load_dataset, Dataset
 
+# ==============================================================================
+# 🚀 必须放在最外层的独立工作函数 (Worker) 
+# 因为 Python multiprocessing 不能传递内部函数或带有锁的对象
+# ==============================================================================
+def _process_data_chunk(kwargs):
+    """独立的子进程处理函数"""
+    ext = kwargs['ext']
+    src_file = kwargs['src_file']
+    bin_file = kwargs['bin_file']
+    model_dir = kwargs['model_dir']
+    
+    # ⚠️ 必须在子进程内部初始化 Tokenizer，不能从主进程传进来
+    tokenizer = Tokenizer(model_dir)
+    tmp_bin_file = f"{bin_file}.tmp"
+
+    with open(tmp_bin_file, "wb") as f:
+        # --------------------------------------------------
+        # Parquet 切片处理
+        # --------------------------------------------------
+        if ext == ".parquet":
+            parquet_file = pq.ParquetFile(src_file)
+            for rg in kwargs['row_groups']:
+                # 直接读取指定的 Row Group
+                table = parquet_file.read_row_group(rg, columns=["text"])
+                batch_tokens = []
+                for text in table.to_pandas()["text"]:
+                    tokens = tokenizer.encode(text, bos=False, eos=True).tolist()
+                    batch_tokens.extend(tokens)
+                
+                if batch_tokens:
+                    arr = np.array(batch_tokens, dtype=np.int32)
+                    f.write(arr.tobytes())
+                    
+        # --------------------------------------------------
+        # JSONL 切片处理
+        # --------------------------------------------------
+        elif ext == ".jsonl":
+            start_byte = kwargs['start_byte']
+            end_byte = kwargs['end_byte']
+            
+            with open(src_file, 'r', encoding='utf-8') as jf:
+                jf.seek(start_byte)
+                # 不是文件头的话，跳过残行
+                if start_byte > 0:
+                    jf.readline()
+
+                batch_tokens = []
+                while True:
+                    if jf.tell() >= end_byte:
+                        break
+                    line = jf.readline()
+                    if not line:
+                        break
+                        
+                    try:
+                        line_data = json.loads(line)
+                        text = line_data.get("text", line_data.get("content", ""))
+                        if not text:
+                            continue
+
+                        tokens = tokenizer.encode(text, bos=False, eos=True).tolist()
+                        batch_tokens.extend(tokens)
+
+                        if len(batch_tokens) > 1000000:
+                            arr = np.array(batch_tokens, dtype=np.int32)
+                            f.write(arr.tobytes())
+                            batch_tokens = []
+                    except json.JSONDecodeError:
+                        continue
+                        
+                if batch_tokens:
+                    arr = np.array(batch_tokens, dtype=np.int32)
+                    f.write(arr.tobytes())
+
+    # 移正文件
+    shutil.move(tmp_bin_file, bin_file)
+    return bin_file
+
+
+# ==============================================================================
+# 主控函数
+# ==============================================================================
+def prepare_data(dataset_dir, dataset_name, model_dir, data_dir=None, rank=0, local_rank=0, world_size=1):
+    # 动态获取当前机器的 CPU 核心数
+    num_cpus = 64
+    # 计算当前 Rank 能分到几个 CPU 核心 (至少保证 1 个)
+    workers_per_rank = max(1, num_cpus // world_size)
+    # 重新定义文件切分总数 = 物理总 GPU 数 × 每个 GPU 挂载的 CPU 进程数
+    total_parts = world_size * workers_per_rank
+
+    if rank == 0:
+        print(f"⏳ [Rank 0] 系统检测到 {num_cpus} 个 CPU 核心。")
+        print(f"🚀 [Rank 0] 并行策略：将每个文件切分为 {total_parts} 份，每个 Rank 分配 {workers_per_rank} 个子进程狂飙！")
+
+    os.makedirs(dataset_dir, exist_ok=True)
     model_name = os.path.basename(os.path.normpath(model_dir))
     bin_cache_dir = os.path.join(data_dir, f"bins_{model_name}") if data_dir else os.path.join(dataset_dir, f"bins_{model_name}")
     os.makedirs(bin_cache_dir, exist_ok=True)
 
     bin_paths = []
-    parquet_files = []
+    all_files = []
 
-    # 1. 找 parquet 文件
+    # 1. 找文件 (逻辑不变)
     if data_dir and os.path.isdir(data_dir):
-        print(f"[Rank {rank}] 📂 检测到本地数据集目录: {data_dir}")
         parquet_files = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
-        if not parquet_files:
-            raise FileNotFoundError(f"❌ 在 {data_dir} 下没有找到任何 .parquet 文件！")
+        jsonl_files = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
+        all_files = parquet_files + jsonl_files
+        if not all_files:
+            raise FileNotFoundError(f"❌ 在 {data_dir} 下没有找到任何 .parquet 或 .jsonl 文件！")
     else:
         single_parquet = os.path.join(dataset_dir, f"{dataset_name}.parquet")
         if not os.path.exists(single_parquet):
             if dataset_name == "debug":
-                print(f"[Rank {rank}] 🌐 正在拉取 FineWeb-Edu...")
+                if rank == 0: print(f"🌐 [Rank 0] 正在拉取 FineWeb-Edu...")
                 eng_stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-100BT", split="train", streaming=True)
-                eng_list = list(eng_stream.take(10000))
-                mixed_dataset = Dataset.from_list(eng_list).select_columns(["text"])
+                mixed_dataset = Dataset.from_list(list(eng_stream.take(10000))).select_columns(["text"])
                 mixed_dataset.to_parquet(single_parquet)
             else:
                 raise NotImplementedError(f"数据集 {dataset_name} 尚未实现")
-        parquet_files = [single_parquet]
+        all_files = [single_parquet]
 
-    # 2. 先把所有目标 bin 路径算出来，所有 rank 都返回同样的 bin_paths
-    compile_jobs = []
-    for file_idx, pq_file in enumerate(parquet_files):
-        rel_path = os.path.relpath(pq_file, data_dir)
-        base_name = rel_path.replace(os.sep, "__").replace(".parquet", "")
-        bin_file = os.path.join(bin_cache_dir, f"{base_name}.bin")
-        bin_paths.append(bin_file)
+    # 2. 预计算所有的最终输出路径，外层 Dataset 调用时保证各个 Rank 对齐
+    for src_file in all_files:
+        rel_path = os.path.relpath(src_file, data_dir if data_dir else dataset_dir)
+        base_name = rel_path.replace(os.sep, "__").replace(".parquet", "").replace(".jsonl", "")
+        for p in range(total_parts):
+            bin_paths.append(os.path.join(bin_cache_dir, f"{base_name}_part{p}.bin"))
 
-        if os.path.exists(bin_file):
-            continue
+    # 3. 收集当前 Rank 需要处理的所有 "微任务 (Task)"
+    my_tasks = []
+    for src_file in all_files:
+        ext = os.path.splitext(src_file)[1].lower()
+        rel_path = os.path.relpath(src_file, data_dir if data_dir else dataset_dir)
+        base_name = rel_path.replace(os.sep, "__").replace(".parquet", "").replace(".jsonl", "")
+        
+        # 将一个文件切片为 total_parts 份
+        for part_id in range(total_parts):
+            # 过滤出只属于当前 Rank 的 part (轮询分配)
+            if part_id % world_size != rank:
+                continue
+                
+            bin_file = os.path.join(bin_cache_dir, f"{base_name}_part{part_id}.bin")
+            if os.path.exists(bin_file):
+                continue
+                
+            task = {
+                'ext': ext,
+                'src_file': src_file,
+                'bin_file': bin_file,
+                'model_dir': model_dir
+            }
 
-        if file_idx % world_size == rank:
-            compile_jobs.append((pq_file, bin_file, base_name))
+            if ext == ".parquet":
+                parquet_file = pq.ParquetFile(src_file)
+                num_row_groups = parquet_file.num_row_groups
+                # 当前微任务负责的 row_groups (交错切分)
+                my_rgs = [i for i in range(num_row_groups) if i % total_parts == part_id]
+                if not my_rgs: 
+                    continue # 文件极小，没分到
+                task['row_groups'] = my_rgs
 
-    # 3. 当前 rank 只编译自己那部分
-    if compile_jobs:
-        tokenizer = Tokenizer(model_dir)
+            elif ext == ".jsonl":
+                total_size = os.path.getsize(src_file)
+                chunk_size = total_size // total_parts
+                task['start_byte'] = part_id * chunk_size
+                task['end_byte'] = total_size if part_id == total_parts - 1 else task['start_byte'] + chunk_size
+                
+            my_tasks.append(task)
 
-
-    for pq_file, bin_file, base_name in compile_jobs:
-        parquet_file = pq.ParquetFile(pq_file)
-        tmp_bin_file = f"{bin_file}.rank{rank}.tmp"
-        # if os.path.exists(tmp_bin_file):
-        #     os.replace(tmp_bin_file, bin_file)
-        #     continue
-
-        total_batches = parquet_file.metadata.num_rows // 8192
-        if parquet_file.metadata.num_rows % 8192 != 0:
-            total_batches += 1
-
-        with open(tmp_bin_file, "wb") as f:
-            pbar = tqdm(
-                parquet_file.iter_batches(batch_size=8192, columns=["text"]),
-                total=total_batches,
-                desc=f"[Rank {rank}] {base_name}",
-                position=local_rank,
-                leave=True,
-                dynamic_ncols=True,
-                mininterval=0.5,
-            )
-
-            for batch in pbar:
-                batch_tokens = []
-                for text in batch.to_pandas()["text"]:
-                    tokens = tokenizer.encode(text, bos=False, eos=True).tolist()
-                    batch_tokens.extend(tokens)
-
-                arr = np.array(batch_tokens, dtype=np.int32)
-                f.write(arr.tobytes())
-
-        os.replace(tmp_bin_file, bin_file)
+    # 4. 进程池多核全开，执行处理任务
+    if my_tasks:
+        print(f"🔥 [Rank {rank}] 分配到 {len(my_tasks)} 个分块任务，启动 {workers_per_rank} 个进程全力处理...")
+        
+        with ProcessPoolExecutor(max_workers=workers_per_rank) as executor:
+            # 提交所有微任务
+            futures = [executor.submit(_process_data_chunk, task) for task in my_tasks]
+            
+            # 使用 tqdm 监控当前 Rank 的进程池进度
+            for _ in tqdm(as_completed(futures), total=len(futures), desc=f"[Rank {rank}] 多进程编译中", position=local_rank, leave=True):
+                pass
+                
+        print(f"✅ [Rank {rank}] 所有分块处理完毕！")
 
     return bin_paths
-
 
 class CPTBinDataset(torch.utils.data.Dataset):
     """

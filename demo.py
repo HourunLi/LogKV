@@ -26,7 +26,7 @@ from contextlib import nullcontext
 from utils import *
 
 torch.set_float32_matmul_precision('high')
-torch.cuda.memory._record_memory_history(True)
+torch.set_default_dtype(torch.bfloat16)
 
 def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     """
@@ -51,9 +51,6 @@ def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     
     return min_lr + coeff * (max_lr - min_lr)
 
-# ==========================================
-# 🌟 你的专属 Schedule 逻辑
-# ==========================================
 def generate_step_driven_mask(batch_size, seq_len, current_step, total_steps, device, stable=0, schedule=None):
     """
     基于当前训练 Iter 的动态断点生成器
@@ -147,9 +144,6 @@ def decode_prefix_mean_ce_multi_k(
     return results
 
 
-# ==========================================
-# CPT 主训练循环
-# ==========================================
 @auto_expand_env_vars
 def main(
         # MODEL
@@ -284,7 +278,7 @@ def main(
         fabric.print(f"✅ 成功映射并注入了 {len(prefill_weights)} 个 Block 级别的张量！")
 
     # 3. 严格度降低，因为我们凭空造了全新的网络分支
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False, assign=True if use_fsdp else False)
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=True if not use_research else False, assign=True if use_fsdp else False)
     
     if len(missing_keys) > 0:
         fabric.print(f"⚠️ 未加载的参数 (通常为 buffer): {missing_keys[:5]}...")
@@ -344,32 +338,26 @@ def main(
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    if dataset_name == 'longabc':
-        jsonl_data_paths = sorted(glob.glob(os.path.join(data_dir, "*.jsonl")))
-        fabric.print(f"找到jsonl文件路径：{jsonl_data_paths}")
-        datasets = [CPTOnlineJsonlDataset(jsonl_path=path, model_dir=checkpoint_dir, seq_len=context_length) for path in jsonl_data_paths]
-        dataset = ConcatDataset(datasets)
-    else:
-        bin_data_paths = prepare_data(
-            data_dir=data_dir,
-            dataset_dir=dataset_dir,
-            dataset_name=dataset_name,
-            model_dir=checkpoint_dir,
-            rank=fabric.global_rank,
-            local_rank=local_rank,
-            world_size=fabric.world_size,
-        )
-        fabric.barrier()
+    bin_data_paths = prepare_data(
+        data_dir=data_dir,
+        dataset_dir=dataset_dir,
+        dataset_name=dataset_name,
+        model_dir=checkpoint_dir,
+        rank=fabric.global_rank,
+        local_rank=local_rank,
+        world_size=fabric.world_size,
+    )
+    fabric.barrier()
 
-        # 再做一次校验，确保所有 bin 都已经存在
-        missing_bins = [p for p in bin_data_paths if not os.path.exists(p)]
-        if missing_bins:
-            raise RuntimeError(f"[Rank {fabric.global_rank}] 这些 bin 文件不存在: {missing_bins}")
+    # 再做一次校验，确保所有 bin 都已经存在
+    missing_bins = [p for p in bin_data_paths if not os.path.exists(p)]
+    if missing_bins:
+        raise RuntimeError(f"[Rank {fabric.global_rank}] 这些 bin 文件不存在: {missing_bins}")
 
-        fabric.print(f"[Rank {fabric.global_rank}] 数据预编译完成，共 {len(bin_data_paths)} 个 bin 文件")
+    fabric.print(f"[Rank {fabric.global_rank}] 数据预编译完成，共 {len(bin_data_paths)} 个 bin 文件")
 
-        datasets = [CPTBinDataset(bin_path=bp, seq_len=context_length) for bp in bin_data_paths]
-        dataset = ConcatDataset(datasets)
+    datasets = [CPTBinDataset(bin_path=bp, seq_len=context_length) for bp in bin_data_paths]
+    dataset = ConcatDataset(datasets)
     
     # 🌟 修改点：IterableDataset 不支持 shuffle=True 和 drop_last=True
     # 因为数据已经是流式了，我们在 prepare_data 阶段已经做过了全局 Shuffle
@@ -438,13 +426,7 @@ def main(
                 step_stats.accumulate(**metrics)
 
                 loss = loss / gradient_accumulation_steps
-                torch.cuda.memory._dump_snapshot("./pre_backward.pickle")
-                try:
-                    fabric.backward(loss)
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        torch.cuda.memory._dump_snapshot("./oom_snapshot.pickle")
-                    raise e
+                fabric.backward(loss)
 
             if not is_accumulating:
                 current_lr = get_lr(global_step, total_steps, warmup_steps, learning_rate, min_lr)
