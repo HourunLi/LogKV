@@ -166,6 +166,7 @@ def main(
         dataset_name: str = "debug",
         dataset_dir: str = "data",
         data_dir: str = "data",
+        tokenizer_dir: str | None = None,
         num_workers: int = 16,
         # IO
         save_ckpt: bool = False,
@@ -328,39 +329,23 @@ def main(
     if run_eval in ("before", "both"):
         _run_eval(load_dir)
 
-    # 🌟 3. 初始化新的流式 Parquet 数据集
-    # tokenizer = Tokenizer(checkpoint_dir)
-    # ==========================================
-    # 🌟 工业级多卡同步：预编译安全锁
-    # ==========================================
+    # 3. 读取离线预处理好的 .bin（与模型无关，仅与 tokenizer 一致即可；请先运行 python data.py）
+    tok_dir = tokenizer_dir if tokenizer_dir is not None else load_dir
+    fabric.print(f"[Rank {fabric.global_rank}] 加载 tokenizer 缓存下的 .bin（tokenizer_dir={tok_dir}）...")
 
-    print(f"[Rank {fabric.global_rank}] 开始并行预编译数据...")
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-
-    bin_data_paths = prepare_data(
-        data_dir=data_dir,
+    bin_data_paths = list_tokenized_bin_paths(
+        tokenizer_dir=tok_dir,
         dataset_dir=dataset_dir,
         dataset_name=dataset_name,
-        model_dir=checkpoint_dir,
-        rank=fabric.global_rank,
-        local_rank=local_rank,
-        world_size=fabric.world_size,
+        data_dir=data_dir,
     )
     fabric.barrier()
 
-    # 再做一次校验，确保所有 bin 都已经存在
-    missing_bins = [p for p in bin_data_paths if not os.path.exists(p)]
-    if missing_bins:
-        raise RuntimeError(f"[Rank {fabric.global_rank}] 这些 bin 文件不存在: {missing_bins}")
-
-    fabric.print(f"[Rank {fabric.global_rank}] 数据预编译完成，共 {len(bin_data_paths)} 个 bin 文件")
+    fabric.print(f"[Rank {fabric.global_rank}] 共 {len(bin_data_paths)} 个 bin 分片")
 
     datasets = [CPTBinDataset(bin_path=bp, seq_len=context_length) for bp in bin_data_paths]
     dataset = ConcatDataset(datasets)
     
-    # 🌟 修改点：IterableDataset 不支持 shuffle=True 和 drop_last=True
-    # 因为数据已经是流式了，我们在 prepare_data 阶段已经做过了全局 Shuffle
     dataloader = DataLoader(dataset, batch_size=micro_batch_size, num_workers=num_workers, shuffle=True)
     dataloader = fabric.setup_dataloaders(dataloader)
 
