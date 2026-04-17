@@ -283,17 +283,22 @@ class CustomResearchLM(LM):
                 prompt_tensor = prompt_tensor[-keep_prompt_len:]
                 print(f"⚠️ [Rank {dp_rank}] 警告: 触发生成截断，Prompt 被切至: {keep_prompt_len}")
             
+            total_max_len = prompt_tensor.size(0) + max_new_tokens
             with torch.no_grad():
-                # 调用我们马上要在 base.py 里修改的 generate 函数
-                out = litgpt_generate(
-                    self.model, 
-                    prompt_tensor, 
-                    max_returned_tokens=prompt_tensor.size(0) + max_new_tokens,
-                    temperature=gen_args.get("temperature", 1.0),
-                    top_k=gen_args.get("top_k", None),
-                    eos_id=self.tokenizer.eos_id
-                )
-                
+                # 自回归路径带 input_pos，必须初始化 mask_cache / KVCache（与 litgpt/generate/base.py main 一致）
+                self.model.set_kv_cache(batch_size=1, max_seq_length=total_max_len, device=self._device)
+                try:
+                    out = litgpt_generate(
+                        self.model,
+                        prompt_tensor,
+                        max_returned_tokens=total_max_len,
+                        temperature=gen_args.get("temperature", 1.0),
+                        top_k=gen_args.get("top_k", None),
+                        eos_id=self.tokenizer.eos_id,
+                    )
+                finally:
+                    self.model.clear_kv_cache()
+
             # 截取新生成的部分并解码
             generated_tokens = out[prompt_tensor.size(0):]
             decoded = self.tokenizer.decode(generated_tokens)
