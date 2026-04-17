@@ -206,7 +206,9 @@ class CustomResearchLM(LM):
             context, continuation = req.args[0], req.args[1]
             
             ctx_enc = self.tokenizer.encode(context).tolist()
-            cont_enc = self.tokenizer.encode(continuation).tolist()
+            # Llama 3 等 use_bos=True：若对 continuation 再 encode 一次会多一个 BOS，拼接后破坏
+            # loglikelihood 对齐；Qwen 通常无 BOS，bos=False 与默认行为一致。
+            cont_enc = self.tokenizer.encode(continuation, bos=False).tolist()
             
             # 🌟 安全阀：如果 题干 + 选项 > 4096，必须切掉题干最前面的部分
             max_len = self.model.max_seq_length
