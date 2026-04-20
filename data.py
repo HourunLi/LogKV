@@ -50,6 +50,8 @@ def _parquet_format_for_source_paths(paths: list[str]) -> str:
     """路径含 ``tulu`` → ``messages`` 列；否则 ``text`` 列。"""
     if paths and any("tulu" in os.path.normpath(p).lower() for p in paths):
         return "tulu_messages"
+    elif paths and any("textbookchapters" in os.path.normpath(p).lower() for p in paths):
+        return "chapter"
     return "text"
 
 
@@ -89,6 +91,8 @@ def tokenize_source_file(path: str, tokenizer: Tokenizer, parquet_format: str = 
         pf = pq.ParquetFile(path)
         if parquet_format == "tulu_messages":
             col = "messages"
+        elif parquet_format == 'chapter':
+            col = "chapter"
         elif parquet_format == "text":
             col = "text"
         else:
