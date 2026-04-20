@@ -12,7 +12,7 @@ import json
 import os
 
 # 替换成你的 parquet 路径
-file_path = os.path.join(os.path.dirname(__file__), "..", "data", "debug.parquet")
+file_path = "../longdata/textbookchapters/data/train-00000-of-00003.parquet"
 
 NUM_ROWS = 10
 PREVIEW_LEN = 1000
@@ -69,7 +69,7 @@ def main() -> None:
 
     table = _read_table_head(path, NUM_ROWS)
     names = table.column_names
-    print(f"\n👉 前 {n} 行（列: {names}）:\n")
+    print(f"\n👉 前几行（列: {names}）:\n")
     for i in range(table.num_rows):
         print(f"--- row {i} ---")
         for name in names:
