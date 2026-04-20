@@ -3,6 +3,8 @@ import os
 import re
 import shutil
 import glob
+import tempfile
+from pathlib import Path
 # os.environ['https_proxy'] = '127.0.0.1:7897'
 # os.environ['http_proxy'] = '127.0.0.1:7897'
 import yaml
@@ -13,7 +15,7 @@ from datetime import datetime
 from torch.utils.data import DataLoader
 from litgpt import Config
 from litgpt.model import GPT
-from litgpt.utils import chunked_cross_entropy
+from litgpt.utils import chunked_cross_entropy, load_checkpoint
 from jsonargparse import CLI
 import random
 import numpy as np
@@ -338,45 +340,45 @@ def main(
     if ckpt_dir is not None:
         checkpoint_dir = ckpt_dir
     load_dir = checkpoint_dir if resume_dir is None else resume_dir
-    fabric.print(f"🔄 正在从 {load_dir} 加载预训练 Checkpoint...")
-    # 1. 先把原版权重字典加载到内存里
-    raw_ckpt = torch.load(f"{load_dir}/lit_model.pth", map_location='cpu')
-    state_dict = raw_ckpt['model'] if 'model' in raw_ckpt else raw_ckpt
+    ckpt_path = Path(load_dir) / "lit_model.pth"
+    fabric.print(f"🔄 正在从 {ckpt_path} 加载预训练 Checkpoint...")
+
+    # 与 litgpt/pretrain、litgpt/utils.load_checkpoint 一致：先 fabric.setup，再加载。
+    # FSDP 下必须在 wrap 之后用 fabric.load_raw，否则易出现分片与全量 state_dict 不匹配。
+    merged_state_dict = None
+    raw_ckpt = torch.load(ckpt_path, map_location="cpu")
+    state_dict = raw_ckpt["model"] if "model" in raw_ckpt else raw_ckpt
     del raw_ckpt
-    
-    # 2. 🌟 核心拦截：Block 级别的映射与克隆
+
     if config.use_research and config.research_separate_parameter:
         fabric.print("🔀 检测到 Block 级参数独立！正在为 h_prefill 组装预训练权重...")
         prefill_weights = {}
-
-        # 遍历配置中的 SWA 层列表
-        # i 是在 h_prefill ModuleList 中的物理索引 (0, 1, 2...)
-        # block_idx 是在原版 h 中的逻辑层号 (0, 2, 4...)
         for i, block_idx in enumerate(config.research_prefill_swa_layers):
             orig_prefix = f"transformer.h.{block_idx}."
             new_prefix = f"transformer.h_prefill.{i}."
-
-            # 遍历寻找属于原版 block_idx 的所有权重，并改名挂载到 h_prefill 下
             for key, value in state_dict.items():
                 if key.startswith(orig_prefix):
-                    # 极其精准的前缀替换
                     new_key = key.replace(orig_prefix, new_prefix, 1)
                     if new_key not in state_dict.keys():
                         prefill_weights[new_key] = value.clone()
-
-        # 将克隆出的 prefill 分支权重合并入主字典
         state_dict.update(prefill_weights)
         fabric.print(f"✅ 成功映射并注入了 {len(prefill_weights)} 个 Block 级别的张量！")
-
-    # 3. 严格度降低，因为我们凭空造了全新的网络分支
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=True if not use_research else False, assign=True if use_fsdp else False)
-    
-    if len(missing_keys) > 0:
-        fabric.print(f"⚠️ 未加载的参数 (通常为 buffer): {missing_keys[:5]}...")
-        
-    fabric.print("✅ 真实权重加载成功！所有分支已完成 Pre-trained 初始化。")
+        merged_state_dict = state_dict
 
     model = fabric.setup_module(model)
+
+    if merged_state_dict is not None:
+        fd, tmp_path = tempfile.mkstemp(suffix=".pth")
+        os.close(fd)
+        try:
+            torch.save({"model": merged_state_dict}, tmp_path)
+            load_checkpoint(fabric, model, Path(tmp_path), strict=False)
+        finally:
+            os.unlink(tmp_path)
+    else:
+        load_checkpoint(fabric, model, ckpt_path, strict=True)
+
+    fabric.print("✅ 真实权重加载成功！所有分支已完成 Pre-trained 初始化。")
 
     # ==========================================
     # 🌟 工业级优化器初始化：Weight Decay 分组过滤
