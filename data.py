@@ -1,11 +1,10 @@
 """
-parquet / jsonl → LitData 流式 chunks（litdata.optimize）。
+parquet / jsonl / json → LitData 流式 chunks（litdata.optimize）。
 
-缓存目录名含 tokenizer 内容哈希，与模型权重无关；训练侧用 StreamingDataset + TokensLoader 读取。
+``data_dir`` 下 ``rglob`` 递归收集 ``*.parquet`` / ``*.jsonl`` / ``*.json``（``.json`` 常为 NDJSON：每行一个 dict），一次写入同一 litdata 目录。
 """
 from __future__ import annotations
 
-import glob
 import hashlib
 import json
 import os
@@ -47,12 +46,53 @@ def litdata_chunks_dir(
 
 
 def _parquet_format_for_source_paths(paths: list[str]) -> str:
-    """路径含 ``tulu`` → ``messages`` 列；否则 ``text`` 列。"""
+    """路径含 ``tulu`` → ``messages``；``textbookchapters`` → ``chapter``；否则 ``text`` 列。"""
     if paths and any("tulu" in os.path.normpath(p).lower() for p in paths):
         return "tulu_messages"
-    elif paths and any("textbookchapters" in os.path.normpath(p).lower() for p in paths):
+    if paths and any("textbookchapters" in os.path.normpath(p).lower() for p in paths):
         return "chapter"
     return "text"
+
+
+def _collect_data_files(data_dir: str) -> list[str]:
+    """递归收集 ``*.parquet`` / ``*.jsonl`` / ``*.json``。"""
+    root = Path(data_dir).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"data_dir 不是目录: {data_dir}")
+    files = list(root.rglob("*.parquet")) + list(root.rglob("*.jsonl")) + list(root.rglob("*.json"))
+    return sorted({str(p) for p in files})
+
+
+def _iter_json_dicts(path: str):
+    """``.json`` 多为 NDJSON（每行一个完整 dict）；仅当以 ``[`` 开头时才整文件解析 JSON 数组。"""
+    with open(path, encoding="utf-8") as f:
+        head = ""
+        for line in f:
+            s = line.strip()
+            if s:
+                head = s
+                break
+        else:
+            return
+        if head[0] == "[":
+            f.seek(0)
+            data = json.loads(f.read())
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        yield item
+            return
+        f.seek(0)
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    yield obj
+            except json.JSONDecodeError:
+                continue
 
 
 def tulu_messages_to_text(messages: object) -> str | None:
@@ -82,9 +122,9 @@ def tulu_messages_to_text(messages: object) -> str | None:
 
 def tokenize_source_file(path: str, tokenizer: Tokenizer, parquet_format: str = "text"):
     """
-    供 litdata.optimize 调用：每个样本一条序列（与原先 CPT 一致：bos=False, eos=True）。
+    供 litdata.optimize 调用：每个样本一条序列（bos=False, eos=True）。
 
-    ``parquet_format="text"`` 读 ``text`` 列；``tulu_messages`` 读 ``messages`` 列并拼成单段文本。
+    json/jsonl：``content`` / ``text`` / ``code``（The Stack 多为 ``content``）。
     """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".parquet":
@@ -96,20 +136,20 @@ def tokenize_source_file(path: str, tokenizer: Tokenizer, parquet_format: str = 
         elif parquet_format == "text":
             col = "text"
         else:
-            raise ValueError(f"未知 parquet_format: {parquet_format!r}（支持 text、tulu_messages）")
+            raise ValueError(
+                f"未知 parquet_format: {parquet_format!r}（支持 text、chapter、tulu_messages）"
+            )
         for rg in range(pf.num_row_groups):
             table = pf.read_row_group(rg, columns=[col])
             pc = table.column(col)
             for i in range(len(pc)):
                 raw = pc[i].as_py()
-                if parquet_format == "text":
+                if parquet_format == "tulu_messages":
+                    text = tulu_messages_to_text(raw)
+                else:
                     if raw is None or (isinstance(raw, float) and pd.isna(raw)):
                         continue
                     text = str(raw).strip()
-                else:
-                    text = tulu_messages_to_text(raw)
-                    if not text:
-                        continue
                 if not text:
                     continue
                 yield tokenizer.encode(text, bos=False, eos=True)
@@ -121,12 +161,22 @@ def tokenize_source_file(path: str, tokenizer: Tokenizer, parquet_format: str = 
                     continue
                 try:
                     obj = json.loads(line)
-                    text = obj.get("text", obj.get("content", ""))
+                    if not isinstance(obj, dict):
+                        continue
+                    text = (obj.get("content") or obj.get("text") or obj.get("code") or "")
+                    text = str(text).strip()
                     if not text:
                         continue
                     yield tokenizer.encode(text, bos=False, eos=True)
                 except json.JSONDecodeError:
                     continue
+    elif ext == ".json":
+        for obj in _iter_json_dicts(path):
+            text = (obj.get("content") or obj.get("text") or obj.get("code") or "")
+            text = str(text).strip()
+            if not text:
+                continue
+            yield tokenizer.encode(text, bos=False, eos=True)
     else:
         raise ValueError(f"不支持的文件类型: {path}")
 
@@ -160,11 +210,9 @@ def prepare_tokenized_data(
 
     all_files: list[str] = []
     if data_dir and os.path.isdir(data_dir):
-        all_files = sorted(glob.glob(os.path.join(data_dir, "*.parquet"))) + sorted(
-            glob.glob(os.path.join(data_dir, "*.jsonl"))
-        )
+        all_files = _collect_data_files(data_dir)
         if not all_files:
-            raise FileNotFoundError(f"在 {data_dir} 下没有找到 .parquet 或 .jsonl。")
+            raise FileNotFoundError(f"在 {data_dir} 下（递归）没有找到 .parquet / .jsonl / .json。")
     else:
         single_parquet = os.path.join(dataset_dir, f"{dataset_name}.parquet")
         if not os.path.exists(single_parquet):
