@@ -33,6 +33,28 @@ def _preview(val: object, max_len: int) -> str:
     return s
 
 
+def _read_table_head(path: str, max_rows: int):
+    """读前 max_rows 行，兼容旧版 pyarrow（无 read_table(max_rows=)）；不整文件扫描。"""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(path)
+    parts: list = []
+    total = 0
+    for rg in range(pf.num_row_groups):
+        t = pf.read_row_group(rg)
+        parts.append(t)
+        total += t.num_rows
+        if total >= max_rows:
+            break
+    if not parts:
+        return pa.table({})
+    table = pa.concat_tables(parts) if len(parts) > 1 else parts[0]
+    if table.num_rows > max_rows:
+        table = table.slice(0, max_rows)
+    return table
+
+
 def main() -> None:
     import pyarrow.parquet as pq
 
@@ -45,9 +67,9 @@ def main() -> None:
     print("📋 Schema:\n", pf.schema_arrow)
     print("📊 num_rows:", pf.metadata.num_rows, " num_row_groups:", pf.num_row_groups)
 
-    table = pq.read_table(path, max_rows=NUM_ROWS)
+    table = _read_table_head(path, NUM_ROWS)
     names = table.column_names
-    print(f"\n👉 前 {min(NUM_ROWS, table.num_rows)} 行（列: {names}）:\n")
+    print(f"\n👉 前 {n} 行（列: {names}）:\n")
     for i in range(table.num_rows):
         print(f"--- row {i} ---")
         for name in names:
