@@ -30,7 +30,7 @@ from litdata.streaming import (
     TokensLoader,
 )
 
-from data import litdata_chunks_dir
+from data import litdata_chunks_dir, tokenizer_cache_key
 from utils import *
 
 torch.set_float32_matmul_precision('high')
@@ -161,7 +161,7 @@ def build_train_dataset(
     dataset_dir: str,
     data_mix_yaml: str | None,
 ) -> StreamingDataset | CombinedStreamingDataset:
-    """无 ``data_mix_yaml`` → ``litdata_chunks_dir`` 单源；有 → YAML 里 ``paths`` + ``weights`` → ``CombinedStreamingDataset``。"""
+    """无 ``data_mix_yaml`` → ``litdata_chunks_dir`` 单源；有 → YAML 的 ``paths``（语料父目录）+ ``weights`` → ``CombinedStreamingDataset``。"""
     block = context_length + 1
 
     def _stream(path: str) -> StreamingDataset:
@@ -193,11 +193,25 @@ def build_train_dataset(
         raise ValueError("paths 与 weights 长度须相同")
     base = cfg.get("base_dir")
     base = os.path.abspath(os.path.expanduser(str(base))) if base else ""
+
+    def _resolve_yaml_path(p: str) -> str:
+        """每项为语料根目录（与 data.py 的 ``--data_dir`` 对应），解析为 ``<dir>/litdata_<hash>_ctx<len>``。"""
+        p_exp = os.path.expanduser(str(p).strip())
+        full = os.path.join(base, p_exp) if base else p_exp
+        full = os.path.abspath(os.path.normpath(full))
+        if not os.path.isdir(full):
+            raise FileNotFoundError(f"paths 不是目录: {full!r}")
+        key = tokenizer_cache_key(tok_dir)
+        exact = os.path.join(full, f"litdata_{key}_ctx{context_length}")
+        if os.path.isdir(exact) and any(os.scandir(exact)):
+            return os.path.abspath(exact)
+        raise FileNotFoundError(
+            f"未找到 {exact!r}（需与当前 tokenizer、context_length 一致地先跑 data.py）"
+        )
+
     dirs: list[str] = []
     for p in raw_paths:
-        p = os.path.expanduser(str(p))
-        full = os.path.join(base, p) if base else p
-        full = os.path.abspath(full)
+        full = _resolve_yaml_path(str(p))
         if not os.path.isdir(full) or not any(os.scandir(full)):
             raise FileNotFoundError(f"LitData 目录无效（需已 data.py optimize）: {full}")
         dirs.append(full)
