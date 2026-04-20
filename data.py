@@ -46,12 +46,21 @@ def litdata_chunks_dir(
 
 
 def _parquet_format_for_source_paths(paths: list[str]) -> str:
-    """路径含 ``tulu`` → ``messages``；``textbookchapters`` → ``chapter``；否则 ``text`` 列。"""
+    """路径含 ``tulu`` → ``messages``；``textbookchapters`` → 正文列在 tokenize 里按 schema 选；否则 ``text`` 列。"""
     if paths and any("tulu" in os.path.normpath(p).lower() for p in paths):
         return "tulu_messages"
     if paths and any("textbookchapters" in os.path.normpath(p).lower() for p in paths):
         return "chapter"
     return "text"
+
+
+def _parquet_body_column(pf: pq.ParquetFile) -> str:
+    """TextbookChapters 等语料正文列多为 ``text``，少数为 ``chapter`` / ``content``。"""
+    names = {f.name for f in pf.schema_arrow}
+    for c in ("text", "chapter", "content"):
+        if c in names:
+            return c
+    raise ValueError(f"parquet 缺少正文列 text/chapter/content，实际列: {sorted(names)}")
 
 
 def _collect_data_files(data_dir: str) -> list[str]:
@@ -124,15 +133,16 @@ def tokenize_source_file(path: str, tokenizer: Tokenizer, parquet_format: str = 
     """
     供 litdata.optimize 调用：每个样本一条序列（bos=False, eos=True）。
 
-    json/jsonl：``content`` / ``text`` / ``code``（The Stack 多为 ``content``）。
+    Parquet：``text`` 模式固定读 ``text``；``chapter`` 模式按文件 schema 选 ``text`` / ``chapter`` / ``content``。
+    json/jsonl：``content`` / ``text`` / ``code``。
     """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".parquet":
         pf = pq.ParquetFile(path)
         if parquet_format == "tulu_messages":
             col = "messages"
-        elif parquet_format == 'chapter':
-            col = "chapter"
+        elif parquet_format == "chapter":
+            col = _parquet_body_column(pf)
         elif parquet_format == "text":
             col = "text"
         else:
