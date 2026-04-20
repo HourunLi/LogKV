@@ -1,1 +1,1 @@
-python data.py --tokenizer_dir checkpoints/Qwen/Qwen3-0.6B-Base/ --data_dir ../longdata/tulu-v2-sft-mixture/data/ --context_length 32768 --num_workers 64
+python data.py --tokenizer_dir checkpoints/Qwen/Qwen3-0.6B-Base/ --data_dir /home/ma-user/work/bucket-wulan-green/zhaoyusheng/fineweb-edu/sample/10BT/ --context_length 32768 --num_workers 64
