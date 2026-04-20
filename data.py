@@ -40,25 +40,72 @@ def tokenizer_cache_key(tokenizer_dir: str) -> str:
 def litdata_chunks_dir(
     tokenizer_dir: str, data_dir: str | None, dataset_dir: str, context_length: int
 ) -> str:
-    """LitData optimize 输出目录（与训练共用；含 context_length 避免块大小不一致）。"""
+    """LitData optimize 输出目录（与训练共用；含 context_length）。"""
     key = tokenizer_cache_key(tokenizer_dir)
     root = data_dir if data_dir else dataset_dir
     return os.path.join(root, f"litdata_{key}_ctx{context_length}")
 
 
-def tokenize_source_file(path: str, tokenizer: Tokenizer):
+def _parquet_format_for_source_paths(paths: list[str]) -> str:
+    """路径含 ``tulu`` → ``messages`` 列；否则 ``text`` 列。"""
+    if paths and any("tulu" in os.path.normpath(p).lower() for p in paths):
+        return "tulu_messages"
+    return "text"
+
+
+def tulu_messages_to_text(messages: object) -> str | None:
+    """``messages`` → 单段文本（``### role`` 分段）。"""
+    if messages is None:
+        return None
+    if isinstance(messages, float) and pd.isna(messages):
+        return None
+    if not messages:
+        return None
+    parts: list[str] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role", "user"))
+        content = m.get("content")
+        if content is None:
+            continue
+        text = str(content).strip()
+        if not text:
+            continue
+        parts.append(f"### {role}\n{text}")
+    if not parts:
+        return None
+    return "\n\n".join(parts)
+
+
+def tokenize_source_file(path: str, tokenizer: Tokenizer, parquet_format: str = "text"):
     """
     供 litdata.optimize 调用：每个样本一条序列（与原先 CPT 一致：bos=False, eos=True）。
+
+    ``parquet_format="text"`` 读 ``text`` 列；``tulu_messages`` 读 ``messages`` 列并拼成单段文本。
     """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".parquet":
         pf = pq.ParquetFile(path)
+        if parquet_format == "tulu_messages":
+            col = "messages"
+        elif parquet_format == "text":
+            col = "text"
+        else:
+            raise ValueError(f"未知 parquet_format: {parquet_format!r}（支持 text、tulu_messages）")
         for rg in range(pf.num_row_groups):
-            table = pf.read_row_group(rg, columns=["text"])
-            for text in table.to_pandas()["text"]:
-                if pd.isna(text):
-                    continue
-                text = str(text).strip()
+            table = pf.read_row_group(rg, columns=[col])
+            pc = table.column(col)
+            for i in range(len(pc)):
+                raw = pc[i].as_py()
+                if parquet_format == "text":
+                    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+                        continue
+                    text = str(raw).strip()
+                else:
+                    text = tulu_messages_to_text(raw)
+                    if not text:
+                        continue
                 if not text:
                     continue
                 yield tokenizer.encode(text, bos=False, eos=True)
@@ -128,6 +175,8 @@ def prepare_tokenized_data(
                 raise NotImplementedError(f"数据集 {dataset_name} 尚未实现")
         all_files = [single_parquet]
 
+    parquet_format = _parquet_format_for_source_paths(all_files)
+
     tokenizer = Tokenizer(tokenizer_dir)
     _validate_tokenizer(tokenizer)
 
@@ -145,7 +194,7 @@ def prepare_tokenized_data(
     print(f"🚀 litdata.optimize → {out_dir}（chunk_bytes={chunk_bytes}, workers={use_workers}）")
 
     optimize(
-        fn=partial(tokenize_source_file, tokenizer=tokenizer),
+        fn=partial(tokenize_source_file, tokenizer=tokenizer, parquet_format=parquet_format),
         inputs=all_files,
         output_dir=out_dir,
         num_workers=use_workers,
