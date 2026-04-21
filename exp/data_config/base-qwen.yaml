@@ -9,12 +9,12 @@ paths:
   - slimpajama-books/train/RedPajamaBook/
   - slimpajama-stackexchange/train/RedPajamaStackExchange/
   - slimpajama-wikipedia/train/RedPajamaWikipedia/
-  # - textbookchapters/data/
+  - textbookchapters/data/
   - the-stack-smol-xl/data/
   - tulu-v2-sft-mixture/data/
-weights: [0.15, 0.10, 0.15, 0.20, 0.05, 0.05, 0.10, 0.10]
+weights: [0.15, 0.10, 0.15, 0.20, 0.05, 0.05, 0.10, 0.10, 0.10]
 
 # 可选
-# base_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/
-base_dir: /data/zys/longdata/
+base_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/
+# base_dir: /data/zys/longdata/
 # iterate_over_all: false
