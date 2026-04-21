@@ -371,7 +371,10 @@ def main(
         fd, tmp_path = tempfile.mkstemp(suffix=".pth")
         os.close(fd)
         try:
-            torch.save({"model": merged_state_dict}, tmp_path)
+            # 须与 convert_hf_checkpoint 的 lit_model.pth 一致：扁平 state_dict。
+            # fabric.load_raw → _load_raw_module_state 不会执行 .get("model")；若包一层 "model" 则
+            # load_state_dict 匹配不到任何参数，strict=False 下整网仍随机（loss≈ln vocab）。
+            torch.save(merged_state_dict, tmp_path)
             load_checkpoint(fabric, model, Path(tmp_path), strict=False)
         finally:
             os.unlink(tmp_path)
