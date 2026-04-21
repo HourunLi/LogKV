@@ -1,1 +1,1 @@
-python data.py --tokenizer_dir checkpoints/Qwen/Qwen3-0.6B-Base/ --data_dir /workspace/fineweb-edu/sample/10BT/ --context_length 32768 --num_workers 64
+python data.py --tokenizer_dir checkpoints/Qwen/Qwen3-0.6B-Base/ --data_dir /workspace/longcontext/textbookchapters/data/ --context_length 32768 --num_workers 64
