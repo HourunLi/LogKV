@@ -20,9 +20,12 @@ if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     os.environ['HF_DATASETS_CACHE'] = f'{BASE}/hf_cache'
     os.environ['HF_EVALUATE_CACHE'] = f'{BASE}/evaluate'
     os.environ['HF_MODULES_CACHE'] = f'{BASE}/modules'
+    os.environ['HUGGINGFACE_HUB_CACHE'] = f'{BASE}/hub'
+    os.environ['HF_HUB_CACHE'] = f'{BASE}/hub'
     os.environ['NLTK_DATA'] = f'{BASE}/nltk_data'
     os.environ['HF_HUB_OFFLINE'] = '1'
     os.environ['HF_DATASETS_OFFLINE'] = '1'
+    os.environ['HF_DATASETS_IN_MEMORY_MAX_SIZE'] = '0'
     os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     os.environ["HF_ALLOW_CODE_EVAL"] = "1"
