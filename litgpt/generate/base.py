@@ -222,10 +222,6 @@ def generate_fn(
                 top_p=top_p,
                 prefill_mask=decode_mask, # 🌟 强制走 Decode 分支
             )
-            
-            # 状态更新，进入自回归模式
-            prefill_token = False
-            input_pos = torch.tensor([prompt_size], device=device, dtype=torch.int64)
         else:
             # ==========================================
             # 🌟 正常的逐字 Decode 生成逻辑
@@ -240,11 +236,7 @@ def generate_fn(
                 top_p=top_p,
                 prefill_mask=decode_mask, # 🌟 强制走 Decode 分支
             )
-            input_pos.add_(1)
-            
-        if input_pos_maxp1 is not None:
-            input_pos_maxp1 += 1
-        
+
         tokens.append(token)
         int_token = token.item()
 
