@@ -12,7 +12,7 @@ import json
 import os
 
 # 替换成你的 parquet 路径
-file_path = "../longdata/textbookchapters/data/train-00000-of-00003.parquet"
+file_path = "../longdata/prolong/data/train-00000-of-00241.parquet"
 
 NUM_ROWS = 10
 PREVIEW_LEN = 1000
