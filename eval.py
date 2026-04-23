@@ -12,14 +12,34 @@ from typing import Any
 from jsonargparse import CLI
 import tqdm
 
-if 'HF_DATASETS_CACHE' not in os.environ:
+if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     print("设置环境变量...")
-    os.environ['HF_HOME'] = '/data/zys/data/hf_cache'
-    os.environ['HF_DATASETS_CACHE'] = '/data/zys/data/hf_cache/hf_cache'
-    os.environ['HF_EVALUATE_CACHE'] = '/data/zys/data/hf_cache/evaluate'
-    os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
+
+    BASE = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache'
+    os.environ['HF_HOME'] = BASE
+    os.environ['HF_DATASETS_CACHE'] = f'{BASE}/hf_cache'
+    os.environ['HF_EVALUATE_CACHE'] = f'{BASE}/evaluate'
+    os.environ['HF_MODULES_CACHE'] = f'{BASE}/modules'
+    os.environ['HUGGINGFACE_HUB_CACHE'] = f'{BASE}/hub'
+    os.environ['HF_HUB_CACHE'] = f'{BASE}/hub'
+    os.environ['NLTK_DATA'] = f'{BASE}/nltk_data'
+    os.environ['HF_HUB_OFFLINE'] = '1'
     os.environ['HF_DATASETS_OFFLINE'] = '1'
+    os.environ['HF_DATASETS_IN_MEMORY_MAX_SIZE'] = '0'
+    os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+
+    # os.environ['HF_HOME'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache'
+    # os.environ['HF_DATASETS_CACHE'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/hf_cache'
+    # os.environ['HF_EVALUATE_CACHE'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/evaluate'
+    # os.environ['HUGGINGFACE_HUB_CACHE'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/hub'
+    # os.environ['HF_HUB_CACHE'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/hub'
+    # os.environ['NLTK_DATA'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/nltk_data'
+    # os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
+    # os.environ['HF_DATASETS_OFFLINE'] = '1'
+    # os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    
     # os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
     # os.environ['CURL_CA_BUNDLE'] = ''
     # os.environ['REQUESTS_CA_BUNDLE'] = ''
@@ -348,6 +368,7 @@ def main(
     results = evaluator.simple_evaluate(
         model=lm_model,
         tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
+        confirm_run_unsafe_code=True,
         batch_size=1,
     )
     
