@@ -559,26 +559,29 @@ def main(
                     fabric.print(f"🔥 已移除层 {remove_index}，当前所有已移除层为 {config.research_removed_layers}")
 
     if save_ckpt:
+        local_save_path = f"/cache/tmp_ckpt/step_{global_step}"
+        os.makedirs(local_save_path, exist_ok=True)
         os.makedirs(save_path, exist_ok=True)
-        fabric.print(f"💾 正在保存模型至 {save_path}")
         
-        # 🌟 直接传对象引用！不需要显式调用 model.state_dict()
-        # 甚至可以顺手把 optimizer 的状态也存进去，方便中断后继续训练
+        fabric.print(f"💾 正在将模型先临时保存至本地高速磁盘 {local_save_path} ...")
+        
         state = {
             "model": model, 
             "optimizer": optimizer, 
             "global_step": global_step
         }
-        
-        # fabric.save 底层会安全地萃取出没有 module. 前缀的纯净权重
-        fabric.save(f"{save_path}/lit_model.pth", state)
-
+        fabric.save(f"{local_save_path}/lit_model.pth", state)
         for file_path in glob.glob(f"{checkpoint_dir}/*.json") + glob.glob(f"{checkpoint_dir}/*.model"):
-            shutil.copy(file_path, save_path)
-        with open(f"{save_path}/model_config.yaml", "w", encoding="utf-8") as f:
+            shutil.copy(file_path, local_save_path)
+            
+        with open(f"{local_save_path}/model_config.yaml", "w", encoding="utf-8") as f:
             yaml.dump(asdict(config), f)
             
-        fabric.print(f"📦 Tokenizer 和 Config 已自动同步至 {save_path}")
+        fabric.print(f"📦 Tokenizer 和 Config 已自动同步至 {local_save_path}")
+        fabric.print(f"🚀 正在将完整权重文件同步至最终目标路径 {save_path} ...")
+        shutil.copytree(local_save_path, save_path, dirs_exist_ok=True)
+        shutil.rmtree(local_save_path)
+        fabric.print(f"✅ 模型及配置文件已成功安全地保存至 {save_path}")
     
     if run_eval in ("after", "both"):
         _run_eval(save_path)

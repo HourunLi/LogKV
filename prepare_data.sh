@@ -1,1 +1,1 @@
-python data.py --tokenizer_dir checkpoints/Qwen/Qwen3-0.6B-Base/ --data_dir /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/textbookchapters/data/ --context_length 32768 --num_workers 64
+python data.py --tokenizer_dir checkpoints/Qwen/Qwen3-0.6B-Base/ --data_dir ../longdata/prolong/data/ --context_length 32768 --num_workers 64
