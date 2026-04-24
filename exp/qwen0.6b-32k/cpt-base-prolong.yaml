@@ -13,7 +13,7 @@ min_lr: 5e-5
 weight_decay: 0.1
 num_devices: 8
 
-data_dir: /workspace/prolong/data
+data_dir: /workspace/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
 save_path: /workspace/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-base
