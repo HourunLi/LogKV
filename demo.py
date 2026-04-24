@@ -612,8 +612,10 @@ def main(
 
     if save_ckpt:
         local_save_path = f"/cache/tmp_ckpt/step_{global_step}"
-        os.makedirs(local_save_path, exist_ok=True)
-        os.makedirs(save_path, exist_ok=True)
+        if fabric.global_rank == 0:
+            os.makedirs(local_save_path, exist_ok=True)
+            os.makedirs(save_path, exist_ok=True)
+        fabric.barrier()
         
         fabric.print(f"💾 正在将模型先临时保存至本地高速磁盘 {local_save_path} ...")
         
@@ -623,17 +625,21 @@ def main(
             "global_step": global_step
         }
         fabric.save(f"{local_save_path}/lit_model.pth", state)
-        for file_path in glob.glob(f"{checkpoint_dir}/*.json") + glob.glob(f"{checkpoint_dir}/*.model"):
-            shutil.copy(file_path, local_save_path)
-            
-        with open(f"{local_save_path}/model_config.yaml", "w", encoding="utf-8") as f:
-            yaml.dump(asdict(config), f)
-            
-        fabric.print(f"📦 Tokenizer 和 Config 已自动同步至 {local_save_path}")
-        fabric.print(f"🚀 正在将完整权重文件同步至最终目标路径 {save_path} ...")
-        shutil.copytree(local_save_path, save_path, dirs_exist_ok=True)
-        shutil.rmtree(local_save_path)
-        fabric.print(f"✅ 模型及配置文件已成功安全地保存至 {save_path}")
+        fabric.barrier()
+
+        if fabric.global_rank == 0:
+            for file_path in glob.glob(f"{checkpoint_dir}/*.json") + glob.glob(f"{checkpoint_dir}/*.model"):
+                shutil.copy(file_path, local_save_path)
+                
+            with open(f"{local_save_path}/model_config.yaml", "w", encoding="utf-8") as f:
+                yaml.dump(asdict(config), f)
+                
+            fabric.print(f"📦 Tokenizer 和 Config 已自动同步至 {local_save_path}")
+            fabric.print(f"🚀 正在将完整权重文件同步至最终目标路径 {save_path} ...")
+            shutil.copytree(local_save_path, save_path, dirs_exist_ok=True)
+            shutil.rmtree(local_save_path)
+            fabric.print(f"✅ 模型及配置文件已成功安全地保存至 {save_path}")
+        fabric.barrier()
     
     if run_eval in ("after", "both"):
         _run_eval(save_path)
