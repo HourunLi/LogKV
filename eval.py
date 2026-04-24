@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import yaml
 import torch
@@ -56,6 +57,31 @@ from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
 
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
+
+
+def _load_lit_model_checkpoint(checkpoint_dir: str, map_location: str | torch.device) -> Any:
+    """加载 ``{checkpoint_dir}/lit_model.pth``。
+
+    - **经典格式（默认）**：单个 ``lit_model.pth`` 文件 → ``torch.load``，与改 DCP 之前行为一致。
+    - **FSDP 分片**：``lit_model.pth`` 为目录且含 ``*.distcp`` → Lightning ``_load_distributed_checkpoint`` 合并后再走原有 ``"model"`` 解析逻辑。
+    """
+    lit_path = Path(checkpoint_dir).expanduser() / "lit_model.pth"
+    if not lit_path.exists():
+        raise FileNotFoundError(f"未找到 checkpoint: {lit_path}")
+
+    # 1) 以前训练 / convert 产出的单文件权重（最常见）
+    if lit_path.is_file():
+        return torch.load(str(lit_path), map_location=map_location, weights_only=False)
+
+    # 2) Fabric FSDP sharded：同名路径下是目录
+    if lit_path.is_dir():
+        from lightning.fabric.utilities.load import _load_distributed_checkpoint
+        return _load_distributed_checkpoint(lit_path)
+
+    raise FileNotFoundError(
+        f"{lit_path} 存在但不是单文件权重，也不像 DCP/FSDP 分片目录（需要 *.distcp 以及 meta.pt 或 .metadata）。"
+        "若你仍是单文件 ckpt，请确认路径为文件而非目录。"
+    )
 
 
 def _parse_csv_ints(s: str) -> list[int]:
@@ -151,7 +177,7 @@ class CustomResearchLM(LM):
         self.model = GPT(self.config).to(device).bfloat16()
         
         if is_master: print(f"🔄 正在加载权重...")
-        checkpoint = torch.load(f"{checkpoint_dir}/lit_model.pth", map_location=device)
+        checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
         
         # 🌟 核心修复：检查是不是被包裹过的 checkpoint 字典
         if "model" in checkpoint:
