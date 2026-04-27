@@ -62,8 +62,10 @@ _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 def _load_lit_model_checkpoint(checkpoint_dir: str, map_location: str | torch.device) -> Any:
     """加载 ``{checkpoint_dir}/lit_model.pth``。
 
-    - **经典格式（默认）**：单个 ``lit_model.pth`` 文件 → ``torch.load``，与改 DCP 之前行为一致。
-    - **FSDP 分片**：``lit_model.pth`` 为目录且含 ``*.distcp`` → Lightning ``_load_distributed_checkpoint`` 合并后再走原有 ``"model"`` 解析逻辑。
+    - **经典格式**：单文件 ``lit_model.pth`` → ``torch.load(..., weights_only=False)``（兼容 PyTorch 2.6+ 默认）。
+    - **FSDP 分片**：``lit_model.pth`` 为目录 → Lightning ``_load_distributed_checkpoint``；加载期间临时设置
+      ``TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1``，避免 2.6+ 默认 ``weights_only=True`` 在读 ``meta.pt``/DCP 时触发
+      ``_weights_only_unpickler`` 报错（如 ``IndexError: pop from empty list``）。
     """
     lit_path = Path(checkpoint_dir).expanduser() / "lit_model.pth"
     if not lit_path.exists():
@@ -76,7 +78,17 @@ def _load_lit_model_checkpoint(checkpoint_dir: str, map_location: str | torch.de
     # 2) Fabric FSDP sharded：同名路径下是目录
     if lit_path.is_dir():
         from lightning.fabric.utilities.load import _load_distributed_checkpoint
-        return _load_distributed_checkpoint(lit_path)
+
+        _k = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
+        _prev = os.environ.get(_k)
+        os.environ[_k] = "1"
+        try:
+            return _load_distributed_checkpoint(lit_path)
+        finally:
+            if _prev is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _prev
 
     raise FileNotFoundError(
         f"{lit_path} 存在但不是单文件权重，也不像 DCP/FSDP 分片目录（需要 *.distcp 以及 meta.pt 或 .metadata）。"
