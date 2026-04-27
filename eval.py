@@ -64,10 +64,13 @@ _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 def _load_lit_model_checkpoint(checkpoint_dir: str, map_location: str | torch.device) -> Any:
     """加载 ``{checkpoint_dir}/lit_model.pth``。
 
-    - **经典格式**：单文件 ``lit_model.pth`` → ``torch.load(..., weights_only=False)``（兼容 PyTorch 2.6+ 默认）。
-    - **FSDP 分片**：``lit_model.pth`` 为目录 → Lightning ``_load_distributed_checkpoint``；加载期间临时设置
-      ``TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1``，避免 2.6+ 默认 ``weights_only=True`` 在读 ``meta.pt``/DCP 时触发
-      ``_weights_only_unpickler`` 报错（如 ``IndexError: pop from empty list``）。
+    - **经典格式**：单文件 ``lit_model.pth`` → ``torch.load(..., weights_only=False)``。
+    - **FSDP 分片**：``lit_model.pth`` 为目录 → Lightning ``_load_distributed_checkpoint``。
+
+    PyTorch DCP 的 ``FileSystemReader.read_data`` 会对分片内张量显式 ``torch.load(..., weights_only=True)``，
+    与部分 Fabric/Lightning 保存的 pickle 不兼容，触发 ``_weights_only_unpickler`` 的 ``IndexError``。
+    环境变量 ``TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD`` **无法**覆盖「已显式传入的 weights_only」，
+    因此在合并分片期间临时把 ``torch.load`` 替换为强制 ``weights_only=False``（仅作用于本次加载）。
     """
     lit_path = Path(checkpoint_dir).expanduser() / "lit_model.pth"
     if not lit_path.exists():
@@ -81,16 +84,25 @@ def _load_lit_model_checkpoint(checkpoint_dir: str, map_location: str | torch.de
     if lit_path.is_dir():
         from lightning.fabric.utilities.load import _load_distributed_checkpoint
 
+        _orig_torch_load = torch.load
+
+        def _trusted_torch_load(*args: Any, **kwargs: Any) -> Any:
+            kwargs = dict(kwargs)
+            kwargs["weights_only"] = False
+            return _orig_torch_load(*args, **kwargs)
+
         _k = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
-        _prev = os.environ.get(_k)
+        _prev_env = os.environ.get(_k)
         os.environ[_k] = "1"
+        torch.load = _trusted_torch_load  # type: ignore[method-assign]
         try:
             return _load_distributed_checkpoint(lit_path)
         finally:
-            if _prev is None:
+            torch.load = _orig_torch_load  # type: ignore[method-assign]
+            if _prev_env is None:
                 os.environ.pop(_k, None)
             else:
-                os.environ[_k] = _prev
+                os.environ[_k] = _prev_env
 
     raise FileNotFoundError(
         f"{lit_path} 存在但不是单文件权重，也不像 DCP/FSDP 分片目录（需要 *.distcp 以及 meta.pt 或 .metadata）。"
