@@ -1,42 +1,40 @@
-[rank7]: Traceback (most recent call last):
-[rank7]:   File "/data/zys/litgpt/eval.py", line 421, in <module>
-[rank7]:     CLI(main)
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/jsonargparse/_cli.py", line 27, in CLI
-[rank7]:     return auto_cli(*args, _stacklevel=3, **kwargs)
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/jsonargparse/_cli.py", line 106, in auto_cli
-[rank7]:     return _run_component(components, init)
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/jsonargparse/_cli.py", line 227, in _run_component
-[rank7]:     return component(**cfg)
-[rank7]:   File "/data/zys/litgpt/utils.py", line 47, in wrapper
-[rank7]:     return func(*expanded_args, **expanded_kwargs)
-[rank7]:   File "/data/zys/litgpt/eval.py", line 402, in main
-[rank7]:     lm_model = CustomResearchLM(
-[rank7]:   File "/data/zys/litgpt/eval.py", line 194, in __init__
-[rank7]:     checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
-[rank7]:   File "/data/zys/litgpt/eval.py", line 88, in _load_lit_model_checkpoint
-[rank7]:     return _load_distributed_checkpoint(lit_path)
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/lightning/fabric/utilities/load.py", line 254, in _load_distributed_checkpoint
-[rank7]:     _load_state_dict(
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/state_dict_loader.py", line 300, in _load_state_dict
-[rank7]:     _ = distW.all_gather("read", read_data)
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/utils.py", line 288, in all_gather
-[rank7]:     raise CheckpointException(step, node_failures)
-[rank7]: torch.distributed.checkpoint.api.CheckpointException: CheckpointException ranks:dict_keys([0])
-[rank7]: Traceback (most recent call last): (RANK 0)
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/utils.py", line 280, in all_gather
-[rank7]:     result = map_fun()
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/logger.py", line 90, in wrapper
-[rank7]:     result = func(*args, **kwargs)
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/state_dict_loader.py", line 294, in read_data
-[rank7]:     all_reads = storage_reader.read_data(final_local_plan, planner)
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/filesystem.py", line 899, in read_data
-[rank7]:     torch.load(
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/serialization.py", line 1595, in load
-[rank7]:     return _legacy_load(
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/serialization.py", line 1855, in _legacy_load
-[rank7]:     magic_number = pickle_module.load(f, **pickle_load_args)
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/_weights_only_unpickler.py", line 590, in load
-[rank7]:     return Unpickler(file, encoding=encoding).load()
-[rank7]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/_weights_only_unpickler.py", line 566, in load
-[rank7]:     rc = self.stack.pop()
-[rank7]: IndexError: pop from empty list
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/data/zys/litgpt/eval.py", line 433, in <module>
+[rank2]:     CLI(main)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/jsonargparse/_cli.py", line 27, in CLI
+[rank2]:     return auto_cli(*args, _stacklevel=3, **kwargs)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/jsonargparse/_cli.py", line 106, in auto_cli
+[rank2]:     return _run_component(components, init)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/jsonargparse/_cli.py", line 227, in _run_component
+[rank2]:     return component(**cfg)
+[rank2]:   File "/data/zys/litgpt/utils.py", line 47, in wrapper
+[rank2]:     return func(*expanded_args, **expanded_kwargs)
+[rank2]:   File "/data/zys/litgpt/eval.py", line 414, in main
+[rank2]:     lm_model = CustomResearchLM(
+[rank2]:   File "/data/zys/litgpt/eval.py", line 206, in __init__
+[rank2]:     checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
+[rank2]:   File "/data/zys/litgpt/eval.py", line 99, in _load_lit_model_checkpoint
+[rank2]:     return _load_distributed_checkpoint(lit_path)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/lightning/fabric/utilities/load.py", line 254, in _load_distributed_checkpoint
+[rank2]:     _load_state_dict(
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/state_dict_loader.py", line 300, in _load_state_dict
+[rank2]:     _ = distW.all_gather("read", read_data)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/utils.py", line 288, in all_gather
+[rank2]:     raise CheckpointException(step, node_failures)
+[rank2]: torch.distributed.checkpoint.api.CheckpointException: CheckpointException ranks:dict_keys([0])
+[rank2]: Traceback (most recent call last): (RANK 0)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/utils.py", line 280, in all_gather
+[rank2]:     result = map_fun()
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/logger.py", line 90, in wrapper
+[rank2]:     result = func(*args, **kwargs)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/state_dict_loader.py", line 294, in read_data
+[rank2]:     all_reads = storage_reader.read_data(final_local_plan, planner)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/checkpoint/filesystem.py", line 899, in read_data
+[rank2]:     torch.load(
+[rank2]:   File "/data/zys/litgpt/eval.py", line 92, in _trusted_torch_load
+[rank2]:     return _orig_torch_load(*args, **kwargs)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/serialization.py", line 1603, in load
+[rank2]:     return _legacy_load(
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/serialization.py", line 1855, in _legacy_load
+[rank2]:     magic_number = pickle_module.load(f, **pickle_load_args)
+[rank2]: _pickle.UnpicklingError: unpickling stack underflow
