@@ -13,6 +13,8 @@ from typing import Any
 from jsonargparse import CLI
 import tqdm
 
+from utils import auto_expand_env_vars
+
 if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     print("设置环境变量...")
 
@@ -378,6 +380,7 @@ class CustomResearchLM(LM):
     def tok_encode(self, string): return self.tokenizer.encode(string).tolist()
     def tok_decode(self, tokens): return self.tokenizer.decode(torch.tensor(tokens))
 
+@auto_expand_env_vars
 def main(
     checkpoint_dir: str = "checkpoints/Qwen/Qwen3-0.6B-Base",
     benchmark: str = "debug",

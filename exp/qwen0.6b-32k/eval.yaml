@@ -1,0 +1,2 @@
+benchmark: "boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-fullswa-short
