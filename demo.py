@@ -39,6 +39,23 @@ torch.set_float32_matmul_precision('high')
 torch.set_default_dtype(torch.bfloat16)
 
 
+def _unique_save_dir(save_path: str) -> str:
+    """若目标路径已存在（文件或目录），则在同父目录下依次使用 ``{原名}_v2``、``_v3`` … 直至可用。"""
+    p = Path(os.path.expandvars(os.path.expanduser(save_path)))
+    try:
+        p = p.resolve()
+    except OSError:
+        p = Path(os.path.abspath(p))
+    parent = p.parent
+    base = p.name
+    cand = p
+    n = 2
+    while cand.exists():
+        cand = parent / f"{base}_v{n}"
+        n += 1
+    return str(cand)
+
+
 def _distributed_looks_multi_node() -> bool:
     """torchrun 多机时通常 WORLD_SIZE > LOCAL_WORLD_SIZE；单机多卡二者相等。"""
     try:
@@ -611,6 +628,9 @@ def main(
                     fabric.print(f"🔥 已移除层 {remove_index}，当前所有已移除层为 {config.research_removed_layers}")
 
     if save_ckpt:
+        save_path = _unique_save_dir(save_path)
+        if fabric.global_rank == 0:
+            fabric.print(f"💾 最终保存目录（已避重）: {save_path}")
         local_save_path = f"/cache/tmp_ckpt/step_{global_step}"
         if fabric.global_rank == 0:
             os.makedirs(local_save_path, exist_ok=True)
