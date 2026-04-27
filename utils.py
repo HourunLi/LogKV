@@ -7,6 +7,64 @@ import torch
 import random
 import numpy as np
 from litgpt.tokenizer import Tokenizer
+from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
+import shutil
+
+
+def convert_and_replace_fsdp_ckpt(ckpt_root: str):
+    """
+    将指定目录下的 FSDP/DCP checkpoint 转换为单文件，并使用 shutil 自动完成文件替换。
+    假设原分片保存在名为 'lit_model.pth' 的【文件夹】中。
+    """
+    # 1. 定义路径
+    original_dcp_dir = os.path.join(ckpt_root, "lit_model.pth")
+    merged_file_temp = os.path.join(ckpt_root, "lit_model_merged.pth")
+    backup_dcp_dir = os.path.join(ckpt_root, "lit_model_fsdp_dir.bak")
+
+    # 2. 基础检查
+    if not os.path.exists(original_dcp_dir):
+        print(f"❌ 找不到源路径: {original_dcp_dir}")
+        return
+    if not os.path.isdir(original_dcp_dir):
+        print(f"⚠️ {original_dcp_dir} 已经是一个文件，无需合并和替换！")
+        return
+
+    print(f"📦 [1/3] 正在读取分布式分片目录: {original_dcp_dir}")
+    print("⏳ 正在聚合权重（此过程会在 CPU 内存中拼装完整模型，请耐心等待）...")
+
+    try:
+        # 3. 执行核心转换逻辑 (存为一个临时文件)
+        dcp_to_torch_save(original_dcp_dir, merged_file_temp)
+        
+        file_size_gb = os.path.getsize(merged_file_temp) / (1024 ** 3)
+        print(f"✅ 转换成功！合并后的单文件大小: {file_size_gb:.2f} GB")
+
+        # 4. 偷梁换柱 (使用 shutil 转移文件)
+        print("\n🔄 [2/3] 正在执行目录与文件的替换操作...")
+        
+        # 为了防止多次运行报错，检查是否已经有备份的旧目录，有则清理
+        if os.path.exists(backup_dcp_dir):
+            print(f"   * 发现残留的旧备份目录 {backup_dcp_dir}，正在清理...")
+            shutil.rmtree(backup_dcp_dir)
+        
+        # (A) 备份原 FSDP 目录 (将文件夹 lit_model.pth 移动并重命名为 lit_model_fsdp_dir.bak)
+        print("   -> 备份原目录: lit_model.pth ===> lit_model_fsdp_dir.bak")
+        shutil.move(original_dcp_dir, backup_dcp_dir)
+        
+        # (B) 将新生成的单文件重命名为代码期望的名字
+        print("   -> 替换新文件: lit_model_merged.pth ===> lit_model.pth")
+        shutil.move(merged_file_temp, original_dcp_dir)
+
+        print("\n🎉 [3/3] 全部完成！目录结构已自动整理完毕。")
+        print(f"👉 现在的 lit_model.pth 是一个纯净的单文件。你可以直接去运行 eval.py 了！")
+
+    except Exception as e:
+        print(f"\n❌ 操作过程中发生致命错误: {e}")
+        # 安全回滚逻辑：清理可能生成的、损坏的临时单文件
+        if os.path.exists(merged_file_temp):
+            os.remove(merged_file_temp)
+            print("🧹 已自动清理未完成的残缺临时文件。")
+        print("💡 提示：你的原始 FSDP 目录结构未受影响，请检查分片数据是否在保存时损坏。")
 
 def _expand_single_string(text: str) -> str:
     """底层的单字符串替换逻辑"""
