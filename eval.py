@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -86,35 +85,58 @@ def _torch_load_full_pickle():
 
 
 def _load_dcp_dir(lit_dir: Path) -> Any:
-    from lightning.fabric.utilities.load import _load_distributed_checkpoint
+    """从 DCP 目录读出完整 checkpoint（单机、无 PG collective）。
 
+    使用 ``no_dist=True`` 的 DCP 读路径：只扫磁盘上的 shard/metadata，不要求
+    ``WORLD_SIZE`` 与训练时一致（例如 16 卡训、8 卡评）。
+    需 PyTorch >= 2.3（与 Lightning Fabric 的 DCP 支持一致）。
+    """
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
+
+    try:
+        from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
+    except ImportError:
+        from torch.distributed.checkpoint.format_utils import (  # type: ignore[no-redef]
+            _EmptyStateDictLoadPlanner,
+        )
+
+    _META = "meta.pt"
+    checkpoint: dict[str, Any] = {}
     with _torch_load_full_pickle():
-        return _load_distributed_checkpoint(lit_dir)
+        _load_state_dict(
+            checkpoint,
+            storage_reader=FileSystemReader(lit_dir),
+            planner=_EmptyStateDictLoadPlanner(),
+            no_dist=True,
+        )
+    extra = lit_dir / _META
+    if extra.is_file():
+        checkpoint.update(torch.load(extra, map_location="cpu", weights_only=False))
+    return checkpoint
 
 
 def _stage_flat_dcp_multigpu(
     checkpoint_dir: str, local_rank: int, world_size: int
 ) -> tuple[Path, Path] | None:
-    """多卡 + DCP 目录：init PG 前 rank0 合并为单文件，避免 PG 规模与训练不一致损坏读片。"""
+    """多卡 + DCP：rank0 用 no_dist 合并为单文件，其它 rank barrier 等待（与训练卡数无关）。"""
     lit = Path(checkpoint_dir).expanduser() / "lit_model.pth"
     if not lit.is_dir() or world_size <= 1:
         return None
+    if not dist.is_initialized():
+        raise RuntimeError("多卡 DCP 合并必须先 dist.init_process_group（见 main 顺序）。")
     tag = hashlib.md5(str(lit.resolve()).encode()).hexdigest()[:12]
     parent = lit.parent
     pth, ok, tmp = parent / f".lit_eval_{tag}.pth", parent / f".lit_eval_{tag}.ok", parent / f".lit_eval_{tag}.tmp"
+    dist.barrier()
     if local_rank == 0:
         for f in (ok, pth, tmp):
             f.unlink(missing_ok=True)
-        print("[eval] 多卡 DCP：rank0 先合并为临时单文件…")
+        print("[eval] 多卡 DCP：rank0 合并为临时单文件（no_dist 读盘，与训练 world_size 无关）…")
         torch.save(_load_dcp_dir(lit), tmp)
         os.replace(tmp, pth)
         ok.write_text("x", encoding="utf-8")
-    else:
-        t0 = time.time()
-        while not ok.exists():
-            if time.time() - t0 > 7200:
-                raise TimeoutError(f"等待 rank0 合并 DCP 超时: {pth}")
-            time.sleep(0.05)
+    dist.barrier()
     if not pth.is_file():
         raise FileNotFoundError(pth)
     return (pth, ok)
@@ -430,12 +452,12 @@ def main(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    staged = _stage_flat_dcp_multigpu(checkpoint_dir, local_rank, world_size)
-    merged = str(staged[0]) if staged else None
-
     if world_size > 1 and not dist.is_initialized():
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
+
+    staged = _stage_flat_dcp_multigpu(checkpoint_dir, local_rank, world_size)
+    merged = str(staged[0]) if staged else None
 
     device = f"cuda:{local_rank}"
     if local_rank == 0:
