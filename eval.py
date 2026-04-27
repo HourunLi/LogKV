@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import os
-import time
 from pathlib import Path
 
 import yaml
@@ -14,8 +12,6 @@ from typing import Any
 
 from jsonargparse import CLI
 import tqdm
-
-from utils import auto_expand_env_vars
 
 if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     print("设置环境变量...")
@@ -62,106 +58,30 @@ from litgpt.generate.base import generate as litgpt_generate
 
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
-_FORCE_FULL_PICKLE = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
 
+def _load_lit_model_checkpoint(checkpoint_dir: str, map_location: str | torch.device) -> Any:
+    """加载 ``{checkpoint_dir}/lit_model.pth``。
 
-def _load_dcp_dir(lit_dir: Path) -> Any:
-    """从 DCP 目录读出完整 checkpoint（单机 ``no_dist``）。
-
-    注意：**不要**在这里全局替换 ``torch.load``。DCP 的 ``filesystem.read_data`` 会依赖
-    官方 ``torch.load`` 行为；monkeypatch 易导致分片 pickle 读错位 → ``unpickling stack underflow``。
-
-    ``TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`` 仅影响默认 ``weights_only``，不替换实现。
+    - **经典格式（默认）**：单个 ``lit_model.pth`` 文件 → ``torch.load``，与改 DCP 之前行为一致。
+    - **FSDP 分片**：``lit_model.pth`` 为目录且含 ``*.distcp`` → Lightning ``_load_distributed_checkpoint`` 合并后再走原有 ``"model"`` 解析逻辑。
     """
-    from torch.distributed.checkpoint import FileSystemReader
-    from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
+    lit_path = Path(checkpoint_dir).expanduser() / "lit_model.pth"
+    if not lit_path.exists():
+        raise FileNotFoundError(f"未找到 checkpoint: {lit_path}")
 
-    try:
-        from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
-    except ImportError:
-        from torch.distributed.checkpoint.format_utils import (  # type: ignore[no-redef]
-            _EmptyStateDictLoadPlanner,
-        )
+    # 1) 以前训练 / convert 产出的单文件权重（最常见）
+    if lit_path.is_file():
+        return torch.load(str(lit_path), map_location=map_location, weights_only=False)
 
-    _META = "meta.pt"
-    checkpoint: dict[str, Any] = {}
-    prev_force = os.environ.get(_FORCE_FULL_PICKLE)
-    os.environ[_FORCE_FULL_PICKLE] = "1"
-    try:
-        _load_state_dict(
-            checkpoint,
-            storage_reader=FileSystemReader(lit_dir),
-            planner=_EmptyStateDictLoadPlanner(),
-            no_dist=True,
-        )
-    finally:
-        if prev_force is None:
-            os.environ.pop(_FORCE_FULL_PICKLE, None)
-        else:
-            os.environ[_FORCE_FULL_PICKLE] = prev_force
+    # 2) Fabric FSDP sharded：同名路径下是目录
+    if lit_path.is_dir():
+        from lightning.fabric.utilities.load import _load_distributed_checkpoint
+        return _load_distributed_checkpoint(lit_path)
 
-    extra = lit_dir / _META
-    if extra.is_file():
-        checkpoint.update(torch.load(extra, map_location="cpu", weights_only=False))
-    return checkpoint
-
-
-def _stage_flat_dcp_multigpu(
-    checkpoint_dir: str, local_rank: int, world_size: int
-) -> tuple[Path, Path] | None:
-    """多卡 + DCP：在 ``init_process_group`` 之前由 rank0 合并（PG 未初始化 + no_dist 读盘）。"""
-    lit = Path(checkpoint_dir).expanduser() / "lit_model.pth"
-    if not lit.is_dir() or world_size <= 1:
-        return None
-    tag = hashlib.md5(str(lit.resolve()).encode()).hexdigest()[:12]
-    parent = lit.parent
-    pth, ok, tmp = parent / f".lit_eval_{tag}.pth", parent / f".lit_eval_{tag}.ok", parent / f".lit_eval_{tag}.tmp"
-
-    if dist.is_initialized():
-        dist.barrier()
-        if local_rank == 0:
-            for f in (ok, pth, tmp):
-                f.unlink(missing_ok=True)
-            print("[eval] 多卡 DCP：rank0 合并（PG 已存在）…")
-            torch.save(_load_dcp_dir(lit), tmp)
-            os.replace(tmp, pth)
-            ok.write_text("x", encoding="utf-8")
-        dist.barrier()
-    else:
-        if local_rank == 0:
-            for f in (ok, pth, tmp):
-                f.unlink(missing_ok=True)
-            print("[eval] 多卡 DCP：rank0 合并（PG 未初始化 / no_dist，避免 torch.load 被替换导致读片损坏）…")
-            torch.save(_load_dcp_dir(lit), tmp)
-            os.replace(tmp, pth)
-            ok.write_text("x", encoding="utf-8")
-        else:
-            t0 = time.time()
-            while not ok.exists():
-                if time.time() - t0 > 7200:
-                    raise TimeoutError(f"等待 rank0 合并 DCP 超时: {pth}")
-                time.sleep(0.05)
-
-    if not pth.is_file():
-        raise FileNotFoundError(pth)
-    return (pth, ok)
-
-
-def _load_lit_model_checkpoint(
-    checkpoint_dir: str,
-    map_location: str | torch.device,
-    merged_path: str | None = None,
-) -> Any:
-    if merged_path is not None:
-        return torch.load(merged_path, map_location=map_location, weights_only=False)
-    lit = Path(checkpoint_dir).expanduser() / "lit_model.pth"
-    if not lit.exists():
-        raise FileNotFoundError(lit)
-    if lit.is_file():
-        return torch.load(str(lit), map_location=map_location, weights_only=False)
-    if lit.is_dir():
-        return _load_dcp_dir(lit)
-    raise FileNotFoundError(lit)
+    raise FileNotFoundError(
+        f"{lit_path} 存在但不是单文件权重，也不像 DCP/FSDP 分片目录（需要 *.distcp 以及 meta.pt 或 .metadata）。"
+        "若你仍是单文件 ckpt，请确认路径为文件而非目录。"
+    )
 
 
 def _parse_csv_ints(s: str) -> list[int]:
@@ -208,7 +128,6 @@ class CustomResearchLM(LM):
         use_research: bool = True,
         map_branch=False,
         config_overrides: dict[str, Any] | None = None,
-        merged_path: str | None = None,
     ):
         super().__init__()
         self._device = device
@@ -258,7 +177,7 @@ class CustomResearchLM(LM):
         self.model = GPT(self.config).to(device).bfloat16()
         
         if is_master: print(f"🔄 正在加载权重...")
-        checkpoint = _load_lit_model_checkpoint(checkpoint_dir, device, merged_path)
+        checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
         
         # 🌟 核心修复：检查是不是被包裹过的 checkpoint 字典
         if "model" in checkpoint:
@@ -447,7 +366,6 @@ class CustomResearchLM(LM):
     def tok_encode(self, string): return self.tokenizer.encode(string).tolist()
     def tok_decode(self, tokens): return self.tokenizer.decode(torch.tensor(tokens))
 
-@auto_expand_env_vars
 def main(
     checkpoint_dir: str = "checkpoints/Qwen/Qwen3-0.6B-Base",
     benchmark: str = "debug",
@@ -456,28 +374,22 @@ def main(
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-
-    # DCP 合并必须在 init_process_group 之前：否则旧版 Lightning 走 collective + 全局 torch.load 被替换易损坏读片。
-    if world_size > 1:
-        torch.cuda.set_device(local_rank)
-    staged = _stage_flat_dcp_multigpu(checkpoint_dir, local_rank, world_size)
-    merged = str(staged[0]) if staged else None
-
+    
     if world_size > 1 and not dist.is_initialized():
+        torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
-
+        
     device = f"cuda:{local_rank}"
+    
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
 
     lm_model = CustomResearchLM(
-        checkpoint_dir, device=device, map_branch=map_branch, config_overrides=config_overrides, merged_path=merged
+        checkpoint_dir,
+        device=device,
+        map_branch=map_branch,
+        config_overrides=config_overrides,
     )
-    if staged and dist.is_initialized() and dist.get_world_size() > 1:
-        dist.barrier()
-        if dist.get_rank() == 0:
-            staged[0].unlink(missing_ok=True)
-            staged[1].unlink(missing_ok=True)
     
     results = evaluator.simple_evaluate(
         model=lm_model,
