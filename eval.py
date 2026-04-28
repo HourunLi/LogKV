@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -345,6 +346,7 @@ def main(
     benchmark: str = "debug",
     map_branch: bool = False,
     config_overrides: dict[str, Any] | None = None,
+    output_path: str | None = None,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -371,8 +373,10 @@ def main(
         confirm_run_unsafe_code=True,
         batch_size=1,
     )
-    
-    if local_rank == 0:
+
+    # 与 CustomResearchLM.is_master 一致：多节点时应用全局 rank==0，而非 local_rank==0（每节点各有一个 local 0）
+    is_main = not dist.is_initialized() or dist.get_rank() == 0
+    if is_main and output_path is not None:
         from lm_eval.utils import make_table
         print(make_table(results))
 
@@ -380,14 +384,16 @@ def main(
         json_output = {
             "benchmark": benchmark,
             "checkpoint_dir": checkpoint_dir,
-            "results": results
+            "results": results,
         }
-        json_str = json.dumps(json_output, indent=2, ensure_ascii=False)
-        print("\n📊 JSON 格式输出:")
-        print(json_str)
 
-        # 可选：保存到文件
-        output_file = Path("/home/ma-user/work/bucket-wulan-green/lihourun/eval_results.json")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = Path(output_path).expanduser()
+        if base.suffix.lower() == ".json":
+            output_file = base.with_name(f"{base.stem}_{ts}{base.suffix}")
+        else:
+            output_file = base / f"eval_results_{ts}.json"
+        output_file.parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(json_output, f, indent=2, ensure_ascii=False)
         print(f"\n✅ 结果已保存到: {output_file}")
