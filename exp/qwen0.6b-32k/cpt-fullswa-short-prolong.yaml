@@ -17,6 +17,7 @@ data_dir: /workspace/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
 save_path: /workspace/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-fullswa-short-prolong
+merged_state_staging_dir: /workspace/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging
 
 enable_tensorboard: true
 tensorboard_root: /workspace/${MY_REAL_NAME-default}/tb-32k

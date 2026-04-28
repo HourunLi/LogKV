@@ -56,6 +56,16 @@ def _unique_save_dir(save_path: str) -> str:
     return str(cand)
 
 
+def _distributed_looks_multi_node() -> bool:
+    """torchrun 多机时通常 WORLD_SIZE > LOCAL_WORLD_SIZE；单机多卡二者相等。"""
+    try:
+        ws = int(os.environ.get("WORLD_SIZE", "1"))
+        lws = int(os.environ.get("LOCAL_WORLD_SIZE", str(ws)))
+    except ValueError:
+        return False
+    return ws > lws
+
+
 def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     """
     大厂标准 LR 调度器：前段线性 Warmup，后段余弦退火 (Cosine Decay)
@@ -281,6 +291,10 @@ def main(
         # IO
         save_ckpt: bool = False,
         save_path: str = "./ckpt/cpt",
+        # 多机 + research_separate_parameter：组装后的 state 必须先落到全员可读路径再 fabric.load_raw；
+        # tempfile 只在 rank0 本机存在，其它 node 会打不开。显式指定共享目录最稳妥；
+        # 未指定且检测到多机时，默认 save_path/_litgpt_fsdp_merged_staging/{expid}/（要求 save_path 在共享盘上）。
+        merged_state_staging_dir: str | None = None,
         enable_tensorboard: bool = True,
         tensorboard_root: str = './tb',
         # RESEARCH
@@ -387,23 +401,47 @@ def main(
     model = fabric.setup_module(model)
 
     if merged_state_dict is not None:
-        # 须与 convert_hf_checkpoint 的 lit_model.pth 一致：扁平 state_dict。
-        # fabric.load_raw 不会解包 "model" 键。
-        # load_checkpoint 由 rank0 broadcast 路径；多机时 tempfile 仅存在于 rank0 本机，若你在多机下启用
-        # research_separate_parameter，请把 TMPDIR（或下面 mkstemp 所在目录）设在各节点可见的共享盘上。
-        tmp_path: Path
-        if fabric.global_rank == 0:
-            fd, tmp = tempfile.mkstemp(suffix=".pth")
-            os.close(fd)
-            tmp_path = Path(tmp)
-            torch.save(merged_state_dict, tmp_path)
+        # 须与 convert_hf_checkpoint 的 lit_model.pth 一致：扁平 state_dict；fabric.load_raw 不解包 "model"。
+        # load_checkpoint(FSDP) 会把 rank0 的路径广播给全员；路径必须在每台机器上指向同一可读文件。
+        # 单机多卡：tempfile 在共享内存磁盘上全员可见。多机：必须写到 NFS/对象存储挂载等共享路径。
+        use_shared_staging = merged_state_staging_dir is not None or _distributed_looks_multi_node()
+        staging_file: Path | None = None
+
+        if use_shared_staging:
+            if merged_state_staging_dir is not None:
+                staging_root = Path(os.path.expandvars(os.path.expanduser(merged_state_staging_dir))) / expid
+            else:
+                staging_root = (
+                    Path(os.path.expandvars(os.path.expanduser(save_path))) / "_litgpt_fsdp_merged_staging" / expid
+                )
+            staging_file = staging_root / ".litgpt_demo_merged.pth"
+            fabric.print(f"📁 research 合并权重 staging（多机须共享盘）: {staging_file}")
+            if fabric.global_rank == 0:
+                staging_file.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(merged_state_dict, staging_file)
+            fabric.barrier()
+            load_checkpoint(fabric, model, staging_file, strict=False)
         else:
-            tmp_path = Path("")
+            tmp_path: Path
+            if fabric.global_rank == 0:
+                fd, tmp = tempfile.mkstemp(suffix=".pth")
+                os.close(fd)
+                tmp_path = Path(tmp)
+                torch.save(merged_state_dict, tmp_path)
+            else:
+                tmp_path = Path("")
+            fabric.barrier()
+            load_checkpoint(fabric, model, tmp_path, strict=False)
+            fabric.barrier()
+            if fabric.global_rank == 0 and tmp_path.is_file():
+                tmp_path.unlink(missing_ok=True)
+
         fabric.barrier()
-        load_checkpoint(fabric, model, tmp_path, strict=False)
-        fabric.barrier()
-        if fabric.global_rank == 0 and tmp_path.is_file():
-            tmp_path.unlink(missing_ok=True)
+        if staging_file is not None and fabric.global_rank == 0:
+            try:
+                staging_file.unlink(missing_ok=True)
+            except OSError:
+                fabric.print(f"⚠️ 无法删除 staging 文件（部分共享盘限制 unlink），可手动删: {staging_file}")
     else:
         load_checkpoint(fabric, model, ckpt_path, strict=True)
 
