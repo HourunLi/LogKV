@@ -334,6 +334,16 @@ class GPT(nn.Module):
                 device,
                 dtype,
             )
+        # Research + separate prefill branch uses extra `h_prefill` modules; they also receive `input_pos` and need KVCache.
+        if "h_prefill" in self.transformer:
+            for block in self.transformer.h_prefill:
+                block.attn.kv_cache = block.attn.build_kv_cache(
+                    batch_size,
+                    max_seq_length,
+                    rope_cache_length,
+                    device,
+                    dtype,
+                )
 
         if self.mask_cache is None or self.mask_cache.size(3) != max_seq_length:
             # passing `attn_mask` to SDPA disables the flash implementation. since we only need the mask
@@ -344,6 +354,9 @@ class GPT(nn.Module):
         self.mask_cache = None
         for block in self.transformer.h:
             block.attn.kv_cache = None
+        if "h_prefill" in self.transformer:
+            for block in self.transformer.h_prefill:
+                block.attn.kv_cache = None
 
 
 class Block(nn.Module):
