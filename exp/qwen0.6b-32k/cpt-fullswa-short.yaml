@@ -17,7 +17,6 @@ data_mix_yaml: ./exp/data_config/base-qwen.yaml
 num_workers: 16
 save_ckpt: true
 save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-fullswa-short
-merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging
 
 enable_tensorboard: true
 tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k

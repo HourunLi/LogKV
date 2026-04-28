@@ -33,22 +33,6 @@ if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 
-    # os.environ['HF_HOME'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache'
-    # os.environ['HF_DATASETS_CACHE'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/hf_cache'
-    # os.environ['HF_EVALUATE_CACHE'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/evaluate'
-    # os.environ['HUGGINGFACE_HUB_CACHE'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/hub'
-    # os.environ['HF_HUB_CACHE'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/hub'
-    # os.environ['NLTK_DATA'] = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache/nltk_data'
-    # os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
-    # os.environ['HF_DATASETS_OFFLINE'] = '1'
-    # os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    
-    # os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-    # os.environ['CURL_CA_BUNDLE'] = ''
-    # os.environ['REQUESTS_CA_BUNDLE'] = ''
-    # urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    # ssl._create_default_https_context = ssl._create_unverified_context
-
 import dataclasses
 
 from litgpt.config import Config
@@ -62,28 +46,16 @@ _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
 
 def _load_lit_model_checkpoint(checkpoint_dir: str, map_location: str | torch.device) -> Any:
-    """加载 ``{checkpoint_dir}/lit_model.pth``。
-
-    - **经典格式（默认）**：单个 ``lit_model.pth`` 文件 → ``torch.load``，与改 DCP 之前行为一致。
-    - **FSDP 分片**：``lit_model.pth`` 为目录且含 ``*.distcp`` → Lightning ``_load_distributed_checkpoint`` 合并后再走原有 ``"model"`` 解析逻辑。
-    """
+    """加载 ``{checkpoint_dir}/lit_model.pth``（单文件 ``torch.save``，与 demo FSDP ``state_dict_type='full'`` 一致）。"""
     lit_path = Path(checkpoint_dir).expanduser() / "lit_model.pth"
     if not lit_path.exists():
         raise FileNotFoundError(f"未找到 checkpoint: {lit_path}")
-
-    # 1) 以前训练 / convert 产出的单文件权重（最常见）
-    if lit_path.is_file():
-        return torch.load(str(lit_path), map_location=map_location, weights_only=False)
-
-    # 2) Fabric FSDP sharded：同名路径下是目录
     if lit_path.is_dir():
-        from lightning.fabric.utilities.load import _load_distributed_checkpoint
-        return _load_distributed_checkpoint(lit_path)
-
-    raise FileNotFoundError(
-        f"{lit_path} 存在但不是单文件权重，也不像 DCP/FSDP 分片目录（需要 *.distcp 以及 meta.pt 或 .metadata）。"
-        "若你仍是单文件 ckpt，请确认路径为文件而非目录。"
-    )
+        raise FileNotFoundError(
+            f"{lit_path} 为目录（旧版 FSDP/DCP 分片）。请先在仓库根目录对同一路径调用 "
+            "`utils.convert_and_replace_fsdp_ckpt` 合并为单文件 lit_model.pth，再跑 eval。"
+        )
+    return torch.load(str(lit_path), map_location=map_location, weights_only=False)
 
 
 def _parse_csv_ints(s: str) -> list[int]:
@@ -152,9 +124,7 @@ class CustomResearchLM(LM):
             
             # 确保对象的开关属性被正确覆盖
             self.use_research = getattr(self.config, 'use_research', False)
-            # self.use_research = False
-            # self.config.use_research = False
-            
+
         else:
             if is_master: print("⚠️ 未发现训练期保存的 YAML 配置文件，正在使用备用参数初始化...")
             self.use_research = use_research
@@ -386,8 +356,6 @@ def main(
     
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
-        print(f"尝试合并ckpt...")
-        convert_and_replace_fsdp_ckpt(checkpoint_dir)
 
     lm_model = CustomResearchLM(
         checkpoint_dir,
