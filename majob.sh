@@ -117,6 +117,22 @@ echo "================================================="
 # 2. 补偿不同 Node 之间保存 checkpoint 到共享存储 (SFS/NAS) 时的极其微小的时间差
 sleep 60
 
+# 拼接 benchmark 列表（避免换行空格被解析进 task 名）
+BENCHMARKS="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
+BENCHMARKS="${BENCHMARKS},mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
+BENCHMARKS="${BENCHMARKS},longbench_2wikimqa,longbench_dureader,longbench_gov_report,longbench_hotpotqa"
+BENCHMARKS="${BENCHMARKS},longbench_lcc,longbench_lsht,longbench_multi_news,longbench_multifieldqa_en,longbench_multifieldqa_zh"
+BENCHMARKS="${BENCHMARKS},longbench_musique,longbench_narrativeqa,longbench_passage_count,longbench_passage_retrieval_en"
+BENCHMARKS="${BENCHMARKS},longbench_qasper,longbench_qmsum,longbench_repobench-p,longbench_samsum,longbench_trec,longbench_triviaqa,longbench_vcsum"
+BENCHMARKS="${BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e"
+BENCHMARKS="${BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
+BENCHMARKS="${BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
+BENCHMARKS="${BENCHMARKS},niah_single_1,niah_single_2,niah_single_3"
+
+# NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度
+# max_seq_lengths 可根据模型实际最大上下文调整
+META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
+
 torchrun \
     --nnodes=${NUM_NODES} \
     --nproc_per_node=${GPUS_PER_NODE} \
@@ -125,7 +141,8 @@ torchrun \
     --master_port=${MASTER_PORT} \
     eval.py \
     --checkpoint_dir ${SAVE_DIR} \
-    --benchmark boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa,mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2
+    --benchmark ${BENCHMARKS} \
+    --metadata "${META}"
 
 EVAL_STATUS=$?
 if [ $EVAL_STATUS -ne 0 ]; then
