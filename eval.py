@@ -347,6 +347,7 @@ def main(
     map_branch: bool = False,
     config_overrides: dict[str, Any] | None = None,
     output_path: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -372,6 +373,7 @@ def main(
         tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
         confirm_run_unsafe_code=True,
         batch_size=1,
+        metadata=metadata,
     )
 
     # 与 CustomResearchLM.is_master 一致：多节点时应用全局 rank==0，而非 local_rank==0（每节点各有一个 local 0）
