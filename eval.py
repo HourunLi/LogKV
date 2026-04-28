@@ -378,10 +378,11 @@ def main(
 
     # 与 CustomResearchLM.is_master 一致：多节点时应用全局 rank==0，而非 local_rank==0（每节点各有一个 local 0）
     is_main = not dist.is_initialized() or dist.get_rank() == 0
-    if is_main and output_path is not None:
+    if is_main:
         from lm_eval.utils import make_table
         print(make_table(results))
 
+    if is_main and output_path is not None:
         # 输出JSON格式结果
         json_output = {
             "benchmark": benchmark,
