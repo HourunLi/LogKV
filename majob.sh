@@ -125,7 +125,7 @@ torchrun \
     --master_port=${MASTER_PORT} \
     eval.py \
     --checkpoint_dir ${SAVE_DIR} \
-    --benchmark boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa
+    --benchmark boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa,mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2
 
 EVAL_STATUS=$?
 if [ $EVAL_STATUS -ne 0 ]; then
