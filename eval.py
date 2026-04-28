@@ -387,7 +387,7 @@ def main(
         print(json_str)
 
         # 可选：保存到文件
-        output_file = Path("eval_results.json")
+        output_file = Path("/home/ma-user/work/bucket-wulan-green/lihourun/eval_results.json")
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(json_output, f, indent=2, ensure_ascii=False)
         print(f"\n✅ 结果已保存到: {output_file}")
