@@ -16,7 +16,7 @@ num_devices: 8
 data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
-save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-fullswa-short
+save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-fullswa-short-prolong
 
 enable_tensorboard: true
 tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k
