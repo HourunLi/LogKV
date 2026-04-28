@@ -1,6 +1,6 @@
 config: base.yaml
 
-expid: cpt-fullswa-short
+expid: cpt-fullswa-short-prolong
 
 ckpt_dir: /workspace/checkpoints/Qwen/Qwen3-0.6B-Base/
 

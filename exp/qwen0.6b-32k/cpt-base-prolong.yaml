@@ -1,6 +1,6 @@
 config: base.yaml
 
-expid: cpt-base
+expid: cpt-base-prolong
 
 ckpt_dir: /workspace/checkpoints/Qwen/Qwen3-0.6B-Base/
 
@@ -16,7 +16,7 @@ num_devices: 8
 data_dir: /workspace/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
-save_path: /workspace/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-base
+save_path: /workspace/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-base-prolong
 
 enable_tensorboard: true
 tensorboard_root: /workspace/${MY_REAL_NAME-default}/tb-32k
