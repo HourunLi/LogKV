@@ -133,6 +133,9 @@ BENCHMARKS="${BENCHMARKS},niah_single_1,niah_single_2,niah_single_3"
 # max_seq_lengths 可根据模型实际最大上下文调整
 META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
 
+# 评测结果：rank0 写入 JSON（带时间戳），与 litgpt evaluate 惯例一致放在 checkpoint 下 evaluate/
+EVAL_OUTPUT_DIR="${SAVE_DIR}/evaluate"
+
 torchrun \
     --nnodes=${NUM_NODES} \
     --nproc_per_node=${GPUS_PER_NODE} \
@@ -142,7 +145,8 @@ torchrun \
     eval.py \
     --checkpoint_dir ${SAVE_DIR} \
     --benchmark ${BENCHMARKS} \
-    --metadata "${META}"
+    --metadata "${META}" \
+    --output_path "${EVAL_OUTPUT_DIR}"
 
 EVAL_STATUS=$?
 if [ $EVAL_STATUS -ne 0 ]; then
