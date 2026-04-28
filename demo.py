@@ -56,16 +56,6 @@ def _unique_save_dir(save_path: str) -> str:
     return str(cand)
 
 
-def _distributed_looks_multi_node() -> bool:
-    """torchrun 多机时通常 WORLD_SIZE > LOCAL_WORLD_SIZE；单机多卡二者相等。"""
-    try:
-        ws = int(os.environ.get("WORLD_SIZE", "1"))
-        lws = int(os.environ.get("LOCAL_WORLD_SIZE", str(ws)))
-    except ValueError:
-        return False
-    return ws > lws
-
-
 def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     """
     大厂标准 LR 调度器：前段线性 Warmup，后段余弦退火 (Cosine Decay)
@@ -291,9 +281,6 @@ def main(
         # IO
         save_ckpt: bool = False,
         save_path: str = "./ckpt/cpt",
-        # 多机 FSDP + research_separate_parameter 时，合并后的权重需写在全员可见的共享盘上（仅 torch.save / unlink，不用 mv）。
-        # 显式指定最稳妥；不指定时若 WORLD_SIZE > LOCAL_WORLD_SIZE，则用 save_path/_litgpt_fsdp_merged_staging/{expid}/。
-        merged_state_staging_dir: str | None = None,
         enable_tensorboard: bool = True,
         tensorboard_root: str = './tb',
         # RESEARCH
@@ -335,9 +322,10 @@ def main(
         strategy = FSDPStrategy(
             # FULL_SHARD 等价于 DeepSpeed ZeRO-3，切分权重、梯度和优化器状态
             # 如果显存依然吃紧，可以保持 FULL_SHARD；如果计算通信比瓶颈明显，可改为 SHARD_GRAD_OP (ZeRO-2)
-            sharding_strategy="SHARD_GRAD_OP", 
-            auto_wrap_policy={Block}, 
-            activation_checkpointing_policy={Block}, 
+            sharding_strategy="SHARD_GRAD_OP",
+            state_dict_type="full",
+            auto_wrap_policy={Block},
+            activation_checkpointing_policy={Block},
             timeout=timedelta(days=3650),
         )
     fabric = L.Fabric(
@@ -400,53 +388,22 @@ def main(
 
     if merged_state_dict is not None:
         # 须与 convert_hf_checkpoint 的 lit_model.pth 一致：扁平 state_dict。
-        # fabric.load_raw → _load_raw_module_state 不会执行 .get("model")；若包一层 "model" 则
-        # load_state_dict 匹配不到任何参数，strict=False 下整网仍随机（loss≈ln vocab）。
-        #
-        # FSDP 下 load_checkpoint 会 broadcast(rank0 的 path)。单机可用 rank0 本地 tempfile；多机必须共享路径，
-        # 且各 rank 应用相同字符串路径（下面 merged_file 由配置确定性算出，全员一致）。
-        use_shared_staging = merged_state_staging_dir is not None or _distributed_looks_multi_node()
-        merged_file: Path | None
-        if use_shared_staging:
-            if merged_state_staging_dir is not None:
-                staging_root = Path(os.path.expandvars(os.path.expanduser(merged_state_staging_dir))) / expid
-            else:
-                staging_root = (
-                    Path(os.path.expandvars(os.path.expanduser(save_path))) / "_litgpt_fsdp_merged_staging" / expid
-                )
-            merged_file = staging_root / ".litgpt_demo_merged.pth"
-            fabric.print(f"📁 FSDP 合并权重 staging（共享盘）: {merged_file}")
+        # fabric.load_raw 不会解包 "model" 键。
+        # load_checkpoint 由 rank0 broadcast 路径；多机时 tempfile 仅存在于 rank0 本机，若你在多机下启用
+        # research_separate_parameter，请把 TMPDIR（或下面 mkstemp 所在目录）设在各节点可见的共享盘上。
+        tmp_path: Path
+        if fabric.global_rank == 0:
+            fd, tmp = tempfile.mkstemp(suffix=".pth")
+            os.close(fd)
+            tmp_path = Path(tmp)
+            torch.save(merged_state_dict, tmp_path)
         else:
-            merged_file = None
-
-        try:
-            if merged_file is not None:
-                if fabric.global_rank == 0:
-                    merged_file.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save(merged_state_dict, merged_file)
-                fabric.barrier()
-                load_checkpoint(fabric, model, merged_file, strict=False)
-            else:
-                tmp_path: Path
-                if fabric.global_rank == 0:
-                    fd, tmp = tempfile.mkstemp(suffix=".pth")
-                    os.close(fd)
-                    tmp_path = Path(tmp)
-                    torch.save(merged_state_dict, tmp_path)
-                else:
-                    tmp_path = Path("")
-                fabric.barrier()
-                load_checkpoint(fabric, model, tmp_path, strict=False)
-                fabric.barrier()
-                if fabric.global_rank == 0 and tmp_path.is_file():
-                    tmp_path.unlink(missing_ok=True)
-        finally:
-            fabric.barrier()
-            if merged_file is not None and fabric.global_rank == 0:
-                try:
-                    merged_file.unlink(missing_ok=True)
-                except OSError:
-                    fabric.print(f"⚠️ 无法删除 staging 文件（部分共享盘限制 unlink），可手动删: {merged_file}")
+            tmp_path = Path("")
+        fabric.barrier()
+        load_checkpoint(fabric, model, tmp_path, strict=False)
+        fabric.barrier()
+        if fabric.global_rank == 0 and tmp_path.is_file():
+            tmp_path.unlink(missing_ok=True)
     else:
         load_checkpoint(fabric, model, ckpt_path, strict=True)
 
@@ -631,34 +588,28 @@ def main(
         save_path = _unique_save_dir(save_path)
         if fabric.global_rank == 0:
             fabric.print(f"💾 最终保存目录（已避重）: {save_path}")
-        local_save_path = f"/cache/tmp_ckpt/step_{global_step}"
-        if fabric.global_rank == 0:
-            os.makedirs(local_save_path, exist_ok=True)
             os.makedirs(save_path, exist_ok=True)
         fabric.barrier()
-        
-        fabric.print(f"💾 正在将模型先临时保存至本地高速磁盘 {local_save_path} ...")
-        
+
         state = {
-            "model": model, 
-            "optimizer": optimizer, 
-            "global_step": global_step
+            "model": model,
+            "optimizer": optimizer,
+            "global_step": global_step,
         }
-        fabric.save(f"{local_save_path}/lit_model.pth", state)
+        # state_dict_type="full" 时由 rank0 写出单个 lit_model.pth 文件（非 DCP 目录）。
+        fabric.print(f"💾 正在保存至 {save_path}/lit_model.pth ...")
+        fabric.save(f"{save_path}/lit_model.pth", state)
         fabric.barrier()
 
         if fabric.global_rank == 0:
             for file_path in glob.glob(f"{checkpoint_dir}/*.json") + glob.glob(f"{checkpoint_dir}/*.model"):
-                shutil.copy(file_path, local_save_path)
-                
-            with open(f"{local_save_path}/model_config.yaml", "w", encoding="utf-8") as f:
+                shutil.copy(file_path, save_path)
+
+            with open(f"{save_path}/model_config.yaml", "w", encoding="utf-8") as f:
                 yaml.dump(asdict(config), f)
-                
-            fabric.print(f"📦 Tokenizer 和 Config 已自动同步至 {local_save_path}")
-            fabric.print(f"🚀 正在将完整权重文件同步至最终目标路径 {save_path} ...")
-            shutil.copytree(local_save_path, save_path, dirs_exist_ok=True)
-            shutil.rmtree(local_save_path)
-            fabric.print(f"✅ 模型及配置文件已成功安全地保存至 {save_path}")
+
+            fabric.print(f"📦 Tokenizer 与 model_config 已写入 {save_path}")
+            fabric.print("✅ 已保存单文件 lit_model.pth（FSDP full state_dict）")
         fabric.barrier()
     
     if run_eval in ("after", "both"):
