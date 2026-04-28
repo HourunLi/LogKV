@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import yaml
@@ -374,6 +375,22 @@ def main(
     if local_rank == 0:
         from lm_eval.utils import make_table
         print(make_table(results))
+
+        # 输出JSON格式结果
+        json_output = {
+            "benchmark": benchmark,
+            "checkpoint_dir": checkpoint_dir,
+            "results": results
+        }
+        json_str = json.dumps(json_output, indent=2, ensure_ascii=False)
+        print("\n📊 JSON 格式输出:")
+        print(json_str)
+
+        # 可选：保存到文件
+        output_file = Path("eval_results.json")
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(json_output, f, indent=2, ensure_ascii=False)
+        print(f"\n✅ 结果已保存到: {output_file}")
 
 if __name__ == "__main__":
     CLI(main)
