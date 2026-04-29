@@ -17,6 +17,32 @@ import tqdm
 
 from utils import *
 
+
+class SafeJSONEncoder(json.JSONEncoder):
+    """处理无法直接序列化的对象（numpy、torch、函数等）"""
+    def default(self, obj):
+        # numpy 类型
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+        # torch 类型
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().numpy().tolist()
+        # 函数、方法、可调用对象
+        if callable(obj):
+            return f"<function: {obj.__name__ if hasattr(obj, '__name__') else str(obj)}>"
+        # 其他特殊类型
+        if isinstance(obj, (set, frozenset)):
+            return list(obj)
+        if isinstance(obj, bytes):
+            return obj.decode('utf-8', errors='replace')
+        # 类实例
+        if hasattr(obj, '__dict__'):
+            return f"<{obj.__class__.__name__} object>"
+        # 默认处理
+        return super().default(obj)
+
 if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     print("设置环境变量...")
 
@@ -351,13 +377,13 @@ def main(
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    
+
     if world_size > 1 and not dist.is_initialized():
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
-        
+
     device = f"cuda:{local_rank}"
-    
+
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
 
@@ -367,7 +393,7 @@ def main(
         map_branch=map_branch,
         config_overrides=config_overrides,
     )
-    
+
     results = evaluator.simple_evaluate(
         model=lm_model,
         tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
@@ -378,28 +404,125 @@ def main(
 
     # 与 CustomResearchLM.is_master 一致：多节点时应用全局 rank==0，而非 local_rank==0（每节点各有一个 local 0）
     is_main = not dist.is_initialized() or dist.get_rank() == 0
+
     if is_main:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 🌟 第一步：立即保存原始 results 对象，便于后续恢复
+        results_cache_file = Path("eval_results_cache.json")
+        try:
+            with open(results_cache_file, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
+            print(f"💾 原始 results 已缓存到: {results_cache_file}")
+        except Exception as e:
+            print(f"❌ 缓存 results 失败: {e}")
+            print(f"⚠️ 尝试使用备用方案...")
+            try:
+                # 备用方案：先转换为字符串表示
+                results_str = str(results)
+                with open(results_cache_file, "w", encoding="utf-8") as f:
+                    json.dump({"results_str": results_str}, f, indent=2, ensure_ascii=False)
+                print(f"💾 results 已以字符串形式缓存到: {results_cache_file}")
+            except Exception as e2:
+                print(f"❌ 备用方案也失败了: {e2}")
+                return
+
+        # 🌟 第二步：打印表格
         from lm_eval.utils import make_table
         print(make_table(results))
 
-    if is_main and output_path is not None:
-        # 输出JSON格式结果
+        # 🌟 第三步：如果指定了输出路径，保存完整的JSON输出
+        if output_path is not None:
+            json_output = {
+                "timestamp": ts,
+                "benchmark": benchmark,
+                "checkpoint_dir": checkpoint_dir,
+                "results": results,
+            }
+
+            base = Path(output_path).expanduser()
+            if base.suffix.lower() == ".json":
+                output_file = base.with_name(f"{base.stem}_{ts}{base.suffix}")
+            else:
+                output_file = base / f"eval_results_{ts}.json"
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                with open(output_file, "w", encoding="utf-8") as f:
+                    json.dump(json_output, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
+                print(f"✅ 完整结果已保存到: {output_file}")
+            except Exception as e:
+                print(f"❌ 保存完整结果失败: {e}")
+                print(f"⚠️ 尝试备用方案...")
+                try:
+                    json_output["results"] = str(results)
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        json.dump(json_output, f, indent=2, ensure_ascii=False)
+                    print(f"✅ 完整结果已以备用方案保存到: {output_file}")
+                except Exception as e2:
+                    print(f"❌ 备用方案也失败了: {e2}")
+
+
+@auto_expand_env_vars
+def output_from_cache(
+    cache_file: str = "eval_results_cache.json",
+    benchmark: str = "debug",
+    checkpoint_dir: str = "checkpoints/Qwen/Qwen3-0.6B-Base",
+    output_path: str | None = None,
+):
+    """从缓存文件读取 results，重新进行输出处理（无需重新运行评测）"""
+    cache_path = Path(cache_file)
+    if not cache_path.exists():
+        print(f"❌ 缓存文件不存在: {cache_path}")
+        return
+
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache_data = json.load(f)
+
+        # 检查是否是备用方案保存的（字符串形式）
+        if "results_str" in cache_data:
+            print(f"⚠️ 缓存是字符串形式，无法恢复为结构化数据")
+            print(f"缓存内容: {cache_data['results_str'][:500]}...")
+            return
+
+        results = cache_data
+        print(f"✅ 从缓存读取 results: {cache_path}")
+    except Exception as e:
+        print(f"❌ 读取缓存失败: {e}")
+        return
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 打印表格
+    try:
+        from lm_eval.utils import make_table
+        print(make_table(results))
+    except Exception as e:
+        print(f"⚠️ 打印表格失败: {e}")
+
+    # 保存完整的JSON输出
+    if output_path is not None:
         json_output = {
+            "timestamp": ts,
             "benchmark": benchmark,
             "checkpoint_dir": checkpoint_dir,
             "results": results,
         }
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = Path(output_path).expanduser()
         if base.suffix.lower() == ".json":
             output_file = base.with_name(f"{base.stem}_{ts}{base.suffix}")
         else:
             output_file = base / f"eval_results_{ts}.json"
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(json_output, f, indent=2, ensure_ascii=False)
-        print(f"\n✅ 结果已保存到: {output_file}")
+
+        try:
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(json_output, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
+            print(f"✅ 完整结果已保存到: {output_file}")
+        except Exception as e:
+            print(f"❌ 保存结果失败: {e}")
 
 if __name__ == "__main__":
     CLI(main)
