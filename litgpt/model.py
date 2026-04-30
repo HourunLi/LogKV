@@ -727,6 +727,12 @@ class CausalSelfAttention(nn.Module):
         # ⚡ 路径 3: 默认的 Full Attention，走 PyTorch 原生极速 SDPA
         # ===================================================================
         else:
+            # KV cache 推理时 mask 来自 mask_cache（非 None）。此处若仍走 flash_attn 且
+            # causal=(mask is None) 会得到 causal=False，又不向 FA 传入 mask，因果约束丢失，
+            # 生成会出现重复 token / 乱码。显式 mask 时改用 SDPA，与无 FA 分支一致。
+            if mask is not None:
+                return self.scaled_dot_product_attention(q, k, v, mask)
+
             if flash_attn_func is None:
                 raise ImportError("🚨 必须安装 flash-attn 库！(运行: pip install flash-attn --no-build-isolation)")
             
