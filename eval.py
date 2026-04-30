@@ -314,13 +314,17 @@ class CustomResearchLM(LM):
             prompt = req.args[0]
             gen_args = req.args[1] 
             
-            # 解析 lm-eval 传来的生成参数
-            max_new_tokens = gen_args.get("until", [self.tokenizer.eos_id])
-            if isinstance(max_new_tokens, list):
-                max_new_tokens = 256 # 如果传的是 stop words 列表，给个默认最大长度
-            else:
-                max_new_tokens = gen_args.get("max_length", 256)
-                
+            # 解析 lm-eval 的 gen_kwargs：`until` 是停词（字符串列表），长度上限用 `max_gen_toks`（见 lm-eval model_guide）
+            max_new_tokens = int(gen_args.get("max_gen_toks", gen_args.get("max_length", self.max_gen_toks)))
+            do_sample = bool(gen_args.get("do_sample", False))
+            temperature = float(gen_args.get("temperature", 1.0))
+            top_p = float(gen_args.get("top_p", 1.0))
+            top_k = gen_args.get("top_k", None)
+            if not do_sample:
+                # litgpt.generate.sample 仅在 temperature<=0 且 top_p<=0 时走 argmax；仅设 temperature=0 而 top_p=1 仍会多项式采样
+                temperature = 0.0
+                top_p = 0.0
+
             prompt_tensor = self.tokenizer.encode(prompt, device=self._device)
 
             # 🌟 安全阀：为生成的新 Token 预留空间
@@ -339,8 +343,9 @@ class CustomResearchLM(LM):
                         self.model,
                         prompt_tensor,
                         max_returned_tokens=total_max_len,
-                        temperature=gen_args.get("temperature", 1.0),
-                        top_k=gen_args.get("top_k", None),
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
                         eos_id=self.tokenizer.eos_id,
                     )
                 finally:
