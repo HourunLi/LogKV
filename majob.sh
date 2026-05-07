@@ -127,7 +127,7 @@ BENCHMARKS="${BENCHMARKS},longbench_qasper,longbench_qmsum,longbench_repobench-p
 BENCHMARKS="${BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e"
 BENCHMARKS="${BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
 BENCHMARKS="${BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
-BENCHMARKS="${BENCHMARKS},niah_single_1,niah_single_2,niah_single_3"
+NIAH_BENCHMARKS="niah_single_1,niah_single_2,niah_single_3"
 
 # NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度
 # max_seq_lengths 可根据模型实际最大上下文调整
@@ -145,8 +145,20 @@ torchrun \
     eval.py \
     --checkpoint_dir ${SAVE_DIR} \
     --benchmark ${BENCHMARKS} \
-    --metadata "${META}" \
     --output_path "${EVAL_OUTPUT_DIR}"
+
+# for NIAH
+# torchrun \
+#     --nnodes=${NUM_NODES} \
+#     --nproc_per_node=${GPUS_PER_NODE} \
+#     --node_rank=${NODE_RANK} \
+#     --master_addr=${MASTER_ADDR} \
+#     --master_port=${MASTER_PORT} \
+#     eval.py \
+#     --checkpoint_dir ${SAVE_DIR} \
+#     --benchmark ${NIAH_BENCHMARKS} \
+#     --metadata "${META}" \
+#     --output_path "${EVAL_OUTPUT_DIR}"
 
 EVAL_STATUS=$?
 if [ $EVAL_STATUS -ne 0 ]; then
