@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -17,10 +17,6 @@ import tqdm
 
 from utils import *
 
-dist.init_process_group(
-    backend="nccl",
-    timeout=datetime.timedelta(hours=12)
-)
 
 class SafeJSONEncoder(json.JSONEncoder):
     """处理无法直接序列化的对象（numpy、torch、函数等）"""
@@ -390,7 +386,7 @@ def main(
 
     if world_size > 1 and not dist.is_initialized():
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=12))
 
     device = f"cuda:{local_rank}"
 
