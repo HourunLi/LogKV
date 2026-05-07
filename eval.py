@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import csv
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -42,6 +43,49 @@ class SafeJSONEncoder(json.JSONEncoder):
             return f"<{obj.__class__.__name__} object>"
         # 默认处理
         return super().default(obj)
+
+
+def extract_results_to_csv(results: dict, benchmark: str, output_path: Path) -> None:
+    """
+    从 results 中提取各数据集的 acc 或 acc_norm 数值，输出为 CSV 文件。
+    - HellaSwag 数据集：提取 acc_norm,none
+    - 其他数据集：提取 acc,none
+    """
+    csv_rows = []
+    tasks = benchmark.split(",") if benchmark != "debug" else ["piqa"]
+
+    results_data = results.get("results", {})
+
+    for task in tasks:
+        task = task.strip()
+        task_results = results_data.get(task, {})
+
+        # HellaSwag 使用 acc_norm，其他使用 acc
+        if task.lower() in ["hellaswag", "arc-c", "openbookqa"]:
+            metric_key = "acc_norm,none"
+            metric_name = "acc_norm"
+        else:
+            metric_key = "acc,none"
+            metric_name = "acc"
+
+        value = task_results.get(metric_key, None)
+
+        csv_rows.append({
+            "dataset": task,
+            # "metric": metric_name,
+            "value": value,
+        })
+
+    # 写入 CSV
+    csv_file = output_path.with_suffix(".csv")
+    try:
+        with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["dataset", "value"])
+            writer.writeheader()
+            writer.writerows(csv_rows)
+        print(f"📊 CSV 结果已保存到: {csv_file}")
+    except Exception as e:
+        print(f"❌ 保存 CSV 失败: {e}")
 
 if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     print("设置环境变量...")
@@ -468,6 +512,9 @@ def main(
                 except Exception as e2:
                     print(f"❌ 备用方案也失败了: {e2}")
 
+            # 🌟 第四步：生成 CSV 结果文件
+            extract_results_to_csv(results, benchmark, output_file)
+
 
 @auto_expand_env_vars
 def output_from_cache(
@@ -529,6 +576,9 @@ def output_from_cache(
             print(f"✅ 完整结果已保存到: {output_file}")
         except Exception as e:
             print(f"❌ 保存结果失败: {e}")
+
+        # 生成 CSV 结果文件
+        extract_results_to_csv(results, benchmark, output_file)
 
 if __name__ == "__main__":
     CLI(main)
