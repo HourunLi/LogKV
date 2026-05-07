@@ -17,6 +17,10 @@ import tqdm
 
 from utils import *
 
+dist.init_process_group(
+    backend="nccl",
+    timeout=datetime.timedelta(hours=12)
+)
 
 class SafeJSONEncoder(json.JSONEncoder):
     """处理无法直接序列化的对象（numpy、torch、函数等）"""
