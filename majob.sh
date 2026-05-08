@@ -148,17 +148,17 @@ torchrun \
     --output_path "${EVAL_OUTPUT_DIR}"
 
 # for NIAH
-# torchrun \
-#     --nnodes=${NUM_NODES} \
-#     --nproc_per_node=${GPUS_PER_NODE} \
-#     --node_rank=${NODE_RANK} \
-#     --master_addr=${MASTER_ADDR} \
-#     --master_port=${MASTER_PORT} \
-#     eval.py \
-#     --checkpoint_dir ${SAVE_DIR} \
-#     --benchmark ${NIAH_BENCHMARKS} \
-#     --metadata "${META}" \
-#     --output_path "${EVAL_OUTPUT_DIR}"
+torchrun \
+    --nnodes=${NUM_NODES} \
+    --nproc_per_node=${GPUS_PER_NODE} \
+    --node_rank=${NODE_RANK} \
+    --master_addr=${MASTER_ADDR} \
+    --master_port=${MASTER_PORT} \
+    eval.py \
+    --checkpoint_dir ${SAVE_DIR} \
+    --benchmark ${NIAH_BENCHMARKS} \
+    --metadata "${META}" \
+    --output_path "${EVAL_OUTPUT_DIR}"
 
 EVAL_STATUS=$?
 if [ $EVAL_STATUS -ne 0 ]; then
