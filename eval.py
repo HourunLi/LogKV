@@ -114,6 +114,8 @@ from litgpt.tokenizer import Tokenizer
 from lm_eval import evaluator
 from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
+# from litgpt.eval.ruler_patch import apply_patch
+# apply_patch()
 
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
