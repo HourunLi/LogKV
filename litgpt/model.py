@@ -192,8 +192,27 @@ class GPT(nn.Module):
                         block_prefill: Block = block
                     x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
                     prefill_hidden = x_prefill
-                # decode
-                x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
+                    # decode: full attention attending to h_prefill's kv_cache (SWA-generated KV)
+                    # inference: temporarily swap kv_cache so block reads from h_prefill's SWA KV
+                    # training: use replacing_kv mechanism (input_pos is None)
+                    if input_pos is not None and self.config.research_separate_parameter:
+                        # prefill_mask all True  → writing SWA KV into h_prefill.kv_cache, block not needed
+                        # prefill_mask all False → decode step: block reads h_prefill.kv_cache (SWA KV), must not overwrite it
+                        all_prefill = prefill_mask.all()
+                        if all_prefill:
+                            # pure prefill: SWA already wrote to h_prefill.kv_cache; skip block to avoid overwriting
+                            x_decode = x_prefill
+                        else:
+                            # decode step: let block do full attention over h_prefill.kv_cache (read-only, no new write)
+                            # block writes its own new-token KV into h_prefill.kv_cache for this position
+                            _orig_kv_cache = block.attn.kv_cache
+                            block.attn.kv_cache = block_prefill.attn.kv_cache
+                            x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1)
+                            block.attn.kv_cache = _orig_kv_cache
+                    else:
+                        x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
+                else:
+                    x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
                 x = torch.where(prefill_mask.unsqueeze(-1), prefill_hidden, x_decode)
         else:
             for block_idx, block in enumerate(self.transformer.h):
