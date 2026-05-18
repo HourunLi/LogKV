@@ -196,23 +196,18 @@ class GPT(nn.Module):
                         block_prefill: Block = block
                     if input_pos is not None: # inference mode
                         if prefill_mask.all(): #  prefill stage in inference mode
-                            x_prefill = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv = False)
-                            x = x_prefill
+                            x = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv = False)
                         else: # decode stage in inference mode
                             if self.config.research_separate_parameter:
                                 # decode step: let block do full attention over h_prefill.kv_cache (SWA KV)
                                 # permanently use h_prefill's kv_cache for decode, so new tokens are written there by pointer
+                                # decode的kv cache是之前的，但是hidden state是用的full attention生成的。
                                 block.attn.kv_cache = block_prefill.attn.kv_cache
-                            x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa = False, return_kv = False)
-                            x = x_decode
+                            x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa = False, return_kv = False)
                     else: # train mode
-                        if self.config.research_separate_parameter:
-                            x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
-                            x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
-                            x = torch.where(prefill_mask.unsqueeze(-1), x_prefill, x_decode)
-                        else:
-                            # No parameter separation: just use SWA for prefill positions
-                            x = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size)
+                        x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
+                        x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
+                        x = torch.where(prefill_mask.unsqueeze(-1), x_prefill, x_decode)
                 else: # process normal layer
                     x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1)
         else:
