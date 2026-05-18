@@ -176,7 +176,6 @@ class GPT(nn.Module):
         # decode: replacing-kv mode
         block_index_to_idx = {x: i for i, x in enumerate(self.config.research_prefill_swa_layers)}
         prefill_kv = None
-        prefill_hidden = None
         if self.config.use_research:
             assert prefill_mask is not None
             for block_idx, block in enumerate(self.transformer.h):
@@ -184,36 +183,38 @@ class GPT(nn.Module):
                     cos_, sin_ = cos[..., self.config.rope_indices[block_idx]], sin[..., self.config.rope_indices[block_idx]]
                 else:
                     cos_, sin_ = cos, sin
-                # prefill
+                # train + inference both go here
+                # process SWA layer
                 if block_idx in self.config.research_prefill_swa_layers and block_idx not in self.config.research_removed_layers:
+                    # SWA layers only for prefill, 只有prefill阶段这些层是用的swa，decode阶段是full attention
+                    # 如果是research_separate_parameter，就用单独的block进行prefill
+                    # 以及无论是train还是inference都会有prefill的阶段以及decode的阶段
+                    # 因为train是经过特殊修改过后的，具体体现为prefill阶段是采用的swa，然后decode阶段是用的full attention，所以要按照这种模式进行训练
                     if self.config.research_separate_parameter:
                         block_prefill: Block = self.transformer.h_prefill[block_index_to_idx[block_idx]]
                     else:
                         block_prefill: Block = block
-                    x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
-                    prefill_hidden = x_prefill
-                    # decode: full attention attending to h_prefill's kv_cache (SWA-generated KV)
-                    # inference: temporarily swap kv_cache so block reads from h_prefill's SWA KV
-                    # training: use replacing_kv mechanism (input_pos is None)
-                    if input_pos is not None and self.config.research_separate_parameter:
-                        # prefill_mask all True  → writing SWA KV into h_prefill.kv_cache, block not needed
-                        # prefill_mask all False → decode step: block reads h_prefill.kv_cache (SWA KV), must not overwrite it
-                        all_prefill = prefill_mask.all()
-                        if all_prefill:
-                            # pure prefill: SWA already wrote to h_prefill.kv_cache; skip block to avoid overwriting
-                            x_decode = x_prefill
+                    if input_pos is not None: # inference mode
+                        if prefill_mask.all(): #  prefill stage in inference mode
+                            x_prefill = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv = False)
+                            x = x_prefill
+                        else: # decode stage in inference mode
+                            if self.config.research_separate_parameter:
+                                # decode step: let block do full attention over h_prefill.kv_cache (SWA KV)
+                                # permanently use h_prefill's kv_cache for decode, so new tokens are written there by pointer
+                                block.attn.kv_cache = block_prefill.attn.kv_cache
+                            x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa = False, return_kv = False)
+                            x = x_decode
+                    else: # train mode
+                        if self.config.research_separate_parameter:
+                            x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
+                            x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
+                            x = torch.where(prefill_mask.unsqueeze(-1), x_prefill, x_decode)
                         else:
-                            # decode step: let block do full attention over h_prefill.kv_cache (read-only, no new write)
-                            # block writes its own new-token KV into h_prefill.kv_cache for this position
-                            _orig_kv_cache = block.attn.kv_cache
-                            block.attn.kv_cache = block_prefill.attn.kv_cache
-                            x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1)
-                            block.attn.kv_cache = _orig_kv_cache
-                    else:
-                        x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
-                else:
-                    x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
-                x = torch.where(prefill_mask.unsqueeze(-1), prefill_hidden, x_decode)
+                            # No parameter separation: just use SWA for prefill positions
+                            x = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size)
+                else: # process normal layer
+                    x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1)
         else:
             for block_idx, block in enumerate(self.transformer.h):
                 if self.config.rope_indices is not None:
@@ -486,9 +487,7 @@ class CausalSelfAttention(nn.Module):
 
         if config.norm_qk:
             norm_q_size = config.n_head * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
-            norm_k_size = (
-                config.n_query_groups * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
-            )
+            norm_k_size = config.n_query_groups * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
             self.norm_q = config.norm_class(norm_q_size, eps=config.norm_eps)
             self.norm_k = config.norm_class(norm_k_size, eps=config.norm_eps)
         else:
@@ -622,6 +621,8 @@ class CausalSelfAttention(nn.Module):
         if input_pos is not None:
             if not isinstance(self.kv_cache, KVCache):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
+            # 写入：把当前计算的 K,V 写入 cache 的指定位置（由 input_pos 决定）
+            # 读取：返回 cache 里的完整历史 K,V（从位置 0 到最新位置）
             k, v = self.kv_cache(input_pos, k, v)
 
             if self.apply_sliding_window_attention:
