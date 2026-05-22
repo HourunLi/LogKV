@@ -700,27 +700,49 @@ class CausalSelfAttention(nn.Module):
         # ===================================================================
         if use_swa:
             sink_size = self.config.research_attention_sink_size
-            if sink_size > 0:
+            dilated_stride = self.config.research_attention_dilated_stride
+            dilated_block = self.config.research_attention_dilated_block_size
+            use_manual_mask = sink_size > 0 or dilated_stride > 0
+            if use_manual_mask:
                 if swa_window <= 0:
-                    raise ValueError(f"use_swa=True with sink_size={sink_size} requires swa_window > 0, got {swa_window}")
-                T = q.size(2)  # (B, nh, T, hs)
-                # 构造 SWA + sink 的 causal mask: (T, T)
-                # 先建全 -inf 的上三角 causal mask，再把 sink 列和滑动窗口列置 0
+                    raise ValueError(f"use_swa=True with sink/dilated requires swa_window > 0, got {swa_window}")
+                T = q.size(2)
+                row_idx = torch.arange(T, device=q.device).unsqueeze(1)  # (T, 1)
+                col_idx = torch.arange(T, device=q.device).unsqueeze(0)  # (1, T)
+
+                # causal local window: col in (i - swa_window, i]
+                visible = (col_idx <= row_idx) & (col_idx > row_idx - swa_window)
+
+                # dilated blocks: centers at i - 2^k * d, k=0,1,2,...
+                # each center covers [center - b//2, center + b//2]
+                if dilated_stride > 0:
+                    half_b = dilated_block // 2
+                    k = 0
+                    while True:
+                        center_offset = (2 ** k) * dilated_stride  # 2^k * d
+                        center = row_idx - center_offset            # (T, 1)
+                        if (center < 0).all():
+                            break
+                        block_lo = center - half_b
+                        block_hi = center + half_b
+                        # block 在 local window 之外（col <= row - swa_window），causal 由最后统一保证
+                        in_block = (col_idx >= block_lo) & (col_idx <= block_hi) & (col_idx <= row_idx - swa_window)
+                        visible = visible | in_block
+                        k += 1
+
+                # sink: 前 sink_size 列始终可见
+                if sink_size > 0:
+                    visible = visible | (col_idx < sink_size)
+
+                # causal: 不能看未来
+                visible = visible & (col_idx <= row_idx)
+
                 attn_mask = torch.zeros(T, T, dtype=q.dtype, device=q.device)
-                # causal: 上三角置 -inf
-                attn_mask = attn_mask.masked_fill(
-                    torch.ones(T, T, dtype=torch.bool, device=q.device).triu(diagonal=1), float("-inf")
-                )
-                # sliding window: 距离超过 swa_window 的位置置 -inf
-                attn_mask = attn_mask.masked_fill(
-                    torch.ones(T, T, dtype=torch.bool, device=q.device).tril(-swa_window - 1), float("-inf")
-                )
-                # sink: 前 sink_size 列始终可见（覆盖回 0）
-                attn_mask[:, :sink_size] = 0.0
+                attn_mask = attn_mask.masked_fill(~visible, float("-inf"))
                 attn_mask = attn_mask.view(1, 1, T, T)
                 return self.scaled_dot_product_attention(q, k, v, mask=attn_mask)
 
-            # sink_size == 0: 纯 SWA，走 Flash Attention
+            # sink_size == 0 且 dilated_stride == 0: 纯 SWA，走 Flash Attention
             if flash_attn_func is None:
                 raise ImportError("🚨 必须安装 flash-attn 库才能使用极速 SWA！(运行: pip install flash-attn --no-build-isolation)")
 

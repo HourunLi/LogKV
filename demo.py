@@ -307,6 +307,8 @@ def main(
         research_breakpoint_schedule_stable: int = 0,
         research_separate_parameter: bool = True,
         research_attention_sink_size: int = 4,
+        research_attention_dilated_stride: int = 256,
+        research_attention_dilated_block_size: int = 8,
         research_decode_prefix_tokens: int = 1,
         research_decode_prefix_loss_weight: float = 0,
         research_prefill_supervise: bool = False,
@@ -363,6 +365,8 @@ def main(
     config.use_research = use_research
     config.research_swa_size = research_swa_size
     config.research_attention_sink_size = research_attention_sink_size
+    config.research_attention_dilated_stride = research_attention_dilated_stride
+    config.research_attention_dilated_block_size = research_attention_dilated_block_size
     config.research_prefill_swa_layers = swa_layers
     config.research_separate_parameter = research_separate_parameter
     config.research_removed_layers = []
