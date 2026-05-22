@@ -30,6 +30,7 @@ class Config:
     use_research: bool = False
     research_enable_flash_attn: bool = True  # must be true for our method
     research_swa_size: int = 512
+    research_attention_sink_size: int = 4
     research_prefill_swa_layers: list[int] = field(default_factory=lambda: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26])
     research_separate_parameter: bool = True
     research_removed_layers: list[int] = field(default_factory=lambda: [])

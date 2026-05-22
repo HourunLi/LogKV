@@ -683,10 +683,10 @@ class CausalSelfAttention(nn.Module):
             return o
 
     def scaled_dot_product_attention_flash_attn(
-        self, 
-        q: torch.Tensor, 
-        k: torch.Tensor, 
-        v: torch.Tensor, 
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         mask: torch.Tensor | None = None,
         use_swa: bool = False,         # 🌟 新增参数
         swa_window: int = 512          # 🌟 新增参数
@@ -695,12 +695,35 @@ class CausalSelfAttention(nn.Module):
         scale = scale * self.mscale * self.mscale
 
         # ===================================================================
-        # 🚀 路径 1: 极速 SWA (Sliding Window Attention) 走 Flash Attention 2
+        # 🚀 路径 1: SWA + Attention Sink
+        # sink_size 个 token 始终可见；其余位置用滑动窗口
         # ===================================================================
         if use_swa:
+            sink_size = self.config.research_attention_sink_size
+            if sink_size > 0:
+                if swa_window <= 0:
+                    raise ValueError(f"use_swa=True with sink_size={sink_size} requires swa_window > 0, got {swa_window}")
+                T = q.size(2)  # (B, nh, T, hs)
+                # 构造 SWA + sink 的 causal mask: (T, T)
+                # 先建全 -inf 的上三角 causal mask，再把 sink 列和滑动窗口列置 0
+                attn_mask = torch.zeros(T, T, dtype=q.dtype, device=q.device)
+                # causal: 上三角置 -inf
+                attn_mask = attn_mask.masked_fill(
+                    torch.ones(T, T, dtype=torch.bool, device=q.device).triu(diagonal=1), float("-inf")
+                )
+                # sliding window: 距离超过 swa_window 的位置置 -inf
+                attn_mask = attn_mask.masked_fill(
+                    torch.ones(T, T, dtype=torch.bool, device=q.device).tril(-swa_window - 1), float("-inf")
+                )
+                # sink: 前 sink_size 列始终可见（覆盖回 0）
+                attn_mask[:, :sink_size] = 0.0
+                attn_mask = attn_mask.view(1, 1, T, T)
+                return self.scaled_dot_product_attention(q, k, v, mask=attn_mask)
+
+            # sink_size == 0: 纯 SWA，走 Flash Attention
             if flash_attn_func is None:
                 raise ImportError("🚨 必须安装 flash-attn 库才能使用极速 SWA！(运行: pip install flash-attn --no-build-isolation)")
-            
+
             # PyTorch SDPA 格式: (B, nh, T, hs) -> Flash Attn 格式: (B, T, nh, hs)
             q_fa = q.transpose(1, 2)
             k_fa = k.transpose(1, 2)
@@ -711,16 +734,16 @@ class CausalSelfAttention(nn.Module):
 
             # 调用 Flash Attention 底层 C++ CUDA 算子
             y_fa = flash_attn_func(
-                q_fa, 
-                k_fa, 
-                v_fa, 
-                dropout_p=0.0, 
+                q_fa,
+                k_fa,
+                v_fa,
+                dropout_p=0.0,
                 softmax_scale=scale,
-                causal=True, 
+                causal=True,
                 window_size=(swa_window, -1), # 左侧看 swa_window, 右侧不看 (causal=True 强制为 0)
                 softcap=softcap_val
             )
-            
+
             # y_fa 出来的 shape 是 (B, T, nh, hs)
             # 为了和下方原版逻辑统一，先转回 (B, nh, T, hs)，统一在最后 return 时翻转
             y = y_fa.transpose(1, 2)
