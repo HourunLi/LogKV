@@ -717,9 +717,9 @@ class CausalSelfAttention(nn.Module):
                 # each center covers [center - b//2, center + b//2]
                 if dilated_stride > 0:
                     half_b = dilated_block // 2
-                    k = 0
+                    power = 0
                     while True:
-                        center_offset = (2 ** k) * dilated_stride  # 2^k * d
+                        center_offset = (2 ** power) * dilated_stride  # 2^power * d
                         center = row_idx - center_offset            # (T, 1)
                         if (center < 0).all():
                             break
@@ -728,7 +728,7 @@ class CausalSelfAttention(nn.Module):
                         # block 在 local window 之外（col <= row - swa_window），causal 由最后统一保证
                         in_block = (col_idx >= block_lo) & (col_idx <= block_hi) & (col_idx <= row_idx - swa_window)
                         visible = visible | in_block
-                        k += 1
+                        power += 1
 
                 # sink: 前 sink_size 列始终可见
                 if sink_size > 0:
