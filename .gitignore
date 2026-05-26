@@ -9,6 +9,8 @@ dist
 .venv/
 .vscode
 uv.lock
+*.json
+*.csv
 
 # data
 data
