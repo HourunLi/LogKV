@@ -176,7 +176,6 @@ class GPT(nn.Module):
         # decode: replacing-kv mode
         block_index_to_idx = {x: i for i, x in enumerate(self.config.research_prefill_swa_layers)}
         prefill_kv = None
-        prefill_hidden = None
         if self.config.use_research:
             assert prefill_mask is not None
             for block_idx, block in enumerate(self.transformer.h):
@@ -184,17 +183,33 @@ class GPT(nn.Module):
                     cos_, sin_ = cos[..., self.config.rope_indices[block_idx]], sin[..., self.config.rope_indices[block_idx]]
                 else:
                     cos_, sin_ = cos, sin
-                # prefill
+                # train + inference both go here
+                # process SWA layer
                 if block_idx in self.config.research_prefill_swa_layers and block_idx not in self.config.research_removed_layers:
+                    # SWA layers only for prefill, 只有prefill阶段这些层是用的swa，decode阶段是full attention
+                    # 如果是research_separate_parameter，就用单独的block进行prefill
+                    # 以及无论是train还是inference都会有prefill的阶段以及decode的阶段
+                    # 因为train是经过特殊修改过后的，具体体现为prefill阶段是采用的swa，然后decode阶段是用的full attention，所以要按照这种模式进行训练
                     if self.config.research_separate_parameter:
                         block_prefill: Block = self.transformer.h_prefill[block_index_to_idx[block_idx]]
                     else:
                         block_prefill: Block = block
-                    x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
-                    prefill_hidden = x_prefill
-                # decode
-                x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
-                x = torch.where(prefill_mask.unsqueeze(-1), prefill_hidden, x_decode)
+                    if input_pos is not None: # inference mode
+                        if prefill_mask.all(): #  prefill stage in inference mode
+                            x = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv = False)
+                        else: # decode stage in inference mode
+                            if self.config.research_separate_parameter:
+                                # decode step: let block do full attention over h_prefill.kv_cache (SWA KV)
+                                # permanently use h_prefill's kv_cache for decode, so new tokens are written there by pointer
+                                # decode的kv cache是之前的，但是hidden state是用的full attention生成的。
+                                block.attn.kv_cache = block_prefill.attn.kv_cache
+                            x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa = False, return_kv = False)
+                    else: # train mode
+                        x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
+                        x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
+                        x = torch.where(prefill_mask.unsqueeze(-1), x_prefill, x_decode)
+                else: # process normal layer
+                    x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1)
         else:
             for block_idx, block in enumerate(self.transformer.h):
                 if self.config.rope_indices is not None:
@@ -467,9 +482,7 @@ class CausalSelfAttention(nn.Module):
 
         if config.norm_qk:
             norm_q_size = config.n_head * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
-            norm_k_size = (
-                config.n_query_groups * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
-            )
+            norm_k_size = config.n_query_groups * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
             self.norm_q = config.norm_class(norm_q_size, eps=config.norm_eps)
             self.norm_k = config.norm_class(norm_k_size, eps=config.norm_eps)
         else:
@@ -603,6 +616,8 @@ class CausalSelfAttention(nn.Module):
         if input_pos is not None:
             if not isinstance(self.kv_cache, KVCache):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
+            # 写入：把当前计算的 K,V 写入 cache 的指定位置（由 input_pos 决定）
+            # 读取：返回 cache 里的完整历史 K,V（从位置 0 到最新位置）
             k, v = self.kv_cache(input_pos, k, v)
 
             if self.apply_sliding_window_attention:
@@ -668,10 +683,10 @@ class CausalSelfAttention(nn.Module):
             return o
 
     def scaled_dot_product_attention_flash_attn(
-        self, 
-        q: torch.Tensor, 
-        k: torch.Tensor, 
-        v: torch.Tensor, 
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         mask: torch.Tensor | None = None,
         use_swa: bool = False,         # 🌟 新增参数
         swa_window: int = 512          # 🌟 新增参数
@@ -680,12 +695,57 @@ class CausalSelfAttention(nn.Module):
         scale = scale * self.mscale * self.mscale
 
         # ===================================================================
-        # 🚀 路径 1: 极速 SWA (Sliding Window Attention) 走 Flash Attention 2
+        # 🚀 路径 1: SWA + Attention Sink
+        # sink_size 个 token 始终可见；其余位置用滑动窗口
         # ===================================================================
         if use_swa:
+            sink_size = self.config.research_attention_sink_size
+            dilated_stride = self.config.research_attention_dilated_stride
+            dilated_block = self.config.research_attention_dilated_block_size
+            use_manual_mask = sink_size > 0 or dilated_stride > 0
+            if use_manual_mask:
+                if swa_window <= 0:
+                    raise ValueError(f"use_swa=True with sink/dilated requires swa_window > 0, got {swa_window}")
+                T = q.size(2)
+                row_idx = torch.arange(T, device=q.device).unsqueeze(1)  # (T, 1)
+                col_idx = torch.arange(T, device=q.device).unsqueeze(0)  # (1, T)
+
+                # causal local window: col in (i - swa_window, i]
+                visible = (col_idx <= row_idx) & (col_idx > row_idx - swa_window)
+
+                # dilated blocks: centers at i - 2^k * d, k=0,1,2,...
+                # each center covers [center - b//2, center + b//2]
+                if dilated_stride > 0:
+                    half_b = dilated_block // 2
+                    power = 0
+                    while True:
+                        center_offset = (2 ** power) * dilated_stride  # 2^power * d
+                        center = row_idx - center_offset            # (T, 1)
+                        if (center < 0).all():
+                            break
+                        block_lo = center - half_b
+                        block_hi = center + half_b
+                        # block 在 local window 之外（col <= row - swa_window），causal 由最后统一保证
+                        in_block = (col_idx >= block_lo) & (col_idx <= block_hi) & (col_idx <= row_idx - swa_window)
+                        visible = visible | in_block
+                        power += 1
+
+                # sink: 前 sink_size 列始终可见
+                if sink_size > 0:
+                    visible = visible | (col_idx < sink_size)
+
+                # causal: 不能看未来
+                visible = visible & (col_idx <= row_idx)
+
+                attn_mask = torch.zeros(T, T, dtype=q.dtype, device=q.device)
+                attn_mask = attn_mask.masked_fill(~visible, float("-inf"))
+                attn_mask = attn_mask.view(1, 1, T, T)
+                return self.scaled_dot_product_attention(q, k, v, mask=attn_mask)
+
+            # sink_size == 0 且 dilated_stride == 0: 纯 SWA，走 Flash Attention
             if flash_attn_func is None:
                 raise ImportError("🚨 必须安装 flash-attn 库才能使用极速 SWA！(运行: pip install flash-attn --no-build-isolation)")
-            
+
             # PyTorch SDPA 格式: (B, nh, T, hs) -> Flash Attn 格式: (B, T, nh, hs)
             q_fa = q.transpose(1, 2)
             k_fa = k.transpose(1, 2)
@@ -696,16 +756,16 @@ class CausalSelfAttention(nn.Module):
 
             # 调用 Flash Attention 底层 C++ CUDA 算子
             y_fa = flash_attn_func(
-                q_fa, 
-                k_fa, 
-                v_fa, 
-                dropout_p=0.0, 
+                q_fa,
+                k_fa,
+                v_fa,
+                dropout_p=0.0,
                 softmax_scale=scale,
-                causal=True, 
+                causal=True,
                 window_size=(swa_window, -1), # 左侧看 swa_window, 右侧不看 (causal=True 强制为 0)
                 softcap=softcap_val
             )
-            
+
             # y_fa 出来的 shape 是 (B, T, nh, hs)
             # 为了和下方原版逻辑统一，先转回 (B, nh, T, hs)，统一在最后 return 时翻转
             y = y_fa.transpose(1, 2)
