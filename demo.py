@@ -571,9 +571,10 @@ def main(
                 "compariable_loss": compariable_decode_loss.detach().item(),
             }
             if research_decode_prefix_tokens > 0:
-                ks = [research_decode_prefix_tokens, 8, 16]
-                if 1 not in ks:
-                    ks.insert(0, 1)
+                ks = [1, 8, 16]
+                if research_decode_prefix_tokens not in ks:
+                    ks.append(research_decode_prefix_tokens)
+                    ks.sort()
                 grad_ctx = torch.no_grad() if research_decode_prefix_loss_weight == 0 else nullcontext()
                 with grad_ctx:
                     prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=ks)
