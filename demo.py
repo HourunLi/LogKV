@@ -302,7 +302,6 @@ def main(
         use_research: bool = False,
         research_swa_size: int = 512,
         research_swa_layers_str: str = "0,2,4,6,8,10,12,14,16,18,20,22,24,26",
-        research_identity_layers_str: str = "1,3,5,7,9,11,13,15,17,19,21,23,25,27",
         research_breakpoint_schedule: str | None = None,
         research_breakpoint_schedule_stable: int = 0,
         research_separate_parameter: bool = True,
