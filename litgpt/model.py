@@ -18,6 +18,9 @@ from typing_extensions import Self
 from litgpt.config import Config
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
+K_SIZE = 1024
+MAX_LENGTH=32*K_SIZE
+
 try:
     from flash_attn import flash_attn_func
 except ImportError:
@@ -205,9 +208,10 @@ class GPT(nn.Module):
                                 block.attn.kv_cache = block_prefill.attn.kv_cache
                             x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa = False, return_kv = False)
                     else: # train mode
-                        x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
-                        x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
-                        x = torch.where(prefill_mask.unsqueeze(-1), x_prefill, x_decode)
+                        # x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
+                        # x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
+                        # x = torch.where(prefill_mask.unsqueeze(-1), x_prefill, x_decode)
+                        x = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=False)
                 else: # process normal layer
                     x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1)
         else:
@@ -702,7 +706,9 @@ class CausalSelfAttention(nn.Module):
             sink_size = self.config.research_attention_sink_size
             dilated_stride = self.config.research_attention_dilated_stride
             dilated_block = self.config.research_attention_dilated_block_size
-            use_manual_mask = sink_size > 0 or dilated_stride > 0
+            # 如果sliding window 的大小比max length还长，俺么可以直接调用flash attention
+            # 其中使用sink和dilated stride都会导致无法使用flash attention
+            use_manual_mask = swa_window < MAX_LENGTH and (sink_size > 0 or dilated_stride > 0)
             if use_manual_mask:
                 if swa_window <= 0:
                     raise ValueError(f"use_swa=True with sink/dilated requires swa_window > 0, got {swa_window}")
