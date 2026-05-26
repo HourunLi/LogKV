@@ -311,7 +311,7 @@ def main(
         research_attention_dilated_block_size: int = 8,
         research_decode_prefix_tokens: int = 1,
         research_decode_prefix_loss_weight: float = 0,
-        research_prefill_supervise: bool = False,
+        research_prefill_supervise: bool = True,
         research_remove_order_str: str = "",
         research_remove_interval: int = 0,
         # EVAL
@@ -572,7 +572,8 @@ def main(
                 "compariable_loss": compariable_decode_loss.detach().item(),
             }
             if research_decode_prefix_tokens > 0:
-                ks = [research_decode_prefix_tokens, 8, 16]
+                # ks = [research_decode_prefix_tokens, 8, 16]
+                ks = [research_decode_prefix_tokens] + [1,2,3,4,5,8,10,16]
                 if 1 not in ks:
                     ks.insert(0, 1)
                 grad_ctx = torch.no_grad() if research_decode_prefix_loss_weight == 0 else nullcontext()
