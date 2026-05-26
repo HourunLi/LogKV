@@ -1,0 +1,31 @@
+config: base.yaml
+
+expid: cpt-fullswa-base_prefillmask_64k
+
+ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-0.6B-Base/
+
+global_batch_size: 128
+micro_batch_size: 1
+max_steps: 2000
+warmup_steps: 0
+learning_rate: 5e-5
+min_lr: 5e-5
+weight_decay: 0.1
+num_devices: 8
+
+data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
+num_workers: 16
+save_ckpt: true
+save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-fullswa-base_prefillmask_64k
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging
+
+enable_tensorboard: true
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k
+
+use_research: true
+research_swa_size: 65536
+# research_swa_layers_str: "0,1,2,3,4,5,6,7,12,17,22,26,27"
+research_swa_layers_str: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27"
+research_separate_parameter: true
+research_breakpoint_schedule_stable: 1000
+research_decode_prefix_tokens: 0

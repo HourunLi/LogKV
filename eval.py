@@ -148,8 +148,6 @@ def _normalize_training_config_dict(d: dict[str, Any]) -> tuple[dict[str, Any], 
     """训练 exp / CLI 里常用 research_*_layers_str；Config 只接受 research_prefill_swa_layers 等。"""
     out = dict(d)
     identity_layers: list[int] | None = None
-    if "research_identity_layers_str" in out:
-        identity_layers = _parse_csv_ints(out.pop("research_identity_layers_str"))
     if "research_swa_layers_str" in out:
         out["research_prefill_swa_layers"] = _parse_csv_ints(out.pop("research_swa_layers_str"))
     return out, identity_layers
@@ -208,7 +206,6 @@ class CustomResearchLM(LM):
                 use_research=use_research,
                 research_separate_parameter=True if use_research else False,
                 research_swa_layers_str="0,2,4,6,8,10,12,14,16,18,20,22,24,26",
-                research_identity_layers_str="1,3,5,7,9,11,13,15,17,19,21,23,25,27",
             )
             if config_overrides:
                 fallback_kw.update(config_overrides)
