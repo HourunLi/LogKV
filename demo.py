@@ -568,8 +568,8 @@ def main(
             elif use_research and research_prefill_supervise:
                 prefill_only_targets = targets.masked_fill(prefill_mask == False, -100)
                 prefill_loss = chunked_cross_entropy(logits, prefill_only_targets, chunk_size=entropy_chunk_size)
-                α = research_prefill_loss_weight
-                loss = α * prefill_loss + (1 - α) * compariable_decode_loss
+                alpha = research_prefill_loss_weight
+                loss = alpha * prefill_loss + (1 - alpha) * compariable_decode_loss
             else:
                 loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
 
