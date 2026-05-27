@@ -30,3 +30,4 @@ research_separate_parameter: true
 research_breakpoint_schedule_stable: 1000
 research_decode_prefix_tokens: 10
 research_prefill_supervise: true
+research_prefill_loss_weight: 0.3

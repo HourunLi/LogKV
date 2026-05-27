@@ -311,6 +311,7 @@ def main(
         research_decode_prefix_tokens: int = 1,
         research_decode_prefix_loss_weight: float = 0,
         research_prefill_supervise: bool = True,
+        research_prefill_loss_weight: float = 0.3,
         research_remove_order_str: str = "",
         research_remove_interval: int = 0,
         # EVAL
@@ -564,12 +565,19 @@ def main(
             compariable_decode_loss = chunked_cross_entropy(logits, masked_targets, chunk_size=entropy_chunk_size)
             if use_research and not research_prefill_supervise:
                 loss = compariable_decode_loss
+            elif use_research and research_prefill_supervise:
+                prefill_only_targets = targets.masked_fill(prefill_mask == False, -100)
+                prefill_loss = chunked_cross_entropy(logits, prefill_only_targets, chunk_size=entropy_chunk_size)
+                α = research_prefill_loss_weight
+                loss = α * prefill_loss + (1 - α) * compariable_decode_loss
             else:
                 loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
 
             metrics = {
                 "compariable_loss": compariable_decode_loss.detach().item(),
             }
+            if use_research and research_prefill_supervise:
+                metrics["prefill_loss"] = prefill_loss.detach().item()
 
             # 🌟 监控 Decode 前缀 token 的 loss（用于诊断上下文休克）
             # 硬编码 ks=[1,2,4,8,16]，观测 decode 开始后前 k 个 token 的平均 loss
