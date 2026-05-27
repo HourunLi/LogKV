@@ -29,4 +29,4 @@ research_swa_layers_str: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,2
 research_separate_parameter: true
 research_breakpoint_schedule_stable: 1000
 research_decode_prefix_tokens: 10
-# research_prefill_supervise: true
+research_prefill_supervise: false
