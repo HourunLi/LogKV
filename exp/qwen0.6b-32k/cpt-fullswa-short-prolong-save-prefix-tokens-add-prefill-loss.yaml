@@ -1,6 +1,6 @@
 config: base.yaml
 
-expid: cpt-fullswa-short-prolong-save-prefix-tokens
+expid: cpt-fullswa-short-prolong-save-prefix-tokens-add-prefill-loss
 
 ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-0.6B-Base/
 
@@ -16,7 +16,7 @@ num_devices: 8
 data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
-save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-fullswa-short-prolong_sink4--save-prefix-tokens
+save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen0.6b-32k-cpt-fullswa-short-prolong_sink4--save-prefix-tokens-add-prefill-loss
 merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging
 
 enable_tensorboard: true
@@ -29,4 +29,4 @@ research_swa_layers_str: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,2
 research_separate_parameter: true
 research_breakpoint_schedule_stable: 1000
 research_decode_prefix_tokens: 10
-# research_prefill_supervise: true
+research_prefill_supervise: true
