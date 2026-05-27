@@ -570,20 +570,27 @@ def main(
             metrics = {
                 "compariable_loss": compariable_decode_loss.detach().item(),
             }
+
+            # 🌟 监控 Decode 前缀 token 的 loss（用于诊断上下文休克）
+            # 硬编码 ks=[1,2,4,8,16]，观测 decode 开始后前 k 个 token 的平均 loss
             if research_decode_prefix_tokens > 0:
-                # ks = [research_decode_prefix_tokens, 8, 16]
-                ks = [research_decode_prefix_tokens] + [1,2,4,8,16]
-                if 1 not in ks:
-                    ks.insert(0, 1)
-                    ks.sort()
+                prefix_ks = [1, 2, 4, 8, 16] + [research_decode_prefix_tokens]
+                prefix_ks.sort()
+                # 如果 weight=0，只观测指标不计算梯度；如果 weight>0，计算梯度用于加权 loss
                 grad_ctx = torch.no_grad() if research_decode_prefix_loss_weight == 0 else nullcontext()
                 with grad_ctx:
-                    prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=ks)
+                    prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=prefix_ks)
+
+                # 记录所有 prefix loss 到 metrics（TensorBoard 监控）
                 if len(prefix_losses) > 0:
                     for k, prefix_loss in prefix_losses.items():
-                        metrics[f"prefix_loss_{k}"] = prefix_loss.detach().item()
-                    if use_research and research_decode_prefix_loss_weight > 0:
+                        if prefix_loss is not None:
+                            metrics[f"prefix_loss_{k}"] = prefix_loss.detach().item()
+
+                    # 可选：如果 weight > 0，加权前 k 个 token 的 loss 到总 loss
+                    if use_research and research_decode_prefix_loss_weight > 0 and prefix_losses[research_decode_prefix_tokens] is not None:
                         loss += prefix_losses[research_decode_prefix_tokens] * research_decode_prefix_loss_weight
+
             metrics["loss"] = loss.detach().item()
             metrics["prefill_ratio"] = (prefill_mask.sum() / prefill_mask.numel()).item()
             step_stats.accumulate(**metrics)
