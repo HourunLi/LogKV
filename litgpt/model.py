@@ -207,11 +207,10 @@ class GPT(nn.Module):
                                 # decode的kv cache是之前的，但是hidden state是用的full attention生成的。
                                 block.attn.kv_cache = block_prefill.attn.kv_cache
                             x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa = False, return_kv = False)
-                    else: # train mode
-                        # x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
-                        # x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
-                        # x = torch.where(prefill_mask.unsqueeze(-1), x_prefill, x_decode)
-                        x = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=False)
+                    else: # train mode: dual-path (prefill SWA + decode full)
+                        x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
+                        x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
+                        x = torch.where(prefill_mask.unsqueeze(-1), x_prefill, x_decode)
                 else: # process normal layer
                     x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1)
         else:
