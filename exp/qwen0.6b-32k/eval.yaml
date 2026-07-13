@@ -1,0 +1,13 @@
+# Eval-only config: run eval.py directly with this config
+checkpoint_dir: ./ckpt/qwen0.6b-32k-cpt-base
+
+benchmark: "boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
+
+output_path: ./ckpt/qwen0.6b-32k-cpt-base/evaluate
+
+# The checkpoint was adapted with logKV training (cpt-base.yaml:
+# log_kv_training: true), so evaluate with the same compressed-KV attention.
+# Must match the training-time values.
+use_log_kv: true
+log_kv_B: 512
+log_kv_recent_size: 1024

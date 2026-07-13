@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
+from litgpt.log_kv_cache import LogStructuredKVCache, log_kv_decoupled_attention
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
 
@@ -132,18 +133,24 @@ class GPT(nn.Module):
             if input_pos.dim() == 1:
                 cos = cos.unsqueeze(0)
                 sin = sin.unsqueeze(0)
-            if self.mask_cache is None:
-                raise TypeError("You need to call `gpt.set_kv_cache()`")
-            mask = batched_index_select(self.mask_cache, 2, input_pos)
-            if mask.dim() > 4:
-                # the mask cache has a batch dim of 1 in addition to the one
-                # we get if input_pos has a batch dimension
-                mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
-            if input_pos_maxp1 is not None:
-                # Shorten final dimension so it just covers all `input_pos` entries
-                if input_pos_maxp1 > self.max_seq_length:
-                    raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
-                mask = mask[..., :input_pos_maxp1]
+            all_log_kv_cache = all(
+                isinstance(block.attn.kv_cache, LogStructuredKVCache) for block in self.transformer.h
+            )
+            if all_log_kv_cache:
+                mask = None
+            else:
+                if self.mask_cache is None:
+                    raise TypeError("You need to call `gpt.set_kv_cache()`")
+                mask = batched_index_select(self.mask_cache, 2, input_pos)
+                if mask.dim() > 4:
+                    # the mask cache has a batch dim of 1 in addition to the one
+                    # we get if input_pos has a batch dimension
+                    mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
+                if input_pos_maxp1 is not None:
+                    # Shorten final dimension so it just covers all `input_pos` entries
+                    if input_pos_maxp1 > self.max_seq_length:
+                        raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
+                    mask = mask[..., :input_pos_maxp1]
         else:
             # unsqueeze to have a batch dimension
             cos = self.cos[:T].unsqueeze(0)
@@ -294,6 +301,7 @@ class GPT(nn.Module):
                 device,
                 dtype,
             )
+            block.attn._log_kv_pending = None
 
         if self.mask_cache is None or self.mask_cache.size(3) != max_seq_length:
             # passing `attn_mask` to SDPA disables the flash implementation. since we only need the mask
@@ -304,6 +312,95 @@ class GPT(nn.Module):
         self.mask_cache = None
         for block in self.transformer.h:
             block.attn.kv_cache = None
+            block.attn._log_kv_pending = None
+
+    def set_log_kv_cache(
+        self,
+        batch_size: int,
+        max_seq_length: int | None = None,
+        rope_cache_length: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        B: int = 512,
+        recent_size: int = 1024,
+    ) -> None:
+        """Initialize log-structured KV caches for all attention layers.
+
+        Memory: O(B * log(N)) slots instead of standard O(N).
+
+        Each layer gets its own LogStructuredKVCache instance.
+
+        Args:
+            batch_size: Batch size for generation
+            max_seq_length: Maximum sequence length to support
+            rope_cache_length: RoPE cache length (auto-detected if None)
+            device: Target device
+            dtype: Target dtype
+            B: Number of memory slots per level (default 512)
+            recent_size: Sliding window size (default 1024, recent tokens kept exact)
+        """
+        if rope_cache_length is None:
+            rope_cache_length = self.rope_cache_length()
+        if max_seq_length is None:
+            max_seq_length = self.max_seq_length
+        if dtype is None:
+            # Default to the parameter dtype, not the process default: a bf16
+            # model with fp32 cache buffers would fail on the first cat/matmul.
+            dtype = next(self.parameters()).dtype
+
+        for block_idx, block in enumerate(self.transformer.h):
+            block.attn.kv_cache = block.attn.build_log_kv_cache(
+                batch_size, max_seq_length, rope_cache_length, device, dtype,
+                B=B, recent_size=recent_size,
+            )
+            block.attn._log_kv_pending = None
+
+        # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
+        # holding stale O(N^2) bool tensors in GPU memory. With every block on
+        # LogKV, GPT.forward sets mask=None and never reads it anyway.
+        self.mask_cache = None
+
+    def enable_log_kv_training(
+        self,
+        batch_size: int,
+        max_seq_length: int | None = None,
+        rope_cache_length: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        B: int = 512,
+        recent_size: int = 1024,
+    ) -> None:
+        """Attach a LogStructuredKVCache to every attention layer and switch
+        each layer into ``training_log_kv`` mode.
+
+        Unlike ``set_log_kv_cache`` (inference), this does NOT build a mask
+        cache (training builds a per-chunk mask) and flips ``training_log_kv``
+        on so that ``CausalSelfAttention.forward`` routes through
+        ``_log_kv_training_forward`` when ``input_pos is None``.
+        """
+        if rope_cache_length is None:
+            rope_cache_length = self.rope_cache_length()
+        if max_seq_length is None:
+            max_seq_length = self.max_seq_length
+        if dtype is None:
+            # Default to the parameter dtype, not the process default (see
+            # set_log_kv_cache).
+            dtype = next(self.parameters()).dtype
+
+        for block_idx, block in enumerate(self.transformer.h):
+            block.attn.kv_cache = block.attn.build_log_kv_cache(
+                batch_size, max_seq_length, rope_cache_length, device, dtype,
+                B=B, recent_size=recent_size,
+            )
+            block.attn.training_log_kv = True
+            block.attn._log_kv_pending = None
+
+    def disable_log_kv_training(self) -> None:
+        """Turn off logKV training mode and drop the caches."""
+        for block in self.transformer.h:
+            block.attn.training_log_kv = False
+            block.attn.kv_cache = None
+            block.attn._log_kv_pending = None
 
 
 class Block(nn.Module):
@@ -399,7 +496,13 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(config.head_size * config.n_head, config.n_embd, bias=config.bias)
         # disabled by default
-        self.kv_cache: KVCache | None = None
+        self.kv_cache: KVCache | LogStructuredKVCache | None = None
+        # When True (training only), simulate the logKV streaming compaction
+        # over the training sequence so the model learns to read compressed KV.
+        self.training_log_kv: bool = False
+        # LogKV inference: carry one trailing token across calls so commits stay
+        # aligned to the training chunk size. Holds (k_content, v, k_pos).
+        self._log_kv_pending: tuple | None = None
         self.apply_sliding_window_attention = False
         if config.sliding_window_size is not None and config.sliding_window_indices is not None:
             self.apply_sliding_window_attention = config.sliding_window_indices[block_idx]
@@ -503,6 +606,10 @@ class CausalSelfAttention(nn.Module):
             k = self.norm_k(k)
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
+        # With DeepSeek V4-style decoupling, the first rope_n_elem dims are the position
+        # channel (RoPE'd, per-token, uncompressed) and the rest are the content channel
+        # (no RoPE, compressed). The cache splits k internally — no pre-RoPE clone needed.
+
         if self.config.rope_interleave:
             q_roped = apply_rope_interleave(q[..., :rope_n_elem], cos, sin)
             k_roped = apply_rope_interleave(k[..., :rope_n_elem], cos, sin)
@@ -512,10 +619,29 @@ class CausalSelfAttention(nn.Module):
         q = torch.cat((q_roped, q[..., rope_n_elem:]), dim=-1)  # (B, nh_q, T, hs)
         k = torch.cat((k_roped, k[..., rope_n_elem:]), dim=-1)  # (B, nh_k, T, hs)
 
+        # LogKV training mode: simulate streaming compaction (C = t) so that
+        # training attention matches inference decode semantics. Each chunk of
+        # t tokens attends to [compact prefix (detached) + current chunk (causal)]
+        # via decoupled content/position attention.
+        if self.training_log_kv and input_pos is None:
+            return self._log_kv_training_forward(q, k, v, B, T)
+
         # Apply kv-cache during inference.
         if input_pos is not None:
-            if not isinstance(self.kv_cache, KVCache):
+            if not isinstance(self.kv_cache, (KVCache, LogStructuredKVCache)):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
+
+            if isinstance(self.kv_cache, LogStructuredKVCache):
+                # Explicit raise (not assert): this correctness precondition must
+                # survive `python -O`, which strips assert statements.
+                if self.config.rope_n_elem >= self.config.head_size:
+                    raise ValueError("logKV decoupled attention requires rotary_percentage < 1.0")
+                self._assert_log_kv_input_pos_contiguous(input_pos, T)
+                # Inference uses the same streaming chunker for prefill and decode.
+                # A trailing single token is kept pending so an odd-length prompt
+                # pairs with the first decode token, matching training chunks.
+                return self._log_kv_training_forward(q, k, v, B, T, reset_cache=False, defer_last_single=True)
+
             k, v = self.kv_cache(input_pos, k, v)
 
             if self.apply_sliding_window_attention:
@@ -523,8 +649,8 @@ class CausalSelfAttention(nn.Module):
                 if mask is not None and mask.size(-1) != actual_kv_len:
                     mask = mask[..., :actual_kv_len]
 
-            if input_pos_maxp1 is not None:
-                # Subselect along sequence dimension
+            if input_pos_maxp1 is not None and not isinstance(self.kv_cache, LogStructuredKVCache):
+                # Subselect along sequence dimension (only for standard cache)
                 k = k[..., :input_pos_maxp1, :]
                 v = v[..., :input_pos_maxp1, :]
             # k, v: (B, nh_k, input_pos_maxp1, hs)
@@ -572,6 +698,292 @@ class CausalSelfAttention(nn.Module):
 
         # Output projection.
         return self.proj(y)  # (B, T, C)
+
+    def _assert_log_kv_input_pos_contiguous(self, input_pos: torch.Tensor, T: int) -> None:
+        """Validate the append-only LogKV cache contract.
+
+        LogKV currently stores position keys in arrival order and tracks cache
+        length with scalar counters. Until true indexed writes are implemented,
+        inference must feed a single shared, contiguous position range.
+        """
+        assert isinstance(self.kv_cache, LogStructuredKVCache)
+
+        if input_pos.dim() == 2:
+            if not torch.equal(input_pos, input_pos[:1].expand_as(input_pos)):
+                raise ValueError(
+                    "LogKV cache does not support per-sample input_pos yet; all batch rows must share the same "
+                    "contiguous positions."
+                )
+            input_pos = input_pos[0]
+        elif input_pos.dim() != 1:
+            raise ValueError(f"LogKV cache requires 1-D or shared 2-D input_pos, got shape {tuple(input_pos.shape)}.")
+
+        pending_len = 0 if self._log_kv_pending is None else self._log_kv_pending[0].size(2)
+        expected_start = self.kv_cache.pos_count + pending_len
+        expected = torch.arange(expected_start, expected_start + T, device=input_pos.device, dtype=input_pos.dtype)
+        if not torch.equal(input_pos, expected):
+            got = input_pos.detach().cpu().tolist()
+            raise ValueError(
+                "LogKV cache requires append-only contiguous input_pos. "
+                f"Expected {expected_start}..{expected_start + T - 1}, got {got}. "
+                "Reset the LogKV cache before starting a new sequence, or implement indexed LogKV writes."
+            )
+
+    def _log_kv_training_forward(
+        self,
+        q: torch.Tensor,    # (B, n_head, T, hs) post-RoPE
+        k: torch.Tensor,    # (B, n_query_groups, T, hs) post-RoPE
+        v: torch.Tensor,    # (B, n_query_groups, T, hs)
+        B: int,
+        T: int,
+        reset_cache: bool = True,
+        defer_last_single: bool = False,
+    ) -> torch.Tensor:
+        """Training forward simulating the logKV streaming compaction with a
+        sliding window.
+
+        Splits the sequence into chunks of 2 tokens. For each chunk the queries
+        attend to:
+            [compact prefix (detached)
+             + sliding window from previous chunks (detached, exact)
+             + current chunk exact KV (causal, with gradient)]
+        via DeepSeek V4-style decoupled attention (content per-slot + position
+        per-token).  After attending, the chunk's KV (detached) is added to the
+        sliding window. When the window overflows, the oldest 2 tokens are
+        compacted into the hierarchy.
+
+        Gradient flows only through the current chunk's q/k/v (and thus the qkv
+        projection weights); the compacted prefix and sliding window are
+        stop-gradient context, keeping activation memory bounded.
+
+        When ``defer_last_single`` is true (LogKV inference), the final
+        one-token chunk is attended immediately but not committed. It is stored
+        in ``_log_kv_pending`` and paired with the next streamed token, which
+        keeps odd-length prefill and subsequent decode on the same 2-token
+        boundaries as training over the concatenated sequence.
+        """
+        # Explicit raises (not asserts): these correctness preconditions must
+        # survive `python -O`, which strips assert statements.
+        if not isinstance(self.kv_cache, LogStructuredKVCache):
+            raise TypeError("training_log_kv requires a LogStructuredKVCache")
+        if self.config.rope_n_elem >= self.config.head_size:
+            raise ValueError(
+                "logKV decoupled attention requires rotary_percentage < 1.0 "
+                f"(got rope_n_elem={self.config.rope_n_elem}, head_size={self.config.head_size}). "
+                "Set rotary_percentage=0.25 in your YAML config."
+            )
+        cache = self.kv_cache
+        if reset_cache:
+            cache.reset_parameters()
+            self._log_kv_pending = None
+
+        # Reconcile cache buffer dtype with the activations before any read/write.
+        # Inference builds the cache via set_log_kv_cache(), which may allocate
+        # buffers at the process-default dtype (fp32) while the model runs in bf16;
+        # without this the first get_attention_state()/add_recent() would cat/matmul
+        # fp32 buffers with bf16 activations and raise. No-op once dtypes match.
+        cache._convert_dtype(q.dtype)
+
+        t = 2  # compaction chunk size (fixed: uniform 2:1)
+        # Post-RoPE position width. Equals rope_n_elem except for the widened
+        # rope_n_elem == 1 case, where apply_rope broadcasts the slice to 2 dims.
+        d_pos = cache.d_pos
+        n_head = self.config.n_head
+        head_size = self.config.head_size
+        device = q.device
+
+        scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or head_size)
+        scale = scale * self.mscale * self.mscale
+
+        # Split q/k into position (RoPE'd, first d_pos dims) and content (rest).
+        q_pos = q[..., :d_pos]         # (B, n_head, T, d_pos)
+        q_content = q[..., d_pos:]     # (B, n_head, T, content_dim)
+        k_pos = k[..., :d_pos]         # (B, n_groups, T, d_pos)
+        k_content = k[..., d_pos:]     # (B, n_groups, T, content_dim)
+
+        outputs: list[torch.Tensor] = []
+        start = 0
+
+        pending = self._log_kv_pending if defer_last_single else None
+        if pending is not None:
+            pk, pv, pp = pending
+            q_content_b = q_content[:, :, :1, :]
+            q_pos_b = q_pos[:, :, :1, :]
+            kc_b = k_content[:, :, :1, :]
+            kv_b = v[:, :, :1, :]
+            kp_b = k_pos[:, :, :1, :]
+
+            state = cache.get_attention_state()
+            (compact_k, compact_v, compact_w, compact_pos_keys,
+             recent_content_cache, recent_values_cache, recent_pos_keys_cache) = state
+
+            parts_k = []
+            parts_v = []
+            parts_p = []
+            if recent_content_cache.size(2) > 0:
+                parts_k.append(recent_content_cache)
+                parts_v.append(recent_values_cache)
+                parts_p.append(recent_pos_keys_cache)
+            parts_k.extend([pk, kc_b])
+            parts_v.extend([pv, kv_b])
+            parts_p.extend([pp, kp_b])
+
+            combined_state = (
+                compact_k, compact_v, compact_w, compact_pos_keys,
+                torch.cat(parts_k, dim=2),
+                torch.cat(parts_v, dim=2),
+                torch.cat(parts_p, dim=2),
+            )
+
+            n_prefix = compact_pos_keys.size(2) + recent_content_cache.size(2) + pp.size(2)
+            n_total = n_prefix + 1
+            mask = torch.ones(1, n_total, dtype=torch.bool, device=device)
+
+            y_b = log_kv_decoupled_attention(
+                q_content_b, q_pos_b, combined_state, scale=scale, mask=mask
+            )
+            outputs.append(y_b)
+
+            cache.add_recent(
+                torch.cat([pk, kc_b.detach()], dim=2),
+                torch.cat([pv, kv_b.detach()], dim=2),
+                torch.cat([pp, kp_b.detach()], dim=2),
+            )
+            self._log_kv_pending = None
+            start = 1
+
+        # ---- Fast path (inference only): vectorize the leading no-compaction run ----
+        # While the hierarchy holds no compact slots and the recent window will not
+        # overflow, every query attends to [existing recent (exact) + causal current
+        # tokens] with no compression — i.e. plain causal attention over exact tokens.
+        # The whole run is then one decoupled-attention call instead of one sequential
+        # 2-token step per chunk (e.g. a 512-token loglikelihood request: 1 call vs 256).
+        # Restricted to the inference path (defer_last_single): under no_grad the output
+        # equals the per-chunk loop below, whereas training must keep the loop's
+        # per-chunk stop-gradient on the sliding window, so training keeps the loop.
+        if (
+            defer_last_single
+            and start < T
+            and cache.level_count.sum().item() == 0        # no compaction has happened
+            and cache.recent_count < cache.recent_size      # room left -> no flush in block
+        ):
+            capacity = cache.recent_size - cache.recent_count
+            block_end = min(T, start + capacity)  # no flush occurs within [start, block_end)
+            blk = block_end - start
+            # Defer a lone tail token so it pairs with the next streamed token (keeps the
+            # 2-token commit alignment with training over the full sequence).
+            defer_tail = block_end == T and blk % 2 == 1
+            commit_end = block_end - 1 if defer_tail else block_end
+
+            state = cache.get_attention_state()
+            (compact_k, compact_v, compact_w, compact_pos_keys,
+             recent_content_cache, recent_values_cache, recent_pos_keys_cache) = state
+            n_recent_cache = recent_content_cache.size(2)
+
+            kc_blk = k_content[:, :, start:block_end, :]
+            kv_blk = v[:, :, start:block_end, :]
+            kp_blk = k_pos[:, :, start:block_end, :]
+            if n_recent_cache > 0:
+                blk_content = torch.cat([recent_content_cache, kc_blk], dim=2)
+                blk_values = torch.cat([recent_values_cache, kv_blk], dim=2)
+                blk_pos = torch.cat([recent_pos_keys_cache, kp_blk], dim=2)
+            else:
+                blk_content, blk_values, blk_pos = kc_blk, kv_blk, kp_blk
+
+            combined_state = (
+                compact_k, compact_v, compact_w, compact_pos_keys,
+                blk_content, blk_values, blk_pos,
+            )
+            # Mask (blk, n_recent_cache + blk): existing recent fully visible, block
+            # tokens causal among themselves.
+            n_total = n_recent_cache + blk
+            mask = torch.ones(blk, n_total, dtype=torch.bool, device=device)
+            mask[:, n_recent_cache:] = torch.tril(
+                torch.ones(blk, blk, dtype=torch.bool, device=device)
+            )
+            y_blk = log_kv_decoupled_attention(
+                q_content[:, :, start:block_end, :],
+                q_pos[:, :, start:block_end, :],
+                combined_state, scale=scale, mask=mask,
+            )
+            outputs.append(y_blk)
+
+            if commit_end > start:
+                cache.add_recent(
+                    k_content[:, :, start:commit_end, :].detach(),
+                    v[:, :, start:commit_end, :].detach(),
+                    k_pos[:, :, start:commit_end, :].detach(),
+                )
+            if defer_tail:
+                self._log_kv_pending = (
+                    k_content[:, :, commit_end:block_end, :].detach(),
+                    v[:, :, commit_end:block_end, :].detach(),
+                    k_pos[:, :, commit_end:block_end, :].detach(),
+                )
+            start = block_end
+
+        while start < T:
+            end = min(start + t, T)
+            actual_t = end - start
+            defer_chunk = defer_last_single and actual_t == 1 and end == T
+
+            q_content_b = q_content[:, :, start:end, :]  # (B, n_head, actual_t, content_dim)
+            q_pos_b = q_pos[:, :, start:end, :]          # (B, n_head, actual_t, d_pos)
+            kc_b = k_content[:, :, start:end, :]         # (B, n_groups, actual_t, content_dim)
+            kv_b = v[:, :, start:end, :]                 # (B, n_groups, actual_t, v_dim)
+            kp_b = k_pos[:, :, start:end, :]             # (B, n_groups, actual_t, d_pos)
+
+            # Cache state: [compact prefix] + [sliding window from prev chunks].
+            # Both are detached — only the current chunk carries gradient.
+            state = cache.get_attention_state()
+            (compact_k, compact_v, compact_w, compact_pos_keys,
+             recent_content_cache, recent_values_cache, recent_pos_keys_cache) = state
+
+            n_compact_tokens = compact_pos_keys.size(2)
+            n_recent_cache = recent_content_cache.size(2)  # sliding window tokens
+
+            # Append current chunk (with gradient) to the sliding window part.
+            if n_recent_cache > 0:
+                combined_recent_content = torch.cat([recent_content_cache, kc_b], dim=2)
+                combined_recent_values = torch.cat([recent_values_cache, kv_b], dim=2)
+                combined_recent_pos_keys = torch.cat([recent_pos_keys_cache, kp_b], dim=2)
+            else:
+                combined_recent_content = kc_b
+                combined_recent_values = kv_b
+                combined_recent_pos_keys = kp_b
+
+            combined_state = (
+                compact_k, compact_v, compact_w, compact_pos_keys,
+                combined_recent_content, combined_recent_values, combined_recent_pos_keys,
+            )
+
+            # Mask: (actual_t, n_total)
+            #   compact prefix + sliding window -> fully visible
+            #   current chunk -> causal
+            n_prefix = n_compact_tokens + n_recent_cache
+            n_total = n_prefix + actual_t
+            mask = torch.ones(actual_t, n_total, dtype=torch.bool, device=device)
+            mask[:, n_prefix:] = torch.tril(
+                torch.ones(actual_t, actual_t, dtype=torch.bool, device=device)
+            )
+
+            y_b = log_kv_decoupled_attention(
+                q_content_b, q_pos_b, combined_state, scale=scale, mask=mask
+            )  # (B, n_head, actual_t, v_dim)
+            outputs.append(y_b)
+
+            # Add current chunk (detached) to the sliding window.
+            # When the window overflows, oldest t tokens are compacted into hierarchy.
+            if defer_chunk:
+                self._log_kv_pending = (kc_b.detach(), kv_b.detach(), kp_b.detach())
+            else:
+                cache.add_recent(kc_b.detach(), kv_b.detach(), kp_b.detach())
+
+            start = end
+
+        y = torch.cat(outputs, dim=2)  # (B, n_head, T, v_dim)
+        y = y.transpose(1, 2).reshape(B, T, head_size * n_head)
+        return self.proj(y)
 
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None
@@ -632,6 +1044,56 @@ class CausalSelfAttention(nn.Module):
             dtype=dtype,
             is_sliding_window=self.apply_sliding_window_attention,
             sliding_window_size=self.config.sliding_window_size if self.apply_sliding_window_attention else None,
+        )
+
+    def build_log_kv_cache(
+        self,
+        batch_size: int,
+        max_seq_length: int,
+        rope_cache_length: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        B: int = 512,
+        recent_size: int = 1024,
+    ) -> "LogStructuredKVCache":
+        """Build a log-structured KV cache with O(B * log(N)) memory.
+
+        Architecture (uniform 2:1 compaction at every level):
+            Buffer:           recent_size raw tokens, no compression
+            Level 0 (write):  B entries, each = 2 tokens merged
+            Level 1+ (carry): B entries, each = 2 entries from prev level merged
+        """
+        rope_n_elem = self.config.rope_n_elem
+        content_dim = self.config.head_size - rope_n_elem
+        v_dim = self.config.head_size
+        # d_pos is the width of the RoPE'd slice AFTER apply_rope, which is
+        # rope_cache_length (cos.size(1)), NOT rope_n_elem: for rope_n_elem == 1
+        # the RoPE cache is widened to 2 dims (HF-compat, see build_rope_cache)
+        # and apply_rope broadcasts the roped slice to that width, so k/q enter
+        # attention with head_size + 1 dims. Mirrors the
+        # `rope_cache_length + head_size - rope_n_elem` k-shape in build_kv_cache.
+        if rope_cache_length is None:
+            rope_cache_length = 2 if rope_n_elem == 1 else rope_n_elem
+        d_pos = rope_cache_length
+
+        k_content_shape = (
+            batch_size,
+            self.config.n_query_groups,
+            max_seq_length,
+            content_dim,
+        )
+        v_shape = (
+            batch_size,
+            self.config.n_query_groups,
+            max_seq_length,
+            v_dim,
+        )
+
+        return LogStructuredKVCache(
+            k_content_shape, v_shape,
+            d_pos=d_pos,
+            B=B, recent_size=recent_size,
+            device=device, dtype=dtype,
         )
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:

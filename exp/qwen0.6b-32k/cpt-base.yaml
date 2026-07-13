@@ -1,0 +1,34 @@
+# CPT with standard attention + log-structured KV cache
+config: base.yaml
+
+expid: cpt-base
+
+ckpt_dir: checkpoints/Qwen/Qwen3-0.6B-Base
+
+global_batch_size: 128
+micro_batch_size: 1
+max_steps: 2000
+warmup_steps: 10
+learning_rate: 5e-5
+min_lr: 5e-6
+weight_decay: 0.1
+num_devices: 8
+
+data_mix_yaml: ./exp/data_config/base-qwen.yaml
+num_workers: 16
+save_ckpt: true
+save_path: ./ckpt/qwen0.6b-32k-cpt-base
+
+enable_tensorboard: true
+tensorboard_root: ./tb-32k
+
+# Log-structured KV cache
+log_kv_B: 512
+log_kv_recent_size: 1024
+# Enable logKV simulation during this adaptation phase.
+# Run AFTER dense pretraining so the model learns to read compressed KV.
+log_kv_training: true
+
+# DeepSeek V4-style content/position decoupling:
+# 32 dims RoPE (position, per-token, uncompressed) + 96 dims content (compressed)
+rotary_percentage: 0.25

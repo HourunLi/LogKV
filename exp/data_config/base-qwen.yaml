@@ -1,0 +1,20 @@
+# 仓库根目录执行 demo.py:
+#   --data_mix_yaml exp/data_config/demo_data_mix.example.yaml
+#
+# paths: 仅写语料根目录（与跑 data.py 时 --data_dir 一致，其下为 litdata_<tokenizer 哈希>_ctx<长度>）
+paths:
+  - fineweb-edu/sample/10BT/
+  - openwebmath/data/
+  - slimpajama-arxiv/train/RedPajamaArXiv/
+  - slimpajama-books/train/RedPajamaBook/
+  - slimpajama-stackexchange/train/RedPajamaStackExchange/
+  - slimpajama-wikipedia/train/RedPajamaWikipedia/
+  - textbookchapters/data/
+  - the-stack-smol-xl/data/
+  - tulu-v2-sft-mixture/data/
+weights: [0.25, 0.05, 0.10, 0.30, 0.05, 0.05, 0.04, 0.15, 0.01]
+
+# 可选
+base_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/
+# base_dir: /data/zys/longdata/
+# iterate_over_all: false
