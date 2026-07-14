@@ -32,10 +32,9 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Any
 
-from jsonargparse import CLI
 import tqdm
 
-from utils import auto_expand_env_vars
+from utils import auto_expand_env_vars, run_cli
 
 # ── Optional: offload large files to cloud storage ──
 if "HF_DATASETS_CACHE" not in os.environ and "PKU" not in os.environ:
@@ -685,4 +684,4 @@ def output_from_cache(
 
 
 if __name__ == "__main__":
-    CLI(main)
+    run_cli(main)
