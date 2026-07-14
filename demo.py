@@ -80,6 +80,75 @@ def _distributed_looks_multi_node() -> bool:
     return ws > lws
 
 
+def _nvidia_smi_field(query: str) -> str | None:
+    """Return a single `nvidia-smi --query-gpu` field for GPU 0, or None if the
+    tool is missing / errors. Used only for diagnostics, so failures are silent."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    first = out.stdout.strip().splitlines()
+    return first[0].strip() if first else None
+
+
+def cuda_preflight() -> None:
+    """Fail fast with a readable message when the CUDA runtime cannot initialize.
+
+    ``torch._C._cuda_init`` is lazy: the first GPU touch (here, ``fabric.launch()``)
+    is where a driver/runtime mismatch surfaces, as an opaque traceback. This
+    prints a torch/CUDA/driver fingerprint up front and, if the device is
+    unreachable, raises a RuntimeError that names the likely cause (NVIDIA driver
+    too old for the CUDA version baked into the installed torch wheel) instead of
+    letting the raw ``_cuda_init`` error propagate.
+    """
+    driver = _nvidia_smi_field("driver_version")
+    print("[cuda-preflight] "
+          f"torch={torch.__version__} "
+          f"torch.version.cuda={torch.version.cuda} "
+          f"driver={driver or 'n/a'} "
+          f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
+          flush=True)
+
+    # Try to actually reach the device. torch.cuda.is_available() swallows the
+    # underlying error, so provoke it directly to capture the real message.
+    err: BaseException | None = None
+    try:
+        if not torch.cuda.is_available():
+            raise RuntimeError("torch.cuda.is_available() returned False")
+        torch.zeros(1, device="cuda")  # forces torch._C._cuda_init
+    except BaseException as e:  # noqa: BLE001 - want the raw reason for the report
+        err = e
+
+    if err is None:
+        print(f"[cuda-preflight] OK: {torch.cuda.device_count()} device(s) visible, "
+              f"compiled for CUDA {torch.version.cuda}", flush=True)
+        return
+
+    if torch.version.cuda is None:
+        hint = ("This torch build is CPU-only (torch.version.cuda is None). Install a "
+                "CUDA build of torch that matches the node's driver.")
+    else:
+        hint = (
+            f"torch was built for CUDA {torch.version.cuda}; the NVIDIA driver "
+            f"({driver or 'unknown'}) must support at least that CUDA version. "
+            "Run `nvidia-smi` and compare its top-right 'CUDA Version' with "
+            f"torch.version.cuda={torch.version.cuda}. If the driver's max is lower, "
+            "either install a torch wheel built for an older CUDA (e.g. a +cu118 "
+            "build) or upgrade the node's driver. Also verify CUDA_VISIBLE_DEVICES "
+            "points at a real GPU and that this node actually has one."
+        )
+    raise RuntimeError(
+        f"CUDA is not usable on this node: {type(err).__name__}: {err}\n"
+        f"[cuda-preflight] {hint}"
+    ) from err
+
+
 def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     """Cosine LR schedule with linear warmup."""
     if current_step < warmup_steps:
@@ -337,6 +406,9 @@ def main(
             activation_checkpointing_policy={Block},
             timeout=timedelta(days=3650),
         )
+    # Surface a driver/runtime mismatch here, as a readable error, before the
+    # opaque torch._C._cuda_init traceback inside fabric.launch().
+    cuda_preflight()
     fabric = L.Fabric(
         accelerator="cuda",
         devices=num_devices,
