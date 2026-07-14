@@ -29,7 +29,6 @@ from datetime import datetime
 from litgpt import Config
 from litgpt.model import GPT
 from litgpt.utils import chunked_cross_entropy, load_checkpoint
-from jsonargparse import CLI
 import random
 import numpy as np
 from lightning.fabric.loggers import TensorBoardLogger
@@ -572,4 +571,4 @@ def main(
 
 
 if __name__ == "__main__":
-    CLI(main)
+    run_cli(main)

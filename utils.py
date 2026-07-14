@@ -1,11 +1,14 @@
+import argparse
 import os
 import json
 import re
 import functools
+import inspect
 from typing import Any
 import torch
 import random
 import numpy as np
+import yaml
 from litgpt.tokenizer import Tokenizer
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 import shutil
@@ -94,9 +97,9 @@ def _deep_expand(obj: Any) -> Any:
 
 def auto_expand_env_vars(func):
     """
-    魔法装饰器：拦截 jsonargparse 传进来的所有参数，清洗后再喂给目标函数。
+    魔法装饰器：拦截 CLI / Python 调用传进来的所有参数，清洗后再喂给目标函数。
     functools.wraps 极其关键，它能保留原函数的 Type Hint 签名，
-    保证 jsonargparse CLI 依然能正常解析！
+    保证 CLI 辅助函数依然能正常解析！
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -104,6 +107,66 @@ def auto_expand_env_vars(func):
         expanded_kwargs = _deep_expand(kwargs)
         return func(*expanded_args, **expanded_kwargs)
     return wrapper
+
+
+def _str_to_bool(value: str) -> bool:
+    lowered = value.lower()
+    if lowered in ("1", "true", "yes", "y", "on"):
+        return True
+    if lowered in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
+def _coerce_cli_value(value: str, param: inspect.Parameter) -> Any:
+    if value.lower() in ("none", "null"):
+        return None
+
+    default = param.default
+    annotation = "" if param.annotation is inspect.Parameter.empty else str(param.annotation)
+
+    if isinstance(default, bool) or "bool" in annotation:
+        return _str_to_bool(value)
+    if (isinstance(default, int) and not isinstance(default, bool)) or "int" in annotation:
+        return int(value)
+    if isinstance(default, float) or "float" in annotation:
+        return float(value)
+    if isinstance(default, (dict, list, tuple)) or "dict" in annotation or "list" in annotation or "tuple" in annotation:
+        return yaml.safe_load(value)
+
+    return value
+
+
+def run_cli(func):
+    """Small CLI runner that keeps ``--config`` available as a normal argument.
+
+    ``jsonargparse.CLI`` reserves ``--config`` for its own config-file action,
+    which collides with these scripts' explicit ``config`` parameter. This thin
+    parser preserves the existing command style while still handling basic
+    command-line overrides such as ``--use_log_kv true`` and ``--max_steps 10``.
+    """
+    signature = inspect.signature(func)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local_rank", "--local-rank", dest="_local_rank", default=None, help=argparse.SUPPRESS)
+
+    for name, param in signature.parameters.items():
+        if param.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            continue
+        default = param.default
+        annotation = "" if param.annotation is inspect.Parameter.empty else str(param.annotation)
+        if isinstance(default, bool) or "bool" in annotation:
+            parser.add_argument(f"--{name}", nargs="?", const="true", default=None)
+        else:
+            parser.add_argument(f"--{name}", default=None)
+
+    args = vars(parser.parse_args())
+    args.pop("_local_rank", None)
+    kwargs = {
+        name: _coerce_cli_value(value, signature.parameters[name])
+        for name, value in args.items()
+        if value is not None
+    }
+    return func(**kwargs)
 
 
 class MicroStepMeanStats:
@@ -243,4 +306,3 @@ class CPTOnlineJsonlDataset(torch.utils.data.Dataset):
         label_tensor = torch.tensor(labels, dtype=torch.long)
         
         return input_tensor, label_tensor
-    
