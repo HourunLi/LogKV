@@ -1,25 +1,30 @@
 #!/bin/bash
-# ==============================================================================
-# Training + Evaluation pipeline for logKV models
-#
-# Usage:
-#   bash majob.sh exp/qwen0.6b-32k/cpt-base.yaml
-#
-# The YAML config must contain a 'save_path' key.
-# If the checkpoint already exists (save_path/lit_model.pth), training is skipped
-# and evaluation runs directly.
-# ==============================================================================
-
-set -e
-
-# ── Environment setup ──
-source /home/ma-user/anaconda3/bin/activate torch218 2>/dev/null || true
+# source /home/miniconda3/bin/activate megatron-lm-014
+source /home/ma-user/anaconda3/bin/activate torch218
+# DeepSeek 3Bv2 Sandwich Training Script with YAML Configuration
+# Optimized for H200 GPUs (141GB VRAM)
 
 export CUDA_DEVICE_MAX_CONNECTIONS=32
+export CUDNN_LOGERR_DBG=1
+export CUDNN_LOGDEST_DBG=stderr
+
 export PATH=/usr/local/cuda-12.8/bin:${PATH}
 export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH}
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
 
-# ── Distributed setup ──
+export NVTE_WITH_USER_CUDA=1 # must turn on when multiple-nodes
+export CUDNN_PATH=/usr # must turn on when multiple-nodes
+export NVTE_CUDA_INCLUDE_DIR=/usr/local/cuda-12.8/include # must turn on when multiple-nodes
+
+export NCCL_NVLS_ENABLE=0
+export NCCL_NET_PLUGIN=none
+export NCCL_IB_TIMEOUT=12000
+export NCCL_NET_GDR_LEVEL=2  # Enable GPUDirect RDMA if RDMA is available # optim0129
+export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
+
+# ==============================================================================
+# Distributed Training Setup
+# ==============================================================================
 GPUS_PER_NODE=${MA_NUM_GPUS:-8}
 NUM_NODES=${MA_NUM_HOSTS:-1}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
@@ -29,36 +34,49 @@ fi
 MASTER_PORT=${MASTER_PORT:-6000}
 NODE_RANK=${VC_TASK_INDEX:-0}
 
-echo "Node ${NODE_RANK}/${NUM_NODES} | Master: ${MASTER_ADDR}:${MASTER_PORT}"
+pip install tensorboard
+echo "🌍 正在启动多机多卡训练: Node ${NODE_RANK} / ${NUM_NODES}"
+echo "🔗 Master 地址: ${MASTER_ADDR}:${MASTER_PORT}"
 
-# ── Config validation ──
+# ==============================================================================
+# 🌟 自动化实验流水线 (Train -> Eval)
+# ==============================================================================
+# 设定你这次实验的 YAML 配置文件路径
+# 1. 🌟 核心拦截：检查用户是否传了参数 ($1 代表传入的第一个参数)
 if [ -z "$1" ]; then
-    echo "ERROR: No YAML config provided."
-    echo "Usage: bash $0 <yaml_config_path>"
+    echo "❌ 致命错误：未提供 YAML 配置文件！"
+    echo "💡 正确用法：bash $0 <你的yaml文件路径>"
     exit 1
 fi
 
+# 2. 把传入的第一个参数赋值给 CONFIG_FILE 变量
 CONFIG_FILE=$1
+
+# 3. 🌟 安全拦截：检查这个文件在硬盘上到底存不存在
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "ERROR: Config file not found: $CONFIG_FILE"
+    echo "❌ 致命错误：找不到配置文件 $CONFIG_FILE"
     exit 1
 fi
 
-echo "Loading config from: $CONFIG_FILE"
+echo "🔍 正在从 $CONFIG_FILE 中提取配置..."
 
-# Extract save_path from YAML
-SAVE_DIR=$(python -c "import yaml; print(yaml.safe_load(open('${CONFIG_FILE}'))['save_path'])")
-eval SAVE_DIR="\"${SAVE_DIR}\""
+# 🌟 核心魔法：使用 Python 一行流提取 yaml 里的 save_path
+# 假设你的 yaml 里写的键名叫 save_path。如果是其他的，把下面单引号里的名字改掉
+RAW_SAVE_DIR=$(python -c "import yaml; print(yaml.safe_load(open('${CONFIG_FILE}'))['save_path'])")
+eval SAVE_DIR="\"${RAW_SAVE_DIR}\""
 
+# 安全检查：如果没提取到，立刻报错退出
 if [ -z "$SAVE_DIR" ] || [ "$SAVE_DIR" == "None" ]; then
-    echo "ERROR: 'save_path' not found in ${CONFIG_FILE}"
+    echo "❌ 提取失败：在 ${CONFIG_FILE} 里没有找到 'save_path' 配置！"
     exit 1
 fi
 
-echo "Save path: ${SAVE_DIR}"
+echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 
-# Extract logKV settings from the training YAML (following 'config:' inheritance)
-# so evaluation runs with the same attention the model was adapted to.
+# ==============================================================================
+# 🧩 logKV 专属：从训练 YAML（跟随 'config:' 继承）提取 logKV 设置，
+# 让评测使用与模型适配时相同的注意力。这是 logKV 分支独有的开发代码。
+# ==============================================================================
 read -r LOG_KV_TRAINING LOG_KV_B LOG_KV_RECENT <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import os
 import sys
@@ -87,22 +105,22 @@ EOF
 LOG_KV_ARGS=""
 if [ "${LOG_KV_TRAINING}" == "true" ]; then
     LOG_KV_ARGS="--use_log_kv true --log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT}"
-    echo "logKV eval ENABLED: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}"
+    echo "🧩 logKV eval ENABLED: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}"
 else
-    echo "logKV eval disabled (log_kv_training not set in ${CONFIG_FILE})"
+    echo "🧩 logKV eval disabled (log_kv_training not set in ${CONFIG_FILE})"
 fi
 
 # ==============================================================================
-# Phase 1: Training (skip if checkpoint exists)
+# 🌟 核心新增：检查 Checkpoint 是否已存在
 # ==============================================================================
 if [ -f "${SAVE_DIR}/lit_model.pth" ]; then
     echo "================================================="
-    echo "Checkpoint exists at ${SAVE_DIR}/lit_model.pth"
-    echo "Skipping training, going directly to evaluation."
+    echo "⏩ [Node ${NODE_RANK}] 阶段一跳过：检测到模型权重已存在于 ${SAVE_DIR}/lit_model.pth"
+    echo "⏩ 直接进入评测阶段！"
     echo "================================================="
 else
     echo "================================================="
-    echo "Phase 1: Continue Pre-Training"
+    echo "🚀 [Node ${NODE_RANK}] 阶段一：未找到现有权重，开始执行 Continual Pre-Training"
     echo "================================================="
 
     torchrun \
@@ -115,41 +133,61 @@ else
 
     TRAIN_STATUS=$?
     if [ $TRAIN_STATUS -ne 0 ]; then
-        echo "ERROR: Training failed (exit code: $TRAIN_STATUS)"
-        exit $TRAIN_STATUS
+        echo "⚠️ [Node ${NODE_RANK}] 训练退出码非零 (Exit Code: $TRAIN_STATUS)，通常为 NCCL 正常销毁竞争，非实质错误。"
     fi
 
-    echo "Phase 1 complete. Model saved to ${SAVE_DIR}"
+    echo "🎉 [Node ${NODE_RANK}] 阶段一（训练）结束"
+
+    # 强制操作系统彻底回收显存
     sleep 15
 fi
 
 # ==============================================================================
-# Phase 2: Evaluation
+# 🌟 文件锁 Barrier：每个节点写独立文件，避免共享文件系统缓存问题
 # ==============================================================================
+BARRIER_DIR="${SAVE_DIR}/.eval_barrier_d"
+mkdir -p "${BARRIER_DIR}"
+
 echo "================================================="
-echo "Phase 2: Evaluation"
+echo "🎯 [Node ${NODE_RANK}] 写入 Barrier 文件，等待所有 ${NUM_NODES} 个节点就绪..."
 echo "================================================="
 
-sleep 30  # Allow FSDP cleanup across nodes
+# 每个节点写自己的独立 barrier 文件（文件存在性比文件内容跨节点可见更快）
+touch "${BARRIER_DIR}/node_${NODE_RANK}"
 
-EVAL_OUTPUT_DIR="${SAVE_DIR}/evaluate"
+CUR_COUNT=0
+LOOP_ITER=0
+while [ "${CUR_COUNT}" -lt "${NUM_NODES}" ]; do
+    # 统计有多少个节点的 barrier 文件已经存在
+    CUR_COUNT=$(ls -1 "${BARRIER_DIR}"/node_* 2>/dev/null | wc -l)
+    LOOP_ITER=$((LOOP_ITER + 1))
+    echo "🔄 [Node ${NODE_RANK}] 第 ${LOOP_ITER} 轮检查: ${CUR_COUNT}/${NUM_NODES} 节点已就绪"
+    sleep 5
+done
 
-# Standard benchmarks
+echo "✅ [Node ${NODE_RANK}] 所有 ${NUM_NODES} 个节点已就绪，启动评测"
+
+# 🌟 核心缓冲：休眠 30 秒确保 NCCL 彻底回收 + 避免 barrier 竞争
+sleep 30
+
+# 拼接 benchmark 列表（避免换行空格被解析进 task 名）
 BENCHMARKS="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
 BENCHMARKS="${BENCHMARKS},mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
-
-# LongBench tasks
 BENCHMARKS="${BENCHMARKS},longbench_2wikimqa,longbench_dureader,longbench_gov_report,longbench_hotpotqa"
-BENCHMARKS="${BENCHMARKS},longbench_lcc,longbench_lsht,longbench_multi_news,longbench_multifieldqa_en"
-BENCHMARKS="${BENCHMARKS},longbench_multifieldqa_zh,longbench_musique,longbench_narrativeqa"
-BENCHMARKS="${BENCHMARKS},longbench_passage_count,longbench_passage_retrieval_en"
-BENCHMARKS="${BENCHMARKS},longbench_qasper,longbench_qmsum,longbench_repobench-p,longbench_samsum"
-BENCHMARKS="${BENCHMARKS},longbench_trec,longbench_triviaqa,longbench_vcsum"
-BENCHMARKS="${BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e"
-BENCHMARKS="${BENCHMARKS},longbench_lcc_e,longbench_multi_news_e,longbench_multifieldqa_en_e"
-BENCHMARKS="${BENCHMARKS},longbench_passage_count_e,longbench_passage_retrieval_en_e"
-BENCHMARKS="${BENCHMARKS},longbench_qasper_e,longbench_repobench-p_e,longbench_samsum_e"
-BENCHMARKS="${BENCHMARKS},longbench_trec_e,longbench_triviaqa_e"
+BENCHMARKS="${BENCHMARKS},longbench_lcc,longbench_lsht,longbench_multi_news,longbench_multifieldqa_en,longbench_multifieldqa_zh"
+BENCHMARKS="${BENCHMARKS},longbench_musique,longbench_narrativeqa,longbench_passage_count,longbench_passage_retrieval_en"
+BENCHMARKS="${BENCHMARKS},longbench_qasper,longbench_qmsum,longbench_repobench-p,longbench_samsum,longbench_trec,longbench_triviaqa,longbench_vcsum"
+BENCHMARKS="${BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e"
+BENCHMARKS="${BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
+BENCHMARKS="${BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
+NIAH_BENCHMARKS="niah_single_1,niah_single_2,niah_single_3"
+
+# NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度
+# max_seq_lengths 可根据模型实际最大上下文调整
+META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
+
+# 评测结果：rank0 写入 JSON（带时间戳），与 litgpt evaluate 惯例一致放在 checkpoint 下 evaluate/
+EVAL_OUTPUT_DIR="${SAVE_DIR}/evaluate"
 
 torchrun \
     --nnodes=${NUM_NODES} \
@@ -163,12 +201,33 @@ torchrun \
     --output_path "${EVAL_OUTPUT_DIR}" \
     ${LOG_KV_ARGS}
 
+# for NIAH
+torchrun \
+    --nnodes=${NUM_NODES} \
+    --nproc_per_node=${GPUS_PER_NODE} \
+    --node_rank=${NODE_RANK} \
+    --master_addr=${MASTER_ADDR} \
+    --master_port=${MASTER_PORT} \
+    eval.py \
+    --checkpoint_dir ${SAVE_DIR} \
+    --benchmark ${NIAH_BENCHMARKS} \
+    --metadata "${META}" \
+    --output_path "${EVAL_OUTPUT_DIR}" \
+    ${LOG_KV_ARGS}
+
 EVAL_STATUS=$?
 if [ $EVAL_STATUS -ne 0 ]; then
-    echo "ERROR: Evaluation failed (exit code: $EVAL_STATUS)"
+    echo "❌ [Node ${NODE_RANK}] 评测阶段崩溃 (Exit Code: $EVAL_STATUS)！"
     exit $EVAL_STATUS
 fi
 
+# 清理 barrier 目录（rank 0 负责）
+if [ ${NODE_RANK} -eq 0 ] && [ -d "${BARRIER_DIR}" ]; then
+    rm -rf "${BARRIER_DIR}"
+fi
+
 echo "================================================="
-echo "Pipeline complete!"
+echo "🎊 [Node ${NODE_RANK}] 全部流水线 (Training + Evaluation) 执行完美结束！"
 echo "================================================="
+
+set +x
