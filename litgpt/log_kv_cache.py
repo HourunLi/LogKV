@@ -1,7 +1,7 @@
-"""Log-Structured Semantic KV Cache with DeepSeek V4-style Content-Position Decoupling.
+"""Log-Structured KV Cache with merged-position slots — strict O(B·log N).
 
 Architecture (uniform 2:1 compaction at every level):
-- Buffer (sliding window): recent_size raw tokens, no compression.
+- Buffer (sliding window): recent_size raw tokens, no compression (exact keys).
 - Level 0 (write level):   B entries, each = 2 tokens merged. Partially fillable
                             (0 to B entries). Filled one entry at a time from buffer
                             flush. When full, carries to level 1.
@@ -9,23 +9,32 @@ Architecture (uniform 2:1 compaction at every level):
                             merged. All-or-nothing (0 or B entries). Binary carry
                             promotes full blocks upward.
 
-Content-Position Decoupling:
-- Content channel (head_size - d_pos dims, NO RoPE): hierarchically compressed.
-  Position-free -> averaging is clean.
-- Position channel (d_pos dims, RoPE'd): stored PER-TOKEN, NEVER compressed.
-  Each token retains its exact position key.
-- Value: compressed together with content via the hierarchy.
+Position handling ("expected RoPE", merged into the compressed state):
+- Keys enter the cache as FULL post-RoPE vectors
+      k_j = [ R(p_j)·k_pos_j ; k_content_j ]
+  (partial rotary: only the leading d_pos dims are rotated; the content channel
+  is position-free).
+- Merging a block mean-pools the WHOLE key. Mean commutes with concatenation, so
+  the merged key is [ mean_j R(p_j)·k_pos_j ; mean_j k_content_j ]: the block's
+  position embedding is the weighted mean of its tokens' rotated position keys —
+  the exact expectation of the rotation over the span. Per RoPE frequency θ over
+  a width-w span centred at c this equals R(c)·sin(wθ/2)/(w·sin(θ/2)): RoPE at
+  the span centre, damped per-frequency by a Dirichlet factor. High frequencies
+  fade as spans widen, so positional resolution decays ∝ span width ∝ distance
+  (constant relative error). The merged key is deliberately NOT renormalized:
+  the norm shrinkage encodes the span's positional uncertainty.
+- NO per-token state of any kind survives outside the recent window.
 
-Decoupled attention (DeepSeek V4 style):
-  score_j = q_content . k_content_{slot(j)}    (per-slot, shared across the span)
-          + q_pos . k_pos_j                     (per-token, exact position)
-  softmax over all tokens (compressed-expanded + exact recent), weighted sum of values.
-  No +log(w) mass correction: per-token expansion naturally gives each slot attention
-  mass proportional to its token count.
+Slot attention (``log_kv_slot_attention``):
+    score_s = (q · k_s) * scale + λ·log(w_s)
+    out     = softmax(score) · v_s
+The +λ·log(w_s) mass bias gives a w-token slot softmax mass ≈ w·exp(score),
+first-order-matching per-token attention (log-sum-exp of w similar logits =
+shared logit + log w + O(intra-slot score variance)). It is EXACT when the
+tokens inside a slot are identical. Recent tokens are slots of w=1 (bias 0).
 
-Memory:  O(B * log(N/t) * (content_dim + v_dim) + N * d_pos)
-  Position is O(N * d_pos) (uncompressed, small dim); content+value O(B * log) (compressed).
-Compute: O(N * (d_pos + v_dim)) per query.
+Memory:  O(recent_size + B·log(N/2)) slots — no Θ(N) term.
+Compute: O(recent_size + B·log(N/2)) per query — no Θ(N) term.
 """
 
 import math
@@ -36,12 +45,14 @@ import torch.nn as nn
 
 
 class LogStructuredKVCache(nn.Module):
-    """Log-Structured KV Cache with per-token position and compressed content/value.
+    """Log-Structured KV Cache storing full post-RoPE keys in merged slots.
 
     Args:
-        k_content_shape: (batch_size, n_groups, max_seq_length, content_dim)
+        k_shape: (batch_size, n_groups, max_seq_length, k_dim) — k_dim is the
+            FULL post-RoPE key width (RoPE'd position channel + content channel).
+            max_seq_length only sizes the level hierarchy and the append-only
+            token counter; no O(N) buffer is allocated.
         v_shape: (batch_size, n_groups, max_seq_length, v_dim)
-        d_pos: position key dim (RoPE'd, per-token, uncompressed)
         B: slots per level (default 512)
         recent_size: sliding window size (default 0 = 2)
         device / dtype: torch device / dtype
@@ -49,9 +60,8 @@ class LogStructuredKVCache(nn.Module):
 
     def __init__(
         self,
-        k_content_shape: tuple[int, int, int, int],
+        k_shape: tuple[int, int, int, int],
         v_shape: tuple[int, int, int, int],
-        d_pos: int,
         B: int = 512,
         recent_size: int = 0,
         device: torch.device | None = None,
@@ -59,15 +69,14 @@ class LogStructuredKVCache(nn.Module):
     ) -> None:
         super().__init__()
 
-        batch_size, n_groups, max_seq_length, content_dim = k_content_shape
+        batch_size, n_groups, max_seq_length, k_dim = k_shape
         _, _, _, v_dim = v_shape
 
         self.batch_size = batch_size
         self.n_groups = n_groups
         self.max_seq_length = max_seq_length
-        self.content_dim = content_dim
+        self.k_dim = k_dim
         self.v_dim = v_dim
-        self.d_pos = d_pos
         self.B = B
         self.recent_size = recent_size if recent_size > 0 else 2
         # Explicit raise (not assert): must survive `python -O`.
@@ -79,22 +88,18 @@ class LogStructuredKVCache(nn.Module):
         # levels needed; total levels = carry + 1 write level.
         self.max_levels = max(2, math.ceil(math.log2(max((max_seq_length + 1) / denom, 1))) + 1)
 
-        # ---- Per-token position keys (NEVER compressed) ----
-        self.register_buffer(
-            "pos_keys",
-            torch.zeros(batch_size, n_groups, max_seq_length, d_pos, device=device, dtype=dtype),
-            persistent=False,
-        )
-        self.pos_count: int = 0
+        # Total tokens ever committed (scalar bookkeeping only — replaces the
+        # former Θ(N) per-token position-key buffer).
+        self.token_count: int = 0
 
-        # ---- Sliding window: last < recent_size tokens (exact content + value) ----
+        # ---- Sliding window: last < recent_size tokens (exact keys + values) ----
         self.register_buffer(
-            "recent_content",
-            torch.zeros(batch_size, n_groups, self.recent_size, content_dim, device=device, dtype=dtype),
+            "recent_k",
+            torch.zeros(batch_size, n_groups, self.recent_size, k_dim, device=device, dtype=dtype),
             persistent=False,
         )
         self.register_buffer(
-            "recent_values",
+            "recent_v",
             torch.zeros(batch_size, n_groups, self.recent_size, v_dim, device=device, dtype=dtype),
             persistent=False,
         )
@@ -106,7 +111,7 @@ class LogStructuredKVCache(nn.Module):
         for ell in range(self.max_levels):
             self.register_buffer(
                 f"level_k_{ell}",
-                torch.zeros(batch_size, n_groups, B, content_dim, device=device, dtype=dtype),
+                torch.zeros(batch_size, n_groups, B, k_dim, device=device, dtype=dtype),
                 persistent=False,
             )
             self.register_buffer(
@@ -156,22 +161,25 @@ class LogStructuredKVCache(nn.Module):
 
     @staticmethod
     def _compact_tokens(
-        k_content: torch.Tensor,  # (B, G, n, content_dim)
-        v: torch.Tensor,          # (B, G, n, v_dim)
+        k: torch.Tensor,  # (B, G, n, k_dim) full post-RoPE keys
+        v: torch.Tensor,  # (B, G, n, v_dim)
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compress n tokens into a single compact entry via mean pooling.
 
-        Content keys carry no RoPE -> averaging is position-clean.
-        Returns k_entry (B,G,1,content_dim), v_entry (B,G,1,v_dim), w_entry (B,G,1).
+        Mean-pooling the full key merges content and position in one step:
+        the position sub-channel becomes the expected rotation over the span
+        (see module docstring). No renormalization — the per-frequency norm
+        shrinkage encodes the span's positional uncertainty.
+        Returns k_entry (B,G,1,k_dim), v_entry (B,G,1,v_dim), w_entry (B,G,1).
         """
-        n = k_content.size(2)
-        k_entry = k_content.mean(dim=2, keepdim=True)
+        n = k.size(2)
+        k_entry = k.mean(dim=2, keepdim=True)
         v_entry = v.mean(dim=2, keepdim=True)
         w_entry = torch.full(
-            (k_content.size(0), k_content.size(1), 1),
+            (k.size(0), k.size(1), 1),
             float(n),
-            device=k_content.device,
-            dtype=k_content.dtype,
+            device=k.device,
+            dtype=k.dtype,
         )
         return k_entry, v_entry, w_entry
 
@@ -187,9 +195,10 @@ class LogStructuredKVCache(nn.Module):
         """Merge two B-slot blocks into one B-slot block.
 
         Concatenates the two blocks in time order (k1=older, k2=newer) and pairs
-        ADJACENT slots: (slot 2i, slot 2i+1) -> slot i. This keeps every merged
-        slot covering a contiguous span, so per-token position keys for the span
-        can be gathered by [start : start + w).
+        ADJACENT slots: (slot 2i, slot 2i+1) -> slot i. Every merged slot covers
+        a contiguous span, and the weighted mean keeps each slot's key equal to
+        the true weighted mean over all tokens it covers (mean-merge is
+        associative), so no error accumulates across levels.
         """
         k_cat = torch.cat([k1, k2], dim=-2)  # (B, G, 2B, D)
         v_cat = torch.cat([v1, v2], dim=-2)
@@ -251,19 +260,17 @@ class LogStructuredKVCache(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # Position key store (per-token, uncompressed)
+    # Token accounting (append-only contract)
     # ------------------------------------------------------------------
 
-    def _store_pos_keys(self, pos_keys_chunk: torch.Tensor) -> None:
-        """Append per-token position keys to the pos_keys buffer (in arrival order)."""
-        n = pos_keys_chunk.size(2)
-        if self.pos_count + n > self.max_seq_length:
+    def _count_tokens(self, n: int) -> None:
+        """Advance the committed-token counter, enforcing the sizing contract."""
+        if self.token_count + n > self.max_seq_length:
             raise RuntimeError(
-                f"LogStructuredKVCache: pos_keys overflow! "
-                f"pos_count={self.pos_count}, n={n}, max_seq_length={self.max_seq_length}."
+                f"LogStructuredKVCache: token overflow! "
+                f"token_count={self.token_count}, n={n}, max_seq_length={self.max_seq_length}."
             )
-        self.pos_keys[:, :, self.pos_count:self.pos_count + n, :] = pos_keys_chunk
-        self.pos_count += n
+        self.token_count += n
 
     # ------------------------------------------------------------------
     # Flush: compact oldest 2 tokens from buffer -> level 0
@@ -275,10 +282,10 @@ class LogStructuredKVCache(nn.Module):
             return
 
         k_entry, v_entry, w_entry = self._compact_tokens(
-            self.recent_content[:, :, :2, :],
-            self.recent_values[:, :, :2, :],
+            self.recent_k[:, :, :2, :],
+            self.recent_v[:, :, :2, :],
         )
-        k_entry = k_entry.squeeze(2)   # (B, G, content_dim)
+        k_entry = k_entry.squeeze(2)   # (B, G, k_dim)
         v_entry = v_entry.squeeze(2)   # (B, G, v_dim)
         w_entry = w_entry.squeeze(2)   # (B, G)
 
@@ -290,10 +297,10 @@ class LogStructuredKVCache(nn.Module):
         # source must be materialized via .clone() first.
         remaining = self.recent_count - 2
         if remaining > 0:
-            self.recent_content[:, :, :remaining, :] = self.recent_content[:, :, 2:self.recent_count, :].clone()
-            self.recent_values[:, :, :remaining, :] = self.recent_values[:, :, 2:self.recent_count, :].clone()
-        self.recent_content[:, :, remaining:self.recent_count, :].zero_()
-        self.recent_values[:, :, remaining:self.recent_count, :].zero_()
+            self.recent_k[:, :, :remaining, :] = self.recent_k[:, :, 2:self.recent_count, :].clone()
+            self.recent_v[:, :, :remaining, :] = self.recent_v[:, :, 2:self.recent_count, :].clone()
+        self.recent_k[:, :, remaining:self.recent_count, :].zero_()
+        self.recent_v[:, :, remaining:self.recent_count, :].zero_()
         self.recent_count = remaining
 
     # ------------------------------------------------------------------
@@ -302,16 +309,15 @@ class LogStructuredKVCache(nn.Module):
 
     def ingest_chunk(
         self,
-        k_content: torch.Tensor,   # (B, G, t_chunk, content_dim) detached
-        v: torch.Tensor,           # (B, G, t_chunk, v_dim) detached
-        pos_keys_chunk: torch.Tensor,  # (B, G, t_chunk, d_pos) detached
+        k: torch.Tensor,   # (B, G, t_chunk, k_dim) full post-RoPE keys, detached
+        v: torch.Tensor,   # (B, G, t_chunk, v_dim) detached
     ) -> None:
-        """Store per-token position keys and compact content+value into level 0.
+        """Compact a chunk of full keys + values straight into level 0.
         Bypasses the buffer. Intended for testing.
         """
-        self._store_pos_keys(pos_keys_chunk)
+        self._count_tokens(k.size(2))
 
-        k_entry, v_entry, w_entry = self._compact_tokens(k_content, v)
+        k_entry, v_entry, w_entry = self._compact_tokens(k, v)
         k_entry = k_entry.squeeze(2)
         v_entry = v_entry.squeeze(2)
         w_entry = w_entry.squeeze(2)
@@ -324,19 +330,18 @@ class LogStructuredKVCache(nn.Module):
 
     def add_recent(
         self,
-        k_content: torch.Tensor,   # (B, G, n, content_dim) detached
-        v: torch.Tensor,           # (B, G, n, v_dim) detached
-        pos_keys: torch.Tensor,    # (B, G, n, d_pos) detached
+        k: torch.Tensor,   # (B, G, n, k_dim) full post-RoPE keys, detached
+        v: torch.Tensor,   # (B, G, n, v_dim) detached
     ) -> None:
-        """Training-only: add tokens to the sliding window. When the window
-        overflows, the oldest 2 tokens are flushed (compacted) into level 0.
+        """Add tokens to the sliding window. When the window overflows, the
+        oldest 2 tokens are flushed (compacted) into level 0.
         """
-        n = k_content.size(2)
+        n = k.size(2)
         # Explicit raise (not assert): must survive `python -O`.
         if n > self.recent_size:
             raise ValueError(f"chunk size {n} exceeds recent_size {self.recent_size}")
 
-        self._store_pos_keys(pos_keys)
+        self._count_tokens(n)
 
         offset = 0
         while offset < n:
@@ -351,10 +356,8 @@ class LogStructuredKVCache(nn.Module):
                 )
 
             take = min(capacity, n - offset)
-            self.recent_content[:, :, self.recent_count:self.recent_count + take, :] = (
-                k_content[:, :, offset:offset + take, :]
-            )
-            self.recent_values[:, :, self.recent_count:self.recent_count + take, :] = v[:, :, offset:offset + take, :]
+            self.recent_k[:, :, self.recent_count:self.recent_count + take, :] = k[:, :, offset:offset + take, :]
+            self.recent_v[:, :, self.recent_count:self.recent_count + take, :] = v[:, :, offset:offset + take, :]
             self.recent_count += take
             offset += take
 
@@ -365,16 +368,16 @@ class LogStructuredKVCache(nn.Module):
     def forward(
         self,
         input_pos: torch.Tensor,
-        k: torch.Tensor,   # (B, G, T, head_size) post-RoPE
-        v: torch.Tensor,   # (B, G, T, head_size)
+        k: torch.Tensor,   # (B, G, T, k_dim) post-RoPE
+        v: torch.Tensor,   # (B, G, T, v_dim)
     ) -> NoReturn:
         """Disabled direct update API.
 
         LogKV attention must build a temporary state that includes the current
-        token(s), compute decoupled attention from that state, and only then
-        commit the token(s) to the cache. Calling the cache directly used to
-        implement an incompatible raw-prefill / write-before-decode path, so it
-        is intentionally disabled. ``input_pos`` is accepted only to keep the
+        token(s), compute slot attention from that state, and only then commit
+        the token(s) to the cache. Calling the cache directly used to implement
+        an incompatible raw-prefill / write-before-decode path, so it is
+        intentionally disabled. ``input_pos`` is accepted only to keep the
         stale call site fail-fast and self-explanatory. Use
         ``GPT.set_log_kv_cache()`` and let ``CausalSelfAttention`` manage the
         update order, or call
@@ -388,29 +391,21 @@ class LogStructuredKVCache(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # Build attention state: assemble all pieces for decoupled attention
+    # Build attention state: slot-granular, O(recent + B*log N) entries
     # ------------------------------------------------------------------
 
-    def get_attention_state(self) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor,  # compact k, v, w
-        torch.Tensor,                               # compact per-token pos_keys
-        torch.Tensor, torch.Tensor, torch.Tensor,  # recent content, values, pos_keys
-    ]:
-        """Assemble the cache state for ``log_kv_decoupled_attention``.
+    def get_attention_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assemble the cache state for ``log_kv_slot_attention``.
 
         Returns:
-            compact_k:     (B, G, n_slots, content_dim) — time-ordered compact slots
-            compact_v:     (B, G, n_slots, v_dim)
-            compact_w:     (B, G, n_slots) — token count per slot
-            compact_pos_keys: (B, G, n_compressed_tokens, d_pos) — per-token pos keys
-                              for all tokens covered by compact slots (contiguous order)
-            recent_content:(B, G, recent_count, content_dim) — exact
-            recent_values: (B, G, recent_count, v_dim) — exact
-            recent_pos_keys: (B, G, recent_count, d_pos) — exact per-token
+            slot_k: (B, G, n_slots, k_dim) — time-ordered slot keys: compact
+                    levels oldest (highest level) first down to level 0, then
+                    the recent-window tokens as exact w=1 slots.
+            slot_v: (B, G, n_slots, v_dim)
+            slot_w: (B, G, n_slots) — token count per slot (1 for recent).
 
-        The compact slots are time-ordered (oldest level first) with contiguous
-        spans, so ``cumsum(compact_w)`` gives span boundaries aligned with
-        ``compact_pos_keys``.
+        Slots cover contiguous, time-ordered spans, so ``cumsum(slot_w)`` gives
+        the token boundaries of every slot (used by exactness tests).
         """
         k_parts: list[torch.Tensor] = []
         v_parts: list[torch.Tensor] = []
@@ -425,25 +420,25 @@ class LogStructuredKVCache(nn.Module):
                 v_parts.append(lv[:, :, :count, :])
                 w_parts.append(lw[:, :, :count])
 
+        # Recent window: exact tokens, weight 1 each
+        if self.recent_count > 0:
+            k_parts.append(self.recent_k[:, :, :self.recent_count, :])
+            v_parts.append(self.recent_v[:, :, :self.recent_count, :])
+            w_parts.append(
+                self.recent_k.new_ones(self.batch_size, self.n_groups, self.recent_count)
+            )
+
         if w_parts:
-            compact_k = torch.cat(k_parts, dim=-2)
-            compact_v = torch.cat(v_parts, dim=-2)
-            compact_w = torch.cat(w_parts, dim=-1)
-        else:
-            compact_k = self.recent_content[:, :, :0, :]
-            compact_v = self.recent_values[:, :, :0, :]
-            compact_w = getattr(self, "level_w_0")[:, :, :0]
-
-        # Per-token position keys: compressed tokens first, then recent.
-        n_compressed = self.pos_count - self.recent_count
-        n_compressed = max(0, n_compressed)
-        compact_pos_keys = self.pos_keys[:, :, :n_compressed, :]
-        recent_content = self.recent_content[:, :, :self.recent_count, :]
-        recent_values = self.recent_values[:, :, :self.recent_count, :]
-        recent_pos_keys = self.pos_keys[:, :, n_compressed:n_compressed + self.recent_count, :]
-
-        return (compact_k, compact_v, compact_w, compact_pos_keys,
-                recent_content, recent_values, recent_pos_keys)
+            return (
+                torch.cat(k_parts, dim=-2),
+                torch.cat(v_parts, dim=-2),
+                torch.cat(w_parts, dim=-1),
+            )
+        return (
+            self.recent_k[:, :, :0, :],
+            self.recent_v[:, :, :0, :],
+            getattr(self, "level_w_0")[:, :, :0],
+        )
 
     # ------------------------------------------------------------------
     # Utilities
@@ -464,11 +459,10 @@ class LogStructuredKVCache(nn.Module):
         weights are always powers of two (uniform 2:1), hence exact in bf16/fp16,
         so converting ``level_w`` does not corrupt token counts.
         """
-        if self.recent_content.dtype == dtype:
+        if self.recent_k.dtype == dtype:
             return
-        self.pos_keys = self.pos_keys.to(dtype)
-        self.recent_content = self.recent_content.to(dtype)
-        self.recent_values = self.recent_values.to(dtype)
+        self.recent_k = self.recent_k.to(dtype)
+        self.recent_v = self.recent_v.to(dtype)
         for ell in range(self.max_levels):
             setattr(self, f"level_k_{ell}", getattr(self, f"level_k_{ell}").to(dtype))
             setattr(self, f"level_v_{ell}", getattr(self, f"level_v_{ell}").to(dtype))
@@ -476,10 +470,9 @@ class LogStructuredKVCache(nn.Module):
 
     def reset_parameters(self) -> None:
         """Reset all buffers to zero."""
-        self.pos_keys.zero_()
-        self.pos_count = 0
-        self.recent_content.zero_()
-        self.recent_values.zero_()
+        self.token_count = 0
+        self.recent_k.zero_()
+        self.recent_v.zero_()
         self.recent_count = 0
         for ell in range(self.max_levels):
             self._clear_level(ell)
@@ -493,112 +486,103 @@ class LogStructuredKVCache(nn.Module):
 
     @property
     def total_tokens_covered(self) -> int:
-        return self.pos_count
+        return self.token_count
 
 
 # ======================================================================
-# Decoupled attention (DeepSeek V4 style): content (per-slot) + position (per-token)
+# Slot attention: merged-position slots + log-multiplicity mass bias
 # ======================================================================
 
 
-def log_kv_decoupled_attention(
-    q_content: torch.Tensor,  # (B, nh, T_q, content_dim)
-    q_pos: torch.Tensor,      # (B, nh, T_q, d_pos)
-    cache_state: tuple,
+def append_exact_tokens(
+    slot_k: torch.Tensor,   # (B, G, S, k_dim)
+    slot_v: torch.Tensor,   # (B, G, S, v_dim)
+    slot_w: torch.Tensor,   # (B, G, S)
+    k_new: torch.Tensor,    # (B, G, n, k_dim) exact tokens, appended in time order
+    v_new: torch.Tensor,    # (B, G, n, v_dim)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Append exact per-token entries (w=1 slots) after the cached slots.
+
+    Used by the attention layer to make the current chunk (and any pending
+    token) visible to attention BEFORE it is committed to the cache. Gradient
+    flows through ``k_new``/``v_new``; the ones-weights are constants.
+    """
+    n_new = k_new.size(2)
+    ones = slot_w.new_ones(slot_w.size(0), slot_w.size(1), n_new)
+    return (
+        torch.cat([slot_k, k_new], dim=2),
+        torch.cat([slot_v, v_new], dim=2),
+        torch.cat([slot_w, ones], dim=-1),
+    )
+
+
+def log_kv_slot_attention(
+    q: torch.Tensor,        # (B, nh, T_q, k_dim) full post-RoPE queries
+    slot_k: torch.Tensor,   # (B, G, S, k_dim) merged slot keys (position included)
+    slot_v: torch.Tensor,   # (B, G, S, v_dim)
+    slot_w: torch.Tensor,   # (B, G, S) token count per slot (>= 1)
     scale: float,
-    mask: torch.Tensor | None = None,  # (T_q, n_total) bool, True = attend
+    mask: torch.Tensor | None = None,  # (T_q, S) bool, True = attend
+    lam: float = 1.0,
 ) -> torch.Tensor:
-    """Decoupled attention: content channel (per-slot, compressed) + position channel
-    (per-token, exact).
+    """Slot-granular attention over merged-position entries.
 
-    Each compact slot s covers w_s contiguous tokens. It contributes w_s logits to
-    the softmax — one per token — sharing the slot's content score but using each
-    token's own exact position score. Exact (recent / current-chunk) tokens are
-    treated as slots of weight 1.
+        score_s = (q · k_s) * scale + λ·log(w_s)
+        out     = softmax(score) · v_s
 
-    score_{j} = q_content . k_content_{slot(j)} + q_pos . k_pos_j
-    out = softmax(score) . v_{slot(j)}
+    One logit per SLOT — compute and memory are O(S) = O(recent + B·log N),
+    never O(N). The position information lives inside ``slot_k`` (expected-RoPE
+    sub-channel, see module docstring), so a single dot product covers both the
+    content and the position score. The +λ·log(w_s) bias restores the softmax
+    mass a w-token span would have contributed token-by-token; it is exact when
+    the span's tokens are identical and first-order otherwise. λ=1 preserves
+    mass ∝ token count; λ=0 yields a built-in ∝1/w long-range forgetting curve
+    (ablation knob).
 
-    No +log(w): per-token expansion gives each slot mass proportional to w_s.
+    Note the bias is added AFTER ``scale``: it is a multiplicity correction on
+    the logits, not a similarity, so it must not be shrunk by 1/sqrt(d).
+
+    Preconditions (enforced by construction in the callers):
+      - ``slot_w`` entries are >= 1 (log is finite);
+      - every ``mask`` row has at least one True (softmax row is finite) —
+        chunk-causal masks always allow the diagonal.
 
     Args:
-        q_content: (B, nh, T_q, content_dim)
-        q_pos: (B, nh, T_q, d_pos)
-        cache_state: tuple from ``LogStructuredKVCache.get_attention_state()``
-            (compact_k, compact_v, compact_w, compact_pos_keys,
-             recent_content, recent_values, recent_pos_keys)
-        scale: attention scale (applied to the combined score)
-        mask: optional (T_q, n_total) bool. True = allowed. For training chunk
-            causality (prefix fully visible, chunk causal). None for decode.
+        q: (B, nh, T_q, k_dim)
+        slot_k / slot_v / slot_w: from ``get_attention_state()`` (+ optionally
+            ``append_exact_tokens`` for the in-flight chunk)
+        scale: attention scale (applied to the dot product only)
+        mask: optional (T_q, S) bool. True = allowed. For training chunk
+            causality (prefix fully visible, chunk causal). None = attend all.
+        lam: weight of the log-multiplicity mass bias (default 1.0)
 
     Returns:
         (B, nh, T_q, v_dim)
     """
-    (compact_k, compact_v, compact_w, compact_pos_keys,
-     recent_content, recent_values, recent_pos_keys) = cache_state
-
-    B, nh, T_q, content_dim = q_content.shape
-    d_pos = q_pos.size(-1)
-    device = q_content.device
-
-    n_compact_slots = compact_k.size(2)
-    n_compact_tokens = compact_pos_keys.size(2)
-    n_recent = recent_content.size(2)
-    n_total = n_compact_tokens + n_recent
-
-    # --- Build unified slot arrays (at n_groups granularity) ---
-    if n_compact_slots > 0:
-        all_slot_k = torch.cat([compact_k, recent_content], dim=-2)
-        all_slot_v = torch.cat([compact_v, recent_values], dim=-2)
-        w_counts = compact_w[0, 0].long()  # (n_compact_slots,)
-        slot_idx_compact = torch.repeat_interleave(
-            torch.arange(n_compact_slots, device=device), w_counts
-        )  # (n_compact_tokens,)
-    else:
-        all_slot_k = recent_content
-        all_slot_v = recent_values
-        slot_idx_compact = torch.empty(0, dtype=torch.long, device=device)
-
-    n_all_slots = n_compact_slots + n_recent
-    if n_recent > 0:
-        slot_idx_recent = n_compact_slots + torch.arange(n_recent, device=device)
-        token_to_slot = torch.cat([slot_idx_compact, slot_idx_recent], dim=0)  # (n_total,)
-    else:
-        token_to_slot = slot_idx_compact
-
-    # Per-token position keys (all tokens)
-    if n_total > 0:
-        all_pos_keys = torch.cat([compact_pos_keys, recent_pos_keys], dim=2)  # (B, G, n_total, d_pos)
-    else:
-        v_dim = all_slot_v.size(-1)
-        return torch.zeros(B, nh, T_q, v_dim, device=device, dtype=q_content.dtype)
+    B, nh, T_q, _ = q.shape
+    S = slot_k.size(2)
+    if S == 0:
+        return torch.zeros(B, nh, T_q, slot_v.size(-1), device=q.device, dtype=q.dtype)
 
     # --- GQA: expand k-side from n_groups to n_head ---
-    nkv = all_slot_k.size(1)
+    nkv = slot_k.size(1)
     if nh != nkv:
         rf = nh // nkv
-        all_slot_k = all_slot_k.repeat_interleave(rf, dim=1)
-        all_slot_v = all_slot_v.repeat_interleave(rf, dim=1)
-        all_pos_keys = all_pos_keys.repeat_interleave(rf, dim=1)
+        slot_k = slot_k.repeat_interleave(rf, dim=1)
+        slot_v = slot_v.repeat_interleave(rf, dim=1)
+        slot_w = slot_w.repeat_interleave(rf, dim=1)
 
-    # --- Scores ---
-    content_scores_slots = torch.matmul(q_content, all_slot_k.mT)  # (B, nh, T_q, n_all_slots)
-    position_scores = torch.matmul(q_pos, all_pos_keys.mT)         # (B, nh, T_q, n_total)
+    # Scores in fp32: the log-w bias shifts logits by up to ~log(N) and bf16
+    # resolution degrades with magnitude; fp32 keeps cross-level logit
+    # differences intact. S is O(log N), so the fp32 buffer is small.
+    scores = torch.matmul(q, slot_k.mT).to(torch.float32) * scale  # (B, nh, T_q, S)
+    if lam != 0.0:
+        # slot_w >= 1 by construction; guarded via lam gate so lam=0 can never
+        # produce 0 * log(0) = NaN even on malformed input.
+        scores = scores + lam * slot_w.to(torch.float32).log().unsqueeze(-2)
 
-    # Expand content score to per-token: gather along the slot axis.
-    idx_expand = token_to_slot.view(1, 1, 1, n_total).expand(B, nh, T_q, n_total)
-    content_per_token = content_scores_slots.gather(3, idx_expand)  # (B, nh, T_q, n_total)
-
-    total = (content_per_token + position_scores) * scale  # (B, nh, T_q, n_total)
-
-    # --- Mask (training chunk causality) ---
     if mask is not None:
-        total = total.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        scores = scores.masked_fill(~mask.view(1, 1, T_q, S), float("-inf"))
 
-    attn = torch.softmax(total, dim=-1)  # (B, nh, T_q, n_total)
-
-    # --- Value aggregation: segment-sum per slot, then matmul with slot values ---
-    slot_attn = torch.zeros(B, nh, T_q, n_all_slots, device=device, dtype=attn.dtype)
-    slot_attn.scatter_add_(3, idx_expand, attn)  # (B, nh, T_q, n_all_slots)
-    out = torch.matmul(slot_attn, all_slot_v)    # (B, nh, T_q, v_dim)
-    return out
+    attn = torch.softmax(scores, dim=-1).to(q.dtype)  # (B, nh, T_q, S)
+    return torch.matmul(attn, slot_v)                 # (B, nh, T_q, v_dim)

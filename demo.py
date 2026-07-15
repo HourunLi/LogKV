@@ -71,6 +71,19 @@ def _unique_save_dir(save_path: str) -> str:
     return str(cand)
 
 
+def _copy_tokenizer_and_configs(src_dirs: list[str], dst: str) -> None:
+    """Copy *.json / *.model (tokenizer + HF configs) into the save dir so it is
+    self-contained for eval (eval.py builds its Tokenizer from the save dir).
+    Later dirs take precedence on filename clashes, so pass the tokenizer_dir
+    last — it may differ from the weights checkpoint_dir."""
+    files: dict[str, str] = {}
+    for d in src_dirs:
+        for p in glob.glob(f"{d}/*.json") + glob.glob(f"{d}/*.model"):
+            files[os.path.basename(p)] = p
+    for p in files.values():
+        shutil.copy(p, dst)
+
+
 def _distributed_looks_multi_node() -> bool:
     try:
         ws = int(os.environ.get("WORLD_SIZE", "1"))
@@ -388,6 +401,16 @@ def main(
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
+    # Fail fast: run_eval="after"/"both" evaluates save_path, which is only
+    # written when save_ckpt is true. Catch the contradiction here instead of
+    # training for hours and then dying in eval on a missing tokenizer/weights.
+    if run_eval in ("after", "both") and not save_ckpt:
+        raise ValueError(
+            f"run_eval={run_eval!r} evaluates the saved checkpoint, but save_ckpt is false — "
+            "nothing would be written to save_path. Set save_ckpt: true in the YAML "
+            "(or set run_eval: '' to skip the post-training eval)."
+        )
+
     # 1. Set seeds
     set_random_seeds(42)
     tb_logger = TensorBoardLogger(root_dir=tensorboard_root, name=f"{expid}_{arch_name.replace('/', '-')}")
@@ -607,8 +630,7 @@ def main(
                 fabric.save(f"{step_save_path}/lit_model.pth", state)
                 fabric.barrier()
                 if fabric.global_rank == 0:
-                    for file_path in glob.glob(f"{checkpoint_dir}/*.json") + glob.glob(f"{checkpoint_dir}/*.model"):
-                        shutil.copy(file_path, step_save_path)
+                    _copy_tokenizer_and_configs([checkpoint_dir, tok_dir], step_save_path)
                     with open(f"{step_save_path}/model_config.yaml", "w", encoding="utf-8") as f:
                         yaml.dump(asdict(config_obj), f)
                 fabric.barrier()
@@ -628,8 +650,7 @@ def main(
         fabric.barrier()
 
         if fabric.global_rank == 0:
-            for file_path in glob.glob(f"{checkpoint_dir}/*.json") + glob.glob(f"{checkpoint_dir}/*.model"):
-                shutil.copy(file_path, save_path)
+            _copy_tokenizer_and_configs([checkpoint_dir, tok_dir], save_path)
             with open(f"{save_path}/model_config.yaml", "w", encoding="utf-8") as f:
                 yaml.dump(asdict(config_obj), f)
             fabric.print(f"Tokenizer and model_config written to {save_path}")

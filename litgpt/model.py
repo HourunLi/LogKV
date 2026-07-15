@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
-from litgpt.log_kv_cache import LogStructuredKVCache, log_kv_decoupled_attention
+from litgpt.log_kv_cache import LogStructuredKVCache, append_exact_tokens, log_kv_slot_attention
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
 
@@ -501,7 +501,7 @@ class CausalSelfAttention(nn.Module):
         # over the training sequence so the model learns to read compressed KV.
         self.training_log_kv: bool = False
         # LogKV inference: carry one trailing token across calls so commits stay
-        # aligned to the training chunk size. Holds (k_content, v, k_pos).
+        # aligned to the training chunk size. Holds (k, v) — full post-RoPE key.
         self._log_kv_pending: tuple | None = None
         self.apply_sliding_window_attention = False
         if config.sliding_window_size is not None and config.sliding_window_indices is not None:
@@ -606,9 +606,10 @@ class CausalSelfAttention(nn.Module):
             k = self.norm_k(k)
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
-        # With DeepSeek V4-style decoupling, the first rope_n_elem dims are the position
-        # channel (RoPE'd, per-token, uncompressed) and the rest are the content channel
-        # (no RoPE, compressed). The cache splits k internally — no pre-RoPE clone needed.
+        # Partial rotary: the first rope_n_elem dims are the position channel (RoPE'd)
+        # and the rest are the content channel (no RoPE). LogKV mean-pools the FULL
+        # key when merging slots, so the merged position sub-channel becomes the
+        # expected rotation over the span ("expected RoPE") — no per-token state.
 
         if self.config.rope_interleave:
             q_roped = apply_rope_interleave(q[..., :rope_n_elem], cos, sin)
@@ -702,9 +703,9 @@ class CausalSelfAttention(nn.Module):
     def _assert_log_kv_input_pos_contiguous(self, input_pos: torch.Tensor, T: int) -> None:
         """Validate the append-only LogKV cache contract.
 
-        LogKV currently stores position keys in arrival order and tracks cache
-        length with scalar counters. Until true indexed writes are implemented,
-        inference must feed a single shared, contiguous position range.
+        LogKV merges tokens in arrival order and tracks cache length with
+        scalar counters. Until true indexed writes are implemented, inference
+        must feed a single shared, contiguous position range.
         """
         assert isinstance(self.kv_cache, LogStructuredKVCache)
 
@@ -719,7 +720,7 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(f"LogKV cache requires 1-D or shared 2-D input_pos, got shape {tuple(input_pos.shape)}.")
 
         pending_len = 0 if self._log_kv_pending is None else self._log_kv_pending[0].size(2)
-        expected_start = self.kv_cache.pos_count + pending_len
+        expected_start = self.kv_cache.token_count + pending_len
         expected = torch.arange(expected_start, expected_start + T, device=input_pos.device, dtype=input_pos.dtype)
         if not torch.equal(input_pos, expected):
             got = input_pos.detach().cpu().tolist()
@@ -747,10 +748,10 @@ class CausalSelfAttention(nn.Module):
             [compact prefix (detached)
              + sliding window from previous chunks (detached, exact)
              + current chunk exact KV (causal, with gradient)]
-        via DeepSeek V4-style decoupled attention (content per-slot + position
-        per-token).  After attending, the chunk's KV (detached) is added to the
-        sliding window. When the window overflows, the oldest 2 tokens are
-        compacted into the hierarchy.
+        via slot attention over merged-position entries (one logit per slot,
+        +log w mass bias — see ``log_kv_slot_attention``). After attending, the
+        chunk's KV (detached) is added to the sliding window. When the window
+        overflows, the oldest 2 tokens are compacted into the hierarchy.
 
         Gradient flows only through the current chunk's q/k/v (and thus the qkv
         projection weights); the compacted prefix and sliding window are
@@ -768,7 +769,7 @@ class CausalSelfAttention(nn.Module):
             raise TypeError("training_log_kv requires a LogStructuredKVCache")
         if self.config.rope_n_elem >= self.config.head_size:
             raise ValueError(
-                "logKV decoupled attention requires rotary_percentage < 1.0 "
+                "logKV attention requires rotary_percentage < 1.0 "
                 f"(got rope_n_elem={self.config.rope_n_elem}, head_size={self.config.head_size}). "
                 "Set rotary_percentage=0.25 in your YAML config."
             )
@@ -785,9 +786,6 @@ class CausalSelfAttention(nn.Module):
         cache._convert_dtype(q.dtype)
 
         t = 2  # compaction chunk size (fixed: uniform 2:1)
-        # Post-RoPE position width. Equals rope_n_elem except for the widened
-        # rope_n_elem == 1 case, where apply_rope broadcasts the slice to 2 dims.
-        d_pos = cache.d_pos
         n_head = self.config.n_head
         head_size = self.config.head_size
         device = q.device
@@ -795,59 +793,33 @@ class CausalSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or head_size)
         scale = scale * self.mscale * self.mscale
 
-        # Split q/k into position (RoPE'd, first d_pos dims) and content (rest).
-        q_pos = q[..., :d_pos]         # (B, n_head, T, d_pos)
-        q_content = q[..., d_pos:]     # (B, n_head, T, content_dim)
-        k_pos = k[..., :d_pos]         # (B, n_groups, T, d_pos)
-        k_content = k[..., d_pos:]     # (B, n_groups, T, content_dim)
+        # No content/position split: q and k are the full post-RoPE vectors
+        # [R(p)·(pos slice) ; content slice]. Merged slots carry both channels,
+        # so a single dot product covers the content AND the position score.
 
         outputs: list[torch.Tensor] = []
         start = 0
 
         pending = self._log_kv_pending if defer_last_single else None
         if pending is not None:
-            pk, pv, pp = pending
-            q_content_b = q_content[:, :, :1, :]
-            q_pos_b = q_pos[:, :, :1, :]
-            kc_b = k_content[:, :, :1, :]
-            kv_b = v[:, :, :1, :]
-            kp_b = k_pos[:, :, :1, :]
+            pk, pv = pending
+            k_b = k[:, :, :1, :]
+            v_b = v[:, :, :1, :]
 
-            state = cache.get_attention_state()
-            (compact_k, compact_v, compact_w, compact_pos_keys,
-             recent_content_cache, recent_values_cache, recent_pos_keys_cache) = state
-
-            parts_k = []
-            parts_v = []
-            parts_p = []
-            if recent_content_cache.size(2) > 0:
-                parts_k.append(recent_content_cache)
-                parts_v.append(recent_values_cache)
-                parts_p.append(recent_pos_keys_cache)
-            parts_k.extend([pk, kc_b])
-            parts_v.extend([pv, kv_b])
-            parts_p.extend([pp, kp_b])
-
-            combined_state = (
-                compact_k, compact_v, compact_w, compact_pos_keys,
-                torch.cat(parts_k, dim=2),
-                torch.cat(parts_v, dim=2),
-                torch.cat(parts_p, dim=2),
+            slot_k, slot_v, slot_w = cache.get_attention_state()
+            k_all, v_all, w_all = append_exact_tokens(
+                slot_k, slot_v, slot_w,
+                torch.cat([pk, k_b], dim=2),
+                torch.cat([pv, v_b], dim=2),
             )
 
-            n_prefix = compact_pos_keys.size(2) + recent_content_cache.size(2) + pp.size(2)
-            n_total = n_prefix + 1
-            mask = torch.ones(1, n_total, dtype=torch.bool, device=device)
-
-            y_b = log_kv_decoupled_attention(
-                q_content_b, q_pos_b, combined_state, scale=scale, mask=mask
-            )
+            # Single query, everything before it visible -> no mask needed.
+            y_b = log_kv_slot_attention(q[:, :, :1, :], k_all, v_all, w_all, scale=scale)
             outputs.append(y_b)
 
             cache.add_recent(
-                torch.cat([pk, kc_b.detach()], dim=2),
-                torch.cat([pv, kv_b.detach()], dim=2),
-                torch.cat([pp, kp_b.detach()], dim=2),
+                torch.cat([pk, k_b.detach()], dim=2),
+                torch.cat([pv, v_b.detach()], dim=2),
             )
             self._log_kv_pending = None
             start = 1
@@ -855,9 +827,10 @@ class CausalSelfAttention(nn.Module):
         # ---- Fast path (inference only): vectorize the leading no-compaction run ----
         # While the hierarchy holds no compact slots and the recent window will not
         # overflow, every query attends to [existing recent (exact) + causal current
-        # tokens] with no compression — i.e. plain causal attention over exact tokens.
-        # The whole run is then one decoupled-attention call instead of one sequential
-        # 2-token step per chunk (e.g. a 512-token loglikelihood request: 1 call vs 256).
+        # tokens] with no compression — i.e. plain causal attention over exact tokens
+        # (all w=1, mass bias 0). The whole run is then one slot-attention call instead
+        # of one sequential 2-token step per chunk (e.g. a 512-token loglikelihood
+        # request: 1 call vs 256).
         # Restricted to the inference path (defer_last_single): under no_grad the output
         # equals the per-chunk loop below, whereas training must keep the loop's
         # per-chunk stop-gradient on the sliding window, so training keeps the loop.
@@ -875,50 +848,34 @@ class CausalSelfAttention(nn.Module):
             defer_tail = block_end == T and blk % 2 == 1
             commit_end = block_end - 1 if defer_tail else block_end
 
-            state = cache.get_attention_state()
-            (compact_k, compact_v, compact_w, compact_pos_keys,
-             recent_content_cache, recent_values_cache, recent_pos_keys_cache) = state
-            n_recent_cache = recent_content_cache.size(2)
-
-            kc_blk = k_content[:, :, start:block_end, :]
-            kv_blk = v[:, :, start:block_end, :]
-            kp_blk = k_pos[:, :, start:block_end, :]
-            if n_recent_cache > 0:
-                blk_content = torch.cat([recent_content_cache, kc_blk], dim=2)
-                blk_values = torch.cat([recent_values_cache, kv_blk], dim=2)
-                blk_pos = torch.cat([recent_pos_keys_cache, kp_blk], dim=2)
-            else:
-                blk_content, blk_values, blk_pos = kc_blk, kv_blk, kp_blk
-
-            combined_state = (
-                compact_k, compact_v, compact_w, compact_pos_keys,
-                blk_content, blk_values, blk_pos,
+            slot_k, slot_v, slot_w = cache.get_attention_state()
+            n_state = slot_k.size(2)  # recent tokens only (no compaction yet)
+            k_all, v_all, w_all = append_exact_tokens(
+                slot_k, slot_v, slot_w,
+                k[:, :, start:block_end, :],
+                v[:, :, start:block_end, :],
             )
-            # Mask (blk, n_recent_cache + blk): existing recent fully visible, block
+
+            # Mask (blk, n_state + blk): existing recent fully visible, block
             # tokens causal among themselves.
-            n_total = n_recent_cache + blk
-            mask = torch.ones(blk, n_total, dtype=torch.bool, device=device)
-            mask[:, n_recent_cache:] = torch.tril(
+            mask = torch.ones(blk, n_state + blk, dtype=torch.bool, device=device)
+            mask[:, n_state:] = torch.tril(
                 torch.ones(blk, blk, dtype=torch.bool, device=device)
             )
-            y_blk = log_kv_decoupled_attention(
-                q_content[:, :, start:block_end, :],
-                q_pos[:, :, start:block_end, :],
-                combined_state, scale=scale, mask=mask,
+            y_blk = log_kv_slot_attention(
+                q[:, :, start:block_end, :], k_all, v_all, w_all, scale=scale, mask=mask
             )
             outputs.append(y_blk)
 
             if commit_end > start:
                 cache.add_recent(
-                    k_content[:, :, start:commit_end, :].detach(),
+                    k[:, :, start:commit_end, :].detach(),
                     v[:, :, start:commit_end, :].detach(),
-                    k_pos[:, :, start:commit_end, :].detach(),
                 )
             if defer_tail:
                 self._log_kv_pending = (
-                    k_content[:, :, commit_end:block_end, :].detach(),
+                    k[:, :, commit_end:block_end, :].detach(),
                     v[:, :, commit_end:block_end, :].detach(),
-                    k_pos[:, :, commit_end:block_end, :].detach(),
                 )
             start = block_end
 
@@ -927,57 +884,36 @@ class CausalSelfAttention(nn.Module):
             actual_t = end - start
             defer_chunk = defer_last_single and actual_t == 1 and end == T
 
-            q_content_b = q_content[:, :, start:end, :]  # (B, n_head, actual_t, content_dim)
-            q_pos_b = q_pos[:, :, start:end, :]          # (B, n_head, actual_t, d_pos)
-            kc_b = k_content[:, :, start:end, :]         # (B, n_groups, actual_t, content_dim)
-            kv_b = v[:, :, start:end, :]                 # (B, n_groups, actual_t, v_dim)
-            kp_b = k_pos[:, :, start:end, :]             # (B, n_groups, actual_t, d_pos)
+            k_b = k[:, :, start:end, :]  # (B, n_groups, actual_t, k_dim)
+            v_b = v[:, :, start:end, :]  # (B, n_groups, actual_t, v_dim)
 
-            # Cache state: [compact prefix] + [sliding window from prev chunks].
+            # Cache state: [compact slots] + [sliding window from prev chunks].
             # Both are detached — only the current chunk carries gradient.
-            state = cache.get_attention_state()
-            (compact_k, compact_v, compact_w, compact_pos_keys,
-             recent_content_cache, recent_values_cache, recent_pos_keys_cache) = state
+            slot_k, slot_v, slot_w = cache.get_attention_state()
+            n_prefix = slot_k.size(2)  # compact slots + recent tokens (all visible)
 
-            n_compact_tokens = compact_pos_keys.size(2)
-            n_recent_cache = recent_content_cache.size(2)  # sliding window tokens
+            # Append current chunk (with gradient) as exact w=1 slots.
+            k_all, v_all, w_all = append_exact_tokens(slot_k, slot_v, slot_w, k_b, v_b)
 
-            # Append current chunk (with gradient) to the sliding window part.
-            if n_recent_cache > 0:
-                combined_recent_content = torch.cat([recent_content_cache, kc_b], dim=2)
-                combined_recent_values = torch.cat([recent_values_cache, kv_b], dim=2)
-                combined_recent_pos_keys = torch.cat([recent_pos_keys_cache, kp_b], dim=2)
-            else:
-                combined_recent_content = kc_b
-                combined_recent_values = kv_b
-                combined_recent_pos_keys = kp_b
-
-            combined_state = (
-                compact_k, compact_v, compact_w, compact_pos_keys,
-                combined_recent_content, combined_recent_values, combined_recent_pos_keys,
-            )
-
-            # Mask: (actual_t, n_total)
-            #   compact prefix + sliding window -> fully visible
+            # Mask: (actual_t, n_prefix + actual_t)
+            #   compact slots + sliding window -> fully visible
             #   current chunk -> causal
-            n_prefix = n_compact_tokens + n_recent_cache
-            n_total = n_prefix + actual_t
-            mask = torch.ones(actual_t, n_total, dtype=torch.bool, device=device)
+            mask = torch.ones(actual_t, n_prefix + actual_t, dtype=torch.bool, device=device)
             mask[:, n_prefix:] = torch.tril(
                 torch.ones(actual_t, actual_t, dtype=torch.bool, device=device)
             )
 
-            y_b = log_kv_decoupled_attention(
-                q_content_b, q_pos_b, combined_state, scale=scale, mask=mask
+            y_b = log_kv_slot_attention(
+                q[:, :, start:end, :], k_all, v_all, w_all, scale=scale, mask=mask
             )  # (B, n_head, actual_t, v_dim)
             outputs.append(y_b)
 
             # Add current chunk (detached) to the sliding window.
             # When the window overflows, oldest t tokens are compacted into hierarchy.
             if defer_chunk:
-                self._log_kv_pending = (kc_b.detach(), kv_b.detach(), kp_b.detach())
+                self._log_kv_pending = (k_b.detach(), v_b.detach())
             else:
-                cache.add_recent(kc_b.detach(), kv_b.detach(), kp_b.detach())
+                cache.add_recent(k_b.detach(), v_b.detach())
 
             start = end
 
@@ -1056,42 +992,44 @@ class CausalSelfAttention(nn.Module):
         B: int = 512,
         recent_size: int = 1024,
     ) -> "LogStructuredKVCache":
-        """Build a log-structured KV cache with O(B * log(N)) memory.
+        """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
         Architecture (uniform 2:1 compaction at every level):
             Buffer:           recent_size raw tokens, no compression
             Level 0 (write):  B entries, each = 2 tokens merged
             Level 1+ (carry): B entries, each = 2 entries from prev level merged
+
+        Slots store the FULL post-RoPE key (position sub-channel included);
+        merging mean-pools it, so a slot's position embedding is the expected
+        rotation over its span. No per-token buffer of any kind is allocated.
         """
         rope_n_elem = self.config.rope_n_elem
-        content_dim = self.config.head_size - rope_n_elem
-        v_dim = self.config.head_size
-        # d_pos is the width of the RoPE'd slice AFTER apply_rope, which is
-        # rope_cache_length (cos.size(1)), NOT rope_n_elem: for rope_n_elem == 1
-        # the RoPE cache is widened to 2 dims (HF-compat, see build_rope_cache)
-        # and apply_rope broadcasts the roped slice to that width, so k/q enter
-        # attention with head_size + 1 dims. Mirrors the
-        # `rope_cache_length + head_size - rope_n_elem` k-shape in build_kv_cache.
+        # k_dim is the full post-RoPE key width: the RoPE'd slice AFTER
+        # apply_rope, which is rope_cache_length (cos.size(1)) wide — NOT
+        # rope_n_elem: for rope_n_elem == 1 the RoPE cache is widened to 2 dims
+        # (HF-compat, see build_rope_cache) and apply_rope broadcasts the roped
+        # slice to that width, so k/q enter attention with head_size + 1 dims.
+        # Mirrors the `rope_cache_length + head_size - rope_n_elem` k-shape in
+        # build_kv_cache.
         if rope_cache_length is None:
             rope_cache_length = 2 if rope_n_elem == 1 else rope_n_elem
-        d_pos = rope_cache_length
+        k_dim = rope_cache_length + self.config.head_size - rope_n_elem
 
-        k_content_shape = (
+        k_shape = (
             batch_size,
             self.config.n_query_groups,
             max_seq_length,
-            content_dim,
+            k_dim,
         )
         v_shape = (
             batch_size,
             self.config.n_query_groups,
             max_seq_length,
-            v_dim,
+            self.config.head_size,
         )
 
         return LogStructuredKVCache(
-            k_content_shape, v_shape,
-            d_pos=d_pos,
+            k_shape, v_shape,
             B=B, recent_size=recent_size,
             device=device, dtype=dtype,
         )

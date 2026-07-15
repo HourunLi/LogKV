@@ -216,6 +216,55 @@ def extract_results_to_csv(results: dict, benchmark: str, output_path: Path) -> 
         print(f"Failed to save CSV: {e}")
 
 
+def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
+    """Resolve a directory that actually holds tokenizer.json / tokenizer.model.
+
+    The training save dir normally receives a copy of the tokenizer files
+    (demo.py copies them next to lit_model.pth), but older checkpoints,
+    interrupted runs, or ``save_ckpt: false`` leave it without one. litgpt's
+    ``Tokenizer`` then raises a bare ``NotImplementedError``, so resolve the
+    directory up front and fail with an actionable message instead.
+
+    Search order:
+      1. explicit ``tokenizer_dir`` (CLI/YAML),
+      2. ``checkpoint_dir`` itself,
+      3. the base model dir recorded in ``model_config.yaml``
+         (demo.py convention: checkpoints/<hf org>/<hf name>).
+    """
+    candidates: list[tuple[str, Path]] = []
+    if tokenizer_dir is not None:
+        candidates.append(("--tokenizer_dir", Path(tokenizer_dir)))
+    candidates.append(("checkpoint_dir", Path(checkpoint_dir)))
+
+    cfg_path = Path(checkpoint_dir) / "model_config.yaml"
+    if cfg_path.is_file():
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            hf = cfg.get("hf_config") or {}
+            if hf.get("org") and hf.get("name"):
+                candidates.append(
+                    ("base checkpoint (from model_config.yaml)",
+                     Path("checkpoints") / hf["org"] / hf["name"])
+                )
+        except Exception as e:  # noqa: BLE001 — fallback probing only
+            print(f"[eval] WARNING: could not read {cfg_path} for tokenizer fallback: {e}")
+
+    for label, d in candidates:
+        if (d / "tokenizer.json").is_file() or (d / "tokenizer.model").is_file():
+            return d
+
+    tried = "\n".join(f"  - {label}: {d.resolve()}" for label, d in candidates)
+    raise FileNotFoundError(
+        "No tokenizer.json / tokenizer.model found. Searched:\n"
+        f"{tried}\n"
+        "Fix: pass --tokenizer_dir <dir containing the tokenizer files>, or copy "
+        "the base model's tokenizer files into the checkpoint dir. Note that a "
+        "training run with `save_ckpt: false` writes NO checkpoint (no weights, "
+        "no tokenizer) — the train->eval pipeline requires `save_ckpt: true`."
+    )
+
+
 class LogKVLM(LM):
     """LM wrapper for a causal LM with an optional log-structured KV cache.
 
@@ -235,16 +284,21 @@ class LogKVLM(LM):
         use_log_kv: bool = False,
         log_kv_B: int = 512,
         log_kv_recent_size: int = 1024,
+        tokenizer_dir: str | None = None,
     ):
         super().__init__()
         self._device = device
         self.checkpoint_dir = checkpoint_dir
-        self.tokenizer = Tokenizer(checkpoint_dir)
         self.use_log_kv = use_log_kv
         self.log_kv_B = log_kv_B
         self.log_kv_recent_size = log_kv_recent_size
 
         is_master = not dist.is_initialized() or dist.get_rank() == 0
+
+        resolved_tok_dir = _find_tokenizer_dir(checkpoint_dir, tokenizer_dir)
+        if is_master:
+            print(f"Loading tokenizer from: {resolved_tok_dir}")
+        self.tokenizer = Tokenizer(resolved_tok_dir)
 
         # ── Config loading ──
         config_path = os.path.join(checkpoint_dir, "model_config.yaml")
@@ -517,6 +571,8 @@ def main(
     use_log_kv: bool = False,
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
+    # ── Tokenizer fallback (when the checkpoint dir has no tokenizer files) ──
+    tokenizer_dir: str | None = None,
     # ── YAML config ──
     config: str | None = None,
 ):
@@ -546,6 +602,7 @@ def main(
     use_log_kv = _o("use_log_kv", use_log_kv)
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
+    tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -566,6 +623,7 @@ def main(
         use_log_kv=use_log_kv,
         log_kv_B=log_kv_B,
         log_kv_recent_size=log_kv_recent_size,
+        tokenizer_dir=tokenizer_dir,
     )
 
     results = evaluator.simple_evaluate(
