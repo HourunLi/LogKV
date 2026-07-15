@@ -20,7 +20,9 @@ dataset_name: "debug"
 dataset_dir: "data"
 data_dir: "data"
 num_workers: 16
-save_ckpt: false
+# 必须为 true：majob.sh 流水线在训练后固定评测 save_path，
+# save_ckpt: false 时不会写任何 checkpoint（含 tokenizer 文件），eval 必然失败。
+save_ckpt: true
 save_path: "./ckpt/qwen1.7b-32k-debug"
 
 # TensorBoard

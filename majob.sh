@@ -77,7 +77,7 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 # 🧩 logKV 专属：从训练 YAML（跟随 'config:' 继承）提取 logKV 设置，
 # 让评测使用与模型适配时相同的注意力。这是 logKV 分支独有的开发代码。
 # ==============================================================================
-read -r LOG_KV_TRAINING LOG_KV_B LOG_KV_RECENT <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_TRAINING LOG_KV_B LOG_KV_RECENT SAVE_CKPT <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import os
 import sys
 
@@ -98,9 +98,19 @@ print(
     str(bool(cfg.get("log_kv_training", False))).lower(),
     cfg.get("log_kv_B", 512),
     cfg.get("log_kv_recent_size", 1024),
+    str(bool(cfg.get("save_ckpt", False))).lower(),
 )
 EOF
 )"
+
+# 流水线前置检查：eval 阶段固定评测 ${SAVE_DIR}，如果既没有现成权重、
+# 训练又不会保存（save_ckpt: false），训练完就会在 eval 的 tokenizer/权重
+# 加载处崩溃。在开训前拦截，避免白跑几小时。
+if [ "${SAVE_CKPT}" != "true" ] && [ ! -f "${SAVE_DIR}/lit_model.pth" ]; then
+    echo "❌ 致命错误：${CONFIG_FILE} 中 save_ckpt 未开启，且 ${SAVE_DIR} 下没有现成权重。"
+    echo "   训练结束后将没有 checkpoint 可评测。请在 YAML 中设置 save_ckpt: true。"
+    exit 1
+fi
 
 LOG_KV_ARGS=""
 if [ "${LOG_KV_TRAINING}" == "true" ]; then
