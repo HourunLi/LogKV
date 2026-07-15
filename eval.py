@@ -285,11 +285,10 @@ class LogKVLM(LM):
     """LM wrapper for a causal LM with an optional log-structured KV cache.
 
     When ``use_log_kv`` is set, both loglikelihood scoring and generate_until run
-    through the log-structured (compressed) KV attention, matching how a
-    logKV-adapted model was trained. Otherwise both use dense attention.
-    Loglikelihood scores a fixed sequence in a single full forward (for lengths
-    within ``recent_size`` this is identical to dense causal attention);
-    generation streams prefill + decode.
+    through the merged-position slot cache used by the current LogKV training
+    path: full post-RoPE keys are stored as exact recent tokens or compressed
+    slots, and slot attention scores one logit per slot with the log(w) mass
+    bias. Otherwise both paths use the standard dense / KV-cache attention.
     """
 
     def __init__(
@@ -361,6 +360,32 @@ class LogKVLM(LM):
         self.gen_metrics: list[dict] = []      # generate_until
         self.ppl_metrics: list[dict] = []      # loglikelihood
 
+    def _set_eval_cache(self, max_seq_length: int) -> None:
+        """Install the correct per-request inference cache.
+
+        LogKV now stores full post-RoPE keys directly in slots; there is no
+        separate per-token position buffer to size or maintain here.
+        ``max_seq_length`` only bounds the append-only token counter and level
+        hierarchy.
+        """
+        dtype = next(self.model.parameters()).dtype
+        if self.use_log_kv:
+            self.model.set_log_kv_cache(
+                batch_size=1,
+                max_seq_length=max_seq_length,
+                device=self._device,
+                dtype=dtype,
+                B=self.log_kv_B,
+                recent_size=max(2, min(self.log_kv_recent_size, max_seq_length)),
+            )
+        else:
+            self.model.set_kv_cache(
+                batch_size=1,
+                max_seq_length=max_seq_length,
+                device=self._device,
+                dtype=dtype,
+            )
+
     # ==========================================
     # 🌟 分布式结果收集
     # ==========================================
@@ -414,17 +439,14 @@ class LogKVLM(LM):
 
         with torch.no_grad():
             if self.use_log_kv:
-                # Score under the same log-structured (compressed) KV attention the
-                # model is adapted to. Within recent_size this equals dense causal
-                # attention (no compaction); the LogKV fast path keeps it cheap.
-                self.model.set_log_kv_cache(
-                    batch_size=1, max_seq_length=seq_len, device=self._device,
-                    dtype=next(self.model.parameters()).dtype,
-                    B=self.log_kv_B, recent_size=self.log_kv_recent_size,
-                )
+                # Score with the same merged-position slot attention used by
+                # LogKV inference. ``input_pos`` must be append-only contiguous
+                # because slot compaction is order-based rather than indexed.
+                self._set_eval_cache(seq_len)
                 try:
                     t0 = time.perf_counter()
-                    logits = self.model(inps, input_pos=torch.arange(seq_len, device=self._device))
+                    input_pos = torch.arange(seq_len, device=self._device, dtype=torch.int64)
+                    logits = self.model(inps, input_pos=input_pos)
                     t1 = time.perf_counter()
                 finally:
                     self.model.clear_kv_cache()
@@ -509,15 +531,8 @@ class LogKVLM(LM):
             prompt_len = prompt_tensor.size(0)
 
             with torch.no_grad():
-                # 🧩 logKV：长上下文生成使用 log-structured KV cache
-                if self.use_log_kv:
-                    self.model.set_log_kv_cache(
-                        batch_size=1, max_seq_length=total_max_len, device=self._device,
-                        dtype=next(self.model.parameters()).dtype,
-                        B=self.log_kv_B, recent_size=self.log_kv_recent_size,
-                    )
-                else:
-                    self.model.set_kv_cache(batch_size=1, max_seq_length=total_max_len, device=self._device)
+                # 🧩 logKV：长上下文生成使用 merged-position slot cache
+                self._set_eval_cache(total_max_len)
                 try:
                     t0 = time.perf_counter()
                     out = litgpt_generate(
@@ -630,6 +645,12 @@ def main(
     use_log_kv: bool = False,
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
+    # ── 🧩 logKV：rotary 覆盖（与 demo.py 对称）──
+    # merged-RoPE 方案下 rotary_percentage 决定 key 中被旋转的份额，对取值没有
+    # 硬性要求（1.0 也能跑），但评测必须与训练一致。正常留 null——demo.py 训练时
+    # 已把它写进 checkpoint 的 model_config.yaml；仅评测缺 model_config.yaml 的
+    # 旧 checkpoint 时用来对齐训练值。
+    rotary_percentage: float | None = None,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 🧩 logKV：YAML config ──
@@ -660,7 +681,13 @@ def main(
     use_log_kv = _o("use_log_kv", use_log_kv)
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
+    rotary_percentage = _o("rotary_percentage", rotary_percentage)
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
+
+    # rotary_percentage 只是 config_overrides 的便捷入口（Config.__post_init__ 会
+    # 由它重算 rope_n_elem），显式的 config_overrides 优先。
+    if rotary_percentage is not None:
+        config_overrides = {"rotary_percentage": rotary_percentage, **(config_overrides or {})}
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -674,6 +701,8 @@ def main(
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
         print(f"🧩 logKV: {use_log_kv} | B: {log_kv_B} | recent_size: {log_kv_recent_size}")
+        if rotary_percentage is not None:
+            print(f"🧩 rotary_percentage 覆盖: {rotary_percentage}（须与训练一致）")
 
     checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
 
