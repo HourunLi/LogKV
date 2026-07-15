@@ -623,7 +623,7 @@ class CausalSelfAttention(nn.Module):
         # LogKV training mode: simulate streaming compaction (C = t) so that
         # training attention matches inference decode semantics. Each chunk of
         # t tokens attends to [compact prefix (detached) + current chunk (causal)]
-        # via decoupled content/position attention.
+        # via slot attention over merged-position entries.
         if self.training_log_kv and input_pos is None:
             return self._log_kv_training_forward(q, k, v, B, T)
 
@@ -633,10 +633,6 @@ class CausalSelfAttention(nn.Module):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
 
             if isinstance(self.kv_cache, LogStructuredKVCache):
-                # Explicit raise (not assert): this correctness precondition must
-                # survive `python -O`, which strips assert statements.
-                if self.config.rope_n_elem >= self.config.head_size:
-                    raise ValueError("logKV decoupled attention requires rotary_percentage < 1.0")
                 self._assert_log_kv_input_pos_contiguous(input_pos, T)
                 # Inference uses the same streaming chunker for prefill and decode.
                 # A trailing single token is kept pending so an odd-length prompt
@@ -763,16 +759,18 @@ class CausalSelfAttention(nn.Module):
         keeps odd-length prefill and subsequent decode on the same 2-token
         boundaries as training over the concatenated sequence.
         """
-        # Explicit raises (not asserts): these correctness preconditions must
+        # Explicit raise (not assert): this correctness precondition must
         # survive `python -O`, which strips assert statements.
         if not isinstance(self.kv_cache, LogStructuredKVCache):
             raise TypeError("training_log_kv requires a LogStructuredKVCache")
-        if self.config.rope_n_elem >= self.config.head_size:
-            raise ValueError(
-                "logKV attention requires rotary_percentage < 1.0 "
-                f"(got rope_n_elem={self.config.rope_n_elem}, head_size={self.config.head_size}). "
-                "Set rotary_percentage=0.25 in your YAML config."
-            )
+        # Any rotary_percentage is valid here: compaction mean-pools the FULL
+        # post-RoPE key, so the rotated slice merges into the expected rotation
+        # (Dirichlet-damped as spans widen) and any pass-through content slice
+        # merges undamped. rotary_percentage < 1.0 (e.g. 0.25) keeps a
+        # position-free content channel whose signal survives compaction at any
+        # distance — recommended for adaptation quality — but full RoPE
+        # (Qwen3 default 1.0) runs correctly: distant compact slots just fade
+        # toward pure mass-bias contributions.
         cache = self.kv_cache
         if reset_cache:
             cache.reset_parameters()
