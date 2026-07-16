@@ -590,9 +590,12 @@ def main(
         micro_batch_idx += 1
 
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            # Routes through _log_kv_training_forward (training_log_kv is on and
-            # input_pos is None): chunked slot attention over the simulated
-            # compressed-KV stream, not a standard dense causal forward.
+            # Routes through _log_kv_train_lowmem_forward (training_log_kv is on
+            # and input_pos is None): chunked slot attention over the simulated
+            # compressed-KV stream, not a standard dense causal forward. The
+            # low-memory Function streams the forward without a graph and
+            # replays chunk-by-chunk in backward, so per-layer activation
+            # memory is O(T + S) instead of the naive O(T/2 x S).
             logits = model(inputs)
             loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
             # Feed the per-micro-batch loss into the step aggregator; without this

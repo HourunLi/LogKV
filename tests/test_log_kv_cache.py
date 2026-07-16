@@ -986,6 +986,100 @@ class TestBlockPrefill:
 
 
 # ---------------------------------------------------------------------------
+# Low-memory training Function: must equal the naive differentiable reference
+# ---------------------------------------------------------------------------
+
+class TestLowMemTrainingEquivalence:
+    """``_log_kv_train_lowmem_forward`` (LogKVStreamTrainingAttention:
+    graph-free forward stream + chunk-by-chunk backward replay) must reproduce
+    the naive per-chunk-graph reference
+    ``_log_kv_training_forward(reset_cache=True, defer_last_single=False)``
+    exactly: outputs, input gradients, parameter gradients, cache end state."""
+
+    @staticmethod
+    def _make_attention() -> CausalSelfAttention:
+        config = Config(
+            block_size=64,
+            padded_vocab_size=16,
+            n_layer=1,
+            n_head=4,
+            n_query_groups=2,  # GQA: exercises the broadcast attention branch
+            n_embd=16,
+            rotary_percentage=0.5,
+        )
+        attn = CausalSelfAttention(config, block_idx=0)
+        attn.kv_cache = attn.build_log_kv_cache(
+            batch_size=1,
+            max_seq_length=64,
+            B=4,
+            recent_size=4,  # small: compaction kicks in almost immediately
+        )
+        return attn
+
+    def _make_pair_with_inputs(self, T: int, seed: int):
+        # Identical weights: re-seed before each construction so qkv/proj match.
+        torch.manual_seed(0)
+        a_ref = self._make_attention()
+        torch.manual_seed(0)
+        a_new = self._make_attention()
+
+        torch.manual_seed(seed)
+        hs = a_ref.config.head_size
+        q0 = torch.randn(1, 4, T, hs)
+        k0 = torch.randn(1, 2, T, hs)
+        v0 = torch.randn(1, 2, T, hs)
+        q1, k1, v1 = (t.clone().requires_grad_(True) for t in (q0, k0, v0))
+        q2, k2, v2 = (t.clone().requires_grad_(True) for t in (q0, k0, v0))
+        return a_ref, a_new, (q1, k1, v1), (q2, k2, v2)
+
+    @pytest.mark.parametrize("T", [1, 2, 5, 12, 33])
+    def test_matches_reference_forward_and_grads(self, T):
+        a_ref, a_new, (q1, k1, v1), (q2, k2, v2) = self._make_pair_with_inputs(T, seed=7)
+
+        y_ref = a_ref._log_kv_training_forward(q1, k1, v1, B=1, T=T)
+        y_new = a_new._log_kv_train_lowmem_forward(q2, k2, v2, B=1, T=T)
+
+        # Same op sequence (both chunk through log_kv_chunk_attention semantics
+        # with causal_tail), so outputs and cache trajectories are identical.
+        assert torch.equal(y_new, y_ref)
+        assert_cache_states_bit_identical(a_ref.kv_cache, a_new.kv_cache)
+
+        # Position-dependent loss so gradient errors cannot cancel.
+        torch.manual_seed(99)
+        w = torch.randn_like(y_ref)
+        (y_ref * w).sum().backward()
+        (y_new * w).sum().backward()
+
+        torch.testing.assert_close(q2.grad, q1.grad, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(k2.grad, k1.grad, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(v2.grad, v1.grad, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(
+            a_new.proj.weight.grad, a_ref.proj.weight.grad, rtol=1e-6, atol=1e-6
+        )
+
+    def test_backward_ignores_forwards_cache_end_state(self):
+        """Backward replays the stream from a reset cache, so mutating the
+        cache between forward and backward (as interleaved micro-batches or
+        activation-checkpoint recompute would) must not change gradients."""
+        T = 12
+        a_ref, a_new, (q1, k1, v1), (q2, k2, v2) = self._make_pair_with_inputs(T, seed=3)
+
+        y_ref = a_ref._log_kv_training_forward(q1, k1, v1, B=1, T=T)
+        y_new = a_new._log_kv_train_lowmem_forward(q2, k2, v2, B=1, T=T)
+
+        # Trash the low-mem module's cache state before its backward runs.
+        hs = a_new.config.head_size
+        a_new.kv_cache.reset_parameters()
+        a_new.kv_cache.add_recent(torch.randn(1, 2, 2, hs), torch.randn(1, 2, 2, hs))
+
+        y_ref.sum().backward()
+        y_new.sum().backward()
+        torch.testing.assert_close(q2.grad, q1.grad, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(k2.grad, k1.grad, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(v2.grad, v1.grad, rtol=1e-6, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # Integration: GPT.forward LogKV mask handling
 # ---------------------------------------------------------------------------
 
