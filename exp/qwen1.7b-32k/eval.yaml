@@ -16,7 +16,7 @@
 # 默认指向 logKV 训练产物（base.yaml 的 save_path，目录内应有
 # lit_model.pth + tokenizer 文件 + model_config.yaml）。
 checkpoint_dir: ./ckpt/qwen1.7b-32k-debug
-# 若要复现 kv 分支的「原始基座模型」基线评测，改用下面这行并把 use_log_kv 设为 false:
+# 若要评测原始基座模型（training-free 基线，同样走 logKV 压缩注意力），改用下面这行:
 # checkpoint_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
 
 # 仅当 checkpoint_dir 里没有 tokenizer.json / tokenizer.model 时才需要
@@ -32,17 +32,20 @@ benchmark: "boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,op
 output_path: ./ckpt/qwen1.7b-32k-debug/evaluate
 # output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/checkpoints/Qwen/Qwen3-1.7B-Base/
 
-# ── logKV（本分支专属；评测须与训练时的注意力一致）──
-# 评测 logKV 适配后的 checkpoint 时置 true；评测原始基座基线时置 false。
-use_log_kv: true
+# ── logKV（本分支专属；评测恒定走压缩注意力，无 dense 分支）──
 # 必须与训练 YAML（base.yaml）中的取值一致：
 log_kv_B: 512
 log_kv_recent_size: 1024
+# prefill 分块大小（推理专用，不影响训练语义对齐的缓存状态）：
+# 2 = 严格 2-token 流式语义（慢，用于 A/B 验证）；越大越快，
+# 偏差上界 = 块内 query 比严格流式多看到 < block 个未压缩 token。
+log_kv_prefill_block: 256
 
 # ── 其余可用键（保持 null / 注释即用默认或 CLI 值）──
-# 覆盖模型 Config 字段（一般不需要，model_config.yaml 已随 checkpoint 保存）：
+# 覆盖模型 Config 字段（一般不需要：架构随 checkpoint 的 model_config.yaml
+# 自动同步；仅评测缺 model_config.yaml 的旧 checkpoint 时用来对齐训练配置）：
 # config_overrides:
-#   rotary_percentage: 0.25
+#   n_layer: 28
 
 # NIAH / RULER 任务需要 metadata（majob.sh 里由第二个 torchrun 单独传入；
 # 手动跑 niah_* 时取消注释）：

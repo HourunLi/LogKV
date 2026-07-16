@@ -323,6 +323,7 @@ class GPT(nn.Module):
         dtype: torch.dtype | None = None,
         B: int = 512,
         recent_size: int = 1024,
+        prefill_block: int = 256,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -338,6 +339,10 @@ class GPT(nn.Module):
             dtype: Target dtype
             B: Number of memory slots per level (default 512)
             recent_size: Sliding window size (default 1024, recent tokens kept exact)
+            prefill_block: Vectorized prefill block size. 2 reproduces the strict
+                per-2-token streaming semantics; larger values batch prefill
+                attention with a deviation bounded by the block size (the cache
+                state trajectory is exact either way).
         """
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
@@ -354,6 +359,7 @@ class GPT(nn.Module):
                 B=B, recent_size=recent_size,
             )
             block.attn._log_kv_pending = None
+            block.attn.log_kv_prefill_block = prefill_block
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
         # holding stale O(N^2) bool tensors in GPU memory. With every block on
@@ -503,6 +509,12 @@ class CausalSelfAttention(nn.Module):
         # LogKV inference: carry one trailing token across calls so commits stay
         # aligned to the training chunk size. Holds (k, v) — full post-RoPE key.
         self._log_kv_pending: tuple | None = None
+        # LogKV inference prefill block size (see _log_kv_training_forward):
+        # queries in a block share the slot state frozen at block start. 2 =
+        # strict per-2-token streaming semantics; larger = fewer, larger
+        # kernels with a deviation bounded by the block size. Set via
+        # GPT.set_log_kv_cache(prefill_block=...).
+        self.log_kv_prefill_block: int = 256
         self.apply_sliding_window_attention = False
         if config.sliding_window_size is not None and config.sliding_window_indices is not None:
             self.apply_sliding_window_attention = config.sliding_window_indices[block_idx]
@@ -822,60 +834,62 @@ class CausalSelfAttention(nn.Module):
             self._log_kv_pending = None
             start = 1
 
-        # ---- Fast path (inference only): vectorize the leading no-compaction run ----
-        # While the hierarchy holds no compact slots and the recent window will not
-        # overflow, every query attends to [existing recent (exact) + causal current
-        # tokens] with no compression — i.e. plain causal attention over exact tokens
-        # (all w=1, mass bias 0). The whole run is then one slot-attention call instead
-        # of one sequential 2-token step per chunk (e.g. a 512-token loglikelihood
-        # request: 1 call vs 256).
-        # Restricted to the inference path (defer_last_single): under no_grad the output
-        # equals the per-chunk loop below, whereas training must keep the loop's
-        # per-chunk stop-gradient on the sliding window, so training keeps the loop.
-        if (
-            defer_last_single
-            and start < T
-            and cache.level_count.sum().item() == 0        # no compaction has happened
-            and cache.recent_count < cache.recent_size      # room left -> no flush in block
-        ):
-            capacity = cache.recent_size - cache.recent_count
-            block_end = min(T, start + capacity)  # no flush occurs within [start, block_end)
-            blk = block_end - start
-            # Defer a lone tail token so it pairs with the next streamed token (keeps the
-            # 2-token commit alignment with training over the full sequence).
-            defer_tail = block_end == T and blk % 2 == 1
-            commit_end = block_end - 1 if defer_tail else block_end
+        # ---- Vectorized block prefill (inference only) ----
+        # Process the stream in blocks, freezing the slot state at block start:
+        # in-block queries attend to [frozen compact+recent slots (fully
+        # visible) + causal exact in-block tokens]. While no window flush would
+        # occur inside a block this IS the exact 2-token streaming semantics
+        # (each in-block query's true state equals the frozen one). Once
+        # compaction is active, a query at in-block offset j instead sees up to
+        # j exact tokens that strict streaming would already have compacted — a
+        # bounded, strictly information-richer deviation (effective exact
+        # window stretched by less than one block out of recent_size). The
+        # cache state trajectory stays exact regardless: add_recent() below
+        # flushes/compacts exactly as streaming would, so decode after prefill
+        # sees bit-identical cache contents. A block size of 2 reproduces
+        # strict streaming exactly (log_kv_prefill_block=2 for A/B checks).
+        # Training keeps the per-chunk loop below for its per-chunk
+        # stop-gradient structure.
+        if defer_last_single:
+            blk_size = max(2, min(self.log_kv_prefill_block, cache.recent_size))
+            while start < T:
+                block_end = min(T, start + blk_size)
+                blk = block_end - start
+                # Defer a lone tail token so it pairs with the next streamed
+                # token (keeps the 2-token commit alignment with training).
+                defer_tail = block_end == T and blk % 2 == 1
+                commit_end = block_end - 1 if defer_tail else block_end
 
-            slot_k, slot_v, slot_w = cache.get_attention_state()
-            n_state = slot_k.size(2)  # recent tokens only (no compaction yet)
-            k_all, v_all, w_all = append_exact_tokens(
-                slot_k, slot_v, slot_w,
-                k[:, :, start:block_end, :],
-                v[:, :, start:block_end, :],
-            )
-
-            # Mask (blk, n_state + blk): existing recent fully visible, block
-            # tokens causal among themselves.
-            mask = torch.ones(blk, n_state + blk, dtype=torch.bool, device=device)
-            mask[:, n_state:] = torch.tril(
-                torch.ones(blk, blk, dtype=torch.bool, device=device)
-            )
-            y_blk = log_kv_slot_attention(
-                q[:, :, start:block_end, :], k_all, v_all, w_all, scale=scale, mask=mask
-            )
-            outputs.append(y_blk)
-
-            if commit_end > start:
-                cache.add_recent(
-                    k[:, :, start:commit_end, :].detach(),
-                    v[:, :, start:commit_end, :].detach(),
+                slot_k, slot_v, slot_w = cache.get_attention_state()
+                n_state = slot_k.size(2)  # compact slots + recent tokens (all visible)
+                k_all, v_all, w_all = append_exact_tokens(
+                    slot_k, slot_v, slot_w,
+                    k[:, :, start:block_end, :],
+                    v[:, :, start:block_end, :],
                 )
-            if defer_tail:
-                self._log_kv_pending = (
-                    k[:, :, commit_end:block_end, :].detach(),
-                    v[:, :, commit_end:block_end, :].detach(),
+
+                # Mask (blk, n_state + blk): frozen state fully visible, block
+                # tokens causal among themselves.
+                mask = torch.ones(blk, n_state + blk, dtype=torch.bool, device=device)
+                mask[:, n_state:] = torch.tril(
+                    torch.ones(blk, blk, dtype=torch.bool, device=device)
                 )
-            start = block_end
+                y_blk = log_kv_slot_attention(
+                    q[:, :, start:block_end, :], k_all, v_all, w_all, scale=scale, mask=mask
+                )
+                outputs.append(y_blk)
+
+                if commit_end > start:
+                    cache.add_recent(
+                        k[:, :, start:commit_end, :].detach(),
+                        v[:, :, start:commit_end, :].detach(),
+                    )
+                if defer_tail:
+                    self._log_kv_pending = (
+                        k[:, :, commit_end:block_end, :].detach(),
+                        v[:, :, commit_end:block_end, :].detach(),
+                    )
+                start = block_end
 
         while start < T:
             end = min(start + t, T)

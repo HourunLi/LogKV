@@ -46,6 +46,19 @@ def add_full_kv_in_chunks(cache: LogStructuredKVCache, k: torch.Tensor, v: torch
         cache.add_recent(k[:, :, start:end, :], v[:, :, start:end, :])
 
 
+def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredKVCache) -> None:
+    """The full cache state (counters, recent window, all levels) must match bitwise."""
+    assert a.token_count == b.token_count
+    assert a.recent_count == b.recent_count
+    rc = a.recent_count
+    assert torch.equal(a.recent_k[:, :, :rc], b.recent_k[:, :, :rc])
+    assert torch.equal(a.recent_v[:, :, :rc], b.recent_v[:, :, :rc])
+    assert torch.equal(a.level_count, b.level_count)
+    for ell in range(a.max_levels):
+        for name in ("level_k_", "level_v_", "level_w_"):
+            assert torch.equal(getattr(a, f"{name}{ell}"), getattr(b, f"{name}{ell}")), f"{name}{ell} differ"
+
+
 # ---------------------------------------------------------------------------
 # __init__ / structure tests
 # ---------------------------------------------------------------------------
@@ -844,6 +857,135 @@ class TestAttentionStreamingBoundaries:
 
 
 # ---------------------------------------------------------------------------
+# Batched flush: chunked add_recent must equal strict 2-token streaming
+# ---------------------------------------------------------------------------
+
+class TestBatchedFlushEquivalence:
+    """add_recent() flushes window overflow in one batch (one shift, vectorized
+    pair merges). The resulting cache state must be bit-identical to feeding the
+    same token stream in the strict 2-token cadence."""
+
+    @staticmethod
+    def _new_cache(recent: int = 16, B: int = 4, max_seq: int = 2048) -> LogStructuredKVCache:
+        return LogStructuredKVCache(
+            (1, 2, max_seq, 8), (1, 2, max_seq, 8), B=B, recent_size=recent,
+            device=torch.device("cpu"), dtype=torch.float32,
+        )
+
+    @pytest.mark.parametrize("chunk_sizes", ([16], [2, 4, 14, 16, 6, 12]))
+    def test_even_chunked_add_recent_matches_streaming(self, chunk_sizes):
+        torch.manual_seed(0)
+        T = 700  # even; drives many flushes and several binary carries (B=4)
+        k = torch.randn(1, 2, T, 8)
+        v = torch.randn(1, 2, T, 8)
+
+        ref = self._new_cache()
+        add_full_kv_in_chunks(ref, k, v, chunk_size=2)
+
+        c = self._new_cache()
+        i, si = 0, 0
+        while i < T:
+            n = min(chunk_sizes[si % len(chunk_sizes)], T - i)
+            c.add_recent(k[:, :, i:i + n], v[:, :, i:i + n])
+            i += n
+            si += 1
+
+        assert_cache_states_bit_identical(ref, c)
+
+    def test_full_window_replacement_chunk(self):
+        """n == recent_size arriving at a full window flushes the entire old
+        window — the boundary case of the batched path."""
+        torch.manual_seed(1)
+        recent = 8
+        k = torch.randn(1, 2, 2 * recent, 8)
+        v = torch.randn(1, 2, 2 * recent, 8)
+
+        ref = self._new_cache(recent=recent)
+        add_full_kv_in_chunks(ref, k, v, chunk_size=2)
+
+        c = self._new_cache(recent=recent)
+        c.add_recent(k[:, :, :recent], v[:, :, :recent])
+        c.add_recent(k[:, :, recent:], v[:, :, recent:])
+
+        assert_cache_states_bit_identical(ref, c)
+
+
+# ---------------------------------------------------------------------------
+# Vectorized block prefill (inference): exact in-window, state-exact always
+# ---------------------------------------------------------------------------
+
+class TestBlockPrefill:
+    """log_kv_prefill_block > 2 batches prefill attention. Within the recent
+    window the outputs must equal strict streaming (block=2); past compaction
+    the outputs may deviate boundedly, but the cache state trajectory — and
+    therefore every subsequent decode step — must stay bit-identical."""
+
+    @staticmethod
+    def _make_attention(recent: int, prefill_block: int) -> CausalSelfAttention:
+        config = Config(
+            block_size=64,
+            padded_vocab_size=16,
+            n_layer=1,
+            n_head=2,
+            n_query_groups=2,
+            n_embd=8,
+            rotary_percentage=0.5,
+        )
+        attn = CausalSelfAttention(config, block_idx=0)
+        attn.kv_cache = attn.build_log_kv_cache(
+            batch_size=1,
+            max_seq_length=64,
+            B=4,
+            recent_size=recent,
+        )
+        attn.log_kv_prefill_block = prefill_block
+        return attn
+
+    def _run_pair(self, recent: int, T: int) -> tuple:
+        # Identical weights: re-seed before each construction so qkv/proj match.
+        torch.manual_seed(0)
+        a_stream = self._make_attention(recent, prefill_block=2)
+        torch.manual_seed(0)
+        a_block = self._make_attention(recent, prefill_block=64)
+
+        torch.manual_seed(42)
+        head_size = 4  # n_embd=8 / n_head=2
+        q = torch.randn(1, 2, T, head_size)
+        k = torch.randn(1, 2, T, head_size)
+        v = torch.randn(1, 2, T, head_size)
+        with torch.no_grad():
+            y_stream = a_stream._log_kv_training_forward(
+                q, k, v, B=1, T=T, reset_cache=True, defer_last_single=True)
+            y_block = a_block._log_kv_training_forward(
+                q, k, v, B=1, T=T, reset_cache=True, defer_last_single=True)
+        return a_stream, a_block, y_stream, y_block
+
+    def test_in_window_outputs_match_streaming(self):
+        """No flush inside the sequence -> block prefill is the same math as
+        streaming (differences only from fp32 matmul tiling)."""
+        a_s, a_b, y_s, y_b = self._run_pair(recent=32, T=20)
+        torch.testing.assert_close(y_b, y_s, atol=1e-5, rtol=1e-5)
+        assert_cache_states_bit_identical(a_s.kv_cache, a_b.kv_cache)
+
+    def test_post_compaction_state_and_decode_match_streaming(self):
+        """Past compaction the prefill OUTPUTS deviate (bounded, documented),
+        but cache state and subsequent decode logits must not."""
+        a_s, a_b, y_s, y_b = self._run_pair(recent=8, T=40)
+        assert torch.isfinite(y_b).all()
+        assert_cache_states_bit_identical(a_s.kv_cache, a_b.kv_cache)
+
+        torch.manual_seed(1)
+        head_size = 4
+        q = torch.randn(1, 2, 2, head_size)
+        k = torch.randn(1, 2, 2, head_size)
+        v = torch.randn(1, 2, 2, head_size)
+        with torch.no_grad():
+            d_s = a_s._log_kv_training_forward(q, k, v, B=1, T=2, reset_cache=False, defer_last_single=True)
+            d_b = a_b._log_kv_training_forward(q, k, v, B=1, T=2, reset_cache=False, defer_last_single=True)
+        assert torch.equal(d_s, d_b)
+
+
+# ---------------------------------------------------------------------------
 # Integration: GPT.forward LogKV mask handling
 # ---------------------------------------------------------------------------
 
@@ -993,8 +1135,8 @@ class TestLogKVDtypeReconcile:
 
 class TestLogKVMatchesDense:
     """Within recent_size no compaction occurs, so LogKV inference must reproduce
-    dense causal attention exactly. This validates the prefill fast path and
-    underpins routing loglikelihood scoring through LogKV (eval.use_log_kv)."""
+    dense causal attention exactly. This validates the prefill fast path that
+    underpins eval.py's loglikelihood scoring through the logKV cache."""
 
     @staticmethod
     def _make_model() -> GPT:

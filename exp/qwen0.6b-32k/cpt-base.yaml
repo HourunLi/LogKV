@@ -22,13 +22,8 @@ save_path: ./ckpt/qwen0.6b-32k-cpt-base
 enable_tensorboard: true
 tensorboard_root: ./tb-32k
 
-# Log-structured KV cache
+# Log-structured KV cache (always on: demo.py simulates compressed-KV
+# attention for the whole run; eval uses the same B/recent_size). Run AFTER
+# dense pretraining so the model learns to read compressed KV.
 log_kv_B: 512
 log_kv_recent_size: 1024
-# Enable logKV simulation during this adaptation phase.
-# Run AFTER dense pretraining so the model learns to read compressed KV.
-log_kv_training: true
-
-# DeepSeek V4-style content/position decoupling:
-# 32 dims RoPE (position, per-token, uncompressed) + 96 dims content (compressed)
-rotary_percentage: 0.25

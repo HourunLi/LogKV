@@ -282,13 +282,13 @@ def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
 
 
 class LogKVLM(LM):
-    """LM wrapper for a causal LM with an optional log-structured KV cache.
+    """LM wrapper that scores and generates through the log-structured KV cache.
 
-    When ``use_log_kv`` is set, both loglikelihood scoring and generate_until run
-    through the merged-position slot cache used by the current LogKV training
-    path: full post-RoPE keys are stored as exact recent tokens or compressed
-    slots, and slot attention scores one logit per slot with the log(w) mass
-    bias. Otherwise both paths use the standard dense / KV-cache attention.
+    Both loglikelihood scoring and generate_until run through the merged-position
+    slot cache used by the LogKV training path: full post-RoPE keys are stored as
+    exact recent tokens or compressed slots, and slot attention scores one logit
+    per slot with the log(w) mass bias. There is no dense fallback — this
+    pipeline only evaluates the logKV compression route.
     """
 
     def __init__(
@@ -296,17 +296,17 @@ class LogKVLM(LM):
         checkpoint_dir: str,
         device: str = "cuda",
         config_overrides: dict[str, Any] | None = None,
-        use_log_kv: bool = False,
         log_kv_B: int = 512,
         log_kv_recent_size: int = 1024,
+        log_kv_prefill_block: int = 256,
         tokenizer_dir: str | None = None,
     ):
         super().__init__()
         self._device = device
         self.checkpoint_dir = checkpoint_dir
-        self.use_log_kv = use_log_kv
         self.log_kv_B = log_kv_B
         self.log_kv_recent_size = log_kv_recent_size
+        self.log_kv_prefill_block = log_kv_prefill_block
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = not dist.is_initialized() or dist.get_rank() == 0
@@ -334,7 +334,7 @@ class LogKVLM(LM):
 
         # ==========================================
 
-        if is_master: print(f"🔧 正在初始化 Transformer (logKV模式: {self.use_log_kv})...")
+        if is_master: print("🔧 正在初始化 Transformer (logKV 压缩注意力)...")
         self.model = GPT(self.config).to(device).bfloat16()
 
         if is_master: print(f"🔄 正在加载权重...")
@@ -369,22 +369,15 @@ class LogKVLM(LM):
         hierarchy.
         """
         dtype = next(self.model.parameters()).dtype
-        if self.use_log_kv:
-            self.model.set_log_kv_cache(
-                batch_size=1,
-                max_seq_length=max_seq_length,
-                device=self._device,
-                dtype=dtype,
-                B=self.log_kv_B,
-                recent_size=max(2, min(self.log_kv_recent_size, max_seq_length)),
-            )
-        else:
-            self.model.set_kv_cache(
-                batch_size=1,
-                max_seq_length=max_seq_length,
-                device=self._device,
-                dtype=dtype,
-            )
+        self.model.set_log_kv_cache(
+            batch_size=1,
+            max_seq_length=max_seq_length,
+            device=self._device,
+            dtype=dtype,
+            B=self.log_kv_B,
+            recent_size=max(2, min(self.log_kv_recent_size, max_seq_length)),
+            prefill_block=self.log_kv_prefill_block,
+        )
 
     # ==========================================
     # 🌟 分布式结果收集
@@ -438,23 +431,17 @@ class LogKVLM(LM):
         ctx_len = len(ctx_enc)
 
         with torch.no_grad():
-            if self.use_log_kv:
-                # Score with the same merged-position slot attention used by
-                # LogKV inference. ``input_pos`` must be append-only contiguous
-                # because slot compaction is order-based rather than indexed.
-                self._set_eval_cache(seq_len)
-                try:
-                    t0 = time.perf_counter()
-                    input_pos = torch.arange(seq_len, device=self._device, dtype=torch.int64)
-                    logits = self.model(inps, input_pos=input_pos)
-                    t1 = time.perf_counter()
-                finally:
-                    self.model.clear_kv_cache()
-            else:
-                # Dense full-attention scoring: one full forward, no KV cache needed.
+            # Score with the same merged-position slot attention used by LogKV
+            # inference. ``input_pos`` must be append-only contiguous because
+            # slot compaction is order-based rather than indexed.
+            self._set_eval_cache(seq_len)
+            try:
                 t0 = time.perf_counter()
-                logits = self.model(inps)
+                input_pos = torch.arange(seq_len, device=self._device, dtype=torch.int64)
+                logits = self.model(inps, input_pos=input_pos)
                 t1 = time.perf_counter()
+            finally:
+                self.model.clear_kv_cache()
 
         self.ppl_metrics.append({
             "total_seq_len": seq_len, "context_len": ctx_len,
@@ -641,16 +628,13 @@ def main(
     config_overrides: dict[str, Any] | None = None,
     output_path: str | None = None,
     metadata: dict[str, Any] | None = None,
-    # ── 🧩 logKV ──
-    use_log_kv: bool = False,
+    # ── 🧩 logKV（本管线只跑压缩路线，无 dense 分支）──
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
-    # ── 🧩 logKV：rotary 覆盖（与 demo.py 对称）──
-    # merged-RoPE 方案下 rotary_percentage 决定 key 中被旋转的份额，对取值没有
-    # 硬性要求（1.0 也能跑），但评测必须与训练一致。正常留 null——demo.py 训练时
-    # 已把它写进 checkpoint 的 model_config.yaml；仅评测缺 model_config.yaml 的
-    # 旧 checkpoint 时用来对齐训练值。
-    rotary_percentage: float | None = None,
+    # prefill 分块大小：块内 query 共享块首冻结的 slot 状态。2 = 严格 2-token
+    # 流式语义（用于 A/B 验证近似偏差）；越大越快，偏差上界 = 块内 query 比严格
+    # 流式多看到 < block 个未压缩 token（缓存状态轨迹两者严格一致）。
+    log_kv_prefill_block: int = 256,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 🧩 logKV：YAML config ──
@@ -678,16 +662,10 @@ def main(
     config_overrides = _o("config_overrides", config_overrides)
     output_path = _o("output_path", output_path)
     metadata = _o("metadata", metadata)
-    use_log_kv = _o("use_log_kv", use_log_kv)
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
-    rotary_percentage = _o("rotary_percentage", rotary_percentage)
+    log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
-
-    # rotary_percentage 只是 config_overrides 的便捷入口（Config.__post_init__ 会
-    # 由它重算 rope_n_elem），显式的 config_overrides 优先。
-    if rotary_percentage is not None:
-        config_overrides = {"rotary_percentage": rotary_percentage, **(config_overrides or {})}
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -700,9 +678,7 @@ def main(
 
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
-        print(f"🧩 logKV: {use_log_kv} | B: {log_kv_B} | recent_size: {log_kv_recent_size}")
-        if rotary_percentage is not None:
-            print(f"🧩 rotary_percentage 覆盖: {rotary_percentage}（须与训练一致）")
+        print(f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | prefill_block: {log_kv_prefill_block}")
 
     checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
 
@@ -710,9 +686,9 @@ def main(
         checkpoint_dir,
         device=device,
         config_overrides=config_overrides,
-        use_log_kv=use_log_kv,
         log_kv_B=log_kv_B,
         log_kv_recent_size=log_kv_recent_size,
+        log_kv_prefill_block=log_kv_prefill_block,
         tokenizer_dir=tokenizer_dir,
     )
 
