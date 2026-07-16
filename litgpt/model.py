@@ -16,7 +16,12 @@ import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
-from litgpt.log_kv_cache import LogStructuredKVCache, append_exact_tokens, log_kv_slot_attention
+from litgpt.log_kv_cache import (
+    LogKVStreamTrainingAttention,
+    LogStructuredKVCache,
+    append_exact_tokens,
+    log_kv_slot_attention,
+)
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
 
@@ -666,9 +671,11 @@ class CausalSelfAttention(nn.Module):
         # LogKV training mode: simulate streaming compaction (C = t) so that
         # training attention matches inference decode semantics. Each chunk of
         # t tokens attends to [compact prefix (detached) + current chunk (causal)]
-        # via slot attention over merged-position entries.
+        # via slot attention over merged-position entries. Routed through the
+        # low-memory Function (graph-free stream + backward replay): the naive
+        # per-chunk graph saves O(T/2 x S) tensors per layer and OOMs at 32K.
         if self.training_log_kv and input_pos is None:
-            return self._log_kv_training_forward(q, k, v, B, T)
+            return self._log_kv_train_lowmem_forward(q, k, v, B, T)
 
         # Apply kv-cache during inference.
         if input_pos is not None:
@@ -769,6 +776,42 @@ class CausalSelfAttention(nn.Module):
                 "Reset the LogKV cache before starting a new sequence, or implement indexed LogKV writes."
             )
 
+    def _log_kv_train_lowmem_forward(
+        self,
+        q: torch.Tensor,    # (B, n_head, T, hs) post-RoPE
+        k: torch.Tensor,    # (B, n_query_groups, T, hs) post-RoPE
+        v: torch.Tensor,    # (B, n_query_groups, T, hs)
+        B: int,
+        T: int,
+    ) -> torch.Tensor:
+        """Training forward over the logKV stream with O(T + S) memory.
+
+        Streaming semantics identical to
+        ``_log_kv_training_forward(reset_cache=True, defer_last_single=False)``
+        — 2-token chunks, [compact prefix (detached) + current chunk (causal)]
+        slot attention — but routed through ``LogKVStreamTrainingAttention``:
+        the forward pass streams WITHOUT recording an autograd graph and the
+        backward pass replays the stream chunk by chunk, so the O(T/2 x S)
+        per-chunk saved tensors of the naive graph (the long-context training
+        OOM) never materialize. Gradients are exact (see the Function's
+        docstring). ``_log_kv_training_forward`` remains as the inference
+        streaming engine and as the differentiable reference implementation
+        the equivalence tests compare against.
+        """
+        # Explicit raise (not assert): must survive `python -O`.
+        if not isinstance(self.kv_cache, LogStructuredKVCache):
+            raise TypeError("training_log_kv requires a LogStructuredKVCache")
+        cache = self.kv_cache
+        cache._convert_dtype(q.dtype)
+        self._log_kv_pending = None  # training never defers a tail token
+
+        scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
+        scale = scale * self.mscale * self.mscale
+
+        y = LogKVStreamTrainingAttention.apply(q, k, v, cache, scale)  # (B, n_head, T, hs)
+        y = y.transpose(1, 2).reshape(B, T, self.config.head_size * self.config.n_head)
+        return self.proj(y)
+
     def _log_kv_training_forward(
         self,
         q: torch.Tensor,    # (B, n_head, T, hs) post-RoPE
@@ -779,8 +822,14 @@ class CausalSelfAttention(nn.Module):
         reset_cache: bool = True,
         defer_last_single: bool = False,
     ) -> torch.Tensor:
-        """Training forward simulating the logKV streaming compaction with a
+        """Reference forward simulating the logKV streaming compaction with a
         sliding window.
+
+        Role: inference streaming engine (prefill blocks + pending-token
+        decode pairing) and the differentiable REFERENCE implementation for
+        the training semantics. Actual training routes through
+        ``_log_kv_train_lowmem_forward`` — identical math, O(T + S) memory —
+        and the equivalence tests pin the two together.
 
         Splits the sequence into chunks of 2 tokens. For each chunk the queries
         attend to:
