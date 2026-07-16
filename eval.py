@@ -30,7 +30,6 @@ from pathlib import Path
 import yaml
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import numpy as np
 from typing import Any
 
@@ -360,15 +359,26 @@ class LogKVLM(LM):
         self.gen_metrics: list[dict] = []      # generate_until
         self.ppl_metrics: list[dict] = []      # loglikelihood
 
-    def _set_eval_cache(self, max_seq_length: int) -> None:
-        """Install the correct per-request inference cache.
+        # LogKV eval cache is built lazily once and reset per request (see
+        # _set_eval_cache) — never re-allocated per sample.
+        self._eval_cache_ready = False
 
-        LogKV now stores full post-RoPE keys directly in slots; there is no
-        separate per-token position buffer to size or maintain here.
+    def _set_eval_cache(self) -> None:
+        """Install (once) and reset the LogKV inference cache.
+
+        LogKV buffer sizes depend only on (B, recent_size, max_levels) — not on
+        the request length — so the cache is built ONCE at the model's full
+        window and reset in place before each request. Rebuilding per request
+        re-allocates O(n_layer x (recent + B*logN)) CUDA buffers thousands of
+        times over a benchmark run and fragments the allocator (OOM risk).
         ``max_seq_length`` only bounds the append-only token counter and level
-        hierarchy.
+        hierarchy, so sizing it at the model's window covers every request.
         """
+        if self._eval_cache_ready:
+            self.model.reset_log_kv_cache()
+            return
         dtype = next(self.model.parameters()).dtype
+        max_seq_length = self.model.max_seq_length
         self.model.set_log_kv_cache(
             batch_size=1,
             max_seq_length=max_seq_length,
@@ -378,6 +388,7 @@ class LogKVLM(LM):
             recent_size=max(2, min(self.log_kv_recent_size, max_seq_length)),
             prefill_block=self.log_kv_prefill_block,
         )
+        self._eval_cache_ready = True
 
     # ==========================================
     # 🌟 分布式结果收集
@@ -434,14 +445,19 @@ class LogKVLM(LM):
             # Score with the same merged-position slot attention used by LogKV
             # inference. ``input_pos`` must be append-only contiguous because
             # slot compaction is order-based rather than indexed.
-            self._set_eval_cache(seq_len)
+            self._set_eval_cache()
             try:
                 t0 = time.perf_counter()
                 input_pos = torch.arange(seq_len, device=self._device, dtype=torch.int64)
-                logits = self.model(inps, input_pos=input_pos)
+                # lm_head_start: materialize logits only for the scoring span
+                # [ctx_len-1, seq_len) — full-sequence logits at 32K are ~10 GB
+                # bf16, the sliced tensor is (cont_len + 1) x vocab.
+                logits = self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
                 t1 = time.perf_counter()
             finally:
-                self.model.clear_kv_cache()
+                # In-place state reset (defensive: the next request resets again
+                # via _set_eval_cache). Keeping the buffers avoids re-allocation.
+                self.model.reset_log_kv_cache()
 
         self.ppl_metrics.append({
             "total_seq_len": seq_len, "context_len": ctx_len,
@@ -449,13 +465,28 @@ class LogKVLM(LM):
             "forward_time_ms": round((t1 - t0) * 1000, 2),
         })
 
-        # Continuation logits: positions [ctx_len-1, seq_len-2] predict cont tokens.
-        cont_logits = logits[0, ctx_len - 1 : seq_len - 1]
+        # ``logits`` starts at position ctx_len-1 (lm_head_start); its first
+        # len(cont_enc) rows are the positions [ctx_len-1, seq_len-2] that
+        # predict the continuation tokens.
+        cont_logits = logits[0, : len(cont_enc)]
         cont_targets = torch.tensor(cont_enc, dtype=torch.long, device=self._device)
-        log_probs = F.log_softmax(cont_logits, dim=-1)
-        token_log_probs = log_probs.gather(dim=-1, index=cont_targets.unsqueeze(-1)).squeeze(-1)
-        is_greedy = (cont_logits.argmax(dim=-1) == cont_targets).all().item()
-        return token_log_probs.sum().item(), is_greedy
+
+        # fp32 log-softmax in position-chunks: rolling-PPL requests score a
+        # full window (cont_len ~ max_seq_length), and a one-shot fp32
+        # log_softmax over cont_len x vocab would peak at ~19 GB at 32K. fp32
+        # (rather than the model's bf16) keeps per-token log-probs accurate —
+        # they are summed over thousands of tokens downstream.
+        total_logprob = 0.0
+        is_greedy = True
+        step = 1024
+        for i in range(0, cont_logits.size(0), step):
+            blk = cont_logits[i : i + step].to(torch.float32)
+            tgt = cont_targets[i : i + step]
+            log_probs = torch.log_softmax(blk, dim=-1)
+            total_logprob += log_probs.gather(dim=-1, index=tgt.unsqueeze(-1)).sum().item()
+            if is_greedy:
+                is_greedy = bool((blk.argmax(dim=-1) == tgt).all().item())
+        return total_logprob, is_greedy
 
     def loglikelihood(self, requests):
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
@@ -519,7 +550,8 @@ class LogKVLM(LM):
 
             with torch.no_grad():
                 # 🧩 logKV：长上下文生成使用 merged-position slot cache
-                self._set_eval_cache(total_max_len)
+                # （建一次、按请求原地重置，不逐样本重分配 — 见 _set_eval_cache）
+                self._set_eval_cache()
                 try:
                     t0 = time.perf_counter()
                     out = litgpt_generate(
@@ -533,7 +565,7 @@ class LogKVLM(LM):
                     )
                     t1 = time.perf_counter()
                 finally:
-                    self.model.clear_kv_cache()
+                    self.model.reset_log_kv_cache()
 
             # 截取新生成的部分并解码
             generated_tokens = out[prompt_tensor.size(0):]
