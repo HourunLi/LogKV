@@ -7,6 +7,10 @@ source /home/ma-user/anaconda3/bin/activate torch218
 export CUDA_DEVICE_MAX_CONNECTIONS=32
 export CUDNN_LOGERR_DBG=1
 export CUDNN_LOGDEST_DBG=stderr
+# logKV 流式 attention 每 chunk 产生大量不等长的小分配（评测数千条样本、训练
+# T/2 个 chunk），expandable_segments 让分配器按段扩展而非整块缓存，
+# 显著缓解长时运行的碎片化 OOM。
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export PATH=/usr/local/cuda-12.8/bin:${PATH}
 export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH}

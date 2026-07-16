@@ -89,6 +89,7 @@ class GPT(nn.Module):
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
         lm_head_chunk_size: int = 0,
+        lm_head_start: int | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -110,12 +111,19 @@ class GPT(nn.Module):
             input_pos_maxp1: Optional. See above.
             lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
                 `lm_head` computation is done in chunks of this size.
+            lm_head_start: Optional. If given, the final norm + `lm_head` are
+                applied only to positions `>= lm_head_start`. Loglikelihood
+                scoring needs logits only for the continuation span; at 32K
+                context the full-sequence logit tensor is ~10 GB (bf16), while
+                the sliced one is `cont_len x vocab`. `None` keeps the full
+                output (generation, training).
 
         Returns:
             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
             `lm_head_chunk_size > 0`, this is a list of chunks of shape
             `(B, lm_head_chunk_size, config.padded_vocab_size)`, the final
-            entry can be shorter.
+            entry can be shorter. If `lm_head_start` is given, the second
+            dimension is `T - lm_head_start` instead of `T`.
 
         """
         T = idx.size(1)
@@ -175,6 +183,11 @@ class GPT(nn.Module):
                 )
             else:
                 x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+        if lm_head_start is not None:
+            # Drop hidden states the caller does not need logits for BEFORE the
+            # O(T x vocab) projection — the transformer stack above already ran
+            # on the full sequence, so cache state / attention are unaffected.
+            x = x[:, lm_head_start:]
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -365,6 +378,24 @@ class GPT(nn.Module):
         # holding stale O(N^2) bool tensors in GPU memory. With every block on
         # LogKV, GPT.forward sets mask=None and never reads it anyway.
         self.mask_cache = None
+
+    def reset_log_kv_cache(self) -> None:
+        """Reset every layer's LogKV cache state in place — no reallocation.
+
+        LogKV buffers are sized by (B, recent_size, max_levels), independent of
+        the request length, so evaluation should build them once via
+        ``set_log_kv_cache()`` and reset between requests. Rebuilding per
+        request re-allocates O(n_layer x (recent + B*logN)) CUDA buffers
+        thousands of times, fragmenting the allocator (OOM risk on long runs).
+        """
+        for block in self.transformer.h:
+            cache = block.attn.kv_cache
+            if not isinstance(cache, LogStructuredKVCache):
+                raise TypeError(
+                    "reset_log_kv_cache() requires set_log_kv_cache() to have been called first"
+                )
+            cache.reset_parameters()
+            block.attn._log_kv_pending = None
 
     def enable_log_kv_training(
         self,
@@ -798,7 +829,6 @@ class CausalSelfAttention(nn.Module):
         t = 2  # compaction chunk size (fixed: uniform 2:1)
         n_head = self.config.n_head
         head_size = self.config.head_size
-        device = q.device
 
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or head_size)
         scale = scale * self.mscale * self.mscale
@@ -861,21 +891,18 @@ class CausalSelfAttention(nn.Module):
                 commit_end = block_end - 1 if defer_tail else block_end
 
                 slot_k, slot_v, slot_w = cache.get_attention_state()
-                n_state = slot_k.size(2)  # compact slots + recent tokens (all visible)
                 k_all, v_all, w_all = append_exact_tokens(
                     slot_k, slot_v, slot_w,
                     k[:, :, start:block_end, :],
                     v[:, :, start:block_end, :],
                 )
 
-                # Mask (blk, n_state + blk): frozen state fully visible, block
-                # tokens causal among themselves.
-                mask = torch.ones(blk, n_state + blk, dtype=torch.bool, device=device)
-                mask[:, n_state:] = torch.tril(
-                    torch.ones(blk, blk, dtype=torch.bool, device=device)
-                )
+                # Frozen state fully visible, block tokens causal among
+                # themselves: causal_tail masks the trailing `blk` in-flight
+                # entries in place instead of allocating a (blk, S) bool mask
+                # and a masked_fill copy of the full score tensor per block.
                 y_blk = log_kv_slot_attention(
-                    q[:, :, start:block_end, :], k_all, v_all, w_all, scale=scale, mask=mask
+                    q[:, :, start:block_end, :], k_all, v_all, w_all, scale=scale, causal_tail=blk
                 )
                 outputs.append(y_blk)
 
@@ -902,21 +929,16 @@ class CausalSelfAttention(nn.Module):
             # Cache state: [compact slots] + [sliding window from prev chunks].
             # Both are detached — only the current chunk carries gradient.
             slot_k, slot_v, slot_w = cache.get_attention_state()
-            n_prefix = slot_k.size(2)  # compact slots + recent tokens (all visible)
 
             # Append current chunk (with gradient) as exact w=1 slots.
             k_all, v_all, w_all = append_exact_tokens(slot_k, slot_v, slot_w, k_b, v_b)
 
-            # Mask: (actual_t, n_prefix + actual_t)
-            #   compact slots + sliding window -> fully visible
-            #   current chunk -> causal
-            mask = torch.ones(actual_t, n_prefix + actual_t, dtype=torch.bool, device=device)
-            mask[:, n_prefix:] = torch.tril(
-                torch.ones(actual_t, actual_t, dtype=torch.bool, device=device)
-            )
-
+            # Visibility: compact slots + sliding window fully visible, the
+            # current chunk causal. causal_tail masks the trailing `actual_t`
+            # in-flight entries in place — building a (actual_t, S) bool mask
+            # here would allocate O(S) per chunk, T/2 times per layer.
             y_b = log_kv_slot_attention(
-                q[:, :, start:end, :], k_all, v_all, w_all, scale=scale, mask=mask
+                q[:, :, start:end, :], k_all, v_all, w_all, scale=scale, causal_tail=actual_t
             )  # (B, n_head, actual_t, v_dim)
             outputs.append(y_b)
 

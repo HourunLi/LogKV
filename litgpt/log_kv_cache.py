@@ -575,6 +575,7 @@ def log_kv_slot_attention(
     scale: float,
     mask: torch.Tensor | None = None,  # (T_q, S) bool, True = attend
     lam: float = 1.0,
+    causal_tail: int = 0,
 ) -> torch.Tensor:
     """Slot-granular attention over merged-position entries.
 
@@ -603,37 +604,91 @@ def log_kv_slot_attention(
         slot_k / slot_v / slot_w: from ``get_attention_state()`` (+ optionally
             ``append_exact_tokens`` for the in-flight chunk)
         scale: attention scale (applied to the dot product only)
-        mask: optional (T_q, S) bool. True = allowed. For training chunk
-            causality (prefix fully visible, chunk causal). None = attend all.
+        mask: optional (T_q, S) bool. True = allowed. General-purpose escape
+            hatch (tests); the model uses ``causal_tail`` instead. None (and
+            causal_tail == 0) = attend all.
         lam: weight of the log-multiplicity mass bias (default 1.0)
+        causal_tail: if > 0, the LAST ``causal_tail`` slots are the in-flight
+            chunk appended behind the frozen cache state (see
+            ``append_exact_tokens``); they are masked causally against the
+            queries (query i sees appended entry j iff j <= i; requires
+            ``causal_tail == T_q``), while everything before them stays fully
+            visible. Memory: this replaces a (T_q, S) bool mask + a
+            masked_fill copy of the full fp32 score tensor with one in-place
+            fill on the (T_q, causal_tail) tail slice — per streaming chunk,
+            per layer. Mutually exclusive with ``mask``.
 
     Returns:
         (B, nh, T_q, v_dim)
     """
-    B, nh, T_q, _ = q.shape
+    B, nh, T_q, k_dim = q.shape
+    v_dim = slot_v.size(-1)
     S = slot_k.size(2)
     if S == 0:
-        return torch.zeros(B, nh, T_q, slot_v.size(-1), device=q.device, dtype=q.dtype)
+        return torch.zeros(B, nh, T_q, v_dim, device=q.device, dtype=q.dtype)
 
-    # --- GQA: expand k-side from n_groups to n_head ---
-    nkv = slot_k.size(1)
-    if nh != nkv:
-        rf = nh // nkv
-        slot_k = slot_k.repeat_interleave(rf, dim=1)
-        slot_v = slot_v.repeat_interleave(rf, dim=1)
-        slot_w = slot_w.repeat_interleave(rf, dim=1)
+    if causal_tail:
+        # Explicit raises (not asserts): survive `python -O`.
+        if mask is not None:
+            raise ValueError("causal_tail and mask are mutually exclusive")
+        if causal_tail != T_q:
+            raise ValueError(
+                f"causal_tail ({causal_tail}) must equal T_q ({T_q}): the tail entries "
+                "are the appended in-flight chunk, aligned one-to-one with the queries"
+            )
+        # (T_q, T_q) bool, True above the diagonal = blocked. Tiny (chunk-sized,
+        # not S-sized) and the only allocation masking costs on this path.
+        tail_blocked = torch.ones(T_q, causal_tail, dtype=torch.bool, device=q.device).triu_(1)
 
     # Scores in fp32: the log-w bias shifts logits by up to ~log(N) and bf16
     # resolution degrades with magnitude; fp32 keeps cross-level logit
     # differences intact. S is O(log N), so the fp32 buffer is small.
-    scores = torch.matmul(q, slot_k.mT).to(torch.float32) * scale  # (B, nh, T_q, S)
+    #
+    # In-place ops (mul_/add_/masked_fill_) are deliberate: none of these
+    # intermediates is a saved tensor for backward (matmul saves its operands,
+    # softmax saves its output, the scalar/bias ops save nothing), so mutating
+    # the score buffer is autograd-safe and avoids three full-size fp32
+    # temporaries per call — once per streaming chunk, per layer.
+    nkv = slot_k.size(1)
+    if nh != nkv:
+        # --- GQA without materializing an rf× copy of the slots ---
+        # repeat_interleave(rf, dim=1) on slot_k/v/w would allocate a fresh
+        # (B, nh, S, ·) copy AND, in training, save that expanded tensor for
+        # backward — rf× the slot memory for every one of the O(T) streaming
+        # chunks, which is what runs the GPU out of memory. Instead fold the rf
+        # query heads that share a KV group into their own axis and let matmul
+        # broadcast the (B, nkv, 1, …) group across them: the K/V operands stay
+        # (B, nkv, S, ·), nothing is duplicated, and the tensor autograd saves is
+        # rf× smaller. Mathematically identical to the repeat_interleave path
+        # (query head h ↔ KV group h // rf, matching model.py's GQA convention);
+        # any difference is kernel-level FP reduction order, ULP-scale.
+        rf = nh // nkv
+        qg = q.reshape(B, nkv, rf, T_q, k_dim)               # (B, nkv, rf, T_q, k_dim)
+        scores = torch.matmul(qg, slot_k.unsqueeze(2).mT)    # (B, nkv, rf, T_q, S)
+        scores = scores.to(torch.float32)
+        scores.mul_(scale)
+        if lam != 0.0:
+            # slot_w >= 1 by construction; guarded via lam gate so lam=0 can
+            # never produce 0 * log(0) = NaN even on malformed input.
+            scores.add_(lam * slot_w.to(torch.float32).log()[:, :, None, None, :])
+        if mask is not None:
+            scores.masked_fill_(~mask.view(1, 1, 1, T_q, S), float("-inf"))
+        elif causal_tail:
+            scores[..., S - causal_tail:].masked_fill_(tail_blocked, float("-inf"))
+        attn = torch.softmax(scores, dim=-1).to(q.dtype)     # (B, nkv, rf, T_q, S)
+        out = torch.matmul(attn, slot_v.unsqueeze(2))        # (B, nkv, rf, T_q, v_dim)
+        return out.reshape(B, nh, T_q, v_dim)
+
+    # MHA (nh == nkv): one logit per slot, no head expansion needed.
+    scores = torch.matmul(q, slot_k.mT).to(torch.float32)  # (B, nh, T_q, S)
+    scores.mul_(scale)
     if lam != 0.0:
         # slot_w >= 1 by construction; guarded via lam gate so lam=0 can never
         # produce 0 * log(0) = NaN even on malformed input.
-        scores = scores + lam * slot_w.to(torch.float32).log().unsqueeze(-2)
-
+        scores.add_(lam * slot_w.to(torch.float32).log().unsqueeze(-2))
     if mask is not None:
-        scores = scores.masked_fill(~mask.view(1, 1, T_q, S), float("-inf"))
-
+        scores.masked_fill_(~mask.view(1, 1, T_q, S), float("-inf"))
+    elif causal_tail:
+        scores[..., S - causal_tail:].masked_fill_(tail_blocked, float("-inf"))
     attn = torch.softmax(scores, dim=-1).to(q.dtype)  # (B, nh, T_q, S)
     return torch.matmul(attn, slot_v)                 # (B, nh, T_q, v_dim)
