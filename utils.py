@@ -143,7 +143,7 @@ def run_cli(func):
     ``jsonargparse.CLI`` reserves ``--config`` for its own config-file action,
     which collides with these scripts' explicit ``config`` parameter. This thin
     parser preserves the existing command style while still handling basic
-    command-line overrides such as ``--use_log_kv true`` and ``--max_steps 10``.
+    command-line overrides such as ``--log_kv_B 512`` and ``--max_steps 10``.
     """
     signature = inspect.signature(func)
     parser = argparse.ArgumentParser()

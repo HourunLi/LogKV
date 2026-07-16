@@ -12,8 +12,9 @@ Architecture (uniform 2:1 compaction at every level):
 Position handling ("expected RoPE", merged into the compressed state):
 - Keys enter the cache as FULL post-RoPE vectors
       k_j = [ R(p_j)·k_pos_j ; k_content_j ]
-  (partial rotary: only the leading d_pos dims are rotated; the content channel
-  is position-free).
+  (partial rotary: only the leading rope_n_elem dims are rotated; any remaining
+  content channel is position-free; full rotary means the content channel is
+  empty — both are supported).
 - Merging a block mean-pools the WHOLE key. Mean commutes with concatenation, so
   the merged key is [ mean_j R(p_j)·k_pos_j ; mean_j k_content_j ]: the block's
   position embedding is the weighted mean of its tokens' rotated position keys —
@@ -280,28 +281,62 @@ class LogStructuredKVCache(nn.Module):
         """Compact the oldest 2 tokens from the sliding window into level 0."""
         if self.recent_count < 2:
             return
+        self._flush_pairs(2)
 
-        k_entry, v_entry, w_entry = self._compact_tokens(
-            self.recent_k[:, :, :2, :],
-            self.recent_v[:, :, :2, :],
-        )
-        k_entry = k_entry.squeeze(2)   # (B, G, k_dim)
-        v_entry = v_entry.squeeze(2)   # (B, G, v_dim)
-        w_entry = w_entry.squeeze(2)   # (B, G)
+    def _flush_pairs(self, flush_len: int) -> None:
+        """Batched equivalent of ``flush_len // 2`` sequential ``_flush_recent``
+        calls: pairwise-merge the oldest ``flush_len`` window tokens into level-0
+        entries in one shot, then shift the window once.
 
-        self._add_compact_entry(k_entry, v_entry, w_entry)
+        The state trajectory is identical to the sequential version — the same
+        (2i, 2i+1) pairs are merged with the same mean, entries reach level 0 in
+        the same order, and carries fire at the same counts — but the O(window)
+        clone+shift happens once instead of once per pair.
+        """
+        f = flush_len // 2
+        rk = self.recent_k[:, :, :flush_len, :]
+        rv = self.recent_v[:, :, :flush_len, :]
+        B_, G_, _, kd = rk.shape
+        vd = rv.size(-1)
+        # Same arithmetic as _compact_tokens on each 2-token pair (mean over a
+        # size-2 dim in the storage dtype), just for all f pairs at once.
+        pk = rk.reshape(B_, G_, f, 2, kd).mean(dim=3)
+        pv = rv.reshape(B_, G_, f, 2, vd).mean(dim=3)
+        pw = torch.full((B_, G_, f), 2.0, device=rk.device, dtype=rk.dtype)
+        self._append_level0(pk, pv, pw)
 
-        # Shift remaining tokens to the front. The source slice [2:count] overlaps
-        # the destination [0:count-2] in the same storage; PyTorch copy_ with
-        # overlapping src/dst is undefined (may corrupt silently on CUDA), so the
-        # source must be materialized via .clone() first.
-        remaining = self.recent_count - 2
+        # Shift the survivors to the front. Source/destination overlap in the
+        # same storage; PyTorch copy_ with overlapping src/dst is undefined (may
+        # corrupt silently on CUDA), so the source must be cloned first.
+        remaining = self.recent_count - flush_len
         if remaining > 0:
-            self.recent_k[:, :, :remaining, :] = self.recent_k[:, :, 2:self.recent_count, :].clone()
-            self.recent_v[:, :, :remaining, :] = self.recent_v[:, :, 2:self.recent_count, :].clone()
+            self.recent_k[:, :, :remaining, :] = self.recent_k[:, :, flush_len:self.recent_count, :].clone()
+            self.recent_v[:, :, :remaining, :] = self.recent_v[:, :, flush_len:self.recent_count, :].clone()
         self.recent_k[:, :, remaining:self.recent_count, :].zero_()
         self.recent_v[:, :, remaining:self.recent_count, :].zero_()
         self.recent_count = remaining
+
+    def _append_level0(self, pk: torch.Tensor, pv: torch.Tensor, pw: torch.Tensor) -> None:
+        """Append f compact entries to level 0 in order, carrying when it fills.
+
+        Trajectory-identical to f sequential ``_add_compact_entry`` calls: the
+        binary carry fires exactly when the count reaches B, between the same
+        two entries as in the sequential version.
+        """
+        f = pk.size(2)
+        off = 0
+        while off < f:
+            idx = int(self.level_count[0].item())
+            take = min(self.B - idx, f - off)
+            getattr(self, "level_k_0")[:, :, idx:idx + take, :] = pk[:, :, off:off + take, :]
+            getattr(self, "level_v_0")[:, :, idx:idx + take, :] = pv[:, :, off:off + take, :]
+            getattr(self, "level_w_0")[:, :, idx:idx + take] = pw[:, :, off:off + take]
+            self.level_count[0] = idx + take
+            off += take
+            if int(self.level_count[0].item()) >= self.B:
+                lk, lv, lw = self._get_level(0)
+                self._binary_carry(lk.clone(), lv.clone(), lw.clone())
+                self._clear_level(0)
 
     # ------------------------------------------------------------------
     # Ingest chunk (testing): direct compact into level 0, bypass buffer
@@ -343,23 +378,39 @@ class LogStructuredKVCache(nn.Module):
 
         self._count_tokens(n)
 
-        offset = 0
-        while offset < n:
-            if self.recent_count == self.recent_size:
-                self._flush_recent()
+        # Batched flush: streaming lazily flushes the oldest pair each time the
+        # window refills, so over this whole chunk it flushes ceil(overflow/2)
+        # pairs — all taken from the CURRENT window front (appends only ever go
+        # to the right). Flushing them up front in one batch reaches the exact
+        # same final state with one shift instead of one per pair.
+        overflow = self.recent_count + n - self.recent_size
+        if overflow > 0:
+            flush_len = 2 * ((overflow + 1) // 2)
+            if flush_len <= self.recent_count:
+                self._flush_pairs(flush_len)
+            else:
+                # Degenerate corner (odd recent_count with n == recent_size):
+                # fall back to the lazy interleaved order.
+                offset = 0
+                while offset < n:
+                    if self.recent_count == self.recent_size:
+                        self._flush_recent()
+                    capacity = self.recent_size - self.recent_count
+                    if capacity <= 0:
+                        raise RuntimeError(
+                            "LogStructuredKVCache.add_recent() could not make room in the recent buffer; "
+                            f"recent_count={self.recent_count}, recent_size={self.recent_size}."
+                        )
+                    take = min(capacity, n - offset)
+                    self.recent_k[:, :, self.recent_count:self.recent_count + take, :] = k[:, :, offset:offset + take, :]
+                    self.recent_v[:, :, self.recent_count:self.recent_count + take, :] = v[:, :, offset:offset + take, :]
+                    self.recent_count += take
+                    offset += take
+                return
 
-            capacity = self.recent_size - self.recent_count
-            if capacity <= 0:
-                raise RuntimeError(
-                    "LogStructuredKVCache.add_recent() could not make room in the recent buffer; "
-                    f"recent_count={self.recent_count}, recent_size={self.recent_size}."
-                )
-
-            take = min(capacity, n - offset)
-            self.recent_k[:, :, self.recent_count:self.recent_count + take, :] = k[:, :, offset:offset + take, :]
-            self.recent_v[:, :, self.recent_count:self.recent_count + take, :] = v[:, :, offset:offset + take, :]
-            self.recent_count += take
-            offset += take
+        self.recent_k[:, :, self.recent_count:self.recent_count + n, :] = k
+        self.recent_v[:, :, self.recent_count:self.recent_count + n, :] = v
+        self.recent_count += n
 
     # ------------------------------------------------------------------
     # nn.Module forward intentionally disabled

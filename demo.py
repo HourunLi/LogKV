@@ -1,5 +1,7 @@
 """
-Continue Pre-Training (CPT) with standard causal LM + log-structured KV cache.
+logKV adaptation CPT: continue pre-training under simulated compressed-KV
+(log-structured) streaming attention, so the model learns to read merged slots.
+Run on already-pretrained base weights. This script has no dense route.
 
 Usage:
     # Single GPU debug
@@ -9,8 +11,9 @@ Usage:
     torchrun --nproc_per_node=8 demo.py --config exp/qwen0.6b-32k/cpt-base.yaml
 
 Architecture:
-    - Training: standard causal LM (model(idx)), no KV cache
-    - Inference (eval): log-structured KV cache with O(T log(N/T)) memory
+    - Training: model(idx) routes through the logKV streaming simulation
+      (enable_log_kv_training; chunked slot attention, 2:1 compaction)
+    - Inference (eval): log-structured KV cache with O(recent + B*log N) memory
       via model.set_log_kv_cache() + model(idx, input_pos=input_pos)
 """
 
@@ -332,17 +335,16 @@ def main(
     tensorboard_root: str = "./tb",
     # ── Experiment ──
     expid: str = "debug",
-    # ── Log-structured KV cache ──
+    # ── Log-structured KV cache (always on) ──
+    # This script IS the logKV adaptation phase: training always simulates the
+    # compressed-KV streaming attention so the model learns to read merged
+    # slots. Run it after dense pretraining, on already-pretrained base weights.
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
-    # Enable logKV simulation during training. Intended for the
-    # short adaptation phase after dense pretraining.
-    log_kv_training: bool = False,
-    # ── RoPE ──
-    # Override rotary_percentage to set d_pos = rope_n_elem = rotary_percentage * head_size.
-    # 0.25 → d_pos=32 for head_size=128 (DeepSeek V4 style: 32-dim position, 96-dim content).
-    # None → use the model's default (typically 1.0 = full RoPE).
-    rotary_percentage: float | None = None,
+    # Eval-time prefill block size, forwarded to eval.py by run_eval (inference
+    # only, does not affect training). 2 = strict 2-token streaming semantics;
+    # larger = faster prefill with a bounded, block-size-limited deviation.
+    log_kv_prefill_block: int = 256,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -396,8 +398,7 @@ def main(
     expid = _o("expid", expid)
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
-    log_kv_training = _o("log_kv_training", log_kv_training)
-    rotary_percentage = _o("rotary_percentage", rotary_percentage)
+    log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
@@ -446,10 +447,6 @@ def main(
     config_obj = Config.from_name(arch_name)
     assert config_obj is not None
     config_obj.block_size = context_length
-    if rotary_percentage is not None:
-        config_obj.rotary_percentage = rotary_percentage
-        config_obj.rope_n_elem = int(rotary_percentage * config_obj.head_size)
-        fabric.print(f"Overridden rotary_percentage={rotary_percentage}, rope_n_elem={config_obj.rope_n_elem}")
     fabric.print(f"Model config initialized: {config_obj.name}")
 
     with fabric.init_module(empty_init=True):
@@ -497,9 +494,25 @@ def main(
     optimizer = fabric.setup_optimizers(optimizer)
 
     # ── Evaluation helper ──
+    # Same code path AND same semantics as a standalone `eval.py --config
+    # exp/.../eval.yaml` run and as majob.sh: the checkpoint is evaluated under
+    # the same compressed-KV (logKV) attention it was trained with, with the
+    # training-time B/recent_size and the same prefill block. Results land in
+    # {save_path}/evaluate (majob.sh's EVAL_OUTPUT_DIR) — also for the "before"
+    # eval, whose base checkpoint dir may be read-only; each timestamped JSON
+    # records its own checkpoint_dir. tokenizer_dir is forwarded for checkpoints
+    # whose save dir lacks tokenizer files.
     def _run_eval(ckpt, benchmark):
         from eval import main as eval_main
-        eval_main(checkpoint_dir=ckpt, benchmark=benchmark)
+        eval_main(
+            checkpoint_dir=ckpt,
+            benchmark=benchmark,
+            output_path=f"{save_path}/evaluate",
+            log_kv_B=log_kv_B,
+            log_kv_recent_size=log_kv_recent_size,
+            log_kv_prefill_block=log_kv_prefill_block,
+            tokenizer_dir=tokenizer_dir,
+        )
 
     if run_eval in ("before", "both"):
         _run_eval(load_dir, eval_benchmark)
@@ -531,23 +544,23 @@ def main(
     fabric.print("Starting Continue Pretraining...")
     model.train()
 
-    # Enable logKV training simulation for the adaptation phase.
-    if log_kv_training:
-        model.enable_log_kv_training(
-            batch_size=micro_batch_size,
-            max_seq_length=context_length,
-            device=fabric.device,
-            # Allocate cache buffers in the activation dtype instead of relying on
-            # the process default; keeps them aligned with the bf16-true params.
-            dtype=next(model.parameters()).dtype,
-            B=log_kv_B,
-            recent_size=log_kv_recent_size,
-        )
-        fabric.print(
-            f"logKV training ENABLED: B={log_kv_B}, "
-            f"recent_size={log_kv_recent_size}, "
-            f"chunks/seq={context_length // 2}"
-        )
+    # Always simulate the logKV compressed-KV streaming attention during
+    # training — this script only supports the logKV adaptation route.
+    model.enable_log_kv_training(
+        batch_size=micro_batch_size,
+        max_seq_length=context_length,
+        device=fabric.device,
+        # Allocate cache buffers in the activation dtype instead of relying on
+        # the process default; keeps them aligned with the bf16-true params.
+        dtype=next(model.parameters()).dtype,
+        B=log_kv_B,
+        recent_size=log_kv_recent_size,
+    )
+    fabric.print(
+        f"logKV training ENABLED: B={log_kv_B}, "
+        f"recent_size={log_kv_recent_size}, "
+        f"chunks/seq={context_length // 2}"
+    )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
     optimizer.zero_grad(set_to_none=True)
@@ -577,7 +590,9 @@ def main(
         micro_batch_idx += 1
 
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            # Standard causal LM forward (no KV cache during training)
+            # Routes through _log_kv_training_forward (training_log_kv is on and
+            # input_pos is None): chunked slot attention over the simulated
+            # compressed-KV stream, not a standard dense causal forward.
             logits = model(inputs)
             loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
             # Feed the per-micro-batch loss into the step aggregator; without this

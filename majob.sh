@@ -75,9 +75,10 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 
 # ==============================================================================
 # 🧩 logKV 专属：从训练 YAML（跟随 'config:' 继承）提取 logKV 设置，
-# 让评测使用与模型适配时相同的注意力。这是 logKV 分支独有的开发代码。
+# 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
+# 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
 # ==============================================================================
-read -r LOG_KV_TRAINING LOG_KV_B LOG_KV_RECENT SAVE_CKPT <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL SAVE_CKPT <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import os
 import sys
 
@@ -95,9 +96,9 @@ def load(path):
 
 cfg = load(sys.argv[1])
 print(
-    str(bool(cfg.get("log_kv_training", False))).lower(),
     cfg.get("log_kv_B", 512),
     cfg.get("log_kv_recent_size", 1024),
+    cfg.get("log_kv_prefill_block", 256),
     str(bool(cfg.get("save_ckpt", False))).lower(),
 )
 EOF
@@ -112,13 +113,8 @@ if [ "${SAVE_CKPT}" != "true" ] && [ ! -f "${SAVE_DIR}/lit_model.pth" ]; then
     exit 1
 fi
 
-LOG_KV_ARGS=""
-if [ "${LOG_KV_TRAINING}" == "true" ]; then
-    LOG_KV_ARGS="--use_log_kv true --log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT}"
-    echo "🧩 logKV eval ENABLED: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}"
-else
-    echo "🧩 logKV eval disabled (log_kv_training not set in ${CONFIG_FILE})"
-fi
+LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL}"
+echo "🧩 logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}"
 
 # ==============================================================================
 # 🌟 核心新增：检查 Checkpoint 是否已存在
