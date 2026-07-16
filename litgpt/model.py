@@ -411,6 +411,7 @@ class GPT(nn.Module):
         dtype: torch.dtype | None = None,
         B: int = 512,
         recent_size: int = 1024,
+        train_block: int = 2,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -419,6 +420,11 @@ class GPT(nn.Module):
         cache (training builds a per-chunk mask) and flips ``training_log_kv``
         on so that ``CausalSelfAttention.forward`` routes through
         ``_log_kv_training_forward`` when ``input_pos is None``.
+
+        ``train_block`` controls low-memory replay granularity. 2 reproduces
+        strict 2-token streaming; larger values trade bounded in-block
+        exact-token visibility for far fewer tiny matmul launches and
+        O(train_block * slots) replay memory.
         """
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
@@ -436,6 +442,7 @@ class GPT(nn.Module):
             )
             block.attn.training_log_kv = True
             block.attn._log_kv_pending = None
+            block.attn.log_kv_train_block = train_block
 
     def disable_log_kv_training(self) -> None:
         """Turn off logKV training mode and drop the caches."""
@@ -551,6 +558,9 @@ class CausalSelfAttention(nn.Module):
         # kernels with a deviation bounded by the block size. Set via
         # GPT.set_log_kv_cache(prefill_block=...).
         self.log_kv_prefill_block: int = 256
+        # LogKV training replay block size. 2 is the strict-streaming reference;
+        # larger blocks keep memory bounded while reducing Python/kernels at 32K.
+        self.log_kv_train_block: int = 2
         self.apply_sliding_window_attention = False
         if config.sliding_window_size is not None and config.sliding_window_indices is not None:
             self.apply_sliding_window_attention = config.sliding_window_indices[block_idx]
@@ -786,17 +796,12 @@ class CausalSelfAttention(nn.Module):
     ) -> torch.Tensor:
         """Training forward over the logKV stream with O(T + S) memory.
 
-        Streaming semantics identical to
-        ``_log_kv_training_forward(reset_cache=True, defer_last_single=False)``
-        — 2-token chunks, [compact prefix (detached) + current chunk (causal)]
-        slot attention — but routed through ``LogKVStreamTrainingAttention``:
-        the forward pass streams WITHOUT recording an autograd graph and the
-        backward pass replays the stream chunk by chunk, so the O(T/2 x S)
-        per-chunk saved tensors of the naive graph (the long-context training
-        OOM) never materialize. Gradients are exact (see the Function's
-        docstring). ``_log_kv_training_forward`` remains as the inference
-        streaming engine and as the differentiable reference implementation
-        the equivalence tests compare against.
+        ``log_kv_train_block=2`` matches the strict 2-token streaming reference.
+        Larger blocks freeze the prefix state at block start and apply causal
+        exact attention inside the block, matching the inference prefill
+        tradeoff: the final cache state is exact, peak replay memory is
+        O(train_block * slots), and the number of tiny matmul launches falls
+        from T/2 to T/train_block.
         """
         # Explicit raise (not assert): must survive `python -O`.
         if not isinstance(self.kv_cache, LogStructuredKVCache):
@@ -808,7 +813,8 @@ class CausalSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
         scale = scale * self.mscale * self.mscale
 
-        y = LogKVStreamTrainingAttention.apply(q, k, v, cache, scale)  # (B, n_head, T, hs)
+        train_block = max(2, min(int(self.log_kv_train_block), cache.recent_size))
+        y = LogKVStreamTrainingAttention.apply(q, k, v, cache, scale, train_block)  # (B, n_head, T, hs)
         y = y.transpose(1, 2).reshape(B, T, self.config.head_size * self.config.n_head)
         return self.proj(y)
 
