@@ -341,6 +341,10 @@ def main(
     # slots. Run it after dense pretraining, on already-pretrained base weights.
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
+    # Training replay block size. 2 = strict 2-token streaming semantics but
+    # extremely slow at 32K; 64/128/256 keep memory bounded and greatly reduce
+    # tiny matmul/autograd replay launches.
+    log_kv_train_block: int = 128,
     # Eval-time prefill block size, forwarded to eval.py by run_eval (inference
     # only, does not affect training). 2 = strict 2-token streaming semantics;
     # larger = faster prefill with a bounded, block-size-limited deviation.
@@ -398,6 +402,7 @@ def main(
     expid = _o("expid", expid)
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
+    log_kv_train_block = _o("log_kv_train_block", log_kv_train_block)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
@@ -555,11 +560,13 @@ def main(
         dtype=next(model.parameters()).dtype,
         B=log_kv_B,
         recent_size=log_kv_recent_size,
+        train_block=log_kv_train_block,
     )
     fabric.print(
         f"logKV training ENABLED: B={log_kv_B}, "
         f"recent_size={log_kv_recent_size}, "
-        f"chunks/seq={context_length // 2}"
+        f"train_block={log_kv_train_block}, "
+        f"blocks/seq={math.ceil(context_length / max(log_kv_train_block, 1))}"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
@@ -594,8 +601,8 @@ def main(
             # and input_pos is None): chunked slot attention over the simulated
             # compressed-KV stream, not a standard dense causal forward. The
             # low-memory Function streams the forward without a graph and
-            # replays chunk-by-chunk in backward, so per-layer activation
-            # memory is O(T + S) instead of the naive O(T/2 x S).
+            # replays block-by-block in backward, so per-layer activation
+            # memory is O(T + train_block*S) instead of the naive O(T/2*S).
             logits = model(inputs)
             loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
             # Feed the per-micro-batch loss into the step aggregator; without this

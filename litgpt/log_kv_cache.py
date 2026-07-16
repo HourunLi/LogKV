@@ -731,33 +731,43 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
     training OOM (the failing allocation is merely whichever op runs next
     once the accumulated graph has eaten the device).
 
-    Forward here streams the whole sequence with NO recorded graph and
-    returns the attention output. Backward resets the cache and REPLAYS the
-    same stream: each chunk's attention is recomputed with a throwaway local
-    graph that ``torch.autograd.grad`` consumes immediately, so at most one
-    chunk graph (O(S)) is alive at any time. Peak memory: O(T + S) instead of
-    O(T*S). Cost: one extra streaming pass plus the per-chunk backwards.
+    Forward here streams the whole sequence with NO recorded graph and returns
+    the attention output. Backward resets the cache and REPLAYS the same stream:
+    each block's attention is recomputed with a throwaway local graph that
+    ``torch.autograd.grad`` consumes immediately, so at most one block graph is
+    alive at any time. Peak memory: O(T + train_block*S) instead of O(T*S).
+    Cost: one extra streaming pass plus the per-block backwards.
 
     Correctness:
-      - Gradients are EXACT, not approximated: in the naive graph, gradient
-        reaches q/k/v only through each token's own chunk (the cache commits
-        detached copies), so per-chunk grads are complete and disjoint, and
-        the replayed per-chunk ``autograd.grad`` reproduces them one-to-one.
+      - For a fixed train_block, gradients are EXACT for that block-streaming
+        objective: in the naive graph, gradient reaches q/k/v only through each
+        token's own block (the cache commits detached copies), so per-block
+        grads are complete and disjoint, and the replayed per-block
+        ``autograd.grad`` reproduces them one-to-one.
       - The replay is deterministic: compaction is pure mean-pooling with
         count-based binary carries — no RNG, identical shapes take identical
-        kernels — so the rebuilt per-chunk prefix states equal forward's.
+        kernels — so the rebuilt per-block prefix states equal forward's.
       - Backward does not depend on the cache state forward left behind (it
         resets first), so interleaved forward/backward across micro-batches
         or activation-checkpoint recompute ordering cannot corrupt it.
 
-    First-order only (``once_differentiable``) — CPT never needs grad-of-grad.
+    ``train_block=2`` is the strict 2-token streaming reference. Larger blocks
+    freeze the prefix state at block start and use causal exact attention within
+    the block, matching the inference prefill speed/memory tradeoff while
+    preserving the exact final cache state. First-order only
+    (``once_differentiable``) — CPT never needs grad-of-grad.
     """
 
-    CHUNK = 2  # streaming chunk size; must stay t=2 (uniform 2:1 compaction)
-
     @staticmethod
-    def forward(ctx, q, k, v, cache, scale):
+    def forward(ctx, q, k, v, cache, scale, train_block):
         T = q.size(2)
+        train_block = int(train_block)
+        if train_block < 2:
+            raise ValueError(f"logKV train_block must be >= 2, got {train_block}")
+        if train_block > cache.recent_size:
+            raise ValueError(
+                f"logKV train_block ({train_block}) must be <= recent_size ({cache.recent_size})"
+            )
         outputs: list[torch.Tensor] = []
         # Explicit no_grad: the memory guarantee of this whole scheme rests on
         # this pass recording nothing (Function.forward already runs detached;
@@ -766,7 +776,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             cache.reset_parameters()
             start = 0
             while start < T:  # mirrored in backward() — keep in sync
-                end = min(start + LogKVStreamTrainingAttention.CHUNK, T)
+                end = min(start + train_block, T)
                 outputs.append(
                     log_kv_chunk_attention(
                         cache,
@@ -779,6 +789,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.save_for_backward(q, k, v)
         ctx.cache = cache
         ctx.scale = scale
+        ctx.train_block = train_block
         return torch.cat(outputs, dim=2)  # (B, nh, T, v_dim)
 
     @staticmethod
@@ -787,16 +798,17 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         q, k, v = ctx.saved_tensors
         cache = ctx.cache
         scale = ctx.scale
+        train_block = ctx.train_block
         T = q.size(2)
-        # Chunks partition [0, T) and each position's grad comes from exactly
-        # its own chunk, so the empty buffers are fully overwritten.
+        # Blocks partition [0, T) and each position's grad comes from exactly
+        # its own block, so the empty buffers are fully overwritten.
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         cache.reset_parameters()
         start = 0
         while start < T:  # mirrors forward() — keep in sync
-            end = min(start + LogKVStreamTrainingAttention.CHUNK, T)
+            end = min(start + train_block, T)
             q_b = q[:, :, start:end].detach().requires_grad_(True)
             k_b = k[:, :, start:end].detach().requires_grad_(True)
             v_b = v[:, :, start:end].detach().requires_grad_(True)
@@ -809,4 +821,4 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             with torch.no_grad():
                 cache.add_recent(k[:, :, start:end], v[:, :, start:end])
             start = end
-        return dq, dk, dv, None, None
+        return dq, dk, dv, None, None, None
