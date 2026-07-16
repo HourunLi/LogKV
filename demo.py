@@ -80,9 +80,17 @@ def _copy_tokenizer_and_configs(src_dirs: list[str], dst: str) -> None:
     Later dirs take precedence on filename clashes, so pass the tokenizer_dir
     last — it may differ from the weights checkpoint_dir."""
     files: dict[str, str] = {}
+    searched: list[str] = []
     for d in src_dirs:
+        searched.append(str(d))
         for p in glob.glob(f"{d}/*.json") + glob.glob(f"{d}/*.model"):
             files[os.path.basename(p)] = p
+    if "tokenizer.json" not in files and "tokenizer.model" not in files:
+        raise FileNotFoundError(
+            "No tokenizer.json / tokenizer.model found while saving checkpoint. "
+            f"Searched: {searched}. Set tokenizer_dir in the YAML to the base model "
+            "directory that contains the tokenizer files."
+        )
     for p in files.values():
         shutil.copy(p, dst)
 

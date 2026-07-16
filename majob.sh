@@ -82,7 +82,7 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 # 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
 # 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL SAVE_CKPT <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL SAVE_CKPT TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import os
 import sys
 
@@ -99,11 +99,22 @@ def load(path):
 
 
 cfg = load(sys.argv[1])
+arch_name = cfg.get("arch_name", "Qwen/Qwen3-0.6B-Base")
+ckpt_dir = cfg.get("ckpt_dir") or os.path.join("checkpoints", arch_name)
+resume_dir = cfg.get("resume_dir")
+tokenizer_dir = cfg.get("tokenizer_dir")
+
+candidates = []
+for d in (tokenizer_dir, resume_dir, ckpt_dir, os.path.join("checkpoints", arch_name)):
+    if d and d not in candidates:
+        candidates.append(d)
+
 print(
     cfg.get("log_kv_B", 512),
     cfg.get("log_kv_recent_size", 1024),
     cfg.get("log_kv_prefill_block", 256),
     str(bool(cfg.get("save_ckpt", False))).lower(),
+    ":".join(candidates),
 )
 EOF
 )"
@@ -117,8 +128,46 @@ if [ "${SAVE_CKPT}" != "true" ] && [ ! -f "${SAVE_DIR}/lit_model.pth" ]; then
     exit 1
 fi
 
+has_tokenizer() {
+    [ -n "$1" ] && { [ -f "$1/tokenizer.json" ] || [ -f "$1/tokenizer.model" ]; }
+}
+
+TOKENIZER_SOURCE=""
+IFS=':' read -r -a TOKENIZER_CANDIDATE_ARRAY <<< "${TOKENIZER_CANDIDATES}"
+for RAW_TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
+    eval TOK_DIR="\"${RAW_TOK_DIR}\""
+    if has_tokenizer "${TOK_DIR}"; then
+        TOKENIZER_SOURCE="${TOK_DIR}"
+        break
+    fi
+done
+
 LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL}"
+TOKENIZER_ARGS=""
+if [ -n "${TOKENIZER_SOURCE}" ]; then
+    TOKENIZER_ARGS="--tokenizer_dir ${TOKENIZER_SOURCE}"
+    echo "🔤 tokenizer source: ${TOKENIZER_SOURCE}"
+else
+    echo "⚠️ 未在候选目录中找到 tokenizer.json/tokenizer.model: ${TOKENIZER_CANDIDATES}"
+    echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
+fi
 echo "🧩 logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}"
+
+ensure_checkpoint_tokenizer() {
+    if has_tokenizer "${SAVE_DIR}"; then
+        return 0
+    fi
+    if [ -z "${TOKENIZER_SOURCE}" ]; then
+        return 1
+    fi
+    if [ "${NODE_RANK}" -eq 0 ]; then
+        echo "🔤 ${SAVE_DIR} 缺少 tokenizer，正在从 ${TOKENIZER_SOURCE} 复制 tokenizer/config 文件..."
+        mkdir -p "${SAVE_DIR}"
+        cp -f "${TOKENIZER_SOURCE}"/*.json "${SAVE_DIR}/" 2>/dev/null || true
+        cp -f "${TOKENIZER_SOURCE}"/*.model "${SAVE_DIR}/" 2>/dev/null || true
+    fi
+    return 0
+}
 
 # ==============================================================================
 # 🌟 核心新增：检查 Checkpoint 是否已存在
@@ -150,6 +199,14 @@ else
 
     # 强制操作系统彻底回收显存
     sleep 15
+fi
+
+if [ -f "${SAVE_DIR}/lit_model.pth" ]; then
+    if ! ensure_checkpoint_tokenizer; then
+        echo "❌ 致命错误：${SAVE_DIR} 下有 lit_model.pth，但没有 tokenizer.json/tokenizer.model。"
+        echo "   请在 ${CONFIG_FILE} 中设置 tokenizer_dir 指向基座模型 tokenizer 目录，或手动复制 tokenizer 文件。"
+        exit 1
+    fi
 fi
 
 # ==============================================================================
@@ -209,7 +266,8 @@ torchrun \
     --checkpoint_dir ${SAVE_DIR} \
     --benchmark ${BENCHMARKS} \
     --output_path "${EVAL_OUTPUT_DIR}" \
-    ${LOG_KV_ARGS}
+    ${LOG_KV_ARGS} \
+    ${TOKENIZER_ARGS}
 
 # for NIAH
 torchrun \
@@ -223,7 +281,8 @@ torchrun \
     --benchmark ${NIAH_BENCHMARKS} \
     --metadata "${META}" \
     --output_path "${EVAL_OUTPUT_DIR}" \
-    ${LOG_KV_ARGS}
+    ${LOG_KV_ARGS} \
+    ${TOKENIZER_ARGS}
 
 EVAL_STATUS=$?
 if [ $EVAL_STATUS -ne 0 ]; then
