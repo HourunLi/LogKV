@@ -370,7 +370,12 @@ def main(
     # unless it is null (None), matching the previous `if v is not None` intent.
     _yaml: dict = {}
     if config is not None:
-        _yaml = _coerce_yaml_sci_floats(_load_yaml_config(os.path.join(os.getcwd(), config), "") or {})
+        # expand_env_vars：bash 风格 ${VAR} / ${VAR-default} 展开（含继承合并后的
+        # 全部值）。必须与 majob.sh 的 bash 展开、eval.py 的装载一致，否则
+        # save_path 会被写成字面 ${...} 目录、eval 却去展开后的路径找权重。
+        _yaml = _coerce_yaml_sci_floats(
+            expand_env_vars(_load_yaml_config(os.path.join(os.getcwd(), config), "") or {})
+        )
         _valid = set(inspect.signature(main).parameters)
         for _k in _yaml:
             if _k != "config" and _k not in _valid:

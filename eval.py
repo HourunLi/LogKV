@@ -677,8 +677,10 @@ def main(
     # CPython, so YAML overrides must be applied by explicit re-binding.
     _yaml: dict = {}
     if config is not None:
+        # expand_env_vars：bash 风格 ${VAR} / ${VAR-default} 展开，与 demo.py 的
+        # YAML 装载、majob.sh 的 bash 展开共用同一语义（详见 utils.expand_env_vars）。
         _yaml = _coerce_yaml_sci_floats(
-            _load_yaml_config(os.path.join(os.getcwd(), config), checkpoint_dir) or {}
+            expand_env_vars(_load_yaml_config(os.path.join(os.getcwd(), config), checkpoint_dir) or {})
         )
         _valid = set(inspect.signature(main).parameters)
         for _k in _yaml:
