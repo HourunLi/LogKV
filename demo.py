@@ -456,6 +456,15 @@ def main(
     )
     fabric.launch()
     fabric.print("Tensorboard root:", tensorboard_root)
+    # Checkpoint 去向尽早入日志：save_path 为相对路径时跟随作业的 cwd，
+    # 训练完“找不到 checkpoint”十有八九是在另一个目录里找。save_ckpt=False
+    # 时这里就是唯一会明说“不会保存”的地方。
+    fabric.print(
+        f"save_ckpt={save_ckpt} | save_path="
+        f"{Path(os.path.expandvars(os.path.expanduser(save_path))).absolute()} "
+        f"(cwd={os.getcwd()})"
+        + ("" if save_ckpt else " | ⚠️ save_ckpt=False：本次训练不会写任何 checkpoint")
+    )
 
     config_obj = Config.from_name(arch_name)
     assert config_obj is not None
@@ -671,8 +680,15 @@ def main(
 
     # ── Final save ──
     if save_ckpt:
+        requested_save_path = save_path
         save_path = _unique_save_dir(save_path)
         if fabric.global_rank == 0:
+            if Path(save_path).name != Path(os.path.expandvars(os.path.expanduser(requested_save_path))).name:
+                fabric.print(
+                    f"⚠️ {requested_save_path} 下已有 lit_model.pth，最终保存目录顺延为 {save_path}。"
+                    "注意：majob.sh / eval.yaml 评测的是原 save_path（旧权重）——"
+                    "如非有意保留，请清理旧目录后重跑。"
+                )
             fabric.print(f"Final save dir: {save_path}")
             os.makedirs(save_path, exist_ok=True)
         fabric.barrier()
@@ -681,6 +697,13 @@ def main(
         fabric.print(f"Saving to {save_path}/lit_model.pth ...")
         fabric.save(f"{save_path}/lit_model.pth", state)
         fabric.barrier()
+        # fabric.save 静默失败（磁盘配额、共享盘未同步）会让后续 eval 报一个
+        # 误导性的加载错误——就地核验，以真实原因尽早失败。
+        if fabric.global_rank == 0 and not os.path.isfile(f"{save_path}/lit_model.pth"):
+            raise RuntimeError(
+                f"fabric.save 已返回，但 {save_path}/lit_model.pth 不存在——"
+                "检查磁盘配额 / 共享文件系统同步状态。"
+            )
 
         if fabric.global_rank == 0:
             _copy_tokenizer_and_configs([checkpoint_dir, tok_dir], save_path)

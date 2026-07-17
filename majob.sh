@@ -201,6 +201,21 @@ else
     sleep 15
 fi
 
+# ==============================================================================
+# 🌟 阶段一产物核验：save_ckpt: true 时训练必须产出权重。缺失说明训练中途
+# 崩溃/被杀（上面的非零退出码并不总是 NCCL 良性竞争）——在这里立刻失败，
+# 否则 eval 阶段只会报一个误导性的「加载 checkpoint 出错」。
+# ==============================================================================
+if [ "${SAVE_CKPT}" == "true" ] && [ ! -f "${SAVE_DIR}/lit_model.pth" ]; then
+    echo "❌ 致命错误：训练阶段结束，但 ${SAVE_DIR}/lit_model.pth 不存在（训练退出码见上方 ⚠️ 行）。"
+    echo "   排查（在训练日志中从后往前找）："
+    echo "   ➤ 无 'Reached max_steps' / 'Data exhausted' → 训练循环中途崩溃，向上翻最后一个 Traceback；"
+    echo "   ➤ 有 'Training complete' 但无 'Final save dir:' → 生效配置 save_ckpt 为 false；"
+    echo "   ➤ 有 'Saving to ... lit_model.pth' 但无 'Done.' → 保存阶段被杀（墙钟/内存/磁盘配额）；"
+    echo "   ➤ 'Final save dir:' 显示 _v2 之类目录 → save_path 下已有旧权重被顺延，请清理或改 YAML。"
+    exit 1
+fi
+
 if [ -f "${SAVE_DIR}/lit_model.pth" ]; then
     if ! ensure_checkpoint_tokenizer; then
         echo "❌ 致命错误：${SAVE_DIR} 下有 lit_model.pth，但没有 tokenizer.json/tokenizer.model。"
