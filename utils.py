@@ -109,6 +109,20 @@ def auto_expand_env_vars(func):
     return wrapper
 
 
+def expand_env_vars(obj: Any) -> Any:
+    """递归展开 ${VAR} / ${VAR-default} / ${VAR:-default}（bash 风格）。
+
+    这是 YAML 路径展开约定的唯一实现（`from utils import *` 可见的公开名）。
+    训练（demo.py）与评测（eval.py）的 YAML 装载、CLI 参数注入必须共用它：
+    Python 自带的 os.path.expandvars 不认识 `${VAR-default}`（变量名含 `-`
+    时查不到就原样保留），曾导致 demo 把 checkpoint 存进字面名为
+    `${MY_REAL_NAME-default}` 的目录，而 majob.sh 用 bash 展开后的路径去
+    评测，两边指向不同目录。幂等：已展开的字符串不含 `${...}`，再过一遍是
+    no-op。
+    """
+    return _deep_expand(obj)
+
+
 def _str_to_bool(value: str) -> bool:
     lowered = value.lower()
     if lowered in ("1", "true", "yes", "y", "on"):
@@ -166,6 +180,9 @@ def run_cli(func):
         for name, value in args.items()
         if value is not None
     }
+    # 与 YAML 装载同一套 bash 风格展开（${VAR} / ${VAR-default}）：
+    # 单引号传入的 --save_path '${MY_REAL_NAME}/...' 也能得到一致语义。
+    kwargs = _deep_expand(kwargs)
     return func(**kwargs)
 
 
