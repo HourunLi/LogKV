@@ -357,6 +357,13 @@ def main(
     # only, does not affect training). 2 = strict 2-token streaming semantics;
     # larger = faster prefill with a bounded, block-size-limited deviation.
     log_kv_prefill_block: int = 256,
+    # Eval-time salience pinning (SnapKV-style, inference only; forwarded to
+    # eval.py). At prefill the trailing pin_obs_window queries (the question at
+    # the prompt tail) score the whole prefix; the top pin_size tokens per KV
+    # group are kept as exact w=1 slots alongside the pooled hierarchy, so a
+    # distant needle survives mean-pool dilution. 0 = off.
+    log_kv_pin_size: int = 0,
+    log_kv_pin_obs_window: int = 64,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -417,6 +424,8 @@ def main(
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_train_block = _o("log_kv_train_block", log_kv_train_block)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
+    log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
+    log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
@@ -538,6 +547,8 @@ def main(
             log_kv_B=log_kv_B,
             log_kv_recent_size=log_kv_recent_size,
             log_kv_prefill_block=log_kv_prefill_block,
+            log_kv_pin_size=log_kv_pin_size,
+            log_kv_pin_obs_window=log_kv_pin_obs_window,
             tokenizer_dir=tokenizer_dir,
         )
 

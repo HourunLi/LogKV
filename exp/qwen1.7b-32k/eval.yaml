@@ -41,6 +41,13 @@ log_kv_recent_size: 1024
 # 偏差上界 = 块内 query 比严格流式多看到 < block 个未压缩 token。
 log_kv_prefill_block: 256
 
+# 显著性钉扎（SnapKV 式观察窗，推理专用；捞针/检索类任务的关键）：
+# prefill 时 prompt 末尾 obs_window 个 query 给全前缀打分，每个 KV 组
+# 各钉 pin_size 个 token 为精确 w=1 槽；层级照常池化（缓存轨迹不变）。
+# 0 = 关闭（做无钉扎消融时用）。
+log_kv_pin_size: 256
+log_kv_pin_obs_window: 64
+
 # ── 其余可用键（保持 null / 注释即用默认或 CLI 值）──
 # 覆盖模型 Config 字段（一般不需要：架构随 checkpoint 的 model_config.yaml
 # 自动同步；仅评测缺 model_config.yaml 的旧 checkpoint 时用来对齐训练配置）：

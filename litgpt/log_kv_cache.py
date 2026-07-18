@@ -68,6 +68,7 @@ class LogStructuredKVCache(nn.Module):
         recent_size: int = 0,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        pin_size: int = 0,
     ) -> None:
         super().__init__()
 
@@ -131,6 +132,57 @@ class LogStructuredKVCache(nn.Module):
             torch.zeros(self.max_levels, dtype=torch.long, device=device),
             persistent=False,
         )
+
+        # ---- Salience pins: up to pin_size exact tokens kept OUTSIDE the
+        # hierarchy (SnapKV-style observation-window selection at prefill; see
+        # CausalSelfAttention._log_kv_select_pins). Rationale: uniform mean-
+        # pooling dilutes a distant low-redundancy fact (a "needle") by 1/w, and
+        # retrospective salience cannot save it — but at prefill time the
+        # query IS in the prompt tail, so the trailing observation window can
+        # score the whole prefix and pin what it will need before compaction
+        # buries it. Pinned tokens are DUPLICATES: the hierarchy still pools
+        # them (state trajectory is bit-identical with pins on or off), the pin
+        # buffer just re-exposes them as exact w=1 slots. The double-counted
+        # softmax mass is one token out of the covering slot's w — negligible.
+        # pin_size=0 disables everything (buffers stay empty). Memory stays
+        # O(recent + pin + B*logN).
+        self.pin_size = pin_size
+        self.register_buffer(
+            "pin_k",
+            torch.zeros(batch_size, n_groups, pin_size, k_dim, device=device, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "pin_v",
+            torch.zeros(batch_size, n_groups, pin_size, v_dim, device=device, dtype=dtype),
+            persistent=False,
+        )
+        self.pin_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Salience pins
+    # ------------------------------------------------------------------
+
+    def set_pinned(self, k_sel: torch.Tensor, v_sel: torch.Tensor) -> None:
+        """Install the pinned exact tokens (post-RoPE K/V), replacing any prior set.
+
+        Args:
+            k_sel: (batch, n_groups, n_pin, k_dim), n_pin <= pin_size. Each
+                group carries its own selection (GQA groups score independently).
+            v_sel: (batch, n_groups, n_pin, v_dim)
+        """
+        n_pin = k_sel.size(2)
+        # Explicit raises (not asserts): must survive `python -O`.
+        if n_pin > self.pin_size:
+            raise ValueError(f"n_pin ({n_pin}) exceeds pin_size ({self.pin_size})")
+        if v_sel.size(2) != n_pin:
+            raise ValueError(f"k_sel/v_sel pin counts differ: {n_pin} vs {v_sel.size(2)}")
+        self.pin_k[:, :, :n_pin, :] = k_sel
+        self.pin_v[:, :, :n_pin, :] = v_sel
+        if n_pin < self.pin_count:
+            self.pin_k[:, :, n_pin:self.pin_count, :].zero_()
+            self.pin_v[:, :, n_pin:self.pin_count, :].zero_()
+        self.pin_count = n_pin
 
     # ------------------------------------------------------------------
     # Level accessors
@@ -457,7 +509,13 @@ class LogStructuredKVCache(nn.Module):
             slot_w: (B, G, n_slots) — token count per slot (1 for recent).
 
         Slots cover contiguous, time-ordered spans, so ``cumsum(slot_w)`` gives
-        the token boundaries of every slot (used by exactness tests).
+        the token boundaries of every slot (used by exactness tests). With
+        salience pins active (pin_count > 0) that contiguity invariant no
+        longer holds: pins are scattered duplicates of tokens the hierarchy
+        also covers. Attention itself is order-agnostic over the state (the
+        whole state is fully visible; only the appended in-flight chunk is
+        causal), so ordering matters only to those boundary-based tests, which
+        run with pins disabled.
         """
         k_parts: list[torch.Tensor] = []
         v_parts: list[torch.Tensor] = []
@@ -471,6 +529,16 @@ class LogStructuredKVCache(nn.Module):
                 k_parts.append(lk[:, :, :count, :])
                 v_parts.append(lv[:, :, :count, :])
                 w_parts.append(lw[:, :, :count])
+
+        # Salience pins: exact w=1 duplicates from the compressed region,
+        # placed between the levels and the recent window (they are older than
+        # everything in recent by construction).
+        if self.pin_count > 0:
+            k_parts.append(self.pin_k[:, :, :self.pin_count, :])
+            v_parts.append(self.pin_v[:, :, :self.pin_count, :])
+            w_parts.append(
+                self.pin_k.new_ones(self.batch_size, self.n_groups, self.pin_count)
+            )
 
         # Recent window: exact tokens, weight 1 each
         if self.recent_count > 0:
@@ -515,6 +583,8 @@ class LogStructuredKVCache(nn.Module):
             return
         self.recent_k = self.recent_k.to(dtype)
         self.recent_v = self.recent_v.to(dtype)
+        self.pin_k = self.pin_k.to(dtype)
+        self.pin_v = self.pin_v.to(dtype)
         for ell in range(self.max_levels):
             setattr(self, f"level_k_{ell}", getattr(self, f"level_k_{ell}").to(dtype))
             setattr(self, f"level_v_{ell}", getattr(self, f"level_v_{ell}").to(dtype))
@@ -526,12 +596,15 @@ class LogStructuredKVCache(nn.Module):
         self.recent_k.zero_()
         self.recent_v.zero_()
         self.recent_count = 0
+        self.pin_k.zero_()
+        self.pin_v.zero_()
+        self.pin_count = 0
         for ell in range(self.max_levels):
             self._clear_level(ell)
 
     @property
     def total_slots(self) -> int:
-        count = self.recent_count
+        count = self.recent_count + self.pin_count
         for ell in range(self.max_levels):
             count += self.level_count[ell].item()
         return count

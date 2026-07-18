@@ -298,6 +298,8 @@ class LogKVLM(LM):
         log_kv_B: int = 512,
         log_kv_recent_size: int = 1024,
         log_kv_prefill_block: int = 256,
+        log_kv_pin_size: int = 0,
+        log_kv_pin_obs_window: int = 64,
         tokenizer_dir: str | None = None,
     ):
         super().__init__()
@@ -306,6 +308,8 @@ class LogKVLM(LM):
         self.log_kv_B = log_kv_B
         self.log_kv_recent_size = log_kv_recent_size
         self.log_kv_prefill_block = log_kv_prefill_block
+        self.log_kv_pin_size = log_kv_pin_size
+        self.log_kv_pin_obs_window = log_kv_pin_obs_window
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = not dist.is_initialized() or dist.get_rank() == 0
@@ -387,6 +391,11 @@ class LogKVLM(LM):
             B=self.log_kv_B,
             recent_size=max(2, min(self.log_kv_recent_size, max_seq_length)),
             prefill_block=self.log_kv_prefill_block,
+            # 显著性钉扎（SnapKV 式观察窗）：0 = 关闭。针对捞针类任务——
+            # prompt 末尾的问题在 prefill 时给全前缀打分，top-P token 以
+            # 精确槽形态钉在层级之外，免于被 mean-pool 稀释。
+            pin_size=self.log_kv_pin_size,
+            pin_obs_window=self.log_kv_pin_obs_window,
         )
         self._eval_cache_ready = True
 
@@ -667,6 +676,11 @@ def main(
     # 流式语义（用于 A/B 验证近似偏差）；越大越快，偏差上界 = 块内 query 比严格
     # 流式多看到 < block 个未压缩 token（缓存状态轨迹两者严格一致）。
     log_kv_prefill_block: int = 256,
+    # 显著性钉扎（SnapKV 式观察窗，推理专用）：prefill 时 prompt 末尾
+    # obs_window 个 query 给全前缀打分，每个 KV 组各钉 pin_size 个 token 为
+    # 精确 w=1 槽（层级照常池化，缓存轨迹不变）。0 = 关闭。捞针类任务的关键。
+    log_kv_pin_size: int = 0,
+    log_kv_pin_obs_window: int = 64,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 🧩 logKV：YAML config ──
@@ -699,6 +713,8 @@ def main(
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
+    log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
+    log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -712,7 +728,7 @@ def main(
 
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
-        print(f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | prefill_block: {log_kv_prefill_block}")
+        print(f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} (obs {log_kv_pin_obs_window})")
 
     checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
 
@@ -723,6 +739,8 @@ def main(
         log_kv_B=log_kv_B,
         log_kv_recent_size=log_kv_recent_size,
         log_kv_prefill_block=log_kv_prefill_block,
+        log_kv_pin_size=log_kv_pin_size,
+        log_kv_pin_obs_window=log_kv_pin_obs_window,
         tokenizer_dir=tokenizer_dir,
     )
 
