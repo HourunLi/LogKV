@@ -342,10 +342,12 @@ class GPT(nn.Module):
         B: int = 512,
         recent_size: int = 1024,
         prefill_block: int = 256,
+        pin_size: int = 0,
+        pin_obs_window: int = 64,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
-        Memory: O(B * log(N)) slots instead of standard O(N).
+        Memory: O((B * log(N)) + pin_size) slots instead of standard O(N).
 
         Each layer gets its own LogStructuredKVCache instance.
 
@@ -361,6 +363,14 @@ class GPT(nn.Module):
                 per-2-token streaming semantics; larger values batch prefill
                 attention with a deviation bounded by the block size (the cache
                 state trajectory is exact either way).
+            pin_size: Salience-pin budget (0 disables). At prefill the trailing
+                ``pin_obs_window`` queries — the question lives at the prompt
+                tail — score the whole prefix and the top ``pin_size`` tokens
+                per KV group are kept as exact w=1 entries alongside the
+                pooled hierarchy, so a distant needle survives compaction
+                (SnapKV-style; see ``_log_kv_select_pins``).
+            pin_obs_window: Number of trailing prompt tokens used as the
+                salience observation window.
         """
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
@@ -374,10 +384,11 @@ class GPT(nn.Module):
         for block_idx, block in enumerate(self.transformer.h):
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
-                B=B, recent_size=recent_size,
+                B=B, recent_size=recent_size, pin_size=pin_size,
             )
             block.attn._log_kv_pending = None
             block.attn.log_kv_prefill_block = prefill_block
+            block.attn.log_kv_pin_obs_window = pin_obs_window
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
         # holding stale O(N^2) bool tensors in GPU memory. With every block on
@@ -561,6 +572,13 @@ class CausalSelfAttention(nn.Module):
         # LogKV training replay block size. 2 is the strict-streaming reference;
         # larger blocks keep memory bounded while reducing Python/kernels at 32K.
         self.log_kv_train_block: int = 2
+        # LogKV salience pinning: trailing prompt tokens used as the SnapKV-style
+        # observation window at prefill (active only when the cache has
+        # pin_size > 0; set via GPT.set_log_kv_cache(pin_size=..., pin_obs_window=...)).
+        self.log_kv_pin_obs_window: int = 64
+        # Last pin selection (batch, groups, n_pin) token indices — kept for
+        # introspection and the pinning tests; not used by the forward pass.
+        self._log_kv_pin_indices: torch.Tensor | None = None
         self.apply_sliding_window_attention = False
         if config.sliding_window_size is not None and config.sliding_window_indices is not None:
             self.apply_sliding_window_attention = config.sliding_window_indices[block_idx]
@@ -818,6 +836,68 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).reshape(B, T, self.config.head_size * self.config.n_head)
         return self.proj(y)
 
+    @torch.no_grad()
+    def _log_kv_select_pins(
+        self,
+        q: torch.Tensor,    # (B, n_head, T, k_dim) post-RoPE
+        k: torch.Tensor,    # (B, n_query_groups, T, k_dim) post-RoPE
+        v: torch.Tensor,    # (B, n_query_groups, T, v_dim)
+        T: int,
+        scale: float,
+        cache: LogStructuredKVCache,
+    ) -> None:
+        """SnapKV-style salience pinning at prefill (inference only).
+
+        Why: uniform 2:1 mean-pooling dilutes a distant low-redundancy fact (a
+        "needle") by 1/w. Retrospective salience (H2O-style accumulated
+        attention) cannot save it — haystack tokens never attend to the
+        needle, so by the time the late query arrives the needle sits diluted
+        in a high level. But at prefill the question IS the prompt tail: the
+        trailing ``log_kv_pin_obs_window`` queries score every prefix token
+        while the full transient K/V (prefill's existing O(T) footprint) is
+        still on hand, and the top ``cache.pin_size`` tokens per KV group are
+        pinned as exact w=1 entries alongside the pooled hierarchy. The
+        hierarchy still pools them — the compaction trajectory is bit-identical
+        with pinning on or off; pins only ADD exact entries to the state.
+
+        Candidates are positions [0, T - recent_size): later tokens either
+        stay exact in the recent window or flush only during decode, and
+        double-representing recent tokens would distort softmax mass for no
+        gain. Salience = fp32 softmax attention of the observation queries,
+        summed over window and heads-in-group, then max-pooled (kernel 7)
+        along positions so a hit pins its local span, not a lone token
+        (SnapKV's clustering trick).
+        """
+        W = min(int(self.log_kv_pin_obs_window), T)
+        C = T - cache.recent_size  # candidate horizon (see docstring)
+        if W <= 0 or C <= 0 or cache.pin_size <= 0:
+            return
+        Bq, nh, _, k_dim = q.shape
+        nkv = k.size(1)
+        rf = nh // nkv
+
+        obs_q = q[:, :, T - W:, :].reshape(Bq, nkv, rf, W, k_dim)
+        # (B, nkv, rf, W, T) fp32. No causal mask: every candidate (< C <=
+        # T - recent_size <= T - W) precedes every observation query, and
+        # normalization differences inside the window do not change candidate
+        # ranking. Transient: ~(nh * W * T) fp32 once per layer per prefill.
+        attn = torch.softmax(
+            torch.matmul(obs_q, k.unsqueeze(2).mT).to(torch.float32) * scale, dim=-1
+        )
+        salience = attn[..., :C].sum(dim=(2, 3))  # (B, nkv, C)
+        salience = torch.nn.functional.max_pool1d(
+            salience.reshape(Bq * nkv, 1, C), kernel_size=7, stride=1, padding=3
+        ).reshape(Bq, nkv, C)
+
+        n_pin = min(cache.pin_size, C)
+        # Time-ordered indices per (batch, group); groups pin independently.
+        idx = salience.topk(n_pin, dim=-1).indices.sort(dim=-1).values
+        cache.set_pinned(
+            torch.gather(k, 2, idx.unsqueeze(-1).expand(-1, -1, -1, k.size(-1))).detach(),
+            torch.gather(v, 2, idx.unsqueeze(-1).expand(-1, -1, -1, v.size(-1))).detach(),
+        )
+        self._log_kv_pin_indices = idx
+
     def _log_kv_training_forward(
         self,
         q: torch.Tensor,    # (B, n_head, T, hs) post-RoPE
@@ -891,6 +971,20 @@ class CausalSelfAttention(nn.Module):
         # No content/position split: q and k are the full post-RoPE vectors
         # [R(p)·(pos slice) ; content slice]. Merged slots carry both channels,
         # so a single dot product covers the content AND the position score.
+
+        # ---- Salience pinning (fresh inference prefill only) ----
+        # Must run BEFORE any token is committed: the trailing observation
+        # window (the question) scores the whole prefix while the transient
+        # K/V is on hand; pins then survive as exact slots through decode.
+        # Decode steps (token_count > 0) and pending continuations never
+        # re-select. No-op when the cache was built with pin_size=0.
+        if (
+            defer_last_single
+            and cache.pin_size > 0
+            and cache.token_count == 0
+            and self._log_kv_pending is None
+        ):
+            self._log_kv_select_pins(q, k, v, T, scale, cache)
 
         outputs: list[torch.Tensor] = []
         start = 0
@@ -1080,6 +1174,7 @@ class CausalSelfAttention(nn.Module):
         dtype: torch.dtype | None = None,
         B: int = 512,
         recent_size: int = 1024,
+        pin_size: int = 0,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1119,7 +1214,7 @@ class CausalSelfAttention(nn.Module):
 
         return LogStructuredKVCache(
             k_shape, v_shape,
-            B=B, recent_size=recent_size,
+            B=B, recent_size=recent_size, pin_size=pin_size,
             device=device, dtype=dtype,
         )
 
