@@ -16,15 +16,13 @@ import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
+from litgpt.log_kv_cache import (
+    LogKVStreamTrainingAttention,
+    LogStructuredKVCache,
+    append_exact_tokens,
+    log_kv_slot_attention,
+)
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
-
-K_SIZE = 1024
-MAX_LENGTH=32*K_SIZE
-
-try:
-    from flash_attn import flash_attn_func
-except ImportError:
-    flash_attn_func = None
 
 
 class GPT(nn.Module):
@@ -34,23 +32,13 @@ class GPT(nn.Module):
         self.config = config
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
-        if config.use_research and config.research_separate_parameter:
-            self.transformer = nn.ModuleDict(
-                dict(
-                    wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                    h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
-                    h_prefill=nn.ModuleList(Block(config, block_idx) for block_idx in config.research_prefill_swa_layers),
-                    ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
-                )
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
+                h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
+                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
-        else:
-            self.transformer = nn.ModuleDict(
-                dict(
-                    wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                    h=nn.ModuleList(Block(config, block_idx) for block_idx in range(config.n_layer)),
-                    ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
-                )
-            )
+        )
         self.mask_cache: torch.Tensor | None = None
         self.max_seq_length = self.config.block_size
 
@@ -106,7 +94,7 @@ class GPT(nn.Module):
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
         lm_head_chunk_size: int = 0,
-        prefill_mask: torch.Tensor = None,
+        lm_head_start: int | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -128,12 +116,19 @@ class GPT(nn.Module):
             input_pos_maxp1: Optional. See above.
             lm_head_chunk_size: Optional. If `lm_head_chunk_size > 0`, the final
                 `lm_head` computation is done in chunks of this size.
+            lm_head_start: Optional. If given, the final norm + `lm_head` are
+                applied only to positions `>= lm_head_start`. Loglikelihood
+                scoring needs logits only for the continuation span; at 32K
+                context the full-sequence logit tensor is ~10 GB (bf16), while
+                the sliced one is `cont_len x vocab`. `None` keeps the full
+                output (generation, training).
 
         Returns:
             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
             `lm_head_chunk_size > 0`, this is a list of chunks of shape
             `(B, lm_head_chunk_size, config.padded_vocab_size)`, the final
-            entry can be shorter.
+            entry can be shorter. If `lm_head_start` is given, the second
+            dimension is `T - lm_head_start` instead of `T`.
 
         """
         T = idx.size(1)
@@ -151,18 +146,24 @@ class GPT(nn.Module):
             if input_pos.dim() == 1:
                 cos = cos.unsqueeze(0)
                 sin = sin.unsqueeze(0)
-            if self.mask_cache is None:
-                raise TypeError("You need to call `gpt.set_kv_cache()`")
-            mask = batched_index_select(self.mask_cache, 2, input_pos)
-            if mask.dim() > 4:
-                # the mask cache has a batch dim of 1 in addition to the one
-                # we get if input_pos has a batch dimension
-                mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
-            if input_pos_maxp1 is not None:
-                # Shorten final dimension so it just covers all `input_pos` entries
-                if input_pos_maxp1 > self.max_seq_length:
-                    raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
-                mask = mask[..., :input_pos_maxp1]
+            all_log_kv_cache = all(
+                isinstance(block.attn.kv_cache, LogStructuredKVCache) for block in self.transformer.h
+            )
+            if all_log_kv_cache:
+                mask = None
+            else:
+                if self.mask_cache is None:
+                    raise TypeError("You need to call `gpt.set_kv_cache()`")
+                mask = batched_index_select(self.mask_cache, 2, input_pos)
+                if mask.dim() > 4:
+                    # the mask cache has a batch dim of 1 in addition to the one
+                    # we get if input_pos has a batch dimension
+                    mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
+                if input_pos_maxp1 is not None:
+                    # Shorten final dimension so it just covers all `input_pos` entries
+                    if input_pos_maxp1 > self.max_seq_length:
+                        raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
+                    mask = mask[..., :input_pos_maxp1]
         else:
             # unsqueeze to have a batch dimension
             cos = self.cos[:T].unsqueeze(0)
@@ -175,57 +176,23 @@ class GPT(nn.Module):
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
-        # prefill: SWA mode, Identity mode
-        # decode: replacing-kv mode
-        block_index_to_idx = {x: i for i, x in enumerate(self.config.research_prefill_swa_layers)}
-        prefill_kv = None
-        if self.config.use_research:
-            assert prefill_mask is not None
-            for block_idx, block in enumerate(self.transformer.h):
-                if self.config.rope_indices is not None:
-                    cos_, sin_ = cos[..., self.config.rope_indices[block_idx]], sin[..., self.config.rope_indices[block_idx]]
-                else:
-                    cos_, sin_ = cos, sin
-                # train + inference both go here
-                # process SWA layer
-                if block_idx in self.config.research_prefill_swa_layers and block_idx not in self.config.research_removed_layers:
-                    # SWA layers only for prefill, 只有prefill阶段这些层是用的swa，decode阶段是full attention
-                    # 如果是research_separate_parameter，就用单独的block进行prefill
-                    # 以及无论是train还是inference都会有prefill的阶段以及decode的阶段
-                    # 因为train是经过特殊修改过后的，具体体现为prefill阶段是采用的swa，然后decode阶段是用的full attention，所以要按照这种模式进行训练
-                    if self.config.research_separate_parameter:
-                        block_prefill: Block = self.transformer.h_prefill[block_index_to_idx[block_idx]]
-                    else:
-                        block_prefill: Block = block
-                    if input_pos is not None: # inference mode
-                        if prefill_mask.all(): #  prefill stage in inference mode
-                            x = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv = False)
-                        else: # decode stage in inference mode
-                            if self.config.research_separate_parameter:
-                                # decode step: let block do full attention over h_prefill.kv_cache (SWA KV)
-                                # permanently use h_prefill's kv_cache for decode, so new tokens are written there by pointer
-                                # decode的kv cache是之前的，但是hidden state是用的full attention生成的。
-                                block.attn.kv_cache = block_prefill.attn.kv_cache
-                            x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa = False, return_kv = False)
-                    else: # train mode: dual-path (prefill SWA + decode full)
-                        x_prefill, prefill_kv = block_prefill(x, cos_, sin_, mask, input_pos, input_pos_maxp1, use_swa=True, swa_size=self.config.research_swa_size, return_kv=True)
-                        x_decode = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1, replacing_kv=prefill_kv, replacing_kv_mask=prefill_mask)
-                        x = torch.where(prefill_mask.unsqueeze(-1), x_prefill, x_decode)
-                else: # process normal layer
-                    x = block(x, cos_, sin_, mask, input_pos, input_pos_maxp1)
-        else:
-            for block_idx, block in enumerate(self.transformer.h):
-                if self.config.rope_indices is not None:
-                    x = block(
-                        x,
-                        cos[..., self.config.rope_indices[block_idx]],
-                        sin[..., self.config.rope_indices[block_idx]],
-                        mask,
-                        input_pos,
-                        input_pos_maxp1,
-                    )
-                else:
-                    x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+        for block_idx, block in enumerate(self.transformer.h):
+            if self.config.rope_indices is not None:
+                x = block(
+                    x,
+                    cos[..., self.config.rope_indices[block_idx]],
+                    sin[..., self.config.rope_indices[block_idx]],
+                    mask,
+                    input_pos,
+                    input_pos_maxp1,
+                )
+            else:
+                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+        if lm_head_start is not None:
+            # Drop hidden states the caller does not need logits for BEFORE the
+            # O(T x vocab) projection — the transformer stack above already ran
+            # on the full sequence, so cache state / attention are unaffected.
+            x = x[:, lm_head_start:]
         x = self.transformer.ln_f(x)
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
@@ -352,16 +319,7 @@ class GPT(nn.Module):
                 device,
                 dtype,
             )
-        # Research + separate prefill branch uses extra `h_prefill` modules; they also receive `input_pos` and need KVCache.
-        if "h_prefill" in self.transformer:
-            for block in self.transformer.h_prefill:
-                block.attn.kv_cache = block.attn.build_kv_cache(
-                    batch_size,
-                    max_seq_length,
-                    rope_cache_length,
-                    device,
-                    dtype,
-                )
+            block.attn._log_kv_pending = None
 
         if self.mask_cache is None or self.mask_cache.size(3) != max_seq_length:
             # passing `attn_mask` to SDPA disables the flash implementation. since we only need the mask
@@ -372,9 +330,137 @@ class GPT(nn.Module):
         self.mask_cache = None
         for block in self.transformer.h:
             block.attn.kv_cache = None
-        if "h_prefill" in self.transformer:
-            for block in self.transformer.h_prefill:
-                block.attn.kv_cache = None
+            block.attn._log_kv_pending = None
+
+    def set_log_kv_cache(
+        self,
+        batch_size: int,
+        max_seq_length: int | None = None,
+        rope_cache_length: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        B: int = 512,
+        recent_size: int = 1024,
+        prefill_block: int = 256,
+        pin_size: int = 0,
+        pin_obs_window: int = 64,
+    ) -> None:
+        """Initialize log-structured KV caches for all attention layers.
+
+        Memory: O((B * log(N)) + pin_size) slots instead of standard O(N).
+
+        Each layer gets its own LogStructuredKVCache instance.
+
+        Args:
+            batch_size: Batch size for generation
+            max_seq_length: Maximum sequence length to support
+            rope_cache_length: RoPE cache length (auto-detected if None)
+            device: Target device
+            dtype: Target dtype
+            B: Number of memory slots per level (default 512)
+            recent_size: Sliding window size (default 1024, recent tokens kept exact)
+            prefill_block: Vectorized prefill block size. 2 reproduces the strict
+                per-2-token streaming semantics; larger values batch prefill
+                attention with a deviation bounded by the block size (the cache
+                state trajectory is exact either way).
+            pin_size: Salience-pin budget (0 disables). At prefill the trailing
+                ``pin_obs_window`` queries — the question lives at the prompt
+                tail — score the whole prefix and the top ``pin_size`` tokens
+                per KV group are kept as exact w=1 entries alongside the
+                pooled hierarchy, so a distant needle survives compaction
+                (SnapKV-style; see ``_log_kv_select_pins``).
+            pin_obs_window: Number of trailing prompt tokens used as the
+                salience observation window.
+        """
+        if rope_cache_length is None:
+            rope_cache_length = self.rope_cache_length()
+        if max_seq_length is None:
+            max_seq_length = self.max_seq_length
+        if dtype is None:
+            # Default to the parameter dtype, not the process default: a bf16
+            # model with fp32 cache buffers would fail on the first cat/matmul.
+            dtype = next(self.parameters()).dtype
+
+        for block_idx, block in enumerate(self.transformer.h):
+            block.attn.kv_cache = block.attn.build_log_kv_cache(
+                batch_size, max_seq_length, rope_cache_length, device, dtype,
+                B=B, recent_size=recent_size, pin_size=pin_size,
+            )
+            block.attn._log_kv_pending = None
+            block.attn.log_kv_prefill_block = prefill_block
+            block.attn.log_kv_pin_obs_window = pin_obs_window
+
+        # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
+        # holding stale O(N^2) bool tensors in GPU memory. With every block on
+        # LogKV, GPT.forward sets mask=None and never reads it anyway.
+        self.mask_cache = None
+
+    def reset_log_kv_cache(self) -> None:
+        """Reset every layer's LogKV cache state in place — no reallocation.
+
+        LogKV buffers are sized by (B, recent_size, max_levels), independent of
+        the request length, so evaluation should build them once via
+        ``set_log_kv_cache()`` and reset between requests. Rebuilding per
+        request re-allocates O(n_layer x (recent + B*logN)) CUDA buffers
+        thousands of times, fragmenting the allocator (OOM risk on long runs).
+        """
+        for block in self.transformer.h:
+            cache = block.attn.kv_cache
+            if not isinstance(cache, LogStructuredKVCache):
+                raise TypeError(
+                    "reset_log_kv_cache() requires set_log_kv_cache() to have been called first"
+                )
+            cache.reset_parameters()
+            block.attn._log_kv_pending = None
+
+    def enable_log_kv_training(
+        self,
+        batch_size: int,
+        max_seq_length: int | None = None,
+        rope_cache_length: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        B: int = 512,
+        recent_size: int = 1024,
+        train_block: int = 2,
+    ) -> None:
+        """Attach a LogStructuredKVCache to every attention layer and switch
+        each layer into ``training_log_kv`` mode.
+
+        Unlike ``set_log_kv_cache`` (inference), this does NOT build a mask
+        cache (training builds a per-chunk mask) and flips ``training_log_kv``
+        on so that ``CausalSelfAttention.forward`` routes through
+        ``_log_kv_training_forward`` when ``input_pos is None``.
+
+        ``train_block`` controls low-memory replay granularity. 2 reproduces
+        strict 2-token streaming; larger values trade bounded in-block
+        exact-token visibility for far fewer tiny matmul launches and
+        O(train_block * slots) replay memory.
+        """
+        if rope_cache_length is None:
+            rope_cache_length = self.rope_cache_length()
+        if max_seq_length is None:
+            max_seq_length = self.max_seq_length
+        if dtype is None:
+            # Default to the parameter dtype, not the process default (see
+            # set_log_kv_cache).
+            dtype = next(self.parameters()).dtype
+
+        for block_idx, block in enumerate(self.transformer.h):
+            block.attn.kv_cache = block.attn.build_log_kv_cache(
+                batch_size, max_seq_length, rope_cache_length, device, dtype,
+                B=B, recent_size=recent_size,
+            )
+            block.attn.training_log_kv = True
+            block.attn._log_kv_pending = None
+            block.attn.log_kv_train_block = train_block
+
+    def disable_log_kv_training(self) -> None:
+        """Turn off logKV training mode and drop the caches."""
+        for block in self.transformer.h:
+            block.attn.training_log_kv = False
+            block.attn.kv_cache = None
+            block.attn._log_kv_pending = None
 
 
 class Block(nn.Module):
@@ -415,14 +501,13 @@ class Block(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor | tuple[torch.Tensor],
+        x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
-        **kwargs,
-    ) -> torch.Tensor | tuple[torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
            ┌─ x                     ┌─ x ──────────────────┐             Note: if `shared_attention_norm` is True,
@@ -445,11 +530,7 @@ class Block(nn.Module):
         """
 
         x_normed = self.norm_1(x)
-        return_kv = kwargs.get('return_kv', False)
-        if return_kv:
-            attention_output, prefill_kv = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1, **kwargs)
-        else:
-            attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1, **kwargs)
+        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1)
         attention_output = self.post_attention_norm(attention_output)
 
         if self.config.parallel_residual:
@@ -460,10 +541,7 @@ class Block(nn.Module):
             x = attention_output + x
             x_normed = self.norm_2(x)
 
-        if return_kv:
-            return self.post_mlp_norm(self.mlp(x_normed)) + x, prefill_kv
-        else:
-            return self.post_mlp_norm(self.mlp(x_normed)) + x
+        return self.post_mlp_norm(self.mlp(x_normed)) + x
 
 
 class CausalSelfAttention(nn.Module):
@@ -478,14 +556,38 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(config.head_size * config.n_head, config.n_embd, bias=config.bias)
         # disabled by default
-        self.kv_cache: KVCache | None = None
+        self.kv_cache: KVCache | LogStructuredKVCache | None = None
+        # When True (training only), simulate the logKV streaming compaction
+        # over the training sequence so the model learns to read compressed KV.
+        self.training_log_kv: bool = False
+        # LogKV inference: carry one trailing token across calls so commits stay
+        # aligned to the training chunk size. Holds (k, v) — full post-RoPE key.
+        self._log_kv_pending: tuple | None = None
+        # LogKV inference prefill block size (see _log_kv_training_forward):
+        # queries in a block share the slot state frozen at block start. 2 =
+        # strict per-2-token streaming semantics; larger = fewer, larger
+        # kernels with a deviation bounded by the block size. Set via
+        # GPT.set_log_kv_cache(prefill_block=...).
+        self.log_kv_prefill_block: int = 256
+        # LogKV training replay block size. 2 is the strict-streaming reference;
+        # larger blocks keep memory bounded while reducing Python/kernels at 32K.
+        self.log_kv_train_block: int = 2
+        # LogKV salience pinning: trailing prompt tokens used as the SnapKV-style
+        # observation window at prefill (active only when the cache has
+        # pin_size > 0; set via GPT.set_log_kv_cache(pin_size=..., pin_obs_window=...)).
+        self.log_kv_pin_obs_window: int = 64
+        # Last pin selection (batch, groups, n_pin) token indices — kept for
+        # introspection and the pinning tests; not used by the forward pass.
+        self._log_kv_pin_indices: torch.Tensor | None = None
         self.apply_sliding_window_attention = False
         if config.sliding_window_size is not None and config.sliding_window_indices is not None:
             self.apply_sliding_window_attention = config.sliding_window_indices[block_idx]
 
         if config.norm_qk:
             norm_q_size = config.n_head * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
-            norm_k_size = config.n_query_groups * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
+            norm_k_size = (
+                config.n_query_groups * config.head_size if config.norm_qk_type == "olmo2" else config.head_size
+            )
             self.norm_q = config.norm_class(norm_q_size, eps=config.norm_eps)
             self.norm_k = config.norm_class(norm_k_size, eps=config.norm_eps)
         else:
@@ -512,13 +614,7 @@ class CausalSelfAttention(nn.Module):
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
-        # added
-        use_swa: bool = False,
-        swa_size: int | None = None,
-        replacing_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
-        replacing_kv_mask: torch.Tensor | None = None,  # B,T: 1->prefill; 0->decode
-        return_kv: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor]]:
+    ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
         # - T          | time-step (sequence length)
@@ -561,26 +657,6 @@ class CausalSelfAttention(nn.Module):
         # Split qkv into query, key and value matrices.
         q, k, v = qkv.split((query_size, key_size, value_size), dim=-1)  # 3x(B, T, C*)
 
-        # save kv
-        k_save, v_save = k, v
-        # Replace current prefill K/V during training when a mask is provided.
-        if self.training and replacing_kv is not None and replacing_kv_mask is not None:
-            replacing_k, replacing_v = replacing_kv
-            if replacing_k.shape != k.shape or replacing_v.shape != v.shape:
-                raise ValueError(
-                    "replacing_kv tensors must match current k/v shape before head reshape: "
-                    f"expected {k.shape}, got k={replacing_k.shape}, v={replacing_v.shape}"
-                )
-            if replacing_kv_mask.dim() != 2 or replacing_kv_mask.shape != (B, T):
-                raise ValueError(
-                    f"replacing_kv_mask must have shape (B, T)=({B}, {T}), got {tuple(replacing_kv_mask.shape)}"
-                )
-
-            # mask=1 -> prefill token uses replacing kv; mask=0 -> keep current kv
-            kv_mask = replacing_kv_mask.to(device=k.device, dtype=torch.bool).unsqueeze(-1)
-            k = torch.where(kv_mask, replacing_k.to(device=k.device, dtype=k.dtype), k)
-            v = torch.where(kv_mask, replacing_v.to(device=v.device, dtype=v.dtype), v)
-
         if self.config.norm_qk and self.config.norm_qk_type == "olmo2":
             q = self.norm_q(q)
             k = self.norm_k(k)
@@ -606,6 +682,11 @@ class CausalSelfAttention(nn.Module):
             k = self.norm_k(k)
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
+        # Partial rotary: the first rope_n_elem dims are the position channel (RoPE'd)
+        # and the rest are the content channel (no RoPE). LogKV mean-pools the FULL
+        # key when merging slots, so the merged position sub-channel becomes the
+        # expected rotation over the span ("expected RoPE") — no per-token state.
+
         if self.config.rope_interleave:
             q_roped = apply_rope_interleave(q[..., :rope_n_elem], cos, sin)
             k_roped = apply_rope_interleave(k[..., :rope_n_elem], cos, sin)
@@ -615,12 +696,27 @@ class CausalSelfAttention(nn.Module):
         q = torch.cat((q_roped, q[..., rope_n_elem:]), dim=-1)  # (B, nh_q, T, hs)
         k = torch.cat((k_roped, k[..., rope_n_elem:]), dim=-1)  # (B, nh_k, T, hs)
 
+        # LogKV training mode: simulate streaming compaction (C = t) so that
+        # training attention matches inference decode semantics. Each chunk of
+        # t tokens attends to [compact prefix (detached) + current chunk (causal)]
+        # via slot attention over merged-position entries. Routed through the
+        # low-memory Function (graph-free stream + backward replay): the naive
+        # per-chunk graph saves O(T/2 x S) tensors per layer and OOMs at 32K.
+        if self.training_log_kv and input_pos is None:
+            return self._log_kv_train_lowmem_forward(q, k, v, B, T)
+
         # Apply kv-cache during inference.
         if input_pos is not None:
-            if not isinstance(self.kv_cache, KVCache):
+            if not isinstance(self.kv_cache, (KVCache, LogStructuredKVCache)):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
-            # 写入：把当前计算的 K,V 写入 cache 的指定位置（由 input_pos 决定）
-            # 读取：返回 cache 里的完整历史 K,V（从位置 0 到最新位置）
+
+            if isinstance(self.kv_cache, LogStructuredKVCache):
+                self._assert_log_kv_input_pos_contiguous(input_pos, T)
+                # Inference uses the same streaming chunker for prefill and decode.
+                # A trailing single token is kept pending so an odd-length prompt
+                # pairs with the first decode token, matching training chunks.
+                return self._log_kv_training_forward(q, k, v, B, T, reset_cache=False, defer_last_single=True)
+
             k, v = self.kv_cache(input_pos, k, v)
 
             if self.apply_sliding_window_attention:
@@ -628,8 +724,8 @@ class CausalSelfAttention(nn.Module):
                 if mask is not None and mask.size(-1) != actual_kv_len:
                     mask = mask[..., :actual_kv_len]
 
-            if input_pos_maxp1 is not None:
-                # Subselect along sequence dimension
+            if input_pos_maxp1 is not None and not isinstance(self.kv_cache, LogStructuredKVCache):
+                # Subselect along sequence dimension (only for standard cache)
                 k = k[..., :input_pos_maxp1, :]
                 v = v[..., :input_pos_maxp1, :]
             # k, v: (B, nh_k, input_pos_maxp1, hs)
@@ -643,7 +739,7 @@ class CausalSelfAttention(nn.Module):
             k = k.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
             v = v.repeat_interleave(q_per_kv, dim=1)  # (B, nh_q, T, hs)
 
-        if self.apply_sliding_window_attention:  # not used. we use flashattn instead
+        if self.apply_sliding_window_attention:
             """
                   Global Window              Sliding window             Sliding window
                   attention mask      +            bias          =      attention mask
@@ -670,158 +766,344 @@ class CausalSelfAttention(nn.Module):
         # Efficient attention using Flash Attention CUDA kernels.
         # NOTE: efficient implementation is disabled if `mask` is not None or softcapping is enabled.
         # ↓ (B, nh, T, hs) @ (B, nh, T, hs).mT --> (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
-        if self.config.research_enable_flash_attn:
-            y = self.scaled_dot_product_attention_flash_attn(q, k, v, mask, use_swa=use_swa, swa_window=swa_size)
-        else:
-            y = self.scaled_dot_product_attention(q, k, v, mask)
+        y = self.scaled_dot_product_attention(q, k, v, mask)
 
         # Re-assemble all head outputs side by side.
         y = y.reshape(B, T, head_size * n_head)
 
         # Output projection.
-        o = self.proj(y) # (B, T, C)
-        if return_kv:
-            return o, (k_save, v_save)
-        else:
-            return o
+        return self.proj(y)  # (B, T, C)
 
-    def scaled_dot_product_attention_flash_attn(
+    def _assert_log_kv_input_pos_contiguous(self, input_pos: torch.Tensor, T: int) -> None:
+        """Validate the append-only LogKV cache contract.
+
+        LogKV merges tokens in arrival order and tracks cache length with
+        scalar counters. Until true indexed writes are implemented, inference
+        must feed a single shared, contiguous position range.
+        """
+        assert isinstance(self.kv_cache, LogStructuredKVCache)
+
+        if input_pos.dim() == 2:
+            if not torch.equal(input_pos, input_pos[:1].expand_as(input_pos)):
+                raise ValueError(
+                    "LogKV cache does not support per-sample input_pos yet; all batch rows must share the same "
+                    "contiguous positions."
+                )
+            input_pos = input_pos[0]
+        elif input_pos.dim() != 1:
+            raise ValueError(f"LogKV cache requires 1-D or shared 2-D input_pos, got shape {tuple(input_pos.shape)}.")
+
+        pending_len = 0 if self._log_kv_pending is None else self._log_kv_pending[0].size(2)
+        expected_start = self.kv_cache.token_count + pending_len
+        expected = torch.arange(expected_start, expected_start + T, device=input_pos.device, dtype=input_pos.dtype)
+        if not torch.equal(input_pos, expected):
+            got = input_pos.detach().cpu().tolist()
+            raise ValueError(
+                "LogKV cache requires append-only contiguous input_pos. "
+                f"Expected {expected_start}..{expected_start + T - 1}, got {got}. "
+                "Reset the LogKV cache before starting a new sequence, or implement indexed LogKV writes."
+            )
+
+    def _log_kv_train_lowmem_forward(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: torch.Tensor | None = None,
-        use_swa: bool = False,         # 🌟 新增参数
-        swa_window: int = 512          # 🌟 新增参数
+        q: torch.Tensor,    # (B, n_head, T, hs) post-RoPE
+        k: torch.Tensor,    # (B, n_query_groups, T, hs) post-RoPE
+        v: torch.Tensor,    # (B, n_query_groups, T, hs)
+        B: int,
+        T: int,
     ) -> torch.Tensor:
+        """Training forward over the logKV stream with O(T + S) memory.
+
+        ``log_kv_train_block=2`` matches the strict 2-token streaming reference.
+        Larger blocks freeze the prefix state at block start and apply causal
+        exact attention inside the block, matching the inference prefill
+        tradeoff: the final cache state is exact, peak replay memory is
+        O(train_block * slots), and the number of tiny matmul launches falls
+        from T/2 to T/train_block.
+        """
+        # Explicit raise (not assert): must survive `python -O`.
+        if not isinstance(self.kv_cache, LogStructuredKVCache):
+            raise TypeError("training_log_kv requires a LogStructuredKVCache")
+        cache = self.kv_cache
+        cache._convert_dtype(q.dtype)
+        self._log_kv_pending = None  # training never defers a tail token
+
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
         scale = scale * self.mscale * self.mscale
 
-        # ===================================================================
-        # 🚀 路径 1: SWA + Attention Sink
-        # sink_size 个 token 始终可见；其余位置用滑动窗口
-        # ===================================================================
-        if use_swa:
-            sink_size = self.config.research_attention_sink_size
-            dilated_stride = self.config.research_attention_dilated_stride
-            dilated_block = self.config.research_attention_dilated_block_size
-            # 如果sliding window 的大小比max length还长，俺么可以直接调用flash attention
-            # 其中使用sink和dilated stride都会导致无法使用flash attention
-            use_manual_mask = swa_window < MAX_LENGTH and (sink_size > 0 or dilated_stride > 0)
-            if use_manual_mask:
-                if swa_window <= 0:
-                    raise ValueError(f"use_swa=True with sink/dilated requires swa_window > 0, got {swa_window}")
-                T = q.size(2)
-                row_idx = torch.arange(T, device=q.device).unsqueeze(1)  # (T, 1)
-                col_idx = torch.arange(T, device=q.device).unsqueeze(0)  # (1, T)
+        train_block = max(2, min(int(self.log_kv_train_block), cache.recent_size))
+        y = LogKVStreamTrainingAttention.apply(q, k, v, cache, scale, train_block)  # (B, n_head, T, hs)
+        y = y.transpose(1, 2).reshape(B, T, self.config.head_size * self.config.n_head)
+        return self.proj(y)
 
-                # causal local window: col in (i - swa_window, i]
-                visible = (col_idx <= row_idx) & (col_idx > row_idx - swa_window)
+    @torch.no_grad()
+    def _log_kv_select_pins(
+        self,
+        q: torch.Tensor,    # (B, n_head, T, k_dim) post-RoPE
+        k: torch.Tensor,    # (B, n_query_groups, T, k_dim) post-RoPE
+        v: torch.Tensor,    # (B, n_query_groups, T, v_dim)
+        T: int,
+        scale: float,
+        cache: LogStructuredKVCache,
+    ) -> None:
+        """SnapKV-style salience pinning at prefill (inference only).
 
-                # dilated blocks: centers at i - 2^k * d, k=0,1,2,...
-                # each center covers [center - b//2, center + b//2]
-                if dilated_stride > 0:
-                    half_b = dilated_block // 2
-                    power = 0
-                    while True:
-                        center_offset = (2 ** power) * dilated_stride  # 2^power * d
-                        center = row_idx - center_offset            # (T, 1)
-                        if (center < 0).all():
-                            break
-                        block_lo = center - half_b
-                        block_hi = center + half_b
-                        # block 在 local window 之外（col <= row - swa_window），causal 由最后统一保证
-                        in_block = (col_idx >= block_lo) & (col_idx <= block_hi) & (col_idx <= row_idx - swa_window)
-                        visible = visible | in_block
-                        power += 1
+        Why: uniform 2:1 mean-pooling dilutes a distant low-redundancy fact (a
+        "needle") by 1/w. Retrospective salience (H2O-style accumulated
+        attention) cannot save it — haystack tokens never attend to the
+        needle, so by the time the late query arrives the needle sits diluted
+        in a high level. But at prefill the question IS the prompt tail: the
+        trailing ``log_kv_pin_obs_window`` queries score every prefix token
+        while the full transient K/V (prefill's existing O(T) footprint) is
+        still on hand, and the top ``cache.pin_size`` tokens per KV group are
+        pinned as exact w=1 entries alongside the pooled hierarchy. The
+        hierarchy still pools them — the compaction trajectory is bit-identical
+        with pinning on or off; pins only ADD exact entries to the state.
 
-                # sink: 前 sink_size 列始终可见
-                if sink_size > 0:
-                    visible = visible | (col_idx < sink_size)
+        Candidates are positions [0, T - recent_size): later tokens either
+        stay exact in the recent window or flush only during decode, and
+        double-representing recent tokens would distort softmax mass for no
+        gain. Salience = fp32 softmax attention of the observation queries,
+        summed over window and heads-in-group, then max-pooled (kernel 7)
+        along positions so a hit pins its local span, not a lone token
+        (SnapKV's clustering trick).
+        """
+        W = min(int(self.log_kv_pin_obs_window), T)
+        C = T - cache.recent_size  # candidate horizon (see docstring)
+        if W <= 0 or C <= 0 or cache.pin_size <= 0:
+            return
+        Bq, nh, _, k_dim = q.shape
+        nkv = k.size(1)
+        rf = nh // nkv
 
-                # causal: 不能看未来
-                visible = visible & (col_idx <= row_idx)
+        obs_q = q[:, :, T - W:, :].reshape(Bq, nkv, rf, W, k_dim)
+        # (B, nkv, rf, W, T) fp32. No causal mask: every candidate (< C <=
+        # T - recent_size <= T - W) precedes every observation query, and
+        # normalization differences inside the window do not change candidate
+        # ranking. Transient: ~(nh * W * T) fp32 once per layer per prefill.
+        attn = torch.softmax(
+            torch.matmul(obs_q, k.unsqueeze(2).mT).to(torch.float32) * scale, dim=-1
+        )
+        salience = attn[..., :C].sum(dim=(2, 3))  # (B, nkv, C)
+        salience = torch.nn.functional.max_pool1d(
+            salience.reshape(Bq * nkv, 1, C), kernel_size=7, stride=1, padding=3
+        ).reshape(Bq, nkv, C)
 
-                attn_mask = torch.zeros(T, T, dtype=q.dtype, device=q.device)
-                attn_mask = attn_mask.masked_fill(~visible, float("-inf"))
-                attn_mask = attn_mask.view(1, 1, T, T)
-                return self.scaled_dot_product_attention(q, k, v, mask=attn_mask)
+        n_pin = min(cache.pin_size, C)
+        # Time-ordered indices per (batch, group); groups pin independently.
+        idx = salience.topk(n_pin, dim=-1).indices.sort(dim=-1).values
+        cache.set_pinned(
+            torch.gather(k, 2, idx.unsqueeze(-1).expand(-1, -1, -1, k.size(-1))).detach(),
+            torch.gather(v, 2, idx.unsqueeze(-1).expand(-1, -1, -1, v.size(-1))).detach(),
+        )
+        self._log_kv_pin_indices = idx
 
-            # sink_size == 0 且 dilated_stride == 0: 纯 SWA，走 Flash Attention
-            if flash_attn_func is None:
-                raise ImportError("🚨 必须安装 flash-attn 库才能使用极速 SWA！(运行: pip install flash-attn --no-build-isolation)")
+    def _log_kv_training_forward(
+        self,
+        q: torch.Tensor,    # (B, n_head, T, hs) post-RoPE
+        k: torch.Tensor,    # (B, n_query_groups, T, hs) post-RoPE
+        v: torch.Tensor,    # (B, n_query_groups, T, hs)
+        B: int,
+        T: int,
+        reset_cache: bool = True,
+        defer_last_single: bool = False,
+    ) -> torch.Tensor:
+        """Reference forward simulating the logKV streaming compaction with a
+        sliding window.
 
-            # PyTorch SDPA 格式: (B, nh, T, hs) -> Flash Attn 格式: (B, T, nh, hs)
-            q_fa = q.transpose(1, 2)
-            k_fa = k.transpose(1, 2)
-            v_fa = v.transpose(1, 2)
+        Role: inference streaming engine (prefill blocks + pending-token
+        decode pairing) and the differentiable REFERENCE implementation for
+        the training semantics. Actual training routes through
+        ``_log_kv_train_lowmem_forward`` — identical math, O(T + S) memory —
+        and the equivalence tests pin the two together.
 
-            # 获取 softcap 值 (Flash Attention 2.5+ 原生支持 softcapping)
-            softcap_val = self.config.attention_logit_softcapping or 0.0
+        Splits the sequence into chunks of 2 tokens. For each chunk the queries
+        attend to:
+            [compact prefix (detached)
+             + sliding window from previous chunks (detached, exact)
+             + current chunk exact KV (causal, with gradient)]
+        via slot attention over merged-position entries (one logit per slot,
+        +log w mass bias — see ``log_kv_slot_attention``). After attending, the
+        chunk's KV (detached) is added to the sliding window. When the window
+        overflows, the oldest 2 tokens are compacted into the hierarchy.
 
-            # 调用 Flash Attention 底层 C++ CUDA 算子
-            y_fa = flash_attn_func(
-                q_fa,
-                k_fa,
-                v_fa,
-                dropout_p=0.0,
-                softmax_scale=scale,
-                causal=True,
-                window_size=(swa_window, -1), # 左侧看 swa_window, 右侧不看 (causal=True 强制为 0)
-                softcap=softcap_val
+        Gradient flows only through the current chunk's q/k/v (and thus the qkv
+        projection weights); the compacted prefix and sliding window are
+        stop-gradient context, keeping activation memory bounded.
+
+        When ``defer_last_single`` is true (LogKV inference), the final
+        one-token chunk is attended immediately but not committed. It is stored
+        in ``_log_kv_pending`` and paired with the next streamed token, which
+        keeps odd-length prefill and subsequent decode on the same 2-token
+        boundaries as training over the concatenated sequence.
+        """
+        # Explicit raise (not assert): this correctness precondition must
+        # survive `python -O`, which strips assert statements.
+        if not isinstance(self.kv_cache, LogStructuredKVCache):
+            raise TypeError("training_log_kv requires a LogStructuredKVCache")
+        # Any rotary_percentage is valid here: compaction mean-pools the FULL
+        # post-RoPE key, so the rotated slice merges into the expected rotation
+        # (Dirichlet-damped as spans widen) and any pass-through content slice
+        # merges undamped. rotary_percentage < 1.0 (e.g. 0.25) keeps a
+        # position-free content channel whose signal survives compaction at any
+        # distance — recommended for adaptation quality — but full RoPE
+        # (Qwen3 default 1.0) runs correctly: distant compact slots just fade
+        # toward pure mass-bias contributions.
+        cache = self.kv_cache
+        if reset_cache:
+            cache.reset_parameters()
+            self._log_kv_pending = None
+
+        # Reconcile cache buffer dtype with the activations before any read/write.
+        # Inference builds the cache via set_log_kv_cache(), which may allocate
+        # buffers at the process-default dtype (fp32) while the model runs in bf16;
+        # without this the first get_attention_state()/add_recent() would cat/matmul
+        # fp32 buffers with bf16 activations and raise. No-op once dtypes match.
+        cache._convert_dtype(q.dtype)
+
+        t = 2  # compaction chunk size (fixed: uniform 2:1)
+        n_head = self.config.n_head
+        head_size = self.config.head_size
+
+        scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or head_size)
+        scale = scale * self.mscale * self.mscale
+
+        # No content/position split: q and k are the full post-RoPE vectors
+        # [R(p)·(pos slice) ; content slice]. Merged slots carry both channels,
+        # so a single dot product covers the content AND the position score.
+
+        # ---- Salience pinning (fresh inference prefill only) ----
+        # Must run BEFORE any token is committed: the trailing observation
+        # window (the question) scores the whole prefix while the transient
+        # K/V is on hand; pins then survive as exact slots through decode.
+        # Decode steps (token_count > 0) and pending continuations never
+        # re-select. No-op when the cache was built with pin_size=0.
+        if (
+            defer_last_single
+            and cache.pin_size > 0
+            and cache.token_count == 0
+            and self._log_kv_pending is None
+        ):
+            self._log_kv_select_pins(q, k, v, T, scale, cache)
+
+        outputs: list[torch.Tensor] = []
+        start = 0
+
+        pending = self._log_kv_pending if defer_last_single else None
+        if pending is not None:
+            pk, pv = pending
+            k_b = k[:, :, :1, :]
+            v_b = v[:, :, :1, :]
+
+            slot_k, slot_v, slot_w = cache.get_attention_state()
+            k_all, v_all, w_all = append_exact_tokens(
+                slot_k, slot_v, slot_w,
+                torch.cat([pk, k_b], dim=2),
+                torch.cat([pv, v_b], dim=2),
             )
 
-            # y_fa 出来的 shape 是 (B, T, nh, hs)
-            # 为了和下方原版逻辑统一，先转回 (B, nh, T, hs)，统一在最后 return 时翻转
-            y = y_fa.transpose(1, 2)
+            # Single query, everything before it visible -> no mask needed.
+            y_b = log_kv_slot_attention(q[:, :, :1, :], k_all, v_all, w_all, scale=scale)
+            outputs.append(y_b)
 
-        # ===================================================================
-        # 🐢 路径 2: 带有 Softcapping 的慢速 Math 路径 (如 Gemma 模型会用到)
-        # ===================================================================
-        elif self.config.attention_logit_softcapping is not None:
-            scores = q @ k.mT * scale
-            scores = do_softcapping(scores, self.config.attention_logit_softcapping)
-            if mask is None:
-                mask = torch.ones(q.size(2), q.size(2), dtype=q.dtype, device=q.device).triu(diagonal=1)
-                mask.masked_fill_(mask.bool(), torch.finfo(q.dtype).min)
-            scores = scores + mask
-            scores = F.softmax(scores, dim=-1, dtype=torch.float).to(dtype=q.dtype)
-            y = scores @ v
-
-        # ===================================================================
-        # ⚡ 路径 3: 默认的 Full Attention，走 PyTorch 原生极速 SDPA
-        # ===================================================================
-        else:
-            # KV cache 推理时 mask 来自 mask_cache（非 None）。此处若仍走 flash_attn 且
-            # causal=(mask is None) 会得到 causal=False，又不向 FA 传入 mask，因果约束丢失，
-            # 生成会出现重复 token / 乱码。显式 mask 时改用 SDPA，与无 FA 分支一致。
-            if mask is not None:
-                return self.scaled_dot_product_attention(q, k, v, mask)
-
-            if flash_attn_func is None:
-                raise ImportError("🚨 必须安装 flash-attn 库！(运行: pip install flash-attn --no-build-isolation)")
-            
-            # PyTorch SDPA 格式: (B, nh, T, hs) -> Flash Attn 格式: (B, T, nh, hs)
-            q_fa = q.transpose(1, 2)
-            k_fa = k.transpose(1, 2)
-            v_fa = v.transpose(1, 2)
-
-            # 调用 Flash Attention (全域注意力，不限制 window_size)
-            y_fa = flash_attn_func(
-                q_fa, 
-                k_fa, 
-                v_fa, 
-                dropout_p=0.0, 
-                softmax_scale=scale,
-                causal=(mask is None)  # 如果没有传入特定的 mask，默认开启 causal 掩码
+            cache.add_recent(
+                torch.cat([pk, k_b.detach()], dim=2),
+                torch.cat([pv, v_b.detach()], dim=2),
             )
-            
-            # 转回 (B, nh, T, hs)
-            y = y_fa.transpose(1, 2)
-            
-        # 最终统一把 shape 转换成外层需要的 (B, T, nh * hs) 的前置形态 (B, T, nh, hs) 返回
-        return y.transpose(1, 2)
-    
+            self._log_kv_pending = None
+            start = 1
+
+        # ---- Vectorized block prefill (inference only) ----
+        # Process the stream in blocks, freezing the slot state at block start:
+        # in-block queries attend to [frozen compact+recent slots (fully
+        # visible) + causal exact in-block tokens]. While no window flush would
+        # occur inside a block this IS the exact 2-token streaming semantics
+        # (each in-block query's true state equals the frozen one). Once
+        # compaction is active, a query at in-block offset j instead sees up to
+        # j exact tokens that strict streaming would already have compacted — a
+        # bounded, strictly information-richer deviation (effective exact
+        # window stretched by less than one block out of recent_size). The
+        # cache state trajectory stays exact regardless: add_recent() below
+        # flushes/compacts exactly as streaming would, so decode after prefill
+        # sees bit-identical cache contents. A block size of 2 reproduces
+        # strict streaming exactly (log_kv_prefill_block=2 for A/B checks).
+        # Training keeps the per-chunk loop below for its per-chunk
+        # stop-gradient structure.
+        if defer_last_single:
+            blk_size = max(2, min(self.log_kv_prefill_block, cache.recent_size))
+            while start < T:
+                block_end = min(T, start + blk_size)
+                blk = block_end - start
+                # Defer a lone tail token so it pairs with the next streamed
+                # token (keeps the 2-token commit alignment with training).
+                defer_tail = block_end == T and blk % 2 == 1
+                commit_end = block_end - 1 if defer_tail else block_end
+
+                slot_k, slot_v, slot_w = cache.get_attention_state()
+                k_all, v_all, w_all = append_exact_tokens(
+                    slot_k, slot_v, slot_w,
+                    k[:, :, start:block_end, :],
+                    v[:, :, start:block_end, :],
+                )
+
+                # Frozen state fully visible, block tokens causal among
+                # themselves: causal_tail masks the trailing `blk` in-flight
+                # entries in place instead of allocating a (blk, S) bool mask
+                # and a masked_fill copy of the full score tensor per block.
+                y_blk = log_kv_slot_attention(
+                    q[:, :, start:block_end, :], k_all, v_all, w_all, scale=scale, causal_tail=blk
+                )
+                outputs.append(y_blk)
+
+                if commit_end > start:
+                    cache.add_recent(
+                        k[:, :, start:commit_end, :].detach(),
+                        v[:, :, start:commit_end, :].detach(),
+                    )
+                if defer_tail:
+                    self._log_kv_pending = (
+                        k[:, :, commit_end:block_end, :].detach(),
+                        v[:, :, commit_end:block_end, :].detach(),
+                    )
+                start = block_end
+
+        while start < T:
+            end = min(start + t, T)
+            actual_t = end - start
+            defer_chunk = defer_last_single and actual_t == 1 and end == T
+
+            k_b = k[:, :, start:end, :]  # (B, n_groups, actual_t, k_dim)
+            v_b = v[:, :, start:end, :]  # (B, n_groups, actual_t, v_dim)
+
+            # Cache state: [compact slots] + [sliding window from prev chunks].
+            # Both are detached — only the current chunk carries gradient.
+            slot_k, slot_v, slot_w = cache.get_attention_state()
+
+            # Append current chunk (with gradient) as exact w=1 slots.
+            k_all, v_all, w_all = append_exact_tokens(slot_k, slot_v, slot_w, k_b, v_b)
+
+            # Visibility: compact slots + sliding window fully visible, the
+            # current chunk causal. causal_tail masks the trailing `actual_t`
+            # in-flight entries in place — building a (actual_t, S) bool mask
+            # here would allocate O(S) per chunk, T/2 times per layer.
+            y_b = log_kv_slot_attention(
+                q[:, :, start:end, :], k_all, v_all, w_all, scale=scale, causal_tail=actual_t
+            )  # (B, n_head, actual_t, v_dim)
+            outputs.append(y_b)
+
+            # Add current chunk (detached) to the sliding window.
+            # When the window overflows, oldest t tokens are compacted into hierarchy.
+            if defer_chunk:
+                self._log_kv_pending = (k_b.detach(), v_b.detach())
+            else:
+                cache.add_recent(k_b.detach(), v_b.detach())
+
+            start = end
+
+        y = torch.cat(outputs, dim=2)  # (B, n_head, T, v_dim)
+        y = y.transpose(1, 2).reshape(B, T, head_size * n_head)
+        return self.proj(y)
+
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -881,6 +1163,59 @@ class CausalSelfAttention(nn.Module):
             dtype=dtype,
             is_sliding_window=self.apply_sliding_window_attention,
             sliding_window_size=self.config.sliding_window_size if self.apply_sliding_window_attention else None,
+        )
+
+    def build_log_kv_cache(
+        self,
+        batch_size: int,
+        max_seq_length: int,
+        rope_cache_length: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        B: int = 512,
+        recent_size: int = 1024,
+        pin_size: int = 0,
+    ) -> "LogStructuredKVCache":
+        """Build a log-structured KV cache with strict O(B * log(N)) memory.
+
+        Architecture (uniform 2:1 compaction at every level):
+            Buffer:           recent_size raw tokens, no compression
+            Level 0 (write):  B entries, each = 2 tokens merged
+            Level 1+ (carry): B entries, each = 2 entries from prev level merged
+
+        Slots store the FULL post-RoPE key (position sub-channel included);
+        merging mean-pools it, so a slot's position embedding is the expected
+        rotation over its span. No per-token buffer of any kind is allocated.
+        """
+        rope_n_elem = self.config.rope_n_elem
+        # k_dim is the full post-RoPE key width: the RoPE'd slice AFTER
+        # apply_rope, which is rope_cache_length (cos.size(1)) wide — NOT
+        # rope_n_elem: for rope_n_elem == 1 the RoPE cache is widened to 2 dims
+        # (HF-compat, see build_rope_cache) and apply_rope broadcasts the roped
+        # slice to that width, so k/q enter attention with head_size + 1 dims.
+        # Mirrors the `rope_cache_length + head_size - rope_n_elem` k-shape in
+        # build_kv_cache.
+        if rope_cache_length is None:
+            rope_cache_length = 2 if rope_n_elem == 1 else rope_n_elem
+        k_dim = rope_cache_length + self.config.head_size - rope_n_elem
+
+        k_shape = (
+            batch_size,
+            self.config.n_query_groups,
+            max_seq_length,
+            k_dim,
+        )
+        v_shape = (
+            batch_size,
+            self.config.n_query_groups,
+            max_seq_length,
+            self.config.head_size,
+        )
+
+        return LogStructuredKVCache(
+            k_shape, v_shape,
+            B=B, recent_size=recent_size, pin_size=pin_size,
+            device=device, dtype=dtype,
         )
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:

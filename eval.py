@@ -1,19 +1,38 @@
+"""
+Evaluation pipeline for logKV models.
+
+Usage:
+    # Single GPU
+    python eval.py --checkpoint_dir ./ckpt/qwen0.6b-32k-cpt-base --benchmark piqa
+
+    # Multi-GPU with torchrun
+    torchrun --nproc_per_node=8 eval.py --checkpoint_dir ./ckpt/... --benchmark "boolq,piqa,..."
+
+    # With YAML config
+    python eval.py --config exp/qwen1.7b-32k/eval.yaml
+
+除 logKV 相关内容（LogKVLM、YAML --config 机制、tokenizer 回退）外，
+本文件与 kv 分支的 eval.py 逐段对齐（环境变量、输出、指标收集等）。
+"""
+
 from __future__ import annotations
 
 import os
+import re
 import csv
+import glob
 import json
+import time
+import inspect
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import numpy as np
 from typing import Any
 
-from jsonargparse import CLI
 import tqdm
 
 from utils import *
@@ -167,100 +186,218 @@ def _config_from_yaml_and_overrides(config_path: str, overrides: dict[str, Any] 
     return cfg
 
 
-class CustomResearchLM(LM):
+# ==========================================
+# 🧩 logKV 专属：YAML --config 机制（与 demo.py 相同约定：
+# YAML 非 null 值覆盖 CLI；支持 "config:" 继承）
+# ==========================================
+
+def _load_yaml_config(yaml_path: str, model_dir: str) -> dict:
+    """Load YAML config with inheritance ('config:' key overrides)."""
+    yaml_path = os.path.normpath(os.path.expanduser(yaml_path))
+    if not os.path.isfile(yaml_path):
+        return {}
+
+    with open(yaml_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    if cfg is None:
+        return {}
+
+    if "config" in cfg:
+        base_name = cfg.pop("config")
+        base_dir = os.path.dirname(yaml_path)
+        base_path = os.path.join(base_dir, base_name)
+        base_cfg = _load_yaml_config(base_path, model_dir)
+        return {**base_cfg, **cfg}
+
+    return cfg
+
+
+# PyYAML implements YAML 1.1: scientific notation WITHOUT a decimal point
+# ("2e-5") does not match its float resolver and loads as *str*. Coerce such
+# top-level values so numeric params never receive strings.
+_SCI_FLOAT_RE = re.compile(r"[-+]?\d+(?:\.\d*)?[eE][-+]?\d+")
+
+
+def _coerce_yaml_sci_floats(cfg: dict) -> dict:
+    """Convert top-level str values that are scientific-notation numbers to float."""
+    return {
+        k: float(v) if isinstance(v, str) and _SCI_FLOAT_RE.fullmatch(v) else v
+        for k, v in cfg.items()
+    }
+
+
+# ==========================================
+# 🧩 logKV 专属：tokenizer 目录回退解析
+# ==========================================
+
+def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
+    """Resolve a directory that actually holds tokenizer.json / tokenizer.model.
+
+    The training save dir normally receives a copy of the tokenizer files
+    (demo.py copies them next to lit_model.pth), but older checkpoints,
+    interrupted runs, or ``save_ckpt: false`` leave it without one. litgpt's
+    ``Tokenizer`` then raises a bare ``NotImplementedError``, so resolve the
+    directory up front and fail with an actionable message instead.
+
+    Search order:
+      1. explicit ``tokenizer_dir`` (CLI/YAML),
+      2. ``checkpoint_dir`` itself,
+      3. the base model dir recorded in ``model_config.yaml``
+         (demo.py convention: checkpoints/<hf org>/<hf name>).
+    """
+    candidates: list[tuple[str, Path]] = []
+    if tokenizer_dir is not None:
+        candidates.append(("--tokenizer_dir", Path(tokenizer_dir)))
+    candidates.append(("checkpoint_dir", Path(checkpoint_dir)))
+
+    cfg_path = Path(checkpoint_dir) / "model_config.yaml"
+    if cfg_path.is_file():
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            hf = cfg.get("hf_config") or {}
+            if hf.get("org") and hf.get("name"):
+                candidates.append(
+                    ("base checkpoint (from model_config.yaml)",
+                     Path("checkpoints") / hf["org"] / hf["name"])
+                )
+        except Exception as e:  # noqa: BLE001 — fallback probing only
+            print(f"[eval] WARNING: could not read {cfg_path} for tokenizer fallback: {e}")
+
+    for label, d in candidates:
+        if (d / "tokenizer.json").is_file() or (d / "tokenizer.model").is_file():
+            return d
+
+    tried = "\n".join(f"  - {label}: {d.resolve()}" for label, d in candidates)
+    raise FileNotFoundError(
+        "No tokenizer.json / tokenizer.model found. Searched:\n"
+        f"{tried}\n"
+        "Fix: pass --tokenizer_dir <dir containing the tokenizer files>, or copy "
+        "the base model's tokenizer files into the checkpoint dir. Note that a "
+        "training run with `save_ckpt: false` writes NO checkpoint (no weights, "
+        "no tokenizer) — the train->eval pipeline requires `save_ckpt: true`."
+    )
+
+
+class LogKVLM(LM):
+    """LM wrapper that scores and generates through the log-structured KV cache.
+
+    Both loglikelihood scoring and generate_until run through the merged-position
+    slot cache used by the LogKV training path: full post-RoPE keys are stored as
+    exact recent tokens or compressed slots, and slot attention scores one logit
+    per slot with the log(w) mass bias. There is no dense fallback — this
+    pipeline only evaluates the logKV compression route.
+    """
+
     def __init__(
         self,
         checkpoint_dir: str,
-        device="cuda",
-        use_research: bool = True,
-        map_branch=False,
+        device: str = "cuda",
         config_overrides: dict[str, Any] | None = None,
+        log_kv_B: int = 512,
+        log_kv_recent_size: int = 1024,
+        log_kv_prefill_block: int = 256,
+        log_kv_pin_size: int = 0,
+        log_kv_pin_obs_window: int = 64,
+        tokenizer_dir: str | None = None,
     ):
         super().__init__()
         self._device = device
         self.checkpoint_dir = checkpoint_dir
-        self.tokenizer = Tokenizer(checkpoint_dir)
-        
+        self.log_kv_B = log_kv_B
+        self.log_kv_recent_size = log_kv_recent_size
+        self.log_kv_prefill_block = log_kv_prefill_block
+        self.log_kv_pin_size = log_kv_pin_size
+        self.log_kv_pin_obs_window = log_kv_pin_obs_window
+
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = not dist.is_initialized() or dist.get_rank() == 0
+
+        resolved_tok_dir = _find_tokenizer_dir(checkpoint_dir, tokenizer_dir)
+        if is_master:
+            print(f"🔤 正在加载 tokenizer: {resolved_tok_dir}")
+        self.tokenizer = Tokenizer(resolved_tok_dir)
 
         # ==========================================
         # 🌟 智能 Config 路由加载 (YAML 版本)
         # ==========================================
-        # 试探两种最常见的 yaml 命名方式
         config_path = os.path.join(checkpoint_dir, "model_config.yaml")
-        
+
         if os.path.exists(config_path):
             if is_master: print(f"📄 发现专属架构 YAML 配置文件: {config_path}，正在自动同步架构...")
-            # 合并 YAML + overrides，并把 research_*_layers_str 转成 Config 合法字段
             self.config = _config_from_yaml_and_overrides(config_path, config_overrides)
-            
-            # 确保对象的开关属性被正确覆盖
-            self.use_research = getattr(self.config, 'use_research', False)
-
         else:
             if is_master: print("⚠️ 未发现训练期保存的 YAML 配置文件，正在使用备用参数初始化...")
-            self.use_research = use_research
-            fallback_kw: dict[str, Any] = dict(
-                name=checkpoint_dir.split("/")[-1],
-                use_research=use_research,
-                research_separate_parameter=True if use_research else False,
-                research_swa_layers_str="0,2,4,6,8,10,12,14,16,18,20,22,24,26",
-            )
+            fallback_kw: dict[str, Any] = {"name": checkpoint_dir.split("/")[-1]}
             if config_overrides:
                 fallback_kw.update(config_overrides)
-            fallback_kw, identity_layers = _normalize_training_config_dict(fallback_kw)
             fallback_kw = _filter_config_dict(fallback_kw)
             self.config = Config.from_name(**fallback_kw)
-            if identity_layers is not None:
-                self.config.research_prefill_identity_layers = identity_layers
 
         # ==========================================
-        
-        if is_master: print(f"🔧 正在初始化 Transformer (Research模式: {self.use_research})...")
+
+        if is_master: print("🔧 正在初始化 Transformer (logKV 压缩注意力)...")
         self.model = GPT(self.config).to(device).bfloat16()
-        
+
         if is_master: print(f"🔄 正在加载权重...")
         checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
-        
+
         # 🌟 核心修复：检查是不是被包裹过的 checkpoint 字典
         if "model" in checkpoint:
             state_dict = checkpoint["model"]
             if is_master: print("📦 检测到 Fabric Checkpoint，已自动提取 model 权重。")
         else:
             state_dict = checkpoint
-        
-        if map_branch and self.config.use_research and self.config.research_separate_parameter:
-            print("🔀 检测到 Block 级参数独立！正在为 h_prefill 组装预训练权重...")
-            prefill_weights = {}
 
-            # 遍历配置中的 SWA 层列表
-            # i 是在 h_prefill ModuleList 中的物理索引 (0, 1, 2...)
-            # block_idx 是在原版 h 中的逻辑层号 (0, 2, 4...)
-            for i, block_idx in enumerate(self.config.research_prefill_swa_layers):
-                orig_prefix = f"transformer.h.{block_idx}."
-                new_prefix = f"transformer.h_prefill.{i}."
-
-                # 遍历寻找属于原版 block_idx 的所有权重，并改名挂载到 h_prefill 下
-                for key, value in state_dict.items():
-                    if key.startswith(orig_prefix):
-                        # 极其精准的前缀替换
-                        new_key = key.replace(orig_prefix, new_prefix, 1)
-                        if new_key not in state_dict.keys():
-                            prefill_weights[new_key] = value
-
-            # 将克隆出的 prefill 分支权重合并入主字典
-            state_dict.update(prefill_weights)
-            print(f"✅ 成功映射并注入了 {len(prefill_weights)} 个 Block 级别的张量！")
-            
         # 🌟 强烈建议：捕获并打印一下加载结果，看看是不是真的加载成功了！
-        load_result = self.model.load_state_dict(state_dict, strict=False) 
-        
-        if is_master: 
+        load_result = self.model.load_state_dict(state_dict, strict=False)
+
+        if is_master:
             print(f"✅ 权重加载完毕！缺失的 keys: {len(load_result.missing_keys)} 个")
             # 如果 missing_keys 极其多（比如几百个），说明加载又失败了
-            
+
         self.model.eval()
+
+        # 推理时延指标收集
+        self.gen_metrics: list[dict] = []      # generate_until
+        self.ppl_metrics: list[dict] = []      # loglikelihood
+
+        # LogKV eval cache is built lazily once and reset per request (see
+        # _set_eval_cache) — never re-allocated per sample.
+        self._eval_cache_ready = False
+
+    def _set_eval_cache(self) -> None:
+        """Install (once) and reset the LogKV inference cache.
+
+        LogKV buffer sizes depend only on (B, recent_size, max_levels) — not on
+        the request length — so the cache is built ONCE at the model's full
+        window and reset in place before each request. Rebuilding per request
+        re-allocates O(n_layer x (recent + B*logN)) CUDA buffers thousands of
+        times over a benchmark run and fragments the allocator (OOM risk).
+        ``max_seq_length`` only bounds the append-only token counter and level
+        hierarchy, so sizing it at the model's window covers every request.
+        """
+        if self._eval_cache_ready:
+            self.model.reset_log_kv_cache()
+            return
+        dtype = next(self.model.parameters()).dtype
+        max_seq_length = self.model.max_seq_length
+        self.model.set_log_kv_cache(
+            batch_size=1,
+            max_seq_length=max_seq_length,
+            device=self._device,
+            dtype=dtype,
+            B=self.log_kv_B,
+            recent_size=max(2, min(self.log_kv_recent_size, max_seq_length)),
+            prefill_block=self.log_kv_prefill_block,
+            # 显著性钉扎（SnapKV 式观察窗）：0 = 关闭。针对捞针类任务——
+            # prompt 末尾的问题在 prefill 时给全前缀打分，top-P token 以
+            # 精确槽形态钉在层级之外，免于被 mean-pool 稀释。
+            pin_size=self.log_kv_pin_size,
+            pin_obs_window=self.log_kv_pin_obs_window,
+        )
+        self._eval_cache_ready = True
 
     # ==========================================
     # 🌟 分布式结果收集
@@ -268,11 +405,11 @@ class CustomResearchLM(LM):
     def all_gather_results(self, local_result_list: list):
         if not dist.is_initialized() or dist.get_world_size() == 1:
             return local_result_list
-            
+
         dp_size = dist.get_world_size()
         all_results_list = [None for _ in range(dp_size)]
         dist.all_gather_object(all_results_list, local_result_list)
-        
+
         final_results = []
         max_load = max(len(r) for r in all_results_list)
         for i in range(max_load):
@@ -282,64 +419,104 @@ class CustomResearchLM(LM):
         return final_results
 
     # ==========================================
-    # 🌟 核心 1：PPL 与 选择题评测 (完美适配你的 forward + 并行)
+    # 🌟 核心 1：PPL 与 选择题评测
     # ==========================================
+    def _score_tokens(self, ctx_enc: list[int], cont_enc: list[int]) -> tuple[float, bool]:
+        """Forward (context + continuation) and return
+        ``(sum log p(continuation | context), is_greedy)``.
+
+        Left-truncates so the sequence fits ``max_seq_length``. If the
+        continuation alone meets/exceeds the window, the context is dropped and
+        the continuation is left-truncated to its last ``max_len - 1`` tokens —
+        scoring is then partial but the forward stays in bounds.
+        """
+        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # 🌟 安全阀：如果 题干 + 选项 > max_seq_length，必须切掉题干最前面的部分
+        max_len = self.model.max_seq_length
+        if len(ctx_enc) + len(cont_enc) > max_len:
+            keep_ctx_len = max_len - len(cont_enc)
+            if keep_ctx_len <= 0:
+                cont_enc = cont_enc[-(max_len - 1):]
+                ctx_enc = []
+            else:
+                ctx_enc = ctx_enc[-keep_ctx_len:]
+            print(f"⚠️ [Rank {dp_rank}] 警告: 触发截断，剩余 context 长度: {len(ctx_enc)}")
+
+        if len(ctx_enc) == 0:
+            ctx_enc = [self.tokenizer.bos_id]
+
+        inps = torch.tensor([ctx_enc + cont_enc], dtype=torch.long, device=self._device)
+        seq_len = inps.size(1)
+        ctx_len = len(ctx_enc)
+
+        with torch.no_grad():
+            # Score with the same merged-position slot attention used by LogKV
+            # inference. ``input_pos`` must be append-only contiguous because
+            # slot compaction is order-based rather than indexed.
+            self._set_eval_cache()
+            try:
+                t0 = time.perf_counter()
+                input_pos = torch.arange(seq_len, device=self._device, dtype=torch.int64)
+                # lm_head_start: materialize logits only for the scoring span
+                # [ctx_len-1, seq_len) — full-sequence logits at 32K are ~10 GB
+                # bf16, the sliced tensor is (cont_len + 1) x vocab.
+                logits = self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
+                t1 = time.perf_counter()
+            finally:
+                # In-place state reset (defensive: the next request resets again
+                # via _set_eval_cache). Keeping the buffers avoids re-allocation.
+                self.model.reset_log_kv_cache()
+
+        self.ppl_metrics.append({
+            "total_seq_len": seq_len, "context_len": ctx_len,
+            "cont_len": len(cont_enc),
+            "forward_time_ms": round((t1 - t0) * 1000, 2),
+        })
+
+        # ``logits`` starts at position ctx_len-1 (lm_head_start); its first
+        # len(cont_enc) rows are the positions [ctx_len-1, seq_len-2] that
+        # predict the continuation tokens.
+        cont_logits = logits[0, : len(cont_enc)]
+        cont_targets = torch.tensor(cont_enc, dtype=torch.long, device=self._device)
+
+        # fp32 log-softmax in position-chunks: rolling-PPL requests score a
+        # full window (cont_len ~ max_seq_length), and a one-shot fp32
+        # log_softmax over cont_len x vocab would peak at ~19 GB at 32K. fp32
+        # (rather than the model's bf16) keeps per-token log-probs accurate —
+        # they are summed over thousands of tokens downstream.
+        total_logprob = 0.0
+        is_greedy = True
+        step = 1024
+        for i in range(0, cont_logits.size(0), step):
+            blk = cont_logits[i : i + step].to(torch.float32)
+            tgt = cont_targets[i : i + step]
+            log_probs = torch.log_softmax(blk, dim=-1)
+            total_logprob += log_probs.gather(dim=-1, index=tgt.unsqueeze(-1)).sum().item()
+            if is_greedy:
+                is_greedy = bool((blk.argmax(dim=-1) == tgt).all().item())
+        return total_logprob, is_greedy
+
     def loglikelihood(self, requests):
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
         dp_size = dist.get_world_size() if dist.is_initialized() else 1
-        
+
         local_requests = requests[dp_rank::dp_size]
         results = []
         disable_tqdm = (dp_rank != 0)
-        
+
         for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
             context, continuation = req.args[0], req.args[1]
-            
+
             ctx_enc = self.tokenizer.encode(context).tolist()
             # Llama 3 等 use_bos=True：若对 continuation 再 encode 一次会多一个 BOS，拼接后破坏
             # loglikelihood 对齐；Qwen 通常无 BOS，bos=False 与默认行为一致。
             cont_enc = self.tokenizer.encode(continuation, bos=False).tolist()
-            
-            # 🌟 安全阀：如果 题干 + 选项 > 4096，必须切掉题干最前面的部分
-            max_len = self.model.max_seq_length
-            if len(ctx_enc) + len(cont_enc) > max_len:
-                # 保留完整的选项，切断 context 的头部
-                keep_ctx_len = max_len - len(cont_enc)
-                ctx_enc = ctx_enc[-keep_ctx_len:]
-                print(f"⚠️ [Rank {dp_rank}] 警告: 触发截断，剩余 context 长度: {len(ctx_enc)}")
-            
-            if len(ctx_enc) == 0:
-                ctx_enc = [self.tokenizer.bos_id]
-                
-            inps = torch.tensor([ctx_enc + cont_enc], dtype=torch.long, device=self._device)
-            
-            seq_len = inps.size(1)
-            ctx_len = len(ctx_enc)
-            
-            # 🌟 关键修改：生成 [B, T] 的 2D Mask，你的 forward 里有 unsqueeze(-1)！
-            mask = torch.zeros((1, seq_len), dtype=torch.bool, device=self._device)
-            # 题干设为 True (Prefill/SWA/LayerDrop)
-            mask[0, :ctx_len - 1] = True 
-            # 选项默认为 False (Decode/Full Attention/Cross-layer KV)
 
-            with torch.no_grad():
-                # 为了防止长度爆炸，必须显式调用 set_kv_cache (哪怕这部分是一次性算完的)
-                self.model.set_kv_cache(batch_size=1, max_seq_length=seq_len, device=self._device)
-                if self.use_research:
-                    logits = self.model(inps, prefill_mask=mask)
-                else:
-                    logits = self.model(inps)
-                self.model.clear_kv_cache()
-                
-            cont_logits = logits[0, ctx_len - 1 : seq_len - 1]
-            cont_targets = torch.tensor(cont_enc, dtype=torch.long, device=self._device)
-            
-            log_probs = F.log_softmax(cont_logits, dim=-1)
-            token_log_probs = log_probs.gather(dim=-1, index=cont_targets.unsqueeze(-1)).squeeze(-1)
-            
-            is_greedy = (cont_logits.argmax(dim=-1) == cont_targets).all().item()
-            results.append((token_log_probs.sum().item(), is_greedy))
-            
+            results.append(self._score_tokens(ctx_enc, cont_enc))
+
+        # 清理 CUDA 缓存，避免 all_gather 时 OOM
+        torch.cuda.empty_cache()
         return self.all_gather_results(results)
 
     # ==========================================
@@ -348,15 +525,15 @@ class CustomResearchLM(LM):
     def generate_until(self, requests):
         dp_rank = dist.get_rank() if dist.is_initialized() else 0
         dp_size = dist.get_world_size() if dist.is_initialized() else 1
-        
+
         local_requests = requests[dp_rank::dp_size]
         results = []
         disable_tqdm = (dp_rank != 0)
-        
+
         for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
             prompt = req.args[0]
-            gen_args = req.args[1] 
-            
+            gen_args = req.args[1]
+
             # 解析 lm-eval 的 gen_kwargs：`until` 是停词（字符串列表），长度上限用 `max_gen_toks`（见 lm-eval model_guide）
             max_new_tokens = int(gen_args.get("max_gen_toks", gen_args.get("max_length", self.max_gen_toks)))
             do_sample = bool(gen_args.get("do_sample", False))
@@ -376,12 +553,16 @@ class CustomResearchLM(LM):
                 keep_prompt_len = max_len - max_new_tokens
                 prompt_tensor = prompt_tensor[-keep_prompt_len:]
                 print(f"⚠️ [Rank {dp_rank}] 警告: 触发生成截断，Prompt 被切至: {keep_prompt_len}")
-            
+
             total_max_len = prompt_tensor.size(0) + max_new_tokens
+            prompt_len = prompt_tensor.size(0)
+
             with torch.no_grad():
-                # 自回归路径带 input_pos，必须初始化 mask_cache / KVCache（与 litgpt/generate/base.py main 一致）
-                self.model.set_kv_cache(batch_size=1, max_seq_length=total_max_len, device=self._device)
+                # 🧩 logKV：长上下文生成使用 merged-position slot cache
+                # （建一次、按请求原地重置，不逐样本重分配 — 见 _set_eval_cache）
+                self._set_eval_cache()
                 try:
+                    t0 = time.perf_counter()
                     out = litgpt_generate(
                         self.model,
                         prompt_tensor,
@@ -391,17 +572,69 @@ class CustomResearchLM(LM):
                         top_p=top_p,
                         eos_id=self.tokenizer.eos_id,
                     )
+                    t1 = time.perf_counter()
                 finally:
-                    self.model.clear_kv_cache()
+                    self.model.reset_log_kv_cache()
 
             # 截取新生成的部分并解码
             generated_tokens = out[prompt_tensor.size(0):]
+            gen_len = generated_tokens.size(0)
+            total_time_s = t1 - t0
+            self.gen_metrics.append({
+                "prompt_len": prompt_len, "generated_tokens": gen_len,
+                "total_time_s": round(total_time_s, 4),
+                "decode_ms_per_token": round(total_time_s / max(gen_len, 1) * 1000, 2),
+                "gen_tokens_per_sec": round(gen_len / total_time_s, 2) if total_time_s > 0 else 0,
+            })
+
             decoded = self.tokenizer.decode(generated_tokens)
             results.append(decoded)
-            
+
+        # 清理 CUDA 缓存，避免 all_gather 时 OOM
+        torch.cuda.empty_cache()
         return self.all_gather_results(results)
 
-    def loglikelihood_rolling(self, requests): pass
+    def loglikelihood_rolling(self, requests):
+        """Rolling log-likelihood over full documents (lm-eval PPL tasks, e.g.
+        wikitext). Returns one summed log-prob (scalar float) per request,
+        matching lm-eval's reference implementations — returning tuples here
+        breaks perplexity aggregation downstream.
+
+        Long documents are scored in non-overlapping windows of max_seq_length:
+        each window's tokens are conditioned on the window prefix (the first
+        window starts from BOS). This matches lm-eval's standard rolling-window
+        scoring; a ``pass`` stub would return None and break PPL tasks.
+        """
+        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        dp_size = dist.get_world_size() if dist.is_initialized() else 1
+
+        local_requests = requests[dp_rank::dp_size]
+        results = []
+        disable_tqdm = (dp_rank != 0)
+
+        max_len = self.model.max_seq_length
+        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
+            (text,) = req.args
+            tokens = self.tokenizer.encode(text, bos=False).tolist()
+
+            total_logprob = 0.0
+            # Non-overlapping windows; window size max_len - 1 leaves room for
+            # the 1-token context (BOS or the previous window's last token).
+            window = max_len - 1
+            for start in range(0, len(tokens), window):
+                chunk = tokens[start : start + window]
+                if start == 0:
+                    ctx = [self.tokenizer.bos_id]
+                else:
+                    ctx = [tokens[start - 1]]
+                logprob, _ = self._score_tokens(ctx, chunk)
+                total_logprob += logprob
+
+            results.append(total_logprob)
+
+        torch.cuda.empty_cache()
+        return self.all_gather_results(results)
+
     @property
     def eot_token_id(self): return self.tokenizer.eos_id
     @property
@@ -415,15 +648,75 @@ class CustomResearchLM(LM):
     def tok_encode(self, string): return self.tokenizer.encode(string).tolist()
     def tok_decode(self, tokens): return self.tokenizer.decode(torch.tensor(tokens))
 
+def _resolve_checkpoint_dir(checkpoint_dir: str) -> str:
+    """自动检测分段 checkpoint。若存在 step_* 子目录（含 lit_model.pth）则选最大 step，否则直接用原路径。"""
+    base = Path(os.path.expandvars(os.path.expanduser(checkpoint_dir)))
+    step_dirs = [
+        d for d in base.glob("step_*")
+        if d.is_dir() and (d / "lit_model.pth").exists()
+    ]
+    if not step_dirs:
+        return checkpoint_dir
+    max_dir = max(step_dirs, key=lambda d: int(d.name.split("_")[1]))
+    print(f"🔍 检测到分段 checkpoint，自动选择最新: {max_dir}")
+    return str(max_dir)
+
+
 @auto_expand_env_vars
 def main(
     checkpoint_dir: str = "checkpoints/Qwen/Qwen3-0.6B-Base",
     benchmark: str = "debug",
-    map_branch: bool = False,
     config_overrides: dict[str, Any] | None = None,
     output_path: str | None = None,
     metadata: dict[str, Any] | None = None,
+    # ── 🧩 logKV（本管线只跑压缩路线，无 dense 分支）──
+    log_kv_B: int = 512,
+    log_kv_recent_size: int = 1024,
+    # prefill 分块大小：块内 query 共享块首冻结的 slot 状态。2 = 严格 2-token
+    # 流式语义（用于 A/B 验证近似偏差）；越大越快，偏差上界 = 块内 query 比严格
+    # 流式多看到 < block 个未压缩 token（缓存状态轨迹两者严格一致）。
+    log_kv_prefill_block: int = 256,
+    # 显著性钉扎（SnapKV 式观察窗，推理专用）：prefill 时 prompt 末尾
+    # obs_window 个 query 给全前缀打分，每个 KV 组各钉 pin_size 个 token 为
+    # 精确 w=1 槽（层级照常池化，缓存轨迹不变）。0 = 关闭。捞针类任务的关键。
+    log_kv_pin_size: int = 0,
+    log_kv_pin_obs_window: int = 64,
+    # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
+    tokenizer_dir: str | None = None,
+    # ── 🧩 logKV：YAML config ──
+    config: str | None = None,
 ):
+    # ── 🧩 logKV：加载 YAML config（非 null 值覆盖 CLI，同 demo.py 约定）──
+    # NOTE: `locals()[k] = v` does NOT write back to a function's real locals in
+    # CPython, so YAML overrides must be applied by explicit re-binding.
+    _yaml: dict = {}
+    if config is not None:
+        # expand_env_vars：bash 风格 ${VAR} / ${VAR-default} 展开，与 demo.py 的
+        # YAML 装载、majob.sh 的 bash 展开共用同一语义（详见 utils.expand_env_vars）。
+        _yaml = _coerce_yaml_sci_floats(
+            expand_env_vars(_load_yaml_config(os.path.join(os.getcwd(), config), checkpoint_dir) or {})
+        )
+        _valid = set(inspect.signature(main).parameters)
+        for _k in _yaml:
+            if _k != "config" and _k not in _valid:
+                print(f"[eval] WARNING: unknown YAML key ignored: {_k}")
+
+    def _o(name, current):
+        v = _yaml.get(name)
+        return v if v is not None else current
+
+    checkpoint_dir = _o("checkpoint_dir", checkpoint_dir)
+    benchmark = _o("benchmark", benchmark)
+    config_overrides = _o("config_overrides", config_overrides)
+    output_path = _o("output_path", output_path)
+    metadata = _o("metadata", metadata)
+    log_kv_B = _o("log_kv_B", log_kv_B)
+    log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
+    log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
+    log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
+    log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
+    tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
@@ -435,12 +728,20 @@ def main(
 
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
+        print(f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} (obs {log_kv_pin_obs_window})")
 
-    lm_model = CustomResearchLM(
+    checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
+
+    lm_model = LogKVLM(
         checkpoint_dir,
         device=device,
-        map_branch=map_branch,
         config_overrides=config_overrides,
+        log_kv_B=log_kv_B,
+        log_kv_recent_size=log_kv_recent_size,
+        log_kv_prefill_block=log_kv_prefill_block,
+        log_kv_pin_size=log_kv_pin_size,
+        log_kv_pin_obs_window=log_kv_pin_obs_window,
+        tokenizer_dir=tokenizer_dir,
     )
 
     results = evaluator.simple_evaluate(
@@ -451,7 +752,7 @@ def main(
         metadata=metadata,
     )
 
-    # 与 CustomResearchLM.is_master 一致：多节点时应用全局 rank==0，而非 local_rank==0（每节点各有一个 local 0）
+    # 与 LogKVLM.is_master 一致：多节点时应用全局 rank==0，而非 local_rank==0（每节点各有一个 local 0）
     is_main = not dist.is_initialized() or dist.get_rank() == 0
 
     if is_main:
@@ -511,7 +812,33 @@ def main(
                 except Exception as e2:
                     print(f"❌ 备用方案也失败了: {e2}")
 
-            # 🌟 第四步：生成 CSV 结果文件
+            # 🌟 第四步：保存推理时延 xlsx
+            inference_xlsx = output_file.with_suffix(".inference_metrics.xlsx")
+            try:
+                import pandas as pd
+                with pd.ExcelWriter(inference_xlsx) as writer:
+                    if lm_model.gen_metrics:
+                        gen_df = pd.DataFrame(lm_model.gen_metrics)
+                        gen_df.to_excel(writer, sheet_name="generate_until", index=False)
+                        # 按 prompt 长度分桶统计
+                        gen_df["prompt_bucket"] = pd.cut(gen_df["prompt_len"],
+                            bins=[0, 1024, 4096, 8192, 16384, 32768, 999999],
+                            labels=["0-1K", "1K-4K", "4K-8K", "8K-16K", "16K-32K", "32K+"])
+                        summary = gen_df.groupby("prompt_bucket", observed=False).agg(
+                            count=("prompt_len", "count"),
+                            avg_prompt_len=("prompt_len", "mean"),
+                            avg_decode_ms_tok=("decode_ms_per_token", "mean"),
+                            avg_gen_tok_sec=("gen_tokens_per_sec", "mean"),
+                        ).round(2).reset_index()
+                        summary.to_excel(writer, sheet_name="gen_by_bucket", index=False)
+                    if lm_model.ppl_metrics:
+                        ppl_df = pd.DataFrame(lm_model.ppl_metrics)
+                        ppl_df.to_excel(writer, sheet_name="loglikelihood", index=False)
+                print(f"📊 推理时延指标已保存至 {inference_xlsx}")
+            except Exception as e:
+                print(f"⚠️ 推理时延 xlsx 保存失败: {e}")
+
+            # 🌟 第五步：生成 CSV 结果文件
             extract_results_to_csv(results, benchmark, output_file)
 
 
@@ -580,4 +907,4 @@ def output_from_cache(
         extract_results_to_csv(results, benchmark, output_file)
 
 if __name__ == "__main__":
-    CLI(main)
+    run_cli(main)

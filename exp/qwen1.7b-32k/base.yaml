@@ -1,27 +1,43 @@
 # ==========================================
-# Loss 收敛探测模式 (用于观察架构的真实学习能力)
+# Base config for Qwen3-1.7B with 32K context (logKV branch)
 # ==========================================
-# 基础配置
 arch_name: "Qwen/Qwen3-1.7B-Base"
 context_length: 32768
 
-# 训练超参 (真实负载)
-global_batch_size: 128      # 保证梯度的稳定性
-micro_batch_size: 4        # 假设你的显存能吃下 4096 长度的 batch=4
-max_steps: 300             # 跑 300 步，足够在 TensorBoard/终端 画出一条明显的下降曲线
+# Training hyperparams
+global_batch_size: 128
+micro_batch_size: 2
+max_steps: 300
 learning_rate: 2e-5
 weight_decay: 0.1
 num_devices: 1
+warmup_steps: 5
+min_lr: 2e-6
+entropy_chunk_size: 128
 
-# 数据与 IO
+# Data & IO
 dataset_name: "debug"
 dataset_dir: "data"
 data_dir: "data"
 num_workers: 16
-save_ckpt: false
+# 必须为 true：majob.sh 流水线在训练后固定评测 save_path，
+# save_ckpt: false 时不会写任何 checkpoint（含 tokenizer 文件），eval 必然失败。
+save_ckpt: true
 save_path: "./ckpt/qwen1.7b-32k-debug"
 
-# 架构魔改参数
-use_research: false
-research_swa_size: 512
-research_swa_layers_str: "0,2,4,6,8,10,12,14,16,18,20,22,24,26"
+# TensorBoard
+enable_tensorboard: true
+tensorboard_root: "./tb"
+
+# Log-structured KV cache (uniform 2:1 compaction)
+log_kv_B: 512
+log_kv_recent_size: 1024
+log_kv_train_block: 1024
+log_kv_prefill_block: 1024
+
+# 显著性钉扎（SnapKV 式观察窗；仅评测推理用，训练不受影响，随 run_eval/majob
+# 转发给 eval.py）。prefill 时 prompt 末尾 obs_window 个 query 给全前缀打分，
+# 每个 KV 组各钉 pin_size 个 token 为精确槽，免于被 mean-pool 稀释——
+# 针对捞针（NIAH）类任务。0 = 关闭。
+log_kv_pin_size: 256
+log_kv_pin_obs_window: 64
