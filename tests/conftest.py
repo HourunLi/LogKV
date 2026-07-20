@@ -1,5 +1,6 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
+import gc
 import os
 import shutil
 import sys
@@ -16,6 +17,19 @@ else:
     import warnings
 
     warnings.warn(f"Could not find extensions directory at {wd}")
+
+
+@pytest.fixture(autouse=True)
+def reclaim_cuda_memory():
+    """Free GPU memory after a test that actually used it, to avoid accumulation across CUDA tests.
+
+    Gated on ``memory_allocated`` (a cheap counter read) so the expensive ``gc.collect`` is skipped
+    for the many CPU-only tests that never touch the GPU.
+    """
+    yield
+    if torch.cuda.is_available() and torch.cuda.memory_allocated() > 0:
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 @pytest.fixture()
@@ -173,5 +187,15 @@ def pytest_collection_modifyitems(items: list[pytest.Function], config: pytest.C
                 # which prevents pytest from recognizing it as a TypeError.
                 pytest.mark.xfail(
                     reason="currently not working, see https://github.com/Lightning-AI/lightning-thunder/issues/2085",
+                )
+            )
+        # TODO: remove once thunder supports torch>=2.12
+        # DynamoThunder tests fail with torch>=2.12 due to MappingKeysView/generator having no len()
+        # in thunder's interpreter.
+        if "DynamoThunder" in test.nodeid and torch.__version__ >= "2.12":
+            test.add_marker(
+                pytest.mark.xfail(
+                    reason="DynamoThunder tests incompatible with torch>=2.12, see thunder upstream",
+                    strict=False,
                 )
             )

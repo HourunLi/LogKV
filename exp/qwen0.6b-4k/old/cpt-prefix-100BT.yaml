@@ -1,8 +1,0 @@
-config: cpt-prefix.yaml
-
-# 尝试用更多数据（80B）训练，采用first token loss，weight 0.5
-expid: cpt-prefix-100BT
-max_steps: 20000
-research_breakpoint_schedule_stable: 10000
-data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/fineweb-edu/sample/100BT/
-save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt/qwen0.6b-4k-cpt-prefix-100BT

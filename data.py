@@ -129,15 +129,20 @@ def tulu_messages_to_text(messages: object) -> str | None:
     return "\n\n".join(parts)
 
 
-def tokenize_source_file(path: str, tokenizer: Tokenizer, parquet_format: str = "text"):
+def tokenize_source_file(path: str, tokenizer: Tokenizer, parquet_format: str | None = None):
     """
     供 litdata.optimize 调用：每个样本一条序列（bos=False, eos=True）。
 
     Parquet：``text`` 模式固定读 ``text``；``chapter`` 模式按文件 schema 选 ``text`` / ``chapter`` / ``content``。
+    ``parquet_format=None``（默认）时按**当前文件自身路径**逐文件推断格式。
+    混合语料（如 tulu + 普通 text parquet 同在一个 data_dir）必须逐文件推断：
+    若用所有路径统一决定一个格式，普通 parquet 会被误按 ``messages`` 列读取。
     json/jsonl：``content`` / ``text`` / ``code``。
     """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".parquet":
+        if parquet_format is None:
+            parquet_format = _parquet_format_for_source_paths([path])
         pf = pq.ParquetFile(path)
         if parquet_format == "tulu_messages":
             col = "messages"
@@ -237,8 +242,6 @@ def prepare_tokenized_data(
                 raise NotImplementedError(f"数据集 {dataset_name} 尚未实现")
         all_files = [single_parquet]
 
-    parquet_format = _parquet_format_for_source_paths(all_files)
-
     tokenizer = Tokenizer(tokenizer_dir)
     _validate_tokenizer(tokenizer)
 
@@ -256,7 +259,9 @@ def prepare_tokenized_data(
     print(f"🚀 litdata.optimize → {out_dir}（chunk_bytes={chunk_bytes}, workers={use_workers}）")
 
     optimize(
-        fn=partial(tokenize_source_file, tokenizer=tokenizer, parquet_format=parquet_format),
+        # parquet_format=None → tokenize_source_file 按每个文件自身路径推断格式，
+        # 避免混合语料（tulu + 普通 text parquet）被统一成错误 schema。
+        fn=partial(tokenize_source_file, tokenizer=tokenizer),
         inputs=all_files,
         output_dir=out_dir,
         num_workers=use_workers,

@@ -24,19 +24,6 @@ def find_multiple(n: int, k: int) -> int:
 
 @dataclass
 class Config:
-    # ==========================================
-    # 🌟 你的新 Research 专属参数
-    # ==========================================
-    use_research: bool = False
-    research_enable_flash_attn: bool = True  # must be true for our method
-    research_swa_size: int = 512
-    research_attention_sink_size: int = 4
-    research_attention_dilated_stride: int = 256   # d: 第一个 dilated 中心距当前位置的距离
-    research_attention_dilated_block_size: int = 8  # b: 每个 dilated 中心周围的 block 宽度
-    research_prefill_swa_layers: list[int] = field(default_factory=lambda: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26])
-    research_separate_parameter: bool = True
-    research_removed_layers: list[int] = field(default_factory=lambda: [])
-    # ==========================================
     name: str = ""
     hf_config: dict = field(default_factory=dict)
     # General size parameters

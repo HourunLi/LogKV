@@ -1,22 +1,37 @@
-from eval import main as eval_main
+"""
+logKV adaptation CPT: continue pre-training under simulated compressed-KV
+(log-structured) streaming attention, so the model learns to read merged slots.
+Run on already-pretrained base weights. This script has no dense route.
+
+Usage:
+    # Single GPU debug
+    python demo.py --config exp/qwen0.6b-4k/debug.yaml
+
+    # Multi-GPU with torchrun
+    torchrun --nproc_per_node=8 demo.py --config exp/qwen0.6b-32k/cpt-base.yaml
+
+Architecture:
+    - Training: model(idx) routes through the logKV streaming simulation
+      (enable_log_kv_training; chunked slot attention, 2:1 compaction)
+    - Inference (eval): log-structured KV cache with O(recent + B*log N) memory
+      via model.set_log_kv_cache() + model(idx, input_pos=input_pos)
+"""
+
 import os
 import re
+import inspect
 import shutil
 import glob
 import tempfile
 from pathlib import Path
-# os.environ['https_proxy'] = '127.0.0.1:7897'
-# os.environ['http_proxy'] = '127.0.0.1:7897'
 import yaml
 from dataclasses import asdict
 import torch
 import lightning as L
 from datetime import datetime
-from torch.utils.data import DataLoader
 from litgpt import Config
 from litgpt.model import GPT
 from litgpt.utils import chunked_cross_entropy, load_checkpoint
-from jsonargparse import CLI
 import random
 import numpy as np
 from lightning.fabric.loggers import TensorBoardLogger
@@ -24,7 +39,6 @@ from litgpt.model import Block
 import math
 from lightning.fabric.strategies import DDPStrategy, FSDPStrategy
 from datetime import timedelta
-from contextlib import nullcontext
 from litdata.streaming import (
     CombinedStreamingDataset,
     StreamingDataLoader,
@@ -35,12 +49,11 @@ from litdata.streaming import (
 from data import litdata_chunks_dir, tokenizer_cache_key
 from utils import *
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 torch.set_default_dtype(torch.bfloat16)
 
 
 def _unique_save_dir(save_path: str) -> str:
-    """若目标路径已存在（文件或目录），则在同父目录下依次使用 ``{原名}_v2``、``_v3`` … 直至可用。"""
     p = Path(os.path.expandvars(os.path.expanduser(save_path)))
     try:
         p = p.resolve()
@@ -50,14 +63,39 @@ def _unique_save_dir(save_path: str) -> str:
     base = p.name
     cand = p
     n = 2
-    while cand.exists():
+    # Only bump when the candidate already holds a checkpoint, so a pre-existing
+    # but checkpoint-less directory (TensorBoard logs, a failed run, a manually
+    # created dir) is reused. This keeps the saved path equal to the YAML
+    # `save_path` that the pipeline (majob.sh) later evaluates, instead of
+    # silently diverging to `_v2` and leaving the eval pointed at an empty dir.
+    while (cand / "lit_model.pth").exists():
         cand = parent / f"{base}_v{n}"
         n += 1
     return str(cand)
 
 
+def _copy_tokenizer_and_configs(src_dirs: list[str], dst: str) -> None:
+    """Copy *.json / *.model (tokenizer + HF configs) into the save dir so it is
+    self-contained for eval (eval.py builds its Tokenizer from the save dir).
+    Later dirs take precedence on filename clashes, so pass the tokenizer_dir
+    last — it may differ from the weights checkpoint_dir."""
+    files: dict[str, str] = {}
+    searched: list[str] = []
+    for d in src_dirs:
+        searched.append(str(d))
+        for p in glob.glob(f"{d}/*.json") + glob.glob(f"{d}/*.model"):
+            files[os.path.basename(p)] = p
+    if "tokenizer.json" not in files and "tokenizer.model" not in files:
+        raise FileNotFoundError(
+            "No tokenizer.json / tokenizer.model found while saving checkpoint. "
+            f"Searched: {searched}. Set tokenizer_dir in the YAML to the base model "
+            "directory that contains the tokenizer files."
+        )
+    for p in files.values():
+        shutil.copy(p, dst)
+
+
 def _distributed_looks_multi_node() -> bool:
-    """torchrun 多机时通常 WORLD_SIZE > LOCAL_WORLD_SIZE；单机多卡二者相等。"""
     try:
         ws = int(os.environ.get("WORLD_SIZE", "1"))
         lws = int(os.environ.get("LOCAL_WORLD_SIZE", str(ws)))
@@ -66,120 +104,85 @@ def _distributed_looks_multi_node() -> bool:
     return ws > lws
 
 
+def _nvidia_smi_field(query: str) -> str | None:
+    """Return a single `nvidia-smi --query-gpu` field for GPU 0, or None if the
+    tool is missing / errors. Used only for diagnostics, so failures are silent."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    first = out.stdout.strip().splitlines()
+    return first[0].strip() if first else None
+
+
+def cuda_preflight() -> None:
+    """Fail fast with a readable message when the CUDA runtime cannot initialize.
+
+    ``torch._C._cuda_init`` is lazy: the first GPU touch (here, ``fabric.launch()``)
+    is where a driver/runtime mismatch surfaces, as an opaque traceback. This
+    prints a torch/CUDA/driver fingerprint up front and, if the device is
+    unreachable, raises a RuntimeError that names the likely cause (NVIDIA driver
+    too old for the CUDA version baked into the installed torch wheel) instead of
+    letting the raw ``_cuda_init`` error propagate.
+    """
+    driver = _nvidia_smi_field("driver_version")
+    print("[cuda-preflight] "
+          f"torch={torch.__version__} "
+          f"torch.version.cuda={torch.version.cuda} "
+          f"driver={driver or 'n/a'} "
+          f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
+          flush=True)
+
+    # Try to actually reach the device. torch.cuda.is_available() swallows the
+    # underlying error, so provoke it directly to capture the real message.
+    err: BaseException | None = None
+    try:
+        if not torch.cuda.is_available():
+            raise RuntimeError("torch.cuda.is_available() returned False")
+        torch.zeros(1, device="cuda")  # forces torch._C._cuda_init
+    except BaseException as e:  # noqa: BLE001 - want the raw reason for the report
+        err = e
+
+    if err is None:
+        print(f"[cuda-preflight] OK: {torch.cuda.device_count()} device(s) visible, "
+              f"compiled for CUDA {torch.version.cuda}", flush=True)
+        return
+
+    if torch.version.cuda is None:
+        hint = ("This torch build is CPU-only (torch.version.cuda is None). Install a "
+                "CUDA build of torch that matches the node's driver.")
+    else:
+        hint = (
+            f"torch was built for CUDA {torch.version.cuda}; the NVIDIA driver "
+            f"({driver or 'unknown'}) must support at least that CUDA version. "
+            "Run `nvidia-smi` and compare its top-right 'CUDA Version' with "
+            f"torch.version.cuda={torch.version.cuda}. If the driver's max is lower, "
+            "either install a torch wheel built for an older CUDA (e.g. a +cu118 "
+            "build) or upgrade the node's driver. Also verify CUDA_VISIBLE_DEVICES "
+            "points at a real GPU and that this node actually has one."
+        )
+    raise RuntimeError(
+        f"CUDA is not usable on this node: {type(err).__name__}: {err}\n"
+        f"[cuda-preflight] {hint}"
+    ) from err
+
+
 def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
-    """
-    大厂标准 LR 调度器：前段线性 Warmup，后段余弦退火 (Cosine Decay)
-    """
-    # 1. Warmup 阶段：从 0 线性爬升到 max_lr
+    """Cosine LR schedule with linear warmup."""
     if current_step < warmup_steps:
-        # 防止除零错误，最少给极小值
-        return max_lr * (current_step + 1) / warmup_steps
-        
-    # 2. 如果超出了最大训练步数，保持最小学习率
+        return max_lr * (current_step + 1) / max(warmup_steps, 1)
     if current_step > total_steps:
         return min_lr
-        
-    # 3. 余弦退火阶段：从 max_lr 极其平滑地滑落到 min_lr
-    decay_ratio = (current_step - warmup_steps) / (total_steps - warmup_steps)
+    decay_ratio = (current_step - warmup_steps) / max(total_steps - warmup_steps, 1)
     assert 0 <= decay_ratio <= 1
-    
-    # math.cos 接收弧度 (0 到 pi)，产出 1 到 -1
-    # 经过 0.5 * (1 + ...) 变换后，coeff 会从 1 平滑下降到 0
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) 
-    
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
-
-def generate_step_driven_mask(batch_size, seq_len, current_step, total_steps, device, stable=0, schedule=None):
-    """
-    基于当前训练 Iter 的动态断点生成器
-    一条序列只有一个断点。断点之前为 True (Prefill)，断点之后为 False (Decode)
-    """
-    if stable == -1:
-        progress = 1
-    else:
-        progress = min(current_step / max(1, total_steps - stable), 1)
-    
-    # 动态计算当前的上下界
-    min_prefill_ratio = 0.01 + progress * 0.1
-    max_prefill_ratio = 0.05 + progress * 0.9
-    
-    # 为 Batch 中的【每一条序列】独立地均匀随机生成一个断点
-    breakpoints = [int(random.uniform(min_prefill_ratio, max_prefill_ratio) * seq_len) for _ in range(batch_size)]
-    
-    breakpoints_tensor = torch.tensor(breakpoints, device=device).unsqueeze(1) # [B, 1]
-    
-    # 创造一个形状为 [B, T] 的递增索引矩阵
-    seq_indices = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
-    
-    # 🌟 魔法广播：只要索引 < 断点，就是 Prefill (True)
-    prefill_mask = seq_indices < breakpoints_tensor
-    
-    return prefill_mask
-
-
-def decode_prefix_mean_ce_multi_k(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    prefill_mask: torch.Tensor,
-    ks: list[int],
-    ignore_index: int = -100,
-) -> dict[int, torch.Tensor | None]:
-    """
-    监控 Decode 阶段的上下文休克。
-    支持传入多个 k 值，计算每条样本 decode 段前 k 个位置的平均 CE。
-
-    仅在每个样本断点后的 [bp, bp + max(ks)) 窗口上算 CE，避免对整段 T 做
-    (B*T, V) 的 cross_entropy（长上下文下即使用 no_grad 也会 OOM）。
-    
-    Args:
-        ks: 一个包含多个 k 值的列表，例如 [1, 5, 10]
-        
-    Returns:
-        dict: 形如 {1: tensor(11.9), 5: tensor(8.2), 10: tensor(5.4)}
-    """
-    if not ks:
-        return {}
-
-    B, T, V = logits.shape
-    device = logits.device
-    positive_ks = [k for k in ks if k > 0]
-    results: dict[int, torch.Tensor | None] = {k: None for k in ks if k <= 0}
-    if not positive_ks:
-        return results
-
-    k_max = max(positive_ks)
-    bp = prefill_mask.sum(dim=1, keepdim=True).to(dtype=torch.long, device=device)  # (B, 1)
-    offsets = torch.arange(k_max, device=device, dtype=torch.long).view(1, -1).expand(B, -1)
-    t_sel = bp + offsets  # (B, k_max) 绝对位置
-    in_bounds = t_sel < T
-    t_clamped = t_sel.clamp(max=T - 1)
-
-    b_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(t_clamped)
-    logit_win = logits[b_idx, t_clamped]  # (B, k_max, V)
-    tgt_for_ce = torch.where(
-        in_bounds,
-        targets[b_idx, t_clamped],
-        torch.tensor(ignore_index, device=device, dtype=targets.dtype),
-    )
-    ce_win = torch.nn.functional.cross_entropy(
-        logit_win.reshape(-1, V),
-        tgt_for_ce.reshape(-1),
-        ignore_index=ignore_index,
-        reduction="none",
-    ).view(B, k_max)
-
-    rel = offsets  # 0 .. k_max-1，对应断点后第几个 decode token
-    valid_targets_win = in_bounds & (targets[b_idx, t_clamped] != ignore_index)
-
-    for k in ks:
-        if k <= 0:
-            continue
-        m = (rel < k) & valid_targets_win
-        if not m.any():
-            results[k] = None
-        else:
-            results[k] = ce_win[m].mean()
-    return results
 
 
 def build_train_dataset(
@@ -191,7 +194,7 @@ def build_train_dataset(
     dataset_dir: str,
     data_mix_yaml: str | None,
 ) -> StreamingDataset | CombinedStreamingDataset:
-    """无 ``data_mix_yaml`` → ``litdata_chunks_dir`` 单源；有 → YAML 的 ``paths``（语料父目录）+ ``weights`` → ``CombinedStreamingDataset``。"""
+    """Single-source or multi-source (YAML-weighted) streaming dataset."""
     block = context_length + 1
 
     def _stream(path: str) -> StreamingDataset:
@@ -206,7 +209,7 @@ def build_train_dataset(
         chunks = litdata_chunks_dir(tok_dir, data_dir, dataset_dir, context_length)
         if not os.path.isdir(chunks) or not any(os.scandir(chunks)):
             raise FileNotFoundError(
-                f"未找到 LitData 缓存: {chunks}\n请先: python data.py ... --context_length {context_length}"
+                f"LitData cache not found: {chunks}\nRun: python data.py ... --context_length {context_length}"
             )
         return _stream(chunks)
 
@@ -214,41 +217,40 @@ def build_train_dataset(
     with open(yml, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
-        raise ValueError(f"数据配比 YAML 须为 dict: {yml}")
+        raise ValueError(f"Data mix YAML must be a dict: {yml}")
     try:
         raw_paths, raw_w = cfg["paths"], cfg["weights"]
     except KeyError as e:
-        raise ValueError(f"数据配比 YAML 必须包含 paths 与 weights: {yml}") from e
+        raise ValueError(f"Data mix YAML must contain paths and weights: {yml}") from e
     if len(raw_paths) != len(raw_w):
-        raise ValueError("paths 与 weights 长度须相同")
+        raise ValueError("paths and weights must have same length")
     base = cfg.get("base_dir")
     base = os.path.abspath(os.path.expanduser(str(base))) if base else ""
 
     def _resolve_yaml_path(p: str) -> str:
-        """每项为语料根目录（与 data.py 的 ``--data_dir`` 对应），解析为 ``<dir>/litdata_<hash>_ctx<len>``。"""
         p_exp = os.path.expanduser(str(p).strip())
         full = os.path.join(base, p_exp) if base else p_exp
         full = os.path.abspath(os.path.normpath(full))
         if not os.path.isdir(full):
-            raise FileNotFoundError(f"paths 不是目录: {full!r}")
+            raise FileNotFoundError(f"paths entry is not a directory: {full!r}")
         key = tokenizer_cache_key(tok_dir)
         exact = os.path.join(full, f"litdata_{key}_ctx{context_length}")
         if os.path.isdir(exact) and any(os.scandir(exact)):
             return os.path.abspath(exact)
         raise FileNotFoundError(
-            f"未找到 {exact!r}（需与当前 tokenizer、context_length 一致地先跑 data.py）"
+            f"Not found: {exact!r} (run data.py with matching tokenizer and context_length first)"
         )
 
     dirs: list[str] = []
     for p in raw_paths:
         full = _resolve_yaml_path(str(p))
         if not os.path.isdir(full) or not any(os.scandir(full)):
-            raise FileNotFoundError(f"LitData 目录无效（需已 data.py optimize）: {full}")
+            raise FileNotFoundError(f"Invalid LitData dir: {full}")
         dirs.append(full)
 
     s = float(sum(raw_w))
     if s <= 0:
-        raise ValueError("weights 之和须为正")
+        raise ValueError("weights sum must be positive")
     weights = tuple(float(w) / s for w in raw_w)
     iterate = bool(cfg.get("iterate_over_all", False))
 
@@ -262,204 +264,249 @@ def build_train_dataset(
     )
 
 
+def _load_yaml_config(yaml_path: str, model_dir: str) -> dict:
+    """Load a YAML config file that may refer to another YAML via 'config:' key.
+
+    Supports nesting: if the YAML has a 'config:' key pointing to another YAML,
+    the base config is loaded and overridden with the current YAML's values.
+    The 'config:' path is relative to the current YAML file.
+    """
+    yaml_path = os.path.normpath(os.path.expanduser(yaml_path))
+    if not os.path.isfile(yaml_path):
+        return {}
+
+    with open(yaml_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    if cfg is None:
+        return {}
+
+    if "config" in cfg:
+        base_name = cfg.pop("config")
+        # Resolve relative to the current YAML file's directory
+        base_dir = os.path.dirname(yaml_path)
+        base_path = os.path.join(base_dir, base_name)
+        base_cfg = _load_yaml_config(base_path, model_dir)
+        merged = {**base_cfg, **cfg}
+        return merged
+
+    return cfg
+
+
+# PyYAML implements YAML 1.1: scientific notation WITHOUT a decimal point
+# ("2e-5", "5e-6") does not match its float resolver and loads as *str*.
+# Configs in exp/ use exactly that style, so numeric params (learning_rate,
+# min_lr, ...) would arrive as strings and crash AdamW / the LR schedule.
+_SCI_FLOAT_RE = re.compile(r"[-+]?\d+(?:\.\d*)?[eE][-+]?\d+")
+
+
+def _coerce_yaml_sci_floats(cfg: dict) -> dict:
+    """Convert top-level str values that are scientific-notation numbers to float."""
+    return {
+        k: float(v) if isinstance(v, str) and _SCI_FLOAT_RE.fullmatch(v) else v
+        for k, v in cfg.items()
+    }
+
+
 @auto_expand_env_vars
 def main(
-        # MODEL
-        arch_name: str = "Qwen/Qwen3-0.6B-Base",
-        context_length: int = 4096,
-        ckpt_dir: str | None = None,
-        resume_dir: str | None = None,
-        # TRAINING
-        global_batch_size: int = 32,
-        micro_batch_size: int = 4,
-        num_epochs: int = 10,
-        max_steps: int = 10,
-        learning_rate: float = 2e-5,
-        weight_decay: float = 0.1,
-        num_devices: int = 1,
-        warmup_steps: int = 5,
-        min_lr: float = 2e-6,
-        entropy_chunk_size: int = 0,
-        # DATA
-        dataset_name: str = "debug",
-        dataset_dir: str = "data",
-        data_dir: str = "data",
-        tokenizer_dir: str | None = None,
-        data_shuffle_seed: int = 42,
-        data_mix_yaml: str | None = None,
-        num_workers: int = 16,
-        # IO
-        save_ckpt: bool = False,
-        save_path: str = "./ckpt/cpt",
-        # 多机 + research_separate_parameter：组装后的 state 必须先落到全员可读路径再 fabric.load_raw；
-        # tempfile 只在 rank0 本机存在，其它 node 会打不开。显式指定共享目录最稳妥；
-        # 未指定且检测到多机时，默认 save_path/_litgpt_fsdp_merged_staging/{expid}/（要求 save_path 在共享盘上）。
-        merged_state_staging_dir: str | None = None,
-        enable_tensorboard: bool = True,
-        tensorboard_root: str = './tb',
-        # RESEARCH
-        expid: str = 'debug',
-        use_research: bool = False,
-        research_swa_size: int = 512,
-        research_swa_layers_str: str = "0,2,4,6,8,10,12,14,16,18,20,22,24,26",
-        research_breakpoint_schedule: str | None = None,
-        research_breakpoint_schedule_stable: int = 0,
-        research_separate_parameter: bool = True,
-        research_attention_sink_size: int = 4,
-        research_attention_dilated_stride: int = 256,
-        research_attention_dilated_block_size: int = 8,
-        research_decode_prefix_tokens: int = 1,
-        research_decode_prefix_loss_weight: float = 0,
-        research_prefill_supervise: bool = True,
-        research_prefill_loss_weight: float = 0.3,
-        research_remove_order_str: str = "",
-        research_remove_interval: int = 0,
-        # EVAL
-        run_eval: str = "",  # "before" | "after" | "both"
-        eval_benchmark: str = "debug",
-        eval_map_branch: bool = False,
+    # ── Model ──
+    arch_name: str = "Qwen/Qwen3-0.6B-Base",
+    context_length: int = 4096,
+    ckpt_dir: str | None = None,
+    resume_dir: str | None = None,
+    # ── Training ──
+    global_batch_size: int = 32,
+    micro_batch_size: int = 4,
+    num_epochs: int = 10,
+    max_steps: int = 10,
+    learning_rate: float = 2e-5,
+    weight_decay: float = 0.1,
+    num_devices: int = 1,
+    warmup_steps: int = 5,
+    min_lr: float = 2e-6,
+    entropy_chunk_size: int = 0,
+    # ── Data ──
+    dataset_name: str = "debug",
+    dataset_dir: str = "data",
+    data_dir: str = "data",
+    tokenizer_dir: str | None = None,
+    data_shuffle_seed: int = 42,
+    data_mix_yaml: str | None = None,
+    num_workers: int = 16,
+    # ── IO ──
+    save_ckpt: bool = False,
+    save_path: str = "./ckpt/cpt",
+    save_interval: int = 500,
+    merged_state_staging_dir: str | None = None,
+    enable_tensorboard: bool = True,
+    tensorboard_root: str = "./tb",
+    # ── Experiment ──
+    expid: str = "debug",
+    # ── Log-structured KV cache (always on) ──
+    # This script IS the logKV adaptation phase: training always simulates the
+    # compressed-KV streaming attention so the model learns to read merged
+    # slots. Run it after dense pretraining, on already-pretrained base weights.
+    log_kv_B: int = 512,
+    log_kv_recent_size: int = 1024,
+    # Training replay block size. 2 = strict 2-token streaming semantics but
+    # extremely slow at 32K; 64/128/256 keep memory bounded and greatly reduce
+    # tiny matmul/autograd replay launches.
+    log_kv_train_block: int = 128,
+    # Eval-time prefill block size, forwarded to eval.py by run_eval (inference
+    # only, does not affect training). 2 = strict 2-token streaming semantics;
+    # larger = faster prefill with a bounded, block-size-limited deviation.
+    log_kv_prefill_block: int = 256,
+    # Eval-time salience pinning (SnapKV-style, inference only; forwarded to
+    # eval.py). At prefill the trailing pin_obs_window queries (the question at
+    # the prompt tail) score the whole prefix; the top pin_size tokens per KV
+    # group are kept as exact w=1 slots alongside the pooled hierarchy, so a
+    # distant needle survives mean-pool dilution. 0 = off.
+    log_kv_pin_size: int = 0,
+    log_kv_pin_obs_window: int = 64,
+    # ── Eval ──
+    run_eval: str = "",  # "before" | "after" | "both"
+    eval_benchmark: str = "debug",
+    # ── YAML config ──
+    config: str | None = None,
 ):
+    # ── Load YAML config if provided ──
+    # NOTE: `locals()[k] = v` does NOT write back to a function's real locals in
+    # CPython (locals() returns a snapshot), so YAML overrides must be applied by
+    # explicit re-binding below. A YAML value overrides the CLI/default value
+    # unless it is null (None), matching the previous `if v is not None` intent.
+    _yaml: dict = {}
+    if config is not None:
+        # expand_env_vars：bash 风格 ${VAR} / ${VAR-default} 展开（含继承合并后的
+        # 全部值）。必须与 majob.sh 的 bash 展开、eval.py 的装载一致，否则
+        # save_path 会被写成字面 ${...} 目录、eval 却去展开后的路径找权重。
+        _yaml = _coerce_yaml_sci_floats(
+            expand_env_vars(_load_yaml_config(os.path.join(os.getcwd(), config), "") or {})
+        )
+        _valid = set(inspect.signature(main).parameters)
+        for _k in _yaml:
+            if _k != "config" and _k not in _valid:
+                print(f"[demo] WARNING: unknown YAML key ignored: {_k}")
 
-    # 1. set seeds
+    def _o(name, current):
+        v = _yaml.get(name)
+        return v if v is not None else current
+
+    arch_name = _o("arch_name", arch_name)
+    context_length = _o("context_length", context_length)
+    ckpt_dir = _o("ckpt_dir", ckpt_dir)
+    resume_dir = _o("resume_dir", resume_dir)
+    global_batch_size = _o("global_batch_size", global_batch_size)
+    micro_batch_size = _o("micro_batch_size", micro_batch_size)
+    num_epochs = _o("num_epochs", num_epochs)
+    max_steps = _o("max_steps", max_steps)
+    learning_rate = _o("learning_rate", learning_rate)
+    weight_decay = _o("weight_decay", weight_decay)
+    num_devices = _o("num_devices", num_devices)
+    warmup_steps = _o("warmup_steps", warmup_steps)
+    min_lr = _o("min_lr", min_lr)
+    entropy_chunk_size = _o("entropy_chunk_size", entropy_chunk_size)
+    dataset_name = _o("dataset_name", dataset_name)
+    dataset_dir = _o("dataset_dir", dataset_dir)
+    data_dir = _o("data_dir", data_dir)
+    tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
+    data_shuffle_seed = _o("data_shuffle_seed", data_shuffle_seed)
+    data_mix_yaml = _o("data_mix_yaml", data_mix_yaml)
+    num_workers = _o("num_workers", num_workers)
+    save_ckpt = _o("save_ckpt", save_ckpt)
+    save_path = _o("save_path", save_path)
+    save_interval = _o("save_interval", save_interval)
+    merged_state_staging_dir = _o("merged_state_staging_dir", merged_state_staging_dir)
+    enable_tensorboard = _o("enable_tensorboard", enable_tensorboard)
+    tensorboard_root = _o("tensorboard_root", tensorboard_root)
+    expid = _o("expid", expid)
+    log_kv_B = _o("log_kv_B", log_kv_B)
+    log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
+    log_kv_train_block = _o("log_kv_train_block", log_kv_train_block)
+    log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
+    log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
+    log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
+    run_eval = _o("run_eval", run_eval)
+    eval_benchmark = _o("eval_benchmark", eval_benchmark)
+
+    # Fail fast: run_eval="after"/"both" evaluates save_path, which is only
+    # written when save_ckpt is true. Catch the contradiction here instead of
+    # training for hours and then dying in eval on a missing tokenizer/weights.
+    if run_eval in ("after", "both") and not save_ckpt:
+        raise ValueError(
+            f"run_eval={run_eval!r} evaluates the saved checkpoint, but save_ckpt is false — "
+            "nothing would be written to save_path. Set save_ckpt: true in the YAML "
+            "(or set run_eval: '' to skip the post-training eval)."
+        )
+
+    # 1. Set seeds
     set_random_seeds(42)
-    # timestr = datetime.now().strftime("%Y%m%d-%H%M%S")
     tb_logger = TensorBoardLogger(root_dir=tensorboard_root, name=f"{expid}_{arch_name.replace('/', '-')}")
     loggers = [tb_logger] if enable_tensorboard else []
-    
-    # 2. 这里的 Fabric 逻辑保持不变...
-    find_unused_parameters = True if len(research_remove_order_str) > 0 else False
-    use_fsdp = (context_length > 4096)
+
+    # 2. Fabric setup
+    use_fsdp = context_length > 4096
     print("Use FSDP:", use_fsdp)
     if not use_fsdp:
-        strategy = DDPStrategy(
-            timeout=timedelta(days=3650),
-            find_unused_parameters=find_unused_parameters
-        )
+        strategy = DDPStrategy(timeout=timedelta(days=3650))
     else:
         strategy = FSDPStrategy(
-            # FULL_SHARD 等价于 DeepSpeed ZeRO-3，切分权重、梯度和优化器状态
-            # 如果显存依然吃紧，可以保持 FULL_SHARD；如果计算通信比瓶颈明显，可改为 SHARD_GRAD_OP (ZeRO-2)
             sharding_strategy="SHARD_GRAD_OP",
             state_dict_type="full",
             auto_wrap_policy={Block},
             activation_checkpointing_policy={Block},
             timeout=timedelta(days=3650),
         )
+    # Surface a driver/runtime mismatch here, as a readable error, before the
+    # opaque torch._C._cuda_init traceback inside fabric.launch().
+    cuda_preflight()
     fabric = L.Fabric(
-        accelerator="cuda", 
-        devices=num_devices, 
-        num_nodes=int(os.environ.get("GROUP_WORLD_SIZE", 1)), # 兼容单机和多机
+        accelerator="cuda",
+        devices=num_devices,
+        num_nodes=int(os.environ.get("GROUP_WORLD_SIZE", 1)),
         strategy=strategy,
-        precision='bf16-true',
+        precision="bf16-true",
         loggers=loggers,
     )
     fabric.launch()
     fabric.print("Tensorboard root:", tensorboard_root)
+    # Checkpoint 去向尽早入日志：save_path 为相对路径时跟随作业的 cwd，
+    # 训练完“找不到 checkpoint”十有八九是在另一个目录里找。save_ckpt=False
+    # 时这里就是唯一会明说“不会保存”的地方。
+    fabric.print(
+        f"save_ckpt={save_ckpt} | save_path="
+        f"{Path(os.path.expandvars(os.path.expanduser(save_path))).absolute()} "
+        f"(cwd={os.getcwd()})"
+        + ("" if save_ckpt else " | ⚠️ save_ckpt=False：本次训练不会写任何 checkpoint")
+    )
 
-    swa_layers = [int(x.strip()) for x in research_swa_layers_str.split(",")] if research_swa_layers_str else []
-    research_remove_order = [int(x.strip()) for x in research_remove_order_str.split(",")] if research_remove_order_str else []
-
-    config = Config.from_name(arch_name) 
-    assert config is not None
-    config.block_size = context_length
-    config.use_research = use_research
-    config.research_swa_size = research_swa_size
-    config.research_attention_sink_size = research_attention_sink_size
-    config.research_attention_dilated_stride = research_attention_dilated_stride
-    config.research_attention_dilated_block_size = research_attention_dilated_block_size
-    config.research_prefill_swa_layers = swa_layers
-    config.research_separate_parameter = research_separate_parameter
-    config.research_removed_layers = []
-    fabric.print(f"⚙️ 模型 Config 初始化完成: {config.name}")
+    config_obj = Config.from_name(arch_name)
+    assert config_obj is not None
+    config_obj.block_size = context_length
+    fabric.print(f"Model config initialized: {config_obj.name}")
 
     with fabric.init_module(empty_init=True):
-        model = GPT(config)
+        model = GPT(config_obj)
 
     checkpoint_dir = f"checkpoints/{arch_name}"
     if ckpt_dir is not None:
         checkpoint_dir = ckpt_dir
     load_dir = checkpoint_dir if resume_dir is None else resume_dir
     ckpt_path = Path(load_dir) / "lit_model.pth"
-    fabric.print(f"🔄 正在从 {ckpt_path} 加载预训练 Checkpoint...")
-
-    # 与 litgpt/pretrain、litgpt/utils.load_checkpoint 一致：先 fabric.setup，再加载。
-    # FSDP 下必须在 wrap 之后用 fabric.load_raw，否则易出现分片与全量 state_dict 不匹配。
-    merged_state_dict = None
-    raw_ckpt = torch.load(ckpt_path, map_location="cpu")
-    state_dict = raw_ckpt["model"] if "model" in raw_ckpt else raw_ckpt
-    del raw_ckpt
-
-    if config.use_research and config.research_separate_parameter:
-        fabric.print("🔀 检测到 Block 级参数独立！正在为 h_prefill 组装预训练权重...")
-        prefill_weights = {}
-        for i, block_idx in enumerate(config.research_prefill_swa_layers):
-            orig_prefix = f"transformer.h.{block_idx}."
-            new_prefix = f"transformer.h_prefill.{i}."
-            for key, value in state_dict.items():
-                if key.startswith(orig_prefix):
-                    new_key = key.replace(orig_prefix, new_prefix, 1)
-                    if new_key not in state_dict.keys():
-                        prefill_weights[new_key] = value.clone()
-        state_dict.update(prefill_weights)
-        fabric.print(f"✅ 成功映射并注入了 {len(prefill_weights)} 个 Block 级别的张量！")
-        merged_state_dict = state_dict
+    fabric.print(f"Loading checkpoint from {ckpt_path}...")
 
     model = fabric.setup_module(model)
 
-    if merged_state_dict is not None:
-        # 须与 convert_hf_checkpoint 的 lit_model.pth 一致：扁平 state_dict；fabric.load_raw 不解包 "model"。
-        # load_checkpoint(FSDP) 会把 rank0 的路径广播给全员；路径必须在每台机器上指向同一可读文件。
-        # 单机多卡：tempfile 在共享内存磁盘上全员可见。多机：必须写到 NFS/对象存储挂载等共享路径。
-        use_shared_staging = merged_state_staging_dir is not None or _distributed_looks_multi_node()
-        staging_file: Path | None = None
+    # Single load: load_checkpoint streams weights into the (FSDP-)wrapped model.
+    # A prior torch.load() here only to peek at the state dict doubled peak CPU
+    # memory for large checkpoints without being used.
+    load_checkpoint(fabric, model, ckpt_path, strict=True)
+    fabric.print("Weights loaded successfully.")
 
-        if use_shared_staging:
-            if merged_state_staging_dir is not None:
-                staging_root = Path(os.path.expandvars(os.path.expanduser(merged_state_staging_dir))) / expid
-            else:
-                staging_root = (
-                    Path(os.path.expandvars(os.path.expanduser(save_path))) / "_litgpt_fsdp_merged_staging" / expid
-                )
-            staging_file = staging_root / ".litgpt_demo_merged.pth"
-            fabric.print(f"📁 research 合并权重 staging（多机须共享盘）: {staging_file}")
-            if fabric.global_rank == 0:
-                staging_file.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(merged_state_dict, staging_file)
-            fabric.barrier()
-            load_checkpoint(fabric, model, staging_file, strict=False)
-        else:
-            tmp_path: Path
-            if fabric.global_rank == 0:
-                fd, tmp = tempfile.mkstemp(suffix=".pth")
-                os.close(fd)
-                tmp_path = Path(tmp)
-                torch.save(merged_state_dict, tmp_path)
-            else:
-                tmp_path = Path("")
-            fabric.barrier()
-            load_checkpoint(fabric, model, tmp_path, strict=False)
-            fabric.barrier()
-            if fabric.global_rank == 0 and tmp_path.is_file():
-                tmp_path.unlink(missing_ok=True)
-
-        fabric.barrier()
-        if staging_file is not None and fabric.global_rank == 0:
-            try:
-                staging_file.unlink(missing_ok=True)
-            except OSError:
-                fabric.print(f"⚠️ 无法删除 staging 文件（部分共享盘限制 unlink），可手动删: {staging_file}")
-    else:
-        load_checkpoint(fabric, model, ckpt_path, strict=True)
-
-    fabric.print("✅ 真实权重加载成功！所有分支已完成 Pre-trained 初始化。")
-
-    # ==========================================
-    # 🌟 工业级优化器初始化：Weight Decay 分组过滤
-    # ==========================================
+    # ── Optimizer with weight decay groups ──
     decay_params = []
     no_decay_params = []
-
-    no_decay_keywords = ["bias", "norm", "ln_"] 
+    no_decay_keywords = ["bias", "norm", "ln_"]
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -469,32 +516,46 @@ def main(
         else:
             decay_params.append(param)
 
-    # 打印出来心里有底
-    fabric.print(f"⚙️ 施加 Weight Decay 的参数组 (如 Linear): {len(decay_params)} 个张量")
-    fabric.print(f"⚙️ 豁免 Weight Decay 的参数组 (如 Norm, Bias): {len(no_decay_params)} 个张量")
+    fabric.print(f"Weight decay params: {len(decay_params)} tensors")
+    fabric.print(f"No weight decay params: {len(no_decay_params)} tensors")
 
-    # 组装成包含两组字典的列表喂给优化器
     optim_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},    # 🌟 黄金默认值 0.1
-        {"params": no_decay_params, "weight_decay": 0.0}  # 绝对不能压缩
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    # 这里假设你配置文件里的 learning_rate 是 2e-5 之类的 CPT 常用学习率
     optimizer = torch.optim.AdamW(
-        optim_groups, 
-        lr=learning_rate, 
-        betas=(0.9, 0.95),  # LLM 预训练标配的 betas
-        eps=1e-8
+        optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8
     )
     optimizer = fabric.setup_optimizers(optimizer)
 
-    def _run_eval(ckpt):
-        eval_main(checkpoint_dir=ckpt, benchmark=eval_benchmark, map_branch=eval_map_branch, config_overrides=asdict(config))
+    # ── Evaluation helper ──
+    # Same code path AND same semantics as a standalone `eval.py --config
+    # exp/.../eval.yaml` run and as majob.sh: the checkpoint is evaluated under
+    # the same compressed-KV (logKV) attention it was trained with, with the
+    # training-time B/recent_size and the same prefill block. Results land in
+    # {save_path}/evaluate (majob.sh's EVAL_OUTPUT_DIR) — also for the "before"
+    # eval, whose base checkpoint dir may be read-only; each timestamped JSON
+    # records its own checkpoint_dir. tokenizer_dir is forwarded for checkpoints
+    # whose save dir lacks tokenizer files.
+    def _run_eval(ckpt, benchmark):
+        from eval import main as eval_main
+        eval_main(
+            checkpoint_dir=ckpt,
+            benchmark=benchmark,
+            output_path=f"{save_path}/evaluate",
+            log_kv_B=log_kv_B,
+            log_kv_recent_size=log_kv_recent_size,
+            log_kv_prefill_block=log_kv_prefill_block,
+            log_kv_pin_size=log_kv_pin_size,
+            log_kv_pin_obs_window=log_kv_pin_obs_window,
+            tokenizer_dir=tokenizer_dir,
+        )
 
     if run_eval in ("before", "both"):
-        _run_eval(load_dir)
+        _run_eval(load_dir, eval_benchmark)
 
-    # 3. LitData：单源目录 或 CombinedStreamingDataset 配比多源
+    # ── Data loading ──
     tok_dir = tokenizer_dir if tokenizer_dir is not None else load_dir
     train_dataset = build_train_dataset(
         context_length=context_length,
@@ -505,9 +566,9 @@ def main(
         data_mix_yaml=data_mix_yaml,
     )
     if isinstance(train_dataset, CombinedStreamingDataset):
-        fabric.print(f"[Rank {fabric.global_rank}] 训练数据: CombinedStreamingDataset（多源配比）")
+        fabric.print(f"[Rank {fabric.global_rank}] Training data: CombinedStreamingDataset (multi-source)")
     else:
-        fabric.print(f"[Rank {fabric.global_rank}] 训练数据: StreamingDataset（单源）")
+        fabric.print(f"[Rank {fabric.global_rank}] Training data: StreamingDataset (single source)")
     fabric.barrier()
     dataloader = StreamingDataLoader(
         train_dataset,
@@ -518,11 +579,31 @@ def main(
     )
     dataloader = fabric.setup_dataloaders(dataloader)
 
-    fabric.print("🚀 开始 Continue Pretraining...")
+    fabric.print("Starting Continue Pretraining...")
     model.train()
 
+    # Always simulate the logKV compressed-KV streaming attention during
+    # training — this script only supports the logKV adaptation route.
+    model.enable_log_kv_training(
+        batch_size=micro_batch_size,
+        max_seq_length=context_length,
+        device=fabric.device,
+        # Allocate cache buffers in the activation dtype instead of relying on
+        # the process default; keeps them aligned with the bf16-true params.
+        dtype=next(model.parameters()).dtype,
+        B=log_kv_B,
+        recent_size=log_kv_recent_size,
+        train_block=log_kv_train_block,
+    )
+    fabric.print(
+        f"logKV training ENABLED: B={log_kv_B}, "
+        f"recent_size={log_kv_recent_size}, "
+        f"train_block={log_kv_train_block}, "
+        f"blocks/seq={math.ceil(context_length / max(log_kv_train_block, 1))}"
+    )
+
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
-    optimizer.zero_grad(set_to_none=True) 
+    optimizer.zero_grad(set_to_none=True)
     step_start_time = datetime.now()
     step_stats = MicroStepMeanStats()
     global_step = 0
@@ -538,70 +619,29 @@ def main(
         except StopIteration:
             data_epoch += 1
             if data_epoch > num_epochs:
-                fabric.print(f"🛑 已遍历数据 {num_epochs} 个 epoch，未达到 max_steps={max_steps}，停止。")
+                fabric.print(f"Data exhausted after {num_epochs} epochs, step={global_step}/{max_steps}. Stopping.")
                 break
             loader_iter = iter(dataloader)
             continue
 
         inputs = train_data[:, 0:context_length].contiguous().long()
-        targets = train_data[:, 1 : context_length + 1].contiguous().long()
+        targets = train_data[:, 1:context_length + 1].contiguous().long()
         is_accumulating = (micro_batch_idx + 1) % gradient_accumulation_steps != 0
         micro_batch_idx += 1
 
-        prefill_mask = generate_step_driven_mask(
-            batch_size=inputs.size(0),
-            seq_len=inputs.size(1),
-            current_step=global_step + 1,
-            total_steps=total_steps,
-            device=fabric.device,
-            schedule=research_breakpoint_schedule,
-            stable=research_breakpoint_schedule_stable,
-        )
-
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(inputs, prefill_mask=prefill_mask)
-
-            masked_targets = targets.masked_fill(prefill_mask == True, -100)
-            compariable_decode_loss = chunked_cross_entropy(logits, masked_targets, chunk_size=entropy_chunk_size)
-            if use_research and not research_prefill_supervise:
-                loss = compariable_decode_loss
-            elif use_research and research_prefill_supervise:
-                prefill_only_targets = targets.masked_fill(prefill_mask == False, -100)
-                prefill_loss = chunked_cross_entropy(logits, prefill_only_targets, chunk_size=entropy_chunk_size)
-                alpha = research_prefill_loss_weight
-                loss = alpha * prefill_loss + (1 - alpha) * compariable_decode_loss
-            else:
-                loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
-
-            metrics = {
-                "compariable_loss": compariable_decode_loss.detach().item(),
-            }
-            if use_research and research_prefill_supervise:
-                metrics["prefill_loss"] = prefill_loss.detach().item()
-
-            # 🌟 监控 Decode 前缀 token 的 loss（用于诊断上下文休克）
-            # 硬编码 ks=[1,2,4,8,16]，观测 decode 开始后前 k 个 token 的平均 loss
-            if research_decode_prefix_tokens > 0:
-                prefix_ks = [1, 2, 4, 8, 16] + [research_decode_prefix_tokens]
-                prefix_ks.sort()
-                # 如果 weight=0，只观测指标不计算梯度；如果 weight>0，计算梯度用于加权 loss
-                grad_ctx = torch.no_grad() if research_decode_prefix_loss_weight == 0 else nullcontext()
-                with grad_ctx:
-                    prefix_losses = decode_prefix_mean_ce_multi_k(logits, targets, prefill_mask, ks=prefix_ks)
-
-                # 记录所有 prefix loss 到 metrics（TensorBoard 监控）
-                if len(prefix_losses) > 0:
-                    for k, prefix_loss in prefix_losses.items():
-                        if prefix_loss is not None:
-                            metrics[f"prefix_loss_{k}"] = prefix_loss.detach().item()
-
-                    # 可选：如果 weight > 0，加权前 k 个 token 的 loss 到总 loss
-                    if use_research and research_decode_prefix_loss_weight > 0 and prefix_losses[research_decode_prefix_tokens] is not None:
-                        loss += prefix_losses[research_decode_prefix_tokens] * research_decode_prefix_loss_weight
-
-            metrics["loss"] = loss.detach().item()
-            metrics["prefill_ratio"] = (prefill_mask.sum() / prefill_mask.numel()).item()
-            step_stats.accumulate(**metrics)
+            # Routes through _log_kv_train_lowmem_forward (training_log_kv is on
+            # and input_pos is None): chunked slot attention over the simulated
+            # compressed-KV stream, not a standard dense causal forward. The
+            # low-memory Function streams the forward without a graph and
+            # replays block-by-block in backward, so per-layer activation
+            # memory is O(T + train_block*S) instead of the naive O(T/2*S).
+            logits = model(inputs)
+            loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
+            # Feed the per-micro-batch loss into the step aggregator; without this
+            # step_stats.averages() is always empty and neither the console line
+            # nor TensorBoard ever shows the training loss.
+            step_stats.accumulate(loss=loss.detach().item())
 
             loss = loss / gradient_accumulation_steps
             fabric.backward(loss)
@@ -633,49 +673,67 @@ def main(
 
             step_stats.reset()
             global_step += 1
+
             if global_step >= max_steps:
-                fabric.print(f"🚨 已达到最大训练步数 {max_steps}，提前结束训练！")
+                fabric.print(f"Reached max_steps={max_steps}. Training complete.")
                 training_finished = True
 
-            if research_remove_interval > 0 and global_step % research_remove_interval == 0:
-                remove_index = global_step // research_remove_interval
-                if remove_index <= len(research_remove_order):
-                    remove_index = research_remove_order[remove_index - 1]
-                    config.research_removed_layers.append(remove_index)
-                    fabric.print(f"🔥 已移除层 {remove_index}，当前所有已移除层为 {config.research_removed_layers}")
+            if save_ckpt and save_interval > 0 and global_step % save_interval == 0 and not training_finished:
+                step_save_path = f"{save_path}/step_{global_step}"
+                step_save_path = _unique_save_dir(step_save_path)
+                if fabric.global_rank == 0:
+                    os.makedirs(step_save_path, exist_ok=True)
+                fabric.barrier()
+                state = {"model": model, "optimizer": optimizer, "global_step": global_step}
+                fabric.save(f"{step_save_path}/lit_model.pth", state)
+                fabric.barrier()
+                if fabric.global_rank == 0:
+                    _copy_tokenizer_and_configs([checkpoint_dir, tok_dir], step_save_path)
+                    with open(f"{step_save_path}/model_config.yaml", "w", encoding="utf-8") as f:
+                        yaml.dump(asdict(config_obj), f)
+                fabric.barrier()
+                fabric.print(f"Checkpoint saved to {step_save_path}")
 
+    # ── Final save ──
     if save_ckpt:
+        requested_save_path = save_path
         save_path = _unique_save_dir(save_path)
         if fabric.global_rank == 0:
-            fabric.print(f"💾 最终保存目录（已避重）: {save_path}")
+            if Path(save_path).name != Path(os.path.expandvars(os.path.expanduser(requested_save_path))).name:
+                fabric.print(
+                    f"⚠️ {requested_save_path} 下已有 lit_model.pth，最终保存目录顺延为 {save_path}。"
+                    "注意：majob.sh / eval.yaml 评测的是原 save_path（旧权重）——"
+                    "如非有意保留，请清理旧目录后重跑。"
+                )
+            fabric.print(f"Final save dir: {save_path}")
             os.makedirs(save_path, exist_ok=True)
         fabric.barrier()
 
-        state = {
-            "model": model,
-            "optimizer": optimizer,
-            "global_step": global_step,
-        }
-        # state_dict_type="full" 时由 rank0 写出单个 lit_model.pth 文件（非 DCP 目录）。
-        fabric.print(f"💾 正在保存至 {save_path}/lit_model.pth ...")
+        state = {"model": model, "optimizer": optimizer, "global_step": global_step}
+        fabric.print(f"Saving to {save_path}/lit_model.pth ...")
         fabric.save(f"{save_path}/lit_model.pth", state)
         fabric.barrier()
+        # fabric.save 静默失败（磁盘配额、共享盘未同步）会让后续 eval 报一个
+        # 误导性的加载错误——就地核验，以真实原因尽早失败。
+        if fabric.global_rank == 0 and not os.path.isfile(f"{save_path}/lit_model.pth"):
+            raise RuntimeError(
+                f"fabric.save 已返回，但 {save_path}/lit_model.pth 不存在——"
+                "检查磁盘配额 / 共享文件系统同步状态。"
+            )
 
         if fabric.global_rank == 0:
-            for file_path in glob.glob(f"{checkpoint_dir}/*.json") + glob.glob(f"{checkpoint_dir}/*.model"):
-                shutil.copy(file_path, save_path)
-
+            _copy_tokenizer_and_configs([checkpoint_dir, tok_dir], save_path)
             with open(f"{save_path}/model_config.yaml", "w", encoding="utf-8") as f:
-                yaml.dump(asdict(config), f)
-
-            fabric.print(f"📦 Tokenizer 与 model_config 已写入 {save_path}")
-            fabric.print("✅ 已保存单文件 lit_model.pth（FSDP full state_dict）")
+                yaml.dump(asdict(config_obj), f)
+            fabric.print(f"Tokenizer and model_config written to {save_path}")
+            fabric.print("Done.")
         fabric.barrier()
-    
-    if run_eval in ("after", "both"):
-        _run_eval(save_path)
 
-    fabric.print("🎉 训练运行结束！")
+    if run_eval in ("after", "both"):
+        _run_eval(save_path, eval_benchmark)
+
+    fabric.print("Training finished!")
+
 
 if __name__ == "__main__":
-    CLI(main)
+    run_cli(main)

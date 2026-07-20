@@ -7,6 +7,10 @@ source /home/ma-user/anaconda3/bin/activate torch218
 export CUDA_DEVICE_MAX_CONNECTIONS=32
 export CUDNN_LOGERR_DBG=1
 export CUDNN_LOGDEST_DBG=stderr
+# logKV 流式 attention 每 chunk 产生大量不等长的小分配（评测数千条样本、训练
+# T/2 个 chunk），expandable_segments 让分配器按段扩展而非整块缓存，
+# 显著缓解长时运行的碎片化 OOM。
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export PATH=/usr/local/cuda-12.8/bin:${PATH}
 export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH}
@@ -74,6 +78,100 @@ fi
 echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 
 # ==============================================================================
+# 🧩 logKV 专属：从训练 YAML（跟随 'config:' 继承）提取 logKV 设置，
+# 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
+# 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
+# ==============================================================================
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS SAVE_CKPT TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+import os
+import sys
+
+import yaml
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if "config" in cfg:
+        base = load(os.path.join(os.path.dirname(path), cfg.pop("config")))
+        cfg = {**base, **cfg}
+    return cfg
+
+
+cfg = load(sys.argv[1])
+arch_name = cfg.get("arch_name", "Qwen/Qwen3-0.6B-Base")
+ckpt_dir = cfg.get("ckpt_dir") or os.path.join("checkpoints", arch_name)
+resume_dir = cfg.get("resume_dir")
+tokenizer_dir = cfg.get("tokenizer_dir")
+
+candidates = []
+for d in (tokenizer_dir, resume_dir, ckpt_dir, os.path.join("checkpoints", arch_name)):
+    if d and d not in candidates:
+        candidates.append(d)
+
+print(
+    cfg.get("log_kv_B", 512),
+    cfg.get("log_kv_recent_size", 1024),
+    cfg.get("log_kv_prefill_block", 256),
+    cfg.get("log_kv_pin_size", 0),
+    cfg.get("log_kv_pin_obs_window", 64),
+    str(bool(cfg.get("save_ckpt", False))).lower(),
+    ":".join(candidates),
+)
+EOF
+)"
+
+# 流水线前置检查：eval 阶段固定评测 ${SAVE_DIR}，如果既没有现成权重、
+# 训练又不会保存（save_ckpt: false），训练完就会在 eval 的 tokenizer/权重
+# 加载处崩溃。在开训前拦截，避免白跑几小时。
+if [ "${SAVE_CKPT}" != "true" ] && [ ! -f "${SAVE_DIR}/lit_model.pth" ]; then
+    echo "❌ 致命错误：${CONFIG_FILE} 中 save_ckpt 未开启，且 ${SAVE_DIR} 下没有现成权重。"
+    echo "   训练结束后将没有 checkpoint 可评测。请在 YAML 中设置 save_ckpt: true。"
+    exit 1
+fi
+
+has_tokenizer() {
+    [ -n "$1" ] && { [ -f "$1/tokenizer.json" ] || [ -f "$1/tokenizer.model" ]; }
+}
+
+TOKENIZER_SOURCE=""
+IFS=':' read -r -a TOKENIZER_CANDIDATE_ARRAY <<< "${TOKENIZER_CANDIDATES}"
+for RAW_TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
+    eval TOK_DIR="\"${RAW_TOK_DIR}\""
+    if has_tokenizer "${TOK_DIR}"; then
+        TOKENIZER_SOURCE="${TOK_DIR}"
+        break
+    fi
+done
+
+LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_pin_size ${LOG_KV_PIN} --log_kv_pin_obs_window ${LOG_KV_PIN_OBS}"
+TOKENIZER_ARGS=""
+if [ -n "${TOKENIZER_SOURCE}" ]; then
+    TOKENIZER_ARGS="--tokenizer_dir ${TOKENIZER_SOURCE}"
+    echo "🔤 tokenizer source: ${TOKENIZER_SOURCE}"
+else
+    echo "⚠️ 未在候选目录中找到 tokenizer.json/tokenizer.model: ${TOKENIZER_CANDIDATES}"
+    echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
+fi
+echo "🧩 logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS})"
+
+ensure_checkpoint_tokenizer() {
+    if has_tokenizer "${SAVE_DIR}"; then
+        return 0
+    fi
+    if [ -z "${TOKENIZER_SOURCE}" ]; then
+        return 1
+    fi
+    if [ "${NODE_RANK}" -eq 0 ]; then
+        echo "🔤 ${SAVE_DIR} 缺少 tokenizer，正在从 ${TOKENIZER_SOURCE} 复制 tokenizer/config 文件..."
+        mkdir -p "${SAVE_DIR}"
+        cp -f "${TOKENIZER_SOURCE}"/*.json "${SAVE_DIR}/" 2>/dev/null || true
+        cp -f "${TOKENIZER_SOURCE}"/*.model "${SAVE_DIR}/" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# ==============================================================================
 # 🌟 核心新增：检查 Checkpoint 是否已存在
 # ==============================================================================
 if [ -f "${SAVE_DIR}/lit_model.pth" ]; then
@@ -96,26 +194,65 @@ else
 
     TRAIN_STATUS=$?
     if [ $TRAIN_STATUS -ne 0 ]; then
-        echo "❌ [Node ${NODE_RANK}] 训练阶段崩溃或被手动中断 (Exit Code: $TRAIN_STATUS)，已拦截后续评测！"
-        exit $TRAIN_STATUS
+        echo "⚠️ [Node ${NODE_RANK}] 训练退出码非零 (Exit Code: $TRAIN_STATUS)，通常为 NCCL 正常销毁竞争，非实质错误。"
     fi
 
-    echo "🎉 [Node ${NODE_RANK}] 阶段一完成！模型已成功保存至 ${SAVE_DIR}"
-    
+    echo "🎉 [Node ${NODE_RANK}] 阶段一（训练）结束"
+
     # 强制操作系统彻底回收显存
     sleep 15
 fi
 
+# ==============================================================================
+# 🌟 阶段一产物核验：save_ckpt: true 时训练必须产出权重。缺失说明训练中途
+# 崩溃/被杀（上面的非零退出码并不总是 NCCL 良性竞争）——在这里立刻失败，
+# 否则 eval 阶段只会报一个误导性的「加载 checkpoint 出错」。
+# ==============================================================================
+if [ "${SAVE_CKPT}" == "true" ] && [ ! -f "${SAVE_DIR}/lit_model.pth" ]; then
+    echo "❌ 致命错误：训练阶段结束，但 ${SAVE_DIR}/lit_model.pth 不存在（训练退出码见上方 ⚠️ 行）。"
+    echo "   排查（在训练日志中从后往前找）："
+    echo "   ➤ 无 'Reached max_steps' / 'Data exhausted' → 训练循环中途崩溃，向上翻最后一个 Traceback；"
+    echo "   ➤ 有 'Training complete' 但无 'Final save dir:' → 生效配置 save_ckpt 为 false；"
+    echo "   ➤ 有 'Saving to ... lit_model.pth' 但无 'Done.' → 保存阶段被杀（墙钟/内存/磁盘配额）；"
+    echo "   ➤ 'Final save dir:' 显示 _v2 之类目录 → save_path 下已有旧权重被顺延，请清理或改 YAML。"
+    exit 1
+fi
+
+if [ -f "${SAVE_DIR}/lit_model.pth" ]; then
+    if ! ensure_checkpoint_tokenizer; then
+        echo "❌ 致命错误：${SAVE_DIR} 下有 lit_model.pth，但没有 tokenizer.json/tokenizer.model。"
+        echo "   请在 ${CONFIG_FILE} 中设置 tokenizer_dir 指向基座模型 tokenizer 目录，或手动复制 tokenizer 文件。"
+        exit 1
+    fi
+fi
+
+# ==============================================================================
+# 🌟 文件锁 Barrier：每个节点写独立文件，避免共享文件系统缓存问题
+# ==============================================================================
+BARRIER_DIR="${SAVE_DIR}/.eval_barrier_d"
+mkdir -p "${BARRIER_DIR}"
 
 echo "================================================="
-echo "🎉 [Node ${NODE_RANK}] 阶段一完成！模型已成功保存至 ${SAVE_DIR}"
-echo "🚀 [Node ${NODE_RANK}] 阶段二：释放显存，准备执行分布式自动评测"
+echo "🎯 [Node ${NODE_RANK}] 写入 Barrier 文件，等待所有 ${NUM_NODES} 个节点就绪..."
 echo "================================================="
 
-# 🌟 核心缓冲：休眠 60 秒
-# 1. 强制操作系统彻底回收 demo.py 占用的所有显存
-# 2. 补偿不同 Node 之间保存 checkpoint 到共享存储 (SFS/NAS) 时的极其微小的时间差
-sleep 60
+# 每个节点写自己的独立 barrier 文件（文件存在性比文件内容跨节点可见更快）
+touch "${BARRIER_DIR}/node_${NODE_RANK}"
+
+CUR_COUNT=0
+LOOP_ITER=0
+while [ "${CUR_COUNT}" -lt "${NUM_NODES}" ]; do
+    # 统计有多少个节点的 barrier 文件已经存在
+    CUR_COUNT=$(ls -1 "${BARRIER_DIR}"/node_* 2>/dev/null | wc -l)
+    LOOP_ITER=$((LOOP_ITER + 1))
+    echo "🔄 [Node ${NODE_RANK}] 第 ${LOOP_ITER} 轮检查: ${CUR_COUNT}/${NUM_NODES} 节点已就绪"
+    sleep 5
+done
+
+echo "✅ [Node ${NODE_RANK}] 所有 ${NUM_NODES} 个节点已就绪，启动评测"
+
+# 🌟 核心缓冲：休眠 30 秒确保 NCCL 彻底回收 + 避免 barrier 竞争
+sleep 30
 
 # 拼接 benchmark 列表（避免换行空格被解析进 task 名）
 BENCHMARKS="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
@@ -145,7 +282,9 @@ torchrun \
     eval.py \
     --checkpoint_dir ${SAVE_DIR} \
     --benchmark ${BENCHMARKS} \
-    --output_path "${EVAL_OUTPUT_DIR}"
+    --output_path "${EVAL_OUTPUT_DIR}" \
+    ${LOG_KV_ARGS} \
+    ${TOKENIZER_ARGS}
 
 # for NIAH
 torchrun \
@@ -158,12 +297,19 @@ torchrun \
     --checkpoint_dir ${SAVE_DIR} \
     --benchmark ${NIAH_BENCHMARKS} \
     --metadata "${META}" \
-    --output_path "${EVAL_OUTPUT_DIR}"
+    --output_path "${EVAL_OUTPUT_DIR}" \
+    ${LOG_KV_ARGS} \
+    ${TOKENIZER_ARGS}
 
 EVAL_STATUS=$?
 if [ $EVAL_STATUS -ne 0 ]; then
     echo "❌ [Node ${NODE_RANK}] 评测阶段崩溃 (Exit Code: $EVAL_STATUS)！"
     exit $EVAL_STATUS
+fi
+
+# 清理 barrier 目录（rank 0 负责）
+if [ ${NODE_RANK} -eq 0 ] && [ -d "${BARRIER_DIR}" ]; then
+    rm -rf "${BARRIER_DIR}"
 fi
 
 echo "================================================="

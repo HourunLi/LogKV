@@ -1,4 +1,0 @@
-# boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa,lambada_openai,wikitext,based_swde,based_fda,based_triviaqa,based_nq_1024,based_drop,based_squad,longbench_qasper,longbench_multifieldqa_zh,longbench_multifieldqa_en,longbench_triviaqa,longbench_trec,longbench_lsht,longbench_multi_news,longbench_qmsum,longbench_dureader,longbench_2wikimqa,longbench_gov_report_e,longbench_hotpotqa_e,longbench_multi_news_e,longbench_qasper_e,longbench_multifieldqa_en_e,longbench_passage_retrieval_en_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e
-# mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2
-checkpoint_dir: "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/ckpt/qwen0.6b-4k-cpt"
-benchmark: "boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"

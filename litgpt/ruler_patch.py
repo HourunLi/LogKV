@@ -114,9 +114,16 @@ class _FakeResponse:
         pass
 
 
+def _ssl_bypass_enabled() -> bool:
+    """是否全局关闭 SSL 验证。默认开启（对抗内网代理的自签证书）；
+    设 ``RULER_SSL_NO_VERIFY=0`` 可恢复正常证书校验（本地缓存拦截不受影响）。
+    注意：开启时影响评测进程内**所有** requests HTTPS 请求，属于有意的全局行为。"""
+    return os.environ.get("RULER_SSL_NO_VERIFY", "1") != "0"
+
+
 def _patch_requests_ssl() -> None:
-    """全局 patch requests，强制所有 HTTPS 请求跳过 SSL 验证。
-    同时拦截已知 RULER URL，直接从本地缓存返回数据。"""
+    """全局 patch requests：拦截已知 RULER URL 直接返回本地缓存；
+    并在 ``RULER_SSL_NO_VERIFY != 0`` 时强制所有 HTTPS 请求跳过 SSL 验证。"""
     import requests
 
     if getattr(requests.Session, "_ssl_patched", False):
@@ -125,7 +132,8 @@ def _patch_requests_ssl() -> None:
     _original_request = requests.Session.request
 
     def _patched_request(self, method, url, **kwargs):
-        kwargs.setdefault("verify", False)
+        if _ssl_bypass_enabled():
+            kwargs.setdefault("verify", False)
         filename = _URL_TO_FILENAME.get(url)
         if filename:
             data = _load_json_local(filename)
@@ -144,7 +152,8 @@ def _patch_requests_ssl() -> None:
             data = _load_json_local(filename)
             if data is not None:
                 return _FakeResponse(data)
-        kwargs.setdefault("verify", False)
+        if _ssl_bypass_enabled():
+            kwargs.setdefault("verify", False)
         return _original_get(url, **kwargs)
 
     if not getattr(requests, "_get_patched", False):
@@ -197,25 +206,27 @@ class _QaUtilsImportHook:
 
 
 def apply_patch() -> None:
-    """安装所有补丁：SSL 绕过 + qa_utils patch + import hook"""
+    """安装所有补丁：SSL 绕过（可用 RULER_SSL_NO_VERIFY=0 关闭）+ qa_utils patch + import hook"""
 
-    # 1. SSL 全局绕过
-    ssl._create_default_https_context = ssl._create_unverified_context
-    os.environ.setdefault("CURL_CA_BUNDLE", "")
-    os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
+    # 1. SSL 全局绕过（urllib/ssl 层），受 RULER_SSL_NO_VERIFY 开关控制
+    if _ssl_bypass_enabled():
+        ssl._create_default_https_context = ssl._create_unverified_context
+        os.environ.setdefault("CURL_CA_BUNDLE", "")
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", "")
 
-    # 2. 全局 patch requests.Session.request → verify=False
+    # 2. 全局 patch requests.Session.request（缓存拦截始终生效；verify=False 受开关控制）
     try:
         _patch_requests_ssl()
     except Exception:
         pass
 
-    # 3. 禁用 urllib3 SSL 警告
-    try:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    except Exception:
-        pass
+    # 3. 禁用 urllib3 SSL 警告（仅在绕过开启时需要）
+    if _ssl_bypass_enabled():
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
 
     # 4. 尝试直接 patch qa_utils（如果已经被导入）
     qa_utils = sys.modules.get("lm_eval.tasks.ruler.qa_utils")
