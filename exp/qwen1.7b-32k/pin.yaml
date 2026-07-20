@@ -16,6 +16,8 @@ num_devices: 8
 data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
+# 任务被停后重启时，从 save_path 下最新 checkpoint 继续训练。
+auto_resume: true
 save_interval: 500
 save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-pin
 merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging

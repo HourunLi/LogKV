@@ -82,7 +82,7 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 # 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
 # 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS SAVE_CKPT TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import os
 import sys
 
@@ -103,6 +103,14 @@ arch_name = cfg.get("arch_name", "Qwen/Qwen3-0.6B-Base")
 ckpt_dir = cfg.get("ckpt_dir") or os.path.join("checkpoints", arch_name)
 resume_dir = cfg.get("resume_dir")
 tokenizer_dir = cfg.get("tokenizer_dir")
+try:
+    max_steps = int(float(cfg.get("max_steps", 0) or 0))
+except (TypeError, ValueError):
+    max_steps = 0
+try:
+    num_epochs = int(float(cfg.get("num_epochs", 10) or 0))
+except (TypeError, ValueError):
+    num_epochs = 0
 
 candidates = []
 for d in (tokenizer_dir, resume_dir, ckpt_dir, os.path.join("checkpoints", arch_name)):
@@ -116,15 +124,101 @@ print(
     cfg.get("log_kv_pin_size", 0),
     cfg.get("log_kv_pin_obs_window", 64),
     str(bool(cfg.get("save_ckpt", False))).lower(),
+    max_steps,
+    num_epochs,
     ":".join(candidates),
 )
 EOF
 )"
 
+checkpoint_exists() {
+    [ -f "$1" ] || { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
+}
+
+checkpoint_finished() {
+    python - "${SAVE_DIR}" "${MAX_STEPS}" "${NUM_EPOCHS}" <<'EOF'
+import os
+import sys
+
+import yaml
+
+
+save_dir = sys.argv[1]
+try:
+    max_steps = int(float(sys.argv[2] or 0))
+except (TypeError, ValueError):
+    max_steps = 0
+try:
+    num_epochs = int(float(sys.argv[3] or 0))
+except (TypeError, ValueError):
+    num_epochs = 0
+
+meta_path = os.path.join(save_dir, "checkpoint_meta.yaml")
+if not os.path.exists(meta_path):
+    # 兼容旧产物：过去 save_path/lit_model.pth 只在最终保存时才出现。
+    sys.exit(0)
+
+with open(meta_path, encoding="utf-8") as f:
+    meta = yaml.safe_load(f) or {}
+
+if meta.get("in_progress", False):
+    sys.exit(1)
+
+try:
+    global_step = int(meta.get("global_step", -1))
+except (TypeError, ValueError):
+    global_step = -1
+try:
+    completed_epochs = int(meta.get("completed_epochs", -1))
+except (TypeError, ValueError):
+    completed_epochs = -1
+try:
+    data_epoch = int(meta.get("data_epoch", -1))
+except (TypeError, ValueError):
+    data_epoch = -1
+
+epoch_reached = completed_epochs >= num_epochs if num_epochs > 0 and completed_epochs >= 0 else False
+if not epoch_reached and num_epochs > 0 and data_epoch > num_epochs:
+    epoch_reached = True
+step_reached = max_steps > 0 and global_step >= max_steps
+
+if epoch_reached or step_reached:
+    sys.exit(0)
+
+# Fallback for malformed configs without explicit targets.
+sys.exit(0 if meta.get("finished", False) and max_steps <= 0 and num_epochs <= 0 else 1)
+EOF
+}
+
+checkpoint_step_label() {
+    python - "${SAVE_DIR}" "${MAX_STEPS}" "${NUM_EPOCHS}" <<'EOF'
+import os
+import sys
+
+import yaml
+
+
+save_dir, max_steps, num_epochs = sys.argv[1], sys.argv[2], sys.argv[3]
+meta_path = os.path.join(save_dir, "checkpoint_meta.yaml")
+if not os.path.exists(meta_path):
+    print("legacy/no-meta")
+    raise SystemExit
+with open(meta_path, encoding="utf-8") as f:
+    meta = yaml.safe_load(f) or {}
+print(
+    f"step={meta.get('global_step', 'unknown')}/{max_steps}, "
+    f"epoch={meta.get('completed_epochs', 'unknown')}/{num_epochs} "
+    f"(current={meta.get('data_epoch', 'unknown')}), "
+    f"finished={meta.get('finished', False)}, "
+    f"in_progress={meta.get('in_progress', False)}"
+)
+EOF
+}
+
 # 流水线前置检查：eval 阶段固定评测 ${SAVE_DIR}，如果既没有现成权重、
 # 训练又不会保存（save_ckpt: false），训练完就会在 eval 的 tokenizer/权重
 # 加载处崩溃。在开训前拦截，避免白跑几小时。
-if [ "${SAVE_CKPT}" != "true" ] && [ ! -f "${SAVE_DIR}/lit_model.pth" ]; then
+if [ "${SAVE_CKPT}" != "true" ] && ! checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
     echo "❌ 致命错误：${CONFIG_FILE} 中 save_ckpt 未开启，且 ${SAVE_DIR} 下没有现成权重。"
     echo "   训练结束后将没有 checkpoint 可评测。请在 YAML 中设置 save_ckpt: true。"
     exit 1
@@ -174,14 +268,19 @@ ensure_checkpoint_tokenizer() {
 # ==============================================================================
 # 🌟 核心新增：检查 Checkpoint 是否已存在
 # ==============================================================================
-if [ -f "${SAVE_DIR}/lit_model.pth" ]; then
+if checkpoint_exists "${SAVE_DIR}/lit_model.pth" && checkpoint_finished; then
     echo "================================================="
-    echo "⏩ [Node ${NODE_RANK}] 阶段一跳过：检测到模型权重已存在于 ${SAVE_DIR}/lit_model.pth"
+    echo "⏩ [Node ${NODE_RANK}] 阶段一跳过：检测到已完成 checkpoint 于 ${SAVE_DIR}/lit_model.pth"
+    echo "⏩ checkpoint 状态：$(checkpoint_step_label)"
     echo "⏩ 直接进入评测阶段！"
     echo "================================================="
 else
     echo "================================================="
-    echo "🚀 [Node ${NODE_RANK}] 阶段一：未找到现有权重，开始执行 Continual Pre-Training"
+    if checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
+        echo "🚀 [Node ${NODE_RANK}] 阶段一：检测到未完成 checkpoint（$(checkpoint_step_label)），继续训练"
+    else
+        echo "🚀 [Node ${NODE_RANK}] 阶段一：未找到现有权重，开始执行 Continual Pre-Training"
+    fi
     echo "================================================="
 
     torchrun \
@@ -208,17 +307,23 @@ fi
 # 崩溃/被杀（上面的非零退出码并不总是 NCCL 良性竞争）——在这里立刻失败，
 # 否则 eval 阶段只会报一个误导性的「加载 checkpoint 出错」。
 # ==============================================================================
-if [ "${SAVE_CKPT}" == "true" ] && [ ! -f "${SAVE_DIR}/lit_model.pth" ]; then
-    echo "❌ 致命错误：训练阶段结束，但 ${SAVE_DIR}/lit_model.pth 不存在（训练退出码见上方 ⚠️ 行）。"
-    echo "   排查（在训练日志中从后往前找）："
-    echo "   ➤ 无 'Reached max_steps' / 'Data exhausted' → 训练循环中途崩溃，向上翻最后一个 Traceback；"
-    echo "   ➤ 有 'Training complete' 但无 'Final save dir:' → 生效配置 save_ckpt 为 false；"
-    echo "   ➤ 有 'Saving to ... lit_model.pth' 但无 'Done.' → 保存阶段被杀（墙钟/内存/磁盘配额）；"
-    echo "   ➤ 'Final save dir:' 显示 _v2 之类目录 → save_path 下已有旧权重被顺延，请清理或改 YAML。"
-    exit 1
+if [ "${SAVE_CKPT}" == "true" ]; then
+    if ! checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
+        echo "❌ 致命错误：训练阶段结束，但 ${SAVE_DIR}/lit_model.pth 不存在（训练退出码见上方 ⚠️ 行）。"
+        echo "   排查（在训练日志中从后往前找）："
+        echo "   ➤ 无 'Reached max_steps' / 'Data exhausted' → 训练循环中途崩溃，向上翻最后一个 Traceback；"
+        echo "   ➤ 有 'Training complete' 但无 'Saving final checkpoint' → 生效配置 save_ckpt 为 false；"
+        echo "   ➤ 有 'Saving to ... lit_model.pth' 但无 'Done.' → 保存阶段被杀（墙钟/内存/磁盘配额）。"
+        exit 1
+    fi
+    if ! checkpoint_finished; then
+        echo "❌ 训练阶段未完成，当前 ${SAVE_DIR}/lit_model.pth 只是可恢复 checkpoint：$(checkpoint_step_label)"
+        echo "   已保留断点；下次重启会继续训练，不进入评测阶段。"
+        exit 1
+    fi
 fi
 
-if [ -f "${SAVE_DIR}/lit_model.pth" ]; then
+if checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
     if ! ensure_checkpoint_tokenizer; then
         echo "❌ 致命错误：${SAVE_DIR} 下有 lit_model.pth，但没有 tokenizer.json/tokenizer.model。"
         echo "   请在 ${CONFIG_FILE} 中设置 tokenizer_dir 指向基座模型 tokenizer 目录，或手动复制 tokenizer 文件。"
