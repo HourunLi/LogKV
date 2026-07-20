@@ -74,6 +74,136 @@ def _unique_save_dir(save_path: str) -> str:
     return str(cand)
 
 
+_STEP_CHECKPOINT_RE = re.compile(r"^step[_-](\d+)(?:_v\d+)?$")
+_CHECKPOINT_META_FILENAME = "checkpoint_meta.yaml"
+
+
+def _normal_path(path: str | os.PathLike) -> Path:
+    p = Path(os.path.expandvars(os.path.expanduser(str(path))))
+    try:
+        return p.resolve()
+    except OSError:
+        return Path(os.path.abspath(p))
+
+
+def _checkpoint_exists(path: Path) -> bool:
+    # FSDP/DCP checkpoints may be directories named lit_model.pth; non-FSDP
+    # checkpoints are regular files.
+    try:
+        if path.is_file():
+            return path.stat().st_size > 0
+        if path.is_dir():
+            return any(path.iterdir())
+    except OSError:
+        return False
+    return False
+
+
+def _read_checkpoint_metadata(checkpoint_dir: Path) -> dict:
+    metadata_path = checkpoint_dir / _CHECKPOINT_META_FILENAME
+    if not metadata_path.is_file():
+        return {}
+    try:
+        with open(metadata_path, encoding="utf-8") as f:
+            metadata = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _write_checkpoint_metadata(
+    checkpoint_dir: Path | str,
+    *,
+    global_step: int,
+    max_steps: int,
+    data_epoch: int,
+    num_epochs: int,
+    finished: bool,
+    kind: str,
+    in_progress: bool = False,
+) -> None:
+    checkpoint_dir = _normal_path(checkpoint_dir)
+    completed_epochs = max(0, min(int(num_epochs), int(data_epoch) - 1))
+    metadata = {
+        "global_step": int(global_step),
+        "max_steps": int(max_steps),
+        "data_epoch": int(data_epoch),
+        "completed_epochs": completed_epochs,
+        "num_epochs": int(num_epochs),
+        "finished": bool(finished),
+        "kind": kind,
+        "in_progress": bool(in_progress),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(checkpoint_dir / _CHECKPOINT_META_FILENAME, "w", encoding="utf-8") as f:
+        yaml.safe_dump(metadata, f, sort_keys=False)
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _replace_path(src: Path, dst: Path) -> None:
+    if dst.is_dir():
+        shutil.rmtree(dst)
+    elif dst.exists():
+        dst.unlink()
+    shutil.move(str(src), str(dst))
+
+
+def _checkpoint_is_ready(checkpoint_path: Path) -> bool:
+    if not _checkpoint_exists(checkpoint_path):
+        return False
+    metadata = _read_checkpoint_metadata(checkpoint_path.parent)
+    return not bool(metadata.get("in_progress", False))
+
+
+def _checkpoint_step(checkpoint_path: Path) -> int:
+    metadata = _read_checkpoint_metadata(checkpoint_path.parent)
+    step = metadata.get("global_step")
+    if step is not None:
+        try:
+            return int(step)
+        except (TypeError, ValueError):
+            pass
+    match = _STEP_CHECKPOINT_RE.fullmatch(checkpoint_path.parent.name)
+    if match:
+        return int(match.group(1))
+    # Legacy direct checkpoints predate checkpoint_meta.yaml; treat them as
+    # final so existing completed runs keep the old "do not retrain" behavior.
+    return 10**18
+
+
+def _checkpoint_sort_key(checkpoint_path: Path) -> tuple[int, float]:
+    step = _checkpoint_step(checkpoint_path)
+    try:
+        mtime = checkpoint_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return step, mtime
+
+
+def _latest_training_checkpoint(save_path: str) -> Path | None:
+    root = _normal_path(save_path)
+    candidates: list[Path] = []
+    final_checkpoint = root / "lit_model.pth"
+    if _checkpoint_is_ready(final_checkpoint):
+        candidates.append(final_checkpoint)
+    if root.is_dir():
+        for child in root.iterdir():
+            if not child.is_dir() or _STEP_CHECKPOINT_RE.fullmatch(child.name) is None:
+                continue
+            checkpoint = child / "lit_model.pth"
+            if _checkpoint_is_ready(checkpoint):
+                candidates.append(checkpoint)
+    if not candidates:
+        return None
+    return max(candidates, key=_checkpoint_sort_key)
+
+
 def _copy_tokenizer_and_configs(src_dirs: list[str], dst: str) -> None:
     """Copy *.json / *.model (tokenizer + HF configs) into the save dir so it is
     self-contained for eval (eval.py builds its Tokenizer from the save dir).
@@ -315,6 +445,7 @@ def main(
     context_length: int = 4096,
     ckpt_dir: str | None = None,
     resume_dir: str | None = None,
+    auto_resume: bool = False,
     # ── Training ──
     global_batch_size: int = 32,
     micro_batch_size: int = 4,
@@ -396,6 +527,7 @@ def main(
     context_length = _o("context_length", context_length)
     ckpt_dir = _o("ckpt_dir", ckpt_dir)
     resume_dir = _o("resume_dir", resume_dir)
+    auto_resume = _o("auto_resume", auto_resume)
     global_batch_size = _o("global_batch_size", global_batch_size)
     micro_batch_size = _o("micro_batch_size", micro_batch_size)
     num_epochs = _o("num_epochs", num_epochs)
@@ -474,7 +606,7 @@ def main(
     # 训练完“找不到 checkpoint”十有八九是在另一个目录里找。save_ckpt=False
     # 时这里就是唯一会明说“不会保存”的地方。
     fabric.print(
-        f"save_ckpt={save_ckpt} | save_path="
+        f"save_ckpt={save_ckpt} | auto_resume={auto_resume} | save_path="
         f"{Path(os.path.expandvars(os.path.expanduser(save_path))).absolute()} "
         f"(cwd={os.getcwd()})"
         + ("" if save_ckpt else " | ⚠️ save_ckpt=False：本次训练不会写任何 checkpoint")
@@ -491,17 +623,19 @@ def main(
     checkpoint_dir = f"checkpoints/{arch_name}"
     if ckpt_dir is not None:
         checkpoint_dir = ckpt_dir
-    load_dir = checkpoint_dir if resume_dir is None else resume_dir
-    ckpt_path = Path(load_dir) / "lit_model.pth"
-    fabric.print(f"Loading checkpoint from {ckpt_path}...")
+    initial_load_dir = checkpoint_dir if resume_dir is None else resume_dir
+    initial_ckpt_path = Path(initial_load_dir) / "lit_model.pth"
+    resume_ckpt_path = None
+    if resume_dir is None and auto_resume:
+        resume_ckpt_path = _latest_training_checkpoint(save_path)
+        if resume_ckpt_path is not None:
+            fabric.print(f"Auto-resume checkpoint found: {resume_ckpt_path}")
+        else:
+            fabric.print("auto_resume=True, but no checkpoint was found under save_path; loading initial weights.")
+    elif resume_dir is not None and auto_resume:
+        fabric.print("auto_resume=True is ignored because resume_dir is set; loading resume_dir as the weight source.")
 
     model = fabric.setup_module(model)
-
-    # Single load: load_checkpoint streams weights into the (FSDP-)wrapped model.
-    # A prior torch.load() here only to peek at the state dict doubled peak CPU
-    # memory for large checkpoints without being used.
-    load_checkpoint(fabric, model, ckpt_path, strict=True)
-    fabric.print("Weights loaded successfully.")
 
     # ── Optimizer with weight decay groups ──
     decay_params = []
@@ -528,6 +662,24 @@ def main(
         optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8
     )
     optimizer = fabric.setup_optimizers(optimizer)
+    state = {"model": model, "optimizer": optimizer, "global_step": 0, "data_epoch": 1}
+
+    load_dir = initial_load_dir
+    if resume_ckpt_path is not None:
+        fabric.print(f"Resuming full training state from {resume_ckpt_path}...")
+        fabric.load(resume_ckpt_path, state)
+        load_dir = str(resume_ckpt_path.parent)
+        loaded_global_step = state.get("global_step", 0) or 0
+        if isinstance(loaded_global_step, torch.Tensor):
+            loaded_global_step = loaded_global_step.item()
+        fabric.print(f"Training state restored at global_step={int(loaded_global_step)}.")
+    else:
+        fabric.print(f"Loading checkpoint from {initial_ckpt_path}...")
+        # Single load: load_checkpoint streams weights into the (FSDP-)wrapped model.
+        # A prior torch.load() here only to peek at the state dict doubled peak CPU
+        # memory for large checkpoints without being used.
+        load_checkpoint(fabric, model, initial_ckpt_path, strict=True)
+        fabric.print("Weights loaded successfully.")
 
     # ── Evaluation helper ──
     # Same code path AND same semantics as a standalone `eval.py --config
@@ -579,6 +731,69 @@ def main(
     )
     dataloader = fabric.setup_dataloaders(dataloader)
 
+    def _save_training_checkpoint(
+        checkpoint_dir_path: str | os.PathLike,
+        *,
+        global_step: int,
+        data_epoch: int,
+        finished: bool,
+        kind: str,
+        atomic_model: bool = False,
+    ) -> str:
+        checkpoint_dir_path = _normal_path(checkpoint_dir_path)
+        checkpoint_file = checkpoint_dir_path / "lit_model.pth"
+        save_file = checkpoint_dir_path / "lit_model.pth.tmp" if atomic_model else checkpoint_file
+        if fabric.global_rank == 0:
+            os.makedirs(checkpoint_dir_path, exist_ok=True)
+            if atomic_model:
+                _remove_path(save_file)
+            else:
+                _write_checkpoint_metadata(
+                    checkpoint_dir_path,
+                    global_step=global_step,
+                    max_steps=max_steps,
+                    data_epoch=data_epoch,
+                    num_epochs=num_epochs,
+                    finished=finished,
+                    kind=kind,
+                    in_progress=True,
+                )
+        fabric.barrier()
+
+        state["global_step"] = global_step
+        state["data_epoch"] = data_epoch
+        fabric.print(f"Saving {kind} checkpoint to {checkpoint_file} ...")
+        fabric.save(str(save_file), state)
+        fabric.barrier()
+
+        if fabric.global_rank == 0:
+            if not _checkpoint_exists(save_file):
+                raise RuntimeError(
+                    f"fabric.save 已返回，但 {save_file} 不存在或为空——"
+                    "检查磁盘配额 / 共享文件系统同步状态。"
+                )
+            if atomic_model:
+                _replace_path(save_file, checkpoint_file)
+            if not _checkpoint_exists(checkpoint_file):
+                raise RuntimeError(
+                    f"fabric.save 已返回，但 {checkpoint_file} 不存在或为空——"
+                    "检查磁盘配额 / 共享文件系统同步状态。"
+                )
+            _copy_tokenizer_and_configs([checkpoint_dir, tok_dir], str(checkpoint_dir_path))
+            with open(checkpoint_dir_path / "model_config.yaml", "w", encoding="utf-8") as f:
+                yaml.dump(asdict(config_obj), f)
+            _write_checkpoint_metadata(
+                checkpoint_dir_path,
+                global_step=global_step,
+                max_steps=max_steps,
+                data_epoch=data_epoch,
+                num_epochs=num_epochs,
+                finished=finished,
+                kind=kind,
+            )
+        fabric.barrier()
+        return str(checkpoint_dir_path)
+
     fabric.print("Starting Continue Pretraining...")
     model.train()
 
@@ -606,11 +821,19 @@ def main(
     optimizer.zero_grad(set_to_none=True)
     step_start_time = datetime.now()
     step_stats = MicroStepMeanStats()
-    global_step = 0
+    loaded_global_step = state.get("global_step", 0) or 0
+    if isinstance(loaded_global_step, torch.Tensor):
+        loaded_global_step = loaded_global_step.item()
+    global_step = int(loaded_global_step)
+    if global_step > 0:
+        fabric.print(f"Continuing from global_step={global_step}; target max_steps={max_steps}.")
     total_steps = max_steps
     training_finished = False
     micro_batch_idx = 0
-    data_epoch = 1
+    loaded_data_epoch = state.get("data_epoch", 1) or 1
+    if isinstance(loaded_data_epoch, torch.Tensor):
+        loaded_data_epoch = loaded_data_epoch.item()
+    data_epoch = int(loaded_data_epoch)
     loader_iter = iter(dataloader)
 
     while global_step < max_steps and not training_finished:
@@ -681,53 +904,37 @@ def main(
             if save_ckpt and save_interval > 0 and global_step % save_interval == 0 and not training_finished:
                 step_save_path = f"{save_path}/step_{global_step}"
                 step_save_path = _unique_save_dir(step_save_path)
-                if fabric.global_rank == 0:
-                    os.makedirs(step_save_path, exist_ok=True)
-                fabric.barrier()
-                state = {"model": model, "optimizer": optimizer, "global_step": global_step}
-                fabric.save(f"{step_save_path}/lit_model.pth", state)
-                fabric.barrier()
-                if fabric.global_rank == 0:
-                    _copy_tokenizer_and_configs([checkpoint_dir, tok_dir], step_save_path)
-                    with open(f"{step_save_path}/model_config.yaml", "w", encoding="utf-8") as f:
-                        yaml.dump(asdict(config_obj), f)
-                fabric.barrier()
+                step_save_path = _save_training_checkpoint(
+                    step_save_path,
+                    global_step=global_step,
+                    data_epoch=data_epoch,
+                    finished=False,
+                    kind="interval",
+                )
                 fabric.print(f"Checkpoint saved to {step_save_path}")
+                latest_save_path = _save_training_checkpoint(
+                    save_path,
+                    global_step=global_step,
+                    data_epoch=data_epoch,
+                    finished=False,
+                    kind="latest",
+                    atomic_model=True,
+                )
+                fabric.print(f"Latest checkpoint updated at {latest_save_path}")
 
     # ── Final save ──
     if save_ckpt:
-        requested_save_path = save_path
-        save_path = _unique_save_dir(save_path)
+        save_path = _save_training_checkpoint(
+            save_path,
+            global_step=global_step,
+            data_epoch=data_epoch,
+            finished=True,
+            kind="final",
+            atomic_model=True,
+        )
         if fabric.global_rank == 0:
-            if Path(save_path).name != Path(os.path.expandvars(os.path.expanduser(requested_save_path))).name:
-                fabric.print(
-                    f"⚠️ {requested_save_path} 下已有 lit_model.pth，最终保存目录顺延为 {save_path}。"
-                    "注意：majob.sh / eval.yaml 评测的是原 save_path（旧权重）——"
-                    "如非有意保留，请清理旧目录后重跑。"
-                )
-            fabric.print(f"Final save dir: {save_path}")
-            os.makedirs(save_path, exist_ok=True)
-        fabric.barrier()
-
-        state = {"model": model, "optimizer": optimizer, "global_step": global_step}
-        fabric.print(f"Saving to {save_path}/lit_model.pth ...")
-        fabric.save(f"{save_path}/lit_model.pth", state)
-        fabric.barrier()
-        # fabric.save 静默失败（磁盘配额、共享盘未同步）会让后续 eval 报一个
-        # 误导性的加载错误——就地核验，以真实原因尽早失败。
-        if fabric.global_rank == 0 and not os.path.isfile(f"{save_path}/lit_model.pth"):
-            raise RuntimeError(
-                f"fabric.save 已返回，但 {save_path}/lit_model.pth 不存在——"
-                "检查磁盘配额 / 共享文件系统同步状态。"
-            )
-
-        if fabric.global_rank == 0:
-            _copy_tokenizer_and_configs([checkpoint_dir, tok_dir], save_path)
-            with open(f"{save_path}/model_config.yaml", "w", encoding="utf-8") as f:
-                yaml.dump(asdict(config_obj), f)
             fabric.print(f"Tokenizer and model_config written to {save_path}")
             fabric.print("Done.")
-        fabric.barrier()
 
     if run_eval in ("after", "both"):
         _run_eval(save_path, eval_benchmark)
