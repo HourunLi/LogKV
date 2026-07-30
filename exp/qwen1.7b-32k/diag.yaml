@@ -1,0 +1,68 @@
+# ==========================================
+# logKV 分支 · Qwen3-1.7B · 32K · Phase 0 诊断评测配置
+# 用途：D2（score/value 归因）、D3（逐层率失真）、D5（peakiness）三张诊断图
+# 的数据来源。见 litgpt/log_kv_diag.py 模块文档 + tests/test_log_kv_diag.py。
+#
+# 与 eval.yaml 的区别：
+#   - eval.yaml 跑全量 benchmark，用来看最终分数；
+#   - 这份只挑一小批样本（limit），额外收集 log_kv_diag 的归因统计量，
+#     不是用来产出正式评测分数的。
+#
+# ⚠️ 这份 YAML 里 benchmark / metadata / log_kv_diag_mode 都留 null——
+# 本仓库约定「YAML 非 null 值覆盖 CLI」（见 eval.py main() 的 _o()），
+# 如果在这里写死 benchmark，CLI 传的 --benchmark 会被直接忽略。所以这三项
+# 必须每次调用用 CLI 传，YAML 只固定不随 (task, mode) 变化的部分。
+#
+# 用法（每次一个 (task 类型, mode) 组合，各自落一份 JSON，不合并；
+# 诊断统计量按 rank 各自累积、不 all_gather，单卡最省事）：
+#
+#   # 检索类：NIAH，4 个 mode 各跑一次
+#   for MODE in baseline s_oracle v_oracle exact; do
+#     torchrun --nproc_per_node=1 eval.py --config exp/qwen1.7b-32k/diag.yaml \
+#       --benchmark niah_single_1 --log_kv_diag_mode ${MODE} \
+#       --metadata '{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [4096, 16384]}'
+#   done
+#
+#   # 摘要类：LongBench 摘要任务，同样 4 个 mode（不需要 metadata）
+#   for MODE in baseline s_oracle v_oracle exact; do
+#     torchrun --nproc_per_node=1 eval.py --config exp/qwen1.7b-32k/diag.yaml \
+#       --benchmark longbench_gov_report_e,longbench_qmsum --log_kv_diag_mode ${MODE}
+#   done
+#
+#   # 自检（exact 与独立 dense 参照必须一致；见 test_log_kv_diag.py）：
+#   torchrun --nproc_per_node=1 eval.py --config exp/qwen1.7b-32k/diag.yaml \
+#       --benchmark niah_single_1 --log_kv_diag_mode dense
+# ==========================================
+
+# ── 评测对象：与 exp/qwen1.7b-32k/arc.yaml 训出的 checkpoint 对齐 ──
+# pin_size 只影响推理期缓存配置、不改权重（训练期 _log_kv_train_lowmem_forward
+# 从不选钉——见 log_kv_select_pins 的 defer_last_single 门控），所以 arc/pin
+# 两个训练变体的 checkpoint 对诊断来说是等价的，选 arc 的产物即可。
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV
+tokenizer_dir: null
+
+# ── 只跑一小批样本：几十条足够画出 D2/D3/D5 的图，不需要跑全量 benchmark ──
+limit: 40
+
+# benchmark / metadata：见上面用法块，必须用 CLI 传，这里留空。
+benchmark: null
+metadata: null
+
+# ── 结果输出 ──
+output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV/diag
+
+# ── logKV（须与训练 YAML 中的取值一致，pin 除外）──
+log_kv_B: 512
+log_kv_recent_size: 1024
+log_kv_prefill_block: 1024
+# 诊断的硬约束：槽→token 映射假定槽连续覆盖精确前缀，钉扎会打破这一点
+# （见 log_kv_diag.slot_runs 的文档）。eval.py 的 main() 会在 pin_size != 0
+# 时直接报错拒绝，这里显式设成 0 而不是继承训练 YAML 的 256。
+log_kv_pin_size: 0
+log_kv_pin_obs_window: 64
+
+# ── 诊断开关：留空，每次调用用 --log_kv_diag_mode 传 ──
+# 取值：baseline | s_oracle | v_oracle | exact | dense
+log_kv_diag_mode: null
+# 留空则退回 output_path（即上面的 .../diag/）
+log_kv_diag_output: null

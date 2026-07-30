@@ -24,6 +24,7 @@ import glob
 import json
 import time
 import inspect
+import contextlib
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -133,6 +134,7 @@ from litgpt.tokenizer import Tokenizer
 from lm_eval import evaluator
 from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
+from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
 from litgpt.ruler_patch import apply_patch
 apply_patch()
 
@@ -683,6 +685,16 @@ def main(
     log_kv_pin_obs_window: int = 64,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
+    # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
+    # float in (0, 1) = lm-eval 的抽样比例。None = 跑全量。
+    limit: int | float | None = None,
+    # ── 🧩 logKV 诊断（score/value oracle 归因网格；见 litgpt.log_kv_diag）──
+    # None/"off" = 不诊断（默认，零开销）。其余取值：
+    # baseline/s_oracle/v_oracle/exact/dense —— 见 log_kv_diag 模块文档。
+    # 要求 log_kv_pin_size == 0（诊断假定槽连续覆盖精确前缀，钉扎会打破这一点）。
+    log_kv_diag_mode: str | None = None,
+    # 诊断汇总 JSON 的落盘目录；缺省时退回 output_path。
+    log_kv_diag_output: str | None = None,
     # ── 🧩 logKV：YAML config ──
     config: str | None = None,
 ):
@@ -716,6 +728,9 @@ def main(
     log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
     log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
+    limit = _o("limit", limit)
+    log_kv_diag_mode = _o("log_kv_diag_mode", log_kv_diag_mode)
+    log_kv_diag_output = _o("log_kv_diag_output", log_kv_diag_output)
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -726,9 +741,19 @@ def main(
 
     device = f"cuda:{local_rank}"
 
+    diag_active = log_kv_diag_mode not in (None, "off")
+    if diag_active and log_kv_pin_size != 0:
+        raise ValueError(
+            f"log_kv_diag_mode={log_kv_diag_mode!r} requires log_kv_pin_size=0: "
+            "salience pins scatter duplicate slots and break the diagnostic "
+            "slot->token span mapping (see litgpt.log_kv_diag)."
+        )
+
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
         print(f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} (obs {log_kv_pin_obs_window})")
+        if diag_active:
+            print(f"🔬 诊断模式: {log_kv_diag_mode} | limit: {limit} | 每 rank 各自累积统计量，不跨 rank 聚合")
 
     checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
 
@@ -744,19 +769,32 @@ def main(
         tokenizer_dir=tokenizer_dir,
     )
 
-    results = evaluator.simple_evaluate(
-        model=lm_model,
-        tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
-        confirm_run_unsafe_code=True,
-        batch_size=1,
-        metadata=metadata,
-    )
+    with diag_mode(log_kv_diag_mode) if diag_active else contextlib.nullcontext():
+        results = evaluator.simple_evaluate(
+            model=lm_model,
+            tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
+            confirm_run_unsafe_code=True,
+            batch_size=1,
+            metadata=metadata,
+            limit=limit,
+        )
 
     # 与 LogKVLM.is_master 一致：多节点时应用全局 rank==0，而非 local_rank==0（每节点各有一个 local 0）
     is_main = not dist.is_initialized() or dist.get_rank() == 0
 
     if is_main:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # 🌟 诊断汇总（score/value oracle 归因；见 litgpt.log_kv_diag）：每次调用
+        # 对应一个 (task 类型, mode) 组合，独立落一份 JSON —— 不与常规 results 合并，
+        # 也不跨 rank 聚合（诊断样本量小，单卡跑就够，见上面的启动打印）。
+        if diag_active:
+            diag_dir = Path(log_kv_diag_output or output_path or ".").expanduser()
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            diag_file = diag_dir / f"diag_{log_kv_diag_mode}_{benchmark.replace(',', '+')}_{ts}.json"
+            with open(diag_file, "w", encoding="utf-8") as f:
+                json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)
+            print(f"🔬 诊断汇总已保存到: {diag_file}")
 
         # 🌟 第一步：立即保存原始 results 对象，便于后续恢复
         results_cache_file = Path("eval_results_cache.json")
