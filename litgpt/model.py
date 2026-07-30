@@ -22,6 +22,7 @@ from litgpt.log_kv_cache import (
     append_exact_tokens,
     log_kv_slot_attention,
 )
+from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_block_attention
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
 
@@ -1040,19 +1041,35 @@ class CausalSelfAttention(nn.Module):
                 commit_end = block_end - 1 if defer_tail else block_end
 
                 slot_k, slot_v, slot_w = cache.get_attention_state()
-                k_all, v_all, w_all = append_exact_tokens(
-                    slot_k, slot_v, slot_w,
-                    k[:, :, start:block_end, :],
-                    v[:, :, start:block_end, :],
-                )
 
-                # Frozen state fully visible, block tokens causal among
-                # themselves: causal_tail masks the trailing `blk` in-flight
-                # entries in place instead of allocating a (blk, S) bool mask
-                # and a masked_fill copy of the full score tensor per block.
-                y_blk = log_kv_slot_attention(
-                    q[:, :, start:block_end, :], k_all, v_all, w_all, scale=scale, causal_tail=blk
-                )
+                # Diagnostic branch (score/value oracle grid; see log_kv_diag).
+                # Inert unless a diag_mode(...) context set LOG_KV_DIAG.enabled.
+                # Gated to fresh-prefill blocks whose frozen slots cover exactly
+                # k[:, :, :start] (token_count == start, no pending/decode), the
+                # precondition diag_block_attention relies on. Production numerics
+                # and the cache state trajectory are unchanged.
+                if LOG_KV_DIAG.enabled and start > 0 and int(cache.token_count) == start:
+                    y_blk = diag_block_attention(
+                        q[:, :, start:block_end, :],
+                        k[:, :, :start, :], v[:, :, :start, :],
+                        slot_k, slot_v, slot_w,
+                        k[:, :, start:block_end, :], v[:, :, start:block_end, :],
+                        scale=scale, lam=1.0, layer=self.block_idx,
+                    )
+                else:
+                    k_all, v_all, w_all = append_exact_tokens(
+                        slot_k, slot_v, slot_w,
+                        k[:, :, start:block_end, :],
+                        v[:, :, start:block_end, :],
+                    )
+
+                    # Frozen state fully visible, block tokens causal among
+                    # themselves: causal_tail masks the trailing `blk` in-flight
+                    # entries in place instead of allocating a (blk, S) bool mask
+                    # and a masked_fill copy of the full score tensor per block.
+                    y_blk = log_kv_slot_attention(
+                        q[:, :, start:block_end, :], k_all, v_all, w_all, scale=scale, causal_tail=blk
+                    )
                 outputs.append(y_blk)
 
                 if commit_end > start:
