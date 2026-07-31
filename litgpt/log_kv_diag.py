@@ -28,6 +28,20 @@ attribution grid, so a benchmark drop can be split into "scoring error" vs
 ``exact`` and ``dense`` must agree (two independent routes to the same identity);
 ``baseline`` must reproduce production bit-for-bit (it delegates to it).
 
+``summary()`` reduces the accumulated stats to three tables, labeled with the
+mode they were collected under:
+  * ``by_level`` — per (layer, slot_width): score side ``logit_mae/logit_rmse``
+    (approx vs exact slot logit) + ``intra_slot_logit_var``, and value side
+    ``value_mae/value_rel`` (mean-pooled vs exact within-slot read-out). These are
+    measurements of the CURRENT cache state, taken identically under every mode —
+    they do not collapse to zero in oracle modes; across-mode dumps differ only
+    through hidden-state drift caused by the substituted outputs.
+  * ``by_layer_output`` — per layer: relative L2 error of the baseline / s_oracle
+    / v_oracle outputs vs ``exact``, all four corners evaluated on the SAME
+    hidden states, so one run yields a drift-free D2 attribution.
+  * ``peakiness`` — per layer: running max + p99.9 of |scale·q·k| over a
+    deterministic sample buffer, with the pool size ``n``.
+
 Scope / preconditions (enforced; also see ``diag_block_attention``):
   * Diagnostics run with ``pin_size == 0`` and on a FRESH prefill only. The
     slot→token span mapping assumes every slot covers a contiguous, time-ordered
@@ -46,6 +60,9 @@ import torch
 from litgpt.log_kv_cache import append_exact_tokens, log_kv_slot_attention
 
 _MODES = ("off", "baseline", "s_oracle", "v_oracle", "exact", "dense")
+# Per-layer cap on the deterministic |scale·q·k| sample buffer backing the
+# summary()-time p99.9 (see DiagState.add_peak). ~1 MB fp32 per layer.
+_PEAK_BUF_CAP = 262_144
 # Modes whose slot logit is the exact within-slot logsumexp (score oracle).
 _L_EXACT = ("s_oracle", "exact")
 # Modes whose read-out is the exact within-slot softmax over v (value oracle).
@@ -71,10 +88,18 @@ class DiagState:
         self.mode: str = "off"
         self.q_chunk: int = 64
         self.collect: bool = True
-        # (layer, slot_width) -> running logit-error / intra-slot-variance sums.
+        # Mode the accumulated stats were collected under. Unlike ``mode`` this is
+        # NOT restored when a ``diag_mode`` context exits (mirroring the stats
+        # themselves), so a ``summary()`` dump written after the ``with`` block —
+        # eval.py writes there — is labeled with the collecting mode, not "off".
+        self.stats_mode: str = "off"
+        # (layer, slot_width) -> running logit-error / intra-slot-variance /
+        # value-readout-error sums.
         self.stats: dict[tuple[int, int], dict[str, float]] = {}
-        # layer -> peak |scale·q·k| running max + p99.9.
-        self.peak: dict[int, dict[str, float]] = {}
+        # layer -> peak |scale·q·k| running max + deterministic sample buffer.
+        self.peak: dict[int, dict] = {}
+        # layer -> running squared output error of each grid corner vs ``exact``.
+        self.out_stats: dict[int, dict[str, float]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -83,6 +108,7 @@ class DiagState:
     def reset_stats(self) -> None:
         self.stats = {}
         self.peak = {}
+        self.out_stats = {}
 
     def add_slot_stats(
         self, layer: int, width: int, err: torch.Tensor, intra_var: torch.Tensor
@@ -93,40 +119,96 @@ class DiagState:
         both (B, G, rf, T_c, n_slots); everything is summed so D3's rate-distortion
         curve (variance vs slot width) is exact per (layer, width).
         """
-        key = (int(layer), int(width))
-        acc = self.stats.setdefault(
-            key, {"count": 0.0, "sum_abs": 0.0, "sum_sq": 0.0, "var_sum": 0.0}
-        )
+        acc = self._level_acc(layer, width)
         acc["count"] += float(err.numel())
         acc["sum_abs"] += err.abs().sum().item()
         acc["sum_sq"] += err.double().square().sum().item()
         acc["var_sum"] += intra_var.sum().item()
 
-    def add_peak(self, layer: int, abs_z: torch.Tensor) -> None:
-        """Record D5 peakiness: running max + p99.9 of |scale·q·k| for a layer.
+    def add_value_stats(
+        self, layer: int, width: int, v_err: torch.Tensor, v_ref: torch.Tensor
+    ) -> None:
+        """Accumulate read-out error ``‖mean(v) − V_exact(q, slot)‖`` per (query, slot).
 
-        p99.9 is aggregated as the max of per-call p99.9 estimates (a diagnostic
-        runs on a handful of samples, so this is a fine, cheap proxy). Large score
-        tensors are subsampled before the quantile — ``torch.quantile`` caps its
-        input size, and exact percentiles are not needed here.
+        ``v_err`` / ``v_ref`` are (B, G, rf, T_c, n) per-dim RMS norms (L2 ÷ √Dv) of
+        the mean-vs-exact read-out gap and of the exact read-out itself. Lands in
+        the same (layer, width) cells as ``add_slot_stats``, so D2's score and
+        value sides share one rate-distortion table: ``value_mae`` is absolute
+        (per-dim RMS units), ``value_rel`` is relative to ``‖V_exact‖``.
+        """
+        acc = self._level_acc(layer, width)
+        acc["v_count"] += float(v_err.numel())
+        acc["v_abs"] += v_err.sum().item()
+        acc["v_rel"] += (v_err / v_ref.clamp_min(1e-8)).sum().item()
+
+    def add_out_stats(
+        self,
+        layer: int,
+        err_base: float,
+        err_s: float,
+        err_v: float,
+        ref: float,
+        n_queries: int,
+    ) -> None:
+        """Accumulate per-layer squared output error of each grid corner vs ``exact``.
+
+        One diagnostic run therefore yields the full D2 attribution per layer
+        (``by_layer_output`` in ``summary()``) with all four corners evaluated on
+        the SAME hidden states — no cross-run drift confound.
+        """
+        acc = self.out_stats.setdefault(
+            int(layer), {"base": 0.0, "s": 0.0, "v": 0.0, "ref": 0.0, "n": 0}
+        )
+        acc["base"] += err_base
+        acc["s"] += err_s
+        acc["v"] += err_v
+        acc["ref"] += ref
+        acc["n"] += n_queries
+
+    def _level_acc(self, layer: int, width: int) -> dict[str, float]:
+        return self.stats.setdefault(
+            (int(layer), int(width)),
+            {
+                "count": 0.0, "sum_abs": 0.0, "sum_sq": 0.0, "var_sum": 0.0,
+                "v_count": 0.0, "v_abs": 0.0, "v_rel": 0.0,
+            },
+        )
+
+    def add_peak(self, layer: int, abs_z: torch.Tensor) -> None:
+        """Record D5 peakiness: running max + a sample buffer of |scale·q·k|.
+
+        The buffer holds a deterministic strided subsample per layer (capped at
+        ``_PEAK_BUF_CAP``; thinned 2× on overflow), and ``summary()`` takes ONE
+        quantile over the whole run. The previous max-of-per-call-p99.9 proxy was
+        not comparable across modes — slot paths call once per width-run, dense
+        once per prefix chunk, so identical layer-0 populations still produced
+        different p99.9 (the spurious exact-vs-dense gaps in early dumps).
         """
         if abs_z.numel() == 0:
             return
-        flat = abs_z.detach().flatten().float()
-        m = flat.max().item()
-        if flat.numel() > 1_000_000:
-            idx = torch.randint(0, flat.numel(), (1_000_000,), device=flat.device)
-            flat = flat[idx]
-        p = torch.quantile(flat, 0.999).item()
-        acc = self.peak.setdefault(int(layer), {"r2_max": 0.0, "r2_p999": 0.0})
-        acc["r2_max"] = max(acc["r2_max"], m)
-        acc["r2_p999"] = max(acc["r2_p999"], p)
+        flat = abs_z.detach().reshape(-1).float()
+        acc = self.peak.setdefault(
+            int(layer), {"r2_max": 0.0, "buf": [], "buf_n": 0, "stride": 1, "n_seen": 0}
+        )
+        acc["r2_max"] = max(acc["r2_max"], flat.max().item())
+        acc["n_seen"] += flat.numel()
+        take = flat[:: acc["stride"]]
+        if take.numel() > _PEAK_BUF_CAP:  # one huge call: pre-thin it directly
+            take = take[:: -(-take.numel() // _PEAK_BUF_CAP)]
+        acc["buf"].append(take.cpu())
+        acc["buf_n"] += take.numel()
+        while acc["buf_n"] > _PEAK_BUF_CAP:
+            thinned = torch.cat(acc["buf"])[::2]
+            acc["buf"] = [thinned]
+            acc["buf_n"] = thinned.numel()
+            acc["stride"] *= 2
 
     def summary(self) -> dict:
         """Plot-ready reduction of the accumulated stats (see module docstring)."""
         by_level = []
         for (layer, width), acc in sorted(self.stats.items()):
             n = max(acc["count"], 1.0)
+            nv = max(acc.get("v_count", 0.0), 1.0)
             by_level.append(
                 {
                     "layer": layer,
@@ -134,13 +216,39 @@ class DiagState:
                     "logit_mae": acc["sum_abs"] / n,
                     "logit_rmse": (acc["sum_sq"] / n) ** 0.5,
                     "intra_slot_logit_var": acc["var_sum"] / n,
+                    "value_mae": acc.get("v_abs", 0.0) / nv,
+                    "value_rel": acc.get("v_rel", 0.0) / nv,
                 }
             )
-        peakiness = [
-            {"layer": layer, "r2_max": acc["r2_max"], "r2_p999": acc["r2_p999"]}
-            for layer, acc in sorted(self.peak.items())
-        ]
-        return {"mode": self.mode, "by_level": by_level, "peakiness": peakiness}
+        by_layer_output = []
+        for layer, acc in sorted(self.out_stats.items()):
+            ref = max(acc["ref"], 1e-30)
+            by_layer_output.append(
+                {
+                    "layer": layer,
+                    "err_baseline": (acc["base"] / ref) ** 0.5,
+                    "err_s_oracle": (acc["s"] / ref) ** 0.5,
+                    "err_v_oracle": (acc["v"] / ref) ** 0.5,
+                    "n_queries": acc["n"],
+                }
+            )
+        peakiness = []
+        for layer, acc in sorted(self.peak.items()):
+            buf = torch.cat(acc["buf"]) if acc["buf"] else torch.zeros(1)
+            peakiness.append(
+                {
+                    "layer": layer,
+                    "r2_max": acc["r2_max"],
+                    "r2_p999": torch.quantile(buf, 0.999).item(),
+                    "n": acc["n_seen"],
+                }
+            )
+        return {
+            "mode": self.stats_mode,
+            "by_level": by_level,
+            "by_layer_output": by_layer_output,
+            "peakiness": peakiness,
+        }
 
 
 DIAG = DiagState()
@@ -165,6 +273,12 @@ def diag_mode(mode: str, q_chunk: int = 64, collect: bool = True, reset: bool = 
     if reset:
         DIAG.reset_stats()
     DIAG.mode, DIAG.q_chunk, DIAG.collect = mode, q_chunk, collect
+    if mode != "off":
+        # Not restored on exit (mirrors the stats themselves): eval.py dumps
+        # summary() after this context closes, and the label must name the mode
+        # the stats were collected under — restoring it produced mode="off" in
+        # every early dump.
+        DIAG.stats_mode = mode
     try:
         yield DIAG
     finally:
@@ -277,6 +391,13 @@ def _diag_slot_core(
     ``v_oracle`` and ``exact``. Everything runs in fp32; the query axis is chunked
     (``DIAG.q_chunk``) because the oracle sides materialize a per-token
     (B, G, rf, T_c, N) score, unlike the O(S) production path.
+
+    With ``DIAG.collect`` the within-slot softmax + token values are retained per
+    chunk and ALL FOUR grid corners are evaluated (value-side stats + drift-free
+    per-layer output attribution), so every collecting run — including
+    ``baseline`` — carries the value-oracle memory envelope. The returned output
+    for the active mode is built from the same expressions as the stats-off path,
+    so enabling ``collect`` never changes what the model sees.
     """
     B, nh, T_q, D = q.shape
     G = slot_k.size(1)
@@ -304,18 +425,21 @@ def _diag_slot_core(
         t_c = c1 - c0
         qg = qf[:, :, c0:c1, :].reshape(B, G, rf, t_c, D)
 
-        l_parts: list[torch.Tensor] = []       # per-run slot logits, (B,G,rf,t_c,n)
-        z_keep: list[torch.Tensor | None] = []  # per-run token scores (value oracle)
-        v_keep: list[torch.Tensor | None] = []  # per-run token values  (value oracle)
+        # Per-run slot logits, both sides. Under ``collect`` both sides plus the
+        # within-slot softmax/values are always materialized (the D2 grid needs
+        # all four corners); with stats off, only what the active mode returns,
+        # so a stats-off oracle run stays as lean as before.
+        l_ex_parts: list[torch.Tensor | None] = []
+        l_ap_parts: list[torch.Tensor | None] = []
+        w_keep: list[torch.Tensor | None] = []  # per-run within-slot softmax(z)
+        v_keep: list[torch.Tensor | None] = []  # per-run token values
+        keep_tokens = v_exact or collect        # exact-V read-out needs both
         tok = 0
         for soff, n, width in runs:
             kr = kp[:, :, tok:tok + n * width, :].reshape(B, G, n, width, D)
             # z is the per-token score; every reachable mode needs it (exact-L
             # logsumexp, exact-V within-softmax, or stats), so it is unconditional.
             z = scale * torch.einsum("bgrtd,bgnwd->bgrtnw", qg, kr)  # (B,G,rf,t_c,n,width)
-            # The other logit is only materialized when it is actually used
-            # (as the slot logit or for the approx-vs-exact stat), so on a 32K
-            # sequence a pure oracle run never pays for the unused side.
             l_exact_run = torch.logsumexp(z, dim=-1) if (l_exact or collect) else None
             if not l_exact or collect:
                 skr = skf[:, :, soff:soff + n, :]                   # (B,G,n,D)
@@ -325,41 +449,74 @@ def _diag_slot_core(
                 )
             else:
                 l_approx_run = None
-            l_parts.append(l_exact_run if l_exact else l_approx_run)
+            l_ex_parts.append(l_exact_run)
+            l_ap_parts.append(l_approx_run)
+
+            within = torch.softmax(z, dim=-1) if keep_tokens else None
+            vr = (
+                vp[:, :, tok:tok + n * width, :].reshape(B, G, n, width, Dv)
+                if keep_tokens
+                else None
+            )
+            w_keep.append(within)
+            v_keep.append(vr)
 
             if collect:
                 DIAG.add_slot_stats(
                     layer, width, l_approx_run - l_exact_run, z.var(dim=-1, unbiased=False)
                 )
                 DIAG.add_peak(layer, z.abs())
-
-            if v_exact:
-                z_keep.append(z)
-                v_keep.append(vp[:, :, tok:tok + n * width, :].reshape(B, G, n, width, Dv))
-            else:
-                z_keep.append(None)
-                v_keep.append(None)
+                # Value side of the D2 grid: what a width-w mean-pooled read-out
+                # actually loses, ‖mean(v) − softmax_within(z)·v‖ per (query, slot).
+                v_ex_run = torch.einsum("bgrtnw,bgnwc->bgrtnc", within, vr)
+                diff = v_ex_run - svf[:, :, None, None, soff:soff + n, :]
+                dv_sqrt = Dv ** 0.5
+                DIAG.add_value_stats(
+                    layer, width, diff.norm(dim=-1) / dv_sqrt, v_ex_run.norm(dim=-1) / dv_sqrt
+                )
             tok += n * width
 
-        l_prefix = torch.cat(l_parts, dim=-1)  # (B,G,rf,t_c,S), slot-aligned
         l_tail = scale * torch.einsum("bgrtd,bgsd->bgrts", qg, kt)  # (B,G,rf,t_c,blk)
         l_tail = l_tail.masked_fill(
             _causal_tail_mask(c0, t_c, blk, q.device).view(1, 1, 1, t_c, blk), float("-inf")
         )
 
-        p = torch.softmax(torch.cat([l_prefix, l_tail], dim=-1), dim=-1)
-        p_prefix = p[..., :S]
-        p_tail = p[..., S:]
+        def _mix(l_parts: list[torch.Tensor], exact_v: bool) -> torch.Tensor:
+            """Softmax over [slot logits | causal tail] + the chosen read-out."""
+            p = torch.softmax(torch.cat(l_parts + [l_tail], dim=-1), dim=-1)
+            p_prefix = p[..., :S]
+            p_tail = p[..., S:]
+            if exact_v:
+                o = qg.new_zeros(B, G, rf, t_c, Dv)
+                for (soff, n, _width), within, vr in zip(runs, w_keep, v_keep):
+                    tw = p_prefix[..., soff:soff + n].unsqueeze(-1) * within
+                    o = o + torch.einsum("bgrtnw,bgnwc->bgrtc", tw, vr)
+            else:
+                o = torch.einsum("bgrts,bgsc->bgrtc", p_prefix, svf)  # p·mean(v) == p·slot_v
+            return o + torch.einsum("bgrts,bgsc->bgrtc", p_tail, vt)
 
-        if v_exact:
-            out = qg.new_zeros(B, G, rf, t_c, Dv)
-            for (soff, n, _width), z, vr in zip(runs, z_keep, v_keep):
-                within = torch.softmax(z, dim=-1)                    # (B,G,rf,t_c,n,width)
-                tw = p_prefix[..., soff:soff + n].unsqueeze(-1) * within
-                out = out + torch.einsum("bgrtnw,bgnwc->bgrtc", tw, vr)
+        if collect:
+            # All four grid corners on the SAME hidden states — drift-free
+            # per-layer D2 attribution from a single run (see add_out_stats).
+            out_exact_c = _mix(l_ex_parts, True)
+            out_base_c = _mix(l_ap_parts, False)
+            out_s_c = _mix(l_ex_parts, False)
+            out_v_c = _mix(l_ap_parts, True)
+            DIAG.add_out_stats(
+                layer,
+                (out_base_c - out_exact_c).square().sum().item(),
+                (out_s_c - out_exact_c).square().sum().item(),
+                (out_v_c - out_exact_c).square().sum().item(),
+                out_exact_c.square().sum().item(),
+                B * nh * t_c,
+            )
+            out = (
+                out_exact_c
+                if (l_exact and v_exact)
+                else out_s_c if l_exact else out_v_c if v_exact else out_base_c
+            )
         else:
-            out = torch.einsum("bgrts,bgsc->bgrtc", p_prefix, svf)   # p·mean(v) == p·slot_v
-        out = out + torch.einsum("bgrts,bgsc->bgrtc", p_tail, vt)
+            out = _mix(l_ex_parts if l_exact else l_ap_parts, v_exact)
         outs.append(out.reshape(B, nh, t_c, Dv))
 
     return torch.cat(outs, dim=2).to(q.dtype)
