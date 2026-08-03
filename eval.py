@@ -690,11 +690,19 @@ def main(
     limit: int | float | None = None,
     # ── 🧩 logKV 诊断（score/value oracle 归因网格；见 litgpt.log_kv_diag）──
     # None/"off" = 不诊断（默认，零开销）。其余取值：
-    # baseline/s_oracle/v_oracle/exact/dense —— 见 log_kv_diag 模块文档。
+    # baseline/s_oracle/v_oracle/gamma_only/exact/dense —— 见 log_kv_diag 模块文档。
     # 要求 log_kv_pin_size == 0（诊断假定槽连续覆盖精确前缀，钉扎会打破这一点）。
     log_kv_diag_mode: str | None = None,
     # 诊断汇总 JSON 的落盘目录；缺省时退回 output_path。
     log_kv_diag_output: str | None = None,
+    # ── 分层消融（D1 悬而未决的 marginal vs cumulative 问题；见 log_kv_diag）──
+    # 层号 >= 此值强制走 exact，其余层走 log_kv_diag_mode（通常是 baseline），
+    # 在同一次真实前向里测。None = 不启用（默认）。典型 sweep：28 - N，
+    # N ∈ {0,1,2,4,7,14,21,28}（28 为本模型层数，按实际改）。
+    log_kv_diag_exact_from_layer: int | None = None,
+    # ── D5 重分箱：peakiness 只统计序列最后这么多个 token 的 query ──
+    # （question/生成阶段紧邻的 prefill 尾部），None = 不过滤（默认，旧行为）。
+    log_kv_diag_peak_window_from_end: int | None = None,
     # ── 🧩 logKV：YAML config ──
     config: str | None = None,
 ):
@@ -731,6 +739,10 @@ def main(
     limit = _o("limit", limit)
     log_kv_diag_mode = _o("log_kv_diag_mode", log_kv_diag_mode)
     log_kv_diag_output = _o("log_kv_diag_output", log_kv_diag_output)
+    log_kv_diag_exact_from_layer = _o("log_kv_diag_exact_from_layer", log_kv_diag_exact_from_layer)
+    log_kv_diag_peak_window_from_end = _o(
+        "log_kv_diag_peak_window_from_end", log_kv_diag_peak_window_from_end
+    )
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -753,7 +765,12 @@ def main(
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
         print(f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} (obs {log_kv_pin_obs_window})")
         if diag_active:
-            print(f"🔬 诊断模式: {log_kv_diag_mode} | limit: {limit} | 每 rank 各自累积统计量，不跨 rank 聚合")
+            print(
+                f"🔬 诊断模式: {log_kv_diag_mode} | limit: {limit} | "
+                f"exact_from_layer: {log_kv_diag_exact_from_layer} | "
+                f"peak_window_from_end: {log_kv_diag_peak_window_from_end} | "
+                "每 rank 各自累积统计量，不跨 rank 聚合"
+            )
 
     checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
 
@@ -769,7 +786,11 @@ def main(
         tokenizer_dir=tokenizer_dir,
     )
 
-    with diag_mode(log_kv_diag_mode) if diag_active else contextlib.nullcontext():
+    with diag_mode(
+        log_kv_diag_mode,
+        exact_from_layer=log_kv_diag_exact_from_layer,
+        peak_window_from_end=log_kv_diag_peak_window_from_end,
+    ) if diag_active else contextlib.nullcontext():
         results = evaluator.simple_evaluate(
             model=lm_model,
             tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
@@ -791,7 +812,12 @@ def main(
         if diag_active:
             diag_dir = Path(log_kv_diag_output or output_path or ".").expanduser()
             diag_dir.mkdir(parents=True, exist_ok=True)
-            diag_file = diag_dir / f"diag_{log_kv_diag_mode}_{benchmark.replace(',', '+')}_{ts}.json"
+            tag = log_kv_diag_mode
+            if log_kv_diag_exact_from_layer is not None:
+                tag += f"_efl{log_kv_diag_exact_from_layer}"
+            if log_kv_diag_peak_window_from_end is not None:
+                tag += f"_pw{log_kv_diag_peak_window_from_end}"
+            diag_file = diag_dir / f"diag_{tag}_{benchmark.replace(',', '+')}_{ts}.json"
             with open(diag_file, "w", encoding="utf-8") as f:
                 json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)
             print(f"🔬 诊断汇总已保存到: {diag_file}")

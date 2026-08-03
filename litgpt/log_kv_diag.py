@@ -17,16 +17,56 @@ This module swaps the two sides in and out independently to build a 2×2
 attribution grid, so a benchmark drop can be split into "scoring error" vs
 "read-out error":
 
-    mode        L_s (score)              V_s (value)          answers
-    --------    ---------------------    -----------------    -------------------
-    baseline    approx (production)      mean(v)              control (== prod)
-    s_oracle    exact logsumexp          mean(v)              how much is scoring
-    v_oracle    approx (production)      exact softmax·v      how much is read-out
-    exact       exact                    exact                self-check (== dense)
-    dense       no bucketing — softmax over every raw token   independent oracle
+    mode          L_s (score)              V_s (value)              answers
+    ----------    ---------------------    ---------------------    -------------------
+    baseline      approx (production)      mean(v)                  control (== prod)
+    s_oracle      exact logsumexp          mean(v)                  how much is scoring
+    v_oracle      approx (production)      exact softmax·v          how much is read-out
+    gamma_only    exact logsumexp          mean(v) + scale·Γ_s·q    1st-order value fix
+    exact         exact                    exact                    self-check (== dense)
+    dense         no bucketing — softmax over every raw token       independent oracle
 
 ``exact`` and ``dense`` must agree (two independent routes to the same identity);
 ``baseline`` must reproduce production bit-for-bit (it delegates to it).
+
+``gamma_only`` probes whether a CHEAP, on-the-fly linear value correction closes
+most of ``s_oracle``'s gap without the full ``v_oracle`` within-slot softmax
+read-out: ``V_s(q) ≈ mean(v) + scale·Γ_s·q`` where
+``Γ_s = mean_j[(v_j − mean(v))(k_j − mean(k))^T]`` is the within-slot key/value
+cross-covariance (recomputed fresh per query from ``k_prefix``/``v_prefix``, NOT
+persisted anywhere — this is the delta-method expansion of the exact within-slot
+softmax around uniform weights; see the score-side ``Σ_s`` analogue in the design
+notes). A large gap between ``s_oracle`` and ``gamma_only`` (gamma_only much less
+negative / closer to baseline) says the linear term captures most of what
+``s_oracle`` was missing, which is the case FOR implementing the persisted
+``Γ_s`` correction in production; a small gap says the interaction needs the
+full within-slot distribution, not just its first moment.
+
+Two more instruments beyond the mode grid, both opt-in via ``diag_mode(...)``:
+
+  * ``exact_from_layer``: layers ``>= exact_from_layer`` are forced to ``exact``
+    regardless of the active ``mode``, in the SAME real forward pass (errors from
+    earlier baseline layers propagate in normally). Sweeping this — see
+    ``diag_mode(mode, exact_from_layer=28-N)`` for ``N`` in {0,1,2,4,7,14,21,28} —
+    answers whether a benchmark's gap is dominated by cumulative drift from early
+    layers (fixing only the tail doesn't help until N is large) or by the last
+    layers' own local distortion (a small N recovers most of it). ``by_layer_output``
+    is still collected at every layer including the forced-exact tail, so
+    ``err_baseline`` at the LAST layer, read across the N sweep, is the signal: it
+    is a counterfactual (what baseline WOULD have given at that layer) evaluated on
+    whatever hidden state this specific N actually produced, so it shrinks with N
+    only through less upstream drift, not because the layer's own behavior changed.
+  * ``peak_window_from_end``: restricts D5 peakiness collection (``add_peak``) to
+    query positions within the last ``peak_window_from_end`` tokens of the
+    sequence (needs ``seq_len`` passed to ``diag_block_attention``). Unfiltered
+    peakiness pools every query in the block-prefill indiscriminately, which
+    dilutes a benchmark's few truly retrieval-critical query positions (e.g. a
+    NIAH question near the prompt tail) against a much larger population of
+    ordinary reading positions. ``None`` (default) keeps the old unfiltered
+    behavior. NOTE: this only reaches query positions inside a fresh PREFILL
+    block (see the module-level precondition below) — autoregressive decode is
+    not instrumented, so "generation-phase" queries are approximated by the
+    prompt's tail window, not literal decode steps.
 
 ``summary()`` reduces the accumulated stats to three tables, labeled with the
 mode they were collected under:
@@ -37,8 +77,8 @@ mode they were collected under:
     they do not collapse to zero in oracle modes; across-mode dumps differ only
     through hidden-state drift caused by the substituted outputs.
   * ``by_layer_output`` — per layer: relative L2 error of the baseline / s_oracle
-    / v_oracle outputs vs ``exact``, all four corners evaluated on the SAME
-    hidden states, so one run yields a drift-free D2 attribution.
+    / v_oracle / gamma_only outputs vs ``exact``, all five corners evaluated on
+    the SAME hidden states, so one run yields a drift-free D2 attribution.
   * ``peakiness`` — per layer: running max + p99.9 of |scale·q·k| over a
     deterministic sample buffer, with the pool size ``n``.
 
@@ -59,14 +99,16 @@ import torch
 
 from litgpt.log_kv_cache import append_exact_tokens, log_kv_slot_attention
 
-_MODES = ("off", "baseline", "s_oracle", "v_oracle", "exact", "dense")
+_MODES = ("off", "baseline", "s_oracle", "v_oracle", "gamma_only", "exact", "dense")
 # Per-layer cap on the deterministic |scale·q·k| sample buffer backing the
 # summary()-time p99.9 (see DiagState.add_peak). ~1 MB fp32 per layer.
 _PEAK_BUF_CAP = 262_144
 # Modes whose slot logit is the exact within-slot logsumexp (score oracle).
-_L_EXACT = ("s_oracle", "exact")
+_L_EXACT = ("s_oracle", "gamma_only", "exact")
 # Modes whose read-out is the exact within-slot softmax over v (value oracle).
 _V_EXACT = ("v_oracle", "exact")
+# Mode whose read-out is the 1st-order linear correction mean(v) + scale·Γ_s·q.
+_V_GAMMA = ("gamma_only",)
 
 
 # ======================================================================
@@ -88,6 +130,12 @@ class DiagState:
         self.mode: str = "off"
         self.q_chunk: int = 64
         self.collect: bool = True
+        # Layer-ablation sweep (see module docstring): layers >= this are forced
+        # to "exact" regardless of ``mode``. None = no override (legacy).
+        self.exact_from_layer: int | None = None
+        # D5 re-binning (see module docstring): restrict add_peak to the last N
+        # tokens of the sequence. None = unfiltered (legacy).
+        self.peak_window_from_end: int | None = None
         # Mode the accumulated stats were collected under. Unlike ``mode`` this is
         # NOT restored when a ``diag_mode`` context exits (mirroring the stats
         # themselves), so a ``summary()`` dump written after the ``with`` block —
@@ -147,21 +195,23 @@ class DiagState:
         err_base: float,
         err_s: float,
         err_v: float,
+        err_gamma: float,
         ref: float,
         n_queries: int,
     ) -> None:
         """Accumulate per-layer squared output error of each grid corner vs ``exact``.
 
         One diagnostic run therefore yields the full D2 attribution per layer
-        (``by_layer_output`` in ``summary()``) with all four corners evaluated on
+        (``by_layer_output`` in ``summary()``) with all five corners evaluated on
         the SAME hidden states — no cross-run drift confound.
         """
         acc = self.out_stats.setdefault(
-            int(layer), {"base": 0.0, "s": 0.0, "v": 0.0, "ref": 0.0, "n": 0}
+            int(layer), {"base": 0.0, "s": 0.0, "v": 0.0, "gamma": 0.0, "ref": 0.0, "n": 0}
         )
         acc["base"] += err_base
         acc["s"] += err_s
         acc["v"] += err_v
+        acc["gamma"] += err_gamma
         acc["ref"] += ref
         acc["n"] += n_queries
 
@@ -229,6 +279,7 @@ class DiagState:
                     "err_baseline": (acc["base"] / ref) ** 0.5,
                     "err_s_oracle": (acc["s"] / ref) ** 0.5,
                     "err_v_oracle": (acc["v"] / ref) ** 0.5,
+                    "err_gamma_only": (acc.get("gamma", 0.0) / ref) ** 0.5,
                     "n_queries": acc["n"],
                 }
             )
@@ -255,24 +306,43 @@ DIAG = DiagState()
 
 
 @contextlib.contextmanager
-def diag_mode(mode: str, q_chunk: int = 64, collect: bool = True, reset: bool = True):
+def diag_mode(
+    mode: str,
+    q_chunk: int = 64,
+    collect: bool = True,
+    reset: bool = True,
+    exact_from_layer: int | None = None,
+    peak_window_from_end: int | None = None,
+):
     """Temporarily switch the global diagnostic mode; restore on exit.
 
     Args:
-        mode: one of ``off / baseline / s_oracle / v_oracle / exact / dense``.
+        mode: one of ``off / baseline / s_oracle / v_oracle / gamma_only / exact
+            / dense``.
         q_chunk: query-axis chunk for the memory-heavy oracle paths (they
             materialize a per-token fp32 score; see ``diag_block_attention``).
         collect: gather per-level stats + peakiness while running.
         reset: clear previously accumulated stats on entry (default). Stats are
             deliberately NOT cleared on exit, so ``DIAG.summary()`` can be read
             after the ``with`` block.
+        exact_from_layer: layer-ablation sweep — layers ``>= exact_from_layer``
+            are forced to ``exact`` regardless of ``mode``. ``None`` disables the
+            override (every layer uses ``mode``, the old behavior).
+        peak_window_from_end: restrict D5 peakiness (``add_peak``) to query
+            positions within the last N tokens of the sequence. ``None`` keeps
+            the old unfiltered pooling.
     """
     if mode not in _MODES:
         raise ValueError(f"unknown diag mode {mode!r}; expected one of {_MODES}")
-    prev = (DIAG.mode, DIAG.q_chunk, DIAG.collect)
+    prev = (
+        DIAG.mode, DIAG.q_chunk, DIAG.collect,
+        DIAG.exact_from_layer, DIAG.peak_window_from_end,
+    )
     if reset:
         DIAG.reset_stats()
     DIAG.mode, DIAG.q_chunk, DIAG.collect = mode, q_chunk, collect
+    DIAG.exact_from_layer = exact_from_layer
+    DIAG.peak_window_from_end = peak_window_from_end
     if mode != "off":
         # Not restored on exit (mirrors the stats themselves): eval.py dumps
         # summary() after this context closes, and the label must name the mode
@@ -282,7 +352,10 @@ def diag_mode(mode: str, q_chunk: int = 64, collect: bool = True, reset: bool = 
     try:
         yield DIAG
     finally:
-        DIAG.mode, DIAG.q_chunk, DIAG.collect = prev
+        (
+            DIAG.mode, DIAG.q_chunk, DIAG.collect,
+            DIAG.exact_from_layer, DIAG.peak_window_from_end,
+        ) = prev
 
 
 # ======================================================================
@@ -358,6 +431,27 @@ def _production_block(
     )
 
 
+def _peak_local_slice(t_c: int, global_c0: int, seq_len: int | None) -> slice | None:
+    """Local [lo, t_c) slice restricting a query chunk to ``DIAG.peak_window_from_end``.
+
+    ``global_c0`` is the sequence position of local index 0 in this chunk
+    (``q_offset + c0``); ``seq_len`` is the CURRENT example's total prefill
+    length (varies per call, so it is threaded through as an argument, not
+    stored on ``DIAG`` — see ``diag_block_attention``'s ``seq_len`` param).
+    Returns ``None`` if the chunk has no overlap with the window (skip
+    ``add_peak`` entirely) or ``slice(0, t_c)`` unfiltered when no window /
+    no ``seq_len`` is given (legacy behavior).
+    """
+    window = DIAG.peak_window_from_end
+    if window is None or seq_len is None:
+        return slice(0, t_c)
+    lo_global = seq_len - window
+    lo = max(0, lo_global - global_c0)
+    if lo >= t_c:
+        return None
+    return slice(lo, t_c)
+
+
 def _causal_tail_mask(c0: int, t_c: int, blk: int, device: torch.device) -> torch.Tensor:
     """(T_c, blk) bool, True where query at block-offset c0+i must NOT see tail j.
 
@@ -383,17 +477,22 @@ def _diag_slot_core(
     scale: float,
     lam: float,
     layer: int,
+    q_offset: int = 0,
+    seq_len: int | None = None,
 ) -> torch.Tensor:
     """Slot-bucketed attention with per-side (score/value) oracle swaps + stats.
 
     Handles ``baseline`` (approx/approx — kept for stats; the returned output is
     overridden by ``_production_block`` for bit-exactness), ``s_oracle``,
-    ``v_oracle`` and ``exact``. Everything runs in fp32; the query axis is chunked
-    (``DIAG.q_chunk``) because the oracle sides materialize a per-token
-    (B, G, rf, T_c, N) score, unlike the O(S) production path.
+    ``v_oracle``, ``gamma_only`` and ``exact``. Everything runs in fp32; the
+    query axis is chunked (``DIAG.q_chunk``) because the oracle sides
+    materialize a per-token (B, G, rf, T_c, N) score, unlike the O(S) production
+    path. ``q_offset``/``seq_len`` are only used to restrict D5 peakiness to
+    ``DIAG.peak_window_from_end`` (see module docstring); they do not affect the
+    returned output.
 
     With ``DIAG.collect`` the within-slot softmax + token values are retained per
-    chunk and ALL FOUR grid corners are evaluated (value-side stats + drift-free
+    chunk and ALL FIVE grid corners are evaluated (value-side stats + drift-free
     per-layer output attribution), so every collecting run — including
     ``baseline`` — carries the value-oracle memory envelope. The returned output
     for the active mode is built from the same expressions as the stats-off path,
@@ -408,6 +507,7 @@ def _diag_slot_core(
     collect = DIAG.collect
     l_exact = mode in _L_EXACT
     v_exact = mode in _V_EXACT
+    v_gamma = mode in _V_GAMMA
 
     qf = q.float()
     kp = k_prefix.float()
@@ -424,21 +524,23 @@ def _diag_slot_core(
         c1 = min(T_q, c0 + q_chunk)
         t_c = c1 - c0
         qg = qf[:, :, c0:c1, :].reshape(B, G, rf, t_c, D)
+        peak_sl = _peak_local_slice(t_c, q_offset + c0, seq_len)
 
         # Per-run slot logits, both sides. Under ``collect`` both sides plus the
         # within-slot softmax/values are always materialized (the D2 grid needs
-        # all four corners); with stats off, only what the active mode returns,
+        # all five corners); with stats off, only what the active mode returns,
         # so a stats-off oracle run stays as lean as before.
         l_ex_parts: list[torch.Tensor | None] = []
         l_ap_parts: list[torch.Tensor | None] = []
-        w_keep: list[torch.Tensor | None] = []  # per-run within-slot softmax(z)
-        v_keep: list[torch.Tensor | None] = []  # per-run token values
-        keep_tokens = v_exact or collect        # exact-V read-out needs both
+        w_keep: list[torch.Tensor | None] = []        # per-run within-slot softmax(z)
+        v_keep: list[torch.Tensor | None] = []         # per-run token values
+        v_gamma_keep: list[torch.Tensor | None] = []   # per-run mean(v)+scale·Γ_s·q
+        keep_tokens = v_exact or v_gamma or collect     # exact-V / gamma-V need raw v
         tok = 0
         for soff, n, width in runs:
             kr = kp[:, :, tok:tok + n * width, :].reshape(B, G, n, width, D)
             # z is the per-token score; every reachable mode needs it (exact-L
-            # logsumexp, exact-V within-softmax, or stats), so it is unconditional.
+            # logsumexp, exact-V within-softmax, Γ_s, or stats), so unconditional.
             z = scale * torch.einsum("bgrtd,bgnwd->bgrtnw", qg, kr)  # (B,G,rf,t_c,n,width)
             l_exact_run = torch.logsumexp(z, dim=-1) if (l_exact or collect) else None
             if not l_exact or collect:
@@ -461,11 +563,30 @@ def _diag_slot_core(
             w_keep.append(within)
             v_keep.append(vr)
 
+            if v_gamma or collect:
+                # Γ_s = mean_j[(v_j-v̄_s)(k_j-k̄_s)^T], recomputed fresh from the raw
+                # run tokens (NOT persisted) — the delta-method / 1st-order Taylor
+                # expansion of the exact within-slot softmax read-out around
+                # uniform weights (see module docstring). skr/svr are the STORED
+                # slot means (== mean_j k_j / mean_j v_j by construction of
+                # compact()), so no separate mean pass over kr/vr is needed.
+                skr_g = skf[:, :, soff:soff + n, :]                   # (B,G,n,D)
+                svr_g = svf[:, :, soff:soff + n, :]                   # (B,G,n,Dv)
+                k_c = kr - skr_g.unsqueeze(3)                         # (B,G,n,width,D)
+                v_c = vr - svr_g.unsqueeze(3)                         # (B,G,n,width,Dv)
+                gamma = torch.einsum("bgnwc,bgnwd->bgncd", v_c, k_c) / width  # (B,G,n,Dv,D)
+                corr = scale * torch.einsum("bgncd,bgrtd->bgrtnc", gamma, qg)  # (B,G,rf,t_c,n,Dv)
+                v_gamma_run = svr_g[:, :, None, None, :, :] + corr    # (B,G,rf,t_c,n,Dv)
+            else:
+                v_gamma_run = None
+            v_gamma_keep.append(v_gamma_run)
+
             if collect:
                 DIAG.add_slot_stats(
                     layer, width, l_approx_run - l_exact_run, z.var(dim=-1, unbiased=False)
                 )
-                DIAG.add_peak(layer, z.abs())
+                if peak_sl is not None:
+                    DIAG.add_peak(layer, z[:, :, :, peak_sl].abs())
                 # Value side of the D2 grid: what a width-w mean-pooled read-out
                 # actually loses, ‖mean(v) − softmax_within(z)·v‖ per (query, slot).
                 v_ex_run = torch.einsum("bgrtnw,bgnwc->bgrtnc", within, vr)
@@ -481,42 +602,58 @@ def _diag_slot_core(
             _causal_tail_mask(c0, t_c, blk, q.device).view(1, 1, 1, t_c, blk), float("-inf")
         )
 
-        def _mix(l_parts: list[torch.Tensor], exact_v: bool) -> torch.Tensor:
-            """Softmax over [slot logits | causal tail] + the chosen read-out."""
+        def _mix(l_parts: list[torch.Tensor], v_source: str) -> torch.Tensor:
+            """Softmax over [slot logits | causal tail] + the chosen read-out.
+
+            ``v_source``: "mean" (production, p·slot_v) / "exact" (within-slot
+            softmax over raw v — needs w_keep/v_keep) / "gamma" (1st-order
+            linear correction — needs v_gamma_keep).
+            """
             p = torch.softmax(torch.cat(l_parts + [l_tail], dim=-1), dim=-1)
             p_prefix = p[..., :S]
             p_tail = p[..., S:]
-            if exact_v:
+            if v_source == "exact":
                 o = qg.new_zeros(B, G, rf, t_c, Dv)
                 for (soff, n, _width), within, vr in zip(runs, w_keep, v_keep):
                     tw = p_prefix[..., soff:soff + n].unsqueeze(-1) * within
                     o = o + torch.einsum("bgrtnw,bgnwc->bgrtc", tw, vr)
+            elif v_source == "gamma":
+                o = qg.new_zeros(B, G, rf, t_c, Dv)
+                for (soff, n, _width), vg in zip(runs, v_gamma_keep):
+                    o = o + torch.einsum(
+                        "bgrts,bgrtsc->bgrtc", p_prefix[..., soff:soff + n], vg
+                    )
             else:
                 o = torch.einsum("bgrts,bgsc->bgrtc", p_prefix, svf)  # p·mean(v) == p·slot_v
             return o + torch.einsum("bgrts,bgsc->bgrtc", p_tail, vt)
 
         if collect:
-            # All four grid corners on the SAME hidden states — drift-free
+            # All five grid corners on the SAME hidden states — drift-free
             # per-layer D2 attribution from a single run (see add_out_stats).
-            out_exact_c = _mix(l_ex_parts, True)
-            out_base_c = _mix(l_ap_parts, False)
-            out_s_c = _mix(l_ex_parts, False)
-            out_v_c = _mix(l_ap_parts, True)
+            out_exact_c = _mix(l_ex_parts, "exact")
+            out_base_c = _mix(l_ap_parts, "mean")
+            out_s_c = _mix(l_ex_parts, "mean")
+            out_v_c = _mix(l_ap_parts, "exact")
+            out_gamma_c = _mix(l_ex_parts, "gamma")
             DIAG.add_out_stats(
                 layer,
                 (out_base_c - out_exact_c).square().sum().item(),
                 (out_s_c - out_exact_c).square().sum().item(),
                 (out_v_c - out_exact_c).square().sum().item(),
+                (out_gamma_c - out_exact_c).square().sum().item(),
                 out_exact_c.square().sum().item(),
                 B * nh * t_c,
             )
             out = (
-                out_exact_c
-                if (l_exact and v_exact)
-                else out_s_c if l_exact else out_v_c if v_exact else out_base_c
+                out_exact_c if (l_exact and v_exact)
+                else out_gamma_c if v_gamma
+                else out_s_c if l_exact
+                else out_v_c if v_exact
+                else out_base_c
             )
         else:
-            out = _mix(l_ex_parts if l_exact else l_ap_parts, v_exact)
+            v_src = "gamma" if v_gamma else "exact" if v_exact else "mean"
+            out = _mix(l_ex_parts if l_exact else l_ap_parts, v_src)
         outs.append(out.reshape(B, nh, t_c, Dv))
 
     return torch.cat(outs, dim=2).to(q.dtype)
@@ -530,12 +667,16 @@ def _diag_dense(
     v_tail: torch.Tensor,
     scale: float,
     layer: int,
+    q_offset: int = 0,
+    seq_len: int | None = None,
 ) -> torch.Tensor:
     """Dense causal attention over every raw token — independent of any bucketing.
 
     Prefix fully visible (every prefix token precedes the block), in-flight block
     causal against itself. This is the ground-truth oracle that ``exact`` must
     match, computed by a completely separate route (flat softmax, no slots).
+    ``q_offset``/``seq_len`` only restrict D5 peakiness (``DIAG.peak_window_from_end``,
+    see module docstring); the returned output is unaffected.
     """
     B, nh, T_q, D = q.shape
     G = k_prefix.size(1)
@@ -557,14 +698,15 @@ def _diag_dense(
         c1 = min(T_q, c0 + q_chunk)
         t_c = c1 - c0
         qg = qf[:, :, c0:c1, :].reshape(B, G, rf, t_c, D)
+        peak_sl = _peak_local_slice(t_c, q_offset + c0, seq_len)
 
         z_pre = scale * torch.einsum("bgrtd,bgnd->bgrtn", qg, kp)   # (B,G,rf,t_c,N)
         z_tail = scale * torch.einsum("bgrtd,bgsd->bgrts", qg, kt)  # (B,G,rf,t_c,blk)
         z_tail = z_tail.masked_fill(
             _causal_tail_mask(c0, t_c, blk, q.device).view(1, 1, 1, t_c, blk), float("-inf")
         )
-        if collect:
-            DIAG.add_peak(layer, z_pre.abs())
+        if collect and peak_sl is not None:
+            DIAG.add_peak(layer, z_pre[:, :, :, peak_sl].abs())
 
         p = torch.softmax(torch.cat([z_pre, z_tail], dim=-1), dim=-1)
         out = torch.einsum("bgrtn,bgnc->bgrtc", p[..., :N], vp)
@@ -586,13 +728,21 @@ def diag_block_attention(
     scale: float,
     lam: float = 1.0,
     layer: int = 0,
+    q_offset: int = 0,
+    seq_len: int | None = None,
 ) -> torch.Tensor:
     """Diagnostic replacement for one production block-prefill attention step.
 
     Parallels ``log_kv_slot_attention`` but additionally receives the EXACT prefix
     tokens (``k_prefix``/``v_prefix``) the frozen slots cover, so the score and
     value sides can each be swapped between the production first-order approximation
-    and the exact within-slot computation (see module docstring for the 2×2 grid).
+    and the exact within-slot computation (see module docstring for the mode grid).
+
+    ``q_offset`` (this block's starting position in the sequence) and ``seq_len``
+    (the sequence's total prefill length) are passed straight through to
+    ``DIAG.peak_window_from_end`` filtering — see module docstring — and are not
+    otherwise used; callers that never set that field can leave them at their
+    defaults.
 
     Preconditions (the caller in ``model.py`` guards them; do NOT relax):
       * fresh prefill only — ``k_prefix`` must equal the tokens the slots cover,
@@ -605,6 +755,11 @@ def diag_block_attention(
     Returns (B, nh, T_q, Dv), matching the production output shape.
     """
     mode = DIAG.mode
+    # Layer-ablation sweep (see module docstring): tail layers forced to exact
+    # regardless of ``mode``, in the same real forward pass as everything below.
+    if DIAG.exact_from_layer is not None and layer >= DIAG.exact_from_layer:
+        mode = "exact"
+
     if mode in ("off", "baseline"):
         # off: defensive (never reached with a live diag context). baseline:
         # bit-exact production, optionally with a stats-only oracle pass.
@@ -618,12 +773,12 @@ def diag_block_attention(
                 )
             _diag_slot_core(
                 "baseline", q, k_prefix, v_prefix, slot_k, slot_v, slot_w,
-                k_tail, v_tail, runs, scale, lam, layer,
+                k_tail, v_tail, runs, scale, lam, layer, q_offset, seq_len,
             )
         return out
 
     if mode == "dense":
-        return _diag_dense(q, k_prefix, v_prefix, k_tail, v_tail, scale, layer)
+        return _diag_dense(q, k_prefix, v_prefix, k_tail, v_tail, scale, layer, q_offset, seq_len)
 
     runs, total = slot_runs(slot_w)
     if total != k_prefix.size(2):
@@ -633,5 +788,129 @@ def diag_block_attention(
         )
     return _diag_slot_core(
         mode, q, k_prefix, v_prefix, slot_k, slot_v, slot_w,
-        k_tail, v_tail, runs, scale, lam, layer,
+        k_tail, v_tail, runs, scale, lam, layer, q_offset, seq_len,
     )
+
+
+# ======================================================================
+# D4 (offline, standalone): adjacency grouping vs oracle clustering
+# ======================================================================
+
+
+def _kmeans(x: torch.Tensor, k: int, n_iters: int, seed: int) -> torch.Tensor:
+    """Plain Lloyd's-algorithm k-means. Returns (k,) int64 cluster assignment.
+
+    ``x`` is (N, D). Uses randomized init (k-means++-lite: k random distinct
+    points) — fine here since this is read-only offline analysis, never on the
+    backward-replay path that requires determinism (see log_kv_cache.py).
+    """
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    N = x.size(0)
+    init_idx = torch.randperm(N, generator=g)[:k]
+    centers = x[init_idx].clone()
+    assign = torch.zeros(N, dtype=torch.long)
+    for _ in range(n_iters):
+        d2 = (x.unsqueeze(1) - centers.unsqueeze(0)).square().sum(-1)  # (N, k)
+        new_assign = d2.argmin(dim=1)
+        if torch.equal(new_assign, assign) and _ > 0:
+            break
+        assign = new_assign
+        for c in range(k):
+            members = x[assign == c]
+            if members.numel() > 0:
+                centers[c] = members.mean(dim=0)
+    return assign
+
+
+def oracle_cluster_gap(
+    k_prefix: torch.Tensor,   # (G, N, D) raw prefix keys, ONE batch item
+    v_prefix: torch.Tensor,   # (G, N, Dv)
+    q: torch.Tensor,          # (G, rf, T_q, D) queries (already GQA-folded)
+    n_slots: int,             # budget: cluster count, should match the current
+                               # adjacency S for this prefix so the comparison is
+                               # apples-to-apples on the SAME compression ratio
+    scale: float,
+    n_iters: int = 25,
+    seed: int = 0,
+) -> dict:
+    """D4: same-budget position-agnostic k-means clustering vs strict time
+    adjacency, measured with the SAME estimator (mean-pool + logsumexp-vs-approx
+    logit error) on both sides — isolates whether the ACCURACY cost comes from
+    the adjacency CONSTRAINT (grouping only contiguous-in-time tokens) or from
+    the mean-pooling estimator itself (see module docstring's Σ_s/Γ_s notes and
+    the research log's D4 design).
+
+    Standalone / offline only — NOT wired into ``diag_mode``'s live mode grid,
+    run it from a small script on a handful of cached (k_prefix, v_prefix, q)
+    triples (e.g. captured via a one-off hook, or from a ``diag_mode("exact")``
+    run's inputs). Cost is O(N·k) per k-means iteration — fine for a handful of
+    examples, not for a full benchmark sweep.
+
+    Returns a dict with matched-budget error stats for both groupings:
+    ``{"adjacency": {...}, "oracle_cluster": {...}}``, each with ``logit_mae``
+    and ``value_rel`` pooled over all clusters/slots and all queries — directly
+    comparable to the corresponding aggregate of ``by_level`` for this layer.
+    """
+    G, N, _D = k_prefix.shape
+    Dv = v_prefix.size(-1)
+    rf, T_q = q.size(1), q.size(2)
+    kp, vp, qf = k_prefix.float(), v_prefix.float(), q.float()
+
+    def _adjacency_grouping(n: int) -> torch.Tensor:
+        # Contiguous runs of near-equal size, matching how compact() would
+        # partition N tokens into n slots — same spirit as slot_runs, but built
+        # from a flat token count rather than an existing cache's slot_w. Shared
+        # across every group (time order doesn't depend on G), unlike the
+        # per-group k-means assignment below.
+        base, rem = N // n, N % n
+        sizes = [base + 1] * rem + [base] * (n - rem)
+        assign = torch.empty(N, dtype=torch.long)
+        i = 0
+        for c, sz in enumerate(sizes):
+            assign[i:i + sz] = c
+            i += sz
+        return assign
+
+    def _grouping_error(assigns: torch.Tensor, n: int) -> dict:
+        """Mean logit_mae / value_rel over all (group, cluster, query-head) cells.
+
+        ``assigns`` is (N,) — same grouping for every G — or (G, N) — a
+        per-group grouping (k-means clusters independently per KV group).
+        """
+        mae_num = mae_den = vrel_num = vrel_den = 0.0
+        for g in range(G):
+            a = assigns[g] if assigns.dim() == 2 else assigns
+            for c in range(n):
+                idx = (a == c).nonzero(as_tuple=True)[0]
+                if idx.numel() == 0:
+                    continue
+                kc, vc = kp[g, idx, :], vp[g, idx, :]  # (w, D) / (w, Dv)
+                w = idx.numel()
+                k_bar, v_bar = kc.mean(dim=0), vc.mean(dim=0)
+                for r in range(rf):
+                    qr = qf[g, r]                                      # (T_q, D)
+                    z = scale * (qr @ kc.T)                            # (T_q, w)
+                    l_exact = torch.logsumexp(z, dim=-1)                # (T_q,)
+                    l_approx = scale * (qr @ k_bar) + torch.log(torch.tensor(float(w)))
+                    mae_num += (l_approx - l_exact).abs().sum().item()
+                    mae_den += T_q
+                    within = torch.softmax(z, dim=-1)                   # (T_q, w)
+                    v_exact = within @ vc                                # (T_q, Dv)
+                    diff = (v_exact - v_bar).norm(dim=-1) / (Dv ** 0.5)
+                    ref = v_exact.norm(dim=-1) / (Dv ** 0.5)
+                    vrel_num += (diff / ref.clamp_min(1e-8)).sum().item()
+                    vrel_den += T_q
+        return {
+            "logit_mae": mae_num / max(mae_den, 1),
+            "value_rel": vrel_num / max(vrel_den, 1),
+        }
+
+    adj_assign = _adjacency_grouping(n_slots)
+    oracle_assign = torch.stack(
+        [_kmeans(kp[g], n_slots, n_iters, seed) for g in range(G)]
+    )  # (G, N) — clustered independently per KV group
+
+    return {
+        "adjacency": _grouping_error(adj_assign, n_slots),
+        "oracle_cluster": _grouping_error(oracle_assign, n_slots),
+    }

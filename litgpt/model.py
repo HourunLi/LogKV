@@ -1055,6 +1055,7 @@ class CausalSelfAttention(nn.Module):
                         slot_k, slot_v, slot_w,
                         k[:, :, start:block_end, :], v[:, :, start:block_end, :],
                         scale=scale, lam=1.0, layer=self.block_idx,
+                        q_offset=start, seq_len=T,
                     )
                 else:
                     k_all, v_all, w_all = append_exact_tokens(
