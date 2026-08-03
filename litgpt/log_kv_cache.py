@@ -26,13 +26,15 @@ Position handling ("expected RoPE", merged into the compressed state):
   the norm shrinkage encodes the span's positional uncertainty.
 - NO per-token state of any kind survives outside the recent window.
 
-Slot attention (``log_kv_slot_attention``):
-    score_s = (q · k_s) * scale + λ·log(w_s)
-    out     = softmax(score) · v_s
+Slot attention (``log_kv_slot_attention``), when rank-1 stats are supplied:
+    score_s = scale·(q · k_s) + 0.5·scale²·sigma2_s·(q · sigma_u_s)² + λ·log(w_s)
+    read_s  = v_s + scale·gamma_s·(q · gamma_a_s)·gamma_b_s
+    out     = softmax(score) · read
 The +λ·log(w_s) mass bias gives a w-token slot softmax mass ≈ w·exp(score),
-first-order-matching per-token attention (log-sum-exp of w similar logits =
-shared logit + log w + O(intra-slot score variance)). It is EXACT when the
-tokens inside a slot are identical. Recent tokens are slots of w=1 (bias 0).
+while the Sigma/Gamma terms add the second-order score correction and first-order
+value read-out correction. Exact recent / in-flight tokens carry zero stats, so
+they reduce to ordinary token attention. Calling ``log_kv_slot_attention`` without
+stats preserves the original first-order compatibility path.
 
 Memory:  O(recent_size + B·log(N/2)) slots — no Θ(N) term.
 Compute: O(recent_size + B·log(N/2)) per query — no Θ(N) term.
@@ -44,6 +46,86 @@ from typing import NoReturn
 import torch
 import torch.nn as nn
 from torch.autograd.function import once_differentiable
+
+
+_RANK1_EPS = 1e-12
+
+
+def _normalize(x: torch.Tensor, eps: float = _RANK1_EPS) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a unit direction and the original norm, computed in fp32."""
+    xf = x.float()
+    norm = xf.norm(dim=-1, keepdim=True)
+    unit = torch.where(norm > eps, xf / norm.clamp_min(eps), torch.zeros_like(xf))
+    return unit.to(x.dtype), norm.squeeze(-1).to(x.dtype)
+
+
+def _rank1_psd_from_factors(factors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Best rank-1 PSD approximation to ``sum_i f_i f_i^T``.
+
+    ``factors`` is ``(..., r, D)`` with small ``r`` for merged slots (3 during
+    carry; 2 for raw pairs). The non-zero spectrum of the D x D matrix lives in
+    the r x r Gram matrix, so this performs the exact top-eigen truncation
+    without ever materializing a full covariance matrix.
+    """
+    if factors.size(-2) == 0:
+        return factors[..., :0, :].sum(dim=-2), factors.new_zeros(factors.shape[:-2])
+
+    ff = factors.float()
+    gram = torch.matmul(ff, ff.mT)
+    eigvals, eigvecs = torch.linalg.eigh(gram)
+    top = eigvals[..., -1].clamp_min(0.0)
+    coeff = eigvecs[..., -1]
+    direction = torch.matmul(coeff.unsqueeze(-2), ff).squeeze(-2)
+    direction = direction / top.sqrt().clamp_min(_RANK1_EPS).unsqueeze(-1)
+    direction = torch.where(top.unsqueeze(-1) > _RANK1_EPS, direction, torch.zeros_like(direction))
+    return direction.to(factors.dtype), top.to(factors.dtype)
+
+
+def _rank1_cross_from_factors(
+    left_factors: torch.Tensor,
+    right_factors: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Best rank-1 approximation to ``sum_i l_i r_i^T``.
+
+    Returns ``left_unit, right_unit, singular_value``. The full value-key
+    cross-covariance is never materialized. If ``L`` / ``R`` are the matrices
+    whose columns are the left / right factors, a batched thin QR gives
+    ``L = Ql Rl`` and ``R = Qr Rr``; the non-zero singular spectrum of
+    ``L R^T`` is therefore the small core ``Rl Rr^T``.
+    """
+    left = left_factors.float().mT   # (..., Dv, r)
+    right = right_factors.float().mT  # (..., Dk, r)
+    q_left, r_left = torch.linalg.qr(left, mode="reduced")
+    q_right, r_right = torch.linalg.qr(right, mode="reduced")
+    core = torch.matmul(r_left, r_right.mT)
+    u_core, s, vh_core = torch.linalg.svd(core, full_matrices=False)
+    gamma = s[..., 0]
+    left_unit = torch.matmul(q_left, u_core[..., :, :1]).squeeze(-1)
+    right_unit = torch.matmul(q_right, vh_core.mT[..., :, :1]).squeeze(-1)
+    left_unit = torch.where(gamma.unsqueeze(-1) > _RANK1_EPS, left_unit, torch.zeros_like(left_unit))
+    right_unit = torch.where(gamma.unsqueeze(-1) > _RANK1_EPS, right_unit, torch.zeros_like(right_unit))
+    return (
+        left_unit.to(left_factors.dtype),
+        right_unit.to(right_factors.dtype),
+        gamma.to(left_factors.dtype),
+    )
+
+
+def _pair_rank1_stats(
+    ka: torch.Tensor,
+    kb: torch.Tensor,
+    va: torch.Tensor,
+    vb: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exact rank-1 covariance / cross-covariance stats for a 2-token slot."""
+    dk = ka - kb
+    dv = va - vb
+    sigma_u, dk_norm = _normalize(dk)
+    gamma_b, dv_norm = _normalize(dv)
+    sigma2 = dk_norm.square() * 0.25
+    gamma = dk_norm * dv_norm * 0.25
+    gamma_a = sigma_u
+    return sigma_u, sigma2, gamma_a, gamma_b, gamma
 
 
 class LogStructuredKVCache(nn.Module):
@@ -127,6 +209,36 @@ class LogStructuredKVCache(nn.Module):
                 torch.zeros(batch_size, n_groups, B, device=device, dtype=dtype),
                 persistent=False,
             )
+            # Rank-1 key covariance:
+            #   Sigma_s ~= sigma2_s * sigma_u_s sigma_u_s^T
+            self.register_buffer(
+                f"level_sigma_u_{ell}",
+                torch.zeros(batch_size, n_groups, B, k_dim, device=device, dtype=dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"level_sigma2_{ell}",
+                torch.zeros(batch_size, n_groups, B, device=device, dtype=dtype),
+                persistent=False,
+            )
+            # Rank-1 value-key cross covariance:
+            #   Gamma_s ~= gamma_s * gamma_b_s gamma_a_s^T
+            # where gamma_a lives in key/query space and gamma_b in value space.
+            self.register_buffer(
+                f"level_gamma_a_{ell}",
+                torch.zeros(batch_size, n_groups, B, k_dim, device=device, dtype=dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"level_gamma_b_{ell}",
+                torch.zeros(batch_size, n_groups, B, v_dim, device=device, dtype=dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"level_gamma_{ell}",
+                torch.zeros(batch_size, n_groups, B, device=device, dtype=dtype),
+                persistent=False,
+            )
         self.register_buffer(
             "level_count",
             torch.zeros(self.max_levels, dtype=torch.long, device=device),
@@ -195,19 +307,62 @@ class LogStructuredKVCache(nn.Module):
             getattr(self, f"level_w_{ell}"),
         )
 
+    def _get_level_stats(
+        self, ell: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            getattr(self, f"level_sigma_u_{ell}"),
+            getattr(self, f"level_sigma2_{ell}"),
+            getattr(self, f"level_gamma_a_{ell}"),
+            getattr(self, f"level_gamma_b_{ell}"),
+            getattr(self, f"level_gamma_{ell}"),
+        )
+
     def _set_level(
-        self, ell: int, k: torch.Tensor, v: torch.Tensor, w: torch.Tensor
+        self,
+        ell: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        w: torch.Tensor,
+        sigma_u: torch.Tensor | None = None,
+        sigma2: torch.Tensor | None = None,
+        gamma_a: torch.Tensor | None = None,
+        gamma_b: torch.Tensor | None = None,
+        gamma: torch.Tensor | None = None,
     ) -> None:
         getattr(self, f"level_k_{ell}").copy_(k)
         getattr(self, f"level_v_{ell}").copy_(v)
         getattr(self, f"level_w_{ell}").copy_(w)
+        if sigma_u is None:
+            sigma_u, sigma2, gamma_a, gamma_b, gamma = self._zero_stats_like(k, v, w)
+        getattr(self, f"level_sigma_u_{ell}").copy_(sigma_u)
+        getattr(self, f"level_sigma2_{ell}").copy_(sigma2)
+        getattr(self, f"level_gamma_a_{ell}").copy_(gamma_a)
+        getattr(self, f"level_gamma_b_{ell}").copy_(gamma_b)
+        getattr(self, f"level_gamma_{ell}").copy_(gamma)
         self.level_count[ell] = self.B
 
     def _clear_level(self, ell: int) -> None:
         getattr(self, f"level_k_{ell}").zero_()
         getattr(self, f"level_v_{ell}").zero_()
         getattr(self, f"level_w_{ell}").zero_()
+        getattr(self, f"level_sigma_u_{ell}").zero_()
+        getattr(self, f"level_sigma2_{ell}").zero_()
+        getattr(self, f"level_gamma_a_{ell}").zero_()
+        getattr(self, f"level_gamma_b_{ell}").zero_()
+        getattr(self, f"level_gamma_{ell}").zero_()
         self.level_count[ell] = 0
+
+    def _zero_stats_like(
+        self, k: torch.Tensor, v: torch.Tensor, w: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.zeros_like(k),
+            torch.zeros_like(w),
+            torch.zeros_like(k),
+            torch.zeros_like(v),
+            torch.zeros_like(w),
+        )
 
     # ------------------------------------------------------------------
     # Compact: compress tokens -> 1 entry via mean pooling (2:1 by default)
@@ -217,7 +372,8 @@ class LogStructuredKVCache(nn.Module):
     def _compact_tokens(
         k: torch.Tensor,  # (B, G, n, k_dim) full post-RoPE keys
         v: torch.Tensor,  # (B, G, n, v_dim)
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        with_stats: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """Compress n tokens into a single compact entry via mean pooling.
 
         Mean-pooling the full key merges content and position in one step:
@@ -225,6 +381,8 @@ class LogStructuredKVCache(nn.Module):
         (see module docstring). No renormalization — the per-frequency norm
         shrinkage encodes the span's positional uncertainty.
         Returns k_entry (B,G,1,k_dim), v_entry (B,G,1,v_dim), w_entry (B,G,1).
+        With ``with_stats=True`` also returns rank-1 approximations to the
+        within-slot key covariance and value-key cross covariance.
         """
         n = k.size(2)
         k_entry = k.mean(dim=2, keepdim=True)
@@ -235,7 +393,24 @@ class LogStructuredKVCache(nn.Module):
             device=k.device,
             dtype=k.dtype,
         )
-        return k_entry, v_entry, w_entry
+        if not with_stats:
+            return k_entry, v_entry, w_entry
+
+        inv_sqrt_n = float(n) ** -0.5
+        k_centered = (k - k_entry).float() * inv_sqrt_n
+        v_centered = (v - v_entry).float() * inv_sqrt_n
+        sigma_u, sigma2 = _rank1_psd_from_factors(k_centered)
+        gamma_b, gamma_a, gamma = _rank1_cross_from_factors(v_centered, k_centered)
+        return (
+            k_entry,
+            v_entry,
+            w_entry,
+            sigma_u.unsqueeze(2).to(k.dtype),
+            sigma2.unsqueeze(2).to(k.dtype),
+            gamma_a.unsqueeze(2).to(k.dtype),
+            gamma_b.unsqueeze(2).to(k.dtype),
+            gamma.unsqueeze(2).to(k.dtype),
+        )
 
     # ------------------------------------------------------------------
     # Compact operation: merge two B-slot blocks -> one B-slot block (adjacent pairs)
@@ -245,7 +420,17 @@ class LogStructuredKVCache(nn.Module):
     def compact(
         k1: torch.Tensor, v1: torch.Tensor, w1: torch.Tensor,
         k2: torch.Tensor, v2: torch.Tensor, w2: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sigma_u1: torch.Tensor | None = None,
+        sigma2_1: torch.Tensor | None = None,
+        gamma_a1: torch.Tensor | None = None,
+        gamma_b1: torch.Tensor | None = None,
+        gamma1: torch.Tensor | None = None,
+        sigma_u2: torch.Tensor | None = None,
+        sigma2_2: torch.Tensor | None = None,
+        gamma_a2: torch.Tensor | None = None,
+        gamma_b2: torch.Tensor | None = None,
+        gamma2: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         """Merge two B-slot blocks into one B-slot block.
 
         Concatenates the two blocks in time order (k1=older, k2=newer) and pairs
@@ -253,6 +438,11 @@ class LogStructuredKVCache(nn.Module):
         a contiguous span, and the weighted mean keeps each slot's key equal to
         the true weighted mean over all tokens it covers (mean-merge is
         associative), so no error accumulates across levels.
+
+        If the rank-1 stats are provided for both input blocks, they are merged
+        with Chan's parallel covariance formula and truncated back to rank 1 via
+        exact small-matrix decompositions. Without stats, this preserves the old
+        three-tensor return for tests and diagnostic callers.
         """
         k_cat = torch.cat([k1, k2], dim=-2)  # (B, G, 2B, D)
         v_cat = torch.cat([v1, v2], dim=-2)
@@ -270,41 +460,156 @@ class LogStructuredKVCache(nn.Module):
 
         k_out = alpha * ka + (1 - alpha) * kb
         v_out = alpha * va + (1 - alpha) * vb
-        return k_out, v_out, w_total
+        if sigma_u1 is None:
+            return k_out, v_out, w_total
+
+        if any(x is None for x in (
+            sigma2_1, gamma_a1, gamma_b1, gamma1,
+            sigma_u2, sigma2_2, gamma_a2, gamma_b2, gamma2,
+        )):
+            raise ValueError("compact() requires either all rank-1 stats or none")
+
+        su_cat = torch.cat([sigma_u1, sigma_u2], dim=-2)
+        s2_cat = torch.cat([sigma2_1, sigma2_2], dim=-1)
+        ga_cat = torch.cat([gamma_a1, gamma_a2], dim=-2)
+        gb_cat = torch.cat([gamma_b1, gamma_b2], dim=-2)
+        gm_cat = torch.cat([gamma1, gamma2], dim=-1)
+
+        sua, sub = su_cat[..., 0::2, :], su_cat[..., 1::2, :]
+        s2a, s2b = s2_cat[..., 0::2], s2_cat[..., 1::2]
+        gaa, gab = ga_cat[..., 0::2, :], ga_cat[..., 1::2, :]
+        gba, gbb = gb_cat[..., 0::2, :], gb_cat[..., 1::2, :]
+        gma, gmb = gm_cat[..., 0::2], gm_cat[..., 1::2]
+
+        frac_a = wa.float() / w_total.float().clamp_min(1e-8)
+        frac_b = wb.float() / w_total.float().clamp_min(1e-8)
+        cross_frac = frac_a * frac_b
+
+        dk = (ka - kb).float()
+        dv = (va - vb).float()
+        sigma_factors = torch.stack(
+            [
+                (frac_a * s2a.float()).clamp_min(0.0).sqrt().unsqueeze(-1) * sua.float(),
+                (frac_b * s2b.float()).clamp_min(0.0).sqrt().unsqueeze(-1) * sub.float(),
+                cross_frac.clamp_min(0.0).sqrt().unsqueeze(-1) * dk,
+            ],
+            dim=-2,
+        )
+        sigma_u, sigma2 = _rank1_psd_from_factors(sigma_factors)
+
+        left_factors = torch.stack(
+            [
+                (frac_a * gma.float()).clamp_min(0.0).sqrt().unsqueeze(-1) * gba.float(),
+                (frac_b * gmb.float()).clamp_min(0.0).sqrt().unsqueeze(-1) * gbb.float(),
+                cross_frac.clamp_min(0.0).sqrt().unsqueeze(-1) * dv,
+            ],
+            dim=-2,
+        )
+        right_factors = torch.stack(
+            [
+                (frac_a * gma.float()).clamp_min(0.0).sqrt().unsqueeze(-1) * gaa.float(),
+                (frac_b * gmb.float()).clamp_min(0.0).sqrt().unsqueeze(-1) * gab.float(),
+                cross_frac.clamp_min(0.0).sqrt().unsqueeze(-1) * dk,
+            ],
+            dim=-2,
+        )
+        gamma_b, gamma_a, gamma = _rank1_cross_from_factors(left_factors, right_factors)
+        return (
+            k_out,
+            v_out,
+            w_total,
+            sigma_u.to(k_out.dtype),
+            sigma2.to(k_out.dtype),
+            gamma_a.to(k_out.dtype),
+            gamma_b.to(v_out.dtype),
+            gamma.to(k_out.dtype),
+        )
 
     # ------------------------------------------------------------------
     # Add compact entry to level 0; carry to level 1+ when full
     # ------------------------------------------------------------------
 
     def _add_compact_entry(
-        self, k_entry: torch.Tensor, v_entry: torch.Tensor, w_entry: torch.Tensor
+        self,
+        k_entry: torch.Tensor,
+        v_entry: torch.Tensor,
+        w_entry: torch.Tensor,
+        sigma_u_entry: torch.Tensor | None = None,
+        sigma2_entry: torch.Tensor | None = None,
+        gamma_a_entry: torch.Tensor | None = None,
+        gamma_b_entry: torch.Tensor | None = None,
+        gamma_entry: torch.Tensor | None = None,
     ) -> None:
         """Add one compact entry to level 0. If level 0 is full, binary carry to levels 1+."""
+        if sigma_u_entry is None:
+            sigma_u_entry, sigma2_entry, gamma_a_entry, gamma_b_entry, gamma_entry = self._zero_stats_like(
+                k_entry.unsqueeze(2), v_entry.unsqueeze(2), w_entry.unsqueeze(2)
+            )
+            sigma_u_entry = sigma_u_entry.squeeze(2)
+            sigma2_entry = sigma2_entry.squeeze(2)
+            gamma_a_entry = gamma_a_entry.squeeze(2)
+            gamma_b_entry = gamma_b_entry.squeeze(2)
+            gamma_entry = gamma_entry.squeeze(2)
         idx = self.level_count[0].item()
         getattr(self, "level_k_0")[:, :, idx, :] = k_entry
         getattr(self, "level_v_0")[:, :, idx, :] = v_entry
         getattr(self, "level_w_0")[:, :, idx] = w_entry
+        getattr(self, "level_sigma_u_0")[:, :, idx, :] = sigma_u_entry
+        getattr(self, "level_sigma2_0")[:, :, idx] = sigma2_entry
+        getattr(self, "level_gamma_a_0")[:, :, idx, :] = gamma_a_entry
+        getattr(self, "level_gamma_b_0")[:, :, idx, :] = gamma_b_entry
+        getattr(self, "level_gamma_0")[:, :, idx] = gamma_entry
         self.level_count[0] = idx + 1
 
         if self.level_count[0] >= self.B:
             lk, lv, lw = self._get_level(0)
-            self._binary_carry(lk.clone(), lv.clone(), lw.clone())
+            lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
+            self._binary_carry(
+                lk.clone(), lv.clone(), lw.clone(),
+                lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
+            )
             self._clear_level(0)
 
     # ------------------------------------------------------------------
     # Binary carry: promote B entries through levels 1+
     # ------------------------------------------------------------------
 
-    def _binary_carry(self, block_k: torch.Tensor, block_v: torch.Tensor,
-                      block_w: torch.Tensor) -> None:
+    def _binary_carry(
+        self,
+        block_k: torch.Tensor,
+        block_v: torch.Tensor,
+        block_w: torch.Tensor,
+        block_sigma_u: torch.Tensor,
+        block_sigma2: torch.Tensor,
+        block_gamma_a: torch.Tensor,
+        block_gamma_b: torch.Tensor,
+        block_gamma: torch.Tensor,
+    ) -> None:
         new_k, new_v, new_w = block_k, block_v, block_w
+        new_su, new_s2 = block_sigma_u, block_sigma2
+        new_ga, new_gb, new_gm = block_gamma_a, block_gamma_b, block_gamma
         for ell in range(1, self.max_levels):
             if self.level_count[ell] == 0:
-                self._set_level(ell, new_k, new_v, new_w)
+                self._set_level(ell, new_k, new_v, new_w, new_su, new_s2, new_ga, new_gb, new_gm)
                 return
             else:
                 ek, ev, ew = self._get_level(ell)
-                new_k, new_v, new_w = self.compact(ek, ev, ew, new_k, new_v, new_w)
+                esu, es2, ega, egb, egm = self._get_level_stats(ell)
+                (
+                    new_k,
+                    new_v,
+                    new_w,
+                    new_su,
+                    new_s2,
+                    new_ga,
+                    new_gb,
+                    new_gm,
+                ) = self.compact(
+                    ek, ev, ew,
+                    new_k, new_v, new_w,
+                    esu, es2, ega, egb, egm,
+                    new_su, new_s2, new_ga, new_gb, new_gm,
+                )
                 self._clear_level(ell)
         raise RuntimeError(
             f"LogStructuredKVCache: binary carry overflow! "
@@ -353,10 +658,18 @@ class LogStructuredKVCache(nn.Module):
         vd = rv.size(-1)
         # Same arithmetic as _compact_tokens on each 2-token pair (mean over a
         # size-2 dim in the storage dtype), just for all f pairs at once.
-        pk = rk.reshape(B_, G_, f, 2, kd).mean(dim=3)
-        pv = rv.reshape(B_, G_, f, 2, vd).mean(dim=3)
+        rk_pairs = rk.reshape(B_, G_, f, 2, kd)
+        rv_pairs = rv.reshape(B_, G_, f, 2, vd)
+        pk = rk_pairs.mean(dim=3)
+        pv = rv_pairs.mean(dim=3)
         pw = torch.full((B_, G_, f), 2.0, device=rk.device, dtype=rk.dtype)
-        self._append_level0(pk, pv, pw)
+        psu, ps2, pga, pgb, pgm = _pair_rank1_stats(
+            rk_pairs[:, :, :, 0, :],
+            rk_pairs[:, :, :, 1, :],
+            rv_pairs[:, :, :, 0, :],
+            rv_pairs[:, :, :, 1, :],
+        )
+        self._append_level0(pk, pv, pw, psu, ps2, pga, pgb, pgm)
 
         # Shift the survivors to the front. Source/destination overlap in the
         # same storage; PyTorch copy_ with overlapping src/dst is undefined (may
@@ -369,13 +682,25 @@ class LogStructuredKVCache(nn.Module):
         self.recent_v[:, :, remaining:self.recent_count, :].zero_()
         self.recent_count = remaining
 
-    def _append_level0(self, pk: torch.Tensor, pv: torch.Tensor, pw: torch.Tensor) -> None:
+    def _append_level0(
+        self,
+        pk: torch.Tensor,
+        pv: torch.Tensor,
+        pw: torch.Tensor,
+        psu: torch.Tensor | None = None,
+        ps2: torch.Tensor | None = None,
+        pga: torch.Tensor | None = None,
+        pgb: torch.Tensor | None = None,
+        pgm: torch.Tensor | None = None,
+    ) -> None:
         """Append f compact entries to level 0 in order, carrying when it fills.
 
         Trajectory-identical to f sequential ``_add_compact_entry`` calls: the
         binary carry fires exactly when the count reaches B, between the same
         two entries as in the sequential version.
         """
+        if psu is None:
+            psu, ps2, pga, pgb, pgm = self._zero_stats_like(pk, pv, pw)
         f = pk.size(2)
         off = 0
         while off < f:
@@ -384,11 +709,20 @@ class LogStructuredKVCache(nn.Module):
             getattr(self, "level_k_0")[:, :, idx:idx + take, :] = pk[:, :, off:off + take, :]
             getattr(self, "level_v_0")[:, :, idx:idx + take, :] = pv[:, :, off:off + take, :]
             getattr(self, "level_w_0")[:, :, idx:idx + take] = pw[:, :, off:off + take]
+            getattr(self, "level_sigma_u_0")[:, :, idx:idx + take, :] = psu[:, :, off:off + take, :]
+            getattr(self, "level_sigma2_0")[:, :, idx:idx + take] = ps2[:, :, off:off + take]
+            getattr(self, "level_gamma_a_0")[:, :, idx:idx + take, :] = pga[:, :, off:off + take, :]
+            getattr(self, "level_gamma_b_0")[:, :, idx:idx + take, :] = pgb[:, :, off:off + take, :]
+            getattr(self, "level_gamma_0")[:, :, idx:idx + take] = pgm[:, :, off:off + take]
             self.level_count[0] = idx + take
             off += take
             if int(self.level_count[0].item()) >= self.B:
                 lk, lv, lw = self._get_level(0)
-                self._binary_carry(lk.clone(), lv.clone(), lw.clone())
+                lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
+                self._binary_carry(
+                    lk.clone(), lv.clone(), lw.clone(),
+                    lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
+                )
                 self._clear_level(0)
 
     # ------------------------------------------------------------------
@@ -405,12 +739,29 @@ class LogStructuredKVCache(nn.Module):
         """
         self._count_tokens(k.size(2))
 
-        k_entry, v_entry, w_entry = self._compact_tokens(k, v)
+        (
+            k_entry,
+            v_entry,
+            w_entry,
+            sigma_u_entry,
+            sigma2_entry,
+            gamma_a_entry,
+            gamma_b_entry,
+            gamma_entry,
+        ) = self._compact_tokens(k, v, with_stats=True)
         k_entry = k_entry.squeeze(2)
         v_entry = v_entry.squeeze(2)
         w_entry = w_entry.squeeze(2)
+        sigma_u_entry = sigma_u_entry.squeeze(2)
+        sigma2_entry = sigma2_entry.squeeze(2)
+        gamma_a_entry = gamma_a_entry.squeeze(2)
+        gamma_b_entry = gamma_b_entry.squeeze(2)
+        gamma_entry = gamma_entry.squeeze(2)
 
-        self._add_compact_entry(k_entry, v_entry, w_entry)
+        self._add_compact_entry(
+            k_entry, v_entry, w_entry,
+            sigma_u_entry, sigma2_entry, gamma_a_entry, gamma_b_entry, gamma_entry,
+        )
 
     # ------------------------------------------------------------------
     # Add to recent (training): sliding window entry point
@@ -498,7 +849,7 @@ class LogStructuredKVCache(nn.Module):
     # Build attention state: slot-granular, O(recent + B*log N) entries
     # ------------------------------------------------------------------
 
-    def get_attention_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_attention_state(self, with_stats: bool = False) -> tuple[torch.Tensor, ...]:
         """Assemble the cache state for ``log_kv_slot_attention``.
 
         Returns:
@@ -507,6 +858,10 @@ class LogStructuredKVCache(nn.Module):
                     the recent-window tokens as exact w=1 slots.
             slot_v: (B, G, n_slots, v_dim)
             slot_w: (B, G, n_slots) — token count per slot (1 for recent).
+            If ``with_stats=True``, also returns:
+            slot_sigma_u / slot_sigma2: rank-1 key covariance stats;
+            slot_gamma_a / slot_gamma_b / slot_gamma: rank-1 value-key cross
+                covariance stats. Exact recent and pinned tokens have zero stats.
 
         Slots cover contiguous, time-ordered spans, so ``cumsum(slot_w)`` gives
         the token boundaries of every slot (used by exactness tests). With
@@ -520,6 +875,11 @@ class LogStructuredKVCache(nn.Module):
         k_parts: list[torch.Tensor] = []
         v_parts: list[torch.Tensor] = []
         w_parts: list[torch.Tensor] = []
+        sigma_u_parts: list[torch.Tensor] = []
+        sigma2_parts: list[torch.Tensor] = []
+        gamma_a_parts: list[torch.Tensor] = []
+        gamma_b_parts: list[torch.Tensor] = []
+        gamma_parts: list[torch.Tensor] = []
 
         # Compact levels: oldest (highest level) first, down to level 0
         for ell in range(self.max_levels - 1, -1, -1):
@@ -529,6 +889,13 @@ class LogStructuredKVCache(nn.Module):
                 k_parts.append(lk[:, :, :count, :])
                 v_parts.append(lv[:, :, :count, :])
                 w_parts.append(lw[:, :, :count])
+                if with_stats:
+                    lsu, ls2, lga, lgb, lgm = self._get_level_stats(ell)
+                    sigma_u_parts.append(lsu[:, :, :count, :])
+                    sigma2_parts.append(ls2[:, :, :count])
+                    gamma_a_parts.append(lga[:, :, :count, :])
+                    gamma_b_parts.append(lgb[:, :, :count, :])
+                    gamma_parts.append(lgm[:, :, :count])
 
         # Salience pins: exact w=1 duplicates from the compressed region,
         # placed between the levels and the recent window (they are older than
@@ -539,6 +906,18 @@ class LogStructuredKVCache(nn.Module):
             w_parts.append(
                 self.pin_k.new_ones(self.batch_size, self.n_groups, self.pin_count)
             )
+            if with_stats:
+                sigma_u_parts.append(self.pin_k[:, :, :self.pin_count, :].new_zeros(
+                    self.batch_size, self.n_groups, self.pin_count, self.k_dim
+                ))
+                sigma2_parts.append(self.pin_k.new_zeros(self.batch_size, self.n_groups, self.pin_count))
+                gamma_a_parts.append(self.pin_k[:, :, :self.pin_count, :].new_zeros(
+                    self.batch_size, self.n_groups, self.pin_count, self.k_dim
+                ))
+                gamma_b_parts.append(self.pin_v[:, :, :self.pin_count, :].new_zeros(
+                    self.batch_size, self.n_groups, self.pin_count, self.v_dim
+                ))
+                gamma_parts.append(self.pin_k.new_zeros(self.batch_size, self.n_groups, self.pin_count))
 
         # Recent window: exact tokens, weight 1 each
         if self.recent_count > 0:
@@ -547,17 +926,50 @@ class LogStructuredKVCache(nn.Module):
             w_parts.append(
                 self.recent_k.new_ones(self.batch_size, self.n_groups, self.recent_count)
             )
+            if with_stats:
+                sigma_u_parts.append(self.recent_k[:, :, :self.recent_count, :].new_zeros(
+                    self.batch_size, self.n_groups, self.recent_count, self.k_dim
+                ))
+                sigma2_parts.append(self.recent_k.new_zeros(self.batch_size, self.n_groups, self.recent_count))
+                gamma_a_parts.append(self.recent_k[:, :, :self.recent_count, :].new_zeros(
+                    self.batch_size, self.n_groups, self.recent_count, self.k_dim
+                ))
+                gamma_b_parts.append(self.recent_v[:, :, :self.recent_count, :].new_zeros(
+                    self.batch_size, self.n_groups, self.recent_count, self.v_dim
+                ))
+                gamma_parts.append(self.recent_k.new_zeros(self.batch_size, self.n_groups, self.recent_count))
 
         if w_parts:
+            slot_k = torch.cat(k_parts, dim=-2)
+            slot_v = torch.cat(v_parts, dim=-2)
+            slot_w = torch.cat(w_parts, dim=-1)
+            if not with_stats:
+                return slot_k, slot_v, slot_w
             return (
-                torch.cat(k_parts, dim=-2),
-                torch.cat(v_parts, dim=-2),
-                torch.cat(w_parts, dim=-1),
+                slot_k,
+                slot_v,
+                slot_w,
+                torch.cat(sigma_u_parts, dim=-2),
+                torch.cat(sigma2_parts, dim=-1),
+                torch.cat(gamma_a_parts, dim=-2),
+                torch.cat(gamma_b_parts, dim=-2),
+                torch.cat(gamma_parts, dim=-1),
             )
+
+        slot_k = self.recent_k[:, :, :0, :]
+        slot_v = self.recent_v[:, :, :0, :]
+        slot_w = getattr(self, "level_w_0")[:, :, :0]
+        if not with_stats:
+            return slot_k, slot_v, slot_w
         return (
+            slot_k,
+            slot_v,
+            slot_w,
+            self.recent_k[:, :, :0, :],
+            slot_w,
             self.recent_k[:, :, :0, :],
             self.recent_v[:, :, :0, :],
-            getattr(self, "level_w_0")[:, :, :0],
+            slot_w,
         )
 
     # ------------------------------------------------------------------
@@ -589,6 +1001,11 @@ class LogStructuredKVCache(nn.Module):
             setattr(self, f"level_k_{ell}", getattr(self, f"level_k_{ell}").to(dtype))
             setattr(self, f"level_v_{ell}", getattr(self, f"level_v_{ell}").to(dtype))
             setattr(self, f"level_w_{ell}", getattr(self, f"level_w_{ell}").to(dtype))
+            setattr(self, f"level_sigma_u_{ell}", getattr(self, f"level_sigma_u_{ell}").to(dtype))
+            setattr(self, f"level_sigma2_{ell}", getattr(self, f"level_sigma2_{ell}").to(dtype))
+            setattr(self, f"level_gamma_a_{ell}", getattr(self, f"level_gamma_a_{ell}").to(dtype))
+            setattr(self, f"level_gamma_b_{ell}", getattr(self, f"level_gamma_b_{ell}").to(dtype))
+            setattr(self, f"level_gamma_{ell}", getattr(self, f"level_gamma_{ell}").to(dtype))
 
     def reset_parameters(self) -> None:
         """Reset all buffers to zero."""
@@ -625,19 +1042,39 @@ def append_exact_tokens(
     slot_w: torch.Tensor,   # (B, G, S)
     k_new: torch.Tensor,    # (B, G, n, k_dim) exact tokens, appended in time order
     v_new: torch.Tensor,    # (B, G, n, v_dim)
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    slot_sigma_u: torch.Tensor | None = None,
+    slot_sigma2: torch.Tensor | None = None,
+    slot_gamma_a: torch.Tensor | None = None,
+    slot_gamma_b: torch.Tensor | None = None,
+    slot_gamma: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
     """Append exact per-token entries (w=1 slots) after the cached slots.
 
     Used by the attention layer to make the current chunk (and any pending
     token) visible to attention BEFORE it is committed to the cache. Gradient
-    flows through ``k_new``/``v_new``; the ones-weights are constants.
+    flows through ``k_new``/``v_new``; the ones-weights are constants. If slot
+    rank-1 stats are provided, the appended exact tokens receive zero
+    covariance / cross-covariance stats.
     """
     n_new = k_new.size(2)
     ones = slot_w.new_ones(slot_w.size(0), slot_w.size(1), n_new)
+    k_all = torch.cat([slot_k, k_new], dim=2)
+    v_all = torch.cat([slot_v, v_new], dim=2)
+    w_all = torch.cat([slot_w, ones], dim=-1)
+    if slot_sigma_u is None:
+        return k_all, v_all, w_all
+
+    if any(x is None for x in (slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma)):
+        raise ValueError("append_exact_tokens() requires either all rank-1 stats or none")
     return (
-        torch.cat([slot_k, k_new], dim=2),
-        torch.cat([slot_v, v_new], dim=2),
-        torch.cat([slot_w, ones], dim=-1),
+        k_all,
+        v_all,
+        w_all,
+        torch.cat([slot_sigma_u, torch.zeros_like(k_new)], dim=2),
+        torch.cat([slot_sigma2, torch.zeros_like(ones)], dim=-1),
+        torch.cat([slot_gamma_a, torch.zeros_like(k_new)], dim=2),
+        torch.cat([slot_gamma_b, torch.zeros_like(v_new)], dim=2),
+        torch.cat([slot_gamma, torch.zeros_like(ones)], dim=-1),
     )
 
 
@@ -650,20 +1087,28 @@ def log_kv_slot_attention(
     mask: torch.Tensor | None = None,  # (T_q, S) bool, True = attend
     lam: float = 1.0,
     causal_tail: int = 0,
+    slot_sigma_u: torch.Tensor | None = None,  # (B, G, S, k_dim)
+    slot_sigma2: torch.Tensor | None = None,   # (B, G, S)
+    slot_gamma_a: torch.Tensor | None = None,  # (B, G, S, k_dim)
+    slot_gamma_b: torch.Tensor | None = None,  # (B, G, S, v_dim)
+    slot_gamma: torch.Tensor | None = None,    # (B, G, S)
+    second_order_scale: float = 1.0,
 ) -> torch.Tensor:
     """Slot-granular attention over merged-position entries.
 
-        score_s = (q · k_s) * scale + λ·log(w_s)
-        out     = softmax(score) · v_s
+        score_s = scale·(q · k_s) + 0.5·scale²·sigma2_s·(q · sigma_u_s)² + λ·log(w_s)
+        read_s  = v_s + scale·gamma_s·(q · gamma_a_s)·gamma_b_s
+        out     = softmax(score) · read
 
     One logit per SLOT — compute and memory are O(S) = O(recent + B·log N),
     never O(N). The position information lives inside ``slot_k`` (expected-RoPE
     sub-channel, see module docstring), so a single dot product covers both the
     content and the position score. The +λ·log(w_s) bias restores the softmax
     mass a w-token span would have contributed token-by-token; it is exact when
-    the span's tokens are identical and first-order otherwise. λ=1 preserves
-    mass ∝ token count; λ=0 yields a built-in ∝1/w long-range forgetting curve
-    (ablation knob).
+    the span's tokens are identical and first-order otherwise. When the optional
+    rank-1 stats are present, the Sigma/Gamma terms add the cheap second-order
+    slot corrections. λ=1 preserves mass ∝ token count; λ=0 yields a built-in
+    ∝1/w long-range forgetting curve (ablation knob).
 
     Note the bias is added AFTER ``scale``: it is a multiplicity correction on
     the logits, not a similarity, so it must not be shrunk by 1/sqrt(d).
@@ -677,6 +1122,12 @@ def log_kv_slot_attention(
         q: (B, nh, T_q, k_dim)
         slot_k / slot_v / slot_w: from ``get_attention_state()`` (+ optionally
             ``append_exact_tokens`` for the in-flight chunk)
+        slot_sigma_u / slot_sigma2 / slot_gamma_a / slot_gamma_b / slot_gamma:
+            optional rank-1 second-order slot statistics. When present, score
+            receives ``0.5 * scale**2 * sigma2 * (q·sigma_u)**2`` and value
+            read-out receives ``scale * gamma * (q·gamma_a) * gamma_b``. Both
+            corrections are multiplied by ``second_order_scale`` as a single
+            coupled gate, so CPT can warm them up together.
         scale: attention scale (applied to the dot product only)
         mask: optional (T_q, S) bool. True = allowed. General-purpose escape
             hatch (tests); the model uses ``causal_tail`` instead. None (and
@@ -700,6 +1151,11 @@ def log_kv_slot_attention(
     S = slot_k.size(2)
     if S == 0:
         return torch.zeros(B, nh, T_q, v_dim, device=q.device, dtype=q.dtype)
+
+    has_rank1_stats = slot_sigma_u is not None
+    if has_rank1_stats and any(x is None for x in (slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma)):
+        raise ValueError("log_kv_slot_attention() requires either all rank-1 stats or none")
+    use_rank1_stats = has_rank1_stats and second_order_scale != 0.0
 
     if causal_tail:
         # Explicit raises (not asserts): survive `python -O`.
@@ -741,6 +1197,13 @@ def log_kv_slot_attention(
         scores = torch.matmul(qg, slot_k.unsqueeze(2).mT)    # (B, nkv, rf, T_q, S)
         scores = scores.to(torch.float32)
         scores.mul_(scale)
+        if use_rank1_stats:
+            sigma_dot = torch.matmul(qg, slot_sigma_u.unsqueeze(2).mT).to(torch.float32)
+            scores.add_(
+                second_order_scale * 0.5 * scale * scale
+                * sigma_dot.square()
+                * slot_sigma2.to(torch.float32)[:, :, None, None, :]
+            )
         if lam != 0.0:
             # slot_w >= 1 by construction; guarded via lam gate so lam=0 can
             # never produce 0 * log(0) = NaN even on malformed input.
@@ -751,11 +1214,27 @@ def log_kv_slot_attention(
             scores[..., S - causal_tail:].masked_fill_(tail_blocked, float("-inf"))
         attn = torch.softmax(scores, dim=-1).to(q.dtype)     # (B, nkv, rf, T_q, S)
         out = torch.matmul(attn, slot_v.unsqueeze(2))        # (B, nkv, rf, T_q, v_dim)
+        if use_rank1_stats:
+            gamma_dot = torch.matmul(qg, slot_gamma_a.unsqueeze(2).mT).to(torch.float32)
+            gamma_weight = (
+                attn.to(torch.float32)
+                * (second_order_scale * scale * gamma_dot)
+                * slot_gamma.to(torch.float32)[:, :, None, None, :]
+            )
+            corr = torch.matmul(gamma_weight, slot_gamma_b.unsqueeze(2).to(torch.float32))
+            out = out + corr.to(out.dtype)
         return out.reshape(B, nh, T_q, v_dim)
 
     # MHA (nh == nkv): one logit per slot, no head expansion needed.
     scores = torch.matmul(q, slot_k.mT).to(torch.float32)  # (B, nh, T_q, S)
     scores.mul_(scale)
+    if use_rank1_stats:
+        sigma_dot = torch.matmul(q, slot_sigma_u.mT).to(torch.float32)
+        scores.add_(
+            second_order_scale * 0.5 * scale * scale
+            * sigma_dot.square()
+            * slot_sigma2.to(torch.float32).unsqueeze(-2)
+        )
     if lam != 0.0:
         # slot_w >= 1 by construction; guarded via lam gate so lam=0 can never
         # produce 0 * log(0) = NaN even on malformed input.
@@ -765,7 +1244,17 @@ def log_kv_slot_attention(
     elif causal_tail:
         scores[..., S - causal_tail:].masked_fill_(tail_blocked, float("-inf"))
     attn = torch.softmax(scores, dim=-1).to(q.dtype)  # (B, nh, T_q, S)
-    return torch.matmul(attn, slot_v)                 # (B, nh, T_q, v_dim)
+    out = torch.matmul(attn, slot_v)                  # (B, nh, T_q, v_dim)
+    if use_rank1_stats:
+        gamma_dot = torch.matmul(q, slot_gamma_a.mT).to(torch.float32)
+        gamma_weight = (
+            attn.to(torch.float32)
+            * (second_order_scale * scale * gamma_dot)
+            * slot_gamma.to(torch.float32).unsqueeze(-2)
+        )
+        corr = torch.matmul(gamma_weight, slot_gamma_b.to(torch.float32))
+        out = out + corr.to(out.dtype)
+    return out
 
 
 # ======================================================================
@@ -779,6 +1268,7 @@ def log_kv_chunk_attention(
     k_b: torch.Tensor,   # (B, G, t, k_dim) current-chunk keys, post-RoPE
     v_b: torch.Tensor,   # (B, G, t, v_dim)
     scale: float,
+    second_order_scale: float = 1.0,
 ) -> torch.Tensor:
     """One streaming attention step, WITHOUT committing the chunk.
 
@@ -787,10 +1277,39 @@ def log_kv_chunk_attention(
     stream and its backward replay must both compute chunks through this exact
     function so the recomputed graphs match the streamed outputs.
     """
-    slot_k, slot_v, slot_w = cache.get_attention_state()
-    k_all, v_all, w_all = append_exact_tokens(slot_k, slot_v, slot_w, k_b, v_b)
+    (
+        slot_k,
+        slot_v,
+        slot_w,
+        slot_sigma_u,
+        slot_sigma2,
+        slot_gamma_a,
+        slot_gamma_b,
+        slot_gamma,
+    ) = cache.get_attention_state(with_stats=True)
+    (
+        k_all,
+        v_all,
+        w_all,
+        sigma_u_all,
+        sigma2_all,
+        gamma_a_all,
+        gamma_b_all,
+        gamma_all,
+    ) = append_exact_tokens(
+        slot_k, slot_v, slot_w, k_b, v_b,
+        slot_sigma_u, slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma,
+    )
     return log_kv_slot_attention(
-        q_b, k_all, v_all, w_all, scale=scale, causal_tail=q_b.size(2)
+        q_b, k_all, v_all, w_all,
+        scale=scale,
+        causal_tail=q_b.size(2),
+        slot_sigma_u=sigma_u_all,
+        slot_sigma2=sigma2_all,
+        slot_gamma_a=gamma_a_all,
+        slot_gamma_b=gamma_b_all,
+        slot_gamma=gamma_all,
+        second_order_scale=second_order_scale,
     )
 
 
@@ -827,12 +1346,12 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
     ``train_block=2`` is the strict 2-token streaming reference. Larger blocks
     freeze the prefix state at block start and use causal exact attention within
     the block, matching the inference prefill speed/memory tradeoff while
-    preserving the exact final cache state. First-order only
+    preserving the exact final cache state. First-order autograd only
     (``once_differentiable``) — CPT never needs grad-of-grad.
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, cache, scale, train_block):
+    def forward(ctx, q, k, v, cache, scale, train_block, second_order_scale):
         T = q.size(2)
         train_block = int(train_block)
         if train_block < 2:
@@ -855,6 +1374,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                         cache,
                         q[:, :, start:end], k[:, :, start:end], v[:, :, start:end],
                         scale,
+                        second_order_scale,
                     )
                 )
                 cache.add_recent(k[:, :, start:end], v[:, :, start:end])
@@ -863,6 +1383,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.cache = cache
         ctx.scale = scale
         ctx.train_block = train_block
+        ctx.second_order_scale = second_order_scale
         return torch.cat(outputs, dim=2)  # (B, nh, T, v_dim)
 
     @staticmethod
@@ -872,6 +1393,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         cache = ctx.cache
         scale = ctx.scale
         train_block = ctx.train_block
+        second_order_scale = ctx.second_order_scale
         T = q.size(2)
         # Blocks partition [0, T) and each position's grad comes from exactly
         # its own block, so the empty buffers are fully overwritten.
@@ -886,7 +1408,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             k_b = k[:, :, start:end].detach().requires_grad_(True)
             v_b = v[:, :, start:end].detach().requires_grad_(True)
             with torch.enable_grad():
-                y_b = log_kv_chunk_attention(cache, q_b, k_b, v_b, scale)
+                y_b = log_kv_chunk_attention(cache, q_b, k_b, v_b, scale, second_order_scale)
             g_q, g_k, g_v = torch.autograd.grad(y_b, (q_b, k_b, v_b), grad_y[:, :, start:end])
             dq[:, :, start:end] = g_q
             dk[:, :, start:end] = g_k
@@ -894,4 +1416,4 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             with torch.no_grad():
                 cache.add_recent(k[:, :, start:end], v[:, :, start:end])
             start = end
-        return dq, dk, dv, None, None, None
+        return dq, dk, dv, None, None, None, None

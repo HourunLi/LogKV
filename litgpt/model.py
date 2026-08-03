@@ -345,6 +345,7 @@ class GPT(nn.Module):
         prefill_block: int = 256,
         pin_size: int = 0,
         pin_obs_window: int = 64,
+        second_order_scale: float = 1.0,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -372,6 +373,9 @@ class GPT(nn.Module):
                 (SnapKV-style; see ``_log_kv_select_pins``).
             pin_obs_window: Number of trailing prompt tokens used as the
                 salience observation window.
+            second_order_scale: Coupled scale for the persisted Sigma/Gamma
+                corrections. 0.0 reproduces the old first-order LogKV path;
+                CPT can warm this from 0.0 to 1.0.
         """
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
@@ -390,6 +394,7 @@ class GPT(nn.Module):
             block.attn._log_kv_pending = None
             block.attn.log_kv_prefill_block = prefill_block
             block.attn.log_kv_pin_obs_window = pin_obs_window
+            block.attn.log_kv_second_order_scale = float(second_order_scale)
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
         # holding stale O(N^2) bool tensors in GPU memory. With every block on
@@ -414,6 +419,11 @@ class GPT(nn.Module):
             cache.reset_parameters()
             block.attn._log_kv_pending = None
 
+    def set_log_kv_second_order_scale(self, second_order_scale: float) -> None:
+        """Set the coupled Sigma/Gamma correction scale on every LogKV layer."""
+        for block in self.transformer.h:
+            block.attn.log_kv_second_order_scale = float(second_order_scale)
+
     def enable_log_kv_training(
         self,
         batch_size: int,
@@ -424,6 +434,7 @@ class GPT(nn.Module):
         B: int = 512,
         recent_size: int = 1024,
         train_block: int = 2,
+        second_order_scale: float = 1.0,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -437,6 +448,10 @@ class GPT(nn.Module):
         strict 2-token streaming; larger values trade bounded in-block
         exact-token visibility for far fewer tiny matmul launches and
         O(train_block * slots) replay memory.
+
+        ``second_order_scale`` is a single coupled gate for the score-side
+        Sigma correction and value-side Gamma correction. Use 0.0 for the old
+        first-order objective and warm it to 1.0 during CPT.
         """
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
@@ -455,6 +470,7 @@ class GPT(nn.Module):
             block.attn.training_log_kv = True
             block.attn._log_kv_pending = None
             block.attn.log_kv_train_block = train_block
+            block.attn.log_kv_second_order_scale = float(second_order_scale)
 
     def disable_log_kv_training(self) -> None:
         """Turn off logKV training mode and drop the caches."""
@@ -577,6 +593,8 @@ class CausalSelfAttention(nn.Module):
         # observation window at prefill (active only when the cache has
         # pin_size > 0; set via GPT.set_log_kv_cache(pin_size=..., pin_obs_window=...)).
         self.log_kv_pin_obs_window: int = 64
+        # Coupled scale for Sigma/Gamma second-order LogKV corrections.
+        self.log_kv_second_order_scale: float = 1.0
         # Last pin selection (batch, groups, n_pin) token indices — kept for
         # introspection and the pinning tests; not used by the forward pass.
         self._log_kv_pin_indices: torch.Tensor | None = None
@@ -833,7 +851,9 @@ class CausalSelfAttention(nn.Module):
         scale = scale * self.mscale * self.mscale
 
         train_block = max(2, min(int(self.log_kv_train_block), cache.recent_size))
-        y = LogKVStreamTrainingAttention.apply(q, k, v, cache, scale, train_block)  # (B, n_head, T, hs)
+        y = LogKVStreamTrainingAttention.apply(
+            q, k, v, cache, scale, train_block, self.log_kv_second_order_scale
+        )  # (B, n_head, T, hs)
         y = y.transpose(1, 2).reshape(B, T, self.config.head_size * self.config.n_head)
         return self.proj(y)
 
@@ -996,15 +1016,46 @@ class CausalSelfAttention(nn.Module):
             k_b = k[:, :, :1, :]
             v_b = v[:, :, :1, :]
 
-            slot_k, slot_v, slot_w = cache.get_attention_state()
-            k_all, v_all, w_all = append_exact_tokens(
+            (
+                slot_k,
+                slot_v,
+                slot_w,
+                slot_sigma_u,
+                slot_sigma2,
+                slot_gamma_a,
+                slot_gamma_b,
+                slot_gamma,
+            ) = cache.get_attention_state(with_stats=True)
+            (
+                k_all,
+                v_all,
+                w_all,
+                sigma_u_all,
+                sigma2_all,
+                gamma_a_all,
+                gamma_b_all,
+                gamma_all,
+            ) = append_exact_tokens(
                 slot_k, slot_v, slot_w,
                 torch.cat([pk, k_b], dim=2),
                 torch.cat([pv, v_b], dim=2),
+                slot_sigma_u, slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma,
             )
 
             # Single query, everything before it visible -> no mask needed.
-            y_b = log_kv_slot_attention(q[:, :, :1, :], k_all, v_all, w_all, scale=scale)
+            y_b = log_kv_slot_attention(
+                q[:, :, :1, :],
+                k_all,
+                v_all,
+                w_all,
+                scale=scale,
+                slot_sigma_u=sigma_u_all,
+                slot_sigma2=sigma2_all,
+                slot_gamma_a=gamma_a_all,
+                slot_gamma_b=gamma_b_all,
+                slot_gamma=gamma_all,
+                second_order_scale=self.log_kv_second_order_scale,
+            )
             outputs.append(y_b)
 
             cache.add_recent(
@@ -1040,7 +1091,16 @@ class CausalSelfAttention(nn.Module):
                 defer_tail = block_end == T and blk % 2 == 1
                 commit_end = block_end - 1 if defer_tail else block_end
 
-                slot_k, slot_v, slot_w = cache.get_attention_state()
+                (
+                    slot_k,
+                    slot_v,
+                    slot_w,
+                    slot_sigma_u,
+                    slot_sigma2,
+                    slot_gamma_a,
+                    slot_gamma_b,
+                    slot_gamma,
+                ) = cache.get_attention_state(with_stats=True)
 
                 # Diagnostic branch (score/value oracle grid; see log_kv_diag).
                 # Inert unless a diag_mode(...) context set LOG_KV_DIAG.enabled.
@@ -1056,12 +1116,28 @@ class CausalSelfAttention(nn.Module):
                         k[:, :, start:block_end, :], v[:, :, start:block_end, :],
                         scale=scale, lam=1.0, layer=self.block_idx,
                         q_offset=start, seq_len=T,
+                        slot_sigma_u=slot_sigma_u,
+                        slot_sigma2=slot_sigma2,
+                        slot_gamma_a=slot_gamma_a,
+                        slot_gamma_b=slot_gamma_b,
+                        slot_gamma=slot_gamma,
+                        second_order_scale=self.log_kv_second_order_scale,
                     )
                 else:
-                    k_all, v_all, w_all = append_exact_tokens(
+                    (
+                        k_all,
+                        v_all,
+                        w_all,
+                        sigma_u_all,
+                        sigma2_all,
+                        gamma_a_all,
+                        gamma_b_all,
+                        gamma_all,
+                    ) = append_exact_tokens(
                         slot_k, slot_v, slot_w,
                         k[:, :, start:block_end, :],
                         v[:, :, start:block_end, :],
+                        slot_sigma_u, slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma,
                     )
 
                     # Frozen state fully visible, block tokens causal among
@@ -1069,7 +1145,18 @@ class CausalSelfAttention(nn.Module):
                     # entries in place instead of allocating a (blk, S) bool mask
                     # and a masked_fill copy of the full score tensor per block.
                     y_blk = log_kv_slot_attention(
-                        q[:, :, start:block_end, :], k_all, v_all, w_all, scale=scale, causal_tail=blk
+                        q[:, :, start:block_end, :],
+                        k_all,
+                        v_all,
+                        w_all,
+                        scale=scale,
+                        causal_tail=blk,
+                        slot_sigma_u=sigma_u_all,
+                        slot_sigma2=sigma2_all,
+                        slot_gamma_a=gamma_a_all,
+                        slot_gamma_b=gamma_b_all,
+                        slot_gamma=gamma_all,
+                        second_order_scale=self.log_kv_second_order_scale,
                     )
                 outputs.append(y_blk)
 
@@ -1095,17 +1182,49 @@ class CausalSelfAttention(nn.Module):
 
             # Cache state: [compact slots] + [sliding window from prev chunks].
             # Both are detached — only the current chunk carries gradient.
-            slot_k, slot_v, slot_w = cache.get_attention_state()
+            (
+                slot_k,
+                slot_v,
+                slot_w,
+                slot_sigma_u,
+                slot_sigma2,
+                slot_gamma_a,
+                slot_gamma_b,
+                slot_gamma,
+            ) = cache.get_attention_state(with_stats=True)
 
             # Append current chunk (with gradient) as exact w=1 slots.
-            k_all, v_all, w_all = append_exact_tokens(slot_k, slot_v, slot_w, k_b, v_b)
+            (
+                k_all,
+                v_all,
+                w_all,
+                sigma_u_all,
+                sigma2_all,
+                gamma_a_all,
+                gamma_b_all,
+                gamma_all,
+            ) = append_exact_tokens(
+                slot_k, slot_v, slot_w, k_b, v_b,
+                slot_sigma_u, slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma,
+            )
 
             # Visibility: compact slots + sliding window fully visible, the
             # current chunk causal. causal_tail masks the trailing `actual_t`
             # in-flight entries in place — building a (actual_t, S) bool mask
             # here would allocate O(S) per chunk, T/2 times per layer.
             y_b = log_kv_slot_attention(
-                q[:, :, start:end, :], k_all, v_all, w_all, scale=scale, causal_tail=actual_t
+                q[:, :, start:end, :],
+                k_all,
+                v_all,
+                w_all,
+                scale=scale,
+                causal_tail=actual_t,
+                slot_sigma_u=sigma_u_all,
+                slot_sigma2=sigma2_all,
+                slot_gamma_a=gamma_a_all,
+                slot_gamma_b=gamma_b_all,
+                slot_gamma=gamma_all,
+                second_order_scale=self.log_kv_second_order_scale,
             )  # (B, n_head, actual_t, v_dim)
             outputs.append(y_b)
 
