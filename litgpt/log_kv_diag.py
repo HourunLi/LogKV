@@ -7,27 +7,30 @@ set ``S_s``), attention factors EXACTLY:
     V_s  = sum_{j in S_s} softmax_{j in S_s}(z_j)·v_j
     out  = softmax_s(L_s)·V_s   ==  dense attention          (algebraic identity)
 
-The production path (``log_kv_slot_attention``) replaces both sides with a
-first-order approximation:
+The old first-order LogKV path replaces both sides with:
 
     L_s ≈ scale·q·mean_j(k_j) + λ·log(w_s)        (score side)
     V_s ≈ mean_j(v_j)                              (value side)
 
-This module swaps the two sides in and out independently to build a 2×2
-attribution grid, so a benchmark drop can be split into "scoring error" vs
-"read-out error":
+This module keeps that old path as ``baseline_1st_order`` and swaps the two
+sides in and out independently to build an attribution grid, so a benchmark drop
+can be split into "scoring error" vs "read-out error":
 
     mode          L_s (score)              V_s (value)              answers
     ----------    ---------------------    ---------------------    -------------------
-    baseline      approx (production)      mean(v)                  control (== prod)
+    baseline      production               production               control (== prod)
+    baseline_1st_order
+                  mean/log-w approx        mean(v)                  old LogKV baseline
     s_oracle      exact logsumexp          mean(v)                  how much is scoring
-    v_oracle      approx (production)      exact softmax·v          how much is read-out
+    v_oracle      mean/log-w approx        exact softmax·v          how much is read-out
     gamma_only    exact logsumexp          mean(v) + scale·Γ_s·q    1st-order value fix
     exact         exact                    exact                    self-check (== dense)
     dense         no bucketing — softmax over every raw token       independent oracle
 
 ``exact`` and ``dense`` must agree (two independent routes to the same identity);
-``baseline`` must reproduce production bit-for-bit (it delegates to it).
+``baseline`` must reproduce the current production path bit-for-bit (it delegates
+to it). ``baseline_1st_order`` keeps the old mean/log-w + mean(v) path as a
+stable control after persisted second-order stats are wired into production.
 
 ``gamma_only`` probes whether a CHEAP, on-the-fly linear value correction closes
 most of ``s_oracle``'s gap without the full ``v_oracle`` within-slot softmax
@@ -63,22 +66,37 @@ Two more instruments beyond the mode grid, both opt-in via ``diag_mode(...)``:
     dilutes a benchmark's few truly retrieval-critical query positions (e.g. a
     NIAH question near the prompt tail) against a much larger population of
     ordinary reading positions. ``None`` (default) keeps the old unfiltered
-    behavior. NOTE: this only reaches query positions inside a fresh PREFILL
-    block (see the module-level precondition below) — autoregressive decode is
-    not instrumented, so "generation-phase" queries are approximated by the
-    prompt's tail window, not literal decode steps.
+    behavior. Whenever this is set, ``add_peak`` ALSO buckets samples by
+    relative position from the sequence end (``add_peak_by_pos`` /
+    ``peakiness_by_position`` in ``summary()``) instead of only pooling them
+    into one number — this is what makes D5 re-binning legible: a real
+    retrieval spike shows up as a sharp curve peaked at (or near) the
+    question/answer boundary, whereas a flat curve across the window means the
+    window itself is still too wide (or the theory's prediction doesn't hold).
+    NOTE: this only reaches query positions inside a fresh PREFILL block (see
+    the module-level precondition below) — autoregressive decode is not
+    instrumented (the raw un-compacted tokens a decode query would score
+    against are already gone by then), so "generation-phase" queries are
+    approximated by the prompt's tail window, not literal decode steps. This is
+    a reasonable proxy for NIAH (the question tokens themselves are exactly
+    where the model must locate the needle) but a weak one for LongBench
+    summarization prompts (no natural trailing "question" span) — see the
+    research log for the decode-hook extension this would need to close.
 
 ``summary()`` reduces the accumulated stats to three tables, labeled with the
 mode they were collected under:
   * ``by_level`` — per (layer, slot_width): score side ``logit_mae/logit_rmse``
     (approx vs exact slot logit) + ``intra_slot_logit_var``, and value side
-    ``value_mae/value_rel`` (mean-pooled vs exact within-slot read-out). These are
-    measurements of the CURRENT cache state, taken identically under every mode —
-    they do not collapse to zero in oracle modes; across-mode dumps differ only
-    through hidden-state drift caused by the substituted outputs.
-  * ``by_layer_output`` — per layer: relative L2 error of the baseline / s_oracle
-    / v_oracle / gamma_only outputs vs ``exact``, all five corners evaluated on
-    the SAME hidden states, so one run yields a drift-free D2 attribution.
+    ``value_mae/value_rel`` (mean-pooled vs exact within-slot read-out). When
+    persisted rank-1 stats are supplied it also includes D1 projection errors:
+    ``sigma_q_*``, ``score2_*``, ``gamma_q_*`` and ``value2_*``. These are
+    measurements of the CURRENT cache state, taken identically under every mode;
+    across-mode dumps differ only through hidden-state drift caused by the
+    substituted outputs.
+  * ``by_layer_output`` — per layer: relative L2 error of the baseline /
+    baseline_1st_order / s_oracle / v_oracle / gamma_only outputs vs
+    ``exact``, all corners evaluated on the SAME hidden states, so one run
+    yields a drift-free D2 attribution.
   * ``peakiness`` — per layer: running max + p99.9 of |scale·q·k| over a
     deterministic sample buffer, with the pool size ``n``.
 
@@ -99,10 +117,16 @@ import torch
 
 from litgpt.log_kv_cache import append_exact_tokens, log_kv_slot_attention
 
-_MODES = ("off", "baseline", "s_oracle", "v_oracle", "gamma_only", "exact", "dense")
+_MODES = ("off", "baseline", "baseline_1st_order", "s_oracle", "v_oracle", "gamma_only", "exact", "dense")
 # Per-layer cap on the deterministic |scale·q·k| sample buffer backing the
 # summary()-time p99.9 (see DiagState.add_peak). ~1 MB fp32 per layer.
 _PEAK_BUF_CAP = 262_144
+# Per-(layer, relative-position) cap for the D5 re-binning buffer (see
+# DiagState.add_peak_by_pos). Only active when peak_window_from_end is set, so
+# the position axis is bounded by the window width, not the sequence length —
+# a much smaller cap than _PEAK_BUF_CAP is enough (worst case
+# n_layers * window * cap * 4 bytes; 28 * 128 * 8192 * 4 ≈ 117 MB).
+_PEAK_POS_BUF_CAP = 8_192
 # Modes whose slot logit is the exact within-slot logsumexp (score oracle).
 _L_EXACT = ("s_oracle", "gamma_only", "exact")
 # Modes whose read-out is the exact within-slot softmax over v (value oracle).
@@ -146,6 +170,10 @@ class DiagState:
         self.stats: dict[tuple[int, int], dict[str, float]] = {}
         # layer -> peak |scale·q·k| running max + deterministic sample buffer.
         self.peak: dict[int, dict] = {}
+        # (layer, rel_pos_from_end) -> same running max + sample buffer as
+        # ``peak``, but bucketed by query position instead of pooled (D5
+        # re-binning; only populated while ``peak_window_from_end`` is set).
+        self.peak_pos: dict[tuple[int, int], dict] = {}
         # layer -> running squared output error of each grid corner vs ``exact``.
         self.out_stats: dict[int, dict[str, float]] = {}
 
@@ -156,6 +184,7 @@ class DiagState:
     def reset_stats(self) -> None:
         self.stats = {}
         self.peak = {}
+        self.peak_pos = {}
         self.out_stats = {}
 
     def add_slot_stats(
@@ -189,10 +218,42 @@ class DiagState:
         acc["v_abs"] += v_err.sum().item()
         acc["v_rel"] += (v_err / v_ref.clamp_min(1e-8)).sum().item()
 
+    def add_projection_stats(
+        self,
+        layer: int,
+        width: int,
+        sigma_q_err: torch.Tensor,
+        sigma_q_ref: torch.Tensor,
+        score2_err: torch.Tensor,
+        score2_ref: torch.Tensor,
+        gamma_q_err: torch.Tensor,
+        gamma_q_ref: torch.Tensor,
+        value2_err: torch.Tensor,
+        value2_ref: torch.Tensor,
+    ) -> None:
+        """D1: persisted rank-1 stats vs exact projected Sigma/Gamma quantities.
+
+        Matrix Frobenius error is useful but indirect; these are the quantities
+        the actual attention formula consumes on the real query distribution.
+        """
+        acc = self._level_acc(layer, width)
+        acc["sigma_q_count"] += float(sigma_q_err.numel())
+        acc["sigma_q_abs"] += sigma_q_err.abs().sum().item()
+        acc["sigma_q_rel"] += (sigma_q_err.abs() / sigma_q_ref.abs().clamp_min(1e-8)).sum().item()
+        acc["score2_abs"] += score2_err.abs().sum().item()
+        acc["score2_rel"] += (score2_err.abs() / score2_ref.abs().clamp_min(1e-8)).sum().item()
+
+        acc["gamma_q_count"] += float(gamma_q_err.numel())
+        acc["gamma_q_abs"] += gamma_q_err.sum().item()
+        acc["gamma_q_rel"] += (gamma_q_err / gamma_q_ref.clamp_min(1e-8)).sum().item()
+        acc["value2_abs"] += value2_err.sum().item()
+        acc["value2_rel"] += (value2_err / value2_ref.clamp_min(1e-8)).sum().item()
+
     def add_out_stats(
         self,
         layer: int,
         err_base: float,
+        err_base_1st: float,
         err_s: float,
         err_v: float,
         err_gamma: float,
@@ -202,13 +263,17 @@ class DiagState:
         """Accumulate per-layer squared output error of each grid corner vs ``exact``.
 
         One diagnostic run therefore yields the full D2 attribution per layer
-        (``by_layer_output`` in ``summary()``) with all five corners evaluated on
-        the SAME hidden states — no cross-run drift confound.
+        (``by_layer_output`` in ``summary()``) with all corners evaluated on the
+        SAME hidden states — no cross-run drift confound.
         """
         acc = self.out_stats.setdefault(
-            int(layer), {"base": 0.0, "s": 0.0, "v": 0.0, "gamma": 0.0, "ref": 0.0, "n": 0}
+            int(layer), {
+                "base": 0.0, "base_1st": 0.0, "s": 0.0, "v": 0.0,
+                "gamma": 0.0, "ref": 0.0, "n": 0,
+            }
         )
         acc["base"] += err_base
+        acc["base_1st"] += err_base_1st
         acc["s"] += err_s
         acc["v"] += err_v
         acc["gamma"] += err_gamma
@@ -221,6 +286,10 @@ class DiagState:
             {
                 "count": 0.0, "sum_abs": 0.0, "sum_sq": 0.0, "var_sum": 0.0,
                 "v_count": 0.0, "v_abs": 0.0, "v_rel": 0.0,
+                "sigma_q_count": 0.0, "sigma_q_abs": 0.0, "sigma_q_rel": 0.0,
+                "score2_abs": 0.0, "score2_rel": 0.0,
+                "gamma_q_count": 0.0, "gamma_q_abs": 0.0, "gamma_q_rel": 0.0,
+                "value2_abs": 0.0, "value2_rel": 0.0,
             },
         )
 
@@ -253,12 +322,53 @@ class DiagState:
             acc["buf_n"] = thinned.numel()
             acc["stride"] *= 2
 
+    def add_peak_by_pos(self, layer: int, rel_pos: torch.Tensor, abs_z: torch.Tensor) -> None:
+        """D5 re-binning: record peakiness keyed by relative position from the
+        sequence end, instead of pooling the whole window into one number.
+
+        ``abs_z`` has the query axis at dim 3 (matches every ``add_peak`` call
+        site: (B,G,rf,t_c,...) from both the slot and dense routes). ``rel_pos``
+        is a (t_c,) int tensor, one entry per query row along that axis — 0 is
+        the LAST token of the sequence, 1 the second-to-last, etc. Only called
+        while ``DIAG.peak_window_from_end`` is set (see module docstring), so
+        the number of distinct keys is bounded by the window width, not the
+        sequence length. Mirrors ``add_peak``'s running-max + strided sample
+        buffer per (layer, rel_pos) cell so ``summary()`` can plot a peakiness
+        CURVE over position — the signal D5 actually needs: a real retrieval
+        spike is sharp and localized, a bug/dilution artifact is flat.
+        """
+        if abs_z.numel() == 0:
+            return
+        t_c = abs_z.size(3)
+        for i in range(t_c):
+            flat = abs_z.select(3, i).detach().reshape(-1).float()
+            if flat.numel() == 0:
+                continue
+            key = (int(layer), int(rel_pos[i].item()))
+            acc = self.peak_pos.setdefault(
+                key, {"r2_max": 0.0, "buf": [], "buf_n": 0, "stride": 1, "n_seen": 0}
+            )
+            acc["r2_max"] = max(acc["r2_max"], flat.max().item())
+            acc["n_seen"] += flat.numel()
+            take = flat[:: acc["stride"]]
+            if take.numel() > _PEAK_POS_BUF_CAP:
+                take = take[:: -(-take.numel() // _PEAK_POS_BUF_CAP)]
+            acc["buf"].append(take.cpu())
+            acc["buf_n"] += take.numel()
+            while acc["buf_n"] > _PEAK_POS_BUF_CAP:
+                thinned = torch.cat(acc["buf"])[::2]
+                acc["buf"] = [thinned]
+                acc["buf_n"] = thinned.numel()
+                acc["stride"] *= 2
+
     def summary(self) -> dict:
         """Plot-ready reduction of the accumulated stats (see module docstring)."""
         by_level = []
         for (layer, width), acc in sorted(self.stats.items()):
             n = max(acc["count"], 1.0)
             nv = max(acc.get("v_count", 0.0), 1.0)
+            ns = max(acc.get("sigma_q_count", 0.0), 1.0)
+            ng = max(acc.get("gamma_q_count", 0.0), 1.0)
             by_level.append(
                 {
                     "layer": layer,
@@ -268,6 +378,14 @@ class DiagState:
                     "intra_slot_logit_var": acc["var_sum"] / n,
                     "value_mae": acc.get("v_abs", 0.0) / nv,
                     "value_rel": acc.get("v_rel", 0.0) / nv,
+                    "sigma_q_mae": acc.get("sigma_q_abs", 0.0) / ns,
+                    "sigma_q_rel": acc.get("sigma_q_rel", 0.0) / ns,
+                    "score2_mae": acc.get("score2_abs", 0.0) / ns,
+                    "score2_rel": acc.get("score2_rel", 0.0) / ns,
+                    "gamma_q_mae": acc.get("gamma_q_abs", 0.0) / ng,
+                    "gamma_q_rel": acc.get("gamma_q_rel", 0.0) / ng,
+                    "value2_mae": acc.get("value2_abs", 0.0) / ng,
+                    "value2_rel": acc.get("value2_rel", 0.0) / ng,
                 }
             )
         by_layer_output = []
@@ -277,6 +395,7 @@ class DiagState:
                 {
                     "layer": layer,
                     "err_baseline": (acc["base"] / ref) ** 0.5,
+                    "err_baseline_1st_order": (acc.get("base_1st", 0.0) / ref) ** 0.5,
                     "err_s_oracle": (acc["s"] / ref) ** 0.5,
                     "err_v_oracle": (acc["v"] / ref) ** 0.5,
                     "err_gamma_only": (acc.get("gamma", 0.0) / ref) ** 0.5,
@@ -294,10 +413,24 @@ class DiagState:
                     "n": acc["n_seen"],
                 }
             )
+        peakiness_by_position = []
+        for (layer, rel_pos), acc in sorted(self.peak_pos.items()):
+            buf = torch.cat(acc["buf"]) if acc["buf"] else torch.zeros(1)
+            peakiness_by_position.append(
+                {
+                    "layer": layer,
+                    "rel_pos_from_end": rel_pos,
+                    "r2_max": acc["r2_max"],
+                    "r2_p999": torch.quantile(buf, 0.999).item(),
+                    "r2_mean": buf.mean().item(),
+                    "n": acc["n_seen"],
+                }
+            )
         return {
             "mode": self.stats_mode,
             "by_level": by_level,
             "by_layer_output": by_layer_output,
+            "peakiness_by_position": peakiness_by_position,
             "peakiness": peakiness,
         }
 
@@ -317,8 +450,8 @@ def diag_mode(
     """Temporarily switch the global diagnostic mode; restore on exit.
 
     Args:
-        mode: one of ``off / baseline / s_oracle / v_oracle / gamma_only / exact
-            / dense``.
+        mode: one of ``off / baseline / baseline_1st_order / s_oracle /
+            v_oracle / gamma_only / exact / dense``.
         q_chunk: query-axis chunk for the memory-heavy oracle paths (they
             materialize a per-token fp32 score; see ``diag_block_attention``).
         collect: gather per-level stats + peakiness while running.
@@ -418,6 +551,12 @@ def _production_block(
     v_tail: torch.Tensor,
     scale: float,
     lam: float,
+    slot_sigma_u: torch.Tensor | None = None,
+    slot_sigma2: torch.Tensor | None = None,
+    slot_gamma_a: torch.Tensor | None = None,
+    slot_gamma_b: torch.Tensor | None = None,
+    slot_gamma: torch.Tensor | None = None,
+    second_order_scale: float = 1.0,
 ) -> torch.Tensor:
     """Exactly the production block-prefill call — the ``baseline`` output.
 
@@ -425,9 +564,31 @@ def _production_block(
     argument order the model uses, so ``baseline`` reproduces production bit-for-bit
     (the zero-intrusion guarantee).
     """
-    k_all, v_all, w_all = append_exact_tokens(slot_k, slot_v, slot_w, k_tail, v_tail)
+    appended = append_exact_tokens(
+        slot_k, slot_v, slot_w, k_tail, v_tail,
+        slot_sigma_u, slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma,
+    )
+    if slot_sigma_u is None:
+        k_all, v_all, w_all = appended
+        return log_kv_slot_attention(
+            q, k_all, v_all, w_all, scale=scale, lam=lam, causal_tail=k_tail.size(2),
+            second_order_scale=second_order_scale,
+        )
+    k_all, v_all, w_all, sigma_u_all, sigma2_all, gamma_a_all, gamma_b_all, gamma_all = appended
     return log_kv_slot_attention(
-        q, k_all, v_all, w_all, scale=scale, lam=lam, causal_tail=k_tail.size(2)
+        q,
+        k_all,
+        v_all,
+        w_all,
+        scale=scale,
+        lam=lam,
+        causal_tail=k_tail.size(2),
+        slot_sigma_u=sigma_u_all,
+        slot_sigma2=sigma2_all,
+        slot_gamma_a=gamma_a_all,
+        slot_gamma_b=gamma_b_all,
+        slot_gamma=gamma_all,
+        second_order_scale=second_order_scale,
     )
 
 
@@ -450,6 +611,20 @@ def _peak_local_slice(t_c: int, global_c0: int, seq_len: int | None) -> slice | 
     if lo >= t_c:
         return None
     return slice(lo, t_c)
+
+
+def _peak_rel_pos(peak_sl: slice, global_c0: int, seq_len: int) -> torch.Tensor:
+    """Relative-from-end position (0 = last token) for each query kept by ``peak_sl``.
+
+    ``peak_sl`` is the local ``[lo, t_c)`` slice ``_peak_local_slice`` returned
+    for this chunk; ``global_c0`` is this chunk's sequence offset
+    (``q_offset + c0``). Only called when both ``DIAG.peak_window_from_end``
+    and ``seq_len`` are set (see the call sites), so the result never needs to
+    handle the unfiltered-legacy case.
+    """
+    local_idx = torch.arange(peak_sl.start, peak_sl.stop)
+    global_pos = global_c0 + local_idx
+    return seq_len - 1 - global_pos
 
 
 def _causal_tail_mask(c0: int, t_c: int, blk: int, device: torch.device) -> torch.Tensor:
@@ -479,12 +654,18 @@ def _diag_slot_core(
     layer: int,
     q_offset: int = 0,
     seq_len: int | None = None,
+    slot_sigma_u: torch.Tensor | None = None,
+    slot_sigma2: torch.Tensor | None = None,
+    slot_gamma_a: torch.Tensor | None = None,
+    slot_gamma_b: torch.Tensor | None = None,
+    slot_gamma: torch.Tensor | None = None,
+    second_order_scale: float = 1.0,
 ) -> torch.Tensor:
     """Slot-bucketed attention with per-side (score/value) oracle swaps + stats.
 
-    Handles ``baseline`` (approx/approx — kept for stats; the returned output is
-    overridden by ``_production_block`` for bit-exactness), ``s_oracle``,
-    ``v_oracle``, ``gamma_only`` and ``exact``. Everything runs in fp32; the
+    Handles ``baseline`` (current production), ``baseline_1st_order`` (old
+    mean/log-w path), ``s_oracle``, ``v_oracle``, ``gamma_only`` and ``exact``.
+    Everything runs in fp32; the
     query axis is chunked (``DIAG.q_chunk``) because the oracle sides
     materialize a per-token (B, G, rf, T_c, N) score, unlike the O(S) production
     path. ``q_offset``/``seq_len`` are only used to restrict D5 peakiness to
@@ -492,11 +673,11 @@ def _diag_slot_core(
     returned output.
 
     With ``DIAG.collect`` the within-slot softmax + token values are retained per
-    chunk and ALL FIVE grid corners are evaluated (value-side stats + drift-free
-    per-layer output attribution), so every collecting run — including
-    ``baseline`` — carries the value-oracle memory envelope. The returned output
-    for the active mode is built from the same expressions as the stats-off path,
-    so enabling ``collect`` never changes what the model sees.
+    chunk and the whole diagnostic grid is evaluated (value-side stats +
+    drift-free per-layer output attribution), so every collecting run —
+    including ``baseline`` — carries the value-oracle memory envelope. The
+    returned output for the active mode is built from the same expressions as the
+    stats-off path, so enabling ``collect`` never changes what the model sees.
     """
     B, nh, T_q, D = q.shape
     G = slot_k.size(1)
@@ -508,6 +689,10 @@ def _diag_slot_core(
     l_exact = mode in _L_EXACT
     v_exact = mode in _V_EXACT
     v_gamma = mode in _V_GAMMA
+    has_rank1_stats = slot_sigma_u is not None
+    if has_rank1_stats and any(x is None for x in (slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma)):
+        raise ValueError("_diag_slot_core() requires either all rank-1 stats or none")
+    use_rank1_stats = has_rank1_stats and second_order_scale != 0.0
 
     qf = q.float()
     kp = k_prefix.float()
@@ -517,6 +702,11 @@ def _diag_slot_core(
     kt = k_tail.float()
     vt = v_tail.float()
     logw = lam * slot_w.float().log()  # (B, G, S); w=1 slots contribute 0
+    ssuf = slot_sigma_u.float() if has_rank1_stats else None
+    ss2f = slot_sigma2.float() if has_rank1_stats else None
+    sgaf = slot_gamma_a.float() if has_rank1_stats else None
+    sgbf = slot_gamma_b.float() if has_rank1_stats else None
+    sgf = slot_gamma.float() if has_rank1_stats else None
 
     outs: list[torch.Tensor] = []
     q_chunk = max(1, DIAG.q_chunk)
@@ -528,13 +718,15 @@ def _diag_slot_core(
 
         # Per-run slot logits, both sides. Under ``collect`` both sides plus the
         # within-slot softmax/values are always materialized (the D2 grid needs
-        # all five corners); with stats off, only what the active mode returns,
+        # all grid corners); with stats off, only what the active mode returns,
         # so a stats-off oracle run stays as lean as before.
         l_ex_parts: list[torch.Tensor | None] = []
         l_ap_parts: list[torch.Tensor | None] = []
+        l_prod_parts: list[torch.Tensor | None] = []
         w_keep: list[torch.Tensor | None] = []        # per-run within-slot softmax(z)
         v_keep: list[torch.Tensor | None] = []         # per-run token values
         v_gamma_keep: list[torch.Tensor | None] = []   # per-run mean(v)+scale·Γ_s·q
+        v_prod_keep: list[torch.Tensor | None] = []    # per-run persisted-Gamma read-out
         keep_tokens = v_exact or v_gamma or collect     # exact-V / gamma-V need raw v
         tok = 0
         for soff, n, width in runs:
@@ -553,6 +745,20 @@ def _diag_slot_core(
                 l_approx_run = None
             l_ex_parts.append(l_exact_run)
             l_ap_parts.append(l_approx_run)
+            sigma_q_persist = score2_persist = None
+            if has_rank1_stats and l_approx_run is not None:
+                sigma_u_run = ssuf[:, :, soff:soff + n, :]
+                sigma2_run = ss2f[:, :, soff:soff + n]
+                sigma_dot = torch.einsum("bgrtd,bgnd->bgrtn", qg, sigma_u_run)
+                sigma_q_persist = sigma_dot.square() * sigma2_run[:, :, None, None, :]
+                score2_persist = 0.5 * scale * scale * sigma_q_persist
+                l_prod_parts.append(
+                    l_approx_run + second_order_scale * score2_persist
+                    if use_rank1_stats
+                    else l_approx_run
+                )
+            else:
+                l_prod_parts.append(l_approx_run)
 
             within = torch.softmax(z, dim=-1) if keep_tokens else None
             vr = (
@@ -580,13 +786,40 @@ def _diag_slot_core(
             else:
                 v_gamma_run = None
             v_gamma_keep.append(v_gamma_run)
+            if has_rank1_stats and (v_gamma or collect):
+                gamma_a_run = sgaf[:, :, soff:soff + n, :]
+                gamma_b_run = sgbf[:, :, soff:soff + n, :]
+                gamma_run = sgf[:, :, soff:soff + n]
+                gamma_dot = torch.einsum("bgrtd,bgnd->bgrtn", qg, gamma_a_run)
+                gamma_q_persist = (
+                    gamma_dot.unsqueeze(-1)
+                    * gamma_run[:, :, None, None, :, None]
+                    * gamma_b_run[:, :, None, None, :, :]
+                )
+                corr_persist = scale * gamma_q_persist
+                v_prod_keep.append(
+                    svr_g[:, :, None, None, :, :] + second_order_scale * corr_persist
+                    if use_rank1_stats
+                    else svr_g[:, :, None, None, :, :]
+                )
+            else:
+                gamma_q_persist = corr_persist = None
+                v_prod_keep.append(None)
 
             if collect:
+                qk_centered = torch.einsum("bgrtd,bgnwd->bgrtnw", qg, k_c)
+                sigma_q_exact = qk_centered.square().mean(dim=-1)
+                score2_exact = 0.5 * scale * scale * sigma_q_exact
                 DIAG.add_slot_stats(
                     layer, width, l_approx_run - l_exact_run, z.var(dim=-1, unbiased=False)
                 )
                 if peak_sl is not None:
-                    DIAG.add_peak(layer, z[:, :, :, peak_sl].abs())
+                    z_abs = z[:, :, :, peak_sl].abs()
+                    DIAG.add_peak(layer, z_abs)
+                    if DIAG.peak_window_from_end is not None and seq_len is not None:
+                        DIAG.add_peak_by_pos(
+                            layer, _peak_rel_pos(peak_sl, q_offset + c0, seq_len), z_abs
+                        )
                 # Value side of the D2 grid: what a width-w mean-pooled read-out
                 # actually loses, ‖mean(v) − softmax_within(z)·v‖ per (query, slot).
                 v_ex_run = torch.einsum("bgrtnw,bgnwc->bgrtnc", within, vr)
@@ -595,6 +828,24 @@ def _diag_slot_core(
                 DIAG.add_value_stats(
                     layer, width, diff.norm(dim=-1) / dv_sqrt, v_ex_run.norm(dim=-1) / dv_sqrt
                 )
+                if has_rank1_stats:
+                    gamma_q_exact = torch.einsum("bgrtnw,bgnwc->bgrtnc", qk_centered, v_c) / width
+                    gamma_q_err = (gamma_q_persist - gamma_q_exact).norm(dim=-1) / dv_sqrt
+                    gamma_q_ref = gamma_q_exact.norm(dim=-1) / dv_sqrt
+                    value2_err = (corr_persist - corr).norm(dim=-1) / dv_sqrt
+                    value2_ref = corr.norm(dim=-1) / dv_sqrt
+                    DIAG.add_projection_stats(
+                        layer,
+                        width,
+                        sigma_q_persist - sigma_q_exact,
+                        sigma_q_exact,
+                        score2_persist - score2_exact,
+                        score2_exact,
+                        gamma_q_err,
+                        gamma_q_ref,
+                        value2_err,
+                        value2_ref,
+                    )
             tok += n * width
 
         l_tail = scale * torch.einsum("bgrtd,bgsd->bgrts", qg, kt)  # (B,G,rf,t_c,blk)
@@ -605,9 +856,10 @@ def _diag_slot_core(
         def _mix(l_parts: list[torch.Tensor], v_source: str) -> torch.Tensor:
             """Softmax over [slot logits | causal tail] + the chosen read-out.
 
-            ``v_source``: "mean" (production, p·slot_v) / "exact" (within-slot
-            softmax over raw v — needs w_keep/v_keep) / "gamma" (1st-order
-            linear correction — needs v_gamma_keep).
+            ``v_source``: "mean" (old first-order, p·slot_v) / "exact"
+            (within-slot softmax over raw v — needs w_keep/v_keep) / "gamma"
+            (exact on-the-fly Γ correction — needs v_gamma_keep) / "persisted"
+            (current production persisted Γ correction — needs v_prod_keep).
             """
             p = torch.softmax(torch.cat(l_parts + [l_tail], dim=-1), dim=-1)
             p_prefix = p[..., :S]
@@ -623,21 +875,29 @@ def _diag_slot_core(
                     o = o + torch.einsum(
                         "bgrts,bgrtsc->bgrtc", p_prefix[..., soff:soff + n], vg
                     )
+            elif v_source == "persisted":
+                o = qg.new_zeros(B, G, rf, t_c, Dv)
+                for (soff, n, _width), vg in zip(runs, v_prod_keep):
+                    o = o + torch.einsum(
+                        "bgrts,bgrtsc->bgrtc", p_prefix[..., soff:soff + n], vg
+                    )
             else:
                 o = torch.einsum("bgrts,bgsc->bgrtc", p_prefix, svf)  # p·mean(v) == p·slot_v
             return o + torch.einsum("bgrts,bgsc->bgrtc", p_tail, vt)
 
         if collect:
-            # All five grid corners on the SAME hidden states — drift-free
-            # per-layer D2 attribution from a single run (see add_out_stats).
+            # All grid corners on the SAME hidden states — drift-free per-layer
+            # D2 attribution from a single run (see add_out_stats).
             out_exact_c = _mix(l_ex_parts, "exact")
-            out_base_c = _mix(l_ap_parts, "mean")
+            out_base_1st_c = _mix(l_ap_parts, "mean")
+            out_base_c = _mix(l_prod_parts, "persisted") if use_rank1_stats else out_base_1st_c
             out_s_c = _mix(l_ex_parts, "mean")
             out_v_c = _mix(l_ap_parts, "exact")
             out_gamma_c = _mix(l_ex_parts, "gamma")
             DIAG.add_out_stats(
                 layer,
                 (out_base_c - out_exact_c).square().sum().item(),
+                (out_base_1st_c - out_exact_c).square().sum().item(),
                 (out_s_c - out_exact_c).square().sum().item(),
                 (out_v_c - out_exact_c).square().sum().item(),
                 (out_gamma_c - out_exact_c).square().sum().item(),
@@ -649,11 +909,17 @@ def _diag_slot_core(
                 else out_gamma_c if v_gamma
                 else out_s_c if l_exact
                 else out_v_c if v_exact
+                else out_base_1st_c if mode == "baseline_1st_order"
                 else out_base_c
             )
         else:
             v_src = "gamma" if v_gamma else "exact" if v_exact else "mean"
-            out = _mix(l_ex_parts if l_exact else l_ap_parts, v_src)
+            if mode == "baseline":
+                out = _mix(l_prod_parts, "persisted") if use_rank1_stats else _mix(l_ap_parts, "mean")
+            elif mode == "baseline_1st_order":
+                out = _mix(l_ap_parts, "mean")
+            else:
+                out = _mix(l_ex_parts if l_exact else l_ap_parts, v_src)
         outs.append(out.reshape(B, nh, t_c, Dv))
 
     return torch.cat(outs, dim=2).to(q.dtype)
@@ -706,7 +972,12 @@ def _diag_dense(
             _causal_tail_mask(c0, t_c, blk, q.device).view(1, 1, 1, t_c, blk), float("-inf")
         )
         if collect and peak_sl is not None:
-            DIAG.add_peak(layer, z_pre[:, :, :, peak_sl].abs())
+            z_abs = z_pre[:, :, :, peak_sl].abs()
+            DIAG.add_peak(layer, z_abs)
+            if DIAG.peak_window_from_end is not None and seq_len is not None:
+                DIAG.add_peak_by_pos(
+                    layer, _peak_rel_pos(peak_sl, q_offset + c0, seq_len), z_abs
+                )
 
         p = torch.softmax(torch.cat([z_pre, z_tail], dim=-1), dim=-1)
         out = torch.einsum("bgrtn,bgnc->bgrtc", p[..., :N], vp)
@@ -730,13 +1001,20 @@ def diag_block_attention(
     layer: int = 0,
     q_offset: int = 0,
     seq_len: int | None = None,
+    slot_sigma_u: torch.Tensor | None = None,
+    slot_sigma2: torch.Tensor | None = None,
+    slot_gamma_a: torch.Tensor | None = None,
+    slot_gamma_b: torch.Tensor | None = None,
+    slot_gamma: torch.Tensor | None = None,
+    second_order_scale: float = 1.0,
 ) -> torch.Tensor:
     """Diagnostic replacement for one production block-prefill attention step.
 
     Parallels ``log_kv_slot_attention`` but additionally receives the EXACT prefix
     tokens (``k_prefix``/``v_prefix``) the frozen slots cover, so the score and
-    value sides can each be swapped between the production first-order approximation
-    and the exact within-slot computation (see module docstring for the mode grid).
+    value sides can each be swapped between the old first-order approximation,
+    the current production path and the exact within-slot computation (see
+    module docstring for the mode grid).
 
     ``q_offset`` (this block's starting position in the sequence) and ``seq_len``
     (the sequence's total prefill length) are passed straight through to
@@ -760,11 +1038,31 @@ def diag_block_attention(
     if DIAG.exact_from_layer is not None and layer >= DIAG.exact_from_layer:
         mode = "exact"
 
-    if mode in ("off", "baseline"):
+    has_rank1_stats = slot_sigma_u is not None
+    if has_rank1_stats and any(x is None for x in (slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma)):
+        raise ValueError("diag_block_attention() requires either all rank-1 stats or none")
+
+    if mode in ("off", "baseline", "baseline_1st_order"):
         # off: defensive (never reached with a live diag context). baseline:
         # bit-exact production, optionally with a stats-only oracle pass.
-        out = _production_block(q, slot_k, slot_v, slot_w, k_tail, v_tail, scale, lam)
-        if mode == "baseline" and DIAG.collect:
+        prod_second_order_scale = 0.0 if mode == "baseline_1st_order" else second_order_scale
+        out = _production_block(
+            q=q,
+            slot_k=slot_k,
+            slot_v=slot_v,
+            slot_w=slot_w,
+            k_tail=k_tail,
+            v_tail=v_tail,
+            scale=scale,
+            lam=lam,
+            slot_sigma_u=slot_sigma_u,
+            slot_sigma2=slot_sigma2,
+            slot_gamma_a=slot_gamma_a,
+            slot_gamma_b=slot_gamma_b,
+            slot_gamma=slot_gamma,
+            second_order_scale=prod_second_order_scale,
+        )
+        if mode in ("baseline", "baseline_1st_order") and DIAG.collect:
             runs, total = slot_runs(slot_w)
             if total != k_prefix.size(2):
                 raise ValueError(
@@ -772,8 +1070,27 @@ def diag_block_attention(
                     "diagnostics require a fresh prefill with pin_size=0"
                 )
             _diag_slot_core(
-                "baseline", q, k_prefix, v_prefix, slot_k, slot_v, slot_w,
-                k_tail, v_tail, runs, scale, lam, layer, q_offset, seq_len,
+                mode=mode,
+                q=q,
+                k_prefix=k_prefix,
+                v_prefix=v_prefix,
+                slot_k=slot_k,
+                slot_v=slot_v,
+                slot_w=slot_w,
+                k_tail=k_tail,
+                v_tail=v_tail,
+                runs=runs,
+                scale=scale,
+                lam=lam,
+                layer=layer,
+                q_offset=q_offset,
+                seq_len=seq_len,
+                slot_sigma_u=slot_sigma_u,
+                slot_sigma2=slot_sigma2,
+                slot_gamma_a=slot_gamma_a,
+                slot_gamma_b=slot_gamma_b,
+                slot_gamma=slot_gamma,
+                second_order_scale=second_order_scale,
             )
         return out
 
@@ -787,8 +1104,27 @@ def diag_block_attention(
             "diagnostics require a fresh prefill with pin_size=0"
         )
     return _diag_slot_core(
-        mode, q, k_prefix, v_prefix, slot_k, slot_v, slot_w,
-        k_tail, v_tail, runs, scale, lam, layer, q_offset, seq_len,
+        mode=mode,
+        q=q,
+        k_prefix=k_prefix,
+        v_prefix=v_prefix,
+        slot_k=slot_k,
+        slot_v=slot_v,
+        slot_w=slot_w,
+        k_tail=k_tail,
+        v_tail=v_tail,
+        runs=runs,
+        scale=scale,
+        lam=lam,
+        layer=layer,
+        q_offset=q_offset,
+        seq_len=seq_len,
+        slot_sigma_u=slot_sigma_u,
+        slot_sigma2=slot_sigma2,
+        slot_gamma_a=slot_gamma_a,
+        slot_gamma_b=slot_gamma_b,
+        slot_gamma=slot_gamma,
+        second_order_scale=second_order_scale,
     )
 
 

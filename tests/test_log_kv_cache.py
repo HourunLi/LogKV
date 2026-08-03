@@ -55,7 +55,16 @@ def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredK
     assert torch.equal(a.recent_v[:, :, :rc], b.recent_v[:, :, :rc])
     assert torch.equal(a.level_count, b.level_count)
     for ell in range(a.max_levels):
-        for name in ("level_k_", "level_v_", "level_w_"):
+        for name in (
+            "level_k_",
+            "level_v_",
+            "level_w_",
+            "level_sigma_u_",
+            "level_sigma2_",
+            "level_gamma_a_",
+            "level_gamma_b_",
+            "level_gamma_",
+        ):
             assert torch.equal(getattr(a, f"{name}{ell}"), getattr(b, f"{name}{ell}")), f"{name}{ell} differ"
 
 
@@ -99,6 +108,11 @@ class TestInit:
             assert hasattr(c, f"level_k_{ell}")
             assert hasattr(c, f"level_v_{ell}")
             assert hasattr(c, f"level_w_{ell}")
+            assert hasattr(c, f"level_sigma_u_{ell}")
+            assert hasattr(c, f"level_sigma2_{ell}")
+            assert hasattr(c, f"level_gamma_a_{ell}")
+            assert hasattr(c, f"level_gamma_b_{ell}")
+            assert hasattr(c, f"level_gamma_{ell}")
         assert c.level_count.shape == (c.max_levels,)
         assert c.level_count.sum() == 0
 
@@ -119,7 +133,7 @@ class TestInit:
         """THE core complexity guarantee: total buffer storage must be
         O(recent_size + B * max_levels) — no term linear in max_seq_length.
         Closed form: recent_size*(k_dim+v_dim)*b*g
-                     + max_levels * (B*(k_dim+v_dim+1)*b*g + 1)."""
+                     + max_levels * (B*(3*k_dim+2*v_dim+3)*b*g + 1)."""
         b, g, k_dim, v_dim, B, recent = 1, 2, 8, 8, 4, 8
         for max_seq in (1024, 65536, 1048576):
             c = LogStructuredKVCache(
@@ -129,7 +143,7 @@ class TestInit:
             total = sum(buf.numel() for buf in c.buffers())
             expected = (
                 recent * (k_dim + v_dim) * b * g
-                + c.max_levels * (B * (k_dim + v_dim + 1) * b * g + 1)
+                + c.max_levels * (B * (3 * k_dim + 2 * v_dim + 3) * b * g + 1)
             )
             assert total == expected, (
                 f"max_seq={max_seq}: buffer numel {total} != log-sized {expected} — "
@@ -167,6 +181,37 @@ class TestCompactTokens:
 
         assert w_entry[0, 0, 0].item() == 2.0
         torch.testing.assert_close(k_entry[0, 0, 0], k[0, 0].mean(dim=0))
+
+    def test_pair_rank1_stats_are_exact(self):
+        """A two-token slot has rank-1 key covariance and value-key covariance."""
+        B, G, k_dim, v_dim = 1, 1, 4, 3
+        k = torch.randn(B, G, 2, k_dim)
+        v = torch.randn(B, G, 2, v_dim)
+
+        (
+            _k_entry,
+            _v_entry,
+            _w_entry,
+            sigma_u,
+            sigma2,
+            gamma_a,
+            gamma_b,
+            gamma,
+        ) = LogStructuredKVCache._compact_tokens(k, v, with_stats=True)
+
+        k_c = k - k.mean(dim=2, keepdim=True)
+        v_c = v - v.mean(dim=2, keepdim=True)
+        cov = torch.einsum("bgnd,bgne->bgde", k_c, k_c) / 2.0
+        cross = torch.einsum("bgnc,bgnd->bgcd", v_c, k_c) / 2.0
+
+        cov_rank1 = sigma2[..., 0, None, None] * torch.einsum(
+            "bgd,bge->bgde", sigma_u[..., 0, :], sigma_u[..., 0, :]
+        )
+        cross_rank1 = gamma[..., 0, None, None] * torch.einsum(
+            "bgc,bgd->bgcd", gamma_b[..., 0, :], gamma_a[..., 0, :]
+        )
+        torch.testing.assert_close(cov_rank1, cov, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(cross_rank1, cross, atol=1e-5, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +261,34 @@ class TestCompact:
         # pair 1: wa=3, wb=1, alpha=0.75 -> 0.75*5 + 0.25*7 = 5.5
         torch.testing.assert_close(k_out[0, 0, 1, 0], torch.tensor(5.5))
         torch.testing.assert_close(w_out, torch.tensor([[[4.0, 4.0]]]))
+
+    def test_rank1_stats_merge_matches_direct_truncation(self):
+        """Chan merge + rank-1 truncation should match direct truncation on raw tokens."""
+        torch.manual_seed(123)
+        B, G, k_dim, v_dim = 1, 1, 5, 4
+        k = torch.randn(B, G, 4, k_dim)
+        v = torch.randn(B, G, 4, v_dim)
+
+        left = LogStructuredKVCache._compact_tokens(k[:, :, :2, :], v[:, :, :2, :], with_stats=True)
+        right = LogStructuredKVCache._compact_tokens(k[:, :, 2:, :], v[:, :, 2:, :], with_stats=True)
+        direct = LogStructuredKVCache._compact_tokens(k, v, with_stats=True)
+
+        merged = LogStructuredKVCache.compact(
+            left[0], left[1], left[2],
+            right[0], right[1], right[2],
+            left[3], left[4], left[5], left[6], left[7],
+            right[3], right[4], right[5], right[6], right[7],
+        )
+
+        for got, exp in zip(merged[:3], direct[:3]):
+            torch.testing.assert_close(got, exp, atol=1e-6, rtol=1e-6)
+
+        got_cov = merged[4][..., None, None] * torch.einsum("bgsd,bgse->bgsde", merged[3], merged[3])
+        exp_cov = direct[4][..., None, None] * torch.einsum("bgsd,bgse->bgsde", direct[3], direct[3])
+        got_cross = merged[7][..., None, None] * torch.einsum("bgsc,bgsd->bgscd", merged[6], merged[5])
+        exp_cross = direct[7][..., None, None] * torch.einsum("bgsc,bgsd->bgscd", direct[6], direct[5])
+        torch.testing.assert_close(got_cov, exp_cov, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(got_cross, exp_cross, atol=1e-5, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +497,33 @@ class TestGetAttentionState:
 
         assert slot_k.size(2) == 1
         assert slot_w[0, 0, 0].item() == 2.0
+
+    def test_state_with_rank1_stats(self, small_cache):
+        """with_stats=True should append zero stats for exact recent tokens."""
+        c = small_cache
+        k = torch.randn(1, 2, 3, 8)
+        v = torch.randn(1, 2, 3, 8)
+        add_full_kv_in_chunks(c, k, v, chunk_size=1)
+
+        (
+            slot_k,
+            slot_v,
+            slot_w,
+            sigma_u,
+            sigma2,
+            gamma_a,
+            gamma_b,
+            gamma,
+        ) = c.get_attention_state(with_stats=True)
+
+        assert slot_k.shape == sigma_u.shape == gamma_a.shape
+        assert slot_v.shape == gamma_b.shape
+        assert slot_w.shape == sigma2.shape == gamma.shape
+        assert slot_w[0, 0].tolist() == [2.0, 1.0]
+        assert sigma2[0, 0, 0] > 0.0
+        assert gamma[0, 0, 0] >= 0.0
+        assert sigma2[0, 0, 1] == 0.0
+        assert gamma[0, 0, 1] == 0.0
 
     def test_state_after_prefill(self, small_cache):
         """After prefill, compact slots + recent w=1 tokens should be present."""
@@ -634,6 +734,61 @@ class TestSlotAttention:
         torch.testing.assert_close(out_lam0, out_unweighted)
         assert not torch.allclose(out_biased, out_lam0)
 
+    def test_rank1_score_correction_affects_softmax_mass(self):
+        """Sigma stats add the second-order score term before softmax."""
+        q = torch.tensor([[[[1.0, 0.0]]]])  # (B=1, nh=1, T=1, D=2)
+        slot_k = torch.zeros(1, 1, 2, 2)
+        slot_v = torch.tensor([[[[1.0], [0.0]]]])
+        slot_w = torch.ones(1, 1, 2)
+
+        sigma_u = torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]])
+        sigma2 = torch.tensor([[[2.0, 0.0]]])
+        gamma_a = torch.zeros_like(slot_k)
+        gamma_b = torch.zeros_like(slot_v)
+        gamma = torch.zeros_like(slot_w)
+
+        out = log_kv_slot_attention(
+            q,
+            slot_k,
+            slot_v,
+            slot_w,
+            scale=1.0,
+            slot_sigma_u=sigma_u,
+            slot_sigma2=sigma2,
+            slot_gamma_a=gamma_a,
+            slot_gamma_b=gamma_b,
+            slot_gamma=gamma,
+        )
+
+        torch.testing.assert_close(out[0, 0, 0, 0], torch.sigmoid(torch.tensor(1.0)))
+
+    def test_rank1_value_correction_adds_gamma_readout(self):
+        """Gamma stats add scale * gamma * (q·a) * b after slot softmax."""
+        q = torch.tensor([[[[3.0, 0.0]]]])
+        slot_k = torch.zeros(1, 1, 1, 2)
+        slot_v = torch.zeros(1, 1, 1, 2)
+        slot_w = torch.ones(1, 1, 1)
+        sigma_u = torch.zeros_like(slot_k)
+        sigma2 = torch.zeros_like(slot_w)
+        gamma_a = torch.tensor([[[[1.0, 0.0]]]])
+        gamma_b = torch.tensor([[[[0.0, 1.0]]]])
+        gamma = torch.tensor([[[2.0]]])
+
+        out = log_kv_slot_attention(
+            q,
+            slot_k,
+            slot_v,
+            slot_w,
+            scale=0.5,
+            slot_sigma_u=sigma_u,
+            slot_sigma2=sigma2,
+            slot_gamma_a=gamma_a,
+            slot_gamma_b=gamma_b,
+            slot_gamma=gamma,
+        )
+
+        torch.testing.assert_close(out, torch.tensor([[[[0.0, 3.0]]]]))
+
     def test_append_exact_tokens(self):
         """Helper must append w=1 entries after the cached slots, in order."""
         B, G, k_dim, v_dim = 1, 2, 8, 8
@@ -647,6 +802,36 @@ class TestSlotAttention:
         torch.testing.assert_close(k_all[:, :, 3:, :], k_new)
         torch.testing.assert_close(v_all[:, :, 3:, :], v_new)
         torch.testing.assert_close(w_all[0, 0], torch.tensor([2.0, 2.0, 1.0, 1.0, 1.0]))
+
+    def test_append_exact_tokens_with_rank1_stats(self):
+        """Appended exact tokens should receive zero second-order stats."""
+        B, G, k_dim, v_dim = 1, 2, 8, 4
+        slot_k = torch.randn(B, G, 2, k_dim)
+        slot_v = torch.randn(B, G, 2, v_dim)
+        slot_w = torch.full((B, G, 2), 2.0)
+        sigma_u = torch.randn_like(slot_k)
+        sigma2 = torch.rand_like(slot_w)
+        gamma_a = torch.randn_like(slot_k)
+        gamma_b = torch.randn_like(slot_v)
+        gamma = torch.rand_like(slot_w)
+        k_new = torch.randn(B, G, 3, k_dim)
+        v_new = torch.randn(B, G, 3, v_dim)
+
+        out = append_exact_tokens(
+            slot_k, slot_v, slot_w, k_new, v_new,
+            sigma_u, sigma2, gamma_a, gamma_b, gamma,
+        )
+
+        assert len(out) == 8
+        assert out[3].size(2) == 5
+        torch.testing.assert_close(out[3][:, :, :2, :], sigma_u)
+        torch.testing.assert_close(out[4][:, :, :2], sigma2)
+        torch.testing.assert_close(out[5][:, :, :2, :], gamma_a)
+        torch.testing.assert_close(out[6][:, :, :2, :], gamma_b)
+        torch.testing.assert_close(out[7][:, :, :2], gamma)
+        torch.testing.assert_close(out[3][:, :, 2:, :], torch.zeros_like(k_new))
+        torch.testing.assert_close(out[4][:, :, 2:], torch.zeros(B, G, 3))
+        torch.testing.assert_close(out[6][:, :, 2:, :], torch.zeros_like(v_new))
 
 
 # ---------------------------------------------------------------------------
