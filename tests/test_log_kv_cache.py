@@ -220,7 +220,15 @@ class TestCompactTokens:
 
 class TestCompact:
     def test_merge_weighted_average(self):
-        """compact should produce weighted average of adjacent pairs."""
+        """compact should produce weighted average of adjacent pairs.
+
+        Pairing is over the CONCATENATED ``[k1; k2]`` sequence — (slot 2i,
+        slot 2i+1) -> slot i (see ``compact()``'s docstring), NOT
+        corresponding indices across k1/k2. With ``B_slots=4`` (even), every
+        pair here falls entirely within k1 or entirely within k2, so the two
+        blocks never actually mix: output slots 0-1 are k1's own two pairs,
+        slots 2-3 are k2's own two pairs.
+        """
         B_slots = 4
         B, G, D = 1, 1, 2
 
@@ -237,13 +245,24 @@ class TestCompact:
         assert k_out.shape == (B, G, B_slots, D)
         assert v_out.shape == (B, G, B_slots, D)
         assert w_out.shape == (B, G, B_slots)
-        # equal weights -> alpha=0.5 -> 0.5*1 + 0.5*3 = 2
-        torch.testing.assert_close(k_out, torch.full_like(k_out, 2.0))
-        torch.testing.assert_close(v_out, torch.full_like(v_out, 4.0))
+        # equal weights within each block -> alpha=0.5 -> each pair averages
+        # to its own block's (uniform) value: k1's pairs stay 1.0, k2's stay 3.0.
+        torch.testing.assert_close(
+            k_out, torch.tensor([[[[1.0, 1.0], [1.0, 1.0], [3.0, 3.0], [3.0, 3.0]]]])
+        )
+        torch.testing.assert_close(
+            v_out, torch.tensor([[[[2.0, 2.0], [2.0, 2.0], [6.0, 6.0], [6.0, 6.0]]]])
+        )
         torch.testing.assert_close(w_out, torch.full_like(w_out, 8.0))
 
     def test_merge_unequal_weights(self):
-        """compact with unequal weights should use alpha = wa/(wa+wb)."""
+        """compact with unequal weights should use alpha = wa/(wa+wb).
+
+        Pairing is over the CONCATENATED ``[k1; k2]`` sequence, so slot 0
+        merges k1's own two entries and slot 1 merges k2's own two entries
+        (see ``compact()``'s docstring) — k1 and k2 never mix here since
+        ``len(k1)`` is even.
+        """
         B, G, D = 1, 1, 1
 
         k1 = torch.tensor([[[[1.0], [5.0]]]])  # (1,1,2,1)
@@ -256,10 +275,10 @@ class TestCompact:
 
         k_out, v_out, w_out = LogStructuredKVCache.compact(k1, v1, w1, k2, v2, w2)
 
-        # pair 0: wa=1, wb=3, alpha=0.25 -> 0.25*1 + 0.75*3 = 2.5
-        torch.testing.assert_close(k_out[0, 0, 0, 0], torch.tensor(2.5))
-        # pair 1: wa=3, wb=1, alpha=0.75 -> 0.75*5 + 0.25*7 = 5.5
-        torch.testing.assert_close(k_out[0, 0, 1, 0], torch.tensor(5.5))
+        # slot 0 = merge(k1[0], k1[1]): wa=1, wb=3, alpha=0.25 -> 0.25*1 + 0.75*5 = 4.0
+        torch.testing.assert_close(k_out[0, 0, 0, 0], torch.tensor(4.0))
+        # slot 1 = merge(k2[0], k2[1]): wa=3, wb=1, alpha=0.75 -> 0.75*3 + 0.25*7 = 4.0
+        torch.testing.assert_close(k_out[0, 0, 1, 0], torch.tensor(4.0))
         torch.testing.assert_close(w_out, torch.tensor([[[4.0, 4.0]]]))
 
     def test_rank1_stats_merge_matches_direct_truncation(self):
