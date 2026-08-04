@@ -302,6 +302,7 @@ class LogKVLM(LM):
         log_kv_prefill_block: int = 256,
         log_kv_pin_size: int = 0,
         log_kv_pin_obs_window: int = 64,
+        log_kv_second_order_scale: float = 1.0,
         tokenizer_dir: str | None = None,
     ):
         super().__init__()
@@ -312,6 +313,7 @@ class LogKVLM(LM):
         self.log_kv_prefill_block = log_kv_prefill_block
         self.log_kv_pin_size = log_kv_pin_size
         self.log_kv_pin_obs_window = log_kv_pin_obs_window
+        self.log_kv_second_order_scale = float(log_kv_second_order_scale)
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = not dist.is_initialized() or dist.get_rank() == 0
@@ -398,6 +400,7 @@ class LogKVLM(LM):
             # 精确槽形态钉在层级之外，免于被 mean-pool 稀释。
             pin_size=self.log_kv_pin_size,
             pin_obs_window=self.log_kv_pin_obs_window,
+            second_order_scale=self.log_kv_second_order_scale,
         )
         self._eval_cache_ready = True
 
@@ -683,6 +686,10 @@ def main(
     # 精确 w=1 槽（层级照常池化，缓存轨迹不变）。0 = 关闭。捞针类任务的关键。
     log_kv_pin_size: int = 0,
     log_kv_pin_obs_window: int = 64,
+    # Must match the CPT target scale, not the warm-up intermediate value.
+    # 0.0 reproduces the first-order LogKV eval path; 1.0 enables full
+    # Sigma/Gamma second-order corrections.
+    log_kv_second_order_scale: float = 1.0,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -735,6 +742,7 @@ def main(
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
     log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
     log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
+    log_kv_second_order_scale = float(_o("log_kv_second_order_scale", log_kv_second_order_scale))
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
     limit = _o("limit", limit)
     log_kv_diag_mode = _o("log_kv_diag_mode", log_kv_diag_mode)
@@ -763,7 +771,11 @@ def main(
 
     if local_rank == 0:
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
-        print(f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} (obs {log_kv_pin_obs_window})")
+        print(
+            f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | "
+            f"prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} "
+            f"(obs {log_kv_pin_obs_window}) | second_order_scale: {log_kv_second_order_scale}"
+        )
         if diag_active:
             print(
                 f"🔬 诊断模式: {log_kv_diag_mode} | limit: {limit} | "
@@ -783,6 +795,7 @@ def main(
         log_kv_prefill_block=log_kv_prefill_block,
         log_kv_pin_size=log_kv_pin_size,
         log_kv_pin_obs_window=log_kv_pin_obs_window,
+        log_kv_second_order_scale=log_kv_second_order_scale,
         tokenizer_dir=tokenizer_dir,
     )
 

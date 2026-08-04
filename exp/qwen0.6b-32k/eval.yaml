@@ -6,9 +6,11 @@ benchmark: "boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,op
 output_path: ./ckpt/qwen0.6b-32k-cpt-base/evaluate
 
 # The checkpoint was adapted with logKV (cpt-base.yaml), and this pipeline only
-# evaluates the compressed-KV route. B/recent_size must match training.
+# evaluates the compressed-KV route. B/recent_size/second_order_scale must
+# match training.
 log_kv_B: 512
 log_kv_recent_size: 1024
+log_kv_second_order_scale: 1.0
 
 # 显著性钉扎（推理专用；与训练 YAML 保持一致即可对齐 majob/demo 两条入口）
 log_kv_pin_size: 256

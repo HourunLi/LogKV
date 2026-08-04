@@ -31,7 +31,7 @@ import lightning as L
 from datetime import datetime
 from litgpt import Config
 from litgpt.model import GPT
-from litgpt.utils import chunked_cross_entropy, load_checkpoint
+from litgpt.utils import chunked_cross_entropy, get_log_kv_second_order_scale, load_checkpoint
 import random
 import numpy as np
 from lightning.fabric.loggers import TensorBoardLogger
@@ -495,6 +495,12 @@ def main(
     # distant needle survives mean-pool dilution. 0 = off.
     log_kv_pin_size: int = 0,
     log_kv_pin_obs_window: int = 64,
+    # Coupled gate for score-side Sigma and value-side Gamma corrections. The
+    # CPT path warms this from 0 to the target value to avoid an immediate
+    # attention-distribution jump at step 0. Set
+    # log_kv_second_order_warmup_steps=0 to start at the target value.
+    log_kv_second_order_scale: float = 1.0,
+    log_kv_second_order_warmup_steps: int = 10,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -558,8 +564,19 @@ def main(
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
     log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
     log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
+    log_kv_second_order_scale = _o("log_kv_second_order_scale", log_kv_second_order_scale)
+    log_kv_second_order_warmup_steps = _o(
+        "log_kv_second_order_warmup_steps", log_kv_second_order_warmup_steps
+    )
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
+
+    log_kv_second_order_scale = float(log_kv_second_order_scale)
+    log_kv_second_order_warmup_steps = int(log_kv_second_order_warmup_steps)
+    # Validate early, before launching a long distributed job.
+    get_log_kv_second_order_scale(
+        0, log_kv_second_order_warmup_steps, log_kv_second_order_scale
+    )
 
     # Fail fast: run_eval="after"/"both" evaluates save_path, which is only
     # written when save_ckpt is true. Catch the contradiction here instead of
@@ -701,6 +718,7 @@ def main(
             log_kv_prefill_block=log_kv_prefill_block,
             log_kv_pin_size=log_kv_pin_size,
             log_kv_pin_obs_window=log_kv_pin_obs_window,
+            log_kv_second_order_scale=log_kv_second_order_scale,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -797,6 +815,14 @@ def main(
     fabric.print("Starting Continue Pretraining...")
     model.train()
 
+    loaded_global_step = state.get("global_step", 0) or 0
+    if isinstance(loaded_global_step, torch.Tensor):
+        loaded_global_step = loaded_global_step.item()
+    global_step = int(loaded_global_step)
+    initial_second_order_scale = get_log_kv_second_order_scale(
+        global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
+    )
+
     # Always simulate the logKV compressed-KV streaming attention during
     # training — this script only supports the logKV adaptation route.
     model.enable_log_kv_training(
@@ -809,11 +835,15 @@ def main(
         B=log_kv_B,
         recent_size=log_kv_recent_size,
         train_block=log_kv_train_block,
+        second_order_scale=initial_second_order_scale,
     )
     fabric.print(
         f"logKV training ENABLED: B={log_kv_B}, "
         f"recent_size={log_kv_recent_size}, "
         f"train_block={log_kv_train_block}, "
+        f"second_order_scale={initial_second_order_scale:.4f} "
+        f"(target={log_kv_second_order_scale:.4f}, "
+        f"warmup_steps={log_kv_second_order_warmup_steps}), "
         f"blocks/seq={math.ceil(context_length / max(log_kv_train_block, 1))}"
     )
 
@@ -821,10 +851,6 @@ def main(
     optimizer.zero_grad(set_to_none=True)
     step_start_time = datetime.now()
     step_stats = MicroStepMeanStats()
-    loaded_global_step = state.get("global_step", 0) or 0
-    if isinstance(loaded_global_step, torch.Tensor):
-        loaded_global_step = loaded_global_step.item()
-    global_step = int(loaded_global_step)
     if global_step > 0:
         fabric.print(f"Continuing from global_step={global_step}; target max_steps={max_steps}.")
     total_steps = max_steps
@@ -851,6 +877,10 @@ def main(
         targets = train_data[:, 1:context_length + 1].contiguous().long()
         is_accumulating = (micro_batch_idx + 1) % gradient_accumulation_steps != 0
         micro_batch_idx += 1
+        current_second_order_scale = get_log_kv_second_order_scale(
+            global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
+        )
+        model.set_log_kv_second_order_scale(current_second_order_scale)
 
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             # Routes through _log_kv_train_lowmem_forward (training_log_kv is on
@@ -888,11 +918,13 @@ def main(
                 f"[{now.strftime('%H:%M:%S')}] "
                 f"Epoch {data_epoch} | Step {global_step + 1} | "
                 f"{metrics_txt}"
+                f"2nd_scale: {current_second_order_scale:.4f} | "
                 f"Time: {step_time:.2f}s"
             )
             for name, val in avgs.items():
                 fabric.log(f"train/{name}", val, step=global_step + 1)
             fabric.log("train/learning_rate", current_lr, step=global_step + 1)
+            fabric.log("train/log_kv_second_order_scale", current_second_order_scale, step=global_step + 1)
 
             step_stats.reset()
             global_step += 1
