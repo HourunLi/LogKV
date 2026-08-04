@@ -82,6 +82,25 @@ Two more instruments beyond the mode grid, both opt-in via ``diag_mode(...)``:
     where the model must locate the needle) but a weak one for LongBench
     summarization prompts (no natural trailing "question" span) — see the
     research log for the decode-hook extension this would need to close.
+  * ``second_order_max_width``: D1 shows the persisted rank-1 Σ_s/Γ_s stats are
+    essentially exact at ``slot_width == 2`` (a 2-point covariance is exactly
+    rank 1) but degrade sharply and monotonically from ``width == 4`` upward,
+    as every ``compact()`` carry re-truncates an already-approximate summary
+    back to rank 1. ``second_order_scale`` is currently one coupled scalar
+    applied uniformly to every slot regardless of width. This instrument tests
+    the coarsest possible fix — a hard width cutoff — without touching
+    production or CPT training: slots with ``slot_width <= second_order_max_width``
+    keep the normal ``second_order_scale`` correction; wider slots get the
+    1st-order (mean/log-w, mean(v)) path instead, as if ``second_order_scale``
+    were 0 just for them. ``None`` (default) disables the cutoff (every slot
+    uses ``second_order_scale`` unconditionally, the old behavior). This does
+    NOT change what ``baseline`` returns/propagates — it only adds one more
+    grid corner, ``err_width_gated`` in ``by_layer_output``, computed on the
+    SAME hidden states as ``err_baseline`` and ``err_baseline_1st_order`` in
+    the same run, so the three are directly comparable with no cross-run
+    drift confound. A single sweep over this value therefore says how much of
+    the width≥4 D1 unreliability actually translates into output harm, before
+    committing to a finer per-layer/per-width gate or touching CPT.
 
 ``summary()`` reduces the accumulated stats to three tables, labeled with the
 mode they were collected under:
@@ -160,6 +179,10 @@ class DiagState:
         # D5 re-binning (see module docstring): restrict add_peak to the last N
         # tokens of the sequence. None = unfiltered (legacy).
         self.peak_window_from_end: int | None = None
+        # Width-gated 2nd-order ablation (see module docstring): slots with
+        # slot_width > this use the 1st-order path regardless of mode. None =
+        # no cutoff (legacy — every slot uses second_order_scale unconditionally).
+        self.second_order_max_width: int | None = None
         # Mode the accumulated stats were collected under. Unlike ``mode`` this is
         # NOT restored when a ``diag_mode`` context exits (mirroring the stats
         # themselves), so a ``summary()`` dump written after the ``with`` block —
@@ -257,6 +280,7 @@ class DiagState:
         err_s: float,
         err_v: float,
         err_gamma: float,
+        err_width_gated: float,
         ref: float,
         n_queries: int,
     ) -> None:
@@ -269,7 +293,7 @@ class DiagState:
         acc = self.out_stats.setdefault(
             int(layer), {
                 "base": 0.0, "base_1st": 0.0, "s": 0.0, "v": 0.0,
-                "gamma": 0.0, "ref": 0.0, "n": 0,
+                "gamma": 0.0, "width_gated": 0.0, "ref": 0.0, "n": 0,
             }
         )
         acc["base"] += err_base
@@ -277,6 +301,7 @@ class DiagState:
         acc["s"] += err_s
         acc["v"] += err_v
         acc["gamma"] += err_gamma
+        acc["width_gated"] += err_width_gated
         acc["ref"] += ref
         acc["n"] += n_queries
 
@@ -399,6 +424,7 @@ class DiagState:
                     "err_s_oracle": (acc["s"] / ref) ** 0.5,
                     "err_v_oracle": (acc["v"] / ref) ** 0.5,
                     "err_gamma_only": (acc.get("gamma", 0.0) / ref) ** 0.5,
+                    "err_width_gated": (acc.get("width_gated", 0.0) / ref) ** 0.5,
                     "n_queries": acc["n"],
                 }
             )
@@ -446,6 +472,7 @@ def diag_mode(
     reset: bool = True,
     exact_from_layer: int | None = None,
     peak_window_from_end: int | None = None,
+    second_order_max_width: int | None = None,
 ):
     """Temporarily switch the global diagnostic mode; restore on exit.
 
@@ -464,18 +491,24 @@ def diag_mode(
         peak_window_from_end: restrict D5 peakiness (``add_peak``) to query
             positions within the last N tokens of the sequence. ``None`` keeps
             the old unfiltered pooling.
+        second_order_max_width: width-gated 2nd-order ablation — slots with
+            ``slot_width > second_order_max_width`` use the 1st-order path
+            instead of ``second_order_scale``'s correction. ``None`` disables
+            the cutoff (every slot uses ``second_order_scale`` unconditionally,
+            the old behavior). Adds ``err_width_gated`` to ``by_layer_output``.
     """
     if mode not in _MODES:
         raise ValueError(f"unknown diag mode {mode!r}; expected one of {_MODES}")
     prev = (
         DIAG.mode, DIAG.q_chunk, DIAG.collect,
-        DIAG.exact_from_layer, DIAG.peak_window_from_end,
+        DIAG.exact_from_layer, DIAG.peak_window_from_end, DIAG.second_order_max_width,
     )
     if reset:
         DIAG.reset_stats()
     DIAG.mode, DIAG.q_chunk, DIAG.collect = mode, q_chunk, collect
     DIAG.exact_from_layer = exact_from_layer
     DIAG.peak_window_from_end = peak_window_from_end
+    DIAG.second_order_max_width = second_order_max_width
     if mode != "off":
         # Not restored on exit (mirrors the stats themselves): eval.py dumps
         # summary() after this context closes, and the label must name the mode
@@ -487,7 +520,7 @@ def diag_mode(
     finally:
         (
             DIAG.mode, DIAG.q_chunk, DIAG.collect,
-            DIAG.exact_from_layer, DIAG.peak_window_from_end,
+            DIAG.exact_from_layer, DIAG.peak_window_from_end, DIAG.second_order_max_width,
         ) = prev
 
 
@@ -723,13 +756,24 @@ def _diag_slot_core(
         l_ex_parts: list[torch.Tensor | None] = []
         l_ap_parts: list[torch.Tensor | None] = []
         l_prod_parts: list[torch.Tensor | None] = []
+        l_width_gated_parts: list[torch.Tensor | None] = []  # per-run width-gated score
         w_keep: list[torch.Tensor | None] = []        # per-run within-slot softmax(z)
         v_keep: list[torch.Tensor | None] = []         # per-run token values
         v_gamma_keep: list[torch.Tensor | None] = []   # per-run mean(v)+scale·Γ_s·q
         v_prod_keep: list[torch.Tensor | None] = []    # per-run persisted-Gamma read-out
+        v_width_gated_keep: list[torch.Tensor | None] = []  # per-run width-gated read-out
         keep_tokens = v_exact or v_gamma or collect     # exact-V / gamma-V need raw v
         tok = 0
         for soff, n, width in runs:
+            # D1-motivated ablation (see module docstring): slots wider than
+            # DIAG.second_order_max_width fall back to the 1st-order path,
+            # regardless of second_order_scale. None => no cutoff, eff_scale ==
+            # second_order_scale everywhere, so err_width_gated == err_baseline.
+            eff_scale = (
+                second_order_scale
+                if (DIAG.second_order_max_width is None or width <= DIAG.second_order_max_width)
+                else 0.0
+            )
             kr = kp[:, :, tok:tok + n * width, :].reshape(B, G, n, width, D)
             # z is the per-token score; every reachable mode needs it (exact-L
             # logsumexp, exact-V within-softmax, Γ_s, or stats), so unconditional.
@@ -757,8 +801,14 @@ def _diag_slot_core(
                     if use_rank1_stats
                     else l_approx_run
                 )
+                l_width_gated_parts.append(
+                    l_approx_run + eff_scale * score2_persist
+                    if eff_scale != 0.0
+                    else l_approx_run
+                )
             else:
                 l_prod_parts.append(l_approx_run)
+                l_width_gated_parts.append(l_approx_run)
 
             within = torch.softmax(z, dim=-1) if keep_tokens else None
             vr = (
@@ -802,9 +852,15 @@ def _diag_slot_core(
                     if use_rank1_stats
                     else svr_g[:, :, None, None, :, :]
                 )
+                v_width_gated_keep.append(
+                    svr_g[:, :, None, None, :, :] + eff_scale * corr_persist
+                    if eff_scale != 0.0
+                    else svr_g[:, :, None, None, :, :]
+                )
             else:
                 gamma_q_persist = corr_persist = None
                 v_prod_keep.append(None)
+                v_width_gated_keep.append(None)
 
             if collect:
                 qk_centered = torch.einsum("bgrtd,bgnwd->bgrtnw", qg, k_c)
@@ -881,6 +937,12 @@ def _diag_slot_core(
                     o = o + torch.einsum(
                         "bgrts,bgrtsc->bgrtc", p_prefix[..., soff:soff + n], vg
                     )
+            elif v_source == "persisted_gated":
+                o = qg.new_zeros(B, G, rf, t_c, Dv)
+                for (soff, n, _width), vg in zip(runs, v_width_gated_keep):
+                    o = o + torch.einsum(
+                        "bgrts,bgrtsc->bgrtc", p_prefix[..., soff:soff + n], vg
+                    )
             else:
                 o = torch.einsum("bgrts,bgsc->bgrtc", p_prefix, svf)  # p·mean(v) == p·slot_v
             return o + torch.einsum("bgrts,bgsc->bgrtc", p_tail, vt)
@@ -894,6 +956,9 @@ def _diag_slot_core(
             out_s_c = _mix(l_ex_parts, "mean")
             out_v_c = _mix(l_ap_parts, "exact")
             out_gamma_c = _mix(l_ex_parts, "gamma")
+            out_width_gated_c = (
+                _mix(l_width_gated_parts, "persisted_gated") if use_rank1_stats else out_base_1st_c
+            )
             DIAG.add_out_stats(
                 layer,
                 (out_base_c - out_exact_c).square().sum().item(),
@@ -901,6 +966,7 @@ def _diag_slot_core(
                 (out_s_c - out_exact_c).square().sum().item(),
                 (out_v_c - out_exact_c).square().sum().item(),
                 (out_gamma_c - out_exact_c).square().sum().item(),
+                (out_width_gated_c - out_exact_c).square().sum().item(),
                 out_exact_c.square().sum().item(),
                 B * nh * t_c,
             )
