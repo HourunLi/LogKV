@@ -717,6 +717,11 @@ def main(
     # 和 err_baseline/err_baseline_1st_order 在同一次前向、同一组隐状态上
     # 直接可比。典型 sweep：{2, 4, 8, 16, None}。
     log_kv_diag_second_order_max_width: int | None = None,
+    # ── layer 门控消融（同上；两者是 AND 关系，可单独用也可联合用）── 层号 >
+    # 此值的层强制走 1 阶路径，不管 second_order_scale；None = 不启用（默认）。
+    # 典型 sweep：{7, 14, 21, 27, None}（配合已有的 exact_from_layer 分层消融
+    # 结果来选阈值）。
+    log_kv_diag_second_order_max_layer: int | None = None,
     # ── 🧩 logKV：YAML config ──
     config: str | None = None,
 ):
@@ -761,6 +766,9 @@ def main(
     log_kv_diag_second_order_max_width = _o(
         "log_kv_diag_second_order_max_width", log_kv_diag_second_order_max_width
     )
+    log_kv_diag_second_order_max_layer = _o(
+        "log_kv_diag_second_order_max_layer", log_kv_diag_second_order_max_layer
+    )
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -792,6 +800,7 @@ def main(
                 f"exact_from_layer: {log_kv_diag_exact_from_layer} | "
                 f"peak_window_from_end: {log_kv_diag_peak_window_from_end} | "
                 f"second_order_max_width: {log_kv_diag_second_order_max_width} | "
+                f"second_order_max_layer: {log_kv_diag_second_order_max_layer} | "
                 "每 rank 各自累积统计量，不跨 rank 聚合"
             )
 
@@ -815,6 +824,7 @@ def main(
         exact_from_layer=log_kv_diag_exact_from_layer,
         peak_window_from_end=log_kv_diag_peak_window_from_end,
         second_order_max_width=log_kv_diag_second_order_max_width,
+        second_order_max_layer=log_kv_diag_second_order_max_layer,
     ) if diag_active else contextlib.nullcontext():
         results = evaluator.simple_evaluate(
             model=lm_model,
@@ -844,6 +854,8 @@ def main(
                 tag += f"_pw{log_kv_diag_peak_window_from_end}"
             if log_kv_diag_second_order_max_width is not None:
                 tag += f"_w{log_kv_diag_second_order_max_width}"
+            if log_kv_diag_second_order_max_layer is not None:
+                tag += f"_l{log_kv_diag_second_order_max_layer}"
             diag_file = diag_dir / f"diag_{tag}_{benchmark.replace(',', '+')}_{ts}.json"
             with open(diag_file, "w", encoding="utf-8") as f:
                 json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)

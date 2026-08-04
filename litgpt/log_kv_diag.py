@@ -82,25 +82,36 @@ Two more instruments beyond the mode grid, both opt-in via ``diag_mode(...)``:
     where the model must locate the needle) but a weak one for LongBench
     summarization prompts (no natural trailing "question" span) — see the
     research log for the decode-hook extension this would need to close.
-  * ``second_order_max_width``: D1 shows the persisted rank-1 Σ_s/Γ_s stats are
-    essentially exact at ``slot_width == 2`` (a 2-point covariance is exactly
-    rank 1) but degrade sharply and monotonically from ``width == 4`` upward,
-    as every ``compact()`` carry re-truncates an already-approximate summary
-    back to rank 1. ``second_order_scale`` is currently one coupled scalar
-    applied uniformly to every slot regardless of width. This instrument tests
-    the coarsest possible fix — a hard width cutoff — without touching
-    production or CPT training: slots with ``slot_width <= second_order_max_width``
-    keep the normal ``second_order_scale`` correction; wider slots get the
-    1st-order (mean/log-w, mean(v)) path instead, as if ``second_order_scale``
-    were 0 just for them. ``None`` (default) disables the cutoff (every slot
-    uses ``second_order_scale`` unconditionally, the old behavior). This does
-    NOT change what ``baseline`` returns/propagates — it only adds one more
-    grid corner, ``err_width_gated`` in ``by_layer_output``, computed on the
-    SAME hidden states as ``err_baseline`` and ``err_baseline_1st_order`` in
-    the same run, so the three are directly comparable with no cross-run
-    drift confound. A single sweep over this value therefore says how much of
-    the width≥4 D1 unreliability actually translates into output harm, before
-    committing to a finer per-layer/per-width gate or touching CPT.
+  * ``second_order_max_width`` / ``second_order_max_layer``: D1 shows the
+    persisted rank-1 Σ_s/Γ_s stats are essentially exact at ``slot_width == 2``
+    (a 2-point covariance is exactly rank 1) but degrade sharply and
+    monotonically from ``width == 4`` upward, as every ``compact()`` carry
+    re-truncates an already-approximate summary back to rank 1. Separately,
+    the layer-ablation D2 sweep shows the model's SENSITIVITY to any given
+    error is itself layer-dependent (e.g. LongBench's baseline-vs-1st-order
+    ROI flips from favorable to net-harmful specifically in the tail layers) —
+    and this is NOT explained by width alone, since every layer sees the same
+    slot_width distribution for a given sequence (each layer's LogKV cache is
+    an independent Fenwick hierarchy over the same token positions). So width
+    unreliability and layer sensitivity are two distinct, independently-acting
+    axes. ``second_order_scale`` is currently one coupled scalar applied
+    uniformly to every slot regardless of either. These two instruments test
+    the coarsest possible fix on each axis — hard cutoffs — without touching
+    production or CPT training: a slot keeps the normal ``second_order_scale``
+    correction only if BOTH ``slot_width <= second_order_max_width`` AND
+    ``layer <= second_order_max_layer``; failing either falls back to the
+    1st-order (mean/log-w, mean(v)) path, as if ``second_order_scale`` were 0
+    just for that slot. Each defaults to ``None`` (no cutoff on that axis);
+    setting only one tests that axis alone, setting both tests the joint
+    (AND) gate. Neither changes what ``baseline`` returns/propagates — they
+    only add one more grid corner, ``err_width_gated`` in ``by_layer_output``,
+    computed on the SAME hidden states as ``err_baseline`` and
+    ``err_baseline_1st_order`` in the same run (the name is kept from the
+    width-only instrument for continuity with already-collected width-sweep
+    dumps; it now reflects whichever cutoff(s) are active). A sweep over
+    these — width alone, layer alone, then jointly once both show independent
+    effect — says how much of the D1/D2 unreliability actually translates
+    into output harm, before committing to a finer gate or touching CPT.
 
 ``summary()`` reduces the accumulated stats to three tables, labeled with the
 mode they were collected under:
@@ -183,6 +194,10 @@ class DiagState:
         # slot_width > this use the 1st-order path regardless of mode. None =
         # no cutoff (legacy — every slot uses second_order_scale unconditionally).
         self.second_order_max_width: int | None = None
+        # Layer-gated 2nd-order ablation (see module docstring): layers >
+        # this use the 1st-order path regardless of mode, ANDed with the
+        # width cutoff above. None = no cutoff on this axis.
+        self.second_order_max_layer: int | None = None
         # Mode the accumulated stats were collected under. Unlike ``mode`` this is
         # NOT restored when a ``diag_mode`` context exits (mirroring the stats
         # themselves), so a ``summary()`` dump written after the ``with`` block —
@@ -473,6 +488,7 @@ def diag_mode(
     exact_from_layer: int | None = None,
     peak_window_from_end: int | None = None,
     second_order_max_width: int | None = None,
+    second_order_max_layer: int | None = None,
 ):
     """Temporarily switch the global diagnostic mode; restore on exit.
 
@@ -494,14 +510,20 @@ def diag_mode(
         second_order_max_width: width-gated 2nd-order ablation — slots with
             ``slot_width > second_order_max_width`` use the 1st-order path
             instead of ``second_order_scale``'s correction. ``None`` disables
-            the cutoff (every slot uses ``second_order_scale`` unconditionally,
-            the old behavior). Adds ``err_width_gated`` to ``by_layer_output``.
+            the cutoff on this axis (the old behavior).
+        second_order_max_layer: layer-gated 2nd-order ablation — layers
+            ``> second_order_max_layer`` use the 1st-order path instead of
+            ``second_order_scale``'s correction. ANDed with
+            ``second_order_max_width`` when both are set. ``None`` disables
+            the cutoff on this axis. Either/both add ``err_width_gated`` to
+            ``by_layer_output``.
     """
     if mode not in _MODES:
         raise ValueError(f"unknown diag mode {mode!r}; expected one of {_MODES}")
     prev = (
         DIAG.mode, DIAG.q_chunk, DIAG.collect,
-        DIAG.exact_from_layer, DIAG.peak_window_from_end, DIAG.second_order_max_width,
+        DIAG.exact_from_layer, DIAG.peak_window_from_end,
+        DIAG.second_order_max_width, DIAG.second_order_max_layer,
     )
     if reset:
         DIAG.reset_stats()
@@ -509,6 +531,7 @@ def diag_mode(
     DIAG.exact_from_layer = exact_from_layer
     DIAG.peak_window_from_end = peak_window_from_end
     DIAG.second_order_max_width = second_order_max_width
+    DIAG.second_order_max_layer = second_order_max_layer
     if mode != "off":
         # Not restored on exit (mirrors the stats themselves): eval.py dumps
         # summary() after this context closes, and the label must name the mode
@@ -520,7 +543,8 @@ def diag_mode(
     finally:
         (
             DIAG.mode, DIAG.q_chunk, DIAG.collect,
-            DIAG.exact_from_layer, DIAG.peak_window_from_end, DIAG.second_order_max_width,
+            DIAG.exact_from_layer, DIAG.peak_window_from_end,
+            DIAG.second_order_max_width, DIAG.second_order_max_layer,
         ) = prev
 
 
@@ -726,6 +750,9 @@ def _diag_slot_core(
     if has_rank1_stats and any(x is None for x in (slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma)):
         raise ValueError("_diag_slot_core() requires either all rank-1 stats or none")
     use_rank1_stats = has_rank1_stats and second_order_scale != 0.0
+    # Layer half of the joint width x layer gate (see module docstring); the
+    # width half is checked per-run below since it varies within one call.
+    layer_ok = DIAG.second_order_max_layer is None or layer <= DIAG.second_order_max_layer
 
     qf = q.float()
     kp = k_prefix.float()
@@ -765,15 +792,13 @@ def _diag_slot_core(
         keep_tokens = v_exact or v_gamma or collect     # exact-V / gamma-V need raw v
         tok = 0
         for soff, n, width in runs:
-            # D1-motivated ablation (see module docstring): slots wider than
-            # DIAG.second_order_max_width fall back to the 1st-order path,
-            # regardless of second_order_scale. None => no cutoff, eff_scale ==
-            # second_order_scale everywhere, so err_width_gated == err_baseline.
-            eff_scale = (
-                second_order_scale
-                if (DIAG.second_order_max_width is None or width <= DIAG.second_order_max_width)
-                else 0.0
-            )
+            # D1/D2-motivated joint ablation (see module docstring): a slot
+            # keeps second_order_scale only if BOTH its width and this call's
+            # layer pass their respective cutoffs; either None => that axis
+            # imposes no cutoff, so with both None eff_scale ==
+            # second_order_scale everywhere and err_width_gated == err_baseline.
+            width_ok = DIAG.second_order_max_width is None or width <= DIAG.second_order_max_width
+            eff_scale = second_order_scale if (layer_ok and width_ok) else 0.0
             kr = kp[:, :, tok:tok + n * width, :].reshape(B, G, n, width, D)
             # z is the per-token score; every reachable mode needs it (exact-L
             # logsumexp, exact-V within-softmax, Γ_s, or stats), so unconditional.
