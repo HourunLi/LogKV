@@ -54,6 +54,7 @@ output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-
 # ── logKV（须与训练 YAML 中的取值一致，pin 除外）──
 log_kv_B: 512
 log_kv_recent_size: 1024
+log_kv_second_order_scale: 1.0
 log_kv_prefill_block: 1024
 # 诊断的硬约束：槽→token 映射假定槽连续覆盖精确前缀，钉扎会打破这一点
 # （见 log_kv_diag.slot_runs 的文档）。eval.py 的 main() 会在 pin_size != 0

@@ -39,6 +39,7 @@ output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-
 # 必须与训练 YAML（base.yaml）中的取值一致：
 log_kv_B: 512
 log_kv_recent_size: 1024
+log_kv_second_order_scale: 1.0
 # prefill 分块大小（推理专用，不影响训练语义对齐的缓存状态）：
 # 2 = 严格 2-token 流式语义（慢，用于 A/B 验证）；越大越快，
 # 偏差上界 = 块内 query 比严格流式多看到 < block 个未压缩 token。

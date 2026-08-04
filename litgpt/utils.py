@@ -79,6 +79,26 @@ def num_parameters(module: nn.Module, requires_grad: bool | None = None) -> int:
     return total
 
 
+def get_log_kv_second_order_scale(current_step: int, warmup_steps: int, target_scale: float = 1.0) -> float:
+    """Linear gate for LogKV second-order corrections.
+
+    ``current_step`` is the number of completed optimizer steps. The first
+    training forward at step 0 therefore runs first-order LogKV
+    (``second_order_scale == 0``), then linearly reaches ``target_scale`` after
+    ``warmup_steps`` optimizer steps.
+    """
+    warmup_steps = int(warmup_steps)
+    target_scale = float(target_scale)
+    if warmup_steps < 0:
+        raise ValueError(f"warmup_steps must be non-negative, got {warmup_steps}")
+    if target_scale < 0.0 or not math.isfinite(target_scale):
+        raise ValueError(f"target_scale must be a finite non-negative value, got {target_scale}")
+    if warmup_steps == 0:
+        return target_scale
+    current_step = max(0, int(current_step))
+    return target_scale * min(current_step / warmup_steps, 1.0)
+
+
 def reset_parameters(module: nn.Module) -> None:
     """Calls `reset_parameters` on the module and all its submodules."""
     for mod in module.modules():

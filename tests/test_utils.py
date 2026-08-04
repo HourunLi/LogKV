@@ -40,6 +40,7 @@ from litgpt.utils import (
     extend_checkpoint_dir,
     find_resume_path,
     fix_and_load_json,
+    get_log_kv_second_order_scale,
     incremental_save,
     init_out_dir,
     instantiate_bnb_optimizer,
@@ -48,6 +49,26 @@ from litgpt.utils import (
     parse_devices,
     select_sft_generate_example,
 )
+
+
+def test_get_log_kv_second_order_scale_warms_from_zero():
+    scales = [get_log_kv_second_order_scale(step, warmup_steps=4) for step in range(6)]
+
+    assert scales == [0.0, 0.25, 0.5, 0.75, 1.0, 1.0]
+
+
+def test_get_log_kv_second_order_scale_supports_target_and_no_warmup():
+    assert get_log_kv_second_order_scale(0, warmup_steps=0, target_scale=0.5) == 0.5
+    assert get_log_kv_second_order_scale(3, warmup_steps=4, target_scale=0.5) == 0.375
+
+
+@pytest.mark.parametrize(
+    ("warmup_steps", "target_scale"),
+    [(-1, 1.0), (1, -0.1), (1, float("inf"))],
+)
+def test_get_log_kv_second_order_scale_rejects_invalid_values(warmup_steps, target_scale):
+    with pytest.raises(ValueError):
+        get_log_kv_second_order_scale(0, warmup_steps=warmup_steps, target_scale=target_scale)
 
 
 # match fails on windows. why did they have to use backslashes?
