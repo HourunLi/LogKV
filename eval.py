@@ -710,6 +710,13 @@ def main(
     # ── D5 重分箱：peakiness 只统计序列最后这么多个 token 的 query ──
     # （question/生成阶段紧邻的 prefill 尾部），None = 不过滤（默认，旧行为）。
     log_kv_diag_peak_window_from_end: int | None = None,
+    # ── width 门控消融（D1 显示 rank-1 统计量在 slot_width>=4 起明显失真；
+    # 见 log_kv_diag）── slot_width > 此值的槽位强制走 1 阶路径，不管
+    # second_order_scale；None = 不启用（默认）。不改变 baseline 实际输出/
+    # 传播的隐状态,只在 by_layer_output 里新增一个 err_width_gated 语料,
+    # 和 err_baseline/err_baseline_1st_order 在同一次前向、同一组隐状态上
+    # 直接可比。典型 sweep：{2, 4, 8, 16, None}。
+    log_kv_diag_second_order_max_width: int | None = None,
     # ── 🧩 logKV：YAML config ──
     config: str | None = None,
 ):
@@ -751,6 +758,9 @@ def main(
     log_kv_diag_peak_window_from_end = _o(
         "log_kv_diag_peak_window_from_end", log_kv_diag_peak_window_from_end
     )
+    log_kv_diag_second_order_max_width = _o(
+        "log_kv_diag_second_order_max_width", log_kv_diag_second_order_max_width
+    )
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -781,6 +791,7 @@ def main(
                 f"🔬 诊断模式: {log_kv_diag_mode} | limit: {limit} | "
                 f"exact_from_layer: {log_kv_diag_exact_from_layer} | "
                 f"peak_window_from_end: {log_kv_diag_peak_window_from_end} | "
+                f"second_order_max_width: {log_kv_diag_second_order_max_width} | "
                 "每 rank 各自累积统计量，不跨 rank 聚合"
             )
 
@@ -803,6 +814,7 @@ def main(
         log_kv_diag_mode,
         exact_from_layer=log_kv_diag_exact_from_layer,
         peak_window_from_end=log_kv_diag_peak_window_from_end,
+        second_order_max_width=log_kv_diag_second_order_max_width,
     ) if diag_active else contextlib.nullcontext():
         results = evaluator.simple_evaluate(
             model=lm_model,
@@ -830,6 +842,8 @@ def main(
                 tag += f"_efl{log_kv_diag_exact_from_layer}"
             if log_kv_diag_peak_window_from_end is not None:
                 tag += f"_pw{log_kv_diag_peak_window_from_end}"
+            if log_kv_diag_second_order_max_width is not None:
+                tag += f"_w{log_kv_diag_second_order_max_width}"
             diag_file = diag_dir / f"diag_{tag}_{benchmark.replace(',', '+')}_{ts}.json"
             with open(diag_file, "w", encoding="utf-8") as f:
                 json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)
