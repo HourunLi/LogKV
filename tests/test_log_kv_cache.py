@@ -1529,12 +1529,28 @@ class TestSecondOrderGate:
             assert torch.isfinite(g).all(), f"non-finite gradient at {name}"
             assert g.abs().sum() > 0, f"gradient at {name} is all zero"
 
-    def test_function_owns_the_flag_across_forward_and_backward(self):
-        """``cache.second_order`` decides whether add_recent() builds the
-        statistics, so if the streaming Function read it from ambient state the
-        backward replay could rebuild a different cache than the one forward
-        attended over — gradients for a function that was never evaluated.
-        Flipping it between the passes must therefore change nothing."""
+    def test_flag_guard_blocks_the_external_tamper(self):
+        """The original coupling repro flipped ``cache.second_order`` on a cache
+        already holding compacted entries between forward and backward. The
+        guarded property must refuse that outright rather than let it corrupt
+        the next carry — this is the public-API half of the fix."""
+        T = 33
+        a = self._make_attention(1.0)
+        q, k, v = self._inputs(T, seed=7)
+        a._log_kv_train_lowmem_forward(q, k, v, B=1, T=T)
+        assert any(c > 0 for c in a.kv_cache._counts), "need a non-empty level for this test to mean anything"
+        with pytest.raises(RuntimeError, match="cannot change `second_order`"):
+            a.kv_cache.second_order = False
+        # Refused, not partially applied.
+        assert a.kv_cache.second_order is True
+
+    def test_function_ignores_a_bypassed_flag_between_forward_and_backward(self):
+        """Belt and suspenders: even if something reaches past the property
+        guard by writing the private backing field directly, the streaming
+        Function must still re-derive the flag itself before replaying rather
+        than trusting whatever the cache carries — this is what makes the
+        guard a hardening, not the only thing standing between here and the
+        original 81%-gradient-error repro."""
         T = 33
         torch.manual_seed(99)
 
@@ -1543,7 +1559,7 @@ class TestSecondOrderGate:
             q, k, v = self._inputs(T, seed=7)
             y = a._log_kv_train_lowmem_forward(q, k, v, B=1, T=T)
             if tamper:
-                a.kv_cache.second_order = False
+                a.kv_cache._second_order = False  # bypasses the guard on purpose
             torch.manual_seed(99)
             (y * torch.randn_like(y)).sum().backward()
             return y, (q.grad, k.grad, v.grad)
@@ -1552,7 +1568,7 @@ class TestSecondOrderGate:
         y_tampered, g_tampered = run(tamper=True)
         assert torch.equal(y_clean, y_tampered)
         for name, a_, b_ in zip("qkv", g_clean, g_tampered):
-            assert torch.equal(a_, b_), f"d{name} drifted when the flag was flipped mid-pass"
+            assert torch.equal(a_, b_), f"d{name} drifted despite the Function owning the flag"
 
     def test_function_ignores_a_stale_flag_from_the_caller(self):
         """A caller that never set the flag (or left it from another layer at a
@@ -1579,6 +1595,50 @@ class TestSecondOrderGate:
         assert cache._counts == cache.level_count.tolist()
         cache.reset_parameters()
         assert cache._counts == cache.level_count.tolist() == [0] * cache.max_levels
+
+    def _built_cache(self, second_order=True):
+        c = LogStructuredKVCache(
+            (1, 2, 128, 8), (1, 2, 128, 8), B=4, recent_size=4, dtype=torch.float32
+        )
+        c.second_order = second_order
+        return c
+
+    def test_guard_permits_same_value_writes_on_a_live_cache(self):
+        c = self._built_cache(second_order=True)
+        for _ in range(8):
+            c.add_recent(torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8))
+        assert any(c._counts) or c.recent_count > 0
+        c.second_order = True  # no-op: same value, must never raise regardless of cache state
+        assert c.second_order is True
+
+    def test_guard_permits_a_change_before_any_level_is_populated(self):
+        """Only compacted LEVEL entries are at risk — a cache holding tokens
+        purely in the recent window (no compaction has fired yet) has no
+        stats regime to straddle, so switching must still be allowed."""
+        c = self._built_cache(second_order=True)
+        c.add_recent(torch.randn(1, 2, 2, 8), torch.randn(1, 2, 2, 8))
+        assert not any(c._counts), "test setup needs recent-only state, no compacted levels"
+        c.second_order = False  # must not raise
+        assert c.second_order is False
+
+    def test_guard_blocks_both_directions_on_a_populated_level(self):
+        for start in (True, False):
+            c = self._built_cache(second_order=start)
+            for _ in range(8):  # enough to fill level 0 (B=4) at least once
+                c.add_recent(torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8))
+            assert any(c._counts), "test setup needs a populated level"
+            with pytest.raises(RuntimeError, match="cannot change `second_order`"):
+                c.second_order = not start
+
+    def test_guard_releases_after_reset(self):
+        c = self._built_cache(second_order=True)
+        for _ in range(8):
+            c.add_recent(torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8))
+        with pytest.raises(RuntimeError):
+            c.second_order = False
+        c.reset_parameters()
+        c.second_order = False  # allowed again: nothing left to straddle
+        assert c.second_order is False
 
 
 # ---------------------------------------------------------------------------

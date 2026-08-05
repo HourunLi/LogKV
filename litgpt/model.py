@@ -975,10 +975,17 @@ class CausalSelfAttention(nn.Module):
         # (Qwen3 default 1.0) runs correctly: distant compact slots just fade
         # toward pure mass-bias contributions.
         cache = self.kv_cache
-        cache.second_order = self.log_kv_second_order_scale != 0.0
         if reset_cache:
             cache.reset_parameters()
             self._log_kv_pending = None
+        # AFTER any reset above: this is also the real decode path
+        # (reset_cache=False, same cache reused across every generated token),
+        # where the guarded setter raises if the scale changed since the last
+        # call on a cache that already holds compacted levels — the caller
+        # must reset_parameters() to switch second-order regimes on a live
+        # cache. Setting it before the reset would let a genuine change slip
+        # through unexamined here but corrupt compaction on the very next carry.
+        cache.second_order = self.log_kv_second_order_scale != 0.0
 
         # Reconcile cache buffer dtype with the activations before any read/write.
         # Inference builds the cache via set_log_kv_cache(), which may allocate
