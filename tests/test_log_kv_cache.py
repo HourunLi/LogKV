@@ -7,7 +7,10 @@ import torch
 
 from litgpt.config import Config
 from litgpt.log_kv_cache import (
+    LogKVStreamTrainingAttention,
     LogStructuredKVCache,
+    _rank1_cross_from_factors,
+    _rank1_psd_from_factors,
     append_exact_tokens,
     log_kv_chunk_attention,
     log_kv_slot_attention,
@@ -1289,6 +1292,140 @@ class TestLowMemTrainingEquivalence:
 
 
 # ---------------------------------------------------------------------------
+# Rank-1 truncation quality vs the exact eigh/QR/SVD it replaced
+# ---------------------------------------------------------------------------
+
+class TestRank1Approximation:
+    """``_rank1_psd_from_factors`` / ``_rank1_cross_from_factors`` find their
+    direction by iteration, not by solving, so they are near-optimal rather than
+    optimal. That approximation feeds the Sigma/Gamma corrections and therefore
+    the training objective whenever the second-order gate is open, so the error
+    is pinned here against the exact decompositions it replaced — otherwise a
+    drift in truncation quality is indistinguishable from a modelling problem.
+
+    The metric is the RECONSTRUCTION error, not agreement of the directions:
+    inside a degenerate eigenspace the direction is arbitrary and two equally
+    optimal answers can be far apart, while the rank-1 approximation they induce
+    is equally good. What must not regress is how well ``gamma * u v^T``
+    reproduces the matrix being truncated.
+    """
+
+    # Budget for how much worse than the exact decomposition the truncation may
+    # be, NOT a pin on the iteration count. Worst observed across these cases and
+    # a dozen seeds is ~3.8e-4 (psd) / ~2e-4 (cross), so this leaves ~5x
+    # headroom while still failing if _RANK1_SQUARINGS drops to 5 or below, or
+    # if the reduction to the r x r core is wrong. Tighten rather than loosen.
+    MAX_EXCESS_PSD = 2e-3
+    MAX_EXCESS_CROSS = 2e-3
+
+    N, D = 1024, 64
+
+    @staticmethod
+    def _exact_psd(factors):
+        """The eigh path this replaced: exact top-eigen truncation."""
+        ff = factors.float()
+        gram = torch.matmul(ff, ff.mT)
+        eigvals, eigvecs = torch.linalg.eigh(gram)
+        top = eigvals[..., -1].clamp_min(0.0)
+        coeff = eigvecs[..., -1]
+        d = torch.matmul(coeff.unsqueeze(-2), ff).squeeze(-2)
+        d = d / top.sqrt().clamp_min(1e-12).unsqueeze(-1)
+        d = torch.where(top.unsqueeze(-1) > 1e-12, d, torch.zeros_like(d))
+        return d, top
+
+    @staticmethod
+    def _exact_cross(lf, rf):
+        """The QR+SVD path this replaced: exact top-singular truncation."""
+        left, right = lf.float().mT, rf.float().mT
+        q_l, r_l = torch.linalg.qr(left, mode="reduced")
+        q_r, r_r = torch.linalg.qr(right, mode="reduced")
+        u_c, s, vh_c = torch.linalg.svd(torch.matmul(r_l, r_r.mT), full_matrices=False)
+        gamma = s[..., 0]
+        lu = torch.matmul(q_l, u_c[..., :, :1]).squeeze(-1)
+        ru = torch.matmul(q_r, vh_c.mT[..., :, :1]).squeeze(-1)
+        keep = gamma.unsqueeze(-1) > 1e-12
+        return torch.where(keep, lu, torch.zeros_like(lu)), torch.where(keep, ru, torch.zeros_like(ru)), gamma
+
+    @staticmethod
+    def _rel_err(M, gamma, u, v):
+        approx = gamma[..., None, None] * u.unsqueeze(-1) * v.unsqueeze(-2)
+        return (M - approx).flatten(-2).norm(dim=-1) / M.flatten(-2).norm(dim=-1).clamp_min(1e-30)
+
+    def _factors(self, case, r):
+        """Cases chosen to stress iteration: a degenerate top pair is the slowest
+        to separate, and rank-deficient / vanishing input exercises the guards."""
+        torch.manual_seed(1000 + r)
+        g = torch.randn(self.N, r, self.D)
+        if case == "generic":
+            return g
+        if case == "one_dominant":
+            return g * torch.logspace(2, -2, r)[:, None]
+        if case == "near_degenerate":
+            return torch.nn.functional.normalize(g, dim=-1)
+        if case == "rank_deficient":
+            return torch.stack([g[:, 0, :]] * (r - 1) + [g[:, r - 1, :]], 1)
+        if case == "tiny":
+            return g * 1e-8
+        if case == "zeros":
+            return torch.zeros(self.N, r, self.D)
+        raise AssertionError(case)
+
+    CASES = ["generic", "one_dominant", "near_degenerate", "rank_deficient", "tiny", "zeros"]
+
+    @pytest.mark.parametrize("r", [2, 3])
+    @pytest.mark.parametrize("case", CASES)
+    def test_psd_reconstruction_matches_exact_eigh(self, case, r):
+        F = self._factors(case, r)
+        M = torch.matmul(F.float().mT, F.float())
+
+        u, top = _rank1_psd_from_factors(F)
+        u_ex, top_ex = self._exact_psd(F)
+
+        assert torch.isfinite(u).all() and torch.isfinite(top).all()
+        assert (top >= 0).all(), "a top eigenvalue of a PSD matrix cannot be negative"
+        # Direction is a unit vector, or exactly zero where the input vanished.
+        norms = u.float().norm(dim=-1)
+        assert torch.all(((norms - 1.0).abs() < 1e-4) | (norms == 0)), norms
+
+        excess = (self._rel_err(M, top.float(), u.float(), u.float())
+                  - self._rel_err(M, top_ex, u_ex, u_ex)).max().item()
+        assert excess < self.MAX_EXCESS_PSD, (
+            f"{case} r={r}: rank-1 reconstruction is {excess:.3e} worse than exact eigh"
+        )
+
+    @pytest.mark.parametrize("r", [2, 3])
+    @pytest.mark.parametrize("case", CASES)
+    def test_cross_reconstruction_matches_exact_svd(self, case, r):
+        R = self._factors(case, r)
+        L = self._factors(case, r) if case in ("zeros", "tiny") else torch.randn(self.N, r, self.D)
+        M = torch.matmul(L.float().mT, R.float())
+
+        lu, ru, gamma = _rank1_cross_from_factors(L, R)
+        lu_ex, ru_ex, gamma_ex = self._exact_cross(L, R)
+
+        assert torch.isfinite(lu).all() and torch.isfinite(ru).all() and torch.isfinite(gamma).all()
+        assert (gamma >= 0).all(), "a singular value cannot be negative"
+
+        excess = (self._rel_err(M, gamma.float(), lu.float(), ru.float())
+                  - self._rel_err(M, gamma_ex, lu_ex, ru_ex)).max().item()
+        assert excess < self.MAX_EXCESS_CROSS, (
+            f"{case} r={r}: rank-1 reconstruction is {excess:.3e} worse than exact QR/SVD"
+        )
+
+    def test_exactly_recovers_a_true_rank1_input(self):
+        """When the input really is rank 1 there is no approximation to make and
+        the iteration has nothing to trade off — it must land on the answer."""
+        torch.manual_seed(5)
+        f = torch.nn.functional.normalize(torch.randn(self.N, self.D), dim=-1)
+        scale = torch.rand(self.N, 1) * 3 + 0.5
+        F = (scale * f).unsqueeze(1)  # (N, 1, D): a single factor
+        u, top = _rank1_psd_from_factors(F)
+        torch.testing.assert_close(top, scale.squeeze(-1).square(), rtol=1e-5, atol=1e-5)
+        # Direction matches up to sign.
+        assert (torch.einsum("nd,nd->n", u, f).abs() - 1.0).abs().max() < 1e-5
+
+
+# ---------------------------------------------------------------------------
 # Second-order gate: scale == 0 must SKIP the statistics, not multiply by zero
 # ---------------------------------------------------------------------------
 
@@ -1391,6 +1528,45 @@ class TestSecondOrderGate:
             assert g is not None, f"no gradient reached {name}"
             assert torch.isfinite(g).all(), f"non-finite gradient at {name}"
             assert g.abs().sum() > 0, f"gradient at {name} is all zero"
+
+    def test_function_owns_the_flag_across_forward_and_backward(self):
+        """``cache.second_order`` decides whether add_recent() builds the
+        statistics, so if the streaming Function read it from ambient state the
+        backward replay could rebuild a different cache than the one forward
+        attended over — gradients for a function that was never evaluated.
+        Flipping it between the passes must therefore change nothing."""
+        T = 33
+        torch.manual_seed(99)
+
+        def run(tamper):
+            a = self._make_attention(1.0)
+            q, k, v = self._inputs(T, seed=7)
+            y = a._log_kv_train_lowmem_forward(q, k, v, B=1, T=T)
+            if tamper:
+                a.kv_cache.second_order = False
+            torch.manual_seed(99)
+            (y * torch.randn_like(y)).sum().backward()
+            return y, (q.grad, k.grad, v.grad)
+
+        y_clean, g_clean = run(tamper=False)
+        y_tampered, g_tampered = run(tamper=True)
+        assert torch.equal(y_clean, y_tampered)
+        for name, a_, b_ in zip("qkv", g_clean, g_tampered):
+            assert torch.equal(a_, b_), f"d{name} drifted when the flag was flipped mid-pass"
+
+    def test_function_ignores_a_stale_flag_from_the_caller(self):
+        """A caller that never set the flag (or left it from another layer at a
+        different gate) must not silently get the first-order result."""
+        T = 12
+        scale = 1.0 / math.sqrt(self._make_attention(1.0).config.head_size)
+
+        def run(preset):
+            a = self._make_attention(1.0)
+            a.kv_cache.second_order = preset  # stale/ambient value
+            q, k, v = self._inputs(T, seed=7)
+            return LogKVStreamTrainingAttention.apply(q, k, v, a.kv_cache, scale, 2, 1.0)
+
+        assert torch.equal(run(preset=False), run(preset=True))
 
     def test_host_count_mirror_tracks_device_buffer(self):
         """The streaming path reads level counts from the host mirror instead of
