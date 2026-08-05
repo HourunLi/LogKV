@@ -848,6 +848,8 @@ def main(
             diag_dir = Path(log_kv_diag_output or output_path or ".").expanduser()
             diag_dir.mkdir(parents=True, exist_ok=True)
             tag = log_kv_diag_mode
+            if log_kv_second_order_scale != 1.0:
+                tag += f"_sos{log_kv_second_order_scale:g}"
             if log_kv_diag_exact_from_layer is not None:
                 tag += f"_efl{log_kv_diag_exact_from_layer}"
             if log_kv_diag_peak_window_from_end is not None:
