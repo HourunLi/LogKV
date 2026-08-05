@@ -53,7 +53,14 @@ _RANK1_EPS = 1e-12
 # Squarings used to extract the dominant eigenvector of the tiny (r x r) cores
 # below. Each round squares the eigenvalue gap, so k rounds separate the top
 # eigenpair as well as 2^k power iterations would, at k batched GEMMs.
-_RANK1_SQUARINGS = 6
+#
+# 8 rounds because they are almost free and the accuracy is not: the cost of
+# these helpers sits in the one (batch, r, D) projection, not in the r x r
+# squarings, so 5 -> 8 rounds costs ~4% of the helper while cutting the
+# worst-case truncation error ~8x (3.1e-3 -> 3.8e-4 excess relative Frobenius
+# error over an exact eigh, measured on the near-degenerate case that converges
+# slowest). TestRank1Approximation pins the resulting quality.
+_RANK1_SQUARINGS = 8
 
 
 def _normalize(x: torch.Tensor, eps: float = _RANK1_EPS) -> tuple[torch.Tensor, torch.Tensor]:
@@ -106,12 +113,18 @@ def _dominant_eigvec_small(core: torch.Tensor) -> torch.Tensor:
 
 
 def _rank1_psd_from_factors(factors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Best rank-1 PSD approximation to ``sum_i f_i f_i^T``.
+    """Near-optimal rank-1 PSD approximation to ``sum_i f_i f_i^T``.
 
     ``factors`` is ``(..., r, D)`` with small ``r`` for merged slots (3 during
     carry; 2 for raw pairs). The non-zero spectrum of the D x D matrix lives in
-    the r x r Gram matrix, so this performs the top-eigen truncation without ever
+    the r x r Gram matrix, so the truncation runs there, without ever
     materializing a full covariance matrix.
+
+    NOT an exact top-eigen truncation: the direction comes from
+    ``_dominant_eigvec_small``, which iterates rather than solves. The
+    eigenvalue is then an exact Rayleigh quotient of that direction, so it is
+    the best scale for whatever direction was found. ``TestRank1Approximation``
+    pins the resulting reconstruction error against an ``eigh`` reference.
     """
     if factors.size(-2) == 0:
         return factors[..., :0, :].sum(dim=-2), factors.new_zeros(factors.shape[:-2])
@@ -133,7 +146,12 @@ def _rank1_cross_from_factors(
     left_factors: torch.Tensor,
     right_factors: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Best rank-1 approximation to ``M = sum_i l_i r_i^T``.
+    """Near-optimal rank-1 approximation to ``M = sum_i l_i r_i^T``.
+
+    Like ``_rank1_psd_from_factors`` this is iterative, not an exact SVD
+    truncation; ``TestRank1Approximation`` pins the error against a QR/SVD
+    reference. The singular value is computed from the directions actually
+    found, so the returned triplet is always self-consistent.
 
     Returns ``left_unit, right_unit, singular_value``. The full value-key cross
     covariance is never materialized, and neither are the thin bases of its
@@ -519,8 +537,9 @@ class LogStructuredKVCache(nn.Module):
 
         If the rank-1 stats are provided for both input blocks, they are merged
         with Chan's parallel covariance formula and truncated back to rank 1 via
-        exact small-matrix decompositions. Without stats, this preserves the old
-        three-tensor return for tests and diagnostic callers.
+        the iterative small-matrix routines above (near-optimal, not exact — see
+        their docstrings). Without stats, this preserves the old three-tensor
+        return for tests and diagnostic callers.
         """
         k_cat = torch.cat([k1, k2], dim=-2)  # (B, G, 2B, D)
         v_cat = torch.cat([v1, v2], dim=-2)
@@ -1449,9 +1468,12 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
       - The replay is deterministic: compaction is pure mean-pooling with
         count-based binary carries — no RNG, identical shapes take identical
         kernels — so the rebuilt per-block prefix states equal forward's.
-      - Backward does not depend on the cache state forward left behind (it
-        resets first), so interleaved forward/backward across micro-batches
-        or activation-checkpoint recompute ordering cannot corrupt it.
+      - Backward does not depend on any cache state forward left behind: it
+        resets the buffers AND re-derives ``cache.second_order`` from its own
+        ``second_order_scale`` before replaying, so neither interleaved
+        forward/backward across micro-batches, nor activation-checkpoint
+        recompute ordering, nor another layer running at a different gate can
+        make the replay rebuild a cache that forward never attended over.
 
     ``train_block=2`` is the strict 2-token streaming reference. Larger blocks
     freeze the prefix state at block start and use causal exact attention within
@@ -1470,6 +1492,17 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             raise ValueError(
                 f"logKV train_block ({train_block}) must be <= recent_size ({cache.recent_size})"
             )
+        # Own the flag rather than trusting the caller. It decides whether
+        # add_recent() builds the second-order statistics, so leaving it to
+        # ambient state breaks this Function two ways: a caller that never sets
+        # it runs the attention math against statistics that were never built
+        # (silently first-order), and anything that flips it between forward and
+        # backward makes the replay rebuild a different cache than the one
+        # forward attended over, so the gradients belong to a different function
+        # than the output. Deriving it here from the gate keeps the pair
+        # consistent no matter who calls, and matches the reset_parameters()
+        # below in making the pass independent of inherited cache state.
+        cache.second_order = second_order_scale != 0.0
         outputs: list[torch.Tensor] = []
         # Explicit no_grad: the memory guarantee of this whole scheme rests on
         # this pass recording nothing (Function.forward already runs detached;
@@ -1510,6 +1543,10 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
+        # Re-derive alongside reset_parameters() for the same reason forward
+        # does: the replay must rebuild the cache exactly as forward built it,
+        # and the flag is mutable state anyone could have changed in between.
+        cache.second_order = second_order_scale != 0.0
         cache.reset_parameters()
         start = 0
         while start < T:  # mirrors forward() — keep in sync
