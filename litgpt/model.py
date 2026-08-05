@@ -845,6 +845,11 @@ class CausalSelfAttention(nn.Module):
             raise TypeError("training_log_kv requires a LogStructuredKVCache")
         cache = self.kv_cache
         cache._convert_dtype(q.dtype)
+        # A zero gate makes every Sigma/Gamma term vanish, so tell the cache not
+        # to build the statistics that feed them — during second-order warmup
+        # this is the difference between paying for compaction statistics that
+        # are multiplied by zero and not computing them at all.
+        cache.second_order = self.log_kv_second_order_scale != 0.0
         self._log_kv_pending = None  # training never defers a tail token
 
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
@@ -971,6 +976,7 @@ class CausalSelfAttention(nn.Module):
         # (Qwen3 default 1.0) runs correctly: distant compact slots just fade
         # toward pure mass-bias contributions.
         cache = self.kv_cache
+        cache.second_order = self.log_kv_second_order_scale != 0.0
         if reset_cache:
             cache.reset_parameters()
             self._log_kv_pending = None
