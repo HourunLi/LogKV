@@ -342,8 +342,10 @@ class LogStructuredKVCache(nn.Module):
         # entirely (they stay zero) and the levels behave like the first-order
         # cache. Driven by the second-order gate: a scale of 0 makes every
         # correction term vanish, so computing and merging the statistics that
-        # feed it is pure overhead. See ``log_kv_chunk_attention``.
-        self.second_order: bool = True
+        # feed it is pure overhead. See ``log_kv_chunk_attention``. Guarded by
+        # the ``second_order`` property below — set the backing field directly
+        # here since a fresh cache has nothing for the guard to protect.
+        self._second_order: bool = True
 
         # ---- Salience pins: up to pin_size exact tokens kept OUTSIDE the
         # hierarchy (SnapKV-style observation-window selection at prefill; see
@@ -370,6 +372,48 @@ class LogStructuredKVCache(nn.Module):
             persistent=False,
         )
         self.pin_count: int = 0
+
+    # ------------------------------------------------------------------
+    # Second-order gate (guarded: cannot change regime on a live cache)
+    # ------------------------------------------------------------------
+
+    @property
+    def second_order(self) -> bool:
+        """Whether compaction builds and merges the rank-1 Sigma/Gamma stats.
+
+        Guarded rather than a plain flag: flipping it while a level already
+        holds compacted entries would leave the hierarchy straddling two
+        regimes, silently.
+
+        - True -> False mid-stream: the next binary carry takes the no-stats
+          branch of ``compact()``, which ignores whatever stats the existing
+          level already had and produces a merged entry with none — those
+          real, previously-built stats are gone.
+        - False -> True mid-stream: the next carry merges genuine new stats
+          against a sibling that has structural zero stats (built while this
+          was False) via Chan's formula. That reads as "this half of the slot
+          had exactly zero variance", not "unknown" — an understated, wrong
+          covariance for the merged slot, not a conservative one.
+
+        Both keep producing finite numbers, so nothing downstream would flag
+        it. Call ``reset_parameters()`` before switching regimes on a cache
+        that has ever run ``add_recent()``; a fresh cache and same-value writes
+        are always fine.
+        """
+        return self._second_order
+
+    @second_order.setter
+    def second_order(self, value: bool) -> None:
+        value = bool(value)
+        if value != self._second_order and any(c > 0 for c in self._counts):
+            raise RuntimeError(
+                f"LogStructuredKVCache: cannot change `second_order` "
+                f"({self._second_order} -> {value}) while a compacted level "
+                "already holds entries. Call reset_parameters() first -- see "
+                "the `second_order` property docstring for why switching "
+                "regimes in place is unsafe."
+            )
+        self._second_order = value
 
     # ------------------------------------------------------------------
     # Salience pins
@@ -1492,23 +1536,26 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             raise ValueError(
                 f"logKV train_block ({train_block}) must be <= recent_size ({cache.recent_size})"
             )
-        # Own the flag rather than trusting the caller. It decides whether
-        # add_recent() builds the second-order statistics, so leaving it to
-        # ambient state breaks this Function two ways: a caller that never sets
-        # it runs the attention math against statistics that were never built
-        # (silently first-order), and anything that flips it between forward and
-        # backward makes the replay rebuild a different cache than the one
-        # forward attended over, so the gradients belong to a different function
-        # than the output. Deriving it here from the gate keeps the pair
-        # consistent no matter who calls, and matches the reset_parameters()
-        # below in making the pass independent of inherited cache state.
-        cache.second_order = second_order_scale != 0.0
         outputs: list[torch.Tensor] = []
         # Explicit no_grad: the memory guarantee of this whole scheme rests on
         # this pass recording nothing (Function.forward already runs detached;
         # this makes the invariant local and future-proof).
         with torch.no_grad():
             cache.reset_parameters()
+            # Own the flag rather than trusting the caller, and set it AFTER
+            # the reset above so the cache is always empty when this runs (the
+            # guarded setter would otherwise raise on a cache left non-empty by
+            # a previous call at a different gate). It decides whether
+            # add_recent() builds the second-order statistics, so leaving it to
+            # ambient state breaks this Function two ways: a caller that never
+            # sets it runs the attention math against statistics that were
+            # never built (silently first-order), and anything that flips it
+            # between forward and backward makes the replay rebuild a
+            # different cache than the one forward attended over, so the
+            # gradients belong to a different function than the output.
+            # Deriving it here from the gate keeps the pair consistent no
+            # matter who calls.
+            cache.second_order = second_order_scale != 0.0
             start = 0
             while start < T:  # mirrored in backward() — keep in sync
                 end = min(start + train_block, T)
@@ -1543,11 +1590,12 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
-        # Re-derive alongside reset_parameters() for the same reason forward
-        # does: the replay must rebuild the cache exactly as forward built it,
-        # and the flag is mutable state anyone could have changed in between.
-        cache.second_order = second_order_scale != 0.0
         cache.reset_parameters()
+        # Re-derive AFTER the reset, same reasoning and ordering as forward():
+        # the replay must rebuild the cache exactly as forward built it, the
+        # flag is mutable state anyone could have changed in between, and the
+        # guarded setter needs the cache empty to accept either value.
+        cache.second_order = second_order_scale != 0.0
         start = 0
         while start < T:  # mirrors forward() — keep in sync
             end = min(start + train_block, T)
