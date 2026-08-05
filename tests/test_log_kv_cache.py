@@ -6,7 +6,12 @@ import pytest
 import torch
 
 from litgpt.config import Config
-from litgpt.log_kv_cache import LogStructuredKVCache, append_exact_tokens, log_kv_slot_attention
+from litgpt.log_kv_cache import (
+    LogStructuredKVCache,
+    append_exact_tokens,
+    log_kv_chunk_attention,
+    log_kv_slot_attention,
+)
 from litgpt.model import CausalSelfAttention, GPT
 
 
@@ -1281,6 +1286,123 @@ class TestLowMemTrainingEquivalence:
         torch.testing.assert_close(q2.grad, q1.grad, rtol=1e-6, atol=1e-6)
         torch.testing.assert_close(k2.grad, k1.grad, rtol=1e-6, atol=1e-6)
         torch.testing.assert_close(v2.grad, v1.grad, rtol=1e-6, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Second-order gate: scale == 0 must SKIP the statistics, not multiply by zero
+# ---------------------------------------------------------------------------
+
+class TestSecondOrderGate:
+    """A zero second-order scale makes every Sigma/Gamma term vanish, so the
+    cache must not build the statistics that feed them — that is what makes the
+    warmup steps cost the first-order price instead of the full price times
+    zero. The skip has to be free of observable effects: same outputs, same
+    compaction trajectory, same gradients."""
+
+    @staticmethod
+    def _make_attention(scale: float) -> CausalSelfAttention:
+        torch.manual_seed(0)
+        config = Config(
+            block_size=64,
+            padded_vocab_size=16,
+            n_layer=1,
+            n_head=4,
+            n_query_groups=2,  # GQA: exercises the broadcast attention branch
+            n_embd=16,
+            rotary_percentage=0.5,
+        )
+        attn = CausalSelfAttention(config, block_idx=0)
+        attn.kv_cache = attn.build_log_kv_cache(
+            batch_size=1, max_seq_length=64, B=4, recent_size=4
+        )
+        attn.log_kv_second_order_scale = scale
+        return attn
+
+    @staticmethod
+    def _inputs(T: int, seed: int):
+        torch.manual_seed(seed)
+        q = torch.randn(1, 4, T, 4)
+        k = torch.randn(1, 2, T, 4)
+        v = torch.randn(1, 2, T, 4)
+        return tuple(t.clone().requires_grad_(True) for t in (q, k, v))
+
+    @pytest.mark.parametrize("T", [5, 12, 33])
+    def test_gate_zero_leaves_stats_unbuilt(self, T):
+        attn = self._make_attention(0.0)
+        q, k, v = self._inputs(T, seed=11)
+        attn._log_kv_train_lowmem_forward(q, k, v, B=1, T=T)
+
+        cache = attn.kv_cache
+        assert cache.second_order is False
+        for ell in range(cache.max_levels):
+            for name in ("level_sigma_u", "level_sigma2", "level_gamma_a",
+                         "level_gamma_b", "level_gamma"):
+                buf = getattr(cache, f"{name}_{ell}")
+                assert not buf.any(), f"{name}_{ell} was built despite a zero gate"
+
+    def test_gate_zero_matches_stats_present_but_gated(self):
+        """Skipping the statistics must be indistinguishable from building them
+        and multiplying by a zero gate — the behaviour before the skip existed.
+
+        Driven at the cache level because the attention entry points re-derive
+        the flag from the scale, so this is the only place both sides can be
+        held at a zero gate while differing in whether the statistics exist.
+        """
+        torch.manual_seed(3)
+        kd = vd = 8
+
+        def build():
+            return LogStructuredKVCache(
+                (1, 2, 128, kd), (1, 2, 128, vd), B=4, recent_size=4, dtype=torch.float32
+            )
+
+        c_built, c_skipped = build(), build()
+        c_skipped.second_order = False
+        for _ in range(12):
+            k = torch.randn(1, 2, 4, kd)
+            v = torch.randn(1, 2, 4, vd)
+            c_built.add_recent(k, v)
+            c_skipped.add_recent(k, v)
+
+        # The two caches really do differ in whether the statistics were built.
+        assert any(getattr(c_built, f"level_sigma2_{e}").any() for e in range(c_built.max_levels))
+        assert not any(
+            getattr(c_skipped, f"level_sigma2_{e}").any() for e in range(c_skipped.max_levels)
+        )
+
+        q = torch.randn(1, 4, 4, kd)
+        kb = torch.randn(1, 2, 4, kd)
+        vb = torch.randn(1, 2, 4, vd)
+        y_gated = log_kv_chunk_attention(c_built, q, kb, vb, kd ** -0.5, 0.0)
+        y_skipped = log_kv_chunk_attention(c_skipped, q, kb, vb, kd ** -0.5, 0.0)
+        assert torch.equal(y_gated, y_skipped)
+
+    @pytest.mark.parametrize("T", [5, 12, 33])
+    def test_gate_zero_still_trains(self, T):
+        """Gradients must still flow to q/k/v and the projection with the gate
+        closed — the warmup steps are real training steps."""
+        attn = self._make_attention(0.0)
+        q, k, v = self._inputs(T, seed=13)
+        y = attn._log_kv_train_lowmem_forward(q, k, v, B=1, T=T)
+        torch.manual_seed(5)
+        (y * torch.randn_like(y)).sum().backward()
+        for name, g in (("q", q.grad), ("k", k.grad), ("v", v.grad),
+                        ("proj", attn.proj.weight.grad)):
+            assert g is not None, f"no gradient reached {name}"
+            assert torch.isfinite(g).all(), f"non-finite gradient at {name}"
+            assert g.abs().sum() > 0, f"gradient at {name} is all zero"
+
+    def test_host_count_mirror_tracks_device_buffer(self):
+        """The streaming path reads level counts from the host mirror instead of
+        syncing on the device tensor; the two must never drift."""
+        attn = self._make_attention(1.0)
+        cache = attn.kv_cache
+        T = 40
+        q, k, v = self._inputs(T, seed=17)
+        attn._log_kv_train_lowmem_forward(q, k, v, B=1, T=T)
+        assert cache._counts == cache.level_count.tolist()
+        cache.reset_parameters()
+        assert cache._counts == cache.level_count.tolist() == [0] * cache.max_levels
 
 
 # ---------------------------------------------------------------------------
