@@ -50,6 +50,11 @@ from torch.autograd.function import once_differentiable
 
 _RANK1_EPS = 1e-12
 
+# Squarings used to extract the dominant eigenvector of the tiny (r x r) cores
+# below. Each round squares the eigenvalue gap, so k rounds separate the top
+# eigenpair as well as 2^k power iterations would, at k batched GEMMs.
+_RANK1_SQUARINGS = 6
+
 
 def _normalize(x: torch.Tensor, eps: float = _RANK1_EPS) -> tuple[torch.Tensor, torch.Tensor]:
     """Return a unit direction and the original norm, computed in fp32."""
@@ -59,24 +64,67 @@ def _normalize(x: torch.Tensor, eps: float = _RANK1_EPS) -> tuple[torch.Tensor, 
     return unit.to(x.dtype), norm.squeeze(-1).to(x.dtype)
 
 
+def _dominant_eigvec_small(core: torch.Tensor) -> torch.Tensor:
+    """Unit dominant right eigenvector of a batch of tiny ``(..., r, r)`` cores.
+
+    ``core`` must have a real non-negative spectrum: either symmetric PSD, or a
+    product of two PSD Gram matrices (similar to the PSD ``G^(1/2) H G^(1/2)``).
+
+    Repeated squaring drives ``core^(2^k)`` towards the rank-1 dominant
+    projector, so every column ends up parallel to the top eigenvector and the
+    largest-norm column is the best-conditioned representative. Convergence is
+    ``(lam2/lam1)^(2^k)``; the slowest case is a near-degenerate top pair, which
+    is exactly the case where any vector of that eigenspace is an equally good
+    rank-1 direction, so the resulting approximation error stays small either
+    way.
+
+    Why not ``torch.linalg.eigh``/``qr``/``svd``: those dispatch to cuSOLVER,
+    whose batched small-matrix paths carry a large fixed cost (and, for tall-thin
+    QR, degrade towards a per-matrix loop). LogKV calls this once per merged slot
+    per compaction — thousands of matrices per call, thousands of calls per
+    training step — where that fixed cost dominated everything else. This path is
+    batched GEMM only.
+    """
+    r = core.size(-1)
+    if r == 1:
+        return torch.ones_like(core[..., 0])
+    m = core
+    for _ in range(_RANK1_SQUARINGS):
+        # Renormalize by the trace before squaring: raw powers reach lam1^(2^k)
+        # and overflow fp32 within a few rounds, and the scale is irrelevant to
+        # the direction. trace > 0 for any matrix with non-negative spectrum.
+        trace = m.diagonal(dim1=-2, dim2=-1).sum(-1).abs().clamp_min(_RANK1_EPS)
+        m = m / trace[..., None, None]
+        m = torch.matmul(m, m)
+    # Columns of m^(2^k) are all parallel to the top eigenvector; pick the
+    # longest one (zero everywhere iff the input was the zero matrix).
+    col_norms = m.norm(dim=-2)                       # (..., r)
+    pick = col_norms.argmax(dim=-1, keepdim=True)    # (..., 1)
+    vec = torch.gather(m, -1, pick.unsqueeze(-2).expand(*m.shape[:-1], 1)).squeeze(-1)
+    norm = vec.norm(dim=-1, keepdim=True)
+    return torch.where(norm > _RANK1_EPS, vec / norm.clamp_min(_RANK1_EPS), torch.zeros_like(vec))
+
+
 def _rank1_psd_from_factors(factors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Best rank-1 PSD approximation to ``sum_i f_i f_i^T``.
 
     ``factors`` is ``(..., r, D)`` with small ``r`` for merged slots (3 during
     carry; 2 for raw pairs). The non-zero spectrum of the D x D matrix lives in
-    the r x r Gram matrix, so this performs the exact top-eigen truncation
-    without ever materializing a full covariance matrix.
+    the r x r Gram matrix, so this performs the top-eigen truncation without ever
+    materializing a full covariance matrix.
     """
     if factors.size(-2) == 0:
         return factors[..., :0, :].sum(dim=-2), factors.new_zeros(factors.shape[:-2])
 
     ff = factors.float()
     gram = torch.matmul(ff, ff.mT)
-    eigvals, eigvecs = torch.linalg.eigh(gram)
-    top = eigvals[..., -1].clamp_min(0.0)
-    coeff = eigvecs[..., -1]
-    direction = torch.matmul(coeff.unsqueeze(-2), ff).squeeze(-2)
-    direction = direction / top.sqrt().clamp_min(_RANK1_EPS).unsqueeze(-1)
+    coeff = _dominant_eigvec_small(gram)
+    # raw = F^T c, so ||raw||^2 = c^T G c is the Rayleigh quotient — the top
+    # eigenvalue, and second-order accurate in any eigenvector error. It also
+    # comes for free from the projection we need anyway.
+    raw = torch.matmul(coeff.unsqueeze(-2), ff).squeeze(-2)
+    top = raw.square().sum(-1)
+    direction = raw / top.sqrt().clamp_min(_RANK1_EPS).unsqueeze(-1)
     direction = torch.where(top.unsqueeze(-1) > _RANK1_EPS, direction, torch.zeros_like(direction))
     return direction.to(factors.dtype), top.to(factors.dtype)
 
@@ -85,23 +133,42 @@ def _rank1_cross_from_factors(
     left_factors: torch.Tensor,
     right_factors: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Best rank-1 approximation to ``sum_i l_i r_i^T``.
+    """Best rank-1 approximation to ``M = sum_i l_i r_i^T``.
 
-    Returns ``left_unit, right_unit, singular_value``. The full value-key
-    cross-covariance is never materialized. If ``L`` / ``R`` are the matrices
-    whose columns are the left / right factors, a batched thin QR gives
-    ``L = Ql Rl`` and ``R = Qr Rr``; the non-zero singular spectrum of
-    ``L R^T`` is therefore the small core ``Rl Rr^T``.
+    Returns ``left_unit, right_unit, singular_value``. The full value-key cross
+    covariance is never materialized, and neither are the thin bases of its
+    factors. With ``L`` / ``R`` the ``(..., r, D)`` factor stacks, ``M = L^T R``
+    and ``M M^T = L^T (R R^T) L``, so the top left singular vector lies in the
+    row space of ``L``: writing it as ``L^T c`` reduces the eigenproblem to the
+    r x r core ``(R R^T)(L L^T)``. From its dominant eigenvector ``c``,
+    ``u ∝ L^T c`` and ``v ∝ M^T u = R^T (L L^T) c``, and the singular value is
+    ``u^T M v = <L u, R v>``. Everything is r x r or a single (r, D) projection.
     """
-    left = left_factors.float().mT   # (..., Dv, r)
-    right = right_factors.float().mT  # (..., Dk, r)
-    q_left, r_left = torch.linalg.qr(left, mode="reduced")
-    q_right, r_right = torch.linalg.qr(right, mode="reduced")
-    core = torch.matmul(r_left, r_right.mT)
-    u_core, s, vh_core = torch.linalg.svd(core, full_matrices=False)
-    gamma = s[..., 0]
-    left_unit = torch.matmul(q_left, u_core[..., :, :1]).squeeze(-1)
-    right_unit = torch.matmul(q_right, vh_core.mT[..., :, :1]).squeeze(-1)
+    left = left_factors.float()    # (..., r, Dv)
+    right = right_factors.float()  # (..., r, Dk)
+    gram_left = torch.matmul(left, left.mT)     # (..., r, r)
+    gram_right = torch.matmul(right, right.mT)  # (..., r, r)
+    coeff = _dominant_eigvec_small(torch.matmul(gram_right, gram_left))  # (..., r)
+
+    left_raw = torch.matmul(coeff.unsqueeze(-2), left).squeeze(-2)  # (..., Dv) = L^T c
+    # R^T (L L^T) c — positively aligned with the true right vector for this u,
+    # so the singular value below comes out non-negative without a sign fix.
+    right_raw = torch.matmul(
+        torch.matmul(coeff.unsqueeze(-2), gram_left), right
+    ).squeeze(-2)  # (..., Dk)
+
+    left_norm = left_raw.norm(dim=-1, keepdim=True)
+    right_norm = right_raw.norm(dim=-1, keepdim=True)
+    left_unit = torch.where(
+        left_norm > _RANK1_EPS, left_raw / left_norm.clamp_min(_RANK1_EPS), torch.zeros_like(left_raw)
+    )
+    right_unit = torch.where(
+        right_norm > _RANK1_EPS, right_raw / right_norm.clamp_min(_RANK1_EPS), torch.zeros_like(right_raw)
+    )
+
+    gamma = (
+        torch.matmul(left, left_unit.unsqueeze(-1)) * torch.matmul(right, right_unit.unsqueeze(-1))
+    ).sum(dim=(-2, -1)).clamp_min(0.0)
     left_unit = torch.where(gamma.unsqueeze(-1) > _RANK1_EPS, left_unit, torch.zeros_like(left_unit))
     right_unit = torch.where(gamma.unsqueeze(-1) > _RANK1_EPS, right_unit, torch.zeros_like(right_unit))
     return (
@@ -244,6 +311,21 @@ class LogStructuredKVCache(nn.Module):
             torch.zeros(self.max_levels, dtype=torch.long, device=device),
             persistent=False,
         )
+        # Host-side mirror of ``level_count``. Every control-flow decision in the
+        # streaming path (how many slots a level holds, whether a carry fires)
+        # reads a level count, and reading the device tensor means a
+        # device-to-host sync per read — O(max_levels) stalls per streaming
+        # chunk, per layer, on both the forward stream and the backward replay.
+        # The mirror keeps those decisions on the host; the buffer stays
+        # authoritative for state_dict/tests and is written (never read) in step.
+        self._counts: list[int] = [0] * self.max_levels
+
+        # When False, compaction skips the rank-1 second-order statistics
+        # entirely (they stay zero) and the levels behave like the first-order
+        # cache. Driven by the second-order gate: a scale of 0 makes every
+        # correction term vanish, so computing and merging the statistics that
+        # feed it is pure overhead. See ``log_kv_chunk_attention``.
+        self.second_order: bool = True
 
         # ---- Salience pins: up to pin_size exact tokens kept OUTSIDE the
         # hierarchy (SnapKV-style observation-window selection at prefill; see
@@ -334,13 +416,19 @@ class LogStructuredKVCache(nn.Module):
         getattr(self, f"level_v_{ell}").copy_(v)
         getattr(self, f"level_w_{ell}").copy_(w)
         if sigma_u is None:
-            sigma_u, sigma2, gamma_a, gamma_b, gamma = self._zero_stats_like(k, v, w)
-        getattr(self, f"level_sigma_u_{ell}").copy_(sigma_u)
-        getattr(self, f"level_sigma2_{ell}").copy_(sigma2)
-        getattr(self, f"level_gamma_a_{ell}").copy_(gamma_a)
-        getattr(self, f"level_gamma_b_{ell}").copy_(gamma_b)
-        getattr(self, f"level_gamma_{ell}").copy_(gamma)
+            getattr(self, f"level_sigma_u_{ell}").zero_()
+            getattr(self, f"level_sigma2_{ell}").zero_()
+            getattr(self, f"level_gamma_a_{ell}").zero_()
+            getattr(self, f"level_gamma_b_{ell}").zero_()
+            getattr(self, f"level_gamma_{ell}").zero_()
+        else:
+            getattr(self, f"level_sigma_u_{ell}").copy_(sigma_u)
+            getattr(self, f"level_sigma2_{ell}").copy_(sigma2)
+            getattr(self, f"level_gamma_a_{ell}").copy_(gamma_a)
+            getattr(self, f"level_gamma_b_{ell}").copy_(gamma_b)
+            getattr(self, f"level_gamma_{ell}").copy_(gamma)
         self.level_count[ell] = self.B
+        self._counts[ell] = self.B
 
     def _clear_level(self, ell: int) -> None:
         getattr(self, f"level_k_{ell}").zero_()
@@ -352,17 +440,7 @@ class LogStructuredKVCache(nn.Module):
         getattr(self, f"level_gamma_b_{ell}").zero_()
         getattr(self, f"level_gamma_{ell}").zero_()
         self.level_count[ell] = 0
-
-    def _zero_stats_like(
-        self, k: torch.Tensor, v: torch.Tensor, w: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return (
-            torch.zeros_like(k),
-            torch.zeros_like(w),
-            torch.zeros_like(k),
-            torch.zeros_like(v),
-            torch.zeros_like(w),
-        )
+        self._counts[ell] = 0
 
     # ------------------------------------------------------------------
     # Compact: compress tokens -> 1 entry via mean pooling (2:1 by default)
@@ -541,33 +619,37 @@ class LogStructuredKVCache(nn.Module):
         gamma_entry: torch.Tensor | None = None,
     ) -> None:
         """Add one compact entry to level 0. If level 0 is full, binary carry to levels 1+."""
-        if sigma_u_entry is None:
-            sigma_u_entry, sigma2_entry, gamma_a_entry, gamma_b_entry, gamma_entry = self._zero_stats_like(
-                k_entry.unsqueeze(2), v_entry.unsqueeze(2), w_entry.unsqueeze(2)
-            )
-            sigma_u_entry = sigma_u_entry.squeeze(2)
-            sigma2_entry = sigma2_entry.squeeze(2)
-            gamma_a_entry = gamma_a_entry.squeeze(2)
-            gamma_b_entry = gamma_b_entry.squeeze(2)
-            gamma_entry = gamma_entry.squeeze(2)
-        idx = self.level_count[0].item()
+        idx = self._counts[0]
         getattr(self, "level_k_0")[:, :, idx, :] = k_entry
         getattr(self, "level_v_0")[:, :, idx, :] = v_entry
         getattr(self, "level_w_0")[:, :, idx] = w_entry
-        getattr(self, "level_sigma_u_0")[:, :, idx, :] = sigma_u_entry
-        getattr(self, "level_sigma2_0")[:, :, idx] = sigma2_entry
-        getattr(self, "level_gamma_a_0")[:, :, idx, :] = gamma_a_entry
-        getattr(self, "level_gamma_b_0")[:, :, idx, :] = gamma_b_entry
-        getattr(self, "level_gamma_0")[:, :, idx] = gamma_entry
+        if sigma_u_entry is None:
+            # Zero the slot in place rather than materializing zero tensors to
+            # copy from: this runs per compacted entry.
+            getattr(self, "level_sigma_u_0")[:, :, idx, :].zero_()
+            getattr(self, "level_sigma2_0")[:, :, idx].zero_()
+            getattr(self, "level_gamma_a_0")[:, :, idx, :].zero_()
+            getattr(self, "level_gamma_b_0")[:, :, idx, :].zero_()
+            getattr(self, "level_gamma_0")[:, :, idx].zero_()
+        else:
+            getattr(self, "level_sigma_u_0")[:, :, idx, :] = sigma_u_entry
+            getattr(self, "level_sigma2_0")[:, :, idx] = sigma2_entry
+            getattr(self, "level_gamma_a_0")[:, :, idx, :] = gamma_a_entry
+            getattr(self, "level_gamma_b_0")[:, :, idx, :] = gamma_b_entry
+            getattr(self, "level_gamma_0")[:, :, idx] = gamma_entry
         self.level_count[0] = idx + 1
+        self._counts[0] = idx + 1
 
-        if self.level_count[0] >= self.B:
+        if self._counts[0] >= self.B:
             lk, lv, lw = self._get_level(0)
-            lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
-            self._binary_carry(
-                lk.clone(), lv.clone(), lw.clone(),
-                lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
-            )
+            if self.second_order:
+                lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
+                self._binary_carry(
+                    lk.clone(), lv.clone(), lw.clone(),
+                    lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
+                )
+            else:
+                self._binary_carry(lk.clone(), lv.clone(), lw.clone())
             self._clear_level(0)
 
     # ------------------------------------------------------------------
@@ -579,21 +661,23 @@ class LogStructuredKVCache(nn.Module):
         block_k: torch.Tensor,
         block_v: torch.Tensor,
         block_w: torch.Tensor,
-        block_sigma_u: torch.Tensor,
-        block_sigma2: torch.Tensor,
-        block_gamma_a: torch.Tensor,
-        block_gamma_b: torch.Tensor,
-        block_gamma: torch.Tensor,
+        block_sigma_u: torch.Tensor | None = None,
+        block_sigma2: torch.Tensor | None = None,
+        block_gamma_a: torch.Tensor | None = None,
+        block_gamma_b: torch.Tensor | None = None,
+        block_gamma: torch.Tensor | None = None,
     ) -> None:
         new_k, new_v, new_w = block_k, block_v, block_w
         new_su, new_s2 = block_sigma_u, block_sigma2
         new_ga, new_gb, new_gm = block_gamma_a, block_gamma_b, block_gamma
         for ell in range(1, self.max_levels):
-            if self.level_count[ell] == 0:
+            if self._counts[ell] == 0:
                 self._set_level(ell, new_k, new_v, new_w, new_su, new_s2, new_ga, new_gb, new_gm)
                 return
+            ek, ev, ew = self._get_level(ell)
+            if new_su is None:
+                new_k, new_v, new_w = self.compact(ek, ev, ew, new_k, new_v, new_w)
             else:
-                ek, ev, ew = self._get_level(ell)
                 esu, es2, ega, egb, egm = self._get_level_stats(ell)
                 (
                     new_k,
@@ -610,7 +694,7 @@ class LogStructuredKVCache(nn.Module):
                     esu, es2, ega, egb, egm,
                     new_su, new_s2, new_ga, new_gb, new_gm,
                 )
-                self._clear_level(ell)
+            self._clear_level(ell)
         raise RuntimeError(
             f"LogStructuredKVCache: binary carry overflow! "
             f"All {self.max_levels} levels occupied. "
@@ -663,13 +747,16 @@ class LogStructuredKVCache(nn.Module):
         pk = rk_pairs.mean(dim=3)
         pv = rv_pairs.mean(dim=3)
         pw = torch.full((B_, G_, f), 2.0, device=rk.device, dtype=rk.dtype)
-        psu, ps2, pga, pgb, pgm = _pair_rank1_stats(
-            rk_pairs[:, :, :, 0, :],
-            rk_pairs[:, :, :, 1, :],
-            rv_pairs[:, :, :, 0, :],
-            rv_pairs[:, :, :, 1, :],
-        )
-        self._append_level0(pk, pv, pw, psu, ps2, pga, pgb, pgm)
+        if self.second_order:
+            psu, ps2, pga, pgb, pgm = _pair_rank1_stats(
+                rk_pairs[:, :, :, 0, :],
+                rk_pairs[:, :, :, 1, :],
+                rv_pairs[:, :, :, 0, :],
+                rv_pairs[:, :, :, 1, :],
+            )
+            self._append_level0(pk, pv, pw, psu, ps2, pga, pgb, pgm)
+        else:
+            self._append_level0(pk, pv, pw)
 
         # Shift the survivors to the front. Source/destination overlap in the
         # same storage; PyTorch copy_ with overlapping src/dst is undefined (may
@@ -699,30 +786,41 @@ class LogStructuredKVCache(nn.Module):
         binary carry fires exactly when the count reaches B, between the same
         two entries as in the sequential version.
         """
-        if psu is None:
-            psu, ps2, pga, pgb, pgm = self._zero_stats_like(pk, pv, pw)
         f = pk.size(2)
         off = 0
         while off < f:
-            idx = int(self.level_count[0].item())
+            idx = self._counts[0]
             take = min(self.B - idx, f - off)
             getattr(self, "level_k_0")[:, :, idx:idx + take, :] = pk[:, :, off:off + take, :]
             getattr(self, "level_v_0")[:, :, idx:idx + take, :] = pv[:, :, off:off + take, :]
             getattr(self, "level_w_0")[:, :, idx:idx + take] = pw[:, :, off:off + take]
-            getattr(self, "level_sigma_u_0")[:, :, idx:idx + take, :] = psu[:, :, off:off + take, :]
-            getattr(self, "level_sigma2_0")[:, :, idx:idx + take] = ps2[:, :, off:off + take]
-            getattr(self, "level_gamma_a_0")[:, :, idx:idx + take, :] = pga[:, :, off:off + take, :]
-            getattr(self, "level_gamma_b_0")[:, :, idx:idx + take, :] = pgb[:, :, off:off + take, :]
-            getattr(self, "level_gamma_0")[:, :, idx:idx + take] = pgm[:, :, off:off + take]
+            if psu is None:
+                # Zero in place instead of materializing zero tensors to copy
+                # from: this runs on every window flush.
+                getattr(self, "level_sigma_u_0")[:, :, idx:idx + take, :].zero_()
+                getattr(self, "level_sigma2_0")[:, :, idx:idx + take].zero_()
+                getattr(self, "level_gamma_a_0")[:, :, idx:idx + take, :].zero_()
+                getattr(self, "level_gamma_b_0")[:, :, idx:idx + take, :].zero_()
+                getattr(self, "level_gamma_0")[:, :, idx:idx + take].zero_()
+            else:
+                getattr(self, "level_sigma_u_0")[:, :, idx:idx + take, :] = psu[:, :, off:off + take, :]
+                getattr(self, "level_sigma2_0")[:, :, idx:idx + take] = ps2[:, :, off:off + take]
+                getattr(self, "level_gamma_a_0")[:, :, idx:idx + take, :] = pga[:, :, off:off + take, :]
+                getattr(self, "level_gamma_b_0")[:, :, idx:idx + take, :] = pgb[:, :, off:off + take, :]
+                getattr(self, "level_gamma_0")[:, :, idx:idx + take] = pgm[:, :, off:off + take]
             self.level_count[0] = idx + take
+            self._counts[0] = idx + take
             off += take
-            if int(self.level_count[0].item()) >= self.B:
+            if self._counts[0] >= self.B:
                 lk, lv, lw = self._get_level(0)
-                lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
-                self._binary_carry(
-                    lk.clone(), lv.clone(), lw.clone(),
-                    lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
-                )
+                if self.second_order:
+                    lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
+                    self._binary_carry(
+                        lk.clone(), lv.clone(), lw.clone(),
+                        lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
+                    )
+                else:
+                    self._binary_carry(lk.clone(), lv.clone(), lw.clone())
                 self._clear_level(0)
 
     # ------------------------------------------------------------------
@@ -881,9 +979,11 @@ class LogStructuredKVCache(nn.Module):
         gamma_b_parts: list[torch.Tensor] = []
         gamma_parts: list[torch.Tensor] = []
 
-        # Compact levels: oldest (highest level) first, down to level 0
+        # Compact levels: oldest (highest level) first, down to level 0. Counts
+        # come from the host mirror — reading the device tensor here would sync
+        # once per level, per streaming chunk, per layer.
         for ell in range(self.max_levels - 1, -1, -1):
-            count = self.level_count[ell].item()
+            count = self._counts[ell]
             if count > 0:
                 lk, lv, lw = self._get_level(ell)
                 k_parts.append(lk[:, :, :count, :])
@@ -1021,10 +1121,7 @@ class LogStructuredKVCache(nn.Module):
 
     @property
     def total_slots(self) -> int:
-        count = self.recent_count + self.pin_count
-        for ell in range(self.max_levels):
-            count += self.level_count[ell].item()
-        return count
+        return self.recent_count + self.pin_count + sum(self._counts)
 
     @property
     def total_tokens_covered(self) -> int:
@@ -1215,14 +1312,13 @@ def log_kv_slot_attention(
         attn = torch.softmax(scores, dim=-1).to(q.dtype)     # (B, nkv, rf, T_q, S)
         out = torch.matmul(attn, slot_v.unsqueeze(2))        # (B, nkv, rf, T_q, v_dim)
         if use_rank1_stats:
-            gamma_dot = torch.matmul(qg, slot_gamma_a.unsqueeze(2).mT).to(torch.float32)
-            gamma_weight = (
-                attn.to(torch.float32)
-                * (second_order_scale * scale * gamma_dot)
-                * slot_gamma.to(torch.float32)[:, :, None, None, :]
-            )
-            corr = torch.matmul(gamma_weight, slot_gamma_b.unsqueeze(2).to(torch.float32))
-            out = out + corr.to(out.dtype)
+            # Activation dtype, matching the ``attn @ slot_v`` matmul above —
+            # see the MHA branch for why fp32 here bought nothing but cost the
+            # tensor cores.
+            gamma_dot = torch.matmul(qg, slot_gamma_a.unsqueeze(2).mT)
+            gamma_weight = attn * gamma_dot * slot_gamma[:, :, None, None, :]
+            corr = torch.matmul(gamma_weight, slot_gamma_b.unsqueeze(2))
+            out = out + corr * (second_order_scale * scale)
         return out.reshape(B, nh, T_q, v_dim)
 
     # MHA (nh == nkv): one logit per slot, no head expansion needed.
@@ -1246,14 +1342,15 @@ def log_kv_slot_attention(
     attn = torch.softmax(scores, dim=-1).to(q.dtype)  # (B, nh, T_q, S)
     out = torch.matmul(attn, slot_v)                  # (B, nh, T_q, v_dim)
     if use_rank1_stats:
-        gamma_dot = torch.matmul(q, slot_gamma_a.mT).to(torch.float32)
-        gamma_weight = (
-            attn.to(torch.float32)
-            * (second_order_scale * scale * gamma_dot)
-            * slot_gamma.to(torch.float32).unsqueeze(-2)
-        )
-        corr = torch.matmul(gamma_weight, slot_gamma_b.to(torch.float32))
-        out = out + corr.to(out.dtype)
+        # Value read-out correction in the activation dtype, matching the
+        # ``attn @ slot_v`` matmul right above it. Promoting this one to fp32
+        # bought no accuracy — its largest factor, ``attn``, has already been
+        # rounded to the activation dtype, and matmul accumulates in fp32
+        # regardless — while running a same-shaped matmul off the tensor cores.
+        gamma_dot = torch.matmul(q, slot_gamma_a.mT)
+        gamma_weight = attn * gamma_dot * slot_gamma.unsqueeze(-2)
+        corr = torch.matmul(gamma_weight, slot_gamma_b)
+        out = out + corr * (second_order_scale * scale)
     return out
 
 
@@ -1276,7 +1373,20 @@ def log_kv_chunk_attention(
     the shared building block of ``LogKVStreamTrainingAttention``: its forward
     stream and its backward replay must both compute chunks through this exact
     function so the recomputed graphs match the streamed outputs.
+
+    ``second_order_scale == 0`` skips the rank-1 statistics end to end — they are
+    not gathered, not concatenated, and not multiplied into the scores — so a
+    zero gate costs exactly the first-order path rather than the full
+    second-order path multiplied by zero.
     """
+    if second_order_scale == 0.0:
+        slot_k, slot_v, slot_w = cache.get_attention_state(with_stats=False)
+        k_all, v_all, w_all = append_exact_tokens(slot_k, slot_v, slot_w, k_b, v_b)
+        return log_kv_slot_attention(
+            q_b, k_all, v_all, w_all,
+            scale=scale,
+            causal_tail=q_b.size(2),
+        )
     (
         slot_k,
         slot_v,
