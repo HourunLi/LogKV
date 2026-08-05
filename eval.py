@@ -961,16 +961,16 @@ def main(
                 diag_dir = Path(log_kv_diag_output or output_path or ".").expanduser()
                 diag_dir.mkdir(parents=True, exist_ok=True)
                 tag = log_kv_diag_mode
-            if log_kv_second_order_scale != 1.0:
-                tag += f"_sos{log_kv_second_order_scale:g}"
+                if log_kv_second_order_scale != 1.0:
+                    tag += f"_sos{log_kv_second_order_scale:g}"
                 if log_kv_diag_exact_from_layer is not None:
                     tag += f"_efl{log_kv_diag_exact_from_layer}"
                 if log_kv_diag_peak_window_from_end is not None:
                     tag += f"_pw{log_kv_diag_peak_window_from_end}"
-            if log_kv_diag_second_order_max_width is not None:
-                tag += f"_w{log_kv_diag_second_order_max_width}"
-            if log_kv_diag_second_order_max_layer is not None:
-                tag += f"_l{log_kv_diag_second_order_max_layer}"
+                if log_kv_diag_second_order_max_width is not None:
+                    tag += f"_w{log_kv_diag_second_order_max_width}"
+                if log_kv_diag_second_order_max_layer is not None:
+                    tag += f"_l{log_kv_diag_second_order_max_layer}"
                 diag_file = diag_dir / f"diag_{tag}_{benchmark.replace(',', '+')}_{ts}.json"
                 with open(diag_file, "w", encoding="utf-8") as f:
                     json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)
