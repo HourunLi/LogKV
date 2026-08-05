@@ -251,7 +251,10 @@ for TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
     fi
 done
 
-LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_pin_size ${LOG_KV_PIN} --log_kv_pin_obs_window ${LOG_KV_PIN_OBS} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
+LOG_KV_ARG_LIST=(--log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}" --log_kv_pin_size "${LOG_KV_PIN}" --log_kv_pin_obs_window "${LOG_KV_PIN_OBS}")
+if [ -n "${LOG_KV_SECOND_ORDER_SCALE}" ]; then
+    LOG_KV_ARG_LIST+=(--log_kv_second_order_scale "${LOG_KV_SECOND_ORDER_SCALE}")
+fi
 DIAG_ARGS=${DIAG_ARGS:-}
 TOKENIZER_ARGS=""
 if [ -n "${TOKENIZER_SOURCE}" ]; then
@@ -354,7 +357,7 @@ if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
         --benchmark "${BENCHMARKS}" \
         --output_path "${EVAL_OUTPUT_DIR}" \
         "${MAIN_METADATA_ARGS[@]}" \
-        ${LOG_KV_ARGS} \
+        "${LOG_KV_ARG_LIST[@]}" \
         ${DIAG_ARGS} \
         ${TOKENIZER_ARGS}
 
@@ -379,7 +382,7 @@ if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
         --benchmark "${NIAH_BENCHMARKS}" \
         --metadata "${META}" \
         --output_path "${EVAL_OUTPUT_DIR}" \
-        ${LOG_KV_ARGS} \
+        "${LOG_KV_ARG_LIST[@]}" \
         ${DIAG_ARGS} \
         ${TOKENIZER_ARGS}
 
