@@ -39,6 +39,46 @@ import tqdm
 from utils import *
 
 
+# ==========================================
+# 🧩 分布式小工具
+# ==========================================
+# 约定（与 demo.py 的 checkpoint 保存一致）：**任何"看文件系统"的判定只由
+# rank 0 做，再 broadcast 给其它 rank**。共享盘（OBS/NFS）的元数据缓存在各节点
+# 上的可见时刻不一致，若每个 rank 自己 stat/glob，就可能出现分支不一致 ——
+# 一部分 rank 进了集合通信（barrier / all_gather）而另一部分跳过或直接抛异常
+# 退出，剩下的 rank 就一直等到 NCCL 超时（这里设的是 12h）。评测跑完之后
+# "卡很久" 正是这一类分支不一致 + 进程组没有显式销毁造成的。
+
+def _global_rank() -> int:
+    return dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+
+
+def _is_main() -> bool:
+    """全局 rank == 0（多节点下每个节点都有一个 local_rank 0，不能用 local_rank 判定）。"""
+    return _global_rank() == 0
+
+
+def _dist_ready() -> bool:
+    """真正处于多进程集合通信状态时才为 True（单卡下所有集合操作退化为 no-op）。"""
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+
+def _bcast_device() -> torch.device | None:
+    """NCCL 后端下 broadcast_object_list 必须显式给设备，否则会走默认卡导致串扰。"""
+    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return None
+
+
+def _broadcast_obj(obj: Any, src: int = 0) -> Any:
+    """把 rank ``src`` 上的任意可 pickle 对象广播给所有 rank（单卡时原样返回）。"""
+    if not _dist_ready():
+        return obj
+    box = [obj]
+    dist.broadcast_object_list(box, src=src, device=_bcast_device())
+    return box[0]
+
+
 class SafeJSONEncoder(json.JSONEncoder):
     """处理无法直接序列化的对象（numpy、torch、函数等）"""
     def default(self, obj):
@@ -141,9 +181,23 @@ apply_patch()
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
 
-def _load_lit_model_checkpoint(checkpoint_dir: str, map_location: str | torch.device) -> Any:
-    """加载 ``{checkpoint_dir}/lit_model.pth``（单文件 ``torch.save``，与 demo FSDP ``state_dict_type='full'`` 一致）。"""
+def _load_lit_model_checkpoint(
+    checkpoint_dir: str, map_location: str | torch.device, wait_s: float = 120.0
+) -> Any:
+    """加载 ``{checkpoint_dir}/lit_model.pth``（单文件 ``torch.save``，与 demo FSDP ``state_dict_type='full'`` 一致）。
+
+    多机场景下 rank 0 已经确认过文件存在（见 ``_resolve_checkpoint_dir``），但其它
+    节点的共享盘元数据缓存可能还没刷新。此时直接抛 FileNotFoundError 会让这个 rank
+    单独退出，其余 rank 卡在后续集合通信里等到 NCCL 超时；所以非 rank0 上先轮询等待
+    ``wait_s`` 秒。单进程运行时不等待，行为与之前一致（立刻报错）。
+    """
     lit_path = Path(checkpoint_dir).expanduser() / "lit_model.pth"
+    if not lit_path.exists() and _dist_ready() and not _is_main():
+        deadline = time.time() + wait_s
+        while time.time() < deadline and not lit_path.exists():
+            time.sleep(2.0)
+        if lit_path.exists():
+            print(f"[eval][Rank {_global_rank()}] 共享盘元数据延迟，等待后已看到 {lit_path}")
     if not lit_path.exists():
         raise FileNotFoundError(f"未找到 checkpoint: {lit_path}")
     if lit_path.is_dir():
@@ -233,7 +287,7 @@ def _coerce_yaml_sci_floats(cfg: dict) -> dict:
 # 🧩 logKV 专属：tokenizer 目录回退解析
 # ==========================================
 
-def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
+def _probe_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
     """Resolve a directory that actually holds tokenizer.json / tokenizer.model.
 
     The training save dir normally receives a copy of the tokenizer files
@@ -247,6 +301,9 @@ def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
       2. ``checkpoint_dir`` itself,
       3. the base model dir recorded in ``model_config.yaml``
          (demo.py convention: checkpoints/<hf org>/<hf name>).
+
+    仅供 ``_find_tokenizer_dir`` 在 rank 0 上调用 —— 探测结果由 rank 0 广播，
+    不要在各 rank 上分别调用（分支不一致会挂死，见文件顶部的分布式约定）。
     """
     candidates: list[tuple[str, Path]] = []
     if tokenizer_dir is not None:
@@ -282,6 +339,27 @@ def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
     )
 
 
+def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
+    """rank 0 探测 tokenizer 目录并广播结论；失败信息也一并广播。
+
+    每个 rank 自己探测时，共享盘元数据缓存不一致会让一部分 rank 找到目录、另一部分
+    抛 FileNotFoundError 单独退出，剩下的 rank 就卡在后面的集合通信里。这里让 rank 0
+    独自判定，成功广播路径、失败广播错误信息，保证所有 rank 要么一起继续、要么一起
+    以同一条报错退出。
+    """
+    payload: tuple[str, str] | None = None
+    if _is_main():
+        try:
+            payload = ("ok", str(_probe_tokenizer_dir(checkpoint_dir, tokenizer_dir)))
+        except FileNotFoundError as e:
+            payload = ("err", str(e))
+
+    kind, value = _broadcast_obj(payload)
+    if kind == "err":
+        raise FileNotFoundError(value)
+    return Path(value)
+
+
 class LogKVLM(LM):
     """LM wrapper that scores and generates through the log-structured KV cache.
 
@@ -314,7 +392,7 @@ class LogKVLM(LM):
         self.log_kv_pin_obs_window = log_kv_pin_obs_window
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
-        is_master = not dist.is_initialized() or dist.get_rank() == 0
+        is_master = _is_main()
 
         resolved_tok_dir = _find_tokenizer_dir(checkpoint_dir, tokenizer_dir)
         if is_master:
@@ -404,9 +482,21 @@ class LogKVLM(LM):
     # ==========================================
     # 🌟 分布式结果收集
     # ==========================================
-    def all_gather_results(self, local_result_list: list):
-        if not dist.is_initialized() or dist.get_world_size() == 1:
+    def all_gather_results(self, local_result_list: list, tag: str = ""):
+        if not _dist_ready():
             return local_result_list
+
+        # 各 rank 拿到的样本长度差异很大（长上下文生成尤甚），最慢的 rank 决定整体
+        # 结束时间。先显式 barrier 把"等其它 rank"的时间量出来单独打印，否则它会被
+        # 算进 all_gather 里，看上去就是"评测跑完之后莫名卡住"。
+        t0 = time.perf_counter()
+        dist.barrier()
+        wait_s = time.perf_counter() - t0
+        print(
+            f"⏳ [Rank {dist.get_rank()}] {tag} 本地 {len(local_result_list)} 条已完成，"
+            f"等待其它 rank 用时 {wait_s:.1f}s",
+            flush=True,
+        )
 
         dp_size = dist.get_world_size()
         all_results_list = [None for _ in range(dp_size)]
@@ -519,7 +609,7 @@ class LogKVLM(LM):
 
         # 清理 CUDA 缓存，避免 all_gather 时 OOM
         torch.cuda.empty_cache()
-        return self.all_gather_results(results)
+        return self.all_gather_results(results, tag="loglikelihood")
 
     # ==========================================
     # 🌟 核心 2：自回归生成任务 (LongBench)
@@ -594,7 +684,7 @@ class LogKVLM(LM):
 
         # 清理 CUDA 缓存，避免 all_gather 时 OOM
         torch.cuda.empty_cache()
-        return self.all_gather_results(results)
+        return self.all_gather_results(results, tag="generate_until")
 
     def loglikelihood_rolling(self, requests):
         """Rolling log-likelihood over full documents (lm-eval PPL tasks, e.g.
@@ -635,7 +725,7 @@ class LogKVLM(LM):
             results.append(total_logprob)
 
         torch.cuda.empty_cache()
-        return self.all_gather_results(results)
+        return self.all_gather_results(results, tag="loglikelihood_rolling")
 
     @property
     def eot_token_id(self): return self.tokenizer.eos_id
@@ -651,17 +741,28 @@ class LogKVLM(LM):
     def tok_decode(self, tokens): return self.tokenizer.decode(torch.tensor(tokens))
 
 def _resolve_checkpoint_dir(checkpoint_dir: str) -> str:
-    """自动检测分段 checkpoint。若存在 step_* 子目录（含 lit_model.pth）则选最大 step，否则直接用原路径。"""
-    base = Path(os.path.expandvars(os.path.expanduser(checkpoint_dir)))
-    step_dirs = [
-        d for d in base.glob("step_*")
-        if d.is_dir() and (d / "lit_model.pth").exists()
-    ]
-    if not step_dirs:
-        return checkpoint_dir
-    max_dir = max(step_dirs, key=lambda d: int(d.name.split("_")[1]))
-    print(f"🔍 检测到分段 checkpoint，自动选择最新: {max_dir}")
-    return str(max_dir)
+    """自动检测分段 checkpoint。若存在 step_* 子目录（含 lit_model.pth）则选最大 step，否则直接用原路径。
+
+    glob + exists() 必须只由 rank 0 判定再广播：训练刚写完最后一个 step_* 时，
+    其它节点的共享盘元数据缓存可能还看不到它，各 rank 各自 glob 就会选到**不同的
+    checkpoint**（评测结果静默不可比），或者一部分 rank 找不到权重直接退出、把其余
+    rank 留在集合通信里等到 NCCL 超时。
+    """
+    resolved: str | None = None
+    if _is_main():
+        base = Path(os.path.expandvars(os.path.expanduser(checkpoint_dir)))
+        step_dirs = [
+            d for d in base.glob("step_*")
+            if d.is_dir() and (d / "lit_model.pth").exists()
+        ]
+        if step_dirs:
+            max_dir = max(step_dirs, key=lambda d: int(d.name.split("_")[1]))
+            print(f"🔍 检测到分段 checkpoint，自动选择最新: {max_dir}")
+            resolved = str(max_dir)
+        else:
+            resolved = checkpoint_dir
+
+    return _broadcast_obj(resolved)
 
 
 @auto_expand_env_vars
@@ -747,9 +848,14 @@ def main(
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
+    # 进程组可能由外部创建（demo.py 用 Fabric 起训练后直接 in-process 调 eval.main），
+    # 这时**不能**由 eval 销毁它，否则训练侧后续的集合通信全炸。只有 eval 自己建的
+    # 才由 eval 负责销毁。
+    pg_owned_here = False
     if world_size > 1 and not dist.is_initialized():
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=12))
+        pg_owned_here = True
 
     device = f"cuda:{local_rank}"
 
@@ -761,7 +867,8 @@ def main(
             "slot->token span mapping (see litgpt.log_kv_diag)."
         )
 
-    if local_rank == 0:
+    # 多节点时用全局 rank==0（每个节点都有一个 local_rank 0，用它会重复打印）
+    if _is_main():
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
         print(f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} (obs {log_kv_pin_obs_window})")
         if diag_active:
@@ -772,138 +879,176 @@ def main(
                 "每 rank 各自累积统计量，不跨 rank 聚合"
             )
 
-    checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
+    # eval_done：所有 rank 都跑完了 simple_evaluate（即全部集合通信都已结束）。
+    # 只有这时收尾 barrier 才是安全的；某个 rank 中途抛异常时必须跳过 barrier，
+    # 否则其余 rank 会干等到 NCCL 超时（12h）。
+    eval_done = False
+    try:
+        checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
 
-    lm_model = LogKVLM(
-        checkpoint_dir,
-        device=device,
-        config_overrides=config_overrides,
-        log_kv_B=log_kv_B,
-        log_kv_recent_size=log_kv_recent_size,
-        log_kv_prefill_block=log_kv_prefill_block,
-        log_kv_pin_size=log_kv_pin_size,
-        log_kv_pin_obs_window=log_kv_pin_obs_window,
-        tokenizer_dir=tokenizer_dir,
-    )
-
-    with diag_mode(
-        log_kv_diag_mode,
-        exact_from_layer=log_kv_diag_exact_from_layer,
-        peak_window_from_end=log_kv_diag_peak_window_from_end,
-    ) if diag_active else contextlib.nullcontext():
-        results = evaluator.simple_evaluate(
-            model=lm_model,
-            tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
-            confirm_run_unsafe_code=True,
-            batch_size=1,
-            metadata=metadata,
-            limit=limit,
+        lm_model = LogKVLM(
+            checkpoint_dir,
+            device=device,
+            config_overrides=config_overrides,
+            log_kv_B=log_kv_B,
+            log_kv_recent_size=log_kv_recent_size,
+            log_kv_prefill_block=log_kv_prefill_block,
+            log_kv_pin_size=log_kv_pin_size,
+            log_kv_pin_obs_window=log_kv_pin_obs_window,
+            tokenizer_dir=tokenizer_dir,
         )
 
-    # 与 LogKVLM.is_master 一致：多节点时应用全局 rank==0，而非 local_rank==0（每节点各有一个 local 0）
-    is_main = not dist.is_initialized() or dist.get_rank() == 0
+        with diag_mode(
+            log_kv_diag_mode,
+            exact_from_layer=log_kv_diag_exact_from_layer,
+            peak_window_from_end=log_kv_diag_peak_window_from_end,
+        ) if diag_active else contextlib.nullcontext():
+            results = evaluator.simple_evaluate(
+                model=lm_model,
+                tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
+                confirm_run_unsafe_code=True,
+                batch_size=1,
+                metadata=metadata,
+                limit=limit,
+            )
+        eval_done = True
 
-    if is_main:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 落盘阶段：只有 rank 0 写文件（建目录、写 json/csv/xlsx）。其它 rank 什么都
+        # 不做，直接到下面的 barrier 等 rank 0 写完 —— 各 rank 同时往共享盘写同名文件
+        # 会互相截断，而 mkdir/exists 各判各的又会引入分支不一致。
+        if _is_main():
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # 🌟 诊断汇总（score/value oracle 归因；见 litgpt.log_kv_diag）：每次调用
-        # 对应一个 (task 类型, mode) 组合，独立落一份 JSON —— 不与常规 results 合并，
-        # 也不跨 rank 聚合（诊断样本量小，单卡跑就够，见上面的启动打印）。
-        if diag_active:
-            diag_dir = Path(log_kv_diag_output or output_path or ".").expanduser()
-            diag_dir.mkdir(parents=True, exist_ok=True)
-            tag = log_kv_diag_mode
-            if log_kv_diag_exact_from_layer is not None:
-                tag += f"_efl{log_kv_diag_exact_from_layer}"
-            if log_kv_diag_peak_window_from_end is not None:
-                tag += f"_pw{log_kv_diag_peak_window_from_end}"
-            diag_file = diag_dir / f"diag_{tag}_{benchmark.replace(',', '+')}_{ts}.json"
-            with open(diag_file, "w", encoding="utf-8") as f:
-                json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)
-            print(f"🔬 诊断汇总已保存到: {diag_file}")
+            # 🌟 诊断汇总（score/value oracle 归因；见 litgpt.log_kv_diag）：每次调用
+            # 对应一个 (task 类型, mode) 组合，独立落一份 JSON —— 不与常规 results 合并，
+            # 也不跨 rank 聚合（诊断样本量小，单卡跑就够，见上面的启动打印）。
+            if diag_active:
+                diag_dir = Path(log_kv_diag_output or output_path or ".").expanduser()
+                diag_dir.mkdir(parents=True, exist_ok=True)
+                tag = log_kv_diag_mode
+                if log_kv_diag_exact_from_layer is not None:
+                    tag += f"_efl{log_kv_diag_exact_from_layer}"
+                if log_kv_diag_peak_window_from_end is not None:
+                    tag += f"_pw{log_kv_diag_peak_window_from_end}"
+                diag_file = diag_dir / f"diag_{tag}_{benchmark.replace(',', '+')}_{ts}.json"
+                with open(diag_file, "w", encoding="utf-8") as f:
+                    json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)
+                print(f"🔬 诊断汇总已保存到: {diag_file}")
 
-        # 🌟 第一步：立即保存原始 results 对象，便于后续恢复
-        results_cache_file = Path("eval_results_cache.json")
-        try:
-            with open(results_cache_file, "w", encoding="utf-8") as f:
-                json.dump(results, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
-            print(f"💾 原始 results 已缓存到: {results_cache_file}")
-        except Exception as e:
-            print(f"❌ 缓存 results 失败: {e}")
-            print(f"⚠️ 尝试使用备用方案...")
+            # 🌟 第一步：立即保存原始 results 对象，便于后续恢复
+            results_cache_file = Path("eval_results_cache.json")
             try:
-                # 备用方案：先转换为字符串表示
-                results_str = str(results)
                 with open(results_cache_file, "w", encoding="utf-8") as f:
-                    json.dump({"results_str": results_str}, f, indent=2, ensure_ascii=False)
-                print(f"💾 results 已以字符串形式缓存到: {results_cache_file}")
-            except Exception as e2:
-                print(f"❌ 备用方案也失败了: {e2}")
-                return
-
-        # 🌟 第二步：打印表格
-        from lm_eval.utils import make_table
-        print(make_table(results))
-
-        # 🌟 第三步：如果指定了输出路径，保存完整的JSON输出
-        if output_path is not None:
-            json_output = {
-                "timestamp": ts,
-                "benchmark": benchmark,
-                "checkpoint_dir": checkpoint_dir,
-                "results": results,
-            }
-
-            base = Path(output_path).expanduser()
-            if base.suffix.lower() == ".json":
-                output_file = base.with_name(f"{base.stem}_{ts}{base.suffix}")
-            else:
-                output_file = base / f"eval_results_{ts}.json"
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-
-            try:
-                with open(output_file, "w", encoding="utf-8") as f:
-                    json.dump(json_output, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
-                print(f"✅ 完整结果已保存到: {output_file}")
+                    json.dump(results, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
+                print(f"💾 原始 results 已缓存到: {results_cache_file}")
             except Exception as e:
-                print(f"❌ 保存完整结果失败: {e}")
-                print(f"⚠️ 尝试备用方案...")
+                print(f"❌ 缓存 results 失败: {e}")
+                print(f"⚠️ 尝试使用备用方案...")
                 try:
-                    json_output["results"] = str(results)
-                    with open(output_file, "w", encoding="utf-8") as f:
-                        json.dump(json_output, f, indent=2, ensure_ascii=False)
-                    print(f"✅ 完整结果已以备用方案保存到: {output_file}")
+                    # 备用方案：先转换为字符串表示
+                    results_str = str(results)
+                    with open(results_cache_file, "w", encoding="utf-8") as f:
+                        json.dump({"results_str": results_str}, f, indent=2, ensure_ascii=False)
+                    print(f"💾 results 已以字符串形式缓存到: {results_cache_file}")
                 except Exception as e2:
                     print(f"❌ 备用方案也失败了: {e2}")
+                    return
 
-            # 🌟 第四步：保存推理时延 xlsx
-            inference_xlsx = output_file.with_suffix(".inference_metrics.xlsx")
+            # 🌟 第二步：打印表格
+            from lm_eval.utils import make_table
+            print(make_table(results))
+
+            # 🌟 第三步：如果指定了输出路径，保存完整的JSON输出
+            if output_path is not None:
+                json_output = {
+                    "timestamp": ts,
+                    "benchmark": benchmark,
+                    "checkpoint_dir": checkpoint_dir,
+                    "results": results,
+                }
+
+                base = Path(output_path).expanduser()
+                if base.suffix.lower() == ".json":
+                    output_file = base.with_name(f"{base.stem}_{ts}{base.suffix}")
+                else:
+                    output_file = base / f"eval_results_{ts}.json"
+                output_file.parent.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        json.dump(json_output, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
+                    print(f"✅ 完整结果已保存到: {output_file}")
+                except Exception as e:
+                    print(f"❌ 保存完整结果失败: {e}")
+                    print(f"⚠️ 尝试备用方案...")
+                    try:
+                        json_output["results"] = str(results)
+                        with open(output_file, "w", encoding="utf-8") as f:
+                            json.dump(json_output, f, indent=2, ensure_ascii=False)
+                        print(f"✅ 完整结果已以备用方案保存到: {output_file}")
+                    except Exception as e2:
+                        print(f"❌ 备用方案也失败了: {e2}")
+
+                # 🌟 第四步：保存推理时延 xlsx
+                inference_xlsx = output_file.with_suffix(".inference_metrics.xlsx")
+                try:
+                    import pandas as pd
+                    with pd.ExcelWriter(inference_xlsx) as writer:
+                        if lm_model.gen_metrics:
+                            gen_df = pd.DataFrame(lm_model.gen_metrics)
+                            gen_df.to_excel(writer, sheet_name="generate_until", index=False)
+                            # 按 prompt 长度分桶统计
+                            gen_df["prompt_bucket"] = pd.cut(gen_df["prompt_len"],
+                                bins=[0, 1024, 4096, 8192, 16384, 32768, 999999],
+                                labels=["0-1K", "1K-4K", "4K-8K", "8K-16K", "16K-32K", "32K+"])
+                            summary = gen_df.groupby("prompt_bucket", observed=False).agg(
+                                count=("prompt_len", "count"),
+                                avg_prompt_len=("prompt_len", "mean"),
+                                avg_decode_ms_tok=("decode_ms_per_token", "mean"),
+                                avg_gen_tok_sec=("gen_tokens_per_sec", "mean"),
+                            ).round(2).reset_index()
+                            summary.to_excel(writer, sheet_name="gen_by_bucket", index=False)
+                        if lm_model.ppl_metrics:
+                            ppl_df = pd.DataFrame(lm_model.ppl_metrics)
+                            ppl_df.to_excel(writer, sheet_name="loglikelihood", index=False)
+                    print(f"📊 推理时延指标已保存至 {inference_xlsx}")
+                except Exception as e:
+                    print(f"⚠️ 推理时延 xlsx 保存失败: {e}")
+
+                # 🌟 第五步：生成 CSV 结果文件
+                extract_results_to_csv(results, benchmark, output_file)
+
+    finally:
+        # ── 收尾：所有 rank 在这里汇合，然后显式销毁进程组 ──
+        # 这是"评测跑完之后要等很久"的直接修复点。之前的行为是：非 rank0 跑完
+        # simple_evaluate 就直接走到函数末尾、跑到解释器退出，而 rank 0 还在写
+        # json/csv/xlsx；进程组从头到尾没被销毁，退出时要等 NCCL watchdog 把
+        # 通信子 abort 掉才肯收敛，启动器（torchrun / ModelArts）就一直挂在
+        # "等最后一个 worker 退出"上。
+        # 现在改成：rank 0 写完 → barrier 汇合 → 一起 destroy_process_group() →
+        # 一起退出。
+        # 这里的异常一律吞掉：finally 里抛出会顶掉 try 中真正的报错，把根因藏起来。
+        rank = _global_rank()
+        if _dist_ready():
+            if eval_done:
+                t0 = time.perf_counter()
+                try:
+                    dist.barrier()
+                    print(f"🤝 [Rank {rank}] 收尾同步完成，用时 {time.perf_counter() - t0:.1f}s", flush=True)
+                except Exception as e:  # noqa: BLE001 — 收尾阶段不掩盖主异常
+                    print(f"⚠️ [Rank {rank}] 收尾 barrier 失败（忽略）: {e}", flush=True)
+            else:
+                # 有 rank 异常退出：绝不能 barrier，否则其它 rank 等到 NCCL 超时。
+                # 直接往下销毁进程组，让对端尽快收到通信中断而不是干等 12h。
+                print(f"⚠️ [Rank {rank}] 评测未正常结束，跳过收尾 barrier", flush=True)
+
+        if pg_owned_here and dist.is_available() and dist.is_initialized():
             try:
-                import pandas as pd
-                with pd.ExcelWriter(inference_xlsx) as writer:
-                    if lm_model.gen_metrics:
-                        gen_df = pd.DataFrame(lm_model.gen_metrics)
-                        gen_df.to_excel(writer, sheet_name="generate_until", index=False)
-                        # 按 prompt 长度分桶统计
-                        gen_df["prompt_bucket"] = pd.cut(gen_df["prompt_len"],
-                            bins=[0, 1024, 4096, 8192, 16384, 32768, 999999],
-                            labels=["0-1K", "1K-4K", "4K-8K", "8K-16K", "16K-32K", "32K+"])
-                        summary = gen_df.groupby("prompt_bucket", observed=False).agg(
-                            count=("prompt_len", "count"),
-                            avg_prompt_len=("prompt_len", "mean"),
-                            avg_decode_ms_tok=("decode_ms_per_token", "mean"),
-                            avg_gen_tok_sec=("gen_tokens_per_sec", "mean"),
-                        ).round(2).reset_index()
-                        summary.to_excel(writer, sheet_name="gen_by_bucket", index=False)
-                    if lm_model.ppl_metrics:
-                        ppl_df = pd.DataFrame(lm_model.ppl_metrics)
-                        ppl_df.to_excel(writer, sheet_name="loglikelihood", index=False)
-                print(f"📊 推理时延指标已保存至 {inference_xlsx}")
-            except Exception as e:
-                print(f"⚠️ 推理时延 xlsx 保存失败: {e}")
-
-            # 🌟 第五步：生成 CSV 结果文件
-            extract_results_to_csv(results, benchmark, output_file)
+                dist.destroy_process_group()
+                if rank == 0:
+                    print("✅ 分布式进程组已销毁，评测进程可以正常退出了", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"⚠️ [Rank {rank}] 销毁进程组失败（忽略）: {e}", flush=True)
 
 
 @auto_expand_env_vars
