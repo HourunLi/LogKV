@@ -845,11 +845,10 @@ class CausalSelfAttention(nn.Module):
             raise TypeError("training_log_kv requires a LogStructuredKVCache")
         cache = self.kv_cache
         cache._convert_dtype(q.dtype)
-        # A zero gate makes every Sigma/Gamma term vanish, so tell the cache not
-        # to build the statistics that feed them — during second-order warmup
-        # this is the difference between paying for compaction statistics that
-        # are multiplied by zero and not computing them at all.
-        cache.second_order = self.log_kv_second_order_scale != 0.0
+        # ``cache.second_order`` is deliberately NOT set here: LogKVStreamTrainingAttention
+        # derives it from the gate it is handed, in both forward and backward, so
+        # that the two passes cannot disagree. Setting it here as well would just
+        # be a second source of truth to drift.
         self._log_kv_pending = None  # training never defers a tail token
 
         scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
