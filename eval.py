@@ -1001,7 +1001,11 @@ def main(
                     tag += f"_w{log_kv_diag_second_order_max_width}"
                 if log_kv_diag_second_order_max_layer is not None:
                     tag += f"_l{log_kv_diag_second_order_max_layer}"
-                diag_file = diag_dir / f"diag_{tag}_{benchmark.replace(',', '+')}_{ts}.json"
+                # checkpoint 目录名嵌进文件名——不同 checkpoint（比如 naive vs
+                # warmup）的诊断产物即使不小心落进同一个 output_path，靠文件名
+                # 也能分清，不用回头翻时间戳猜是哪次跑的（历史上 D5 数据被搞混过一次）。
+                ckpt_name = Path(checkpoint_dir).name
+                diag_file = diag_dir / f"diag_{ckpt_name}_{tag}_{benchmark.replace(',', '+')}_{ts}.json"
                 with open(diag_file, "w", encoding="utf-8") as f:
                     json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)
                 print(f"🔬 诊断汇总已保存到: {diag_file}")

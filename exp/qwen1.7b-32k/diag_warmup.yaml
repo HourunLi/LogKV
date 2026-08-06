@@ -1,0 +1,31 @@
+# ==========================================
+# logKV 分支 · Qwen3-1.7B · 32K · Phase 0 诊断评测配置（warmup CPT 版）
+#
+# 和 diag.yaml 的唯一区别：checkpoint_dir / output_path 指向
+# exp/qwen1.7b-32k/arc_warmup.yaml 训出的 checkpoint（second_order_scale
+# 目标 0.2、warmup 100 步），而不是最早那个不带 warmup 的 naive checkpoint。
+# 分开一份文件是为了避免两个 checkpoint 的诊断 JSON 落到同一个 output_path
+# 目录、文件名又分不出是谁跑出来的（历史上 D5 数据就因为类似的新旧数据混淆
+# 出过一次问题）。用法（mode / benchmark 组合、metadata 格式）完全参照
+# diag.yaml 顶部的注释块，这里不重复。
+# ==========================================
+
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
+tokenizer_dir: null
+
+limit: 40
+
+benchmark: null
+metadata: null
+
+output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup/diag
+
+log_kv_B: 512
+log_kv_recent_size: 1024
+log_kv_second_order_scale: null
+log_kv_prefill_block: 1024
+log_kv_pin_size: 0
+log_kv_pin_obs_window: 64
+
+log_kv_diag_mode: null
+log_kv_diag_output: null
