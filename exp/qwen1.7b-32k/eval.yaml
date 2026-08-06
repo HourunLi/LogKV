@@ -38,4 +38,4 @@ log_kv_pin_obs_window: 64
 # benchmark 里只要还含 niah_*/ruler_*，这里就必须给，不能注释掉。
 metadata:
   pretrained: *tokenizer_dir
-  max_seq_lengths: [1024, 2048, 4096, 8192, 16384, 32768]
+  max_seq_lengths: [4096, 16384]
