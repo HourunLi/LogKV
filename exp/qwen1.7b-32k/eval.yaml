@@ -15,40 +15,15 @@
 # ── 评测对象 ──
 # 默认指向 logKV 训练产物（base.yaml 的 save_path，目录内应有
 # lit_model.pth + tokenizer 文件 + model_config.yaml）。
-checkpoint_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV
-# 若要复现 kv 分支的「原始基座模型」基线评测，改用下面这行并把 use_log_kv 设为 false:
-# checkpoint_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
-
-# 仅当 checkpoint_dir 里没有 tokenizer.json / tokenizer.model 时才需要
-# （旧 checkpoint、或训练时未拷贝 tokenizer 的目录）。正常留 null。
-tokenizer_dir: null
-# tokenizer_dir: checkpoints/Qwen/Qwen3-1.7B-Base
-
-# ── benchmark（与 kv 分支 1.7b-32k eval.yaml 完全一致，一项不落）──
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
+tokenizer_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
 # benchmark: "boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa,lambada_openai,wikitext,longbench_qasper,longbench_multifieldqa_zh,longbench_multifieldqa_en,longbench_triviaqa,longbench_trec,longbench_lsht,longbench_multi_news,longbench_qmsum,longbench_dureader,longbench_2wikimqa,longbench_gov_report_e,longbench_hotpotqa_e,longbench_multi_news_e,longbench_qasper_e,longbench_multifieldqa_en_e,longbench_passage_retrieval_en_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e,mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
-benchmark: "longbench_qasper,longbench_multifieldqa_zh,longbench_multifieldqa_en"
-
-# ── 结果输出（目录；rank0 写带时间戳的 JSON + CSV）──
-# 仿照 kv 的 ${MY_REAL_NAME-default} 写法，落在 checkpoint 目录下的 evaluate/。
-# output_path: ./ckpt/qwen1.7b-32k-debug/evaluate
-output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV
-
-# output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/checkpoints/Qwen/Qwen3-1.7B-Base/
-
-# ── logKV（本分支专属；评测恒定走压缩注意力，无 dense 分支）──
-# 必须与训练 YAML（base.yaml）中的取值一致：
+benchmark: "niah_single_1,longbench_gov_report_e,longbench_qmsum"
+output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
 log_kv_B: 512
 log_kv_recent_size: 1024
 log_kv_second_order_scale: 1.0
-# prefill 分块大小（推理专用，不影响训练语义对齐的缓存状态）：
-# 2 = 严格 2-token 流式语义（慢，用于 A/B 验证）；越大越快，
-# 偏差上界 = 块内 query 比严格流式多看到 < block 个未压缩 token。
 log_kv_prefill_block: 1024
-
-# 显著性钉扎（SnapKV 式观察窗，推理专用；捞针/检索类任务的关键）：
-# prefill 时 prompt 末尾 obs_window 个 query 给全前缀打分，每个 KV 组
-# 各钉 pin_size 个 token 为精确 w=1 槽；层级照常池化（缓存轨迹不变）。
-# 0 = 关闭（做无钉扎消融时用）。
 log_kv_pin_size: 256
 log_kv_pin_obs_window: 64
 
@@ -63,3 +38,5 @@ log_kv_pin_obs_window: 64
 # metadata:
 #   pretrained: ./ckpt/qwen1.7b-32k-debug
 #   max_seq_lengths: [1024, 2048, 4096, 8192, 16384, 32768]
+log_kv_second_order_scale: 1.0
+log_kv_second_order_warmup_steps: 10

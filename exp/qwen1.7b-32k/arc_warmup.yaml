@@ -2,11 +2,11 @@ config: base.yaml
 
 expid: qwen1.7b-32k-cpt-logKV-warmup
 
-ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+ckpt_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
 
 global_batch_size: 128
 micro_batch_size: 1
-max_steps: 2000
+max_steps: 1000
 warmup_steps: 0
 learning_rate: 5e-5
 min_lr: 5e-5
