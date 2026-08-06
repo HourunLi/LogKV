@@ -79,6 +79,22 @@ def _broadcast_obj(obj: Any, src: int = 0) -> Any:
     return box[0]
 
 
+def _hb(stage: str) -> None:
+    """无条件心跳打印（所有 rank，不受 tqdm/is_main 限制），排查多机卡死用。
+
+    之前的问题日志里只看得到 global rank 0 的 tqdm（其它 63 个 rank 全程
+    静默，见 loglikelihood/generate_until 里的 disable_tqdm），没法判断到底
+    是所有 rank 都卡住了，还是只有某一个 rank 慢/挂了。这里改成每个 rank
+    自己在关键节点各打一行，帯 hostname，方便从日志里按 rank 分组核对进度。
+    """
+    import socket
+    rank = _global_rank()
+    world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+    host = socket.gethostname()
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"💓 [{ts}][Rank {rank}/{world}][{host}] {stage}", flush=True)
+
+
 class SafeJSONEncoder(json.JSONEncoder):
     """处理无法直接序列化的对象（numpy、torch、函数等）"""
     def default(self, obj):
@@ -596,8 +612,12 @@ class LogKVLM(LM):
         local_requests = requests[dp_rank::dp_size]
         results = []
         disable_tqdm = (dp_rank != 0)
+        if dp_size > 1:
+            _hb(f"loglikelihood 开始，本地 {len(local_requests)} 条")
 
-        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
+        for _i, req in enumerate(tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm)):
+            if dp_size > 1 and (_i == 0 or (_i + 1) % 20 == 0):
+                _hb(f"loglikelihood 开始处理第 {_i + 1}/{len(local_requests)} 条")
             context, continuation = req.args[0], req.args[1]
 
             ctx_enc = self.tokenizer.encode(context).tolist()
@@ -621,8 +641,12 @@ class LogKVLM(LM):
         local_requests = requests[dp_rank::dp_size]
         results = []
         disable_tqdm = (dp_rank != 0)
+        if dp_size > 1:
+            _hb(f"generate_until 开始，本地 {len(local_requests)} 条")
 
-        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
+        for _i, req in enumerate(tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm)):
+            if dp_size > 1 and (_i == 0 or (_i + 1) % 10 == 0):
+                _hb(f"generate_until 开始处理第 {_i + 1}/{len(local_requests)} 条（若长时间不见下一条心跳，说明就卡在这一条上）")
             prompt = req.args[0]
             gen_args = req.args[1]
 
@@ -705,7 +729,11 @@ class LogKVLM(LM):
         disable_tqdm = (dp_rank != 0)
 
         max_len = self.model.max_seq_length
-        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
+        if dp_size > 1:
+            _hb(f"loglikelihood_rolling 开始，本地 {len(local_requests)} 条")
+        for _i, req in enumerate(tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm)):
+            if dp_size > 1 and (_i == 0 or (_i + 1) % 20 == 0):
+                _hb(f"loglikelihood_rolling 开始处理第 {_i + 1}/{len(local_requests)} 条")
             (text,) = req.args
             tokens = self.tokenizer.encode(text, bos=False).tolist()
 
@@ -856,6 +884,8 @@ def main(
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=12))
         pg_owned_here = True
+    if world_size > 1:
+        _hb("进程组就绪（rendezvous 完成）")
 
     device = f"cuda:{local_rank}"
 
@@ -897,6 +927,8 @@ def main(
             log_kv_pin_obs_window=log_kv_pin_obs_window,
             tokenizer_dir=tokenizer_dir,
         )
+        if world_size > 1:
+            _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
 
         with diag_mode(
             log_kv_diag_mode,
