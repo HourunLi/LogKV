@@ -80,12 +80,11 @@ def _broadcast_obj(obj: Any, src: int = 0) -> Any:
 
 
 def _hb(stage: str) -> None:
-    """无条件心跳打印（所有 rank，不受 tqdm/is_main 限制），排查多机卡死用。
+    """无条件心跳打印（所有 rank，不受 is_main 限制），排查多机卡死用。
 
-    之前的问题日志里只看得到 global rank 0 的 tqdm（其它 63 个 rank 全程
-    静默，见 loglikelihood/generate_until 里的 disable_tqdm），没法判断到底
-    是所有 rank 都卡住了，还是只有某一个 rank 慢/挂了。这里改成每个 rank
-    自己在关键节点各打一行，帯 hostname，方便从日志里按 rank 分组核对进度。
+    标记 dist.init_process_group / 模型加载完成这类一次性里程碑（真正的逐条
+    计算进度由 loglikelihood/generate_until 里每个 rank 各自的 tqdm 负责，
+    不需要在这里重复打印）。带 hostname，方便从日志里按 rank 分组核对。
     """
     import socket
     rank = _global_rank()
@@ -181,6 +180,17 @@ if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+
+# 每个 rank 各自独立加载一遍数据集，HF datasets 的 "Found the latest cached
+# dataset configuration ..." 日志和内部 tqdm 进度条会被重复打印 rank 份，
+# 跟评测本身的计算进度混在一起。这里关掉，只留下面每个 rank 自己的计算进度。
+os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+try:
+    import datasets as _hf_datasets
+    _hf_datasets.disable_progress_bars()
+    _hf_datasets.logging.set_verbosity_error()
+except Exception:
+    pass
 
 import dataclasses
 
@@ -611,13 +621,9 @@ class LogKVLM(LM):
 
         local_requests = requests[dp_rank::dp_size]
         results = []
-        disable_tqdm = (dp_rank != 0)
-        if dp_size > 1:
-            _hb(f"loglikelihood 开始，本地 {len(local_requests)} 条")
 
-        for _i, req in enumerate(tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm)):
-            if dp_size > 1 and (_i == 0 or (_i + 1) % 20 == 0):
-                _hb(f"loglikelihood 开始处理第 {_i + 1}/{len(local_requests)} 条")
+        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
+        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank):
             context, continuation = req.args[0], req.args[1]
 
             ctx_enc = self.tokenizer.encode(context).tolist()
@@ -640,13 +646,9 @@ class LogKVLM(LM):
 
         local_requests = requests[dp_rank::dp_size]
         results = []
-        disable_tqdm = (dp_rank != 0)
-        if dp_size > 1:
-            _hb(f"generate_until 开始，本地 {len(local_requests)} 条")
 
-        for _i, req in enumerate(tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm)):
-            if dp_size > 1 and (_i == 0 or (_i + 1) % 10 == 0):
-                _hb(f"generate_until 开始处理第 {_i + 1}/{len(local_requests)} 条（若长时间不见下一条心跳，说明就卡在这一条上）")
+        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
+        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank):
             prompt = req.args[0]
             gen_args = req.args[1]
 
@@ -726,14 +728,10 @@ class LogKVLM(LM):
 
         local_requests = requests[dp_rank::dp_size]
         results = []
-        disable_tqdm = (dp_rank != 0)
 
         max_len = self.model.max_seq_length
-        if dp_size > 1:
-            _hb(f"loglikelihood_rolling 开始，本地 {len(local_requests)} 条")
-        for _i, req in enumerate(tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm)):
-            if dp_size > 1 and (_i == 0 or (_i + 1) % 20 == 0):
-                _hb(f"loglikelihood_rolling 开始处理第 {_i + 1}/{len(local_requests)} 条")
+        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
+        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank):
             (text,) = req.args
             tokens = self.tokenizer.encode(text, bos=False).tolist()
 
