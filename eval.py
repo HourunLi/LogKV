@@ -79,6 +79,21 @@ def _broadcast_obj(obj: Any, src: int = 0) -> Any:
     return box[0]
 
 
+def _hb(stage: str) -> None:
+    """无条件心跳打印（所有 rank，不受 is_main 限制），排查多机卡死用。
+
+    标记 dist.init_process_group / 模型加载完成这类一次性里程碑（真正的逐条
+    计算进度由 loglikelihood/generate_until 里每个 rank 各自的 tqdm 负责，
+    不需要在这里重复打印）。带 hostname，方便从日志里按 rank 分组核对。
+    """
+    import socket
+    rank = _global_rank()
+    world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+    host = socket.gethostname()
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"💓 [{ts}][Rank {rank}/{world}][{host}] {stage}", flush=True)
+
+
 class SafeJSONEncoder(json.JSONEncoder):
     """处理无法直接序列化的对象（numpy、torch、函数等）"""
     def default(self, obj):
@@ -165,6 +180,17 @@ if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+
+# 每个 rank 各自独立加载一遍数据集，HF datasets 的 "Found the latest cached
+# dataset configuration ..." 日志和内部 tqdm 进度条会被重复打印 rank 份，
+# 跟评测本身的计算进度混在一起。这里关掉，只留下面每个 rank 自己的计算进度。
+os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+try:
+    import datasets as _hf_datasets
+    _hf_datasets.disable_progress_bars()
+    _hf_datasets.logging.set_verbosity_error()
+except Exception:
+    pass
 
 import dataclasses
 
@@ -598,9 +624,9 @@ class LogKVLM(LM):
 
         local_requests = requests[dp_rank::dp_size]
         results = []
-        disable_tqdm = (dp_rank != 0)
 
-        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
+        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
+        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank):
             context, continuation = req.args[0], req.args[1]
 
             ctx_enc = self.tokenizer.encode(context).tolist()
@@ -623,9 +649,9 @@ class LogKVLM(LM):
 
         local_requests = requests[dp_rank::dp_size]
         results = []
-        disable_tqdm = (dp_rank != 0)
 
-        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
+        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
+        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank):
             prompt = req.args[0]
             gen_args = req.args[1]
 
@@ -705,10 +731,10 @@ class LogKVLM(LM):
 
         local_requests = requests[dp_rank::dp_size]
         results = []
-        disable_tqdm = (dp_rank != 0)
 
         max_len = self.model.max_seq_length
-        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank, disable=disable_tqdm):
+        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
+        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank):
             (text,) = req.args
             tokens = self.tokenizer.encode(text, bos=False).tolist()
 
@@ -882,6 +908,8 @@ def main(
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=12))
         pg_owned_here = True
+    if world_size > 1:
+        _hb("进程组就绪（rendezvous 完成）")
 
     device = f"cuda:{local_rank}"
 
@@ -930,6 +958,8 @@ def main(
         log_kv_second_order_scale=log_kv_second_order_scale,
             tokenizer_dir=tokenizer_dir,
         )
+        if world_size > 1:
+            _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
 
         with diag_mode(
             log_kv_diag_mode,
