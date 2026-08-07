@@ -156,86 +156,94 @@ scale"，需要改的是接口形状（比如传一个按 layer 索引的 list/d
 
 ## 6. 未解决问题 / 下一步
 
-### 6.1【最高优先级，反复卡住】拿到"width≥8 + scale 匹配训练值(0.2) + 生产 B=512"的干净数据
+### 6.1【已解决，2026-08-07】"width≥8 + scale 匹配训练值(0.2) + 生产 B=512"的干净数据
 
-这是回答第 2 节核心问题（宽槽二阶修正的实际下游损害）所需的最后一块拼图，目标命令是：
+warmup CPT（scale=0.2, warmup=100 步，**1500 步训练已完整跑完**，见 6.2）产出了完整
+的下游指标对比，走的是 `majob.sh`（不是本节原先设想的 `diag_warmup.yaml` 单条
+torchrun 命令），四组配置用的是**同一个 checkpoint + 同一套评测命令模板**，只切换
+`log_kv_pin_size` / `log_kv_second_order_scale`，可比性已确认：
 
-```bash
-torchrun --nproc_per_node=1 eval.py --config exp/qwen1.7b-32k/diag_warmup.yaml \
-  --benchmark niah_single_1 \
-  --metadata '{"pretrained": "'"${CKPT_DIR}"'", "max_seq_lengths": [32768]}' \
-  --log_kv_diag_mode baseline --log_kv_second_order_scale 0.2
-```
+| 配置 | ACC | LongBench | LongBench_e | niah（均值）| niah_single_1 | niah_single_2 | niah_single_3 |
+|---|---|---|---|---|---|---|---|
+| 完整 transformer（dense baseline，CPT 后）| 0.6158 | 0.2463 | 0.2715 | 1.0 | – | – | – |
+| LogKV vanilla（无二阶修正、无 pin）| 0.6146 | 0.1626 | 0.1803 | 0.032 | 0.024 | 0.046 | 0.026 |
+| LogKV + importance pin | 0.6146 | 0.1363 | 0.1441 | 0.0313 | 0.044 | 0.03 | 0.02 |
+| LogKV + 2nd order + pins | 0.6113 | 0.1214 | 0.1331 | 0.0467 | 0.068 | 0.032 | 0.04 |
+| LogKV + 2nd order, no pins | 0.6113 | 0.1716 | 0.1918 | 0.0827 | 0.07 | 0.114 | 0.064 |
 
-**关键点**：`max_seq_lengths` 必须只给**一个足够长的值**（比如 `[32768]`），不能给
-`[4096, 16384]` 这种多值列表——已经通过读 lm-eval-harness 源码
-（`niah_utils.py::niah_single_1`）确认：数据集是按 `max_seq_lengths` 里每个长度各生成
-500 条样本、**按长度顺序拼接**，而 `diag.yaml` 的 `limit: 40` 只取数据集**最前面** 40
-条。如果长度列表里第一个值是短的（如 4096），`limit=40` 会全部落在短样本里，永远采样
-不到深层 width，这也是之前所有 D1 数据卡在 width=4 的根本原因（不是 `log_kv_B` 的
-问题，不需要改 `log_kv_B`）。
+（用户报的原始数字里 "LogKV vanilla" 的 ACC 一开始写的是 `10.6146`，按其余四组 ACC
+都在 0.61–0.62 区间、且跟下一行 "importance pin" 的 0.6146 完全一致，已确认按笔误
+处理，记录为 `0.6146`。）
 
-**现状（2026-08-06 晚最后一次核实）**：`transfer/` 里到目前为止连续三次交付的"新"
-文件，都还是 `widths=[1,2,4]`（浅层）——第一次是 git 层面的纯改名/时间戳重打（内容
-跟旧文件字节相同），后两次内容确实是新跑的，但依然是浅层（怀疑 `--metadata` 的
-`max_seq_lengths` 没有真的传成 `[32768]`，或者被 shell 引号/转义吃掉了）。**下次接续
-时第一件事**：确认用户那边实际执行的命令行，尤其是 `--metadata` 参数的引号有没有被
-shell 转义破坏，同时确认走的是 `diag_warmup.yaml`（而不是没改过的 `diag.yaml`，那个
-指向的是崩溃前 naive checkpoint）。
+**为什么现在认为这组数据是干净的（关闭了本节原先反复卡住的顾虑）**：
+- `majob.sh:377` 的 `META` 确实是 `max_seq_lengths: [1024, 2048, 4096, 8192, 16384,
+  32768]` 多值列表，但 `majob.sh:396-408` 调 `eval.py` 时**没有传 `--config`，也没有
+  传 `--limit`**——`eval.py` 里 `limit` 的函数默认值是 `None`（`eval.py:824`），即
+  **不截断，6 个长度各 500 条样本全跑**。本节原先担心的"`limit=40` 吃掉浅层长度"这个
+  坑，只存在于 `--config diag*.yaml` 那条路径，`majob.sh` 完全没碰到。
+- `unused/parse_lmeval_table.py:338` 里 `TARGET_METRIC_MAP` 显式把 `niah_single_1/2/3`
+  映射到 `"32768"` 这一档——lm-eval-harness 对 niah 任务是按每个长度单独出一行分数
+  （不是跨长度平均），用户确认过表里的 "niah" 数字就是按"每个 niah_single_i 只取
+  32768 档、三个取平均"这个约定算的（见上表 niah_single_1/2/3 细分列）。所以这组
+  niah 数字**是真实的 32768 长度、深 width 区间数据**，不存在浅层污染。
 
-**更新（2026-08-07）**：warmup CPT（scale=0.2, warmup=100 步）跑出了第一组完整的
-下游指标对比（Common Sense Reasoning ACC / LongBench / LongBench_e / niah_single_1，
-具体是不是走的 6.1 开头那条"`max_seq_lengths=[32768]` 单值"命令、跑了多少 step 的
-checkpoint，下次接续时需要跟用户确认，本次会话未核实评测命令本身）：
-
-| 配置 | ACC | LongBench | LongBench_e | niah |
-|---|---|---|---|---|
-| 完整 transformer（dense baseline，CPT 后）| 0.6158 | 0.2463 | 0.2715 | 1.0 |
-| LogKV vanilla（无二阶修正、无 pin）| 0.6146 | 0.1626 | 0.1803 | 0.032 |
-| LogKV + importance pin | 0.6146 | 0.1363 | 0.1441 | 0.0313 |
-| LogKV + 2nd order + pins | 0.6113 | 0.1214 | 0.1331 | 0.0467 |
-| LogKV + 2nd order, no pins | 0.6113 | 0.1716 | 0.1918 | 0.0827 |
-
-（用户报的原始数字里 "LogKV vanilla" 的 ACC 写的是 `10.6146`，按其余四组 ACC 都在
-0.61–0.62 区间、且跟下一行 "importance pin" 的 0.6146 完全一致，判断开头的 `1` 是
-笔误/复制粘贴混入，记录时按 `0.6146` 处理——**下次接续时找用户确认一下这个改动对不
-对**。）
-
-初步解读（都还只是这一组数据的观察，不是定论）：
-- 二阶修正（scale=0.2，与训练目标匹配）在**不加 pin** 时，是四个压缩变体里下游指标
-  最好的：LongBench 0.1716 > vanilla 0.1626，niah 0.0827 > vanilla 0.032（约 2.6×）。
-  说明 warmup CPT 训练出来的二阶修正在下游任务上是正向的，第 4 节的训练崩溃问题
-  修复后没有留下副作用。
+**解读（现在可以当作阶段性结论，不只是观察）**：
+- 二阶修正（scale=0.2，与训练目标匹配）在**不加 pin** 时是四个压缩变体里下游指标
+  最好的：LongBench 0.1716 > vanilla 0.1626，niah 0.0827 > vanilla 0.032（约 2.6×，
+  三个子任务全面提升：0.07/0.114/0.064 vs 0.024/0.046/0.026）。说明 warmup CPT 训练
+  出来的二阶修正在下游任务上确实有正向作用，第 4 节的训练崩溃问题修复后没有留下
+  副作用，值得继续往这个方向投入。
 - **加 pin 是负向的**，且和是否叠加二阶修正无关：单独 importance pin（LongBench
   0.1363、niah 0.0313）比 vanilla 还差；2nd order + pins（LongBench 0.1214、niah
-  0.0467）也明显不如 2nd order 不加 pin。这跟直觉（pin 应该保留重要 token、只会更好）
-  相反，是这次会话浮出的新问题，原因还没查（可能的方向：pin 选择逻辑本身、pin 与
-  Fenwick 合并的交互、还是训练时 pin_size 与推理不一致——见第 4 节关于
-  `log_kv_pin_size` 训练/推理可以不一致的备注，这里恰好是需要重新审视这条备注的地方）。
-- ACC（常识推理）四组几乎不分伯仲（0.611–0.616），说明短程信息在所有压缩方案下都
-  保留得不错，真正拉开差距的是长程检索类任务（LongBench、niah）。
-- 即便是最好的压缩变体（2nd order, no pins），niah 也只有 0.0827，离 dense baseline
-  的 1.0 差距巨大——对第 2 节"宽槽 rank-1 失真是否有实际下游损害"这个问题，这组数据
-  倾向于支持"有明显损害"，但还不能排除是训练配置本身（1500 步是否训完、scale=0.2
-  是否是最优点）尚未调到位，需要结合 6.2 的训练完成度确认一起看。
+  0.0467）也明显不如 2nd order 不加 pin。**根因大概率已经定位到代码层面**：训练走
+  的 `_log_kv_train_lowmem_forward`（`model.py:724-725`）从头到尾没有任何 pin 相关
+  代码；`_log_kv_select_pins`（`model.py:865`，`@torch.no_grad()`）只在推理路径里
+  被调用（`model.py:1013-1020`，`cache.pin_size > 0` 时）。`arc_warmup.yaml` 虽然
+  `config: base.yaml` 继承了 `log_kv_pin_size: 256`，但这个值对训练**完全没有效果**
+  ——训练根本不构建 `LogStructuredKVCache`，不会走到 pin 选择逻辑。也就是说**模型从
+  没在训练里见过"精确 pin token + 同一 token 被池化稀释的粗糙副本同时存在"这种输入
+  结构**，pin 是纯推理期外挂（`log_kv_cache.py:357-361` 注释："pins only ADD
+  duplicates, hierarchy still pools them, state trajectory bit-identical
+  with/without pins"）。这个"多一个精确副本只会帮忙不会有害"的设计假设，被这组
+  实测数据推翻了。第 4 节那条"训练用非 0 pin、推理改成 0 pin 是安全的，两者可以自由
+  不一致"的备注需要重新审视——**这个备注反过来才是更接近真相的：train/eval 在 pin
+  这件事上必须不一致，因为训练那条路径根本不存在"有 pin"这个状态**。
+- ACC（常识推理）四组几乎不分伯仲（0.611–0.616），短程信息在所有压缩方案下都保留
+  得不错，真正拉开差距的是长程检索类任务（LongBench、niah）。
+- **重新解读第 2 节的核心问题**：LogKV vanilla（纯均值池化，不开二阶修正、不开 pin）
+  在 32768 长度上 niah 已经是 0.032，相对 dense baseline 的 1.0 几乎全灭。二阶修正
+  把它拉到 0.0827（+2.6×）是真实的正向贡献，但**绝大部分损失在纯均值池化阶段就已经
+  发生**——32768 长度下大量 token 被压进远超"width≥8 开始失真"量级的槽（B=512，
+  recent_size=1024，实际宽度可能是 64/128 甚至更宽），rank-1 近似哪怕完全精确，
+  表达能力也不足以在这么宽的槽里救回一个孤立事实。这正是 pin 机制本来要解决的场景
+  （`log_kv_cache.py` 注释："uniform 2:1 mean-pooling dilutes a distant
+  low-redundancy fact ... pins"），但目前 pin 是负贡献而不是正贡献。**结论：比起
+  继续抠 rank-1 精度，修好 pin 大概率是更高杠杆的下一步**（pin 本来就是为了兜住这个
+  确切失败模式设计的）。
 
-**下次接续的下一步**：(a) 找用户确认上面 ACC 笔误的判断；(b) 查一下这组数据具体是
-哪个 checkpoint / 哪条评测命令跑出来的（尤其是 niah 的 `max_seq_lengths` 是不是按
-6.1 开头强调的"单值 32768"跑的，否则这组 niah 数字可能仍然偏浅层，跟之前反复卡住
-的问题是同一个坑）；(c) 着手查一下"加 pin 为什么反而更差"。
+**下一步（尚未执行，等待决定要不要做）**：写一个只读诊断，对着现有 checkpoint 跑
+几条 niah_single_1 样本，把 `_log_kv_select_pins` 选中的 `_log_kv_pin_indices`
+（`model.py:924`）跟数据集里真实的 needle 插入位置对比：
+- 如果 pin 选得准但指标还是差 → 印证"训练从没见过 pin 态"的分布不一致假设，下一步
+  要决定要不要让训练也引入 pin 态（工程量较大）。
+- 如果 pin 选得不准 → 问题在 `_log_kv_select_pins` 本身（`log_kv_pin_obs_window=64`、
+  `kernel_size=7` 聚类之类），修起来便宜很多，不涉及重训。
 
-### 6.2 warmup CPT 训练（1500 步，scale=0.2, warmup=100）是否已经完整跑完
+### 6.2【已解决，2026-08-07】warmup CPT 训练（1500 步，scale=0.2, warmup=100）已完整跑完
 
-目前只直接见过 step_200 的 checkpoint 产出的诊断数据，没有确认过 1500 步是否已经
-训练完成、loss 曲线是否正常（不再出现类似崩溃）。
+用户确认 6.1 表格里的数据就是完整 1500 步训练后的结果，不再是中间 checkpoint。
 
-### 6.3（较低优先级，仅为设计参考）是否要做按 layer/width 差异化的 `second_order_scale`
+### 6.3（优先级低于 6.1 的 pin 排查，仅为设计参考）是否要做按 layer/width 差异化的 `second_order_scale`
 
-取决于 6.1 的结果：如果干净数据证明 width≥8 在匹配 scale 下依然有明显下游损害，则
-值得考虑把 `second_order_scale` 从全局标量改成按 width 分桶的接口（3.1 节的诊断门控
-已经验证过"只在 width≤N 生效"在数值上是可行的，接口改动主要是把这个门控从诊断专用
-搬到生产路径，并想清楚训练时怎么处理这个新维度的超参）。**在 6.1 有干净结论之前不要
-动生产接口**。
+6.1 的干净数据已经证明 width≥8（32768 长度）在匹配 scale 下确实有明显下游损害，但
+6.1 结尾的重新解读认为**大部分损害发生在纯均值池化阶段**（vanilla niah 就已经
+0.032），二阶修正只是部分缓解；真正对症的机制（pin）目前是负贡献。所以这里的判断
+调整为：**先把 6.1 里 pin 的根因查清楚、pin 能不能修好，再回头评估 6.3 这个接口改动
+的 ROI**——如果 pin 修好后 width≥8 的损害大幅缩小，那么 per-width scale 这个接口
+改动的必要性会显著降低；如果 pin 修好后仍有明显损害，再考虑这个方向（3.1 节的诊断
+门控已经验证过"只在 width≤N 生效"在数值上是可行的，接口改动主要是把这个门控从诊断
+专用搬到生产路径，并想清楚训练时怎么处理这个新维度的超参）。**不要在 pin 排查有
+结论之前动生产接口**。
 
 ## 7. 有用的坑 / 经验教训（给下次接续的自己看）
 
