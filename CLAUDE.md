@@ -5,6 +5,42 @@
 > 代码层面的细节（怎么加插件、怎么跑服务）见仓库根目录上一级的 `~/CLAUDE.md`；这份
 > 只讲 LogKV 这一个专题。
 
+## 0. 现状速览（2026-08-07，只想快速接续就读这节，细节看后面对应章节）
+
+**进展**：warmup CPT（`second_order_scale` 目标 0.2，warmup 100 步）已经完整训练
+1500 步，并跑出了 dense baseline / LogKV vanilla / +importance pin / +2nd order+pins /
++2nd order no-pins 五组下游指标（ACC、LongBench、LongBench_e、niah@32768），四组
+压缩变体用的是同一个 checkpoint + 同一套评测命令模板，可比性已确认（详见 6.1）。
+
+**评测结果**（niah 是 niah_single_1/2/3 在 32768 长度上的均值，其余同理，完整细分表
+见 6.1）：
+
+| 配置 | ACC | LongBench | LongBench_e | niah |
+|---|---|---|---|---|
+| dense baseline（CPT 后）| 0.6158 | 0.2463 | 0.2715 | 1.0 |
+| LogKV vanilla | 0.6146 | 0.1626 | 0.1803 | 0.032 |
+| + importance pin | 0.6146 | 0.1363 | 0.1441 | 0.0313 |
+| + 2nd order + pins | 0.6113 | 0.1214 | 0.1331 | 0.0467 |
+| + 2nd order, no pins | 0.6113 | 0.1716 | 0.1918 | 0.0827 |
+
+**怀疑的问题（按当前置信度从高到低）**：
+1. **pin 是负贡献，且大概率是训练/推理分布不一致导致的**——训练路径
+   `_log_kv_train_lowmem_forward` 完全不涉及 pin（`_log_kv_select_pins` 是
+   `@torch.no_grad()`、只在推理时调用），所以不管 yaml 里 `log_kv_pin_size` 写多少，
+   模型从没在训练里见过"精确 pin token + 同一 token 被池化稀释的粗糙副本同时存在"
+   这种输入结构。还没做的验证：pin 选的位置到底准不准（见 6.1 末尾的诊断计划）。
+2. 二阶修正本身是正贡献（niah 0.032→0.0827），但**大部分下游损失在纯均值池化阶段就
+   已经发生**（vanilla niah 就已经比 dense 掉了 97%），所以第 2 节"rank-1 在宽槽下
+   失真"未必是当前最大的病灶——32768 长度下槽宽可能远超 width=8，rank-1 表达能力
+   本身就不够，这正是 pin 该顶上的场景。
+3. ACC（常识推理）四组几乎无差异，问题集中在长程检索类任务，短程信息保留良好。
+
+**下一步方向**：优先级从高到低——(a) 写只读诊断脚本，对比 `_log_kv_select_pins`
+选中的 pin 位置和 niah 真实 needle 位置，判断 pin 选择准不准（还没做，等待拍板）；
+(b) 视 (a) 结果决定是修 `_log_kv_select_pins` 本身，还是要不要让训练也引入 pin 态；
+(c) 6.3 提到的"按 layer/width 差异化 second_order_scale"接口改动，明确排在 pin 排查
+之后，pin 修好后再评估还有没有必要做。
+
 ## 1. 这是什么项目
 
 `litgpt/litgpt/log_kv_cache.py` 实现了一个分层（Fenwick-tree 风格，二进制进位合并）的
@@ -106,6 +142,22 @@ rank-1 近似开始明显失真，但这个失真是否在**实际下游指标**
 等全部换成独立路径（`-warmup` 后缀），跟原来那个不带 warmup 的 naive checkpoint 完全
 隔离，互不覆盖。当前内容（已验证，见第 4 节）：`ckpt_dir` 指向 base Qwen3-1.7B-Base，
 `max_steps=1500`，`log_kv_second_order_scale=0.2`，`log_kv_second_order_warmup_steps=100`。
+
+### 3.6 本次会话（2026-08-07 续，纯排查，未改动任何生产/测试代码）
+
+上一次会话（3.1–3.5）改了代码；这次会话只做了三件事，**都没有touch生产代码**：
+1. 帮用户核对了 warmup CPT（scale=0.2）五组下游指标数据，确认口径（ACC 笔误、niah
+   取 32768 档均值的约定）——结果见 6.1 表格。
+2. 读代码定位了"pin 拖累指标"的大概率根因：`model.py:724-725`
+   （`_log_kv_train_lowmem_forward`，训练路径）与 `model.py:865/1013-1020`
+   （`_log_kv_select_pins`，推理路径 `@torch.no_grad()`）之间完全没有交集——训练从不
+   构建 `LogStructuredKVCache`，`log_kv_pin_size` 这个训练配置字段是死参数。
+3. 读了 `majob.sh:377,396-408` 和 `unused/parse_lmeval_table.py:338`，确认 6.1 的
+   niah 数据没有踩中 6.1 原先担心的"`limit` 截断到浅层 width"的坑（`majob.sh` 调
+   `eval.py` 时不传 `--config`/`--limit`，全量跑；niah 数字按约定取的是 32768 档）。
+
+产出的诊断脚本（6.1 末尾"下一步"里提的 pin-vs-needle 对比）**还没写**，等用户决定
+要不要做。
 
 ## 4. 一次真实的训练崩溃排查（已定位根因）
 
