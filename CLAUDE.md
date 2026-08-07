@@ -1,0 +1,216 @@
+# LogKV 项目工作记录（存档，更新于 2026-08-06）
+
+> 本文件是给下次接续工作时用的存档，记录 LogKV（Fenwick-tree / O(log N) 显存 KV cache
+> 压缩，rank-1 Σ_s/Γ_s 二阶修正）这条线目前做了什么、改了什么、卡在哪、下一步该干嘛。
+> 代码层面的细节（怎么加插件、怎么跑服务）见仓库根目录上一级的 `~/CLAUDE.md`；这份
+> 只讲 LogKV 这一个专题。
+
+## 1. 这是什么项目
+
+`litgpt/litgpt/log_kv_cache.py` 实现了一个分层（Fenwick-tree 风格，二进制进位合并）的
+KV cache 压缩机制：新 token 先落在 width=1 的槽，随着序列增长，相邻两个槽以 2:1 均值
+池化的方式合并成更宽的槽（width 2, 4, 8, 16...），整体显存占用是 O(log N) 而不是 O(N)。
+
+朴素均值池化会丢失槽内 token 的方差信息，所以每个槽除了 `k`/`v`/`w`（合并权重），还
+额外维护一份 **rank-1 二阶统计量**：`slot_sigma_u` / `slot_sigma2`（对 K 的协方差做
+rank-1 近似）和 `slot_gamma_a` / `slot_gamma_b` / `slot_gamma`（对 K-V 互协方差做 rank-1
+近似）。Attention 时用这些统计量对分数和读出值做二阶修正：
+
+```
+score_s = scale·(q·k_s) + 0.5·scale²·second_order_scale·sigma2_s·(q·sigma_u_s)² + λ·log(w_s)
+read_s  = v_s + second_order_scale·scale·gamma_s·(q·gamma_a_s)·gamma_b_s
+```
+
+`second_order_scale` 是一个运行时标量，同时缩放分数修正和读出修正，训练和推理路径共用
+（`litgpt/litgpt/log_kv_cache.py` 里的 `log_kv_slot_attention`）。目前**全局唯一一个
+scale，没有按 layer / 按 width 区分**（这是本次会话里反复确认过的设计现状，不是遗漏——
+下面第 5 节会讲为什么，以及诊断工具怎么在不改生产代码的前提下模拟"按 width 门控"）。
+
+模型侧：`litgpt/litgpt/model.py` 的 `set_log_kv_second_order_scale()` 把这个标量设到
+所有 transformer block 上（每层统一）；训练时 `_log_kv_train_lowmem_forward` 调用
+`LogKVStreamTrainingAttention.apply(q, k, v, cache, scale, train_block,
+self.log_kv_second_order_scale)`，梯度经过这个被 scale 加权的修正项回传（cache 状态
+本身是 `.detach()` 的 / no_grad，但用它算出来的 attention 输出是可微的）。
+
+## 2. 核心问题：rank-1 近似在宽槽下会失真
+
+`compact()` 合并两个 B-slot 的 block 时，语义是"把 `[k1;k2]` 按时间顺序拼起来，然后
+在拼接后的序列里配对相邻槽 (2i, 2i+1) → i"，**不是**按下标跨 block 一一配对。这个语义
+本身是对的（通过追踪 `_binary_carry` 的真实行为验证过：某一层自己的 B 个条目和刚进位
+上来的 B 个条目，正是按这种"拼接再相邻配对"的方式合并，能正确且独立地把各自内部的
+pair 减半）。
+
+合并用 `_rank1_psd_from_factors`（对小 Gram 矩阵做 eigh）算 Σ，`_rank1_cross_from_factors`
+（QR+SVD）算 Γ，实现的是 Chan 并行协方差公式 + 强制 rank-1 截断。**这个强制截断就是
+误差的来源**：width=2 的槽（正好两个 token）的协方差天然就是 rank-1，此时统计量是精确
+的；但从 width=4 开始，两个已经是"近似 rank-1"的子槽再合并，截断误差会累积——这是
+D1 自检（`sigma_q_rel` / `gamma_q_rel` / `score2_rel` / `value2_rel`，在 `by_level`
+里）测出来的核心结论，而且这个结论是**纯算法性质**：只取决于原始 K/V 和 width，跟
+模型权重、checkpoint、`second_order_scale`、`log_kv_B` 都无关（B 只影响某个 width 的
+槽**什么时候**首次出现，不影响它出现时统计量的精度）。
+
+**当前假设（部分验证，部分待验证）**：二阶修正在 width ≤ 4 时基本可靠，width ≥ 8 时
+rank-1 近似开始明显失真，但这个失真是否在**实际下游指标**（NIAH 检索准确率、LongBench
+分数）上造成有意义的伤害——尤其是在 `second_order_scale` 与训练时匹配的前提下——
+**还没有一个干净的数据点能回答**（见第 6 节"未解决问题"）。
+
+## 3. 这次会话做的代码改动（都已完成并验证）
+
+### 3.1 诊断工具：width × layer 联合门控（`litgpt/litgpt/log_kv_diag.py`）
+
+纯诊断用途，**从未接入生产路径**（`log_kv_slot_attention` 完全不知道这个东西存在）。
+目的是回答"如果二阶修正只在 width ≤ N 且 layer ≤ M 时生效，指标会怎样变化"，不用改
+生产代码、不用重新训练就能扫描这个门控阈值对诊断误差的影响。
+
+- `DiagState` 新增 `second_order_max_width` / `second_order_max_layer`（`None` = 不限制）。
+- `_diag_slot_core` 里新增一条并行计算路径：`layer_ok`（每次调用算一次）和 `width_ok`
+  （每次 run 算一次）都满足时才用真实 `second_order_scale`，否则该项 `eff_scale = 0`；
+  用这个 `eff_scale` 重新算一遍 `out_width_gated_c`，误差记到新字段 `err_width_gated`
+  （复用命名，向前兼容旧的 `err_baseline` 语义）。
+- `diag_mode(...)` context manager 加了对应的两个参数透传。
+- `summary()` 的 `by_layer_output` 新增 `err_width_gated` 输出。
+
+### 3.2 修了两个过时的单测（`litgpt/tests/test_log_kv_cache.py` 的 `TestCompact`）
+
+`test_merge_weighted_average` / `test_merge_unequal_weights` 之前的预期值是按"跨 block
+按下标一一配对"算的，跟 3.1 节确认的真实语义（拼接后配对相邻槽）不符。已按正确语义
+改写期望值和注释。改完后 `TestCompact` 3/3、全文件 73/73 通过。
+
+### 3.3 修了三处同一个模式的 YAML 覆盖 CLI 的 bug
+
+`eval.py` 的 `main()` 里有个 `_o()` 辅助函数，规则是"YAML 里非 null 的值会覆盖 CLI
+传的值"——这个规则是为了让 `benchmark`/`metadata`/`log_kv_diag_mode` 这类"故意留空
+等 CLI 传"的字段生效。但如果 YAML 里某个字段写死了非 null 默认值，用
+`--config <yaml>` 直接跑（而不是走 `eval.sh` 的展平方式）时，CLI 传的同名参数会被
+**静默丢弃**，不会报错，很容易跑出一批"以为改了参数、实际上跑的还是旧值"的脏数据。
+
+本次会话发现并修了三处：
+- `exp/qwen1.7b-32k/diag.yaml`：`log_kv_second_order_scale: 1.0` → `null`
+- `exp/qwen1.7b-32k/diag.yaml`：`log_kv_B: 512` → `null`
+- `exp/qwen1.7b-32k/diag_warmup.yaml`：`log_kv_B: 512` → `null`
+
+（`main()` 自己的 Python 函数默认值分别是 `1.0` / `512`，所以不传 CLI 时行为不变，
+向后兼容。）**这个 bug 类型值得记住**：以后往任何诊断/评测 YAML 里加新字段、又想让
+它支持 CLI 扫参时，默认必须写 `null`，不能写具体数值。
+
+### 3.4 `eval.py` 诊断文件名加了区分度
+
+加了 `_sos{scale}` 标签（scale≠1.0 时）和 checkpoint 名前缀（`diag_{ckpt_name}_{tag}_...`），
+避免不同 checkpoint / 不同 scale 跑出来的诊断 JSON 文件名混淆、互相覆盖或分不清谁是谁
+（历史上出过一次"新旧数据混淆"的问题，这是针对性修复）。
+
+### 3.5 新建了 warmup CPT 专用配置
+
+`exp/qwen1.7b-32k/arc_warmup.yaml`（训练）+ `exp/qwen1.7b-32k/diag_warmup.yaml`（诊断
+评测），是 `arc.yaml` / `diag.yaml` 的平行版本，`expid`/`save_path`/`checkpoint_dir`
+等全部换成独立路径（`-warmup` 后缀），跟原来那个不带 warmup 的 naive checkpoint 完全
+隔离，互不覆盖。当前内容（已验证，见第 4 节）：`ckpt_dir` 指向 base Qwen3-1.7B-Base，
+`max_steps=1500`，`log_kv_second_order_scale=0.2`，`log_kv_second_order_warmup_steps=100`。
+
+## 4. 一次真实的训练崩溃排查（已定位根因）
+
+用户报告：第一版 warmup CPT（`second_order_scale` 目标 1.0，`warmup_steps=10`）训练
+loss 从原本 2 左右直接飙到 7，LongBench 和 NIAH 几乎崩坏。用户给的分 scale 观察数据：
+
+| scale | loss |
+|---|---|
+| 0.1 | 0.5896 |
+| 0.2 | 2.70 |
+| 0.3 | 4.1719 |
+| 0.4 | 6.656 |
+| 1.0 | 11-12（训练若干轮后降到 7，但整体效果极差）|
+
+排查结论：**不是"二阶修正本身太强/有害"，而是目标 scale（1.0）远超过一个明确存在的
+"甜点区"（eval-time-only 的 scale 扫描显示大约在 0.1–0.25 之间），叠加 warmup 只有 10
+步（几乎没有缓冲）**，两者叠加导致训练早期梯度爆炸式崩溃。不是根本机制问题。
+
+修复：`arc_warmup.yaml` 改成 `log_kv_second_order_scale: 0.2`、
+`log_kv_second_order_warmup_steps: 100`，`ckpt_dir` 确认（用户确认过）是从干净的
+Qwen3-1.7B-Base 开始训练、不是从崩溃的 checkpoint 续训。已重新用 `majob.sh` 启动。
+
+**训练/评测双端一致性已核实**（这是本次会话最后确认的问题）：
+- 训练（`demo.py --config arc_warmup.yaml`）：前 100 步 `current_second_order_scale`
+  从 0 线性爬升到 0.2（`get_log_kv_second_order_scale` 算，`set_log_kv_second_order_scale`
+  每步设一次），之后固定 0.2，二阶修正项参与反向传播。
+  同一份 yaml 里 `log_kv_pin_size` 没设（继承 `arc.yaml`? 需要下次确认，pin 只影响推理
+  期缓存配置、不影响训练权重——`_log_kv_select_pins` 是 `@torch.no_grad()` 的纯推理期
+  行为，所以训练用非 0 pin、推理改成 0 pin 是安全的，两者可以自由不一致）。
+- 评测（`majob.sh` 的 `LOG_KV_ARGS`，第 242 行拼出 `--log_kv_second_order_scale
+  ${LOG_KV_SECOND_ORDER_SCALE}`，值从同一份 yaml 里 bash 提取）：固定用 0.2，跟训练
+  目标值一致，没有爬坡（评测不需要）。
+- `majob.sh` 正常调用**不会**激活任何 `diag_mode`（`log_kv_diag_mode` 从不传，
+  `diag_active=False`，走 `contextlib.nullcontext()`，诊断代码路径完全绕过），但数值
+  上等价于 `diag_mode=baseline` 测出来的东西（`baseline` 就是直接委托给生产路径
+  `_production_block` → `log_kv_slot_attention`）。第 3.1 节的 width/layer 门控对
+  `majob.sh` 的真实产出**没有任何影响**——它只在显式用 `diag_mode` 跑诊断脚本时才会
+  生效。
+
+## 5. 为什么现在没有按 layer / 按 width 差异化 scale
+
+这是设计讨论，不是代码限制——`second_order_scale` 目前是运行时传入所有层的单一标量，
+`model.py` 遍历所有 transformer block 时统一设置。要做到"每层甚至每个 width 桶用不同
+scale"，需要改的是接口形状（比如传一个按 layer 索引的 list/dict），而不是算法本身；
+本次会话没有实现这个（用户明确要求先做诊断验证，别急着改生产接口），而是用 3.1 节的
+诊断门控在不改生产代码的前提下模拟"只在 width ≤ N 时生效"的效果，用来判断值不值得
+真的去做这个接口改动。
+
+## 6. 未解决问题 / 下一步
+
+### 6.1【最高优先级，反复卡住】拿到"width≥8 + scale 匹配训练值(0.2) + 生产 B=512"的干净数据
+
+这是回答第 2 节核心问题（宽槽二阶修正的实际下游损害）所需的最后一块拼图，目标命令是：
+
+```bash
+torchrun --nproc_per_node=1 eval.py --config exp/qwen1.7b-32k/diag_warmup.yaml \
+  --benchmark niah_single_1 \
+  --metadata '{"pretrained": "'"${CKPT_DIR}"'", "max_seq_lengths": [32768]}' \
+  --log_kv_diag_mode baseline --log_kv_second_order_scale 0.2
+```
+
+**关键点**：`max_seq_lengths` 必须只给**一个足够长的值**（比如 `[32768]`），不能给
+`[4096, 16384]` 这种多值列表——已经通过读 lm-eval-harness 源码
+（`niah_utils.py::niah_single_1`）确认：数据集是按 `max_seq_lengths` 里每个长度各生成
+500 条样本、**按长度顺序拼接**，而 `diag.yaml` 的 `limit: 40` 只取数据集**最前面** 40
+条。如果长度列表里第一个值是短的（如 4096），`limit=40` 会全部落在短样本里，永远采样
+不到深层 width，这也是之前所有 D1 数据卡在 width=4 的根本原因（不是 `log_kv_B` 的
+问题，不需要改 `log_kv_B`）。
+
+**现状（2026-08-06 晚最后一次核实）**：`transfer/` 里到目前为止连续三次交付的"新"
+文件，都还是 `widths=[1,2,4]`（浅层）——第一次是 git 层面的纯改名/时间戳重打（内容
+跟旧文件字节相同），后两次内容确实是新跑的，但依然是浅层（怀疑 `--metadata` 的
+`max_seq_lengths` 没有真的传成 `[32768]`，或者被 shell 引号/转义吃掉了）。**下次接续
+时第一件事**：确认用户那边实际执行的命令行，尤其是 `--metadata` 参数的引号有没有被
+shell 转义破坏，同时确认走的是 `diag_warmup.yaml`（而不是没改过的 `diag.yaml`，那个
+指向的是崩溃前 naive checkpoint）。
+
+### 6.2 warmup CPT 训练（1500 步，scale=0.2, warmup=100）是否已经完整跑完
+
+目前只直接见过 step_200 的 checkpoint 产出的诊断数据，没有确认过 1500 步是否已经
+训练完成、loss 曲线是否正常（不再出现类似崩溃）。
+
+### 6.3（较低优先级，仅为设计参考）是否要做按 layer/width 差异化的 `second_order_scale`
+
+取决于 6.1 的结果：如果干净数据证明 width≥8 在匹配 scale 下依然有明显下游损害，则
+值得考虑把 `second_order_scale` 从全局标量改成按 width 分桶的接口（3.1 节的诊断门控
+已经验证过"只在 width≤N 生效"在数值上是可行的，接口改动主要是把这个门控从诊断专用
+搬到生产路径，并想清楚训练时怎么处理这个新维度的超参）。**在 6.1 有干净结论之前不要
+动生产接口**。
+
+## 7. 有用的坑 / 经验教训（给下次接续的自己看）
+
+- `eval.sh` vs 直接 `torchrun --config <yaml> eval.py`：**语义不同**。`eval.sh` 会把
+  YAML 展平成纯 CLI flag 自己拼命令，不传 `--config` 给 `eval.py`，所以 `_o()` 的
+  "YAML 非 null 覆盖 CLI" 逻辑根本不会触发；直接用 `--config <yaml>` 时会触发。凡是
+  新增会被扫参覆盖的字段，YAML 里必须写 `null`（见 3.3 节）。
+- argparse "后出现的 flag 生效"：`utils.py` 的 `run_cli()` 用的是普通
+  `argparse.ArgumentParser()`（不是 jsonargparse，是为了让 `--config` 能当一个普通
+  参数存在），一行命令里如果同一个 flag 出现两次，以最后一次为准——这是 `majob.sh`/
+  `eval.sh` 里 `DIAG_ARGS` 放在 `LOG_KV_ARGS` 后面、能正确覆盖 YAML 默认值的原因。
+- `majob.sh` 如果 `save_path` 下已经存在一个"finished"的 checkpoint，会**跳过整个
+  训练阶段**直接进 eval——这是当初新建 `arc_warmup.yaml` 必须用独立 `save_path` 的
+  原因，不然会误判成"已经训练好了"，直接拿旧 checkpoint 去评测。
+- 修改本地代码前，遇到"看起来是 bug"的测试预期值，先去追代码的真实语义（本次是
+  `_binary_carry`），不要想当然地"以测试为准"去改生产代码——3.2 节就是反过来，测试
+  错了，代码是对的。
+- 本地跑 pytest 用 conda env `mineru`（`/Users/hourunli/anaconda3/envs/mineru`,
+  Python 3.12）；系统自带 Python 3.9.13 无法解析仓库里到处用的 `X | None` 类型注解。
