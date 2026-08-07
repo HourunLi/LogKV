@@ -10,13 +10,15 @@
 # diag.yaml 顶部的注释块，这里不重复。
 # ==========================================
 
-checkpoint_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
-tokenizer_dir: null
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup/step_1400
+tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup/step_1400
 
 limit: 40
 
-benchmark: null
-metadata: null
+benchmark: "niah_single_1,niah_single_2,niah_single_3"
+metadata:
+  pretrained: *tokenizer_dir
+  max_seq_lengths: [32768]
 
 output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup/diag
 
@@ -25,7 +27,8 @@ log_kv_recent_size: 1024
 log_kv_second_order_scale: null
 log_kv_prefill_block: 1024
 log_kv_pin_size: 0
-log_kv_pin_obs_window: 64
+log_kv_pin_obs_window: 0
 
 log_kv_diag_mode: null
 log_kv_diag_output: null
+log_kv_second_order_scale: 0.2

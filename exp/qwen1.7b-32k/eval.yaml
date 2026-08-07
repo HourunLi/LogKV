@@ -15,17 +15,18 @@
 # ── 评测对象 ──
 # 默认指向 logKV 训练产物（base.yaml 的 save_path，目录内应有
 # lit_model.pth + tokenizer 文件 + model_config.yaml）。
-checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
-tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup/step_200
+tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup/step_200
 # benchmark: "boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa,lambada_openai,wikitext,longbench_qasper,longbench_multifieldqa_zh,longbench_multifieldqa_en,longbench_triviaqa,longbench_trec,longbench_lsht,longbench_multi_news,longbench_qmsum,longbench_dureader,longbench_2wikimqa,longbench_gov_report_e,longbench_hotpotqa_e,longbench_multi_news_e,longbench_qasper_e,longbench_multifieldqa_en_e,longbench_passage_retrieval_en_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e,mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
-benchmark: "niah_single_1,longbench_gov_report_e,longbench_qmsum"
+benchmark: "niah_single_1"
 output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
 log_kv_B: 512
 log_kv_recent_size: 1024
 log_kv_second_order_scale: 1.0
 log_kv_prefill_block: 1024
-log_kv_pin_size: 256
-log_kv_pin_obs_window: 64
+log_kv_pin_size: 0
+log_kv_pin_obs_window: 0
+log_kv_second_order_scale: 0.2
 
 # ── 其余可用键（保持 null / 注释即用默认或 CLI 值）──
 # 覆盖模型 Config 字段（一般不需要：架构随 checkpoint 的 model_config.yaml
