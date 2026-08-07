@@ -1,4 +1,4 @@
-# LogKV 项目工作记录（存档，更新于 2026-08-06）
+# LogKV 项目工作记录（存档，更新于 2026-08-07）
 
 > 本文件是给下次接续工作时用的存档，记录 LogKV（Fenwick-tree / O(log N) 显存 KV cache
 > 压缩，rank-1 Σ_s/Γ_s 二阶修正）这条线目前做了什么、改了什么、卡在哪、下一步该干嘛。
@@ -182,6 +182,47 @@ torchrun --nproc_per_node=1 eval.py --config exp/qwen1.7b-32k/diag_warmup.yaml \
 时第一件事**：确认用户那边实际执行的命令行，尤其是 `--metadata` 参数的引号有没有被
 shell 转义破坏，同时确认走的是 `diag_warmup.yaml`（而不是没改过的 `diag.yaml`，那个
 指向的是崩溃前 naive checkpoint）。
+
+**更新（2026-08-07）**：warmup CPT（scale=0.2, warmup=100 步）跑出了第一组完整的
+下游指标对比（Common Sense Reasoning ACC / LongBench / LongBench_e / niah_single_1，
+具体是不是走的 6.1 开头那条"`max_seq_lengths=[32768]` 单值"命令、跑了多少 step 的
+checkpoint，下次接续时需要跟用户确认，本次会话未核实评测命令本身）：
+
+| 配置 | ACC | LongBench | LongBench_e | niah |
+|---|---|---|---|---|
+| 完整 transformer（dense baseline，CPT 后）| 0.6158 | 0.2463 | 0.2715 | 1.0 |
+| LogKV vanilla（无二阶修正、无 pin）| 0.6146 | 0.1626 | 0.1803 | 0.032 |
+| LogKV + importance pin | 0.6146 | 0.1363 | 0.1441 | 0.0313 |
+| LogKV + 2nd order + pins | 0.6113 | 0.1214 | 0.1331 | 0.0467 |
+| LogKV + 2nd order, no pins | 0.6113 | 0.1716 | 0.1918 | 0.0827 |
+
+（用户报的原始数字里 "LogKV vanilla" 的 ACC 写的是 `10.6146`，按其余四组 ACC 都在
+0.61–0.62 区间、且跟下一行 "importance pin" 的 0.6146 完全一致，判断开头的 `1` 是
+笔误/复制粘贴混入，记录时按 `0.6146` 处理——**下次接续时找用户确认一下这个改动对不
+对**。）
+
+初步解读（都还只是这一组数据的观察，不是定论）：
+- 二阶修正（scale=0.2，与训练目标匹配）在**不加 pin** 时，是四个压缩变体里下游指标
+  最好的：LongBench 0.1716 > vanilla 0.1626，niah 0.0827 > vanilla 0.032（约 2.6×）。
+  说明 warmup CPT 训练出来的二阶修正在下游任务上是正向的，第 4 节的训练崩溃问题
+  修复后没有留下副作用。
+- **加 pin 是负向的**，且和是否叠加二阶修正无关：单独 importance pin（LongBench
+  0.1363、niah 0.0313）比 vanilla 还差；2nd order + pins（LongBench 0.1214、niah
+  0.0467）也明显不如 2nd order 不加 pin。这跟直觉（pin 应该保留重要 token、只会更好）
+  相反，是这次会话浮出的新问题，原因还没查（可能的方向：pin 选择逻辑本身、pin 与
+  Fenwick 合并的交互、还是训练时 pin_size 与推理不一致——见第 4 节关于
+  `log_kv_pin_size` 训练/推理可以不一致的备注，这里恰好是需要重新审视这条备注的地方）。
+- ACC（常识推理）四组几乎不分伯仲（0.611–0.616），说明短程信息在所有压缩方案下都
+  保留得不错，真正拉开差距的是长程检索类任务（LongBench、niah）。
+- 即便是最好的压缩变体（2nd order, no pins），niah 也只有 0.0827，离 dense baseline
+  的 1.0 差距巨大——对第 2 节"宽槽 rank-1 失真是否有实际下游损害"这个问题，这组数据
+  倾向于支持"有明显损害"，但还不能排除是训练配置本身（1500 步是否训完、scale=0.2
+  是否是最优点）尚未调到位，需要结合 6.2 的训练完成度确认一起看。
+
+**下次接续的下一步**：(a) 找用户确认上面 ACC 笔误的判断；(b) 查一下这组数据具体是
+哪个 checkpoint / 哪条评测命令跑出来的（尤其是 niah 的 `max_seq_lengths` 是不是按
+6.1 开头强调的"单值 32768"跑的，否则这组 niah 数字可能仍然偏浅层，跟之前反复卡住
+的问题是同一个坑）；(c) 着手查一下"加 pin 为什么反而更差"。
 
 ### 6.2 warmup CPT 训练（1500 步，scale=0.2, warmup=100）是否已经完整跑完
 
