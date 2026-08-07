@@ -20,7 +20,9 @@ metadata: null
 
 output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup/diag
 
-log_kv_B: 512
+# null（不是 512）：同 diag.yaml 的理由，写死非 null 会让 --log_kv_B 的 CLI
+# 覆盖被静默忽略（见 eval.py 的 _o()）。main() 自己的函数默认值仍是 512。
+log_kv_B: null
 log_kv_recent_size: 1024
 log_kv_second_order_scale: null
 log_kv_prefill_block: 1024
