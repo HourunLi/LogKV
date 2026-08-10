@@ -218,6 +218,111 @@ def _distance_to_spans(index: int, spans: list[NeedleSpan]) -> int | None:
     return best
 
 
+def _cache_slot_layout(
+    cache: Any,
+    *,
+    batch_i: int,
+    group_i: int,
+    prompt_token_offset: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Reconstruct current LogKV slot spans from level widths.
+
+    LogStructuredKVCache deliberately does not keep an O(N) token->slot map, but
+    its slots are contiguous and time-ordered (ignoring salience-pin duplicates).
+    Therefore cumulative ``level_w`` plus the exact recent window is enough to
+    recover which original token span each compressed slot currently covers.
+    """
+
+    slots: list[dict[str, Any]] = []
+    cursor = 0
+
+    max_levels = int(getattr(cache, "max_levels", 0) or 0)
+    counts = getattr(cache, "_counts", [0] * max_levels)
+    for level in range(max_levels - 1, -1, -1):
+        count = int(counts[level]) if level < len(counts) else 0
+        if count <= 0:
+            continue
+        level_w = getattr(cache, f"level_w_{level}")
+        widths = level_w[batch_i, group_i, :count].detach().to("cpu").tolist()
+        for slot_i, width_value in enumerate(widths):
+            width = int(round(float(width_value)))
+            used_start = cursor
+            used_end = cursor + width
+            slots.append(
+                {
+                    "kind": "level",
+                    "level": level,
+                    "slot_index": slot_i,
+                    "width": width,
+                    "used_token_start": used_start,
+                    "used_token_end": used_end,
+                    "token_start": used_start + int(prompt_token_offset),
+                    "token_end": used_end + int(prompt_token_offset),
+                }
+            )
+            cursor = used_end
+
+    recent_count = int(getattr(cache, "recent_count", 0) or 0)
+    for slot_i in range(recent_count):
+        used_start = cursor
+        used_end = cursor + 1
+        slots.append(
+            {
+                "kind": "recent",
+                "level": None,
+                "slot_index": slot_i,
+                "width": 1,
+                "used_token_start": used_start,
+                "used_token_end": used_end,
+                "token_start": used_start + int(prompt_token_offset),
+                "token_end": used_end + int(prompt_token_offset),
+            }
+        )
+        cursor = used_end
+
+    meta = {
+        "token_count": int(getattr(cache, "token_count", 0) or 0),
+        "recent_count": recent_count,
+        "pin_count": int(getattr(cache, "pin_count", 0) or 0),
+        "slot_count_without_pins": len(slots),
+        "covered_tokens_without_pins": cursor,
+        "layout_matches_token_count": cursor == int(getattr(cache, "token_count", cursor) or cursor),
+    }
+    return slots, meta
+
+
+def _needle_covering_slots(
+    slots: list[dict[str, Any]],
+    spans: list[NeedleSpan],
+) -> list[dict[str, Any]]:
+    covers: list[dict[str, Any]] = []
+    for span_i, span in enumerate(spans):
+        for slot in slots:
+            left = max(int(slot["token_start"]), span.token_start)
+            right = min(int(slot["token_end"]), span.token_end)
+            if right <= left:
+                continue
+            covers.append(
+                {
+                    "needle_span_index": span_i,
+                    "needle_source": span.source,
+                    "needle_token_start": span.token_start,
+                    "needle_token_end": span.token_end,
+                    "kind": slot["kind"],
+                    "level": slot["level"],
+                    "slot_index": slot["slot_index"],
+                    "slot_width": slot["width"],
+                    "slot_token_start": slot["token_start"],
+                    "slot_token_end": slot["token_end"],
+                    "slot_used_token_start": slot["used_token_start"],
+                    "slot_used_token_end": slot["used_token_end"],
+                    "overlap_tokens": right - left,
+                    "is_compressed": slot["kind"] == "level",
+                }
+            )
+    return covers
+
+
 def _safe_request_metadata(req: Any | None) -> dict[str, Any]:
     if req is None:
         return {}
@@ -301,6 +406,7 @@ class PinDiagRecorder:
                 sample["layers"].append({"layer": layer_idx, "has_pin_indices": False, "groups": []})
                 continue
 
+            cache = getattr(block.attn, "kv_cache", None)
             idx_cpu = idx.detach().to(device="cpu", dtype=torch.long)
             # _log_kv_pin_indices are coordinates in the used/truncated prompt.
             # Shift them back to original prompt token coordinates for comparison
@@ -309,6 +415,17 @@ class PinDiagRecorder:
             groups = []
             for batch_i in range(idx_full.size(0)):
                 for group_i in range(idx_full.size(1)):
+                    if cache is not None:
+                        slot_layout, slot_layout_meta = _cache_slot_layout(
+                            cache,
+                            batch_i=batch_i,
+                            group_i=group_i,
+                            prompt_token_offset=int(prompt_token_offset),
+                        )
+                        needle_covering_slots = _needle_covering_slots(slot_layout, comparable_spans)
+                    else:
+                        slot_layout_meta = None
+                        needle_covering_slots = []
                     pins = idx_full[batch_i, group_i].tolist()
                     scored = []
                     for pin in pins:
@@ -329,7 +446,16 @@ class PinDiagRecorder:
                             {"index": pin, "distance": dist}
                             for dist, pin in scored[: self.nearest_k]
                         ],
+                        "needle_covering_slots": needle_covering_slots,
+                        "needle_compressed_slot_count": sum(
+                            1 for slot in needle_covering_slots if slot.get("is_compressed")
+                        ),
+                        "needle_recent_slot_count": sum(
+                            1 for slot in needle_covering_slots if slot.get("kind") == "recent"
+                        ),
                     }
+                    if slot_layout_meta is not None:
+                        group["slot_layout"] = slot_layout_meta
                     if self.include_indices:
                         group["pin_indices"] = pins
                     groups.append(group)
@@ -420,6 +546,10 @@ class PinDiagRecorder:
                 "prefer near_hit_rate when exact_hit_rate is low but near_hit_rate is high."
             ),
             "max_samples_scope": "per_rank_before_all_gather_then_truncated_after_merge",
+            "compressed_slot_method": (
+                "reconstruct_current_logkv_slot_spans_from_cumulative_level_w; "
+                "kind=level means compressed hierarchy slot, kind=recent means exact recent-window token"
+            ),
             "sample_count": len(self.samples),
             "samples_with_needle": samples_with_needle,
             "samples_with_comparable_needle": samples_with_comparable_needle,
