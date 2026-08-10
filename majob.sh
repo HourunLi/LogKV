@@ -262,6 +262,7 @@ for RAW_TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
 done
 
 LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_pin_size ${LOG_KV_PIN} --log_kv_pin_obs_window ${LOG_KV_PIN_OBS} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
+DIAG_ARGS=${DIAG_ARGS:-}
 TOKENIZER_ARGS=""
 if [ -n "${TOKENIZER_SOURCE}" ]; then
     TOKENIZER_ARGS="--tokenizer_dir ${TOKENIZER_SOURCE}"
@@ -271,6 +272,9 @@ else
     echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
 fi
 echo "🧩 logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}"
+if [ -n "${DIAG_ARGS}" ]; then
+    echo "🧪 extra eval args: ${DIAG_ARGS}"
+fi
 
 ensure_checkpoint_tokenizer() {
     if has_tokenizer "${SAVE_DIR}"; then
@@ -291,19 +295,15 @@ ensure_checkpoint_tokenizer() {
 # ==============================================================================
 # 🌟 核心新增：检查 Checkpoint 是否已存在
 # ==============================================================================
-if checkpoint_exists "${SAVE_DIR}/lit_model.pth" && checkpoint_finished; then
+if checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
     echo "================================================="
-    echo "⏩ [Node ${NODE_RANK}] 阶段一跳过：检测到已完成 checkpoint 于 ${SAVE_DIR}/lit_model.pth"
+    echo "⏩ [Node ${NODE_RANK}] 阶段一跳过：检测到 checkpoint 于 ${SAVE_DIR}/lit_model.pth"
     echo "⏩ checkpoint 状态：$(checkpoint_step_label)"
     echo "⏩ 直接进入评测阶段！"
     echo "================================================="
 else
     echo "================================================="
-    if checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
-        echo "🚀 [Node ${NODE_RANK}] 阶段一：检测到未完成 checkpoint（$(checkpoint_step_label)），继续训练"
-    else
-        echo "🚀 [Node ${NODE_RANK}] 阶段一：未找到现有权重，开始执行 Continual Pre-Training"
-    fi
+    echo "🚀 [Node ${NODE_RANK}] 阶段一：未找到现有权重，开始执行 Continual Pre-Training"
     echo "================================================="
 
     torchrun \
@@ -330,20 +330,13 @@ fi
 # 崩溃/被杀（上面的非零退出码并不总是 NCCL 良性竞争）——在这里立刻失败，
 # 否则 eval 阶段只会报一个误导性的「加载 checkpoint 出错」。
 # ==============================================================================
-if [ "${SAVE_CKPT}" == "true" ]; then
-    if ! checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
-        echo "❌ 致命错误：训练阶段结束，但 ${SAVE_DIR}/lit_model.pth 不存在（训练退出码见上方 ⚠️ 行）。"
-        echo "   排查（在训练日志中从后往前找）："
-        echo "   ➤ 无 'Reached max_steps' / 'Data exhausted' → 训练循环中途崩溃，向上翻最后一个 Traceback；"
-        echo "   ➤ 有 'Training complete' 但无 'Saving final checkpoint' → 生效配置 save_ckpt 为 false；"
-        echo "   ➤ 有 'Saving to ... lit_model.pth' 但无 'Done.' → 保存阶段被杀（墙钟/内存/磁盘配额）。"
-        exit 1
-    fi
-    if ! checkpoint_finished; then
-        echo "❌ 训练阶段未完成，当前 ${SAVE_DIR}/lit_model.pth 只是可恢复 checkpoint：$(checkpoint_step_label)"
-        echo "   已保留断点；下次重启会继续训练，不进入评测阶段。"
-        exit 1
-    fi
+if [ "${SAVE_CKPT}" == "true" ] && ! checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
+    echo "❌ 致命错误：训练阶段结束，但 ${SAVE_DIR}/lit_model.pth 不存在（训练退出码见上方 ⚠️ 行）。"
+    echo "   排查（在训练日志中从后往前找）："
+    echo "   ➤ 无 'Reached max_steps' / 'Data exhausted' → 训练循环中途崩溃，向上翻最后一个 Traceback；"
+    echo "   ➤ 有 'Training complete' 但无 'Saving final checkpoint' → 生效配置 save_ckpt 为 false；"
+    echo "   ➤ 有 'Saving to ... lit_model.pth' 但无 'Done.' → 保存阶段被杀（墙钟/内存/磁盘配额）。"
+    exit 1
 fi
 
 if checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
@@ -382,17 +375,19 @@ echo "✅ [Node ${NODE_RANK}] 所有 ${NUM_NODES} 个节点已就绪，启动评
 # 🌟 核心缓冲：休眠 30 秒确保 NCCL 彻底回收 + 避免 barrier 竞争
 sleep 30
 
-# 拼接 benchmark 列表（避免换行空格被解析进 task 名）
-BENCHMARKS="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
-BENCHMARKS="${BENCHMARKS},mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
-BENCHMARKS="${BENCHMARKS},longbench_2wikimqa,longbench_dureader,longbench_gov_report,longbench_hotpotqa"
-BENCHMARKS="${BENCHMARKS},longbench_lcc,longbench_lsht,longbench_multi_news,longbench_multifieldqa_en,longbench_multifieldqa_zh"
-BENCHMARKS="${BENCHMARKS},longbench_musique,longbench_narrativeqa,longbench_passage_count,longbench_passage_retrieval_en"
-BENCHMARKS="${BENCHMARKS},longbench_qasper,longbench_qmsum,longbench_repobench-p,longbench_samsum,longbench_trec,longbench_triviaqa,longbench_vcsum"
-BENCHMARKS="${BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e"
-BENCHMARKS="${BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
-BENCHMARKS="${BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
-NIAH_BENCHMARKS="niah_single_1,niah_single_2,niah_single_3"
+# 拼接 benchmark 列表（避免换行空格被解析进 task 名）。支持用环境变量覆盖；
+# BENCHMARKS=none 可跳过主评测，只跑 NIAH/pin 诊断。
+DEFAULT_BENCHMARKS="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa,longbench_dureader,longbench_gov_report,longbench_hotpotqa"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_lcc,longbench_lsht,longbench_multi_news,longbench_multifieldqa_en,longbench_multifieldqa_zh"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_musique,longbench_narrativeqa,longbench_passage_count,longbench_passage_retrieval_en"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_qasper,longbench_qmsum,longbench_repobench-p,longbench_samsum,longbench_trec,longbench_triviaqa,longbench_vcsum"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
+BENCHMARKS=${BENCHMARKS:-${DEFAULT_BENCHMARKS}}
+NIAH_BENCHMARKS=${NIAH_BENCHMARKS:-niah_single_1,niah_single_2,niah_single_3}
 
 # NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度
 # max_seq_lengths 可根据模型实际最大上下文调整
@@ -401,38 +396,53 @@ META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 81
 # 评测结果：rank0 写入 JSON（带时间戳），与 litgpt evaluate 惯例一致放在 checkpoint 下 evaluate/
 EVAL_OUTPUT_DIR="${SAVE_DIR}/evaluate"
 
-torchrun \
-    --nnodes=${NUM_NODES} \
-    --nproc_per_node=${GPUS_PER_NODE} \
-    --node_rank=${NODE_RANK} \
-    --master_addr=${MASTER_ADDR} \
-    --master_port=${EVAL_MASTER_PORT} \
-    eval.py \
-    --checkpoint_dir ${SAVE_DIR} \
-    --benchmark ${BENCHMARKS} \
-    --output_path "${EVAL_OUTPUT_DIR}" \
-    ${LOG_KV_ARGS} \
-    ${TOKENIZER_ARGS}
+if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
+    torchrun \
+        --nnodes=${NUM_NODES} \
+        --nproc_per_node=${GPUS_PER_NODE} \
+        --node_rank=${NODE_RANK} \
+        --master_addr=${MASTER_ADDR} \
+        --master_port=${EVAL_MASTER_PORT} \
+        eval.py \
+        --checkpoint_dir ${SAVE_DIR} \
+        --benchmark ${BENCHMARKS} \
+        --output_path "${EVAL_OUTPUT_DIR}" \
+        ${LOG_KV_ARGS} \
+        ${DIAG_ARGS} \
+        ${TOKENIZER_ARGS}
 
-# for NIAH
-torchrun \
-    --nnodes=${NUM_NODES} \
-    --nproc_per_node=${GPUS_PER_NODE} \
-    --node_rank=${NODE_RANK} \
-    --master_addr=${MASTER_ADDR} \
-    --master_port=${NIAH_MASTER_PORT} \
-    eval.py \
-    --checkpoint_dir ${SAVE_DIR} \
-    --benchmark ${NIAH_BENCHMARKS} \
-    --metadata "${META}" \
-    --output_path "${EVAL_OUTPUT_DIR}" \
-    ${LOG_KV_ARGS} \
-    ${TOKENIZER_ARGS}
+    EVAL_STATUS=$?
+    if [ $EVAL_STATUS -ne 0 ]; then
+        echo "❌ [Node ${NODE_RANK}] 主评测阶段崩溃 (Exit Code: $EVAL_STATUS)！"
+        exit $EVAL_STATUS
+    fi
+else
+    echo "⏩ [Node ${NODE_RANK}] 跳过主评测 BENCHMARKS=${BENCHMARKS}"
+fi
 
-EVAL_STATUS=$?
-if [ $EVAL_STATUS -ne 0 ]; then
-    echo "❌ [Node ${NODE_RANK}] 评测阶段崩溃 (Exit Code: $EVAL_STATUS)！"
-    exit $EVAL_STATUS
+if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
+    torchrun \
+        --nnodes=${NUM_NODES} \
+        --nproc_per_node=${GPUS_PER_NODE} \
+        --node_rank=${NODE_RANK} \
+        --master_addr=${MASTER_ADDR} \
+        --master_port=${NIAH_MASTER_PORT} \
+        eval.py \
+        --checkpoint_dir ${SAVE_DIR} \
+        --benchmark ${NIAH_BENCHMARKS} \
+        --metadata "${META}" \
+        --output_path "${EVAL_OUTPUT_DIR}" \
+        ${LOG_KV_ARGS} \
+        ${DIAG_ARGS} \
+        ${TOKENIZER_ARGS}
+
+    EVAL_STATUS=$?
+    if [ $EVAL_STATUS -ne 0 ]; then
+        echo "❌ [Node ${NODE_RANK}] NIAH 评测阶段崩溃 (Exit Code: $EVAL_STATUS)！"
+        exit $EVAL_STATUS
+    fi
+else
+    echo "⏩ [Node ${NODE_RANK}] 跳过 NIAH 评测 NIAH_BENCHMARKS=${NIAH_BENCHMARKS}"
 fi
 
 # 清理 barrier 目录（rank 0 负责）
