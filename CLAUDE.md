@@ -1,11 +1,11 @@
-# LogKV 项目工作记录（存档，更新于 2026-08-07）
+# LogKV 项目工作记录（存档，更新于 2026-08-10）
 
 > 本文件是给下次接续工作时用的存档，记录 LogKV（Fenwick-tree / O(log N) 显存 KV cache
 > 压缩，rank-1 Σ_s/Γ_s 二阶修正）这条线目前做了什么、改了什么、卡在哪、下一步该干嘛。
 > 代码层面的细节（怎么加插件、怎么跑服务）见仓库根目录上一级的 `~/CLAUDE.md`；这份
 > 只讲 LogKV 这一个专题。
 
-## 0. 现状速览（2026-08-07，只想快速接续就读这节，细节看后面对应章节）
+## 0. 现状速览（2026-08-10 更新，只想快速接续就读这节，细节看后面对应章节）
 
 **进展**：warmup CPT（`second_order_scale` 目标 0.2，warmup 100 步）已经完整训练
 1500 步，并跑出了 dense baseline / LogKV vanilla / +importance pin / +2nd order+pins /
@@ -23,23 +23,31 @@
 | + 2nd order + pins | 0.6113 | 0.1214 | 0.1331 | 0.0467 |
 | + 2nd order, no pins | 0.6113 | 0.1716 | 0.1918 | 0.0827 |
 
-**怀疑的问题（按当前置信度从高到低）**：
-1. **pin 是负贡献，且大概率是训练/推理分布不一致导致的**——训练路径
-   `_log_kv_train_lowmem_forward` 完全不涉及 pin（`_log_kv_select_pins` 是
-   `@torch.no_grad()`、只在推理时调用），所以不管 yaml 里 `log_kv_pin_size` 写多少，
-   模型从没在训练里见过"精确 pin token + 同一 token 被池化稀释的粗糙副本同时存在"
-   这种输入结构。验证 pin 选的位置到底准不准的诊断代码已接入（见 6.1 末尾），待在
-   目标评测环境跑真实 checkpoint。
+**怀疑的问题（按当前置信度从高到低，2026-08-10 已用真实 pin 诊断数据更新，见 6.4）**：
+1. **pin 大概率是选择机制本身在中浅层就不准，不只是训练/推理分布不一致**——
+   pin-vs-needle 诊断在目标 checkpoint 上跑出了真实数字（6.4 节）：整体
+   `exact_hit_rate≈13.16%`、`near_hit_rate≈13.40%`，两者几乎相等说明没命中时是
+   "错很远"（中位距离 ~7390 token）而不是"差一点"；命中率随层数明显上升，
+   Layer 23-26 最好（~25-31%），Layer 0/5/15 很差（~2.5-5%）。**训练/推理分布
+   不一致（`_log_kv_select_pins` 是 `@torch.no_grad()`、训练路径
+   `_log_kv_train_lowmem_forward` 完全不涉及 pin）依然是成立的机制性解释**，但
+   现在有了更细的画像：这个问题在浅/中层远比深层严重，不是所有层均匀地"选不准"。
 2. 二阶修正本身是正贡献（niah 0.032→0.0827），但**大部分下游损失在纯均值池化阶段就
    已经发生**（vanilla niah 就已经比 dense 掉了 97%），所以第 2 节"rank-1 在宽槽下
    失真"未必是当前最大的病灶——32768 长度下槽宽可能远超 width=8，rank-1 表达能力
    本身就不够，这正是 pin 该顶上的场景。
 3. ACC（常识推理）四组几乎无差异，问题集中在长程检索类任务，短程信息保留良好。
 
-**下一步方向**：优先级从高到低——(a) 跑只读诊断，对比 `_log_kv_select_pins`
-选中的 pin 位置和 niah 真实 needle 位置，判断 pin 选择准不准；
-(b) 视 (a) 结果决定是修 `_log_kv_select_pins` 本身，还是要不要让训练也引入 pin 态；
-(c) 6.3 提到的"按 layer/width 差异化 second_order_scale"接口改动，明确排在 pin 排查
+**下一步方向**：优先级从高到低——
+(a)【已完成，见 6.4】跑只读诊断，对比 `_log_kv_select_pins` 选中的 pin 位置和 niah
+真实 needle 位置，判断 pin 选择准不准；
+(b) 用 `unused/pin_diag.py`（6.4 节新增的离线分析工具）在真实 JSON 上补两个数：
+样本级"任意层/组至少命中一次"的比例、以及同等 `pin_size`/候选区间下的随机基线
+命中率——判断 13% 这个整体数字到底是"比乱猜好多少"；
+(c) 视 (b) 结果决定：是修 `_log_kv_select_pins` 本身（如果连深层随机基线都打不过），
+还是探索"只在 Layer 20+ 分配 pin 预算"这类分层方案（如果深层确实显著强于随机、
+只是预算被浅层稀释）；
+(d) 6.3 提到的"按 layer/width 差异化 second_order_scale"接口改动，明确排在 pin 排查
 之后，pin 修好后再评估还有没有必要做。
 
 ## 1. 这是什么项目
@@ -318,6 +326,69 @@ needle sentence token span 对比；`eval.py` 新增默认关闭的
 专用搬到生产路径，并想清楚训练时怎么处理这个新维度的超参）。**不要在 pin 排查有
 结论之前动生产接口**。
 
+### 6.4 pin 诊断首次真实数据 + 离线分析工具（2026-08-10）
+
+**首次在真实 checkpoint 上跑出了 pin-vs-needle 诊断结果**（32768 长度 NIAH，走的是
+6.1 节提到的 `--log_kv_pin_diag_output` 路径，`log_kv_pin_size=256`、
+`log_kv_pin_obs_window=64`，跟 base.yaml/eval.yaml 生产配置一致）：
+
+- 整体 `exact_hit_rate ≈ 13.16%`，`near_hit_rate ≈ 13.40%`（radius=16）。两者只差
+  0.25 个百分点，说明低命中率**不是字符→token 边界估计误差造成的**（那种误差最多
+  偏 1-2 个 token，radius=16 早该吸收）——没命中的时候是真的选错了，不是"差一点"。
+- 没命中时平均/中位距离分别约 **8036 / 7390 token**，两者接近、无明显长尾。这个量级
+  接近候选区间 `C = T - recent_size ≈ 32768 - 1024 = 31744` 的 1/4——跟"在整个候选
+  区间里近似随机选点"时到 needle 的期望距离量级相当，是"pin 选错时可能约等于随机"
+  这个猜想的一个间接证据（还需要 6.4 下面提到的随机基线来正面验证，不是结论）。
+- **命中率按层数呈明显上升趋势**：
+
+  | 层段 | exact 命中率 |
+  |---|---:|
+  | Layer 0–9 | 9.22% |
+  | Layer 10–19 | 9.19% |
+  | Layer 20–27 | 23.05% |
+  | Layer 23–26 | 28.05%（最佳区间） |
+
+  最好的单层是 Layer 25（30.63%），最差包括 Layer 0、5（均 2.5%）和 Layer 15（5%）。
+  Layer 27 命中率 19.69%（低于 23-26 区间），但中位距离骤升到 10711——怀疑是两极
+  分化（部分样本精确命中、部分比其他层错得更远），还是末层 Q/K 已经偏向为输出 logits
+  服务、语义检索功能减弱，待后续用逐样本分布核实。
+- 这组数据支持"pin 选择机制本身在浅/中层不可靠"，跟第 6.1 节"训练从没见过 pin 态"
+  的假设并不矛盾——可以同时成立：训练缺口可能是"深层学到的 needle 显著性没有稳定
+  传播到浅/中层"的原因之一。
+
+**遗留的两个方法论缺口**（用户在读结果时主动指出的）：
+1. group 级命中率（按 sample×layer×kv_group 三元组统计）不等于样本级"这条样本有没有
+   被任何一层/组保住"——原始 `PinDiagRecorder.summary()` 答不出这个问题。
+2. 13% 这个数字本身有没有意义，取决于跟同样 `pin_size`/候选区间下的**随机选点基线**
+   比，光看绝对值判断不了"比瞎选好多少"。
+
+**离线分析工具：`unused/pin_diag.py`（2026-08-10 新增）** 解决了这两个缺口，直接读
+`eval.py --log_kv_pin_diag_output` 产出的 JSON，不用重新跑评测：
+
+```bash
+python unused/pin_diag.py ./pin_diag_smoke/pin_diag_xxx.json
+python unused/pin_diag.py './pin_diag_smoke/*.json' --band 23-26   # 支持 glob，按文件名排序取最后一个
+```
+
+功能：①样本级"任意层/组至少命中一次"的比例（回答缺口 1）；②同一比例限定在 `--band`
+指定的层区间内；③原样重打 JSON 里已有的 group 级 `overall`/`by_layer` 摘要；
+④用相同 `pin_size`/`recent_size`/`radius`、相同的真实 needle span，对候选区间做
+纯随机采样算出的基线命中率（回答缺口 2，`--seed`/`--recent_size`/`--pin_size`
+可覆盖，默认读 JSON 里落盘的 `config`）。
+
+代码审查结论（已用合成 JSON 跑通全部分支，包括 0 样本、无 `config` 包装两种边界
+情况，均正常返回 `n/a` 不报错）：**没有发现功能性 bug**。唯一的小瑕疵：
+`_load_json` 对 glob 匹配结果用 `sorted(...)[−1]`（按文件名字符串排序取最后一个）
+来挑"最新"文件——同一个 benchmark+checkpoint 反复重跑时，因为文件名里的时间戳是
+定长零填充的 `%Y%m%d_%H%M%S`，字符串排序等价于时间排序，能正确选到最新；但如果
+glob 跨了**不同的 benchmark 或 checkpoint 名**（文件名时间戳前缀不同），字符串排序
+不保证选到真正最新的那个。目前的用法（单目录对应单个 benchmark+checkpoint）不会
+触发，暂不算需要立刻修的问题，以后 glob 混用多个 benchmark 时注意一下即可。
+
+**下一步**：用这个工具在真实的 pin_diag JSON 上把两个缺口的数字跑出来，看随机基线
+比 13% 差多少、以及样本级"至少一次命中"的比例——决定是该修 `_log_kv_select_pins`
+本身，还是往"只在深层分配 pin 预算"这个方向走（见上面 0 节"下一步方向"(b)(c)）。
+
 ## 7. 有用的坑 / 经验教训（给下次接续的自己看）
 
 - `eval.sh` vs 直接 `torchrun --config <yaml> eval.py`：**语义不同**。`eval.sh` 会把
@@ -336,3 +407,84 @@ needle sentence token span 对比；`eval.py` 新增默认关闭的
   错了，代码是对的。
 - 本地跑 pytest 用 conda env `mineru`（`/Users/hourunli/anaconda3/envs/mineru`,
   Python 3.12）；系统自带 Python 3.9.13 无法解析仓库里到处用的 `X | None` 类型注解。
+
+## 8. 常用运行命令（2026-08-10 新增）
+
+### 8.1 直接调用 Python 脚本（单机调试用）
+
+`demo.py`（训练，logKV CPT，无 dense 分支）：
+
+```bash
+# 单卡调试
+python demo.py --config exp/qwen0.6b-4k/debug.yaml
+
+# 单机多卡
+torchrun --nproc_per_node=8 demo.py --config exp/qwen1.7b-32k/arc_warmup.yaml
+```
+
+`eval.py`（评测）：
+
+```bash
+# 单卡，不用 YAML，纯 CLI（调试用）
+python eval.py --checkpoint_dir ./checkpoints/Qwen/Qwen3-0.6B-Base --benchmark piqa
+
+# 单机多卡，纯 CLI
+torchrun --nproc_per_node=8 eval.py \
+  --checkpoint_dir <SAVE_DIR> --benchmark "boolq,piqa,hellaswag" \
+  --log_kv_B 512 --log_kv_recent_size 1024 --log_kv_pin_size 0
+
+# 用 YAML（--config 会触发 3.3 节提到的"YAML 非 null 覆盖 CLI"逻辑，
+# 新增字段默认值必须写 null，否则同名 CLI 参数会被静默吞掉）
+python eval.py --config exp/qwen1.7b-32k/eval.yaml
+
+# pin-vs-needle 只读诊断（3.6 / 6.1 节），单卡先跑小样本：
+torchrun --nproc_per_node=1 eval.py --config exp/qwen1.7b-32k/eval.yaml \
+  --benchmark niah_single_1 --limit 4 \
+  --log_kv_pin_size 256 --log_kv_pin_diag_output <out-dir> \
+  --log_kv_pin_diag_max_samples 4
+```
+
+### 8.2 `majob.sh`：训练→评测一条龙（ModelArts 作业入口）
+
+```bash
+bash majob.sh <config.yaml>
+# 例：
+bash majob.sh exp/qwen1.7b-32k/arc_warmup.yaml
+```
+
+行为：先看 `save_path` 下是否已有"finished"的 checkpoint（有就跳过训练直接评测，
+见 7 节），否则跑 `torchrun ... demo.py --config <yaml>` 训练；训练完做文件锁
+barrier 等所有节点就绪，再跑两次 `torchrun ... eval.py`（主 benchmark 列表一次，
+niah_single_1/2/3 一次，两次共用同一个 `MASTER_PORT`——这点跟 8.3 的 `eval.sh` 不同）。
+
+依赖的环境变量（ModelArts 会自动注入；本地单机手动跑时全部有默认值，不用手动设置）：
+
+| 变量 | 作用 | 默认值 |
+|---|---|---|
+| `MA_NUM_GPUS` | 每节点卡数 → `GPUS_PER_NODE` | 8 |
+| `MA_NUM_HOSTS` | 节点数 → `NUM_NODES` | 1 |
+| `MASTER_ADDR` | rendezvous 地址 | `localhost`（多机必须显式可达，或靠 `MA_VJ_NAME`/`MA_TASK_NAME`/`MA_MASTER_INDEX` 拼出 ModelArts DNS 名） |
+| `MASTER_PORT` | rendezvous 端口 | 6000 |
+| `VC_TASK_INDEX` | 当前节点序号 → `NODE_RANK` | 0（多机每个节点必须不同，通常由调度器注入，不要手动瞎设） |
+
+脚本开头硬编码 `source /home/ma-user/anaconda3/bin/activate torch218`——本地非
+ModelArts 环境跑之前先确认这个 conda env 路径存在，或者手动改成本机的 conda 路径。
+
+### 8.3 `eval.sh`：跳过训练，只跑评测（已有 checkpoint 时调参/重跑用）
+
+```bash
+bash eval.sh <training_yaml_or_eval_yaml> [benchmark_csv|none] [niah_csv|none]
+# 例：
+bash eval.sh exp/qwen1.7b-32k/arc.yaml                  # 默认全量 benchmark + 默认三项 niah
+bash eval.sh exp/qwen1.7b-32k/arc.yaml piqa none        # 只跑 piqa，不跑 niah
+DIAG_ARGS="--log_kv_diag_mode baseline --log_kv_diag_exact_from_layer 21" \
+    bash eval.sh exp/qwen1.7b-32k/diag.yaml niah_single_1 none   # 透传诊断参数
+```
+
+跟 `majob.sh` 共用同一套环境变量约定（见 8.2 表格），但更严格：会校验
+`GPUS_PER_NODE`/`NUM_NODES`/`NODE_RANK`/端口必须是非负整数，多机时 `MASTER_ADDR`
+仍是 `localhost` 会直接报错退出（`majob.sh` 没有这个校验）。另外主 benchmark 和
+niah 两次 `torchrun` **各用各的端口**（`MAIN_EVAL_MASTER_PORT` 默认 `MASTER_PORT`，
+`NIAH_EVAL_MASTER_PORT` 默认 `MASTER_PORT + 1`），不会像 `majob.sh` 那样两次评测
+复用同一个端口。`eval.sh` 把 YAML 展平成纯 CLI flag 传给 `eval.py`（不传
+`--config`），所以 3.3 节"YAML 非 null 覆盖 CLI"的坑在这条路径上不会触发。
