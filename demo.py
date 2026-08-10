@@ -495,6 +495,8 @@ def main(
     # distant needle survives mean-pool dilution. 0 = off.
     log_kv_pin_size: int = 0,
     log_kv_pin_obs_window: int = 64,
+    # Eval-time NMS spacing for salience pins. 0/1 keeps the original top-k path.
+    log_kv_pin_min_distance: int = 0,
     # Coupled gate for score-side Sigma and value-side Gamma corrections. The
     # CPT path warms this from 0 to the target value to avoid an immediate
     # attention-distribution jump at step 0. Set
@@ -564,6 +566,7 @@ def main(
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
     log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
     log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
+    log_kv_pin_min_distance = int(_o("log_kv_pin_min_distance", log_kv_pin_min_distance))
     log_kv_second_order_scale = _o("log_kv_second_order_scale", log_kv_second_order_scale)
     log_kv_second_order_warmup_steps = _o(
         "log_kv_second_order_warmup_steps", log_kv_second_order_warmup_steps
@@ -718,6 +721,7 @@ def main(
             log_kv_prefill_block=log_kv_prefill_block,
             log_kv_pin_size=log_kv_pin_size,
             log_kv_pin_obs_window=log_kv_pin_obs_window,
+            log_kv_pin_min_distance=log_kv_pin_min_distance,
             log_kv_second_order_scale=log_kv_second_order_scale,
             tokenizer_dir=tokenizer_dir,
         )
