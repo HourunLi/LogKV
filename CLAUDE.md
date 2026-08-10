@@ -28,15 +28,16 @@
    `_log_kv_train_lowmem_forward` 完全不涉及 pin（`_log_kv_select_pins` 是
    `@torch.no_grad()`、只在推理时调用），所以不管 yaml 里 `log_kv_pin_size` 写多少，
    模型从没在训练里见过"精确 pin token + 同一 token 被池化稀释的粗糙副本同时存在"
-   这种输入结构。还没做的验证：pin 选的位置到底准不准（见 6.1 末尾的诊断计划）。
+   这种输入结构。验证 pin 选的位置到底准不准的诊断代码已接入（见 6.1 末尾），待在
+   目标评测环境跑真实 checkpoint。
 2. 二阶修正本身是正贡献（niah 0.032→0.0827），但**大部分下游损失在纯均值池化阶段就
    已经发生**（vanilla niah 就已经比 dense 掉了 97%），所以第 2 节"rank-1 在宽槽下
    失真"未必是当前最大的病灶——32768 长度下槽宽可能远超 width=8，rank-1 表达能力
    本身就不够，这正是 pin 该顶上的场景。
 3. ACC（常识推理）四组几乎无差异，问题集中在长程检索类任务，短程信息保留良好。
 
-**下一步方向**：优先级从高到低——(a) 写只读诊断脚本，对比 `_log_kv_select_pins`
-选中的 pin 位置和 niah 真实 needle 位置，判断 pin 选择准不准（还没做，等待拍板）；
+**下一步方向**：优先级从高到低——(a) 跑只读诊断，对比 `_log_kv_select_pins`
+选中的 pin 位置和 niah 真实 needle 位置，判断 pin 选择准不准；
 (b) 视 (a) 结果决定是修 `_log_kv_select_pins` 本身，还是要不要让训练也引入 pin 态；
 (c) 6.3 提到的"按 layer/width 差异化 second_order_scale"接口改动，明确排在 pin 排查
 之后，pin 修好后再评估还有没有必要做。
@@ -143,9 +144,9 @@ rank-1 近似开始明显失真，但这个失真是否在**实际下游指标**
 隔离，互不覆盖。当前内容（已验证，见第 4 节）：`ckpt_dir` 指向 base Qwen3-1.7B-Base，
 `max_steps=1500`，`log_kv_second_order_scale=0.2`，`log_kv_second_order_warmup_steps=100`。
 
-### 3.6 本次会话（2026-08-07 续，纯排查，未改动任何生产/测试代码）
+### 3.6 本次接续（2026-08-07 续）：pin-vs-needle 只读诊断
 
-上一次会话（3.1–3.5）改了代码；这次会话只做了三件事，**都没有touch生产代码**：
+先前排查做了三件事：
 1. 帮用户核对了 warmup CPT（scale=0.2）五组下游指标数据，确认口径（ACC 笔误、niah
    取 32768 档均值的约定）——结果见 6.1 表格。
 2. 读代码定位了"pin 拖累指标"的大概率根因：`model.py:724-725`
@@ -156,8 +157,17 @@ rank-1 近似开始明显失真，但这个失真是否在**实际下游指标**
    niah 数据没有踩中 6.1 原先担心的"`limit` 截断到浅层 width"的坑（`majob.sh` 调
    `eval.py` 时不传 `--config`/`--limit`，全量跑；niah 数字按约定取的是 32768 档）。
 
-产出的诊断脚本（6.1 末尾"下一步"里提的 pin-vs-needle 对比）**还没写**，等用户决定
-要不要做。
+随后实现了只读诊断：
+- `litgpt/litgpt/log_kv_pin_diag.py`：定位 NIAH prompt 里的 needle sentence token span，
+  汇总每层/每个 KV group 的 `_log_kv_pin_indices` 是否 exact/near hit。
+- `eval.py`：新增默认关闭的 `--log_kv_pin_diag_output` 等参数，在真实 `generate_until`
+  路径 prefill 后记录 pin indices；多卡时 gather 各 rank 的诊断样本。
+- `model.py`：reset/init cache 时清掉旧 `_log_kv_pin_indices`，避免诊断读到上一条样本的
+  残留调试状态。
+- `unused/diagnose_log_kv_pins_jsonl.py`：离线入口，给已经 dump 好的 prompt JSON/JSONL
+  也能复用同一套 LogKV eval 路径跑 pin-vs-needle 诊断。
+
+诊断不改变模型输出、不参与训练，仍需在目标评测环境上跑真实 checkpoint 得出结论。
 
 ## 4. 一次真实的训练崩溃排查（已定位根因）
 
@@ -273,13 +283,24 @@ torchrun 命令），四组配置用的是**同一个 checkpoint + 同一套评�
   继续抠 rank-1 精度，修好 pin 大概率是更高杠杆的下一步**（pin 本来就是为了兜住这个
   确切失败模式设计的）。
 
-**下一步（尚未执行，等待决定要不要做）**：写一个只读诊断，对着现有 checkpoint 跑
-几条 niah_single_1 样本，把 `_log_kv_select_pins` 选中的 `_log_kv_pin_indices`
-（`model.py:924`）跟数据集里真实的 needle 插入位置对比：
-- 如果 pin 选得准但指标还是差 → 印证"训练从没见过 pin 态"的分布不一致假设，下一步
-  要决定要不要让训练也引入 pin 态（工程量较大）。
-- 如果 pin 选得不准 → 问题在 `_log_kv_select_pins` 本身（`log_kv_pin_obs_window=64`、
-  `kernel_size=7` 聚类之类），修起来便宜很多，不涉及重训。
+**pin 诊断代码已实现（2026-08-07，待在目标评测环境跑真实 checkpoint）**：
+`litgpt/litgpt/log_kv_pin_diag.py` 会在真实 `generate_until` 路径 prefill 后读取每层
+`_log_kv_pin_indices`，把它们转回原始 prompt token 坐标，并跟 NIAH prompt 里的真实
+needle sentence token span 对比；`eval.py` 新增默认关闭的
+`--log_kv_pin_diag_output` / `--log_kv_pin_diag_radius` /
+`--log_kv_pin_diag_max_samples` / `--log_kv_pin_diag_include_indices`。
+
+建议先跑少量样本：
+`torchrun --nproc_per_node=1 eval.py --config exp/qwen1.7b-32k/eval.yaml --benchmark niah_single_1 --limit 4 --log_kv_pin_diag_output <out-dir> --log_kv_pin_size 256 --log_kv_pin_diag_max_samples 4`
+
+如果已有 prompt dump，也可以跑：
+`python unused/diagnose_log_kv_pins_jsonl.py --samples <samples.jsonl> --checkpoint_dir <ckpt> --tokenizer_dir <tok> --output <pin_diag.json> --limit 4`
+
+输出 JSON 的 `pin_diag.verdict` 读法：
+- `pins_often_hit_needle_or_neighborhood_check_train_infer_pin_mismatch` → pin 多数选中
+  needle 或近邻，但指标仍差，更支持"训练从没见过 pin 态"的训推分布不一致假设。
+- `pins_mostly_miss_needle_check_pin_selection` → pin 多数没选到 needle，优先查
+  `_log_kv_select_pins` 本身（`log_kv_pin_obs_window=64`、`kernel_size=7` 聚类等）。
 
 ### 6.2【已解决，2026-08-07】warmup CPT 训练（1500 步，scale=0.2, warmup=100）已完整跑完
 

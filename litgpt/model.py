@@ -321,6 +321,7 @@ class GPT(nn.Module):
                 dtype,
             )
             block.attn._log_kv_pending = None
+            block.attn._log_kv_pin_indices = None
 
         if self.mask_cache is None or self.mask_cache.size(3) != max_seq_length:
             # passing `attn_mask` to SDPA disables the flash implementation. since we only need the mask
@@ -332,6 +333,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             block.attn.kv_cache = None
             block.attn._log_kv_pending = None
+            block.attn._log_kv_pin_indices = None
 
     def set_log_kv_cache(
         self,
@@ -392,6 +394,7 @@ class GPT(nn.Module):
                 B=B, recent_size=recent_size, pin_size=pin_size,
             )
             block.attn._log_kv_pending = None
+            block.attn._log_kv_pin_indices = None
             block.attn.log_kv_prefill_block = prefill_block
             block.attn.log_kv_pin_obs_window = pin_obs_window
             block.attn.log_kv_second_order_scale = float(second_order_scale)
@@ -418,6 +421,7 @@ class GPT(nn.Module):
                 )
             cache.reset_parameters()
             block.attn._log_kv_pending = None
+            block.attn._log_kv_pin_indices = None
 
     def set_log_kv_second_order_scale(self, second_order_scale: float) -> None:
         """Set the coupled Sigma/Gamma correction scale on every LogKV layer."""
