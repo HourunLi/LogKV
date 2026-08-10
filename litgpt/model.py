@@ -347,6 +347,7 @@ class GPT(nn.Module):
         prefill_block: int = 256,
         pin_size: int = 0,
         pin_obs_window: int = 64,
+        pin_min_distance: int = 0,
         second_order_scale: float = 1.0,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
@@ -375,6 +376,8 @@ class GPT(nn.Module):
                 (SnapKV-style; see ``_log_kv_select_pins``).
             pin_obs_window: Number of trailing prompt tokens used as the
                 salience observation window.
+            pin_min_distance: Minimum token distance between salience pins
+                selected by NMS. 0/1 keeps the old unconstrained top-k path.
             second_order_scale: Coupled scale for the persisted Sigma/Gamma
                 corrections. 0.0 reproduces the old first-order LogKV path;
                 CPT can warm this from 0.0 to 1.0.
@@ -397,6 +400,7 @@ class GPT(nn.Module):
             block.attn._log_kv_pin_indices = None
             block.attn.log_kv_prefill_block = prefill_block
             block.attn.log_kv_pin_obs_window = pin_obs_window
+            block.attn.log_kv_pin_min_distance = int(pin_min_distance)
             block.attn.log_kv_second_order_scale = float(second_order_scale)
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
@@ -597,6 +601,9 @@ class CausalSelfAttention(nn.Module):
         # observation window at prefill (active only when the cache has
         # pin_size > 0; set via GPT.set_log_kv_cache(pin_size=..., pin_obs_window=...)).
         self.log_kv_pin_obs_window: int = 64
+        # Optional NMS-style spatial de-clustering for salience pins. 0/1 keeps
+        # the original unconstrained top-k selection.
+        self.log_kv_pin_min_distance: int = 0
         # Coupled scale for Sigma/Gamma second-order LogKV corrections.
         self.log_kv_second_order_scale: float = 1.0
         # Last pin selection (batch, groups, n_pin) token indices — kept for
@@ -797,6 +804,60 @@ class CausalSelfAttention(nn.Module):
         # Output projection.
         return self.proj(y)  # (B, T, C)
 
+    @staticmethod
+    def _log_kv_select_nms_indices(
+        salience: torch.Tensor,
+        n_pin: int,
+        min_distance: int,
+    ) -> torch.Tensor:
+        """Select high-salience positions while discouraging local clustering.
+
+        ``salience`` is ``(batch, groups, C)``. The old path is pure top-k; this
+        path walks candidates in descending score order and accepts a candidate
+        only if it is at least ``min_distance`` tokens away from previously
+        accepted pins in the same batch/group. If an extreme setting cannot
+        produce ``n_pin`` spaced pins, the remaining slots are backfilled by the
+        best leftover candidates so cache shapes and pin budget stay unchanged.
+        """
+        if n_pin <= 0:
+            return salience.new_empty(*salience.shape[:2], 0, dtype=torch.long)
+
+        order = torch.argsort(salience, dim=-1, descending=True).detach().to("cpu")
+        out = torch.empty(*salience.shape[:2], n_pin, dtype=torch.long)
+
+        batch_size, n_groups, _ = salience.shape
+        for batch_i in range(batch_size):
+            for group_i in range(n_groups):
+                candidates = order[batch_i, group_i].tolist()
+                selected: list[int] = []
+                suppressed: set[int] = set()
+                for pos in candidates:
+                    pos = int(pos)
+                    if pos in suppressed:
+                        continue
+                    selected.append(pos)
+                    if len(selected) >= n_pin:
+                        break
+                    left = max(0, pos - min_distance + 1)
+                    right = pos + min_distance
+                    suppressed.update(range(left, right))
+
+                if len(selected) < n_pin:
+                    selected_set = set(selected)
+                    for pos in candidates:
+                        pos = int(pos)
+                        if pos in selected_set:
+                            continue
+                        selected.append(pos)
+                        selected_set.add(pos)
+                        if len(selected) >= n_pin:
+                            break
+
+                selected.sort()
+                out[batch_i, group_i] = torch.tensor(selected[:n_pin], dtype=torch.long)
+
+        return out.to(device=salience.device)
+
     def _assert_log_kv_input_pos_contiguous(self, input_pos: torch.Tensor, T: int) -> None:
         """Validate the append-only LogKV cache contract.
 
@@ -895,7 +956,9 @@ class CausalSelfAttention(nn.Module):
         gain. Salience = fp32 softmax attention of the observation queries,
         summed over window and heads-in-group, then max-pooled (kernel 7)
         along positions so a hit pins its local span, not a lone token
-        (SnapKV's clustering trick).
+        (SnapKV's clustering trick). If ``log_kv_pin_min_distance > 1``, the
+        final selection applies NMS-style minimum spacing: still descending by
+        salience, but skipping candidates too close to an already selected pin.
         """
         W = min(int(self.log_kv_pin_obs_window), T)
         C = T - cache.recent_size  # candidate horizon (see docstring)
@@ -920,7 +983,11 @@ class CausalSelfAttention(nn.Module):
 
         n_pin = min(cache.pin_size, C)
         # Time-ordered indices per (batch, group); groups pin independently.
-        idx = salience.topk(n_pin, dim=-1).indices.sort(dim=-1).values
+        min_distance = max(0, int(self.log_kv_pin_min_distance))
+        if min_distance <= 1:
+            idx = salience.topk(n_pin, dim=-1).indices.sort(dim=-1).values
+        else:
+            idx = self._log_kv_select_nms_indices(salience, n_pin, min_distance)
         cache.set_pinned(
             torch.gather(k, 2, idx.unsqueeze(-1).expand(-1, -1, -1, k.size(-1))).detach(),
             torch.gather(v, 2, idx.unsqueeze(-1).expand(-1, -1, -1, v.size(-1))).detach(),

@@ -164,6 +164,7 @@ emit("LOG_KV_RECENT", cfg.get("log_kv_recent_size", 1024))
 emit("LOG_KV_PREFILL", cfg.get("log_kv_prefill_block", 256))
 emit("LOG_KV_PIN", cfg.get("log_kv_pin_size", 0))
 emit("LOG_KV_PIN_OBS", cfg.get("log_kv_pin_obs_window", 64))
+emit("LOG_KV_PIN_MIN_DIST", cfg.get("log_kv_pin_min_distance", 0))
 emit("LOG_KV_SECOND_ORDER_SCALE", cfg.get("log_kv_second_order_scale", 1.0))
 emit("MAX_STEPS", max_steps)
 emit("NUM_EPOCHS", num_epochs)
@@ -271,7 +272,7 @@ for TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
     fi
 done
 
-LOG_KV_ARG_LIST=(--log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}" --log_kv_pin_size "${LOG_KV_PIN}" --log_kv_pin_obs_window "${LOG_KV_PIN_OBS}")
+LOG_KV_ARG_LIST=(--log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}" --log_kv_pin_size "${LOG_KV_PIN}" --log_kv_pin_obs_window "${LOG_KV_PIN_OBS}" --log_kv_pin_min_distance "${LOG_KV_PIN_MIN_DIST}")
 if [ -n "${LOG_KV_SECOND_ORDER_SCALE}" ]; then
     LOG_KV_ARG_LIST+=(--log_kv_second_order_scale "${LOG_KV_SECOND_ORDER_SCALE}")
 fi
@@ -287,7 +288,7 @@ fi
 
 echo "Checkpoint: ${SAVE_DIR}"
 echo "Output dir: ${EVAL_OUTPUT_DIR}"
-echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}"
+echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}"
 if [ -n "${DIAG_ARGS}" ]; then
     echo "Extra eval args: ${DIAG_ARGS}"
 fi

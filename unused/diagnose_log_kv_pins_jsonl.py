@@ -71,6 +71,7 @@ def main() -> None:
     parser.add_argument("--log_kv_prefill_block", type=int, default=1024)
     parser.add_argument("--log_kv_pin_size", type=int, default=256)
     parser.add_argument("--log_kv_pin_obs_window", type=int, default=64)
+    parser.add_argument("--log_kv_pin_min_distance", type=int, default=0)
     parser.add_argument("--log_kv_second_order_scale", type=float, default=0.2)
     parser.add_argument("--radius", type=int, default=16)
     parser.add_argument("--include_indices", action="store_true")
@@ -93,6 +94,7 @@ def main() -> None:
         log_kv_prefill_block=args.log_kv_prefill_block,
         log_kv_pin_size=args.log_kv_pin_size,
         log_kv_pin_obs_window=args.log_kv_pin_obs_window,
+        log_kv_pin_min_distance=args.log_kv_pin_min_distance,
         log_kv_second_order_scale=args.log_kv_second_order_scale,
         tokenizer_dir=args.tokenizer_dir,
         pin_diag_recorder=recorder,
@@ -117,6 +119,7 @@ def main() -> None:
             "log_kv_prefill_block": args.log_kv_prefill_block,
             "log_kv_pin_size": args.log_kv_pin_size,
             "log_kv_pin_obs_window": args.log_kv_pin_obs_window,
+            "log_kv_pin_min_distance": args.log_kv_pin_min_distance,
             "log_kv_second_order_scale": args.log_kv_second_order_scale,
             "radius": args.radius,
             "include_indices": args.include_indices,
