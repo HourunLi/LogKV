@@ -35,17 +35,37 @@ export NCCL_IB_TIMEOUT=12000
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_MIN_NCHANNELS=4
 
-GPUS_PER_NODE=${MA_NUM_GPUS:-8}
-NUM_NODES=${MA_NUM_HOSTS:-1}
+GPUS_PER_NODE=${MA_NUM_GPUS:-${LOCAL_WORLD_SIZE:-8}}
+NUM_NODES=${MA_NUM_HOSTS:-${GROUP_WORLD_SIZE:-1}}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 if [ -n "${MA_VJ_NAME:-}" ]; then
     MASTER_ADDR="${MA_VJ_NAME}-${MA_TASK_NAME}-${MA_MASTER_INDEX:-0}.${MA_VJ_NAME}"
 fi
 MASTER_PORT=${MASTER_PORT:-6000}
-NODE_RANK=${VC_TASK_INDEX:-0}
+NODE_RANK=${VC_TASK_INDEX:-${NODE_RANK:-${GROUP_RANK:-0}}}
+MAIN_EVAL_MASTER_PORT=${MAIN_EVAL_MASTER_PORT:-${EVAL_MASTER_PORT:-${MASTER_PORT}}}
+NIAH_EVAL_MASTER_PORT=${NIAH_EVAL_MASTER_PORT:-${NIAH_MASTER_PORT:-$((MASTER_PORT + 1))}}
+
+for name in GPUS_PER_NODE NUM_NODES NODE_RANK MASTER_PORT MAIN_EVAL_MASTER_PORT NIAH_EVAL_MASTER_PORT; do
+    value=${!name}
+    if [[ -z "${value}" || "${value}" == *[!0-9]* ]]; then
+        echo "ERROR: ${name} must be a non-negative integer, got '${value}'"
+        exit 1
+    fi
+done
+
+if [ "${NUM_NODES}" -gt 1 ] && [ "${MASTER_ADDR}" = "localhost" ]; then
+    echo "ERROR: NUM_NODES=${NUM_NODES} but MASTER_ADDR=localhost."
+    echo "Multi-node torchrun needs a master address reachable from every node."
+    exit 1
+fi
+
+export LITGPT_EXPECTED_WORLD_SIZE=${LITGPT_EXPECTED_WORLD_SIZE:-$((NUM_NODES * GPUS_PER_NODE))}
 
 echo "Starting eval-only job: Node ${NODE_RANK} / ${NUM_NODES}"
-echo "Master: ${MASTER_ADDR}:${MASTER_PORT}"
+echo "Expected world size: ${LITGPT_EXPECTED_WORLD_SIZE} (= ${NUM_NODES} nodes x ${GPUS_PER_NODE} gpus)"
+echo "Main eval rendezvous: ${MASTER_ADDR}:${MAIN_EVAL_MASTER_PORT}"
+echo "NIAH eval rendezvous: ${MASTER_ADDR}:${NIAH_EVAL_MASTER_PORT}"
 
 if [ -z "$1" ]; then
     echo "ERROR: missing YAML config."
@@ -351,7 +371,7 @@ if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
         --nproc_per_node=${GPUS_PER_NODE} \
         --node_rank=${NODE_RANK} \
         --master_addr=${MASTER_ADDR} \
-        --master_port=${MASTER_PORT} \
+        --master_port=${MAIN_EVAL_MASTER_PORT} \
         eval.py \
         --checkpoint_dir "${SAVE_DIR}" \
         --benchmark "${BENCHMARKS}" \
@@ -376,7 +396,7 @@ if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
         --nproc_per_node=${GPUS_PER_NODE} \
         --node_rank=${NODE_RANK} \
         --master_addr=${MASTER_ADDR} \
-        --master_port=${MASTER_PORT} \
+        --master_port=${NIAH_EVAL_MASTER_PORT} \
         eval.py \
         --checkpoint_dir "${SAVE_DIR}" \
         --benchmark "${NIAH_BENCHMARKS}" \

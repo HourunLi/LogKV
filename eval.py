@@ -49,8 +49,89 @@ from utils import *
 # 退出，剩下的 rank 就一直等到 NCCL 超时（这里设的是 12h）。评测跑完之后
 # "卡很久" 正是这一类分支不一致 + 进程组没有显式销毁造成的。
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def _global_rank() -> int:
-    return dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    return _env_int("RANK", 0)
+
+
+def _world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return _env_int("WORLD_SIZE", 1)
+
+
+def _local_rank() -> int:
+    return _env_int("LOCAL_RANK", _global_rank())
+
+
+def _rank_label() -> str:
+    return f"GlobalRank {_global_rank()}/{_world_size()} (local {_local_rank()})"
+
+
+def _tqdm_position() -> int:
+    # Use global rank so aggregated multi-node stdout gets one tqdm row per
+    # process instead of collapsing every node onto local ranks 0..7.
+    return _global_rank()
+
+
+_DIST_ENV_KEYS = (
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "GROUP_RANK",
+    "ROLE_RANK",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "LITGPT_EXPECTED_WORLD_SIZE",
+    "TORCHELASTIC_RUN_ID",
+)
+
+
+def _dist_env_text() -> str:
+    return " ".join(f"{key}={os.environ.get(key, '<unset>')}" for key in _DIST_ENV_KEYS)
+
+
+def _expected_world_size() -> int:
+    for key in ("LITGPT_EXPECTED_WORLD_SIZE", "EXPECTED_WORLD_SIZE"):
+        value = _env_int(key, 0)
+        if value > 0:
+            return value
+    return 0
+
+
+def _check_expected_world_size(stage: str) -> None:
+    expected = _expected_world_size()
+    if expected <= 0:
+        return
+    actual = _world_size()
+    if actual != expected:
+        raise RuntimeError(
+            f"{stage}: distributed world size mismatch: actual={actual}, expected={expected}. "
+            f"This usually means torchrun did not rendezvous across all nodes. env: {_dist_env_text()}"
+        )
+
+
+def _rendezvous_snapshot(stage: str) -> None:
+    import socket
+
+    ts = datetime.now().strftime("%H:%M:%S")
+    if dist.is_available() and dist.is_initialized():
+        dist_text = (
+            f"dist_initialized=True backend={dist.get_backend()} "
+            f"rank={dist.get_rank()} world={dist.get_world_size()}"
+        )
+    else:
+        dist_text = "dist_initialized=False backend=<unset> rank=<unset> world=<unset>"
+    print(f"🧭 [{ts}][{socket.gethostname()}][{stage}] {dist_text} env: {_dist_env_text()}", flush=True)
 
 
 def _is_main() -> bool:
@@ -87,11 +168,9 @@ def _hb(stage: str) -> None:
     不需要在这里重复打印）。带 hostname，方便从日志里按 rank 分组核对。
     """
     import socket
-    rank = _global_rank()
-    world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
     host = socket.gethostname()
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"💓 [{ts}][Rank {rank}/{world}][{host}] {stage}", flush=True)
+    print(f"💓 [{ts}][{_rank_label()}][{host}] {stage}", flush=True)
 
 
 class SafeJSONEncoder(json.JSONEncoder):
@@ -201,6 +280,7 @@ from lm_eval import evaluator
 from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
+from litgpt.log_kv_pin_diag import PinDiagRecorder
 from litgpt.ruler_patch import apply_patch
 apply_patch()
 
@@ -223,7 +303,7 @@ def _load_lit_model_checkpoint(
         while time.time() < deadline and not lit_path.exists():
             time.sleep(2.0)
         if lit_path.exists():
-            print(f"[eval][Rank {_global_rank()}] 共享盘元数据延迟，等待后已看到 {lit_path}")
+            print(f"[eval][{_rank_label()}] 共享盘元数据延迟，等待后已看到 {lit_path}")
     if not lit_path.exists():
         raise FileNotFoundError(f"未找到 checkpoint: {lit_path}")
     if lit_path.is_dir():
@@ -408,6 +488,7 @@ class LogKVLM(LM):
         log_kv_pin_obs_window: int = 64,
         log_kv_second_order_scale: float = 1.0,
         tokenizer_dir: str | None = None,
+        pin_diag_recorder: PinDiagRecorder | None = None,
     ):
         super().__init__()
         self._device = device
@@ -418,6 +499,7 @@ class LogKVLM(LM):
         self.log_kv_pin_size = log_kv_pin_size
         self.log_kv_pin_obs_window = log_kv_pin_obs_window
         self.log_kv_second_order_scale = float(log_kv_second_order_scale)
+        self.pin_diag_recorder = pin_diag_recorder
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -522,12 +604,12 @@ class LogKVLM(LM):
         dist.barrier()
         wait_s = time.perf_counter() - t0
         print(
-            f"⏳ [Rank {dist.get_rank()}] {tag} 本地 {len(local_result_list)} 条已完成，"
+            f"⏳ [{_rank_label()}] {tag} 本 rank {len(local_result_list)} 条已完成，"
             f"等待其它 rank 用时 {wait_s:.1f}s",
             flush=True,
         )
 
-        dp_size = dist.get_world_size()
+        dp_size = _world_size()
         all_results_list = [None for _ in range(dp_size)]
         dist.all_gather_object(all_results_list, local_result_list)
 
@@ -551,7 +633,7 @@ class LogKVLM(LM):
         the continuation is left-truncated to its last ``max_len - 1`` tokens —
         scoring is then partial but the forward stays in bounds.
         """
-        dp_rank = dist.get_rank() if dist.is_initialized() else 0
+        rank_label = _rank_label()
 
         # 🌟 安全阀：如果 题干 + 选项 > max_seq_length，必须切掉题干最前面的部分
         max_len = self.model.max_seq_length
@@ -562,7 +644,7 @@ class LogKVLM(LM):
                 ctx_enc = []
             else:
                 ctx_enc = ctx_enc[-keep_ctx_len:]
-            print(f"⚠️ [Rank {dp_rank}] 警告: 触发截断，剩余 context 长度: {len(ctx_enc)}")
+            print(f"⚠️ [{rank_label}] 警告: 触发截断，剩余 context 长度: {len(ctx_enc)}")
 
         if len(ctx_enc) == 0:
             ctx_enc = [self.tokenizer.bos_id]
@@ -619,14 +701,15 @@ class LogKVLM(LM):
         return total_logprob, is_greedy
 
     def loglikelihood(self, requests):
-        dp_rank = dist.get_rank() if dist.is_initialized() else 0
-        dp_size = dist.get_world_size() if dist.is_initialized() else 1
+        dp_rank = _global_rank()
+        dp_size = _world_size()
 
         local_requests = requests[dp_rank::dp_size]
         results = []
 
         # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
-        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank):
+        desc = f"loglikelihood GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
+        for req in tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position()):
             context, continuation = req.args[0], req.args[1]
 
             ctx_enc = self.tokenizer.encode(context).tolist()
@@ -644,14 +727,15 @@ class LogKVLM(LM):
     # 🌟 核心 2：自回归生成任务 (LongBench)
     # ==========================================
     def generate_until(self, requests):
-        dp_rank = dist.get_rank() if dist.is_initialized() else 0
-        dp_size = dist.get_world_size() if dist.is_initialized() else 1
+        dp_rank = _global_rank()
+        dp_size = _world_size()
 
         local_requests = requests[dp_rank::dp_size]
         results = []
 
         # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
-        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank):
+        desc = f"generate_until GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
+        for req in tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position()):
             prompt = req.args[0]
             gen_args = req.args[1]
 
@@ -667,13 +751,16 @@ class LogKVLM(LM):
                 top_p = 0.0
 
             prompt_tensor = self.tokenizer.encode(prompt, device=self._device)
+            original_prompt_tokens = int(prompt_tensor.size(0))
+            prompt_token_offset = 0
 
             # 🌟 安全阀：为生成的新 Token 预留空间
             max_len = self.model.max_seq_length
             if prompt_tensor.size(0) + max_new_tokens > max_len:
                 keep_prompt_len = max_len - max_new_tokens
+                prompt_token_offset = int(prompt_tensor.size(0) - keep_prompt_len)
                 prompt_tensor = prompt_tensor[-keep_prompt_len:]
-                print(f"⚠️ [Rank {dp_rank}] 警告: 触发生成截断，Prompt 被切至: {keep_prompt_len}")
+                print(f"⚠️ [{_rank_label()}] 警告: 触发生成截断，Prompt 被切至: {keep_prompt_len}")
 
             total_max_len = prompt_tensor.size(0) + max_new_tokens
             prompt_len = prompt_tensor.size(0)
@@ -693,6 +780,17 @@ class LogKVLM(LM):
                         top_p=top_p,
                         eos_id=self.tokenizer.eos_id,
                     )
+                    if self.pin_diag_recorder is not None:
+                        self.pin_diag_recorder.record(
+                            model=self.model,
+                            tokenizer=self.tokenizer,
+                            prompt=prompt,
+                            doc=getattr(req, "doc", None),
+                            request=req,
+                            prompt_token_offset=prompt_token_offset,
+                            original_prompt_tokens=original_prompt_tokens,
+                            used_prompt_tokens=prompt_len,
+                        )
                     t1 = time.perf_counter()
                 finally:
                     self.model.reset_log_kv_cache()
@@ -726,15 +824,16 @@ class LogKVLM(LM):
         window starts from BOS). This matches lm-eval's standard rolling-window
         scoring; a ``pass`` stub would return None and break PPL tasks.
         """
-        dp_rank = dist.get_rank() if dist.is_initialized() else 0
-        dp_size = dist.get_world_size() if dist.is_initialized() else 1
+        dp_rank = _global_rank()
+        dp_size = _world_size()
 
         local_requests = requests[dp_rank::dp_size]
         results = []
 
         max_len = self.model.max_seq_length
         # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
-        for req in tqdm.tqdm(local_requests, desc=f'Rank {dp_rank}', position=dp_rank):
+        desc = f"loglikelihood_rolling GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
+        for req in tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position()):
             (text,) = req.args
             tokens = self.tokenizer.encode(text, bos=False).tolist()
 
@@ -849,6 +948,13 @@ def main(
     # 典型 sweep：{7, 14, 21, 27, None}（配合已有的 exact_from_layer 分层消融
     # 结果来选阈值）。
     log_kv_diag_second_order_max_layer: int | None = None,
+    # ── 🧩 logKV pin 诊断：比较 _log_kv_pin_indices 与 NIAH needle token span ──
+    # None = 关闭。开启后只记录 generate_until 请求（NIAH/RULER 属于这个路径），
+    # 不改变模型输出；建议配合 --benchmark niah_single_1 --limit 4 单卡先跑。
+    log_kv_pin_diag_output: str | None = None,
+    log_kv_pin_diag_radius: int = 16,
+    log_kv_pin_diag_max_samples: int | None = None,
+    log_kv_pin_diag_include_indices: bool = False,
     # ── 🧩 logKV：YAML config ──
     config: str | None = None,
 ):
@@ -896,9 +1002,18 @@ def main(
     log_kv_diag_second_order_max_layer = _o(
         "log_kv_diag_second_order_max_layer", log_kv_diag_second_order_max_layer
     )
+    log_kv_pin_diag_output = _o("log_kv_pin_diag_output", log_kv_pin_diag_output)
+    log_kv_pin_diag_radius = _o("log_kv_pin_diag_radius", log_kv_pin_diag_radius)
+    log_kv_pin_diag_max_samples = _o("log_kv_pin_diag_max_samples", log_kv_pin_diag_max_samples)
+    log_kv_pin_diag_include_indices = _o(
+        "log_kv_pin_diag_include_indices", log_kv_pin_diag_include_indices
+    )
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = _local_rank()
+    world_size = _world_size()
+    if world_size > 1 or _expected_world_size() > 0:
+        _rendezvous_snapshot("eval startup before init_process_group")
+        _check_expected_world_size("eval startup before init_process_group")
 
     # 进程组可能由外部创建（demo.py 用 Fabric 起训练后直接 in-process 调 eval.main），
     # 这时**不能**由 eval 销毁它，否则训练侧后续的集合通信全炸。只有 eval 自己建的
@@ -909,11 +1024,22 @@ def main(
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=12))
         pg_owned_here = True
     if world_size > 1:
+        _rendezvous_snapshot("eval startup after init_process_group")
+        _check_expected_world_size("eval startup after init_process_group")
         _hb("进程组就绪（rendezvous 完成）")
 
     device = f"cuda:{local_rank}"
 
     diag_active = log_kv_diag_mode not in (None, "off")
+    pin_diag_recorder = (
+        PinDiagRecorder(
+            radius=log_kv_pin_diag_radius,
+            max_samples=log_kv_pin_diag_max_samples,
+            include_indices=log_kv_pin_diag_include_indices,
+        )
+        if log_kv_pin_diag_output is not None
+        else None
+    )
     if diag_active and log_kv_pin_size != 0:
         raise ValueError(
             f"log_kv_diag_mode={log_kv_diag_mode!r} requires log_kv_pin_size=0: "
@@ -938,6 +1064,12 @@ def main(
                 f"second_order_max_layer: {log_kv_diag_second_order_max_layer} | "
                 "每 rank 各自累积统计量，不跨 rank 聚合"
             )
+        if pin_diag_recorder is not None:
+            print(
+                f"📍 pin 诊断开启: output={log_kv_pin_diag_output} | "
+                f"radius={log_kv_pin_diag_radius} | max_samples={log_kv_pin_diag_max_samples} | "
+                f"include_indices={log_kv_pin_diag_include_indices}"
+            )
 
     # eval_done：所有 rank 都跑完了 simple_evaluate（即全部集合通信都已结束）。
     # 只有这时收尾 barrier 才是安全的；某个 rank 中途抛异常时必须跳过 barrier，
@@ -955,8 +1087,9 @@ def main(
             log_kv_prefill_block=log_kv_prefill_block,
             log_kv_pin_size=log_kv_pin_size,
             log_kv_pin_obs_window=log_kv_pin_obs_window,
-        log_kv_second_order_scale=log_kv_second_order_scale,
+            log_kv_second_order_scale=log_kv_second_order_scale,
             tokenizer_dir=tokenizer_dir,
+            pin_diag_recorder=pin_diag_recorder,
         )
         if world_size > 1:
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
@@ -965,8 +1098,8 @@ def main(
             log_kv_diag_mode,
             exact_from_layer=log_kv_diag_exact_from_layer,
             peak_window_from_end=log_kv_diag_peak_window_from_end,
-        second_order_max_width=log_kv_diag_second_order_max_width,
-        second_order_max_layer=log_kv_diag_second_order_max_layer,
+            second_order_max_width=log_kv_diag_second_order_max_width,
+            second_order_max_layer=log_kv_diag_second_order_max_layer,
         ) if diag_active else contextlib.nullcontext():
             results = evaluator.simple_evaluate(
                 model=lm_model,
@@ -977,6 +1110,11 @@ def main(
                 limit=limit,
             )
         eval_done = True
+
+        if pin_diag_recorder is not None and _dist_ready():
+            gathered_pin_samples = [None for _ in range(_world_size())]
+            dist.all_gather_object(gathered_pin_samples, pin_diag_recorder.samples)
+            pin_diag_recorder.merge_samples(gathered_pin_samples)
 
         # 落盘阶段：只有 rank 0 写文件（建目录、写 json/csv/xlsx）。其它 rank 什么都
         # 不做，直接到下面的 barrier 等 rank 0 写完 —— 各 rank 同时往共享盘写同名文件
@@ -1009,6 +1147,36 @@ def main(
                 with open(diag_file, "w", encoding="utf-8") as f:
                     json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)
                 print(f"🔬 诊断汇总已保存到: {diag_file}")
+
+            if pin_diag_recorder is not None:
+                pin_base = Path(log_kv_pin_diag_output).expanduser()
+                if pin_base.suffix.lower() == ".json":
+                    pin_file = pin_base
+                else:
+                    pin_base.mkdir(parents=True, exist_ok=True)
+                    ckpt_name = Path(checkpoint_dir).name
+                    pin_file = pin_base / f"pin_diag_{ckpt_name}_{benchmark.replace(',', '+')}_{ts}.json"
+                pin_file.parent.mkdir(parents=True, exist_ok=True)
+                pin_payload = {
+                    "timestamp": ts,
+                    "benchmark": benchmark,
+                    "checkpoint_dir": checkpoint_dir,
+                    "config": {
+                        "log_kv_B": log_kv_B,
+                        "log_kv_recent_size": log_kv_recent_size,
+                        "log_kv_prefill_block": log_kv_prefill_block,
+                        "log_kv_pin_size": log_kv_pin_size,
+                        "log_kv_pin_obs_window": log_kv_pin_obs_window,
+                        "log_kv_second_order_scale": log_kv_second_order_scale,
+                        "radius": log_kv_pin_diag_radius,
+                        "max_samples": log_kv_pin_diag_max_samples,
+                        "include_indices": log_kv_pin_diag_include_indices,
+                    },
+                    "pin_diag": pin_diag_recorder.summary(),
+                }
+                with open(pin_file, "w", encoding="utf-8") as f:
+                    json.dump(pin_payload, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
+                print(f"📍 pin 诊断已保存到: {pin_file}")
 
             # 🌟 第一步：立即保存原始 results 对象，便于后续恢复
             results_cache_file = Path("eval_results_cache.json")
@@ -1103,27 +1271,27 @@ def main(
         # 现在改成：rank 0 写完 → barrier 汇合 → 一起 destroy_process_group() →
         # 一起退出。
         # 这里的异常一律吞掉：finally 里抛出会顶掉 try 中真正的报错，把根因藏起来。
-        rank = _global_rank()
         if _dist_ready():
             if eval_done:
                 t0 = time.perf_counter()
                 try:
                     dist.barrier()
-                    print(f"🤝 [Rank {rank}] 收尾同步完成，用时 {time.perf_counter() - t0:.1f}s", flush=True)
+                    print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {time.perf_counter() - t0:.1f}s", flush=True)
                 except Exception as e:  # noqa: BLE001 — 收尾阶段不掩盖主异常
-                    print(f"⚠️ [Rank {rank}] 收尾 barrier 失败（忽略）: {e}", flush=True)
+                    print(f"⚠️ [{_rank_label()}] 收尾 barrier 失败（忽略）: {e}", flush=True)
             else:
                 # 有 rank 异常退出：绝不能 barrier，否则其它 rank 等到 NCCL 超时。
                 # 直接往下销毁进程组，让对端尽快收到通信中断而不是干等 12h。
-                print(f"⚠️ [Rank {rank}] 评测未正常结束，跳过收尾 barrier", flush=True)
+                print(f"⚠️ [{_rank_label()}] 评测未正常结束，跳过收尾 barrier", flush=True)
 
         if pg_owned_here and dist.is_available() and dist.is_initialized():
             try:
+                rank_before_destroy = _global_rank()
                 dist.destroy_process_group()
-                if rank == 0:
+                if rank_before_destroy == 0:
                     print("✅ 分布式进程组已销毁，评测进程可以正常退出了", flush=True)
             except Exception as e:  # noqa: BLE001
-                print(f"⚠️ [Rank {rank}] 销毁进程组失败（忽略）: {e}", flush=True)
+                print(f"⚠️ [{_rank_label()}] 销毁进程组失败（忽略）: {e}", flush=True)
 
 
 @auto_expand_env_vars
