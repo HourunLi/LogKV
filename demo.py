@@ -972,6 +972,18 @@ def main(
         _run_eval(save_path, eval_benchmark)
 
     fabric.print("Training finished!")
+    try:
+        fabric.barrier()
+    except Exception as e:  # noqa: BLE001
+        fabric.print(f"Final training barrier failed before teardown; continuing shutdown: {e}")
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank_before_destroy = torch.distributed.get_rank()
+            torch.distributed.destroy_process_group()
+            if rank_before_destroy == 0:
+                print("Distributed process group destroyed after training.", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"Distributed process group teardown after training failed; ignoring during shutdown: {e}", flush=True)
 
 
 if __name__ == "__main__":
