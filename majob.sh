@@ -104,7 +104,7 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 # 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
 # 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS LOG_KV_SECOND_ORDER_SCALE SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS LOG_KV_PIN_MIN_DIST LOG_KV_SECOND_ORDER_SCALE SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import os
 import sys
 
@@ -145,6 +145,7 @@ print(
     cfg.get("log_kv_prefill_block", 256),
     cfg.get("log_kv_pin_size", 0),
     cfg.get("log_kv_pin_obs_window", 64),
+    cfg.get("log_kv_pin_min_distance", 0),
     cfg.get("log_kv_second_order_scale", 1.0),
     str(bool(cfg.get("save_ckpt", False))).lower(),
     max_steps,
@@ -261,7 +262,7 @@ for RAW_TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
     fi
 done
 
-LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_pin_size ${LOG_KV_PIN} --log_kv_pin_obs_window ${LOG_KV_PIN_OBS} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
+LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_pin_size ${LOG_KV_PIN} --log_kv_pin_obs_window ${LOG_KV_PIN_OBS} --log_kv_pin_min_distance ${LOG_KV_PIN_MIN_DIST} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
 DIAG_ARGS=${DIAG_ARGS:-}
 TOKENIZER_ARGS=""
 if [ -n "${TOKENIZER_SOURCE}" ]; then
@@ -271,7 +272,7 @@ else
     echo "⚠️ 未在候选目录中找到 tokenizer.json/tokenizer.model: ${TOKENIZER_CANDIDATES}"
     echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
 fi
-echo "🧩 logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}"
+echo "🧩 logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}"
 if [ -n "${DIAG_ARGS}" ]; then
     echo "🧪 extra eval args: ${DIAG_ARGS}"
 fi

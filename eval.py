@@ -486,6 +486,7 @@ class LogKVLM(LM):
         log_kv_prefill_block: int = 256,
         log_kv_pin_size: int = 0,
         log_kv_pin_obs_window: int = 64,
+        log_kv_pin_min_distance: int = 0,
         log_kv_second_order_scale: float = 1.0,
         tokenizer_dir: str | None = None,
         pin_diag_recorder: PinDiagRecorder | None = None,
@@ -498,6 +499,7 @@ class LogKVLM(LM):
         self.log_kv_prefill_block = log_kv_prefill_block
         self.log_kv_pin_size = log_kv_pin_size
         self.log_kv_pin_obs_window = log_kv_pin_obs_window
+        self.log_kv_pin_min_distance = int(log_kv_pin_min_distance)
         self.log_kv_second_order_scale = float(log_kv_second_order_scale)
         self.pin_diag_recorder = pin_diag_recorder
 
@@ -586,6 +588,7 @@ class LogKVLM(LM):
             # 精确槽形态钉在层级之外，免于被 mean-pool 稀释。
             pin_size=self.log_kv_pin_size,
             pin_obs_window=self.log_kv_pin_obs_window,
+            pin_min_distance=self.log_kv_pin_min_distance,
             second_order_scale=self.log_kv_second_order_scale,
         )
         self._eval_cache_ready = True
@@ -912,6 +915,9 @@ def main(
     # 精确 w=1 槽（层级照常池化，缓存轨迹不变）。0 = 关闭。捞针类任务的关键。
     log_kv_pin_size: int = 0,
     log_kv_pin_obs_window: int = 64,
+    # NMS 式 pin 空间分散约束。0/1 = 旧 top-k；>1 时每个 KV group 内相邻 pin
+    # 至少间隔这么多 token，不够时用剩余高分点回填以保持 pin 数量。
+    log_kv_pin_min_distance: int = 0,
     # Must match the CPT target scale, not the warm-up intermediate value.
     # 0.0 reproduces the first-order LogKV eval path; 1.0 enables full
     # Sigma/Gamma second-order corrections.
@@ -987,6 +993,7 @@ def main(
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
     log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
     log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
+    log_kv_pin_min_distance = int(_o("log_kv_pin_min_distance", log_kv_pin_min_distance))
     log_kv_second_order_scale = float(_o("log_kv_second_order_scale", log_kv_second_order_scale))
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
     limit = _o("limit", limit)
@@ -1053,7 +1060,8 @@ def main(
         print(
             f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | "
             f"prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} "
-            f"(obs {log_kv_pin_obs_window}) | second_order_scale: {log_kv_second_order_scale}"
+            f"(obs {log_kv_pin_obs_window}, min_dist {log_kv_pin_min_distance}) | "
+            f"second_order_scale: {log_kv_second_order_scale}"
         )
         if diag_active:
             print(
@@ -1087,6 +1095,7 @@ def main(
             log_kv_prefill_block=log_kv_prefill_block,
             log_kv_pin_size=log_kv_pin_size,
             log_kv_pin_obs_window=log_kv_pin_obs_window,
+            log_kv_pin_min_distance=log_kv_pin_min_distance,
             log_kv_second_order_scale=log_kv_second_order_scale,
             tokenizer_dir=tokenizer_dir,
             pin_diag_recorder=pin_diag_recorder,
@@ -1167,6 +1176,7 @@ def main(
                         "log_kv_prefill_block": log_kv_prefill_block,
                         "log_kv_pin_size": log_kv_pin_size,
                         "log_kv_pin_obs_window": log_kv_pin_obs_window,
+                        "log_kv_pin_min_distance": log_kv_pin_min_distance,
                         "log_kv_second_order_scale": log_kv_second_order_scale,
                         "radius": log_kv_pin_diag_radius,
                         "max_samples": log_kv_pin_diag_max_samples,

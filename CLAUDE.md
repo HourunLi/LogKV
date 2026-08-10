@@ -46,13 +46,14 @@
 *阶段 1 —— 修选择算法，纯推理期改动，不碰训练：*
 (a)【已完成，见 6.4】跑只读诊断 + 随机基线对比，确认 `_log_kv_select_pins` 的
 near-hit 覆盖率不如随机采样、exact-hit 略优于随机；
-(b) 用 `--log_kv_pin_diag_include_indices` 对一小批样本重新跑一次诊断,把真实
-256 个 pin 的完整位置摊开看空间分布,确认"抱团扎堆"这个猜想是否成立（当前保存的
-JSON 是 `include_indices: false`,只有 `nearest_indices` 前 8 个,不够画分布）；
-(c) 如果 (b) 确认，给 `_log_kv_select_pins` 加一个空间分散约束（topk 后按最小间距
-做非极大值抑制，或者把候选区间分桶限额）；
-(d) 用 `unused/pin_diag.py` 的随机基线重新验证：near_hit_rate 有没有真正甩开
-35% 这条基线（不是打平）。
+(b)【已完成并确认，见 6.6】用 `--log_kv_pin_diag_include_indices` + `pin_diag.py`
+新增的 spatial distribution 分析，证实"抱团扎堆"——23-26 层 3840 个 group 的
+**中位数**就已经明显聚集（32 bin 只占用 25%，熵 0.471），不是极端个例；
+(c)【已实现并通过代码审查，见 6.7】给 `_log_kv_select_pins` 加了 NMS 式最小间距
+空间分散约束（`log_kv_pin_min_distance`），合成数据验证聚集度从 79.7%→4.7%；
+(d)【下一步，待做】用非 0 的 `--log_kv_pin_min_distance` 重新跑真实 pin 诊断 +
+`unused/pin_diag.py` 随机基线对比：near_hit_rate 有没有真正甩开 35% 这条基线
+（不是打平）。
 
 *阶段 2 —— 确认选择修好后是否真的解决下游问题，仍不碰训练：*
 (e) 阶段 1 通过后，跑一次真实 niah/longbench 评测（`majob.sh`/`eval.sh`），确认
@@ -460,6 +461,73 @@ CPT 之后 checkpoint，在**稠密**注意力（不开任何 LogKV 压缩）下
 能力被压缩训练目标"挤掉"；如果不成立（base 模型本来就一般，不是 CPT 的锅），提升
 salience 质量就要靠更大投入的专门检索监督或检索类数据继续预训练，优先级低于修选择
 算法（见 0 节"下一步方向"阶段 3(f)(g)）。
+
+### 6.6 抱团扎堆已实锤 + `pin_diag.py` 新增的空间分布分析（2026-08-10）
+
+**`unused/pin_diag.py` 新增了两块功能**（用户实现）：
+- `print_pin_distribution_summary`：用 `--log_kv_pin_diag_include_indices` 记录的
+  完整 `pin_indices`，对每个 (sample, layer, group) 算直方图占用 bin 数、归一化熵、
+  相邻 pin 间隔、以及若干固定宽度（64/128/256/512 token）滑动窗口内的最大 pin 密度，
+  并打印密度最高的 top-N group 的 ASCII 直方图。
+- `print_compressed_slot_summary`：读取 `needle_covering_slots`（见下面的已知问题），
+  统计 needle 落在压缩 level slot 还是 recent 精确窗口。
+
+**空间分布结果证实了"抱团扎堆"猜想，而且是典型现象，不是极端个例**（23-26 层，
+3840 个 group）：32 个 bin 的占用比例中位数只有 25%（约 8/32），单个最热 bin 中位数
+占了 38.3% 的 pin，最密 512-token 窗口中位数占比 35.5%，归一化熵中位数 0.471（1.0
+才是均匀分布）。极端例子（如 `sample=104 layer=23 group=4`）里，256 个 pin 中
+250 个（97.7%）挤在一个 512-token 窗口里，而这个 group 的"span"却高达候选区间的
+98.7%——span 这个指标会被少数跑到候选区间另一端的离群点带偏，看聚集程度应该看
+`dense{window}`/`max_bin_frac` 这几列，不要只看 span。**结论：阶段 1(b) 确认通过，
+可以直接进入 1(c) 给 `_log_kv_select_pins` 加空间分散约束**，不需要更多证据。
+
+**已知问题（不阻塞，之后再查）：`print_compressed_slot_summary` 的输出全是 0%/n/a，
+大概率是 bug，不是真实结论**。`group-level compressed coverage: 0/0` 说明每个
+group 的 `needle_covering_slots` 都是空列表——连"needle 落在 recent 精确窗口"都是
+0%，这不合理（`_cache_slot_layout`，[log_kv_pin_diag.py:221-291](litgpt/litgpt/log_kv_pin_diag.py#L221-L291)，
+理论上会把当前缓存里所有 level + recent 累计拼起来，应该完整覆盖 needle 所在位置，
+不管它被压缩到多深）。两个怀疑方向：①`record()` 是在整个 `generate_until` 生成流程
+跑完之后才读缓存状态，不是紧跟在 prefill 之后——此时缓存已经因为解码新 token 又做过
+若干次进位合并，跟 pin 刚选出来那一刻的快照不是同一个状态；②`_cache_slot_layout`
+自己的坐标/计数有 bug——它已经把自检字段 `layout_matches_token_count`
+（[log_kv_pin_diag.py:289](litgpt/litgpt/log_kv_pin_diag.py#L289)）记进了每个
+group 的 `slot_layout` 字段，但 `pin_diag.py` 当前没有打印它，下次要查这个问题时
+第一步就是把这个字段打出来看是不是 False。这个功能不影响阶段 1(c) 的判断，先不修。
+
+### 6.7 阶段 1(c)：给 `_log_kv_select_pins` 加 NMS 空间分散约束（2026-08-10，已实现并通过审查）
+
+**改动**（六个文件，都已提交，无未提交改动）：
+- `litgpt/model.py`：`GPT.set_log_kv_cache()` 新增 `pin_min_distance` 参数；
+  `CausalSelfAttention` 新增 `log_kv_pin_min_distance` 属性；新增静态方法
+  `_log_kv_select_nms_indices()`——按显著性从高到低贪心选 pin，每选一个就抑制周围
+  `min_distance` 范围内的候选，间距不够时用剩余最高分点回填以保证 `pin_size` 不变；
+  `_log_kv_select_pins()` 里 `log_kv_pin_min_distance <= 1` 走旧 `topk`，`> 1` 走
+  NMS。
+- `eval.py`/`demo.py`/`eval.sh`/`majob.sh`/`unused/diagnose_log_kv_pins_jsonl.py`：
+  新增 `log_kv_pin_min_distance` 参数，从 CLI/YAML 一路串到
+  `model.set_log_kv_cache()`，默认值全链路统一是 `0`（等价旧行为）。
+  `majob.sh` 的 `read -r` 位置变量列表和 Python 端 `print()` 的输出顺序同步加了
+  新字段，避免后面的 `LOG_KV_SECOND_ORDER_SCALE`/`SAVE_CKPT` 等字段被串位。
+
+**审查结论：核心算法正确，已用合成数据验证**（不是只读代码，实际跑了一遍）：
+构造一个"抱团"显著性分布（4000 候选里塞一个 50-token 宽的超高分热点，模拟真实
+观测到的"250/256 挤在一个窗口"），top-k 在 100-token 窗口内集中度 79.7%，加了
+`min_distance=32` 的 NMS 降到 4.7%；相邻 pin 最小间距实测精确等于设定值；
+`min_distance` 大到无法满足间距时触发回填，验证过不会死循环、不会重复索引、
+最终数量精确等于 `n_pin`；`n_pin == C` 边界正常。六个文件的参数默认值、
+`majob.sh` 的位置变量顺序都逐一核对过，没发现功能性 bug。
+
+**唯一非阻塞的顾虑：性能**。`_log_kv_select_nms_indices` 是纯 Python 嵌套循环
+（每个 batch×group 一次，候选列表可达 3 万+），没有向量化、跑在 CPU 上——而且
+"高分挤在一起"恰恰是最容易让 NMS 需要多走几步候选列表的输入分布，也正是这次要修的
+场景。28 层 × 8 组每次 prefill 都要跑一遍，建议在真实评测上留意一下墙钟时间有没有
+明显变慢，不用现在就优化。
+
+**下一步（阶段 1(d)）**：用非 0 的 `--log_kv_pin_min_distance`（比如先试 32 或 64）
+重新跑一次跟 6.4/6.6 同样配置的 pin 诊断 + `unused/pin_diag.py` 随机基线对比，
+确认 near_hit_rate 有没有真正甩开随机基线的 35%（不是像之前那样打平或更差），
+以及"Pin spatial distribution"那几个聚集指标（bin 占用比例、熵、密度窗口）有没有
+明显改善。确认后再进入阶段 2（跑真实 niah/longbench 看下游指标是否好转）。
 
 ## 7. 有用的坑 / 经验教训（给下次接续的自己看）
 
