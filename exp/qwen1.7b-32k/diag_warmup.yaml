@@ -26,8 +26,9 @@ log_kv_B: null
 log_kv_recent_size: 1024
 log_kv_second_order_scale: null
 log_kv_prefill_block: 1024
-log_kv_pin_size: 0
+log_kv_pin_size: 256
 log_kv_pin_obs_window: 64
+log_kv_pin_min_distance: 64
 
 log_kv_diag_mode: null
 log_kv_diag_output: null
