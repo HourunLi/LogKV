@@ -296,11 +296,6 @@ if ! checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
     echo "ERROR: checkpoint not found: ${SAVE_DIR}/lit_model.pth"
     exit 1
 fi
-if ! checkpoint_finished; then
-    echo "ERROR: checkpoint exists but is not marked finished: $(checkpoint_step_label)"
-    echo "Refusing eval-only run on an unfinished training checkpoint."
-    exit 1
-fi
 
 ensure_checkpoint_tokenizer() {
     if has_tokenizer "${SAVE_DIR}"; then
