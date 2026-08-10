@@ -29,18 +29,40 @@ export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
 # ==============================================================================
 # Distributed Training Setup
 # ==============================================================================
-GPUS_PER_NODE=${MA_NUM_GPUS:-8}
-NUM_NODES=${MA_NUM_HOSTS:-1}
+GPUS_PER_NODE=${MA_NUM_GPUS:-${LOCAL_WORLD_SIZE:-8}}
+NUM_NODES=${MA_NUM_HOSTS:-${GROUP_WORLD_SIZE:-1}}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 if [ -n "${MA_VJ_NAME:-}" ]; then
     MASTER_ADDR="${MA_VJ_NAME}-${MA_TASK_NAME}-${MA_MASTER_INDEX:-0}.${MA_VJ_NAME}"
 fi
 MASTER_PORT=${MASTER_PORT:-6000}
-NODE_RANK=${VC_TASK_INDEX:-0}
+NODE_RANK=${VC_TASK_INDEX:-${NODE_RANK:-${GROUP_RANK:-0}}}
+
+for name in GPUS_PER_NODE NUM_NODES NODE_RANK MASTER_PORT; do
+    value=${!name}
+    if [[ -z "${value}" || "${value}" == *[!0-9]* ]]; then
+        echo "❌ 致命错误：${name} 必须是非负整数，当前值为 '${value}'"
+        exit 1
+    fi
+done
+
+if [ "${NUM_NODES}" -gt 1 ] && [ "${MASTER_ADDR}" = "localhost" ]; then
+    echo "❌ 致命错误：NUM_NODES=${NUM_NODES} 但 MASTER_ADDR=localhost。"
+    echo "   多节点 torchrun 必须使用所有节点可访问的 master 地址；否则每个节点会各自组成 world_size=${GPUS_PER_NODE}。"
+    exit 1
+fi
+
+TRAIN_MASTER_PORT=${TRAIN_MASTER_PORT:-${MASTER_PORT}}
+EVAL_MASTER_PORT=${EVAL_MASTER_PORT:-$((MASTER_PORT + 1))}
+NIAH_MASTER_PORT=${NIAH_MASTER_PORT:-$((MASTER_PORT + 2))}
+export LITGPT_EXPECTED_WORLD_SIZE=${LITGPT_EXPECTED_WORLD_SIZE:-$((NUM_NODES * GPUS_PER_NODE))}
 
 pip install tensorboard
 echo "🌍 正在启动多机多卡训练: Node ${NODE_RANK} / ${NUM_NODES}"
-echo "🔗 Master 地址: ${MASTER_ADDR}:${MASTER_PORT}"
+echo "🧮 期望 world size: ${LITGPT_EXPECTED_WORLD_SIZE} (= ${NUM_NODES} nodes × ${GPUS_PER_NODE} gpus)"
+echo "🔗 Train rendezvous: ${MASTER_ADDR}:${TRAIN_MASTER_PORT}"
+echo "🔗 Eval rendezvous: ${MASTER_ADDR}:${EVAL_MASTER_PORT}"
+echo "🔗 NIAH rendezvous: ${MASTER_ADDR}:${NIAH_MASTER_PORT}"
 
 # ==============================================================================
 # 🌟 自动化实验流水线 (Train -> Eval)
@@ -289,7 +311,7 @@ else
         --nproc_per_node=${GPUS_PER_NODE} \
         --node_rank=${NODE_RANK} \
         --master_addr=${MASTER_ADDR} \
-        --master_port=${MASTER_PORT} \
+        --master_port=${TRAIN_MASTER_PORT} \
         demo.py --config ${CONFIG_FILE}
 
     TRAIN_STATUS=$?
@@ -384,7 +406,7 @@ torchrun \
     --nproc_per_node=${GPUS_PER_NODE} \
     --node_rank=${NODE_RANK} \
     --master_addr=${MASTER_ADDR} \
-    --master_port=${MASTER_PORT} \
+    --master_port=${EVAL_MASTER_PORT} \
     eval.py \
     --checkpoint_dir ${SAVE_DIR} \
     --benchmark ${BENCHMARKS} \
@@ -398,7 +420,7 @@ torchrun \
     --nproc_per_node=${GPUS_PER_NODE} \
     --node_rank=${NODE_RANK} \
     --master_addr=${MASTER_ADDR} \
-    --master_port=${MASTER_PORT} \
+    --master_port=${NIAH_MASTER_PORT} \
     eval.py \
     --checkpoint_dir ${SAVE_DIR} \
     --benchmark ${NIAH_BENCHMARKS} \
