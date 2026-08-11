@@ -8,9 +8,11 @@
 #   bash eval.sh exp/qwen1.7b-32k/dense_niah_base.yaml none niah_single_1,niah_single_2,niah_single_3
 # ==========================================
 
+
+
 checkpoint_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
 tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
-benchmark: "niah_single_1,niah_single_2,niah_single_3"
+benchmark: "boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa,mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2,longbench_2wikimqa,longbench_dureader,longbench_gov_report,longbench_hotpotqa,longbench_lcc,longbench_lsht,longbench_multi_news,longbench_multifieldqa_en,longbench_multifieldqa_zh,longbench_musique,longbench_narrativeqa,longbench_passage_count,longbench_passage_retrieval_en,longbench_qasper,longbench_qmsum,longbench_repobench-p,longbench_samsum,longbench_trec,longbench_triviaqa,longbench_vcsum,longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e,longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e,longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e,niah_single_1,niah_single_2,niah_single_3"
 output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/dense_niah_base_eval
 
 # dense 模式下 log_kv_B/recent_size/prefill_block/second_order_scale 等参数
@@ -21,4 +23,4 @@ log_kv_pin_size: 0
 # niah_* 任务需要 metadata 才能拿到 tokenizer 路径和测试长度。
 metadata:
   pretrained: *tokenizer_dir
-  max_seq_lengths: [1024, 2048, 4096, 8192, 16384, 32768]
+  max_seq_lengths: [32768]
