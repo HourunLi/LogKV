@@ -124,72 +124,72 @@ model_outputs = {
 |                                                       |       |none  |     0|inst_level_strict_acc  |↑  | 0.2638|±  |   N/A|
 |                                                       |       |none  |     0|prompt_level_loose_acc |↑  | 0.1738|±  |0.0163|
 |                                                       |       |none  |     0|prompt_level_strict_acc|↑  | 0.1497|±  |0.0154|
-|longbench_2wikimqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.1061|±  |0.0104|
-|                                                       |       |none  |     0|score                  |↑  | 0.1061|±  |0.0104|
-|longbench_2wikimqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.0982|±  |0.0082|
-|                                                       |       |none  |     0|score                  |↑  | 0.0982|±  |0.0082|
-|longbench_dureader                                     |      5|none  |     0|rouge_zh_score         |↑  | 0.1520|±  |0.0082|
-|                                                       |       |none  |     0|score                  |↑  | 0.1520|±  |0.0082|
-|longbench_gov_report                                   |      5|none  |     0|rouge_score            |↑  | 0.1892|±  |0.0062|
-|                                                       |       |none  |     0|score                  |↑  | 0.1892|±  |0.0062|
-|longbench_gov_report_e                                 |      5|none  |     0|rouge_score            |↑  | 0.1911|±  |0.0049|
-|                                                       |       |none  |     0|score                  |↑  | 0.1911|±  |0.0049|
-|longbench_hotpotqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.0734|±  |0.0097|
-|                                                       |       |none  |     0|score                  |↑  | 0.0734|±  |0.0097|
-|longbench_hotpotqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.0710|±  |0.0054|
-|                                                       |       |none  |     0|score                  |↑  | 0.0710|±  |0.0054|
-|longbench_lcc                                          |      5|none  |     0|code_sim_score         |↑  | 0.1440|±  |0.0098|
-|                                                       |       |none  |     0|score                  |↑  | 0.1440|±  |0.0098|
-|longbench_lcc_e                                        |      5|none  |     0|code_sim_score         |↑  | 0.1442|±  |0.0132|
-|                                                       |       |none  |     0|score                  |↑  | 0.1442|±  |0.0132|
-|longbench_lsht                                         |      5|none  |     0|classification_score   |↑  | 0.2268|±  |0.0282|
-|                                                       |       |none  |     0|score                  |↑  | 0.2268|±  |0.0282|
-|longbench_multi_news                                   |      5|none  |     0|rouge_score            |↑  | 0.2234|±  |0.0072|
-|                                                       |       |none  |     0|score                  |↑  | 0.2234|±  |0.0072|
-|longbench_multi_news_e                                 |      5|none  |     0|rouge_score            |↑  | 0.1848|±  |0.0051|
-|                                                       |       |none  |     0|score                  |↑  | 0.1848|±  |0.0051|
-|longbench_multifieldqa_en                              |      5|none  |     0|qa_f1_score            |↑  | 0.2219|±  |0.0206|
-|                                                       |       |none  |     0|score                  |↑  | 0.2219|±  |0.0206|
-|longbench_multifieldqa_en_e                            |      5|none  |     0|qa_f1_score            |↑  | 0.2219|±  |0.0206|
-|                                                       |       |none  |     0|score                  |↑  | 0.2219|±  |0.0206|
-|longbench_multifieldqa_zh                              |      5|none  |     0|qa_f1_zh_score         |↑  | 0.1775|±  |0.0133|
-|                                                       |       |none  |     0|score                  |↑  | 0.1775|±  |0.0133|
-|longbench_musique                                      |      5|none  |     0|qa_f1_score            |↑  | 0.0420|±  |0.0052|
-|                                                       |       |none  |     0|score                  |↑  | 0.0420|±  |0.0052|
-|longbench_narrativeqa                                  |      5|none  |     0|qa_f1_score            |↑  | 0.0277|±  |0.0042|
-|                                                       |       |none  |     0|score                  |↑  | 0.0277|±  |0.0042|
-|longbench_passage_count                                |      5|none  |     0|count_score            |↑  | 0.0247|±  |0.0075|
-|                                                       |       |none  |     0|score                  |↑  | 0.0247|±  |0.0075|
-|longbench_passage_count_e                              |      5|none  |     0|count_score            |↑  | 0.0499|±  |0.0085|
-|                                                       |       |none  |     0|score                  |↑  | 0.0499|±  |0.0085|
-|longbench_passage_retrieval_en                         |      5|none  |     0|retrieval_score        |↑  | 0.0490|±  |0.0141|
-|                                                       |       |none  |     0|score                  |↑  | 0.0490|±  |0.0141|
-|longbench_passage_retrieval_en_e                       |      5|none  |     0|retrieval_score        |↑  | 0.0773|±  |0.0148|
-|                                                       |       |none  |     0|score                  |↑  | 0.0773|±  |0.0148|
-|longbench_qasper                                       |      5|none  |     0|qa_f1_score            |↑  | 0.1375|±  |0.0117|
-|                                                       |       |none  |     0|score                  |↑  | 0.1375|±  |0.0117|
-|longbench_qasper_e                                     |      5|none  |     0|qa_f1_score            |↑  | 0.1411|±  |0.0123|
-|                                                       |       |none  |     0|score                  |↑  | 0.1411|±  |0.0123|
-|longbench_qmsum                                        |      5|none  |     0|rouge_score            |↑  | 0.1991|±  |0.0053|
-|                                                       |       |none  |     0|score                  |↑  | 0.1991|±  |0.0053|
-|longbench_repobench-p                                  |      5|none  |     0|code_sim_score         |↑  | 0.1314|±  |0.0092|
-|                                                       |       |none  |     0|score                  |↑  | 0.1314|±  |0.0092|
-|longbench_repobench-p_e                                |      5|none  |     0|code_sim_score         |↑  | 0.1226|±  |0.0111|
-|                                                       |       |none  |     0|score                  |↑  | 0.1226|±  |0.0111|
-|longbench_samsum                                       |      5|none  |     0|rouge_score            |↑  | 0.3133|±  |0.0092|
-|                                                       |       |none  |     0|score                  |↑  | 0.3133|±  |0.0092|
-|longbench_samsum_e                                     |      5|none  |     0|rouge_score            |↑  | 0.2997|±  |0.0070|
-|                                                       |       |none  |     0|score                  |↑  | 0.2997|±  |0.0070|
-|longbench_trec                                         |      5|none  |     0|classification_score   |↑  | 0.3383|±  |0.0237|
-|                                                       |       |none  |     0|score                  |↑  | 0.3383|±  |0.0237|
-|longbench_trec_e                                       |      5|none  |     0|classification_score   |↑  | 0.3150|±  |0.0190|
-|                                                       |       |none  |     0|score                  |↑  | 0.3150|±  |0.0190|
-|longbench_triviaqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.1852|±  |0.0076|
-|                                                       |       |none  |     0|score                  |↑  | 0.1852|±  |0.0076|
-|longbench_triviaqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.1946|±  |0.0076|
-|                                                       |       |none  |     0|score                  |↑  | 0.1946|±  |0.0076|
-|longbench_vcsum                                        |      5|none  |     0|rouge_zh_score         |↑  | 0.0516|±  |0.0036|
-|                                                       |       |none  |     0|score                  |↑  | 0.0516|±  |0.0036|
+|longbench_2wikimqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.1040|±  |0.0119|
+|                                                       |       |none  |     0|score                  |↑  | 0.1040|±  |0.0119|
+|longbench_2wikimqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.1018|±  |0.0090|
+|                                                       |       |none  |     0|score                  |↑  | 0.1018|±  |0.0090|
+|longbench_dureader                                     |      5|none  |     0|rouge_zh_score         |↑  | 0.1611|±  |0.0086|
+|                                                       |       |none  |     0|score                  |↑  | 0.1611|±  |0.0086|
+|longbench_gov_report                                   |      5|none  |     0|rouge_score            |↑  | 0.1890|±  |0.0057|
+|                                                       |       |none  |     0|score                  |↑  | 0.1890|±  |0.0057|
+|longbench_gov_report_e                                 |      5|none  |     0|rouge_score            |↑  | 0.2045|±  |0.0054|
+|                                                       |       |none  |     0|score                  |↑  | 0.2045|±  |0.0054|
+|longbench_hotpotqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.0679|±  |0.0094|
+|                                                       |       |none  |     0|score                  |↑  | 0.0679|±  |0.0094|
+|longbench_hotpotqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.0908|±  |0.0090|
+|                                                       |       |none  |     0|score                  |↑  | 0.0908|±  |0.0090|
+|longbench_lcc                                          |      5|none  |     0|code_sim_score         |↑  | 0.0912|±  |0.0074|
+|                                                       |       |none  |     0|score                  |↑  | 0.0912|±  |0.0074|
+|longbench_lcc_e                                        |      5|none  |     0|code_sim_score         |↑  | 0.1161|±  |0.0115|
+|                                                       |       |none  |     0|score                  |↑  | 0.1161|±  |0.0115|
+|longbench_lsht                                         |      5|none  |     0|classification_score   |↑  | 0.1967|±  |0.0262|
+|                                                       |       |none  |     0|score                  |↑  | 0.1967|±  |0.0262|
+|longbench_multi_news                                   |      5|none  |     0|rouge_score            |↑  | 0.2094|±  |0.0077|
+|                                                       |       |none  |     0|score                  |↑  | 0.2094|±  |0.0077|
+|longbench_multi_news_e                                 |      5|none  |     0|rouge_score            |↑  | 0.1907|±  |0.0052|
+|                                                       |       |none  |     0|score                  |↑  | 0.1907|±  |0.0052|
+|longbench_multifieldqa_en                              |      5|none  |     0|qa_f1_score            |↑  | 0.2293|±  |0.0201|
+|                                                       |       |none  |     0|score                  |↑  | 0.2293|±  |0.0201|
+|longbench_multifieldqa_en_e                            |      5|none  |     0|qa_f1_score            |↑  | 0.2293|±  |0.0201|
+|                                                       |       |none  |     0|score                  |↑  | 0.2293|±  |0.0201|
+|longbench_multifieldqa_zh                              |      5|none  |     0|qa_f1_zh_score         |↑  | 0.2119|±  |0.0168|
+|                                                       |       |none  |     0|score                  |↑  | 0.2119|±  |0.0168|
+|longbench_musique                                      |      5|none  |     0|qa_f1_score            |↑  | 0.0380|±  |0.0051|
+|                                                       |       |none  |     0|score                  |↑  | 0.0380|±  |0.0051|
+|longbench_narrativeqa                                  |      5|none  |     0|qa_f1_score            |↑  | 0.0363|±  |0.0061|
+|                                                       |       |none  |     0|score                  |↑  | 0.0363|±  |0.0061|
+|longbench_passage_count                                |      5|none  |     0|count_score            |↑  | 0.0163|±  |0.0062|
+|                                                       |       |none  |     0|score                  |↑  | 0.0163|±  |0.0062|
+|longbench_passage_count_e                              |      5|none  |     0|count_score            |↑  | 0.0523|±  |0.0110|
+|                                                       |       |none  |     0|score                  |↑  | 0.0523|±  |0.0110|
+|longbench_passage_retrieval_en                         |      5|none  |     0|retrieval_score        |↑  | 0.0451|±  |0.0135|
+|                                                       |       |none  |     0|score                  |↑  | 0.0451|±  |0.0135|
+|longbench_passage_retrieval_en_e                       |      5|none  |     0|retrieval_score        |↑  | 0.1182|±  |0.0183|
+|                                                       |       |none  |     0|score                  |↑  | 0.1182|±  |0.0183|
+|longbench_qasper                                       |      5|none  |     0|qa_f1_score            |↑  | 0.1518|±  |0.0131|
+|                                                       |       |none  |     0|score                  |↑  | 0.1518|±  |0.0131|
+|longbench_qasper_e                                     |      5|none  |     0|qa_f1_score            |↑  | 0.1394|±  |0.0122|
+|                                                       |       |none  |     0|score                  |↑  | 0.1394|±  |0.0122|
+|longbench_qmsum                                        |      5|none  |     0|rouge_score            |↑  | 0.1913|±  |0.0053|
+|                                                       |       |none  |     0|score                  |↑  | 0.1913|±  |0.0053|
+|longbench_repobench-p                                  |      5|none  |     0|code_sim_score         |↑  | 0.1343|±  |0.0104|
+|                                                       |       |none  |     0|score                  |↑  | 0.1343|±  |0.0104|
+|longbench_repobench-p_e                                |      5|none  |     0|code_sim_score         |↑  | 0.1122|±  |0.0109|
+|                                                       |       |none  |     0|score                  |↑  | 0.1122|±  |0.0109|
+|longbench_samsum                                       |      5|none  |     0|rouge_score            |↑  | 0.3128|±  |0.0091|
+|                                                       |       |none  |     0|score                  |↑  | 0.3128|±  |0.0091|
+|longbench_samsum_e                                     |      5|none  |     0|rouge_score            |↑  | 0.3021|±  |0.0071|
+|                                                       |       |none  |     0|score                  |↑  | 0.3021|±  |0.0071|
+|longbench_trec                                         |      5|none  |     0|classification_score   |↑  | 0.3567|±  |0.0240|
+|                                                       |       |none  |     0|score                  |↑  | 0.3567|±  |0.0240|
+|longbench_trec_e                                       |      5|none  |     0|classification_score   |↑  | 0.3217|±  |0.0186|
+|                                                       |       |none  |     0|score                  |↑  | 0.3217|±  |0.0186|
+|longbench_triviaqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.1975|±  |0.0093|
+|                                                       |       |none  |     0|score                  |↑  | 0.1975|±  |0.0093|
+|longbench_triviaqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.2051|±  |0.0089|
+|                                                       |       |none  |     0|score                  |↑  | 0.2051|±  |0.0089|
+|longbench_vcsum                                        |      5|none  |     0|rouge_zh_score         |↑  | 0.0575|±  |0.0038|
+|                                                       |       |none  |     0|score                  |↑  | 0.0575|±  |0.0038|
 |mmlu                                                   |      2|none  |      |acc                    |↑  | 0.6008|±  |0.0039|
 | - humanities                                          |      2|none  |      |acc                    |↑  | 0.5116|±  |0.0068|
 |  - formal_logic                                       |      1|none  |     0|acc                    |↑  | 0.4921|±  |0.0447|
@@ -273,23 +273,24 @@ model_outputs = {
 |truthfulqa_mc2                                         |      3|none  |     0|acc                    |↑  | 0.4509|±  |0.0144|
 |winogrande                                             |      1|none  |     0|acc                    |↑  | 0.6338|±  |0.0135|
 |niah_single_1|      1|none  |     0|  1024|   |1.000|±  |     0|
-|             |       |none  |     0| 16384|↑  |0.082|±  |   N/A|
-|             |       |none  |     0|  2048|   |0.980|±  |0.0063|
-|             |       |none  |     0| 32768|↑  |0.056|±  |   N/A|
-|             |       |none  |     0|  4096|↑  |0.594|±  |   N/A|
-|             |       |none  |     0|  8192|↑  |0.294|±  |   N/A|
+|             |       |none  |     0| 16384|↑  |0.090|±  |   N/A|
+|             |       |none  |     0|  2048|   |0.984|±  |0.0056|
+|             |       |none  |     0| 32768|↑  |0.052|±  |   N/A|
+|             |       |none  |     0|  4096|↑  |0.564|±  |   N/A|
+|             |       |none  |     0|  8192|↑  |0.298|±  |   N/A|
 |niah_single_2|      1|none  |     0|  1024|   |1.000|±  |0.0000|
-|             |       |none  |     0| 16384|↑  |0.162|±  |   N/A|
+|             |       |none  |     0| 16384|↑  |0.192|±  |   N/A|
 |             |       |none  |     0|  2048|   |0.998|±  |0.0020|
-|             |       |none  |     0| 32768|↑  |0.102|±  |   N/A|
-|             |       |none  |     0|  4096|↑  |0.466|±  |   N/A|
-|             |       |none  |     0|  8192|↑  |0.270|±  |   N/A|
+|             |       |none  |     0| 32768|↑  |0.108|±  |   N/A|
+|             |       |none  |     0|  4096|↑  |0.494|±  |   N/A|
+|             |       |none  |     0|  8192|↑  |0.262|±  |   N/A|
 |niah_single_3|      1|none  |     0|  1024|   |1.000|±  |0.0000|
-|             |       |none  |     0| 16384|↑  |0.134|±  |   N/A|
+|             |       |none  |     0| 16384|↑  |0.140|±  |   N/A|
 |             |       |none  |     0|  2048|   |0.998|±  |0.0020|
-|             |       |none  |     0| 32768|↑  |0.060|±  |   N/A|
-|             |       |none  |     0|  4096|↑  |0.488|±  |   N/A|
-|             |       |none  |     0|  8192|↑  |0.216|±  |   N/A
+|             |       |none  |     0| 32768|↑  |0.058|±  |   N/A|
+|             |       |none  |     0|  4096|↑  |0.500|±  |   N/A|
+|             |       |none  |     0|  8192|↑  |0.204|±  |   N/A|
+
     """
 }
 
