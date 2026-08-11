@@ -281,6 +281,11 @@ from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
 from litgpt.log_kv_pin_diag import PinDiagRecorder
+from litgpt.log_kv_pin_score_diag import (
+    DIAG as LOG_KV_PIN_SCORE_DIAG,
+    merge_pin_score_diag_states,
+    pin_score_diag_mode,
+)
 from litgpt.ruler_patch import apply_patch
 apply_patch()
 
@@ -985,6 +990,11 @@ def main(
     log_kv_pin_diag_radius: int = 16,
     log_kv_pin_diag_max_samples: int | None = None,
     log_kv_pin_diag_include_indices: bool = False,
+    # ── 🧩 logKV pin score/mass 旁路诊断：比较 pooled vs pin 的最终 softmax mass ──
+    # None = 关闭。不同于 log_kv_diag.py，这套不做 slot->token span 映射，
+    # 因此可以在 pin_size>0 时使用。
+    log_kv_pin_score_diag_output: str | None = None,
+    log_kv_pin_score_diag_window_from_end: int = 512,
     # ── 🧩 logKV：YAML config ──
     config: str | None = None,
 ):
@@ -1040,6 +1050,10 @@ def main(
     log_kv_pin_diag_include_indices = _o(
         "log_kv_pin_diag_include_indices", log_kv_pin_diag_include_indices
     )
+    log_kv_pin_score_diag_output = _o("log_kv_pin_score_diag_output", log_kv_pin_score_diag_output)
+    log_kv_pin_score_diag_window_from_end = int(
+        _o("log_kv_pin_score_diag_window_from_end", log_kv_pin_score_diag_window_from_end)
+    )
 
     local_rank = _local_rank()
     world_size = _world_size()
@@ -1072,6 +1086,7 @@ def main(
         if log_kv_pin_diag_output is not None
         else None
     )
+    pin_score_diag_active = log_kv_pin_score_diag_output is not None
     if log_kv_dense_mode:
         if diag_active:
             raise ValueError(
@@ -1083,6 +1098,11 @@ def main(
                 "log_kv_dense_mode=True is incompatible with log_kv_pin_diag_output: "
                 "dense mode never runs _log_kv_select_pins(), so pin diagnostics would be empty."
             )
+        if pin_score_diag_active:
+            raise ValueError(
+                "log_kv_dense_mode=True is incompatible with log_kv_pin_score_diag_output: "
+                "pin score diagnostics require LogStructuredKVCache salience pins."
+            )
         if int(log_kv_pin_size) != 0:
             raise ValueError(
                 "log_kv_dense_mode=True requires log_kv_pin_size=0: salience pins are a LogKV-only feature."
@@ -1093,6 +1113,21 @@ def main(
             "salience pins scatter duplicate slots and break the diagnostic "
             "slot->token span mapping (see litgpt.log_kv_diag)."
         )
+    if pin_score_diag_active:
+        if diag_active:
+            raise ValueError(
+                "log_kv_pin_score_diag_output is incompatible with log_kv_diag_mode: "
+                "the oracle diagnostic requires pin_size=0, while pin score diagnostics require pins."
+            )
+        if int(log_kv_pin_size) <= 0:
+            raise ValueError(
+                "log_kv_pin_score_diag_output requires log_kv_pin_size > 0; otherwise there are no pin slots."
+            )
+        if log_kv_pin_score_diag_window_from_end <= 0:
+            raise ValueError(
+                "log_kv_pin_score_diag_window_from_end must be positive, "
+                f"got {log_kv_pin_score_diag_window_from_end}"
+            )
 
     # 多节点时用全局 rank==0（每个节点都有一个 local_rank 0，用它会重复打印）
     if _is_main():
@@ -1124,6 +1159,12 @@ def main(
                 f"radius={log_kv_pin_diag_radius} | max_samples={log_kv_pin_diag_max_samples} | "
                 f"include_indices={log_kv_pin_diag_include_indices}"
             )
+        if pin_score_diag_active:
+            print(
+                f"📊 pin score/mass 诊断开启: output={log_kv_pin_score_diag_output} | "
+                f"window_from_end={log_kv_pin_score_diag_window_from_end} | "
+                "只统计 fresh prefill 尾部 query 的 pooled vs pin 槽"
+            )
 
     # eval_done：所有 rank 都跑完了 simple_evaluate（即全部集合通信都已结束）。
     # 只有这时收尾 barrier 才是安全的；某个 rank 中途抛异常时必须跳过 barrier，
@@ -1150,13 +1191,20 @@ def main(
         if world_size > 1:
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
 
-        with diag_mode(
-            log_kv_diag_mode,
-            exact_from_layer=log_kv_diag_exact_from_layer,
-            peak_window_from_end=log_kv_diag_peak_window_from_end,
-            second_order_max_width=log_kv_diag_second_order_max_width,
-            second_order_max_layer=log_kv_diag_second_order_max_layer,
-        ) if diag_active else contextlib.nullcontext():
+        with (
+            diag_mode(
+                log_kv_diag_mode,
+                exact_from_layer=log_kv_diag_exact_from_layer,
+                peak_window_from_end=log_kv_diag_peak_window_from_end,
+                second_order_max_width=log_kv_diag_second_order_max_width,
+                second_order_max_layer=log_kv_diag_second_order_max_layer,
+            ) if diag_active else contextlib.nullcontext()
+        ), (
+            pin_score_diag_mode(
+                pin_score_diag_active,
+                window_from_end=log_kv_pin_score_diag_window_from_end,
+            ) if pin_score_diag_active else contextlib.nullcontext()
+        ):
             results = evaluator.simple_evaluate(
                 model=lm_model,
                 tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
@@ -1171,6 +1219,15 @@ def main(
             gathered_pin_samples = [None for _ in range(_world_size())]
             dist.all_gather_object(gathered_pin_samples, pin_diag_recorder.samples)
             pin_diag_recorder.merge_samples(gathered_pin_samples)
+
+        pin_score_diag_summary = None
+        if pin_score_diag_active:
+            if _dist_ready():
+                gathered_pin_score_states = [None for _ in range(_world_size())]
+                dist.all_gather_object(gathered_pin_score_states, LOG_KV_PIN_SCORE_DIAG.state_dict())
+                pin_score_diag_summary = merge_pin_score_diag_states(gathered_pin_score_states)
+            else:
+                pin_score_diag_summary = LOG_KV_PIN_SCORE_DIAG.summary()
 
         # 落盘阶段：只有 rank 0 写文件（建目录、写 json/csv/xlsx）。其它 rank 什么都
         # 不做，直接到下面的 barrier 等 rank 0 写完 —— 各 rank 同时往共享盘写同名文件
@@ -1234,6 +1291,38 @@ def main(
                 with open(pin_file, "w", encoding="utf-8") as f:
                     json.dump(pin_payload, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
                 print(f"📍 pin 诊断已保存到: {pin_file}")
+
+            if pin_score_diag_active:
+                pin_score_base = Path(log_kv_pin_score_diag_output).expanduser()
+                if pin_score_base.suffix.lower() == ".json":
+                    pin_score_file = pin_score_base
+                else:
+                    pin_score_base.mkdir(parents=True, exist_ok=True)
+                    ckpt_name = Path(checkpoint_dir).name
+                    pin_score_file = (
+                        pin_score_base
+                        / f"pin_score_diag_{ckpt_name}_{benchmark.replace(',', '+')}_{ts}.json"
+                    )
+                pin_score_file.parent.mkdir(parents=True, exist_ok=True)
+                pin_score_payload = {
+                    "timestamp": ts,
+                    "benchmark": benchmark,
+                    "checkpoint_dir": checkpoint_dir,
+                    "config": {
+                        "log_kv_B": log_kv_B,
+                        "log_kv_recent_size": log_kv_recent_size,
+                        "log_kv_prefill_block": log_kv_prefill_block,
+                        "log_kv_pin_size": log_kv_pin_size,
+                        "log_kv_pin_obs_window": log_kv_pin_obs_window,
+                        "log_kv_pin_min_distance": log_kv_pin_min_distance,
+                        "log_kv_second_order_scale": log_kv_second_order_scale,
+                        "window_from_end": log_kv_pin_score_diag_window_from_end,
+                    },
+                    "pin_score_diag": pin_score_diag_summary,
+                }
+                with open(pin_score_file, "w", encoding="utf-8") as f:
+                    json.dump(pin_score_payload, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
+                print(f"📊 pin score/mass 诊断已保存到: {pin_score_file}")
 
             # 🌟 第一步：立即保存原始 results 对象，便于后续恢复
             results_cache_file = Path("eval_results_cache.json")

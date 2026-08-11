@@ -47,6 +47,8 @@ import torch
 import torch.nn as nn
 from torch.autograd.function import once_differentiable
 
+from litgpt.log_kv_pin_score_diag import DIAG as LOG_KV_PIN_SCORE_DIAG
+
 
 _RANK1_EPS = 1e-12
 
@@ -1253,6 +1255,11 @@ def log_kv_slot_attention(
     slot_gamma_b: torch.Tensor | None = None,  # (B, G, S, v_dim)
     slot_gamma: torch.Tensor | None = None,    # (B, G, S)
     second_order_scale: float = 1.0,
+    pin_slot_range: tuple[int, int] | None = None,
+    pooled_slot_range: tuple[int, int] | None = None,
+    pin_score_diag_layer: int | None = None,
+    pin_score_diag_q_offset: int = 0,
+    pin_score_diag_q_slice: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Slot-granular attention over merged-position entries.
 
@@ -1316,6 +1323,13 @@ def log_kv_slot_attention(
     if has_rank1_stats and any(x is None for x in (slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma)):
         raise ValueError("log_kv_slot_attention() requires either all rank-1 stats or none")
     use_rank1_stats = has_rank1_stats and second_order_scale != 0.0
+    pin_score_diag_active = (
+        LOG_KV_PIN_SCORE_DIAG.enabled
+        and pin_slot_range is not None
+        and pooled_slot_range is not None
+        and pin_score_diag_layer is not None
+        and pin_score_diag_q_slice is not None
+    )
 
     if causal_tail:
         # Explicit raises (not asserts): survive `python -O`.
@@ -1357,6 +1371,16 @@ def log_kv_slot_attention(
         scores = torch.matmul(qg, slot_k.unsqueeze(2).mT)    # (B, nkv, rf, T_q, S)
         scores = scores.to(torch.float32)
         scores.mul_(scale)
+        dot_stats = (
+            LOG_KV_PIN_SCORE_DIAG.capture_score_stats(
+                scores,
+                q_slice=pin_score_diag_q_slice,
+                pin_slot_range=pin_slot_range,
+                pooled_slot_range=pooled_slot_range,
+            )
+            if pin_score_diag_active
+            else None
+        )
         if use_rank1_stats:
             sigma_dot = torch.matmul(qg, slot_sigma_u.unsqueeze(2).mT).to(torch.float32)
             scores.add_(
@@ -1373,6 +1397,18 @@ def log_kv_slot_attention(
         elif causal_tail:
             scores[..., S - causal_tail:].masked_fill_(tail_blocked, float("-inf"))
         attn = torch.softmax(scores, dim=-1).to(q.dtype)     # (B, nkv, rf, T_q, S)
+        if pin_score_diag_active:
+            LOG_KV_PIN_SCORE_DIAG.record(
+                layer=int(pin_score_diag_layer),
+                branch="gqa",
+                q_offset=int(pin_score_diag_q_offset),
+                q_slice=pin_score_diag_q_slice,
+                pin_slot_range=pin_slot_range,
+                pooled_slot_range=pooled_slot_range,
+                dot_stats=dot_stats,
+                final_scores=scores,
+                attn=attn,
+            )
         out = torch.matmul(attn, slot_v.unsqueeze(2))        # (B, nkv, rf, T_q, v_dim)
         if use_rank1_stats:
             # Activation dtype, matching the ``attn @ slot_v`` matmul above —
@@ -1387,6 +1423,16 @@ def log_kv_slot_attention(
     # MHA (nh == nkv): one logit per slot, no head expansion needed.
     scores = torch.matmul(q, slot_k.mT).to(torch.float32)  # (B, nh, T_q, S)
     scores.mul_(scale)
+    dot_stats = (
+        LOG_KV_PIN_SCORE_DIAG.capture_score_stats(
+            scores,
+            q_slice=pin_score_diag_q_slice,
+            pin_slot_range=pin_slot_range,
+            pooled_slot_range=pooled_slot_range,
+        )
+        if pin_score_diag_active
+        else None
+    )
     if use_rank1_stats:
         sigma_dot = torch.matmul(q, slot_sigma_u.mT).to(torch.float32)
         scores.add_(
@@ -1403,6 +1449,18 @@ def log_kv_slot_attention(
     elif causal_tail:
         scores[..., S - causal_tail:].masked_fill_(tail_blocked, float("-inf"))
     attn = torch.softmax(scores, dim=-1).to(q.dtype)  # (B, nh, T_q, S)
+    if pin_score_diag_active:
+        LOG_KV_PIN_SCORE_DIAG.record(
+            layer=int(pin_score_diag_layer),
+            branch="mha",
+            q_offset=int(pin_score_diag_q_offset),
+            q_slice=pin_score_diag_q_slice,
+            pin_slot_range=pin_slot_range,
+            pooled_slot_range=pooled_slot_range,
+            dot_stats=dot_stats,
+            final_scores=scores,
+            attn=attn,
+        )
     out = torch.matmul(attn, slot_v)                  # (B, nh, T_q, v_dim)
     if use_rank1_stats:
         # Value read-out correction in the activation dtype, matching the
