@@ -23,6 +23,7 @@ from litgpt.log_kv_cache import (
     log_kv_slot_attention,
 )
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_block_attention
+from litgpt.log_kv_pin_score_diag import DIAG as LOG_KV_PIN_SCORE_DIAG
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 
 
@@ -1271,6 +1272,27 @@ class CausalSelfAttention(nn.Module):
                         second_order_scale=self.log_kv_second_order_scale,
                     )
                 else:
+                    pin_score_diag_kwargs = {}
+                    if (
+                        LOG_KV_PIN_SCORE_DIAG.enabled
+                        and cache.pin_count > 0
+                        and int(cache.token_count) == start
+                    ):
+                        tail_start = max(0, T - int(LOG_KV_PIN_SCORE_DIAG.window_from_end))
+                        diag_q_start = max(start, tail_start)
+                        diag_q_end = block_end
+                        state_slots = int(slot_w.size(-1))
+                        pin_count = int(cache.pin_count)
+                        recent_count = int(cache.recent_count)
+                        n_pooled = state_slots - pin_count - recent_count
+                        if diag_q_start < diag_q_end and n_pooled > 0:
+                            pin_score_diag_kwargs = {
+                                "pooled_slot_range": (0, n_pooled),
+                                "pin_slot_range": (n_pooled, n_pooled + pin_count),
+                                "pin_score_diag_layer": self.block_idx,
+                                "pin_score_diag_q_offset": start,
+                                "pin_score_diag_q_slice": (diag_q_start - start, diag_q_end - start),
+                            }
                     (
                         k_all,
                         v_all,
@@ -1304,6 +1326,7 @@ class CausalSelfAttention(nn.Module):
                         slot_gamma_b=gamma_b_all,
                         slot_gamma=gamma_all,
                         second_order_scale=self.log_kv_second_order_scale,
+                        **pin_score_diag_kwargs,
                     )
                 outputs.append(y_blk)
 
