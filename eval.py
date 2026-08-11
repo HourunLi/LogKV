@@ -467,13 +467,14 @@ def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
 
 
 class LogKVLM(LM):
-    """LM wrapper that scores and generates through the log-structured KV cache.
+    """LM wrapper that scores and generates through LogKV or dense KV cache.
 
-    Both loglikelihood scoring and generate_until run through the merged-position
-    slot cache used by the LogKV training path: full post-RoPE keys are stored as
+    By default, loglikelihood scoring and generate_until use the merged-position
+    slot cache from the LogKV training path: full post-RoPE keys are stored as
     exact recent tokens or compressed slots, and slot attention scores one logit
-    per slot with the log(w) mass bias. There is no dense fallback — this
-    pipeline only evaluates the logKV compression route.
+    per slot with the log(w) mass bias. With ``log_kv_dense_mode=True``, the same
+    request/scoring code builds the native full KV cache instead, so attention is
+    ordinary causal dense attention with no LogKV slots, pins, or corrections.
     """
 
     def __init__(
@@ -488,6 +489,7 @@ class LogKVLM(LM):
         log_kv_pin_obs_window: int = 64,
         log_kv_pin_min_distance: int = 0,
         log_kv_second_order_scale: float = 1.0,
+        log_kv_dense_mode: bool = False,
         tokenizer_dir: str | None = None,
         pin_diag_recorder: PinDiagRecorder | None = None,
     ):
@@ -501,6 +503,7 @@ class LogKVLM(LM):
         self.log_kv_pin_obs_window = log_kv_pin_obs_window
         self.log_kv_pin_min_distance = int(log_kv_pin_min_distance)
         self.log_kv_second_order_scale = float(log_kv_second_order_scale)
+        self.log_kv_dense_mode = bool(log_kv_dense_mode)
         self.pin_diag_recorder = pin_diag_recorder
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
@@ -529,7 +532,8 @@ class LogKVLM(LM):
 
         # ==========================================
 
-        if is_master: print("🔧 正在初始化 Transformer (logKV 压缩注意力)...")
+        mode_name = "dense 标准 KV 注意力" if self.log_kv_dense_mode else "logKV 压缩注意力"
+        if is_master: print(f"🔧 正在初始化 Transformer ({mode_name})...")
         self.model = GPT(self.config).to(device).bfloat16()
 
         if is_master: print(f"🔄 正在加载权重...")
@@ -555,12 +559,12 @@ class LogKVLM(LM):
         self.gen_metrics: list[dict] = []      # generate_until
         self.ppl_metrics: list[dict] = []      # loglikelihood
 
-        # LogKV eval cache is built lazily once and reset per request (see
+        # Eval cache is built lazily once and reset per request (see
         # _set_eval_cache) — never re-allocated per sample.
         self._eval_cache_ready = False
 
     def _set_eval_cache(self) -> None:
-        """Install (once) and reset the LogKV inference cache.
+        """Install (once) and reset the selected inference cache.
 
         LogKV buffer sizes depend only on (B, recent_size, max_levels) — not on
         the request length — so the cache is built ONCE at the model's full
@@ -569,12 +573,22 @@ class LogKVLM(LM):
         times over a benchmark run and fragments the allocator (OOM risk).
         ``max_seq_length`` only bounds the append-only token counter and level
         hierarchy, so sizing it at the model's window covers every request.
+        Dense mode mirrors this reuse policy with the standard O(N) KV cache.
         """
         if self._eval_cache_ready:
-            self.model.reset_log_kv_cache()
+            self._reset_eval_cache()
             return
         dtype = next(self.model.parameters()).dtype
         max_seq_length = self.model.max_seq_length
+        if self.log_kv_dense_mode:
+            self.model.set_kv_cache(
+                batch_size=1,
+                max_seq_length=max_seq_length,
+                device=self._device,
+                dtype=dtype,
+            )
+            self._eval_cache_ready = True
+            return
         self.model.set_log_kv_cache(
             batch_size=1,
             max_seq_length=max_seq_length,
@@ -592,6 +606,12 @@ class LogKVLM(LM):
             second_order_scale=self.log_kv_second_order_scale,
         )
         self._eval_cache_ready = True
+
+    def _reset_eval_cache(self) -> None:
+        if self.log_kv_dense_mode:
+            self.model.reset_kv_cache()
+        else:
+            self.model.reset_log_kv_cache()
 
     # ==========================================
     # 🌟 分布式结果收集
@@ -657,9 +677,10 @@ class LogKVLM(LM):
         ctx_len = len(ctx_enc)
 
         with torch.no_grad():
-            # Score with the same merged-position slot attention used by LogKV
-            # inference. ``input_pos`` must be append-only contiguous because
-            # slot compaction is order-based rather than indexed.
+            # Score through whichever eval cache was selected. In LogKV mode,
+            # ``input_pos`` must be append-only contiguous because slot
+            # compaction is order-based rather than indexed; dense KV mode uses
+            # the same positions for the native full cache.
             self._set_eval_cache()
             try:
                 t0 = time.perf_counter()
@@ -672,7 +693,7 @@ class LogKVLM(LM):
             finally:
                 # In-place state reset (defensive: the next request resets again
                 # via _set_eval_cache). Keeping the buffers avoids re-allocation.
-                self.model.reset_log_kv_cache()
+                self._reset_eval_cache()
 
         self.ppl_metrics.append({
             "total_seq_len": seq_len, "context_len": ctx_len,
@@ -769,8 +790,8 @@ class LogKVLM(LM):
             prompt_len = prompt_tensor.size(0)
 
             with torch.no_grad():
-                # 🧩 logKV：长上下文生成使用 merged-position slot cache
-                # （建一次、按请求原地重置，不逐样本重分配 — 见 _set_eval_cache）
+                # 🧩 长上下文生成使用所选 cache（LogKV slot cache 或 dense KV）。
+                # 建一次、按请求原地重置，不逐样本重分配 — 见 _set_eval_cache。
                 self._set_eval_cache()
                 try:
                     t0 = time.perf_counter()
@@ -796,7 +817,7 @@ class LogKVLM(LM):
                         )
                     t1 = time.perf_counter()
                 finally:
-                    self.model.reset_log_kv_cache()
+                    self._reset_eval_cache()
 
             # 截取新生成的部分并解码
             generated_tokens = out[prompt_tensor.size(0):]
@@ -903,7 +924,10 @@ def main(
     config_overrides: dict[str, Any] | None = None,
     output_path: str | None = None,
     metadata: dict[str, Any] | None = None,
-    # ── 🧩 logKV（本管线只跑压缩路线，无 dense 分支）──
+    # ── 🧩 logKV / dense KV eval ──
+    # true = 使用原生 O(N) 标准 KVCache 跑普通 causal dense attention；
+    # false = 默认 LogKV 压缩注意力路径。dense 模式只用于手动基线对比。
+    log_kv_dense_mode: bool = False,
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
     # prefill 分块大小：块内 query 共享块首冻结的 slot 状态。2 = 严格 2-token
@@ -988,6 +1012,7 @@ def main(
     config_overrides = _o("config_overrides", config_overrides)
     output_path = _o("output_path", output_path)
     metadata = _o("metadata", metadata)
+    log_kv_dense_mode = bool(_o("log_kv_dense_mode", log_kv_dense_mode))
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
@@ -1047,6 +1072,21 @@ def main(
         if log_kv_pin_diag_output is not None
         else None
     )
+    if log_kv_dense_mode:
+        if diag_active:
+            raise ValueError(
+                "log_kv_dense_mode=True is incompatible with log_kv_diag_mode: "
+                "LogKV diagnostics require LogStructuredKVCache slots."
+            )
+        if log_kv_pin_diag_output is not None:
+            raise ValueError(
+                "log_kv_dense_mode=True is incompatible with log_kv_pin_diag_output: "
+                "dense mode never runs _log_kv_select_pins(), so pin diagnostics would be empty."
+            )
+        if int(log_kv_pin_size) != 0:
+            raise ValueError(
+                "log_kv_dense_mode=True requires log_kv_pin_size=0: salience pins are a LogKV-only feature."
+            )
     if diag_active and log_kv_pin_size != 0:
         raise ValueError(
             f"log_kv_diag_mode={log_kv_diag_mode!r} requires log_kv_pin_size=0: "
@@ -1057,12 +1097,18 @@ def main(
     # 多节点时用全局 rank==0（每个节点都有一个 local_rank 0，用它会重复打印）
     if _is_main():
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
-        print(
-            f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | "
-            f"prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} "
-            f"(obs {log_kv_pin_obs_window}, min_dist {log_kv_pin_min_distance}) | "
-            f"second_order_scale: {log_kv_second_order_scale}"
-        )
+        if log_kv_dense_mode:
+            print(
+                "🧩 dense 标准 KV 注意力 | 使用 GPT.set_kv_cache() 原生 causal attention；"
+                "忽略 log_kv_B/recent_size/prefill_block/pin/second_order_scale 等 LogKV 参数"
+            )
+        else:
+            print(
+                f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | "
+                f"prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} "
+                f"(obs {log_kv_pin_obs_window}, min_dist {log_kv_pin_min_distance}) | "
+                f"second_order_scale: {log_kv_second_order_scale}"
+            )
         if diag_active:
             print(
                 f"🔬 诊断模式: {log_kv_diag_mode} | limit: {limit} | "
@@ -1097,6 +1143,7 @@ def main(
             log_kv_pin_obs_window=log_kv_pin_obs_window,
             log_kv_pin_min_distance=log_kv_pin_min_distance,
             log_kv_second_order_scale=log_kv_second_order_scale,
+            log_kv_dense_mode=log_kv_dense_mode,
             tokenizer_dir=tokenizer_dir,
             pin_diag_recorder=pin_diag_recorder,
         )
@@ -1217,6 +1264,7 @@ def main(
                     "timestamp": ts,
                     "benchmark": benchmark,
                     "checkpoint_dir": checkpoint_dir,
+                    "log_kv_dense_mode": log_kv_dense_mode,
                     "results": results,
                 }
 
@@ -1348,6 +1396,7 @@ def output_from_cache(
             "timestamp": ts,
             "benchmark": benchmark,
             "checkpoint_dir": checkpoint_dir,
+            "log_kv_dense_mode": log_kv_dense_mode,
             "results": results,
         }
 

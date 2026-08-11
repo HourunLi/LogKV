@@ -335,6 +335,16 @@ class GPT(nn.Module):
             block.attn._log_kv_pending = None
             block.attn._log_kv_pin_indices = None
 
+    def reset_kv_cache(self) -> None:
+        """Reset every layer's standard KV cache state in place — no reallocation."""
+        for block in self.transformer.h:
+            cache = block.attn.kv_cache
+            if not isinstance(cache, KVCache):
+                raise TypeError("reset_kv_cache() requires set_kv_cache() to have been called first")
+            cache.reset_parameters()
+            block.attn._log_kv_pending = None
+            block.attn._log_kv_pin_indices = None
+
     def set_log_kv_cache(
         self,
         batch_size: int,
@@ -432,6 +442,23 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             block.attn.log_kv_second_order_scale = float(second_order_scale)
 
+    def set_log_kv_pin_training(self, pin_train_max: int, pin_train_prob: float) -> None:
+        """Set training-time random pin injection controls on every LogKV layer."""
+        pin_train_max = int(pin_train_max)
+        pin_train_prob = float(pin_train_prob)
+        if pin_train_max < 0:
+            raise ValueError(f"pin_train_max must be non-negative, got {pin_train_max}")
+        if not 0.0 <= pin_train_prob <= 1.0:
+            raise ValueError(f"pin_train_prob must be in [0, 1], got {pin_train_prob}")
+        for block in self.transformer.h:
+            cache = block.attn.kv_cache
+            if isinstance(cache, LogStructuredKVCache) and pin_train_max > cache.pin_size:
+                raise ValueError(
+                    f"pin_train_max ({pin_train_max}) exceeds training cache pin_size ({cache.pin_size})"
+                )
+            block.attn.log_kv_pin_train_max = pin_train_max
+            block.attn.log_kv_pin_train_prob = pin_train_prob
+
     def enable_log_kv_training(
         self,
         batch_size: int,
@@ -443,6 +470,9 @@ class GPT(nn.Module):
         recent_size: int = 1024,
         train_block: int = 2,
         second_order_scale: float = 1.0,
+        pin_size: int = 0,
+        pin_train_max: int = 0,
+        pin_train_prob: float = 0.0,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -460,7 +490,23 @@ class GPT(nn.Module):
         ``second_order_scale`` is a single coupled gate for the score-side
         Sigma correction and value-side Gamma correction. Use 0.0 for the old
         first-order objective and warm it to 1.0 during CPT.
+
+        ``pin_size`` allocates exact-pin capacity for training. ``pin_train_max``
+        and ``pin_train_prob`` control whether a forward pass injects random
+        historical exact K/V pins into that buffer; defaults keep the old
+        pin-free training objective.
         """
+        pin_size = int(pin_size)
+        pin_train_max = int(pin_train_max)
+        pin_train_prob = float(pin_train_prob)
+        if pin_size < 0:
+            raise ValueError(f"pin_size must be non-negative, got {pin_size}")
+        if pin_train_max < 0:
+            raise ValueError(f"pin_train_max must be non-negative, got {pin_train_max}")
+        if pin_train_max > pin_size:
+            raise ValueError(f"pin_train_max ({pin_train_max}) exceeds pin_size ({pin_size})")
+        if not 0.0 <= pin_train_prob <= 1.0:
+            raise ValueError(f"pin_train_prob must be in [0, 1], got {pin_train_prob}")
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
         if max_seq_length is None:
@@ -473,12 +519,15 @@ class GPT(nn.Module):
         for block_idx, block in enumerate(self.transformer.h):
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
-                B=B, recent_size=recent_size,
+                B=B, recent_size=recent_size, pin_size=pin_size,
             )
             block.attn.training_log_kv = True
             block.attn._log_kv_pending = None
+            block.attn._log_kv_pin_indices = None
             block.attn.log_kv_train_block = train_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
+            block.attn.log_kv_pin_train_max = pin_train_max
+            block.attn.log_kv_pin_train_prob = pin_train_prob
 
     def disable_log_kv_training(self) -> None:
         """Turn off logKV training mode and drop the caches."""
@@ -486,6 +535,7 @@ class GPT(nn.Module):
             block.attn.training_log_kv = False
             block.attn.kv_cache = None
             block.attn._log_kv_pending = None
+            block.attn._log_kv_pin_indices = None
 
 
 class Block(nn.Module):
@@ -606,6 +656,12 @@ class CausalSelfAttention(nn.Module):
         self.log_kv_pin_min_distance: int = 0
         # Coupled scale for Sigma/Gamma second-order LogKV corrections.
         self.log_kv_second_order_scale: float = 1.0
+        # Training-time random exact-pin injection. These are independent from
+        # eval-time salience pins: training teaches the model to consume mixed
+        # exact+compressed states without reproducing the expensive salience
+        # selector.
+        self.log_kv_pin_train_max: int = 0
+        self.log_kv_pin_train_prob: float = 0.0
         # Last pin selection (batch, groups, n_pin) token indices — kept for
         # introspection and the pinning tests; not used by the forward pass.
         self._log_kv_pin_indices: torch.Tensor | None = None
@@ -921,7 +977,15 @@ class CausalSelfAttention(nn.Module):
 
         train_block = max(2, min(int(self.log_kv_train_block), cache.recent_size))
         y = LogKVStreamTrainingAttention.apply(
-            q, k, v, cache, scale, train_block, self.log_kv_second_order_scale
+            q,
+            k,
+            v,
+            cache,
+            scale,
+            train_block,
+            self.log_kv_second_order_scale,
+            int(self.log_kv_pin_train_max),
+            float(self.log_kv_pin_train_prob),
         )  # (B, n_head, T, hs)
         y = y.transpose(1, 2).reshape(B, T, self.config.head_size * self.config.n_head)
         return self.proj(y)

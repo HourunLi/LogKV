@@ -1,0 +1,61 @@
+config: base.yaml
+
+expid: qwen1.7b-32k-cpt-logKV-pintrain
+
+# 不从 base Qwen 权重开始，而是从已经跑完的 warmup CPT checkpoint 续训
+# （demo.py 里 resume_dir 只做纯权重加载：优化器状态、global_step、LR
+#   schedule 全部重新开始，不会用 auto_resume 的续跑逻辑）。
+resume_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
+
+global_batch_size: 128
+micro_batch_size: 1
+max_steps: 300
+warmup_steps: 0
+# 续训一个已经收敛的 checkpoint，用比初始 CPT 更低的 LR，避免破坏已经学到的
+# 32K 长上下文能力，只做小幅分布适配。可按效果再调。
+learning_rate: 1e-5
+min_lr: 1e-5
+weight_decay: 0.1
+num_devices: 8
+
+data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
+num_workers: 16
+save_ckpt: true
+save_interval: 100
+# 必须是新路径：跟 warmup 的 save_path 不同，否则 majob.sh 检测到已有
+# lit_model.pth 会直接跳过训练，而且会覆盖掉 warmup 的 checkpoint。
+save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-pintrain
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_pintrain
+
+enable_tensorboard: true
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k-pintrain
+
+log_kv_B: 512
+log_kv_recent_size: 1024
+log_kv_train_block: 16384
+log_kv_prefill_block: 1024
+
+# second_order_scale 在 warmup 阶段已经爬坡到 0.2 并收敛，这次续训保持
+# 恒定（warmup_steps=0 即从第一步就用满 0.2），不重新爬坡，避免同时叠加
+# 两个分布变化，干扰这次实验想单独观察的东西（pin 注入的影响）。
+log_kv_second_order_scale: 0.2
+log_kv_second_order_warmup_steps: 0
+
+# eval-time salience pin 配置，跟部署时保持一致，续训结束后 majob.sh 的
+# 评测阶段会直接用这份配置跑 NMS pin。
+log_kv_pin_size: 256
+log_kv_pin_obs_window: 64
+log_kv_pin_min_distance: 64
+
+# 训练期随机 pin 注入（这次实验的核心）：随机挑选已经流式处理过的历史
+# token，把它们的原始 K/V 也作为 exact pin 注入进当前 chunk 的注意力，让
+# 模型在训练中见过"压缩槽 + 精确重复槽"共存的输入分布，而不是像目前这样
+# 只在推理时才第一次遇到这种分布。
+# - pin_train_max: 目标值，对齐上面的 log_kv_pin_size=256
+# - pin_train_prob: 每个 chunk 边界有 50% 概率触发注入，另外一半保持不注入，
+#   保护模型在没有 pin 时的现有能力不被这次续训破坏
+# - pin_train_warmup_steps: max_steps 的一半，注入强度从 0 线性爬坡上去，
+#   避免续训一开始就骤然引入新分布造成不稳定
+log_kv_pin_train_max: 256
+log_kv_pin_train_prob: 0.5
+log_kv_pin_train_warmup_steps: 150
