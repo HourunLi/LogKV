@@ -1486,6 +1486,63 @@ def log_kv_chunk_attention(
     )
 
 
+def _sample_training_pin_positions(
+    k: torch.Tensor,
+    cache: LogStructuredKVCache,
+    T: int,
+    train_block: int,
+    pin_train_max: int,
+    pin_train_prob: float,
+) -> tuple[int, torch.Tensor | None]:
+    """Sample one chunk-boundary injection point and random historical pins."""
+    pin_train_max = min(int(pin_train_max), cache.pin_size)
+    pin_train_prob = float(pin_train_prob)
+    if cache.pin_size <= 0 or pin_train_max <= 0 or pin_train_prob <= 0.0:
+        return -1, None
+    if T <= train_block:
+        return -1, None
+    if torch.rand((), device=k.device).item() >= pin_train_prob:
+        return -1, None
+
+    # Loop starts are 0, train_block, 2*train_block, ... < T. Injection must
+    # happen at a nonzero start so the pins are drawn from already-streamed K/V.
+    n_inject_points = (T - 1) // train_block
+    if n_inject_points <= 0:
+        return -1, None
+    inject_start = int(torch.randint(1, n_inject_points + 1, (), device=k.device).item()) * train_block
+    max_pin = min(pin_train_max, inject_start)
+    if max_pin <= 0:
+        return -1, None
+
+    # Random dose in [0, max_pin] so the model still sees pin-free forwards even
+    # when the injection Bernoulli fires.
+    n_pin = int(torch.randint(0, max_pin + 1, (), device=k.device).item())
+    if n_pin <= 0:
+        return -1, None
+
+    # Per batch/KV-group sampling without replacement. ``topk`` over random
+    # scores is cheap at the target batch/group sizes and keeps every group free
+    # to receive a different random pin set, matching eval-time per-group pins.
+    rand = torch.rand(k.size(0), k.size(1), inject_start, device=k.device)
+    positions = rand.topk(n_pin, dim=-1).indices.sort(dim=-1).values
+    return inject_start, positions
+
+
+def _install_training_pins(
+    cache: LogStructuredKVCache,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor | None,
+) -> None:
+    """Install detached exact K/V pins selected from the full sequence tensors."""
+    if positions is None or positions.numel() == 0:
+        return
+    positions = positions.to(device=k.device, dtype=torch.long)
+    k_sel = torch.gather(k, 2, positions.unsqueeze(-1).expand(-1, -1, -1, k.size(-1))).detach()
+    v_sel = torch.gather(v, 2, positions.unsqueeze(-1).expand(-1, -1, -1, v.size(-1))).detach()
+    cache.set_pinned(k_sel, v_sel)
+
+
 class LogKVStreamTrainingAttention(torch.autograd.Function):
     """Constant-in-T-times-S memory autograd for logKV streaming training.
 
@@ -1527,7 +1584,16 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, cache, scale, train_block, second_order_scale):
+    def forward(ctx, q, k, v, cache, scale, train_block, second_order_scale, *pin_args):
+        if len(pin_args) > 2:
+            raise TypeError(
+                "LogKVStreamTrainingAttention accepts at most two pin args: "
+                "pin_train_max and pin_train_prob"
+            )
+        ctx._num_inputs = 7 + len(pin_args)
+        pin_train_max = int(pin_args[0]) if len(pin_args) >= 1 else 0
+        pin_train_prob = float(pin_args[1]) if len(pin_args) >= 2 else 0.0
+
         T = q.size(2)
         train_block = int(train_block)
         if train_block < 2:
@@ -1556,8 +1622,13 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             # Deriving it here from the gate keeps the pair consistent no
             # matter who calls.
             cache.second_order = second_order_scale != 0.0
+            pin_inject_start, pin_positions = _sample_training_pin_positions(
+                k, cache, T, train_block, pin_train_max, pin_train_prob
+            )
             start = 0
             while start < T:  # mirrored in backward() — keep in sync
+                if start == pin_inject_start:
+                    _install_training_pins(cache, k, v, pin_positions)
                 end = min(start + train_block, T)
                 outputs.append(
                     log_kv_chunk_attention(
@@ -1574,6 +1645,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.scale = scale
         ctx.train_block = train_block
         ctx.second_order_scale = second_order_scale
+        ctx.pin_inject_start = pin_inject_start
+        ctx.pin_positions = pin_positions
         return torch.cat(outputs, dim=2)  # (B, nh, T, v_dim)
 
     @staticmethod
@@ -1584,6 +1657,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         scale = ctx.scale
         train_block = ctx.train_block
         second_order_scale = ctx.second_order_scale
+        pin_inject_start = ctx.pin_inject_start
+        pin_positions = ctx.pin_positions
         T = q.size(2)
         # Blocks partition [0, T) and each position's grad comes from exactly
         # its own block, so the empty buffers are fully overwritten.
@@ -1598,6 +1673,9 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         cache.second_order = second_order_scale != 0.0
         start = 0
         while start < T:  # mirrors forward() — keep in sync
+            if start == pin_inject_start:
+                with torch.no_grad():
+                    _install_training_pins(cache, k, v, pin_positions)
             end = min(start + train_block, T)
             q_b = q[:, :, start:end].detach().requires_grad_(True)
             k_b = k[:, :, start:end].detach().requires_grad_(True)
@@ -1611,4 +1689,5 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             with torch.no_grad():
                 cache.add_recent(k[:, :, start:end], v[:, :, start:end])
             start = end
-        return dq, dk, dv, None, None, None, None
+        grad_inputs = (dq, dk, dv, None, None, None, None)
+        return grad_inputs + (None,) * (ctx._num_inputs - len(grad_inputs))
