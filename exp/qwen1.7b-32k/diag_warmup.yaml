@@ -34,4 +34,3 @@ log_kv_pin_min_distance: 64
 
 log_kv_diag_mode: null
 log_kv_diag_output: null
-log_kv_second_order_scale: 0.2

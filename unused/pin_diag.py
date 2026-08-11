@@ -7,10 +7,12 @@ Usage:
 The script reports:
   1. sample-level hit rates: whether any layer/group hits the needle;
   2. sample-level hit rates inside a selected layer band;
-  3. the recorded group-level rates from the JSON summary;
-  4. full ``pin_indices`` spatial spread when the JSON was recorded with
+  3. needle-token coverage density when the JSON was recorded with
      ``--log_kv_pin_diag_include_indices``;
-  5. a random-pin baseline with the same pin_size/recent_size/radius.
+  4. the recorded group-level rates from the JSON summary;
+  5. full ``pin_indices`` spatial spread when the JSON was recorded with
+     ``--log_kv_pin_diag_include_indices``;
+  6. a random-pin baseline with the same pin_size/recent_size/radius.
 """
 
 from __future__ import annotations
@@ -106,6 +108,64 @@ def _distance_to_spans(index: int, spans: list[dict[str, Any]]) -> int | None:
     return best
 
 
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not intervals:
+        return []
+    ordered = sorted((start, end) for start, end in intervals if end > start)
+    if not ordered:
+        return []
+    merged = [ordered[0]]
+    for start, end in ordered[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _comparable_needle_intervals(sample: dict[str, Any]) -> list[tuple[int, int]]:
+    """Return original-token-coordinate needle intervals present in the used prompt."""
+    prompt_tokens = sample.get("prompt_tokens", {})
+    offset = int(prompt_tokens.get("left_truncated_tokens") or 0)
+    used = prompt_tokens.get("used")
+    used_end = offset + int(used) if used is not None else None
+
+    intervals: list[tuple[int, int]] = []
+    for span in sample.get("needle_spans", []):
+        if not span.get("survived_left_truncation"):
+            continue
+        start = int(span["token_start"])
+        end = int(span["token_end"])
+        # If the needle was partially left-truncated, only count the surviving
+        # token portion as coverable by pins from this actual request.
+        start = max(start, offset)
+        if used_end is not None:
+            end = min(end, used_end)
+        if end > start:
+            intervals.append((start, end))
+    return _merge_intervals(intervals)
+
+
+def _interval_token_count(intervals: list[tuple[int, int]]) -> int:
+    return sum(end - start for start, end in intervals)
+
+
+def _pin_coverage(pins: list[int], intervals: list[tuple[int, int]]) -> tuple[int, int, float | None]:
+    needle_tokens = _interval_token_count(intervals)
+    if needle_tokens <= 0:
+        return 0, 0, None
+
+    covered: set[int] = set()
+    for pin in set(int(pin) for pin in pins):
+        for start, end in intervals:
+            if start <= pin < end:
+                covered.add(pin)
+                break
+    covered_tokens = len(covered)
+    return covered_tokens, needle_tokens, covered_tokens / needle_tokens
+
+
 def _iter_comparable_samples(pin_diag: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         sample
@@ -194,6 +254,127 @@ def print_compressed_slot_summary(pin_diag: dict[str, Any], band_layers: set[int
     if levels:
         level_text = ", ".join(f"L{level}:{count}" for level, count in sorted(levels.items()))
         print(f"compressed levels covering needle: {level_text}")
+
+
+def _coverage_records(
+    pin_diag: dict[str, Any],
+    layers: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for sample_i, sample in enumerate(pin_diag.get("samples", [])):
+        if sample.get("comparable_needle_count", 0) <= 0:
+            continue
+        intervals = _comparable_needle_intervals(sample)
+        if not intervals:
+            continue
+        for layer, group in _iter_groups(sample, layers):
+            raw_pins = group.get("pin_indices")
+            if not raw_pins:
+                continue
+            covered_tokens, needle_tokens, density = _pin_coverage(
+                [int(pin) for pin in raw_pins],
+                intervals,
+            )
+            if density is None:
+                continue
+            records.append(
+                {
+                    "sample": sample_i,
+                    "layer": int(layer.get("layer", -1)),
+                    "batch": group.get("batch"),
+                    "kv_group": group.get("kv_group"),
+                    "covered_tokens": covered_tokens,
+                    "needle_tokens": needle_tokens,
+                    "coverage_density": density,
+                }
+            )
+    return records
+
+
+def _coverage_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    densities = [float(record["coverage_density"]) for record in records]
+    covered = sum(int(record["covered_tokens"]) for record in records)
+    total = sum(int(record["needle_tokens"]) for record in records)
+    nonzero = sum(1 for record in records if int(record["covered_tokens"]) > 0)
+    full = sum(
+        1
+        for record in records
+        if int(record["needle_tokens"]) > 0 and int(record["covered_tokens"]) >= int(record["needle_tokens"])
+    )
+    return {
+        "groups": len(records),
+        "covered_tokens": covered,
+        "needle_tokens": total,
+        "token_weighted_density": covered / total if total else None,
+        "mean_group_density": _mean(densities),
+        "median_group_density": _median(densities),
+        "nonzero_groups": nonzero,
+        "full_coverage_groups": full,
+    }
+
+
+def _sample_best_coverage(records: list[dict[str, Any]]) -> dict[str, Any]:
+    best_by_sample: dict[int, float] = {}
+    for record in records:
+        sample_i = int(record["sample"])
+        density = float(record["coverage_density"])
+        best_by_sample[sample_i] = max(best_by_sample.get(sample_i, 0.0), density)
+    values = list(best_by_sample.values())
+    return {
+        "samples": len(values),
+        "mean_best_density": _mean(values),
+        "median_best_density": _median(values),
+        "perfect_samples": sum(1 for value in values if value >= 1.0),
+        "nonzero_samples": sum(1 for value in values if value > 0.0),
+    }
+
+
+def _print_coverage_line(label: str, summary: dict[str, Any]) -> None:
+    groups = int(summary.get("groups") or 0)
+    if groups <= 0:
+        print(f"{label}: n/a")
+        return
+    nonzero = int(summary.get("nonzero_groups") or 0)
+    full = int(summary.get("full_coverage_groups") or 0)
+    print(
+        f"{label}: "
+        f"token_weighted={_pct(summary.get('token_weighted_density'))} "
+        f"mean_group={_pct(summary.get('mean_group_density'))} "
+        f"median_group={_pct(summary.get('median_group_density'))} "
+        f"nonzero_groups={nonzero}/{groups} ({_pct(nonzero, groups)}) "
+        f"full_groups={full}/{groups} ({_pct(full, groups)})"
+    )
+
+
+def _print_sample_best_line(label: str, summary: dict[str, Any]) -> None:
+    samples = int(summary.get("samples") or 0)
+    if samples <= 0:
+        print(f"{label}: n/a")
+        return
+    nonzero = int(summary.get("nonzero_samples") or 0)
+    perfect = int(summary.get("perfect_samples") or 0)
+    print(
+        f"{label}: "
+        f"mean_best={_pct(summary.get('mean_best_density'))} "
+        f"median_best={_pct(summary.get('median_best_density'))} "
+        f"nonzero_samples={nonzero}/{samples} ({_pct(nonzero, samples)}) "
+        f"perfect_samples={perfect}/{samples} ({_pct(perfect, samples)})"
+    )
+
+
+def print_needle_pin_coverage_summary(pin_diag: dict[str, Any], band_layers: set[int]) -> None:
+    print("\n== Needle token pin coverage density ==")
+    all_records = _coverage_records(pin_diag)
+    if not all_records:
+        print("无法计算：JSON 里没有 group.pin_indices。需要诊断时开启 --log_kv_pin_diag_include_indices。")
+        return
+
+    band_records = _coverage_records(pin_diag, band_layers)
+    print("口径: unique pinned needle tokens / surviving needle tokens；这是 coverage density，不是 any-hit。")
+    _print_coverage_line("all layers group-level", _coverage_summary(all_records))
+    _print_coverage_line(f"{_format_layers(band_layers)} group-level", _coverage_summary(band_records))
+    _print_sample_best_line("all layers sample-best", _sample_best_coverage(all_records))
+    _print_sample_best_line(f"{_format_layers(band_layers)} sample-best", _sample_best_coverage(band_records))
 
 
 def _mean(values: list[float]) -> float | None:
@@ -544,6 +725,7 @@ def print_random_baseline(
     exact_hits = 0
     near_hits = 0
     trials = 0
+    coverage_densities: list[float] = []
 
     for sample in pin_diag.get("samples", []):
         if sample.get("comparable_needle_count", 0) <= 0:
@@ -562,6 +744,7 @@ def print_random_baseline(
         spans = [span for span in sample.get("needle_spans", []) if span.get("survived_left_truncation")]
         if not spans:
             continue
+        intervals = _comparable_needle_intervals(sample)
 
         random_pin_count = min(actual_pin_size, candidate_count)
         for layer in sample.get("layers", []):
@@ -579,6 +762,9 @@ def print_random_baseline(
                 trials += 1
                 exact_hits += any(dist == 0 for dist in distances)
                 near_hits += any(dist <= radius for dist in distances)
+                _covered, _needle_tokens, density = _pin_coverage(random_pins, intervals)
+                if density is not None:
+                    coverage_densities.append(density)
 
     print("\n== Random pin baseline ==")
     print(
@@ -588,6 +774,11 @@ def print_random_baseline(
     print(f"随机 pin 基线（{trials} 组 sample×layer×group）:")
     print(f"  exact_hit_rate ~ {_pct(exact_hits, trials)}")
     print(f"  near_hit_rate  ~ {_pct(near_hits, trials)}")
+    print(
+        "  coverage_density ~ "
+        f"median={_pct(_median(coverage_densities))} "
+        f"mean={_pct(_mean(coverage_densities))}"
+    )
 
 
 def main() -> None:
@@ -615,6 +806,7 @@ def main() -> None:
     print(f"file: {path}")
     print_sample_hit_summary(pin_diag, band_layers)
     print_compressed_slot_summary(pin_diag, band_layers)
+    print_needle_pin_coverage_summary(pin_diag, band_layers)
     print_pin_distribution_summary(
         pin_diag,
         config,

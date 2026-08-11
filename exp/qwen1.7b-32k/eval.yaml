@@ -22,11 +22,10 @@ benchmark: "niah_single_1"
 output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
 log_kv_B: 512
 log_kv_recent_size: 1024
-log_kv_second_order_scale: 1.0
+log_kv_second_order_scale: 0.2
 log_kv_prefill_block: 1024
 log_kv_pin_size: 0
 log_kv_pin_obs_window: 0
-log_kv_second_order_scale: 0.2
 
 # ── 其余可用键（保持 null / 注释即用默认或 CLI 值）──
 # 覆盖模型 Config 字段（一般不需要：架构随 checkpoint 的 model_config.yaml
@@ -39,4 +38,4 @@ log_kv_second_order_scale: 0.2
 # benchmark 里只要还含 niah_*/ruler_*，这里就必须给，不能注释掉。
 metadata:
   pretrained: *tokenizer_dir
-  max_seq_lengths: [4096, 16384]
+  max_seq_lengths: [32768]
