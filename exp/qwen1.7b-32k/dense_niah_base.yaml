@@ -1,0 +1,24 @@
+# ==========================================
+# Dense（未压缩）attention baseline · 未经 CPT 的原始 Qwen3-1.7B-Base
+# 配合 arc_warmup.yaml + DIAG_ARGS="--log_kv_dense_mode true --log_kv_pin_size 0"
+# 跑出的 CPT-dense 结果对比，回答"CPT 本身有没有在稠密注意力下把长上下文
+# 检索能力练出来"。
+#
+# 用法（eval-only，不经 majob.sh）:
+#   bash eval.sh exp/qwen1.7b-32k/dense_niah_base.yaml none niah_single_1,niah_single_2,niah_single_3
+# ==========================================
+
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+benchmark: "niah_single_1,niah_single_2,niah_single_3"
+output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/dense_niah_base_eval
+
+# dense 模式下 log_kv_B/recent_size/prefill_block/second_order_scale 等参数
+# 全部被忽略（eval.py 启动横幅会打印这一点），只有这两个字段有意义：
+log_kv_dense_mode: true
+log_kv_pin_size: 0
+
+# niah_* 任务需要 metadata 才能拿到 tokenizer 路径和测试长度。
+metadata:
+  pretrained: *tokenizer_dir
+  max_seq_lengths: [1024, 2048, 4096, 8192, 16384, 32768]
