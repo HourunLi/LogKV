@@ -13,7 +13,7 @@
 checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
 tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
 
-limit: 40
+# limit: 40
 
 benchmark: "niah_single_1,niah_single_2,niah_single_3"
 metadata:
