@@ -5,11 +5,11 @@ expid: qwen1.7b-32k-cpt-logKV-pintrain
 # 不从 base Qwen 权重开始，而是从已经跑完的 warmup CPT checkpoint 续训
 # （demo.py 里 resume_dir 只做纯权重加载：优化器状态、global_step、LR
 #   schedule 全部重新开始，不会用 auto_resume 的续跑逻辑）。
-resume_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
+resume_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-pintrain
 
 global_batch_size: 128
 micro_batch_size: 1
-max_steps: 300
+max_steps: 1700
 warmup_steps: 0
 # 续训一个已经收敛的 checkpoint，用比初始 CPT 更低的 LR，避免破坏已经学到的
 # 32K 长上下文能力，只做小幅分布适配。可按效果再调。

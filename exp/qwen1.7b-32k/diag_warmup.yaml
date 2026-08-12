@@ -24,13 +24,16 @@ output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-
 
 # null（不是 512）：同 diag.yaml 的理由，写死非 null 会让 --log_kv_B 的 CLI
 # 覆盖被静默忽略（见 eval.py 的 _o()）。main() 自己的函数默认值仍是 512。
-log_kv_B: 512
-log_kv_recent_size: 1024
-log_kv_second_order_scale: null
-log_kv_prefill_block: 1024
-log_kv_pin_size: 256
-log_kv_pin_obs_window: 64
-log_kv_pin_min_distance: 26
 
 log_kv_diag_mode: null
 log_kv_diag_output: null
+
+log_kv_B: 512
+log_kv_recent_size: 1024
+log_kv_train_block: 16384
+log_kv_prefill_block: 1024
+log_kv_second_order_scale: 0.2
+log_kv_second_order_warmup_steps: 100
+log_kv_pin_size: 256
+log_kv_pin_obs_window: 64
+log_kv_pin_min_distance: 64

@@ -1,5 +1,5 @@
 {
-  "timestamp": "20260811_174343",
+  "timestamp": "20260812_115411",
   "benchmark": "niah_single_1,niah_single_2,niah_single_3",
   "checkpoint_dir": "/home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup/step_1400",
   "config": {
@@ -4463,6 +4463,2408 @@
           }
         }
       }
-    }
+    },
+    "samples": [
+      {
+        "sample_id": "rank0|global_req0|task=niah_single_3|doc=0",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31507,
+        "q_pos_max": 32530,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.964240312576294,
+        "max_pin_to_pooled_mass_per_slot_ratio": 9209.590344027138,
+        "last_query": {
+          "q_abs_pos": 32530,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4845910370349884,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23273725807666779,
+          "mean_pin_mass_total": 0.0132034532725811,
+          "mean_pooled_mass_total": 0.5071651935577393,
+          "mean_pin_mass_per_slot": 5.1575989346019924e-05,
+          "mean_pooled_mass_per_slot": 0.00024763925466686487
+        }
+      },
+      {
+        "sample_id": "rank0|global_req104|task=niah_single_1|doc=24",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.4314534664154053,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2700.5577347090316,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.47679251432418823,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.18659323453903198,
+          "mean_pin_mass_total": 0.011861506849527359,
+          "mean_pooled_mass_total": 0.5792376399040222,
+          "mean_pin_mass_per_slot": 4.6334011130966246e-05,
+          "mean_pooled_mass_per_slot": 0.00028283087885938585
+        }
+      },
+      {
+        "sample_id": "rank0|global_req112|task=niah_single_1|doc=32",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31451,
+        "q_pos_max": 32474,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.0478997230529785,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1116.6053980663567,
+        "last_query": {
+          "q_abs_pos": 32474,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.39110231399536133,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.18934664130210876,
+          "mean_pin_mass_total": 0.011774024926126003,
+          "mean_pooled_mass_total": 0.562251091003418,
+          "mean_pin_mass_per_slot": 4.59922848676797e-05,
+          "mean_pooled_mass_per_slot": 0.0002745366655290127
+        }
+      },
+      {
+        "sample_id": "rank0|global_req16|task=niah_single_3|doc=16",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31506,
+        "q_pos_max": 32529,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.7398383617401123,
+        "max_pin_to_pooled_mass_per_slot_ratio": 5493.363805787686,
+        "last_query": {
+          "q_abs_pos": 32529,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.37245941162109375,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23585785925388336,
+          "mean_pin_mass_total": 0.014571007341146469,
+          "mean_pooled_mass_total": 0.543059229850769,
+          "mean_pin_mass_per_slot": 5.6917997426353395e-05,
+          "mean_pooled_mass_per_slot": 0.0002651656395755708
+        }
+      },
+      {
+        "sample_id": "rank0|global_req24|task=niah_single_3|doc=24",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31503,
+        "q_pos_max": 32526,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.5687201023101807,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3704.418993809567,
+        "last_query": {
+          "q_abs_pos": 32526,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.26067379117012024,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2684434652328491,
+          "mean_pin_mass_total": 0.011999081820249557,
+          "mean_pooled_mass_total": 0.47331738471984863,
+          "mean_pin_mass_per_slot": 4.6871413360349834e-05,
+          "mean_pooled_mass_per_slot": 0.0002311120042577386
+        }
+      },
+      {
+        "sample_id": "rank0|global_req32|task=niah_single_3|doc=32",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31515,
+        "q_pos_max": 32538,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.425942897796631,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2666.508041841984,
+        "last_query": {
+          "q_abs_pos": 32538,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3306156098842621,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23754280805587769,
+          "mean_pin_mass_total": 0.01483973953872919,
+          "mean_pooled_mass_total": 0.532676100730896,
+          "mean_pin_mass_per_slot": 5.79677325731609e-05,
+          "mean_pooled_mass_per_slot": 0.0002600957523100078
+        }
+      },
+      {
+        "sample_id": "rank0|global_req40|task=niah_single_2|doc=0",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.107800006866455,
+        "max_pin_to_pooled_mass_per_slot_ratio": 12817.402038191678,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.2546182870864868,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.247970849275589,
+          "mean_pin_mass_total": 0.014111015945672989,
+          "mean_pooled_mass_total": 0.5451644659042358,
+          "mean_pin_mass_per_slot": 5.512115603778511e-05,
+          "mean_pooled_mass_per_slot": 0.00026619358686730266
+        }
+      },
+      {
+        "sample_id": "rank0|global_req48|task=niah_single_2|doc=8",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31487,
+        "q_pos_max": 32510,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.145453929901123,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1397.8286253456495,
+        "last_query": {
+          "q_abs_pos": 32510,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3625856339931488,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22943001985549927,
+          "mean_pin_mass_total": 0.012176533229649067,
+          "mean_pooled_mass_total": 0.5150845646858215,
+          "mean_pin_mass_per_slot": 4.756458292831667e-05,
+          "mean_pooled_mass_per_slot": 0.0002515061351004988
+        }
+      },
+      {
+        "sample_id": "rank0|global_req56|task=niah_single_2|doc=16",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.6295976638793945,
+        "max_pin_to_pooled_mass_per_slot_ratio": 4261.84512921857,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.47237834334373474,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22007441520690918,
+          "mean_pin_mass_total": 0.013668966479599476,
+          "mean_pooled_mass_total": 0.5372610092163086,
+          "mean_pin_mass_per_slot": 5.339440031093545e-05,
+          "mean_pooled_mass_per_slot": 0.0002623344771564007
+        }
+      },
+      {
+        "sample_id": "rank0|global_req64|task=niah_single_2|doc=24",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31487,
+        "q_pos_max": 32510,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.3980343341827393,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2500.5430402570814,
+        "last_query": {
+          "q_abs_pos": 32510,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5042377710342407,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2258177101612091,
+          "mean_pin_mass_total": 0.014829915016889572,
+          "mean_pooled_mass_total": 0.5518792867660522,
+          "mean_pin_mass_per_slot": 5.792935553472489e-05,
+          "mean_pooled_mass_per_slot": 0.00026947230799123645
+        }
+      },
+      {
+        "sample_id": "rank0|global_req72|task=niah_single_2|doc=32",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.828397750854492,
+        "max_pin_to_pooled_mass_per_slot_ratio": 6735.9328777604005,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4739168882369995,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22633367776870728,
+          "mean_pin_mass_total": 0.014624767936766148,
+          "mean_pooled_mass_total": 0.5487274527549744,
+          "mean_pin_mass_per_slot": 5.7127999752992764e-05,
+          "mean_pooled_mass_per_slot": 0.0002679333265405148
+        }
+      },
+      {
+        "sample_id": "rank0|global_req80|task=niah_single_1|doc=0",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 2.9068987369537354,
+        "max_pin_to_pooled_mass_per_slot_ratio": 807.0468317971522,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4666767120361328,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.19633759558200836,
+          "mean_pin_mass_total": 0.012245919555425644,
+          "mean_pooled_mass_total": 0.5514543056488037,
+          "mean_pin_mass_per_slot": 4.783562326338142e-05,
+          "mean_pooled_mass_per_slot": 0.00026926479768007994
+        }
+      },
+      {
+        "sample_id": "rank0|global_req88|task=niah_single_1|doc=8",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31463,
+        "q_pos_max": 32486,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.040052890777588,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1096.6117394377732,
+        "last_query": {
+          "q_abs_pos": 32486,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.28020811080932617,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2205602526664734,
+          "mean_pin_mass_total": 0.013768630102276802,
+          "mean_pooled_mass_total": 0.5632319450378418,
+          "mean_pin_mass_per_slot": 5.378371133701876e-05,
+          "mean_pooled_mass_per_slot": 0.0002750155981630087
+        }
+      },
+      {
+        "sample_id": "rank0|global_req8|task=niah_single_3|doc=8",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31513,
+        "q_pos_max": 32536,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.4545605182647705,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2848.134655684452,
+        "last_query": {
+          "q_abs_pos": 32536,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5526072382926941,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21607816219329834,
+          "mean_pin_mass_total": 0.013538297265768051,
+          "mean_pooled_mass_total": 0.5418603420257568,
+          "mean_pin_mass_per_slot": 5.288397369440645e-05,
+          "mean_pooled_mass_per_slot": 0.0002645802451297641
+        }
+      },
+      {
+        "sample_id": "rank0|global_req96|task=niah_single_1|doc=16",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31460,
+        "q_pos_max": 32483,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.176839351654053,
+        "max_pin_to_pooled_mass_per_slot_ratio": 15025.86046951883,
+        "last_query": {
+          "q_abs_pos": 32483,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.37087148427963257,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2045697122812271,
+          "mean_pin_mass_total": 0.013421828858554363,
+          "mean_pooled_mass_total": 0.5855264663696289,
+          "mean_pin_mass_per_slot": 5.242901897872798e-05,
+          "mean_pooled_mass_per_slot": 0.00028590159490704536
+        }
+      },
+      {
+        "sample_id": "rank1|global_req105|task=niah_single_1|doc=25",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.3336024284362793,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2155.770022383581,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4085768461227417,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.1922476440668106,
+          "mean_pin_mass_total": 0.012372972443699837,
+          "mean_pooled_mass_total": 0.577567994594574,
+          "mean_pin_mass_per_slot": 4.833192360820249e-05,
+          "mean_pooled_mass_per_slot": 0.0002820156223606318
+        }
+      },
+      {
+        "sample_id": "rank1|global_req113|task=niah_single_1|doc=33",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 8.406281471252441,
+        "max_pin_to_pooled_mass_per_slot_ratio": 254848141.75974286,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.41450411081314087,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.1972978115081787,
+          "mean_pin_mass_total": 0.012004300951957703,
+          "mean_pooled_mass_total": 0.5700409412384033,
+          "mean_pin_mass_per_slot": 4.6891800593584776e-05,
+          "mean_pooled_mass_per_slot": 0.0002783403033390641
+        }
+      },
+      {
+        "sample_id": "rank1|global_req17|task=niah_single_3|doc=17",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31510,
+        "q_pos_max": 32533,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.795365571975708,
+        "max_pin_to_pooled_mass_per_slot_ratio": 6242.600919194173,
+        "last_query": {
+          "q_abs_pos": 32533,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.46522003412246704,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22570940852165222,
+          "mean_pin_mass_total": 0.012699631974101067,
+          "mean_pooled_mass_total": 0.4963887333869934,
+          "mean_pin_mass_per_slot": 4.960793739883229e-05,
+          "mean_pooled_mass_per_slot": 0.00024237731122411788
+        }
+      },
+      {
+        "sample_id": "rank1|global_req1|task=niah_single_3|doc=1",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31517,
+        "q_pos_max": 32540,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.635254859924316,
+        "max_pin_to_pooled_mass_per_slot_ratio": 43177.23823598471,
+        "last_query": {
+          "q_abs_pos": 32540,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.45588022470474243,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22190891206264496,
+          "mean_pin_mass_total": 0.014004822820425034,
+          "mean_pooled_mass_total": 0.5489222407341003,
+          "mean_pin_mass_per_slot": 5.470633914228529e-05,
+          "mean_pooled_mass_per_slot": 0.00026802843785844743
+        }
+      },
+      {
+        "sample_id": "rank1|global_req25|task=niah_single_3|doc=25",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31512,
+        "q_pos_max": 32535,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.381126642227173,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2405.0640252649564,
+        "last_query": {
+          "q_abs_pos": 32535,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.45451998710632324,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23205561935901642,
+          "mean_pin_mass_total": 0.013397732749581337,
+          "mean_pooled_mass_total": 0.5117212533950806,
+          "mean_pin_mass_per_slot": 5.23348935530521e-05,
+          "mean_pooled_mass_per_slot": 0.0002498638932593167
+        }
+      },
+      {
+        "sample_id": "rank1|global_req33|task=niah_single_3|doc=33",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31509,
+        "q_pos_max": 32532,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.6993606090545654,
+        "max_pin_to_pooled_mass_per_slot_ratio": 5004.499025920924,
+        "last_query": {
+          "q_abs_pos": 32532,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5317708849906921,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22411295771598816,
+          "mean_pin_mass_total": 0.014099672436714172,
+          "mean_pooled_mass_total": 0.5423377752304077,
+          "mean_pin_mass_per_slot": 5.5076845455914736e-05,
+          "mean_pooled_mass_per_slot": 0.0002648133668117225
+        }
+      },
+      {
+        "sample_id": "rank1|global_req41|task=niah_single_2|doc=1",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.545877456665039,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3514.612559585469,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4033474326133728,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2493254840373993,
+          "mean_pin_mass_total": 0.015118594281375408,
+          "mean_pooled_mass_total": 0.5626624822616577,
+          "mean_pin_mass_per_slot": 5.905700891162269e-05,
+          "mean_pooled_mass_per_slot": 0.00027473754016682506
+        }
+      },
+      {
+        "sample_id": "rank1|global_req49|task=niah_single_2|doc=9",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.40529203414917,
+        "max_pin_to_pooled_mass_per_slot_ratio": 25426.819152650452,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4729580879211426,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2297620177268982,
+          "mean_pin_mass_total": 0.014162015169858932,
+          "mean_pooled_mass_total": 0.5297960042953491,
+          "mean_pin_mass_per_slot": 5.5320371757261455e-05,
+          "mean_pooled_mass_per_slot": 0.00025868945522233844
+        }
+      },
+      {
+        "sample_id": "rank1|global_req57|task=niah_single_2|doc=17",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.7731354236602783,
+        "max_pin_to_pooled_mass_per_slot_ratio": 5931.102420531029,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3683372437953949,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.24296019971370697,
+          "mean_pin_mass_total": 0.013761875219643116,
+          "mean_pooled_mass_total": 0.5388717651367188,
+          "mean_pin_mass_per_slot": 5.375732507673092e-05,
+          "mean_pooled_mass_per_slot": 0.00026312097907066345
+        }
+      },
+      {
+        "sample_id": "rank1|global_req65|task=niah_single_2|doc=25",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.533679962158203,
+        "max_pin_to_pooled_mass_per_slot_ratio": 34172.75257823541,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4707174599170685,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23983781039714813,
+          "mean_pin_mass_total": 0.014950480312108994,
+          "mean_pooled_mass_total": 0.5460509061813354,
+          "mean_pin_mass_per_slot": 5.8400313719175756e-05,
+          "mean_pooled_mass_per_slot": 0.0002666264190338552
+        }
+      },
+      {
+        "sample_id": "rank1|global_req73|task=niah_single_2|doc=33",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31493,
+        "q_pos_max": 32516,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.773477077484131,
+        "max_pin_to_pooled_mass_per_slot_ratio": 59357.70177502548,
+        "last_query": {
+          "q_abs_pos": 32516,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.46657076478004456,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22330138087272644,
+          "mean_pin_mass_total": 0.01288990955799818,
+          "mean_pooled_mass_total": 0.5291075706481934,
+          "mean_pin_mass_per_slot": 5.035120921093039e-05,
+          "mean_pooled_mass_per_slot": 0.00025835330598056316
+        }
+      },
+      {
+        "sample_id": "rank1|global_req81|task=niah_single_1|doc=1",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.3738834857940674,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2365.2850445218323,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5037827491760254,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.1846674382686615,
+          "mean_pin_mass_total": 0.012668777257204056,
+          "mean_pooled_mass_total": 0.6094616055488586,
+          "mean_pin_mass_per_slot": 4.948741116095334e-05,
+          "mean_pooled_mass_per_slot": 0.00029758867458440363
+        }
+      },
+      {
+        "sample_id": "rank1|global_req89|task=niah_single_1|doc=9",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.4007568359375,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2516.2676600437476,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3589431643486023,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21000626683235168,
+          "mean_pin_mass_total": 0.012857278808951378,
+          "mean_pooled_mass_total": 0.5520686507225037,
+          "mean_pin_mass_per_slot": 5.022374534746632e-05,
+          "mean_pooled_mass_per_slot": 0.0002695647708605975
+        }
+      },
+      {
+        "sample_id": "rank1|global_req97|task=niah_single_1|doc=17",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31460,
+        "q_pos_max": 32483,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.986884355545044,
+        "max_pin_to_pooled_mass_per_slot_ratio": 9702.515730929525,
+        "last_query": {
+          "q_abs_pos": 32483,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4832114577293396,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.20114678144454956,
+          "mean_pin_mass_total": 0.012927458621561527,
+          "mean_pooled_mass_total": 0.5630051493644714,
+          "mean_pin_mass_per_slot": 5.0497885240474716e-05,
+          "mean_pooled_mass_per_slot": 0.0002749048580881208
+        }
+      },
+      {
+        "sample_id": "rank1|global_req9|task=niah_single_3|doc=9",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31509,
+        "q_pos_max": 32532,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.6411824226379395,
+        "max_pin_to_pooled_mass_per_slot_ratio": 4377.059221417092,
+        "last_query": {
+          "q_abs_pos": 32532,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4879559874534607,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.231740340590477,
+          "mean_pin_mass_total": 0.014689483679831028,
+          "mean_pooled_mass_total": 0.5435881018638611,
+          "mean_pin_mass_per_slot": 5.738079562433995e-05,
+          "mean_pooled_mass_per_slot": 0.0002654238778632134
+        }
+      },
+      {
+        "sample_id": "rank2|global_req106|task=niah_single_1|doc=26",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.036172389984131,
+        "max_pin_to_pooled_mass_per_slot_ratio": 10868.56957838914,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.47313570976257324,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.1882346123456955,
+          "mean_pin_mass_total": 0.012960252352058887,
+          "mean_pooled_mass_total": 0.6013041734695435,
+          "mean_pin_mass_per_slot": 5.062598575023003e-05,
+          "mean_pooled_mass_per_slot": 0.0002936055534519255
+        }
+      },
+      {
+        "sample_id": "rank2|global_req10|task=niah_single_3|doc=10",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31510,
+        "q_pos_max": 32533,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.085119724273682,
+        "max_pin_to_pooled_mass_per_slot_ratio": 12165.21319338243,
+        "last_query": {
+          "q_abs_pos": 32533,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5352413654327393,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21898964047431946,
+          "mean_pin_mass_total": 0.014125172048807144,
+          "mean_pooled_mass_total": 0.551705002784729,
+          "mean_pin_mass_per_slot": 5.517645331565291e-05,
+          "mean_pooled_mass_per_slot": 0.00026938720839098096
+        }
+      },
+      {
+        "sample_id": "rank2|global_req114|task=niah_single_1|doc=34",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.534907102584839,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3426.944749172551,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.39409565925598145,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21566548943519592,
+          "mean_pin_mass_total": 0.013594069518148899,
+          "mean_pooled_mass_total": 0.5831826329231262,
+          "mean_pin_mass_per_slot": 5.310183405526914e-05,
+          "mean_pooled_mass_per_slot": 0.0002847571449819952
+        }
+      },
+      {
+        "sample_id": "rank2|global_req18|task=niah_single_3|doc=18",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31515,
+        "q_pos_max": 32538,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.4490010738372803,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2811.9077831183486,
+        "last_query": {
+          "q_abs_pos": 32538,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5220945477485657,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21617837250232697,
+          "mean_pin_mass_total": 0.013961298391222954,
+          "mean_pooled_mass_total": 0.5500684380531311,
+          "mean_pin_mass_per_slot": 5.453632184071466e-05,
+          "mean_pooled_mass_per_slot": 0.0002685881045181304
+        }
+      },
+      {
+        "sample_id": "rank2|global_req26|task=niah_single_3|doc=26",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31513,
+        "q_pos_max": 32536,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.824038982391357,
+        "max_pin_to_pooled_mass_per_slot_ratio": 66686.66246576978,
+        "last_query": {
+          "q_abs_pos": 32536,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.34417805075645447,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.24547788500785828,
+          "mean_pin_mass_total": 0.01341727003455162,
+          "mean_pooled_mass_total": 0.49989819526672363,
+          "mean_pin_mass_per_slot": 5.241121107246727e-05,
+          "mean_pooled_mass_per_slot": 0.0002440909156575799
+        }
+      },
+      {
+        "sample_id": "rank2|global_req2|task=niah_single_3|doc=2",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31515,
+        "q_pos_max": 32538,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.7685399055480957,
+        "max_pin_to_pooled_mass_per_slot_ratio": 5868.672919825251,
+        "last_query": {
+          "q_abs_pos": 32538,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4519864022731781,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2321920394897461,
+          "mean_pin_mass_total": 0.013547909446060658,
+          "mean_pooled_mass_total": 0.5280131101608276,
+          "mean_pin_mass_per_slot": 5.292152127367444e-05,
+          "mean_pooled_mass_per_slot": 0.0002578189014457166
+        }
+      },
+      {
+        "sample_id": "rank2|global_req34|task=niah_single_3|doc=34",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31506,
+        "q_pos_max": 32529,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.637155532836914,
+        "max_pin_to_pooled_mass_per_slot_ratio": 43366.615839777136,
+        "last_query": {
+          "q_abs_pos": 32529,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4208497703075409,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2361605018377304,
+          "mean_pin_mass_total": 0.012779181823134422,
+          "mean_pooled_mass_total": 0.5041400790214539,
+          "mean_pin_mass_per_slot": 4.991867899661884e-05,
+          "mean_pooled_mass_per_slot": 0.00024616214795969427
+        }
+      },
+      {
+        "sample_id": "rank2|global_req42|task=niah_single_2|doc=2",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.503458023071289,
+        "max_pin_to_pooled_mass_per_slot_ratio": 31875.57466003668,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.46359941363334656,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22470027208328247,
+          "mean_pin_mass_total": 0.013375996612012386,
+          "mean_pooled_mass_total": 0.5120822191238403,
+          "mean_pin_mass_per_slot": 5.2249986765673384e-05,
+          "mean_pooled_mass_per_slot": 0.00025004014605656266
+        }
+      },
+      {
+        "sample_id": "rank2|global_req50|task=niah_single_2|doc=10",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 5.145299911499023,
+        "max_pin_to_pooled_mass_per_slot_ratio": 139733.29866275526,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4676917493343353,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2200494408607483,
+          "mean_pin_mass_total": 0.012486321851611137,
+          "mean_pooled_mass_total": 0.49517107009887695,
+          "mean_pin_mass_per_slot": 4.8774694732856005e-05,
+          "mean_pooled_mass_per_slot": 0.00024178274907171726
+        }
+      },
+      {
+        "sample_id": "rank2|global_req58|task=niah_single_2|doc=18",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.162541389465332,
+        "max_pin_to_pooled_mass_per_slot_ratio": 14539.229418828974,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.48747503757476807,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.24482926726341248,
+          "mean_pin_mass_total": 0.01500469259917736,
+          "mean_pooled_mass_total": 0.5322689414024353,
+          "mean_pin_mass_per_slot": 5.8612080465536565e-05,
+          "mean_pooled_mass_per_slot": 0.00025989694404415786
+        }
+      },
+      {
+        "sample_id": "rank2|global_req66|task=niah_single_2|doc=26",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 6.150268077850342,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1413409.7337468136,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.44777166843414307,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23122461140155792,
+          "mean_pin_mass_total": 0.01389905996620655,
+          "mean_pooled_mass_total": 0.5367355942726135,
+          "mean_pin_mass_per_slot": 5.429320299299434e-05,
+          "mean_pooled_mass_per_slot": 0.0002620779268909246
+        }
+      },
+      {
+        "sample_id": "rank2|global_req74|task=niah_single_2|doc=34",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.266738176345825,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1848.1540841012063,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4821763336658478,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22413796186447144,
+          "mean_pin_mass_total": 0.01305888220667839,
+          "mean_pooled_mass_total": 0.5270674824714661,
+          "mean_pin_mass_per_slot": 5.101125861983746e-05,
+          "mean_pooled_mass_per_slot": 0.00025735716917552054
+        }
+      },
+      {
+        "sample_id": "rank2|global_req82|task=niah_single_1|doc=2",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.0952863693237305,
+        "max_pin_to_pooled_mass_per_slot_ratio": 12453.355025463128,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.33547186851501465,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.200141042470932,
+          "mean_pin_mass_total": 0.01226163562387228,
+          "mean_pooled_mass_total": 0.5676714777946472,
+          "mean_pin_mass_per_slot": 4.7897014155751094e-05,
+          "mean_pooled_mass_per_slot": 0.0002771833387669176
+        }
+      },
+      {
+        "sample_id": "rank2|global_req90|task=niah_single_1|doc=10",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.9014105796813965,
+        "max_pin_to_pooled_mass_per_slot_ratio": 7969.123911150695,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4375515580177307,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.18890823423862457,
+          "mean_pin_mass_total": 0.012240475043654442,
+          "mean_pooled_mass_total": 0.584840714931488,
+          "mean_pin_mass_per_slot": 4.7814355639275163e-05,
+          "mean_pooled_mass_per_slot": 0.00028556675533764064
+        }
+      },
+      {
+        "sample_id": "rank2|global_req98|task=niah_single_1|doc=18",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.3788716793060303,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2392.608709493818,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.41012972593307495,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.1943807303905487,
+          "mean_pin_mass_total": 0.01161486841738224,
+          "mean_pooled_mass_total": 0.5481764674186707,
+          "mean_pin_mass_per_slot": 4.5370579755399376e-05,
+          "mean_pooled_mass_per_slot": 0.0002676642907317728
+        }
+      },
+      {
+        "sample_id": "rank3|global_req107|task=niah_single_1|doc=27",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31451,
+        "q_pos_max": 32474,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.051013946533203,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1124.6410890756886,
+        "last_query": {
+          "q_abs_pos": 32474,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3410935699939728,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.19738365709781647,
+          "mean_pin_mass_total": 0.011760978028178215,
+          "mean_pooled_mass_total": 0.5516014695167542,
+          "mean_pin_mass_per_slot": 4.594132042257115e-05,
+          "mean_pooled_mass_per_slot": 0.0002693366550374776
+        }
+      },
+      {
+        "sample_id": "rank3|global_req115|task=niah_single_1|doc=35",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 2.990051746368408,
+        "max_pin_to_pooled_mass_per_slot_ratio": 977.3536661148268,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4015367031097412,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2017773985862732,
+          "mean_pin_mass_total": 0.012067695148289204,
+          "mean_pooled_mass_total": 0.5566964149475098,
+          "mean_pin_mass_per_slot": 4.71394341730047e-05,
+          "mean_pooled_mass_per_slot": 0.00027182442136108875
+        }
+      },
+      {
+        "sample_id": "rank3|global_req11|task=niah_single_3|doc=11",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31508,
+        "q_pos_max": 32531,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.58046555519104,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3805.9717044189,
+        "last_query": {
+          "q_abs_pos": 32531,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4115636944770813,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23821131885051727,
+          "mean_pin_mass_total": 0.01363456528633833,
+          "mean_pooled_mass_total": 0.5226652026176453,
+          "mean_pin_mass_per_slot": 5.32600206497591e-05,
+          "mean_pooled_mass_per_slot": 0.0002552076184656471
+        }
+      },
+      {
+        "sample_id": "rank3|global_req19|task=niah_single_3|doc=19",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31504,
+        "q_pos_max": 32527,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.485775947570801,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3060.3841748227615,
+        "last_query": {
+          "q_abs_pos": 32527,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.48956528306007385,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2396623194217682,
+          "mean_pin_mass_total": 0.01472740713506937,
+          "mean_pooled_mass_total": 0.5319806337356567,
+          "mean_pin_mass_per_slot": 5.752893412136473e-05,
+          "mean_pooled_mass_per_slot": 0.00025975616881623864
+        }
+      },
+      {
+        "sample_id": "rank3|global_req27|task=niah_single_3|doc=27",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31509,
+        "q_pos_max": 32532,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.493769884109497,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3117.2374425744683,
+        "last_query": {
+          "q_abs_pos": 32532,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.46414193511009216,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2346266508102417,
+          "mean_pin_mass_total": 0.01456640474498272,
+          "mean_pooled_mass_total": 0.5379680395126343,
+          "mean_pin_mass_per_slot": 5.690001853508875e-05,
+          "mean_pooled_mass_per_slot": 0.00026267970679327846
+        }
+      },
+      {
+        "sample_id": "rank3|global_req35|task=niah_single_3|doc=35",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31504,
+        "q_pos_max": 32527,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 5.1181135177612305,
+        "max_pin_to_pooled_mass_per_slot_ratio": 131254.29323073718,
+        "last_query": {
+          "q_abs_pos": 32527,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.1328146904706955,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.27003541588783264,
+          "mean_pin_mass_total": 0.014269142411649227,
+          "mean_pooled_mass_total": 0.529388427734375,
+          "mean_pin_mass_per_slot": 5.5738837545504794e-05,
+          "mean_pooled_mass_per_slot": 0.0002584904432296753
+        }
+      },
+      {
+        "sample_id": "rank3|global_req3|task=niah_single_3|doc=3",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31508,
+        "q_pos_max": 32531,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.880882501602173,
+        "max_pin_to_pooled_mass_per_slot_ratio": 7601.2059844529695,
+        "last_query": {
+          "q_abs_pos": 32531,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.46474218368530273,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23247097432613373,
+          "mean_pin_mass_total": 0.013843744061887264,
+          "mean_pooled_mass_total": 0.5225967168807983,
+          "mean_pin_mass_per_slot": 5.4077125241747126e-05,
+          "mean_pooled_mass_per_slot": 0.0002551741781644523
+        }
+      },
+      {
+        "sample_id": "rank3|global_req43|task=niah_single_2|doc=3",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31487,
+        "q_pos_max": 32510,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.487082004547119,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3069.6015433499883,
+        "last_query": {
+          "q_abs_pos": 32510,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5082386136054993,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21590974926948547,
+          "mean_pin_mass_total": 0.014002334326505661,
+          "mean_pooled_mass_total": 0.5529221296310425,
+          "mean_pin_mass_per_slot": 5.469661846291274e-05,
+          "mean_pooled_mass_per_slot": 0.00026998150860890746
+        }
+      },
+      {
+        "sample_id": "rank3|global_req51|task=niah_single_2|doc=11",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.968751907348633,
+        "max_pin_to_pooled_mass_per_slot_ratio": 9305.761278552334,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.49668779969215393,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22731299698352814,
+          "mean_pin_mass_total": 0.014091272838413715,
+          "mean_pooled_mass_total": 0.5363422632217407,
+          "mean_pin_mass_per_slot": 5.5044034525053576e-05,
+          "mean_pooled_mass_per_slot": 0.0002618858707137406
+        }
+      },
+      {
+        "sample_id": "rank3|global_req59|task=niah_single_2|doc=19",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31478,
+        "q_pos_max": 32501,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.6890616416931152,
+        "max_pin_to_pooled_mass_per_slot_ratio": 4887.217212568625,
+        "last_query": {
+          "q_abs_pos": 32501,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.47207164764404297,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2406155914068222,
+          "mean_pin_mass_total": 0.014751816168427467,
+          "mean_pooled_mass_total": 0.5260457992553711,
+          "mean_pin_mass_per_slot": 5.7624281907919794e-05,
+          "mean_pooled_mass_per_slot": 0.00025685830041766167
+        }
+      },
+      {
+        "sample_id": "rank3|global_req67|task=niah_single_2|doc=27",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.762712001800537,
+        "max_pin_to_pooled_mass_per_slot_ratio": 5790.44581247237,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5315107703208923,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2210465371608734,
+          "mean_pin_mass_total": 0.014147837646305561,
+          "mean_pooled_mass_total": 0.5360247492790222,
+          "mean_pin_mass_per_slot": 5.52649908058811e-05,
+          "mean_pooled_mass_per_slot": 0.00026173083460889757
+        }
+      },
+      {
+        "sample_id": "rank3|global_req75|task=niah_single_2|doc=35",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.929809331893921,
+        "max_pin_to_pooled_mass_per_slot_ratio": 8507.64445477159,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5259025692939758,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22107306122779846,
+          "mean_pin_mass_total": 0.013248372822999954,
+          "mean_pooled_mass_total": 0.5053317546844482,
+          "mean_pin_mass_per_slot": 5.175145633984357e-05,
+          "mean_pooled_mass_per_slot": 0.00024674402084201574
+        }
+      },
+      {
+        "sample_id": "rank3|global_req83|task=niah_single_1|doc=3",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.2126495838165283,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1631.7348300075482,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3090096414089203,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.238710418343544,
+          "mean_pin_mass_total": 0.014255700632929802,
+          "mean_pooled_mass_total": 0.5700204372406006,
+          "mean_pin_mass_per_slot": 5.568633059738204e-05,
+          "mean_pooled_mass_per_slot": 0.000278330291621387
+        }
+      },
+      {
+        "sample_id": "rank3|global_req91|task=niah_single_1|doc=11",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.3786871433258057,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2391.592282572492,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4983436167240143,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.19002504646778107,
+          "mean_pin_mass_total": 0.012501314282417297,
+          "mean_pooled_mass_total": 0.5730773210525513,
+          "mean_pin_mass_per_slot": 4.883325891569257e-05,
+          "mean_pooled_mass_per_slot": 0.00027982291067019105
+        }
+      },
+      {
+        "sample_id": "rank3|global_req99|task=niah_single_1|doc=19",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 2.861501455307007,
+        "max_pin_to_pooled_mass_per_slot_ratio": 726.9448351790783,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4673854112625122,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.1846971958875656,
+          "mean_pin_mass_total": 0.01141247060149908,
+          "mean_pooled_mass_total": 0.5525743961334229,
+          "mean_pin_mass_per_slot": 4.4579963287105784e-05,
+          "mean_pooled_mass_per_slot": 0.0002698117168620229
+        }
+      },
+      {
+        "sample_id": "rank4|global_req100|task=niah_single_1|doc=20",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31460,
+        "q_pos_max": 32483,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.028369426727295,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1067.5037927898443,
+        "last_query": {
+          "q_abs_pos": 32483,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3013148307800293,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21251524984836578,
+          "mean_pin_mass_total": 0.013101279735565186,
+          "mean_pooled_mass_total": 0.5685330033302307,
+          "mean_pin_mass_per_slot": 5.1176873967051506e-05,
+          "mean_pooled_mass_per_slot": 0.0002776040055323392
+        }
+      },
+      {
+        "sample_id": "rank4|global_req108|task=niah_single_1|doc=28",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31460,
+        "q_pos_max": 32483,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.6000096797943115,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3981.160438839938,
+        "last_query": {
+          "q_abs_pos": 32483,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.43423303961753845,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.20156164467334747,
+          "mean_pin_mass_total": 0.012331402860581875,
+          "mean_pooled_mass_total": 0.5411309599876404,
+          "mean_pin_mass_per_slot": 4.816954242414795e-05,
+          "mean_pooled_mass_per_slot": 0.00026422410155646503
+        }
+      },
+      {
+        "sample_id": "rank4|global_req116|task=niah_single_1|doc=36",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 2.928541421890259,
+        "max_pin_to_pooled_mass_per_slot_ratio": 848.2842857667373,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4358069598674774,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.19433043897151947,
+          "mean_pin_mass_total": 0.01210885588079691,
+          "mean_pooled_mass_total": 0.574335515499115,
+          "mean_pin_mass_per_slot": 4.730021828436293e-05,
+          "mean_pooled_mass_per_slot": 0.00028043726342730224
+        }
+      },
+      {
+        "sample_id": "rank4|global_req12|task=niah_single_3|doc=12",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31503,
+        "q_pos_max": 32526,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.21958065032959,
+        "max_pin_to_pooled_mass_per_slot_ratio": 16579.852031550785,
+        "last_query": {
+          "q_abs_pos": 32526,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.38010719418525696,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.24164822697639465,
+          "mean_pin_mass_total": 0.01281212829053402,
+          "mean_pooled_mass_total": 0.5090551376342773,
+          "mean_pin_mass_per_slot": 5.0047376134898514e-05,
+          "mean_pooled_mass_per_slot": 0.000248562078922987
+        }
+      },
+      {
+        "sample_id": "rank4|global_req20|task=niah_single_3|doc=20",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31504,
+        "q_pos_max": 32527,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.128049373626709,
+        "max_pin_to_pooled_mass_per_slot_ratio": 13429.176247046771,
+        "last_query": {
+          "q_abs_pos": 32527,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.46087440848350525,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2287125289440155,
+          "mean_pin_mass_total": 0.013200288638472557,
+          "mean_pooled_mass_total": 0.5031178593635559,
+          "mean_pin_mass_per_slot": 5.1563627494033426e-05,
+          "mean_pooled_mass_per_slot": 0.0002456630172673613
+        }
+      },
+      {
+        "sample_id": "rank4|global_req28|task=niah_single_3|doc=28",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31511,
+        "q_pos_max": 32534,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.4096522331237793,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2568.3383292565104,
+        "last_query": {
+          "q_abs_pos": 32534,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5159366726875305,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22475093603134155,
+          "mean_pin_mass_total": 0.013614856638014317,
+          "mean_pooled_mass_total": 0.5221699476242065,
+          "mean_pin_mass_per_slot": 5.3183033742243424e-05,
+          "mean_pooled_mass_per_slot": 0.0002549657947383821
+        }
+      },
+      {
+        "sample_id": "rank4|global_req36|task=niah_single_3|doc=36",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31510,
+        "q_pos_max": 32533,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.509387254714966,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3231.374211615485,
+        "last_query": {
+          "q_abs_pos": 32533,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.38554176688194275,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23426201939582825,
+          "mean_pin_mass_total": 0.013799672946333885,
+          "mean_pooled_mass_total": 0.5263305902481079,
+          "mean_pin_mass_per_slot": 5.390497244661674e-05,
+          "mean_pooled_mass_per_slot": 0.00025699735851958394
+        }
+      },
+      {
+        "sample_id": "rank4|global_req44|task=niah_single_2|doc=4",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31487,
+        "q_pos_max": 32510,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.573946952819824,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3749.272037228819,
+        "last_query": {
+          "q_abs_pos": 32510,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4711925685405731,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2281167209148407,
+          "mean_pin_mass_total": 0.015194064937531948,
+          "mean_pooled_mass_total": 0.5566928386688232,
+          "mean_pin_mass_per_slot": 5.935181616223417e-05,
+          "mean_pooled_mass_per_slot": 0.00027182267513126135
+        }
+      },
+      {
+        "sample_id": "rank4|global_req4|task=niah_single_3|doc=4",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31506,
+        "q_pos_max": 32529,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 5.758502960205078,
+        "max_pin_to_pooled_mass_per_slot_ratio": 573459.7753056295,
+        "last_query": {
+          "q_abs_pos": 32529,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4749387204647064,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2131062150001526,
+          "mean_pin_mass_total": 0.01371280662715435,
+          "mean_pooled_mass_total": 0.5599194765090942,
+          "mean_pin_mass_per_slot": 5.356565088732168e-05,
+          "mean_pooled_mass_per_slot": 0.00027339818188920617
+        }
+      },
+      {
+        "sample_id": "rank4|global_req52|task=niah_single_2|doc=12",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.7041358947753906,
+        "max_pin_to_pooled_mass_per_slot_ratio": 5059.829640017371,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4427867531776428,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2391509711742401,
+          "mean_pin_mass_total": 0.014959779568016529,
+          "mean_pooled_mass_total": 0.540936291217804,
+          "mean_pin_mass_per_slot": 5.843663893756457e-05,
+          "mean_pooled_mass_per_slot": 0.00026412904844619334
+        }
+      },
+      {
+        "sample_id": "rank4|global_req60|task=niah_single_2|doc=20",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.439530849456787,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2751.255029321714,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.39280781149864197,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22870132327079773,
+          "mean_pin_mass_total": 0.014330992475152016,
+          "mean_pooled_mass_total": 0.563052773475647,
+          "mean_pin_mass_per_slot": 5.598043935606256e-05,
+          "mean_pooled_mass_per_slot": 0.00027492811204865575
+        }
+      },
+      {
+        "sample_id": "rank4|global_req68|task=niah_single_2|doc=28",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31490,
+        "q_pos_max": 32513,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.688035011291504,
+        "max_pin_to_pooled_mass_per_slot_ratio": 48756.779451740644,
+        "last_query": {
+          "q_abs_pos": 32513,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5404407978057861,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21437498927116394,
+          "mean_pin_mass_total": 0.013544736430048943,
+          "mean_pooled_mass_total": 0.5372766256332397,
+          "mean_pin_mass_per_slot": 5.290912667987868e-05,
+          "mean_pooled_mass_per_slot": 0.00026234210235998034
+        }
+      },
+      {
+        "sample_id": "rank4|global_req76|task=niah_single_2|doc=36",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31493,
+        "q_pos_max": 32516,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.625325679779053,
+        "max_pin_to_pooled_mass_per_slot_ratio": 42201.285451736345,
+        "last_query": {
+          "q_abs_pos": 32516,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5540946125984192,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.20950548350811005,
+          "mean_pin_mass_total": 0.012869883328676224,
+          "mean_pooled_mass_total": 0.5328832864761353,
+          "mean_pin_mass_per_slot": 5.02729817526415e-05,
+          "mean_pooled_mass_per_slot": 0.0002601969172246754
+        }
+      },
+      {
+        "sample_id": "rank4|global_req84|task=niah_single_1|doc=4",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.3158857822418213,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2069.59698126108,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.42012524604797363,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.1962212473154068,
+          "mean_pin_mass_total": 0.012641522102057934,
+          "mean_pooled_mass_total": 0.5795381665229797,
+          "mean_pin_mass_per_slot": 4.9380945711163804e-05,
+          "mean_pooled_mass_per_slot": 0.0002829776203725487
+        }
+      },
+      {
+        "sample_id": "rank4|global_req92|task=niah_single_1|doc=12",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31451,
+        "q_pos_max": 32474,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.526260852813721,
+        "max_pin_to_pooled_mass_per_slot_ratio": 33593.933084663186,
+        "last_query": {
+          "q_abs_pos": 32474,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4188191592693329,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2103397250175476,
+          "mean_pin_mass_total": 0.012469591572880745,
+          "mean_pooled_mass_total": 0.5472753047943115,
+          "mean_pin_mass_per_slot": 4.870934208156541e-05,
+          "mean_pooled_mass_per_slot": 0.0002672242699190974
+        }
+      },
+      {
+        "sample_id": "rank5|global_req101|task=niah_single_1|doc=21",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.5444211959838867,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3502.8472233745097,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.31652864813804626,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21454310417175293,
+          "mean_pin_mass_total": 0.012942145578563213,
+          "mean_pooled_mass_total": 0.5700721144676208,
+          "mean_pin_mass_per_slot": 5.055525616626255e-05,
+          "mean_pooled_mass_per_slot": 0.000278355524642393
+        }
+      },
+      {
+        "sample_id": "rank5|global_req109|task=niah_single_1|doc=29",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.212414503097534,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1630.851821784883,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.46288397908210754,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21640335023403168,
+          "mean_pin_mass_total": 0.016204046085476875,
+          "mean_pooled_mass_total": 0.6560674905776978,
+          "mean_pin_mass_per_slot": 6.329705502139404e-05,
+          "mean_pooled_mass_per_slot": 0.0003203454543836415
+        }
+      },
+      {
+        "sample_id": "rank5|global_req117|task=niah_single_1|doc=37",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 2.991367816925049,
+        "max_pin_to_pooled_mass_per_slot_ratio": 980.3198960237514,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.46612295508384705,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.1927122175693512,
+          "mean_pin_mass_total": 0.011650314554572105,
+          "mean_pooled_mass_total": 0.5485295653343201,
+          "mean_pin_mass_per_slot": 4.550904122879729e-05,
+          "mean_pooled_mass_per_slot": 0.00026783670182339847
+        }
+      },
+      {
+        "sample_id": "rank5|global_req13|task=niah_single_3|doc=13",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31513,
+        "q_pos_max": 32536,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.689298152923584,
+        "max_pin_to_pooled_mass_per_slot_ratio": 48898.794535158544,
+        "last_query": {
+          "q_abs_pos": 32536,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.49683645367622375,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2266152799129486,
+          "mean_pin_mass_total": 0.014344125986099243,
+          "mean_pooled_mass_total": 0.5428851842880249,
+          "mean_pin_mass_per_slot": 5.603174213320017e-05,
+          "mean_pooled_mass_per_slot": 0.00026508065639063716
+        }
+      },
+      {
+        "sample_id": "rank5|global_req21|task=niah_single_3|doc=21",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31503,
+        "q_pos_max": 32526,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.8766093254089355,
+        "max_pin_to_pooled_mass_per_slot_ratio": 7526.781788009877,
+        "last_query": {
+          "q_abs_pos": 32526,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5598295331001282,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2182813286781311,
+          "mean_pin_mass_total": 0.012982701882719994,
+          "mean_pooled_mass_total": 0.5083169341087341,
+          "mean_pin_mass_per_slot": 5.0713679229374975e-05,
+          "mean_pooled_mass_per_slot": 0.00024820162798278034
+        }
+      },
+      {
+        "sample_id": "rank5|global_req29|task=niah_single_3|doc=29",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31511,
+        "q_pos_max": 32534,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.57983660697937,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3800.4638596172767,
+        "last_query": {
+          "q_abs_pos": 32534,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3603786528110504,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23449814319610596,
+          "mean_pin_mass_total": 0.014637162908911705,
+          "mean_pooled_mass_total": 0.5270500183105469,
+          "mean_pin_mass_per_slot": 5.717641761293635e-05,
+          "mean_pooled_mass_per_slot": 0.0002573486417531967
+        }
+      },
+      {
+        "sample_id": "rank5|global_req37|task=niah_single_3|doc=37",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31504,
+        "q_pos_max": 32527,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.747246742248535,
+        "max_pin_to_pooled_mass_per_slot_ratio": 55878.757694965076,
+        "last_query": {
+          "q_abs_pos": 32527,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.41355133056640625,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2263350784778595,
+          "mean_pin_mass_total": 0.012918952852487564,
+          "mean_pooled_mass_total": 0.5316067337989807,
+          "mean_pin_mass_per_slot": 5.046465958002955e-05,
+          "mean_pooled_mass_per_slot": 0.00025957360048778355
+        }
+      },
+      {
+        "sample_id": "rank5|global_req45|task=niah_single_2|doc=5",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31478,
+        "q_pos_max": 32501,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.6275229454040527,
+        "max_pin_to_pooled_mass_per_slot_ratio": 4241.5339293084735,
+        "last_query": {
+          "q_abs_pos": 32501,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.486356258392334,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2287130504846573,
+          "mean_pin_mass_total": 0.013921061530709267,
+          "mean_pooled_mass_total": 0.537352979183197,
+          "mean_pin_mass_per_slot": 5.437914660433307e-05,
+          "mean_pooled_mass_per_slot": 0.0002623793843667954
+        }
+      },
+      {
+        "sample_id": "rank5|global_req53|task=niah_single_2|doc=13",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 5.5711798667907715,
+        "max_pin_to_pooled_mass_per_slot_ratio": 372545.9674210774,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5086226463317871,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23759374022483826,
+          "mean_pin_mass_total": 0.014773927628993988,
+          "mean_pooled_mass_total": 0.5267632603645325,
+          "mean_pin_mass_per_slot": 5.7710654800757766e-05,
+          "mean_pooled_mass_per_slot": 0.00025720862322486937
+        }
+      },
+      {
+        "sample_id": "rank5|global_req5|task=niah_single_3|doc=5",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31514,
+        "q_pos_max": 32537,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.351388931274414,
+        "max_pin_to_pooled_mass_per_slot_ratio": 22458.923263747893,
+        "last_query": {
+          "q_abs_pos": 32537,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5260357856750488,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21718746423721313,
+          "mean_pin_mass_total": 0.013317078351974487,
+          "mean_pooled_mass_total": 0.5265202522277832,
+          "mean_pin_mass_per_slot": 5.201983731240034e-05,
+          "mean_pooled_mass_per_slot": 0.00025708996690809727
+        }
+      },
+      {
+        "sample_id": "rank5|global_req61|task=niah_single_2|doc=21",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.6852126121520996,
+        "max_pin_to_pooled_mass_per_slot_ratio": 4844.094558622558,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3755267560482025,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.24170216917991638,
+          "mean_pin_mass_total": 0.015112700872123241,
+          "mean_pooled_mass_total": 0.553496778011322,
+          "mean_pin_mass_per_slot": 5.903398778173141e-05,
+          "mean_pooled_mass_per_slot": 0.00027026209863834083
+        }
+      },
+      {
+        "sample_id": "rank5|global_req69|task=niah_single_2|doc=29",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31487,
+        "q_pos_max": 32510,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.452198028564453,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2832.68334157433,
+        "last_query": {
+          "q_abs_pos": 32510,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4721201956272125,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22577126324176788,
+          "mean_pin_mass_total": 0.012887589633464813,
+          "mean_pooled_mass_total": 0.4967001676559448,
+          "mean_pin_mass_per_slot": 5.034214700572193e-05,
+          "mean_pooled_mass_per_slot": 0.0002425293787382543
+        }
+      },
+      {
+        "sample_id": "rank5|global_req77|task=niah_single_2|doc=37",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.722046136856079,
+        "max_pin_to_pooled_mass_per_slot_ratio": 5272.858741546292,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5414334535598755,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2193823754787445,
+          "mean_pin_mass_total": 0.014379537664353848,
+          "mean_pooled_mass_total": 0.5572807788848877,
+          "mean_pin_mass_per_slot": 5.617006900138222e-05,
+          "mean_pooled_mass_per_slot": 0.00027210975531488657
+        }
+      },
+      {
+        "sample_id": "rank5|global_req85|task=niah_single_1|doc=5",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.0762269496917725,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1191.8646792082875,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.32804757356643677,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.20417237281799316,
+          "mean_pin_mass_total": 0.011788840405642986,
+          "mean_pooled_mass_total": 0.5380627512931824,
+          "mean_pin_mass_per_slot": 4.6050157834542915e-05,
+          "mean_pooled_mass_per_slot": 0.0002627259527798742
+        }
+      },
+      {
+        "sample_id": "rank5|global_req93|task=niah_single_1|doc=13",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 2.847830057144165,
+        "max_pin_to_pooled_mass_per_slot_ratio": 704.4173709566145,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.2843325138092041,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2245558500289917,
+          "mean_pin_mass_total": 0.012887094169855118,
+          "mean_pooled_mass_total": 0.5587248802185059,
+          "mean_pin_mass_per_slot": 5.0340211600996554e-05,
+          "mean_pooled_mass_per_slot": 0.0002728148829191923
+        }
+      },
+      {
+        "sample_id": "rank6|global_req102|task=niah_single_1|doc=22",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.990696907043457,
+        "max_pin_to_pooled_mass_per_slot_ratio": 9788.066404495052,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.40854060649871826,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22647276520729065,
+          "mean_pin_mass_total": 0.0133954007178545,
+          "mean_pooled_mass_total": 0.5650919079780579,
+          "mean_pin_mass_per_slot": 5.232578405411914e-05,
+          "mean_pooled_mass_per_slot": 0.00027592378319241107
+        }
+      },
+      {
+        "sample_id": "rank6|global_req110|task=niah_single_1|doc=30",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31463,
+        "q_pos_max": 32486,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.260389804840088,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1821.3348803600184,
+        "last_query": {
+          "q_abs_pos": 32486,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.42215433716773987,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22224362194538116,
+          "mean_pin_mass_total": 0.013087988831102848,
+          "mean_pooled_mass_total": 0.5262718200683594,
+          "mean_pin_mass_per_slot": 5.11249563714955e-05,
+          "mean_pooled_mass_per_slot": 0.0002569686621427536
+        }
+      },
+      {
+        "sample_id": "rank6|global_req118|task=niah_single_1|doc=38",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31460,
+        "q_pos_max": 32483,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.7868926525115967,
+        "max_pin_to_pooled_mass_per_slot_ratio": 6121.990516640753,
+        "last_query": {
+          "q_abs_pos": 32483,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4607841670513153,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.19613417983055115,
+          "mean_pin_mass_total": 0.013630717992782593,
+          "mean_pooled_mass_total": 0.6110106706619263,
+          "mean_pin_mass_per_slot": 5.3244992159307e-05,
+          "mean_pooled_mass_per_slot": 0.0002983450540341437
+        }
+      },
+      {
+        "sample_id": "rank6|global_req14|task=niah_single_3|doc=14",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31506,
+        "q_pos_max": 32529,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 5.532742500305176,
+        "max_pin_to_pooled_mass_per_slot_ratio": 340990.6732018244,
+        "last_query": {
+          "q_abs_pos": 32529,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3428325653076172,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23791533708572388,
+          "mean_pin_mass_total": 0.012530029751360416,
+          "mean_pooled_mass_total": 0.5202529430389404,
+          "mean_pin_mass_per_slot": 4.8945428716251627e-05,
+          "mean_pooled_mass_per_slot": 0.00025402975734323263
+        }
+      },
+      {
+        "sample_id": "rank6|global_req22|task=niah_single_3|doc=22",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31508,
+        "q_pos_max": 32531,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.734468936920166,
+        "max_pin_to_pooled_mass_per_slot_ratio": 54258.64412372067,
+        "last_query": {
+          "q_abs_pos": 32531,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.43139463663101196,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2397323101758957,
+          "mean_pin_mass_total": 0.014507402665913105,
+          "mean_pooled_mass_total": 0.5394161343574524,
+          "mean_pin_mass_per_slot": 5.6669541663723066e-05,
+          "mean_pooled_mass_per_slot": 0.0002633867843542248
+        }
+      },
+      {
+        "sample_id": "rank6|global_req30|task=niah_single_3|doc=30",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31511,
+        "q_pos_max": 32534,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.630570888519287,
+        "max_pin_to_pooled_mass_per_slot_ratio": 4271.4063457023785,
+        "last_query": {
+          "q_abs_pos": 32534,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5004031658172607,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22734129428863525,
+          "mean_pin_mass_total": 0.014596527442336082,
+          "mean_pooled_mass_total": 0.5514687895774841,
+          "mean_pin_mass_per_slot": 5.701768532162532e-05,
+          "mean_pooled_mass_per_slot": 0.0002692718699108809
+        }
+      },
+      {
+        "sample_id": "rank6|global_req38|task=niah_single_3|doc=38",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31515,
+        "q_pos_max": 32538,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.316775321960449,
+        "max_pin_to_pooled_mass_per_slot_ratio": 20738.403586818644,
+        "last_query": {
+          "q_abs_pos": 32538,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4879710078239441,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2317877560853958,
+          "mean_pin_mass_total": 0.013099600560963154,
+          "mean_pooled_mass_total": 0.4793698787689209,
+          "mean_pin_mass_per_slot": 5.117031469126232e-05,
+          "mean_pooled_mass_per_slot": 0.00023406732361763716
+        }
+      },
+      {
+        "sample_id": "rank6|global_req46|task=niah_single_2|doc=6",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31490,
+        "q_pos_max": 32513,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.0260512828826904,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1061.8209330110708,
+        "last_query": {
+          "q_abs_pos": 32513,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.45265573263168335,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.214484304189682,
+          "mean_pin_mass_total": 0.013778820633888245,
+          "mean_pooled_mass_total": 0.5535743236541748,
+          "mean_pin_mass_per_slot": 5.3823518101125956e-05,
+          "mean_pooled_mass_per_slot": 0.00027029996272176504
+        }
+      },
+      {
+        "sample_id": "rank6|global_req54|task=niah_single_2|doc=14",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.9699454307556152,
+        "max_pin_to_pooled_mass_per_slot_ratio": 9331.370444541793,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.47441157698631287,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23357242345809937,
+          "mean_pin_mass_total": 0.014400115236639977,
+          "mean_pooled_mass_total": 0.54549640417099,
+          "mean_pin_mass_per_slot": 5.625045014312491e-05,
+          "mean_pooled_mass_per_slot": 0.0002663556660991162
+        }
+      },
+      {
+        "sample_id": "rank6|global_req62|task=niah_single_2|doc=22",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31490,
+        "q_pos_max": 32513,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.360484600067139,
+        "max_pin_to_pooled_mass_per_slot_ratio": 22934.25304933705,
+        "last_query": {
+          "q_abs_pos": 32513,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3900841772556305,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23707064986228943,
+          "mean_pin_mass_total": 0.01500740647315979,
+          "mean_pooled_mass_total": 0.5473178029060364,
+          "mean_pin_mass_per_slot": 5.862268153578043e-05,
+          "mean_pooled_mass_per_slot": 0.0002672450209502131
+        }
+      },
+      {
+        "sample_id": "rank6|global_req6|task=niah_single_3|doc=6",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31510,
+        "q_pos_max": 32533,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.5876665115356445,
+        "max_pin_to_pooled_mass_per_slot_ratio": 3869.603895091604,
+        "last_query": {
+          "q_abs_pos": 32533,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3155194818973541,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.26013559103012085,
+          "mean_pin_mass_total": 0.012327474541962147,
+          "mean_pooled_mass_total": 0.4790988564491272,
+          "mean_pin_mass_per_slot": 4.8154197429539636e-05,
+          "mean_pooled_mass_per_slot": 0.0002339349885005504
+        }
+      },
+      {
+        "sample_id": "rank6|global_req70|task=niah_single_2|doc=30",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.1320624351501465,
+        "max_pin_to_pooled_mass_per_slot_ratio": 13553.842514296355,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4179781973361969,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2283855378627777,
+          "mean_pin_mass_total": 0.013623018749058247,
+          "mean_pooled_mass_total": 0.5373587608337402,
+          "mean_pin_mass_per_slot": 5.3214916988508776e-05,
+          "mean_pooled_mass_per_slot": 0.0002623822074383497
+        }
+      },
+      {
+        "sample_id": "rank6|global_req78|task=niah_single_2|doc=38",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31481,
+        "q_pos_max": 32504,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.2936995029449463,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1966.5251407050673,
+        "last_query": {
+          "q_abs_pos": 32504,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5017203092575073,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21993784606456757,
+          "mean_pin_mass_total": 0.013796249404549599,
+          "mean_pooled_mass_total": 0.5421724319458008,
+          "mean_pin_mass_per_slot": 5.389159923652187e-05,
+          "mean_pooled_mass_per_slot": 0.00026473263278603554
+        }
+      },
+      {
+        "sample_id": "rank6|global_req86|task=niah_single_1|doc=6",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 2.7736117839813232,
+        "max_pin_to_pooled_mass_per_slot_ratio": 593.7611579730955,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.4534916281700134,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.19519710540771484,
+          "mean_pin_mass_total": 0.011799248866736889,
+          "mean_pooled_mass_total": 0.5563215017318726,
+          "mean_pin_mass_per_slot": 4.609081588569097e-05,
+          "mean_pooled_mass_per_slot": 0.0002716413582675159
+        }
+      },
+      {
+        "sample_id": "rank6|global_req94|task=niah_single_1|doc=14",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.4498045444488525,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2817.1147948485495,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.38857442140579224,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.19070670008659363,
+          "mean_pin_mass_total": 0.011823529377579689,
+          "mean_pooled_mass_total": 0.5715165138244629,
+          "mean_pin_mass_per_slot": 4.618566163117066e-05,
+          "mean_pooled_mass_per_slot": 0.000279060797765851
+        }
+      },
+      {
+        "sample_id": "rank7|global_req103|task=niah_single_1|doc=23",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.188817024230957,
+        "max_pin_to_pooled_mass_per_slot_ratio": 15446.035342723018,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3570142984390259,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.20173923671245575,
+          "mean_pin_mass_total": 0.012229477986693382,
+          "mean_pooled_mass_total": 0.5538232922554016,
+          "mean_pin_mass_per_slot": 4.7771398385521024e-05,
+          "mean_pooled_mass_per_slot": 0.0002704215294215828
+        }
+      },
+      {
+        "sample_id": "rank7|global_req111|task=niah_single_1|doc=31",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.8845760822296143,
+        "max_pin_to_pooled_mass_per_slot_ratio": 7666.128280870995,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.40921321511268616,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.1957821547985077,
+          "mean_pin_mass_total": 0.011866582557559013,
+          "mean_pooled_mass_total": 0.5521880388259888,
+          "mean_pin_mass_per_slot": 4.6353838115464896e-05,
+          "mean_pooled_mass_per_slot": 0.00026962306583300233
+        }
+      },
+      {
+        "sample_id": "rank7|global_req119|task=niah_single_1|doc=39",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.3706023693084717,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2347.4825320772943,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.2763974964618683,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.24071675539016724,
+          "mean_pin_mass_total": 0.013615093193948269,
+          "mean_pooled_mass_total": 0.5672187805175781,
+          "mean_pin_mass_per_slot": 5.3183957788860425e-05,
+          "mean_pooled_mass_per_slot": 0.0002769622951745987
+        }
+      },
+      {
+        "sample_id": "rank7|global_req15|task=niah_single_3|doc=15",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31509,
+        "q_pos_max": 32532,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.561211585998535,
+        "max_pin_to_pooled_mass_per_slot_ratio": 36409.23768243402,
+        "last_query": {
+          "q_abs_pos": 32532,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.3428846001625061,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.23936119675636292,
+          "mean_pin_mass_total": 0.01266590878367424,
+          "mean_pooled_mass_total": 0.510942816734314,
+          "mean_pin_mass_per_slot": 4.94762061862275e-05,
+          "mean_pooled_mass_per_slot": 0.00024948379723355174
+        }
+      },
+      {
+        "sample_id": "rank7|global_req23|task=niah_single_3|doc=23",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31507,
+        "q_pos_max": 32530,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.186558723449707,
+        "max_pin_to_pooled_mass_per_slot_ratio": 15365.925507839287,
+        "last_query": {
+          "q_abs_pos": 32530,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5040961503982544,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.225367933511734,
+          "mean_pin_mass_total": 0.013947376050055027,
+          "mean_pooled_mass_total": 0.5354048609733582,
+          "mean_pin_mass_per_slot": 5.448193769552745e-05,
+          "mean_pooled_mass_per_slot": 0.00026142815477214754
+        }
+      },
+      {
+        "sample_id": "rank7|global_req31|task=niah_single_3|doc=31",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31505,
+        "q_pos_max": 32528,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 5.084113121032715,
+        "max_pin_to_pooled_mass_per_slot_ratio": 121370.49439987588,
+        "last_query": {
+          "q_abs_pos": 32528,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5159620046615601,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22600585222244263,
+          "mean_pin_mass_total": 0.01435016468167305,
+          "mean_pooled_mass_total": 0.5386790633201599,
+          "mean_pin_mass_per_slot": 5.605533078778535e-05,
+          "mean_pooled_mass_per_slot": 0.00026302688638679683
+        }
+      },
+      {
+        "sample_id": "rank7|global_req39|task=niah_single_3|doc=39",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31501,
+        "q_pos_max": 32524,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.837338924407959,
+        "max_pin_to_pooled_mass_per_slot_ratio": 6876.048390741099,
+        "last_query": {
+          "q_abs_pos": 32524,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.43982237577438354,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2260504812002182,
+          "mean_pin_mass_total": 0.014233425259590149,
+          "mean_pooled_mass_total": 0.5582282543182373,
+          "mean_pin_mass_per_slot": 5.559931742027402e-05,
+          "mean_pooled_mass_per_slot": 0.0002725723898038268
+        }
+      },
+      {
+        "sample_id": "rank7|global_req47|task=niah_single_2|doc=7",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.562067985534668,
+        "max_pin_to_pooled_mass_per_slot_ratio": 36481.10508820434,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5147010087966919,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.22690315544605255,
+          "mean_pin_mass_total": 0.014385334216058254,
+          "mean_pooled_mass_total": 0.5472634434700012,
+          "mean_pin_mass_per_slot": 5.6192711781477556e-05,
+          "mean_pooled_mass_per_slot": 0.00026721847825683653
+        }
+      },
+      {
+        "sample_id": "rank7|global_req55|task=niah_single_2|doc=15",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.072202682495117,
+        "max_pin_to_pooled_mass_per_slot_ratio": 11808.716124054568,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.515985906124115,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21990132331848145,
+          "mean_pin_mass_total": 0.01391848549246788,
+          "mean_pooled_mass_total": 0.5399254560470581,
+          "mean_pin_mass_per_slot": 5.436908395495266e-05,
+          "mean_pooled_mass_per_slot": 0.0002636354765854776
+        }
+      },
+      {
+        "sample_id": "rank7|global_req63|task=niah_single_2|doc=23",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31487,
+        "q_pos_max": 32510,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.96234655380249,
+        "max_pin_to_pooled_mass_per_slot_ratio": 91695.18980197424,
+        "last_query": {
+          "q_abs_pos": 32510,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5222676396369934,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21060442924499512,
+          "mean_pin_mass_total": 0.012574102729558945,
+          "mean_pooled_mass_total": 0.5239327549934387,
+          "mean_pin_mass_per_slot": 4.911758878733963e-05,
+          "mean_pooled_mass_per_slot": 0.00025582654052414
+        }
+      },
+      {
+        "sample_id": "rank7|global_req71|task=niah_single_2|doc=31",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31478,
+        "q_pos_max": 32501,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.6871144771575928,
+        "max_pin_to_pooled_mass_per_slot_ratio": 4865.3543631855255,
+        "last_query": {
+          "q_abs_pos": 32501,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.48613783717155457,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2229842245578766,
+          "mean_pin_mass_total": 0.013957980088889599,
+          "mean_pooled_mass_total": 0.522788405418396,
+          "mean_pin_mass_per_slot": 5.4523359722224995e-05,
+          "mean_pooled_mass_per_slot": 0.00025526777608320117
+        }
+      },
+      {
+        "sample_id": "rank7|global_req79|task=niah_single_2|doc=39",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31484,
+        "q_pos_max": 32507,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.410594940185547,
+        "max_pin_to_pooled_mass_per_slot_ratio": 25739.1938192508,
+        "last_query": {
+          "q_abs_pos": 32507,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.541996955871582,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21885915100574493,
+          "mean_pin_mass_total": 0.01319355983287096,
+          "mean_pooled_mass_total": 0.5192140936851501,
+          "mean_pin_mass_per_slot": 5.153734309715219e-05,
+          "mean_pooled_mass_per_slot": 0.0002535225066822022
+        }
+      },
+      {
+        "sample_id": "rank7|global_req7|task=niah_single_3|doc=7",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31509,
+        "q_pos_max": 32532,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 4.123879432678223,
+        "max_pin_to_pooled_mass_per_slot_ratio": 13300.85113120381,
+        "last_query": {
+          "q_abs_pos": 32532,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5143061876296997,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.2125406563282013,
+          "mean_pin_mass_total": 0.013475766405463219,
+          "mean_pooled_mass_total": 0.5418733954429626,
+          "mean_pin_mass_per_slot": 5.26397125213407e-05,
+          "mean_pooled_mass_per_slot": 0.0002645866188686341
+        }
+      },
+      {
+        "sample_id": "rank7|global_req87|task=niah_single_1|doc=7",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31454,
+        "q_pos_max": 32477,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.1655545234680176,
+        "max_pin_to_pooled_mass_per_slot_ratio": 1464.0453294739152,
+        "last_query": {
+          "q_abs_pos": 32477,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.5096211433410645,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.18700657784938812,
+          "mean_pin_mass_total": 0.011732786893844604,
+          "mean_pooled_mass_total": 0.5601990222930908,
+          "mean_pin_mass_per_slot": 4.5831198804080486e-05,
+          "mean_pooled_mass_per_slot": 0.00027353467885404825
+        }
+      },
+      {
+        "sample_id": "rank7|global_req95|task=niah_single_1|doc=15",
+        "calls": 56,
+        "query_vectors": 458752,
+        "q_pos_min": 31457,
+        "q_pos_max": 32480,
+        "max_pin_to_pooled_mass_per_slot_log10_ratio": 3.3523244857788086,
+        "max_pin_to_pooled_mass_per_slot_ratio": 2250.7356286574286,
+        "last_query": {
+          "q_abs_pos": 32480,
+          "layer": 27,
+          "branch": "gqa",
+          "max_pin_to_pooled_mass_per_slot_log10_ratio": -0.37735557556152344,
+          "mean_pin_to_pooled_mass_per_slot_ratio": 0.21997123956680298,
+          "mean_pin_mass_total": 0.012781711295247078,
+          "mean_pooled_mass_total": 0.5442159175872803,
+          "mean_pin_mass_per_slot": 4.99285597470589e-05,
+          "mean_pooled_mass_per_slot": 0.0002657304285094142
+        }
+      }
+    ]
   }
 }
