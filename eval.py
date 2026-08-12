@@ -82,6 +82,27 @@ def _tqdm_position() -> int:
     return _global_rank()
 
 
+def _request_sample_id(req: Any, *, global_request_index: int, rank: int) -> str:
+    """Stable cross-diagnostic id for one actual generate_until model call."""
+    task_name = getattr(req, "task_name", None)
+    doc_id = getattr(req, "doc_id", None)
+    idx = getattr(req, "idx", None)
+    metadata = getattr(req, "metadata", None)
+    if isinstance(metadata, dict):
+        task_name = task_name or metadata.get("task_name") or metadata.get("task")
+        doc_id = doc_id if doc_id is not None else metadata.get("doc_id")
+        idx = idx if idx is not None else metadata.get("idx")
+
+    parts = [f"rank{rank}", f"global_req{int(global_request_index)}"]
+    if task_name is not None:
+        parts.append(f"task={task_name}")
+    if doc_id is not None:
+        parts.append(f"doc={doc_id}")
+    elif idx is not None:
+        parts.append(f"idx={idx}")
+    return "|".join(str(part) for part in parts)
+
+
 _DIST_ENV_KEYS = (
     "RANK",
     "WORLD_SIZE",
@@ -764,7 +785,9 @@ class LogKVLM(LM):
 
         # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
         desc = f"generate_until GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
-        for req in tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position()):
+        for local_i, req in enumerate(tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position())):
+            global_request_index = local_i * dp_size + dp_rank
+            sample_id = _request_sample_id(req, global_request_index=global_request_index, rank=dp_rank)
             prompt = req.args[0]
             gen_args = req.args[1]
 
@@ -798,6 +821,7 @@ class LogKVLM(LM):
                 # 🧩 长上下文生成使用所选 cache（LogKV slot cache 或 dense KV）。
                 # 建一次、按请求原地重置，不逐样本重分配 — 见 _set_eval_cache。
                 self._set_eval_cache()
+                LOG_KV_PIN_SCORE_DIAG.set_sample_context(sample_id)
                 try:
                     t0 = time.perf_counter()
                     out = litgpt_generate(
@@ -814,6 +838,7 @@ class LogKVLM(LM):
                             model=self.model,
                             tokenizer=self.tokenizer,
                             prompt=prompt,
+                            sample_id=sample_id,
                             doc=getattr(req, "doc", None),
                             request=req,
                             prompt_token_offset=prompt_token_offset,
@@ -822,6 +847,7 @@ class LogKVLM(LM):
                         )
                     t1 = time.perf_counter()
                 finally:
+                    LOG_KV_PIN_SCORE_DIAG.clear_sample_context()
                     self._reset_eval_cache()
 
             # 截取新生成的部分并解码
