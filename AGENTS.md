@@ -1,11 +1,11 @@
-# LogKV 项目工作记录（存档，更新于 2026-08-12）
+# LogKV 项目工作记录（存档，更新于 2026-08-11）
 
 > 本文件是给下次接续工作时用的存档，记录 LogKV（Fenwick-tree / O(log N) 显存 KV cache
 > 压缩，rank-1 Σ_s/Γ_s 二阶修正）这条线目前做了什么、改了什么、卡在哪、下一步该干嘛。
-> 代码层面的细节（怎么加插件、怎么跑服务）见仓库根目录上一级的 `~/CLAUDE.md`；这份
+> 代码层面的细节（怎么加插件、怎么跑服务）见仓库根目录上一级的 `~/AGENTS.md`；这份
 > 只讲 LogKV 这一个专题。
 
-## 0. 现状速览（2026-08-12 更新，只想快速接续就读这节，细节看后面对应章节）
+## 0. 现状速览（2026-08-11 更新，只想快速接续就读这节，细节看后面对应章节）
 
 **进展**：warmup CPT（`second_order_scale` 目标 0.2，warmup 100 步）已经完整训练
 1500 步，并跑出了 dense baseline / LogKV vanilla / +importance pin / +2nd order+pins /
@@ -41,8 +41,7 @@
    本身就不够，这正是 pin 该顶上的场景。
 3. ACC（常识推理）四组几乎无差异，问题集中在长程检索类任务，短程信息保留良好。
 
-**下一步方向（2026-08-12 更新——阶段 3 已出结果、阶段 5 新增，训练期 pin 注入正在跑，
-见 6.10/6.11/6.12）**：
+**下一步方向（2026-08-11 更新——阶段 2 已出结果，是负面的，路线图据此重排，见 6.9）**：
 
 *阶段 1 —— 修选择算法，纯推理期改动，不碰训练（已完成）：*
 (a)~(d) 同前，见 6.4/6.6/6.7/6.8——`log_kv_pin_min_distance` 的 NMS 约束把
@@ -57,46 +56,24 @@ near-hit 从"不如随机"修到 1.9× 随机，选择质量本身的问题已�
 从来不是下游变差的主因**——即使选得很准，"往压缩层级里混入精确槽"这件事本身对
 当前（没在训练里见过这种输入分布的）模型就是净负贡献。
 
-*阶段 3【已完成，见 6.10】—— 稠密检索能力是否被侵蚀：*
-(f)(g) `log_kv_dense_mode` 开关真跑了 base vs warmup CPT 的稠密 NIAH 对比：捞针从
-0（base）跳到 0.9353（CPT），LongBench/LongBench_e 也大幅提升，common sense 基本
-持平（微降 0.3pp，续训常见副作用）。**证实 CPT 训练本身确实学会了长上下文检索
-能力**；同时也证实了**压缩本身（不涉及任何 pin）就已经吃掉了 85 个百分点以上**
-（0.9353 稠密 → 0.0827 压缩无 pin），这比 pin 相关的任何一组实验的影响都大一个
-数量级——压缩损失，不是选点精度，才是最大的单一瓶颈。**但要注意 6.10 的一个重要
-限定**：CPT 训练全程走的是 LogKV 分块压缩前向，从没真正用稠密注意力训练过，所以
-0.9353 这个数字不是"干净的能力上限"，而是"压缩训练出来的权重泛化到陌生的稠密
-输入分布"的结果——如果混淆因素有方向性，大概率是让这个数字偏保守（真实上限可能
-更高），不影响"压缩代价远大于 pin 代价"这个结论。
+*阶段 3 —— 稠密检索能力是否被侵蚀（见 6.5），优先级下调为可选补充证据：*
+(f)(g) 6.5 的假设仍未验证，`log_kv_dense_mode` 开关已经实现并通过代码审查，但
+阶段 2 的证据已经不需要靠它来解释下游变差——即使 salience 打分质量完美，只要
+"精确槽混入池化槽"本身是分布外输入，一样会拖累指标。降级为可选的补充证据，不再是
+主线；开关已就绪，真要跑的话成本很低（缺的只是真跑一次 base vs CPT checkpoint 的
+NIAH 对比）。
 
-*阶段 5【已完成，见 6.11/6.12】—— pin 分数/mass 尺度失配是否成立、是否可归因到
-选点精度：*
-新增了独立的 `log_kv_pin_score_diag` 旁路诊断（不复用要求 pin_size=0 的
-`log_kv_diag.py`），直接在生产 `log_kv_slot_attention` 里挂钩记录 pin 槽 vs
-pooled 槽的原始点积、加完 mass bias 后的最终分数、以及各自吃到的 softmax mass。
-**核心结论（1500 个真实 niah 样本，见 6.12）：pin 槽的"塌缩"程度（某个 query 上
-pin 吃掉远超比例的 mass）跟这个 pin 是否真的命中 needle，相关系数只有 ±0.09~0.17，
-基本不相关**——推翻了"塌缩=模型精准命中后合理地全力押注"这个乐观猜测，支持
-6.9 结尾提出的"分数尺度失配"机制假设：塌缩更像是某些位置的原始点积天生偏高（跟
-语义相关性无关），不是选点选得准不准的问题。这进一步确认阶段 4（训推一致）是
-唯一还没验证过的、有希望的方向。
-
-*阶段 4（当前进行中）—— 训推一致：让模型在训练里见过"精确槽混入池化层级"这件事：*
-(h) 已实现（`model.py`/`log_kv_cache.py`/`demo.py`/`base.yaml`，见 6.13，代码审查
-无 bug）：训练时随机挑 `_log_kv_train_lowmem_forward` 已经流过的历史位置，复制
-一份精确副本混进当前 chunk 的槽序列，配合 `pin_train_prob`/`pin_train_warmup_steps`
-线性爬坡，模拟"精确槽 + 池化槽共存"的输入分布，不追求复刻真实
-`_log_kv_select_pins` 的显著性打分（训练侧只需要让模型见过这种**分布**，不需要
-位置选得多准）。**短续训实验已启动**（`exp/qwen1.7b-32k/pin_train_shortft.yaml`，
-从 warmup CPT checkpoint `resume_dir` 续训，`learning_rate=1e-5`，
-`log_kv_second_order_warmup_steps=0` 保持二阶修正恒定不再爬坡，`pin_train_max=256`
-/`pin_train_prob=0.5`/`pin_train_warmup_steps=150`；`max_steps` 已从最初的 300
-上调到 1700，`resume_dir` 也改成指向自己继续续训，说明这个实验正在延长/续跑，
-**当前具体训练进度需要下次接续时向用户确认**）。跑完之后要用同一套 NMS pin 配置
-（256/64 或 26）重新评测 LongBench/LongBench_e/niah，看 pin=256 能不能追上甚至
-超过 vanilla（0.1716/0.1918/0.0827）。如果有效，验证了训推分布不一致假设，pin
-这条路可以继续投入；如果依然没用，说明问题比"分布没见过"更深，需要重新评估是否
-彻底放弃 pin，转而把训推一致性这个思路用到压缩本身（阶段 3 揭示的更大缺口）上。
+*阶段 4（当前优先级最高）—— 训推一致：让模型在训练里见过"精确槽混入池化层级"这件事：*
+(h) 不建议直接照搬最初设想的"重新设计训练前向 + 重新跑完整 CPT"（成本最高、风险
+最大）。建议先做一个**最小可行版本**：从已有的 warmup CPT checkpoint 出发做一次
+**短续训**（几百步量级，不是从头 1500 步），训练时用简单规则（比如随机挑
+`_log_kv_train_lowmem_forward` 已经流过的一部分位置，复制一份精确副本混进当前
+chunk 的槽序列）模拟"精确槽 + 池化槽共存"这种输入结构，不追求复刻真实
+`_log_kv_select_pins` 的显著性打分逻辑（那是 no_grad、推理专用，训练侧模拟只需要
+让模型见过这种**分布**，不需要位置选得多准）。跑完之后用同一套 NMS pin 配置重新
+评测，看 pin=256 能不能追上甚至超过 vanilla。如果这个便宜的短续训验证有效，再考虑
+要不要并入下一次完整 CPT；如果依然没用，说明问题比"分布没见过"更深，需要重新评估
+是否彻底放弃 pin。
 
 *继续排在 pin 这条线之后、暂不动的：*
 (i) 6.3 提到的"按 layer/width 差异化 second_order_scale"接口改动。
@@ -654,206 +631,6 @@ NMS/选点算法上调参预计不会再有实质性突破（min_distance 从 64
 预算"pin=4 这三个方向都试过，负收益的方向没有变过，只是幅度和在哪类任务上更明显
 在变）。下一步方向见 0 节"阶段 4"。
 
-### 6.10 阶段 3：dense-mode base vs warmup CPT 真实跑出结果（2026-08-12）
-
-**改动**（上次会话已实现、代码审查无 bug）：`eval.py`/`litgpt/model.py` 新增
-`log_kv_dense_mode` 开关，为真时 `LogKVLM._set_eval_cache()` 走
-`self.model.set_kv_cache(...)`（标准 KV cache），完全绕开 LogKV 代码；启动时校验
-跟 `log_kv_diag_mode`/`log_kv_pin_diag_output`/`log_kv_pin_size!=0` 互斥。新建了
-`exp/qwen1.7b-32k/dense_niah_base.yaml`（`checkpoint_dir` 指向原始 Qwen3-1.7B-Base，
-`log_kv_dense_mode: true`，`log_kv_pin_size: 0`），跟已有的 `arc_warmup.yaml` +
-`DIAG_ARGS="--log_kv_dense_mode true --log_kv_pin_size 0"` 配合，分别对 base 和
-warmup CPT checkpoint 跑同一套 niah_single_1/2/3。
-
-**结果**：
-
-| 指标 | base（未 CPT）| warmup CPT | 变化 |
-|---|---:|---:|---|
-| Common sense | 0.6151 | 0.6123 | 微降 ~0.3pp |
-| LongBench | 0.013 | 0.2075 | 约 16 倍 |
-| LongBench_e | 0.2606 | 0.4463 | +71% |
-| niah（稠密）| 0 | 0.9353 | 从完全不会到接近满分 |
-
-**解读**：
-- **CPT 训练确实教会了模型长上下文检索能力**（稠密 niah 0→0.9353），长文档理解
-  （LongBench/LongBench_e）也大幅提升，common sense 只有噪声量级的微降（持续预训练
-  在长文档语料上续训导致的轻微"遗忘"，是常见、预期内的副作用，不是训练配方出了
-  问题）。
-- **把这个 0.9353 稠密上限跟 6.1 表格的"LogKV + 2nd order, no pins"（niah 0.0827）
-  对比**：同一个 checkpoint，唯一变量是开不开压缩，niah 从 0.9353 掉到 0.0827——
-  **压缩本身（完全不涉及 pin）就吃掉了 85 个百分点以上**，比整个 pin 系列实验
-  （6.9，各配置在 0.011~0.047 之间来回摆）影响大一个数量级。这把"压缩本身的信息
-  损失"重新确立为全链路里最大的单一瓶颈，pin 一直以来只是在争夺一个本身就很小的
-  剩余空间。
-- **重要限定（不影响上面的结论，但影响怎么解读这个数字本身）**：CPT 训练全程走
-  `_log_kv_train_lowmem_forward`（`log_kv_train_block=16384` 的分块流式训练，
-  block 之外的历史全部走压缩+detach），模型从没有在真正的稠密因果注意力（每个
-  token 精确可见、梯度能穿透到任意历史 token）下训练过。所以 dense_mode 测出来的
-  0.9353，严格说是"压缩训练出来的权重，泛化到一个训练时从未见过的、信息更完整的
-  输入分布"的结果，不是一个可以直接当作训练目标的"干净上限"。这个混淆因素如果有
-  方向性，应该是让这个数字偏保守（信息更完整通常只会帮忙，但分布不匹配本身是训练
-  从没经历过的），所以真实的"如果从头到尾用稠密注意力训练"的上限很可能比 0.9353
-  更高——不会推翻"压缩代价远大于 pin 代价"这个结论，只是提醒不要把 0.9353 直接当
-  成一个精确、无偏的物理量。
-
-### 6.11 新增独立诊断：`log_kv_pin_score_diag`（pin vs pooled 分数/mass 尺度对比，2026-08-12）
-
-**动机**：6.9 结尾提出的机制假设——pooled slot 是多 token mean-pool 出来的，点积
-分数被磨平；pin 槽是未池化的精确 key，分数尺度可能明显不同，混进同一个 softmax
-行会扰乱整行的注意力质量分配，不需要 pin 位置选得准不准。已有的 `log_kv_diag.py`
-明确要求 `pin_size=0`（slot→token 映射假设槽覆盖连续 token 区间，pin 是打散的
-精确重复，破坏这个假设），不能直接拿来验证这个假设，所以新增了一个独立、更轻量
-的旁路诊断，不复用、不修改 `log_kv_diag.py`。
-
-**实现**（三个文件，代码审查无 bug，两条分支——GQA/MHA——都挂了钩子）：
-- 新增 `litgpt/log_kv_pin_score_diag.py`：`PinScoreDiag` 全局单例，
-  `capture_score_stats()` 在 `scores.mul_(scale)` 之后、二阶修正和 `log(w)` mass
-  bias 加上去之前调用，拿到纯 `dot_pin_score`/`dot_pooled_score`；`record()` 在
-  `attn = softmax(scores)` 算完之后调用，用同一份生产 buffer 拿到
-  `final_pin_score`/`final_pooled_score`（加完修正、softmax 前）和按槽归一化的
-  `pin_mass_per_slot`/`pooled_mass_per_slot`/`pin_to_pooled_mass_per_slot_ratio`
-  （及其 log10 版本）。全程复用生产路径的张量，不额外重算，避免诊断和生产口径
-  不一致。
-- `litgpt/log_kv_cache.py` 的 `log_kv_slot_attention()` 新增可选的 slot 边界参数
-  （`pin_slot_range`/`pooled_slot_range`），GQA（`nh != nkv`）和 MHA 两条分支都
-  加了被 `LOG_KV_PIN_SCORE_DIAG.enabled` 门控的记录调用。
-- `litgpt/model.py` 的 `_log_kv_training_forward` 只在 vectorized prefill block
-  里、且只在 `cache.token_count == start`（fresh prefill，跟已有 `LOG_KV_DIAG`
-  oracle 诊断共用同一个 precondition，天然排除 decode/pending 阶段）时计算
-  `[pooled][pin][recent][causal_tail]` 的边界，并且只在 query 位置落在
-  `log_kv_pin_score_diag_window_from_end`（默认 512，落地实验用了 1024）窗口内
-  才记录——避免把生成阶段的 decode query 和 prompt 中段无关的 query 混进统计。
-- `eval.py` 新增 `--log_kv_pin_score_diag_output`/`--log_kv_pin_score_diag_window_from_end`，
-  启动时校验不能跟 `log_kv_dense_mode`/`log_kv_diag_mode` 同开、必须
-  `log_kv_pin_size > 0`；多卡用 `dist.all_gather_object` 收集各 rank 的
-  `state_dict()`，rank 0 落盘 JSON（`total`/`by_layer`/`by_layer_branch` 三级
-  聚合）。
-
-**第一次真实结果**（warmup CPT step_1400，`pin_size=256`/`min_distance=26`，
-niah_single_1/2/3，`window_from_end=1024`，120 个样本，全部 28 层）：
-
-- **典型情况（log10 均值，更抗离群值）：pin 反而略微"吃亏"**——
-  `pin_to_pooled_mass_per_slot_log10_ratio` 在**全部 28 层都是负的**（-0.03 到
-  -0.68，换算成倍数是 0.2~0.9 倍）。但纯点积 `dot_pin_score` 全部 28 层无一例外
-  都比 `dot_pooled_score` 高——证实两者分数尺度确实不一样，`log(w)` mass bias
-  在 27/28 层把这个优势基本抹平甚至反超（只有 layer 0 例外），说明现有的 mass
-  bias 补偿机制在"典型情况"下工作得还不错。
-- **但存在剧烈的偶发"塌缩"**：`pin_to_pooled_mass_per_slot_ratio` 算术均值 9.09，
-  std 高达 36546，max 到 2.5 亿——分布极端右偏，`pin_mass_total.max ≈ 1.0`（某些
-  query 上几乎 100% mass 全给了 pin）。这种塌缩不是少数样本的特例，**120 个样本
-  全部都有**（每个样本在整个窗口里见过的最大 log10_ratio 从 2.77 到 8.41 不等，
-  换算成倍数最小也有约 589 倍）——但塌缩集中发生在窗口内**某个位置**，不是发生在
-  离生成最近的最后一个 query：`last_query` 的 log10_ratio 在 120 个样本里全部
-  温和（-0.13 到 -0.56），跟"最极端时刻"完全不是一回事。
-
-**结论**：塌缩是普遍存在的现象，但不集中在模型真正要用检索信息生成答案的那一刻，
-且这个塌缩程度是否命中真实 needle，需要跟 `log_kv_pin_diag_output` 的命中率数据
-交叉验证——见 6.12。
-
-### 6.12 sample_id 跨诊断关联 + 大规模相关性分析（2026-08-12）
-
-**动机**：6.11 的塌缩事件到底是"模型精准命中 needle 后合理全力押注"还是"跟
-needle 位置无关的伪影"，需要把 `pin_score_diag`（塌缩程度）和 `pin_diag`（命中
-真实 needle 与否）两份独立的诊断数据按同一个请求关联起来看，两者之前互不知道
-对方的存在。
-
-**实现**（三个文件，代码审查无 bug，重点核对过跨 rank 唯一性/多线程串号/内存量级/
-join 语义四个风险点，逐一确认没问题）：
-- `eval.py` 的 `generate_until()` 在真正调用 `litgpt_generate(...)` 前生成全局
-  唯一 `sample_id`（`rank{r}|global_req{n}|task={task}|doc={id}`，`global_req`
-  是从跨 rank 条带切分 `requests[dp_rank::dp_size]` 精确还原出的、在完整共享
-  列表里的原始下标，本身已经全局唯一，`task=` 段用于跨 task 的 `generate_until`
-  调用之间去重）；同一个 id 同时传给 `PinDiagRecorder.record(sample_id=...)` 和
-  `LOG_KV_PIN_SCORE_DIAG.set_sample_context(sample_id)`，`finally` 里清空 context
-  避免异常时串到下一条样本。整个循环单线程同步执行，不存在交错风险。
-- `litgpt/log_kv_pin_diag.py` 的每条样本记录加了 `sample_id` 字段。
-- `litgpt/log_kv_pin_score_diag.py` 新增按样本分桶的 `samples` 输出，每个样本只
-  存几个标量（`max_pin_to_pooled_mass_per_slot_log10_ratio` 及其倍数、
-  `last_query` 下七八个字段），不保留任何张量，内存量级是 O(样本数) 而不是
-  O(query×slot)；多卡 gather 用"列表拼接"语义（不是 `_RunningStat` 那种累加
-  语义），按 `sample_id` 防御性去重。
-- 实测验证（1500 个真实样本）：`sample_id` 100% 唯一无重复，三个 task 各 500
-  个、八个 rank 各分到 1/8，跟设计预期完全吻合。
-
-**分析脚本**：`unused/pin_collapse_vs_hit.py`（纯标准库，无第三方依赖），按
-`sample_id` join 两份 JSON，排除掉 `comparable_needle_count==0`（needle 被截断
-出 prompt）的样本，按 `near_hit_rate`/`exact_hit_rate` 是否 >0 分 hit/miss 两组
-对比塌缩程度，同时算 Pearson 相关系数、按 task 拆分、打印塌缩最猛的 top-N 样本，
-支持 `--out-csv` 导出完整 join 表。
-
-**核心结论（1500 个真实样本，3 个 niah 任务各 500 个）**：
-
-| 命中质量指标 | 与窗口内最猛塌缩（max_log10_ratio）的相关系数 | 与最后一刻塌缩（last_query）的相关系数 |
-|---|---:|---:|
-| `near_hit_rate` | +0.089 | -0.173 |
-| `exact_hit_rate` | +0.100 | — |
-| `min_distance`（离针最近的 pin 有多远）| -0.093 | -0.022 |
-
-命中率本身很健康（97.7% 的样本有 near-hit，`min_distance` 中位数为 0，即绝大多数
-样本在某个 layer/group 上有精确命中），但**塌缩程度跟命中质量的相关系数全部在
-噪声量级（\|r\|<0.2）**，HIT 组（1465 个）和 MISS 组（35 个）的塌缩均值只差
-0.4 个 log10 单位（3.81 vs 3.39），相对组内标准差（0.66/0.46）不算有效差异；
-按 task 拆开看，`near_hit_rate` 均值差得不少（0.67/0.46/0.59），但 `max_log10_ratio`
-均值几乎一样（3.82/3.79/3.80）。**这推翻了"塌缩=正确检索的极端体现"这个乐观
-猜测**（真是这样的话应该看到强正相关），支持 6.9 提出的"分数尺度失配"机制假设：
-塌缩更像是跟位置的原始点积量级绑定的现象，跟这个位置是不是语义上正确的答案基本
-无关。
-
-**对下一步的意义**：这个结果让阶段 4（训练期 pin 注入，见 6.13）变得更有必要——
-问题看起来确实是"模型没学会怎么正确校准精确槽和池化槽混合出现时的分数尺度"，而
-不是"选点选得不够准"（阶段 1 已经证明选点精度可以修好，但 6.9 证明修好选点不解决
-下游问题）或"塌缩本身就是有意义的信号"（这次证明塌缩和是否命中基本无关）。
-
-### 6.13 阶段 4：训练期随机 pin 注入已实现并启动短续训（2026-08-11~12）
-
-**实现**（四个文件，用户实现，代码审查无 bug，重点核对了 forward/backward 选点
-一致性和 `pin_size`/`pin_train_max` 语义不会在 warmup 中途搞混两个高风险点）：
-- `litgpt/log_kv_cache.py` 新增 `_sample_training_pin_positions()`（每个 chunk
-  边界按 `pin_train_prob` 概率触发，随机挑 `[0, inject_start)` 范围内最多
-  `pin_train_max` 个已经流过的历史位置，`inject_start` 严格小于当前位置，不会
-  泄漏未来信息）和 `_install_training_pins()`（取这些位置的原始 K/V 调用已有的
-  `cache.set_pinned()`）。`LogKVStreamTrainingAttention.forward` 用 `*pin_args`
-  变长参数向后兼容旧的 7 参数调用，只采样一次并存进 `ctx`；`backward` 读
-  （不重新采样）`ctx` 里存的选点结果，在 `with torch.no_grad()` 里原样重放同一次
-  注入，保证 forward/backward 走完全相同的代码路径——这是这类"流式训练+backward
-  重放"结构最容易出错的地方，已重点核对过。
-- `litgpt/model.py` 新增 `GPT.set_log_kv_pin_training()`，`enable_log_kv_training()`
-  新增 `pin_size`/`pin_train_max`/`pin_train_prob` 参数并做范围校验（含
-  `pin_train_max > pin_size` 会报错，防止训练配置超过缓存容量）。
-- `demo.py` 新增 `get_log_kv_pin_train_schedule()`（线性爬坡，模式跟已有的
-  `get_log_kv_second_order_scale` 一致）和 `log_kv_pin_train_max`/`_prob`/
-  `_warmup_steps` 三个新 YAML/CLI 参数，训练循环每步据此重设注入强度。
-  `demo.py` 里 `enable_log_kv_training(..., pin_size=log_kv_pin_train_max, ...)`
-  正确地把"目标/最大值"传给固定容量参数 `pin_size`、把"当前 warmup 进度值"传给
-  `pin_train_max`——没有传反（传反会在 warmup 中途缓存容量不够时报错崩溃）。
-- `exp/qwen1.7b-32k/base.yaml` 新增三个 `null` 默认的 YAML 字段（遵循 3.3 节的
-  CLI 扫参约定）。
-
-**实验配置**：`exp/qwen1.7b-32k/pin_train_shortft.yaml`——`resume_dir` 指向 warmup
-CPT checkpoint 纯权重续训（不用 `auto_resume`，优化器/step 全部重新开始），
-`learning_rate=1e-5`（比原 CPT 的 5e-5 低，避免破坏已收敛的长上下文能力）,
-`log_kv_second_order_warmup_steps=0`（`second_order_scale` 保持恒定 0.2，不重新
-爬坡，避免同时引入两个分布变化，方便把效果单独归因到 pin 注入上）,
-`log_kv_pin_train_max=256`/`pin_train_prob=0.5`/`pin_train_warmup_steps=150`。
-
-**当前状态**：已经用 `bash majob.sh exp/qwen1.7b-32k/pin_train_shortft.yaml` 启动，
-`max_steps` 从最初设计的 300 上调到 1700（已跑到 step 1400，还剩 300 步）。**2026-08-12
-修了两个 bug 才能让这次续训真正跑起来**（见 7 节）：①`resume_dir` 原来被设成指向
-自己，但 `resume_dir` 无论指向哪都只做纯权重加载、`global_step` 永远从 0 开始——
-已改成 `auto_resume: true`，才能真正从 step 1400 接着跑剩下的 300 步而不是重新跑满
-1700 步；②`majob.sh` 的跳过训练判断原来只看 `checkpoint_exists`（裸文件存在性），
-不看 `global_step` 有没有达到新的 `max_steps`，导致 `save_path` 下已有 step 1400
-的 checkpoint 时会误判成"训练完成"直接跳到评测——已改成叠加 `checkpoint_finished`
-判断。两处都改完了，**具体这次续训跑到第几步、什么时候能跑完，下次接续时需要向
-用户确认**，本文档写下时还不知道最终会在哪一步停。
-
-**跑完之后要做的唯一一件事**：用同一套 NMS pin 配置（256/64 或与 6.9/6.11 一致的
-具体 min_distance）重新跑 LongBench/LongBench_e/niah，对比 vanilla
-（0.1716/0.1918/0.0827）。看这一个结果就够了——追平/反超说明训推一致这条路有效，
-继续投入；没用就说明问题更深，评估放弃 pin。**不再追加新的诊断实验**（诊断已经
-做得够多，6.4~6.12 已经把机制层面能查的都查过一遍，每次跑评测都是真实 GPU 开销，
-之后除非下游数字本身不好解释，否则不再为了"多看一眼机制"单独起新的诊断跑）。
-
 ## 7. 有用的坑 / 经验教训（给下次接续的自己看）
 
 - `eval.sh` vs 直接 `torchrun --config <yaml> eval.py`：**语义不同**。`eval.sh` 会把
@@ -864,37 +641,14 @@ CPT checkpoint 纯权重续训（不用 `auto_resume`，优化器/step 全部重
   `argparse.ArgumentParser()`（不是 jsonargparse，是为了让 `--config` 能当一个普通
   参数存在），一行命令里如果同一个 flag 出现两次，以最后一次为准——这是 `majob.sh`/
   `eval.sh` 里 `DIAG_ARGS` 放在 `LOG_KV_ARGS` 后面、能正确覆盖 YAML 默认值的原因。
-- `majob.sh` 如果 `save_path` 下已经存在 checkpoint，会**跳过整个训练阶段**直接进
-  eval——这是当初新建 `arc_warmup.yaml` 必须用独立 `save_path` 的原因，不然会误判成
-  "已经训练好了"，直接拿旧 checkpoint 去评测。**2026-08-12 修了一个相关 bug**：
-  跳过判断原来只用 `checkpoint_exists`（裸文件存在性），不看 `checkpoint_meta.yaml`
-  里的 `global_step`——`checkpoint_finished()` 函数其实早就写好了（正确读
-  `global_step`/`max_steps` 比较），但从没被真正调用过。后果是想给一个已经训练过的
-  `save_path` 调高 `max_steps` 续训更多步时，`majob.sh` 会误判"权重已存在"直接跳过，
-  不会真的多训。已修：`majob.sh:299` 判断条件加上 `&& checkpoint_finished`。
-- **`resume_dir` 和 `auto_resume` 不要选错**：想让训练从已有 checkpoint 精确接着跑
-  （`global_step`/optimizer/LR schedule 全部延续），必须用 `auto_resume: true`，
-  不能用 `resume_dir` 指向同一个目录——`resume_dir` 无论指向哪里都只做纯权重加载，
-  `global_step` 永远从 0 开始，调高 `max_steps` 只会导致重新跑满新的总步数，而不是
-  在原有基础上再训练"差额步数"。
+- `majob.sh` 如果 `save_path` 下已经存在一个"finished"的 checkpoint，会**跳过整个
+  训练阶段**直接进 eval——这是当初新建 `arc_warmup.yaml` 必须用独立 `save_path` 的
+  原因，不然会误判成"已经训练好了"，直接拿旧 checkpoint 去评测。
 - 修改本地代码前，遇到"看起来是 bug"的测试预期值，先去追代码的真实语义（本次是
   `_binary_carry`），不要想当然地"以测试为准"去改生产代码——3.2 节就是反过来，测试
   错了，代码是对的。
 - 本地跑 pytest 用 conda env `mineru`（`/Users/hourunli/anaconda3/envs/mineru`,
   Python 3.12）；系统自带 Python 3.9.13 无法解析仓库里到处用的 `X | None` 类型注解。
-- **`log_kv_dense_mode` 测出来的数字不是"干净的能力上限"**（见 6.10）：CPT 训练
-  全程走 LogKV 分块压缩前向，从没真正用稠密注意力训练过，dense_mode 推理是把
-  压缩训练出来的权重塞进一个训练时从未见过的输入分布里跑，本质上也是一种（跟
-  pin 那个不是同一种、但同类型的）训推不一致。不影响"压缩代价远大于 pin 代价"
-  这个定性结论（量级差太多），但引用这个数字时要说清楚它的含义，不要当成物理
-  意义上精确的能力上限。
-- **两份独立诊断要事后关联分析时，提前设计好共享 id，不要等跑完了再想办法对齐**
-  （见 6.12）：`sample_id` 的设计要点——(a) 用能保证跨 rank/跨 task 唯一的组合
-  （rank + 在完整共享请求列表里的原始下标 + task 名兜底），而不是局部计数器；
-  (b) 同一个 id 字符串对象直接传给两边记录，不要各自独立生成再指望格式一致；
-  (c) 需要跨样本聚合分析的诊断，从"只做全局 running stat"改成"额外按样本 id 分桶"
-  时，每个样本只存几个标量（不存张量），内存量级天然可控，不用等真的爆内存了
-  才发现问题。
 
 ## 8. 常用运行命令（2026-08-10 新增）
 
@@ -976,38 +730,3 @@ niah 两次 `torchrun` **各用各的端口**（`MAIN_EVAL_MASTER_PORT` 默认 `
 `NIAH_EVAL_MASTER_PORT` 默认 `MASTER_PORT + 1`），不会像 `majob.sh` 那样两次评测
 复用同一个端口。`eval.sh` 把 YAML 展平成纯 CLI flag 传给 `eval.py`（不传
 `--config`），所以 3.3 节"YAML 非 null 覆盖 CLI"的坑在这条路径上不会触发。
-
-### 8.4 dense-mode base-vs-CPT 对比 / pin_score_diag + pin_diag 联合诊断（2026-08-12 新增）
-
-**dense-mode 对比**（6.10）：base checkpoint 用新建的 `dense_niah_base.yaml`，CPT
-checkpoint 复用 `arc_warmup.yaml` + `DIAG_ARGS` 覆盖 `log_kv_pin_size`：
-
-```bash
-bash eval.sh exp/qwen1.7b-32k/dense_niah_base.yaml none niah_single_1,niah_single_2,niah_single_3
-
-DIAG_ARGS="--log_kv_dense_mode true --log_kv_pin_size 0" \
-    bash eval.sh exp/qwen1.7b-32k/arc_warmup.yaml none niah_single_1,niah_single_2,niah_single_3
-```
-
-**pin_score_diag + pin_diag 联合跑**（6.11/6.12，两个诊断没有互斥关系，可以一次
-跑出来，为了 hit/miss 分组对比样本量足够，不要加 `--limit`，也不要设
-`log_kv_pin_diag_max_samples`，否则 `pin_diag` 那边会截断、join 后一部分
-`pin_score_diag` 样本找不到对应项）：
-
-```bash
-SAVE_DIR=/home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME:-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
-
-DIAG_ARGS="--log_kv_pin_score_diag_output ${SAVE_DIR}/pin_score_diag --log_kv_pin_score_diag_window_from_end 1024 --log_kv_pin_diag_output ${SAVE_DIR}/pin_diag" \
-    bash eval.sh exp/qwen1.7b-32k/arc_warmup.yaml none niah_single_1,niah_single_2,niah_single_3
-```
-
-跑完之后用 `unused/pin_collapse_vs_hit.py`（纯标准库，训练环境不用装额外的包）
-按 `sample_id` join 两份 JSON，输出 hit/miss 分组统计、按 task 拆分、Pearson
-相关系数、塌缩最猛的 top-N 样本：
-
-```bash
-python unused/pin_collapse_vs_hit.py \
-    --pin-score-diag pin_score_diag_..._TS.json \
-    --pin-diag pin_diag_..._TS.json \
-    --out-csv joined.csv
-```

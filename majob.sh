@@ -294,17 +294,21 @@ ensure_checkpoint_tokenizer() {
 }
 
 # ==============================================================================
-# 🌟 核心新增：检查 Checkpoint 是否已存在
+# 🌟 核心新增：检查 Checkpoint 是否已存在且已训练到目标 max_steps/num_epochs
+# （checkpoint_exists 只看文件在不在，不看训练进度——单独用它会导致 max_steps
+#  调高后仍然误判"已完成"直接跳过训练；必须叠加 checkpoint_finished 的
+#  global_step/epoch 比较）
 # ==============================================================================
-if checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
+if checkpoint_exists "${SAVE_DIR}/lit_model.pth" && checkpoint_finished; then
     echo "================================================="
-    echo "⏩ [Node ${NODE_RANK}] 阶段一跳过：检测到 checkpoint 于 ${SAVE_DIR}/lit_model.pth"
+    echo "⏩ [Node ${NODE_RANK}] 阶段一跳过：检测到已完成的 checkpoint 于 ${SAVE_DIR}/lit_model.pth"
     echo "⏩ checkpoint 状态：$(checkpoint_step_label)"
     echo "⏩ 直接进入评测阶段！"
     echo "================================================="
 else
     echo "================================================="
-    echo "🚀 [Node ${NODE_RANK}] 阶段一：未找到现有权重，开始执行 Continual Pre-Training"
+    echo "🚀 [Node ${NODE_RANK}] 阶段一：开始/继续执行 Continual Pre-Training"
+    echo "⏩ checkpoint 状态：$(checkpoint_step_label)"
     echo "================================================="
 
     torchrun \

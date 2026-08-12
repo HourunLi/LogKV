@@ -2,10 +2,13 @@ config: base.yaml
 
 expid: qwen1.7b-32k-cpt-logKV-pintrain
 
-# 不从 base Qwen 权重开始，而是从已经跑完的 warmup CPT checkpoint 续训
-# （demo.py 里 resume_dir 只做纯权重加载：优化器状态、global_step、LR
-#   schedule 全部重新开始，不会用 auto_resume 的续跑逻辑）。
-resume_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-pintrain
+# 续训已经跑到 step 1400 的 checkpoint，目标是再跑到 max_steps=1700（还剩 300 步）。
+# 必须用 auto_resume（不是 resume_dir）：resume_dir 只做纯权重加载，global_step/
+# optimizer/LR schedule 全部从 0 重新开始，会导致重新跑满 1700 步而不是接着 1400
+# 走剩下的 300 步。auto_resume 会自动在 save_path 下找最新的已完成 checkpoint
+# （_latest_training_checkpoint，含 step_N 子目录和裸 save_path 两种），完整恢复
+# global_step/optimizer 状态。
+auto_resume: true
 
 global_batch_size: 128
 micro_batch_size: 1
