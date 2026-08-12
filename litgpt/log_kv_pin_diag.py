@@ -363,6 +363,7 @@ class PinDiagRecorder:
         model: Any,
         tokenizer: Any,
         prompt: str,
+        sample_id: str | None = None,
         doc: Any | None = None,
         request: Any | None = None,
         prompt_token_offset: int = 0,
@@ -389,6 +390,7 @@ class PinDiagRecorder:
                 comparable_spans.append(span)
 
         sample: dict[str, Any] = {
+            "sample_id": sample_id,
             "request": _safe_request_metadata(request),
             "prompt_tokens": {
                 "original": original_prompt_tokens,
