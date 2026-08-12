@@ -15,7 +15,7 @@ num_devices: 8
 
 data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
 num_workers: 16
-save_ckpt: false
+save_ckpt: true
 save_interval: 1000
 save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-blank
 merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_warmup
