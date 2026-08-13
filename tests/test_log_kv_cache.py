@@ -9,6 +9,7 @@ from litgpt.config import Config
 from litgpt.log_kv_cache import (
     LogKVStreamTrainingAttention,
     LogStructuredKVCache,
+    _pair_rank1_stats,
     _rank1_cross_from_factors,
     _rank1_psd_from_factors,
     append_exact_tokens,
@@ -67,6 +68,7 @@ def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredK
             "level_k_",
             "level_v_",
             "level_w_",
+            "level_imp_",
             "level_sigma_u_",
             "level_sigma2_",
             "level_gamma_a_",
@@ -116,6 +118,7 @@ class TestInit:
             assert hasattr(c, f"level_k_{ell}")
             assert hasattr(c, f"level_v_{ell}")
             assert hasattr(c, f"level_w_{ell}")
+            assert hasattr(c, f"level_imp_{ell}")
             assert hasattr(c, f"level_sigma_u_{ell}")
             assert hasattr(c, f"level_sigma2_{ell}")
             assert hasattr(c, f"level_gamma_a_{ell}")
@@ -141,7 +144,8 @@ class TestInit:
         """THE core complexity guarantee: total buffer storage must be
         O(recent_size + B * max_levels) — no term linear in max_seq_length.
         Closed form: recent_size*(k_dim+v_dim)*b*g
-                     + max_levels * (B*(3*k_dim+2*v_dim+3)*b*g + 1)."""
+                     + max_levels * (B*(3*k_dim+2*v_dim+4)*b*g + 1).
+        The "+4" scalar-per-slot group is level_w/sigma2/gamma/imp."""
         b, g, k_dim, v_dim, B, recent = 1, 2, 8, 8, 4, 8
         for max_seq in (1024, 65536, 1048576):
             c = LogStructuredKVCache(
@@ -151,7 +155,7 @@ class TestInit:
             total = sum(buf.numel() for buf in c.buffers())
             expected = (
                 recent * (k_dim + v_dim) * b * g
-                + c.max_levels * (B * (3 * k_dim + 2 * v_dim + 3) * b * g + 1)
+                + c.max_levels * (B * (3 * k_dim + 2 * v_dim + 4) * b * g + 1)
             )
             assert total == expected, (
                 f"max_seq={max_seq}: buffer numel {total} != log-sized {expected} — "
@@ -316,6 +320,253 @@ class TestCompact:
         exp_cross = direct[7][..., None, None] * torch.einsum("bgsc,bgsd->bgscd", direct[6], direct[5])
         torch.testing.assert_close(got_cov, exp_cov, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(got_cross, exp_cross, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Importance-weighted pooling tests
+#
+# ``importance_pooling`` replaces the uniform pooling weight with a per-slot
+# importance mass, independent of ``w`` (token count, which keeps driving the
+# log(w) mass bias unchanged) -- see compact()/_compact_tokens() docstrings.
+# ---------------------------------------------------------------------------
+
+class TestImportancePooling:
+    def test_pair_rank1_stats_weighted_matches_closed_form(self):
+        """Weighted 2-point covariance collapses to p_a*p_b*dk dk^T exactly,
+        for any (p_a, p_b) summing to 1 -- not just the unweighted 0.5/0.5."""
+        B, G, k_dim, v_dim = 1, 1, 4, 3
+        ka = torch.randn(B, G, k_dim)
+        kb = torch.randn(B, G, k_dim)
+        va = torch.randn(B, G, v_dim)
+        vb = torch.randn(B, G, v_dim)
+        frac_a = torch.tensor([[0.2]])
+        frac_b = 1.0 - frac_a
+
+        sigma_u, sigma2, gamma_a, gamma_b, gamma = _pair_rank1_stats(ka, kb, va, vb, frac_a, frac_b)
+
+        m = frac_a.unsqueeze(-1) * ka + frac_b.unsqueeze(-1) * kb
+        mv = frac_a.unsqueeze(-1) * va + frac_b.unsqueeze(-1) * vb
+        cov = (
+            frac_a.unsqueeze(-1) * torch.einsum("bgd,bge->bgde", ka - m, ka - m)
+            + frac_b.unsqueeze(-1) * torch.einsum("bgd,bge->bgde", kb - m, kb - m)
+        )
+        cross = (
+            frac_a.unsqueeze(-1) * torch.einsum("bgc,bgd->bgcd", va - mv, ka - m)
+            + frac_b.unsqueeze(-1) * torch.einsum("bgc,bgd->bgcd", vb - mv, kb - m)
+        )
+        cov_rank1 = sigma2[..., None, None] * torch.einsum("bgd,bge->bgde", sigma_u, sigma_u)
+        cross_rank1 = gamma[..., None, None] * torch.einsum("bgc,bgd->bgcd", gamma_b, gamma_a)
+        torch.testing.assert_close(cov_rank1, cov, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(cross_rank1, cross, atol=1e-5, rtol=1e-5)
+
+    def test_pair_rank1_stats_default_matches_unweighted(self):
+        """Default frac_a=frac_b=0.5 must exactly reproduce the pre-existing
+        (unweighted) formula -- regression safety for the default path."""
+        B, G, k_dim, v_dim = 1, 1, 4, 3
+        ka = torch.randn(B, G, k_dim)
+        kb = torch.randn(B, G, k_dim)
+        va = torch.randn(B, G, v_dim)
+        vb = torch.randn(B, G, v_dim)
+        out_default = _pair_rank1_stats(ka, kb, va, vb)
+        out_explicit = _pair_rank1_stats(ka, kb, va, vb, 0.5, 0.5)
+        for a, b in zip(out_default, out_explicit):
+            torch.testing.assert_close(a, b)
+
+    def test_compact_imp_drives_alpha_not_w(self):
+        """compact() with imp1/imp2 uses importance (not w) for the pooling
+        alpha, but w_total still comes from w1/w2, unaffected -- mirrors
+        TestCompact.test_merge_unequal_weights with w made uninformative
+        (equal) and imp carrying the skew instead."""
+        k1 = torch.tensor([[[[1.0], [5.0]]]])  # (1,1,2,1)
+        v1 = torch.tensor([[[[2.0], [6.0]]]])
+        w1 = torch.tensor([[[10.0, 10.0]]])
+        k2 = torch.tensor([[[[3.0], [7.0]]]])
+        v2 = torch.tensor([[[[4.0], [8.0]]]])
+        w2 = torch.tensor([[[10.0, 10.0]]])
+        imp1 = torch.tensor([[[1.0, 3.0]]])
+        imp2 = torch.tensor([[[3.0, 1.0]]])
+
+        k_out, v_out, w_out, imp_out = LogStructuredKVCache.compact(
+            k1, v1, w1, k2, v2, w2, imp1=imp1, imp2=imp2,
+        )
+        # slot 0 = merge(k1[0], k1[1]): impa=1, impb=3, alpha=0.25 -> 0.25*1+0.75*5=4.0
+        torch.testing.assert_close(k_out[0, 0, 0, 0], torch.tensor(4.0))
+        # slot 1 = merge(k2[0], k2[1]): impa=3, impb=1, alpha=0.75 -> 0.75*3+0.25*7=4.0
+        torch.testing.assert_close(k_out[0, 0, 1, 0], torch.tensor(4.0))
+        # w (token count) is unaffected by imp: still count-based 10+10=20.
+        torch.testing.assert_close(w_out, torch.full_like(w_out, 20.0))
+        torch.testing.assert_close(imp_out, torch.tensor([[[4.0, 4.0]]]))
+
+    def test_compact_without_imp_unchanged_return_shape(self):
+        """Omitting imp1/imp2 must reproduce the exact prior 3-tuple return."""
+        B_slots = 4
+        B, G, D = 1, 1, 2
+        k1 = torch.ones(B, G, B_slots, D)
+        v1 = torch.ones(B, G, B_slots, D) * 2
+        w1 = torch.full((B, G, B_slots), 4.0)
+        k2 = torch.ones(B, G, B_slots, D) * 3
+        v2 = torch.ones(B, G, B_slots, D) * 6
+        w2 = torch.full((B, G, B_slots), 4.0)
+
+        out = LogStructuredKVCache.compact(k1, v1, w1, k2, v2, w2)
+        assert len(out) == 3
+
+    def test_compact_tokens_importance_weighted_mean(self):
+        """_compact_tokens with imp should produce a p-weighted mean and
+        return the raw importance sum as an extra trailing tensor, while w
+        (count) stays exactly n regardless of imp."""
+        B, G, n, D = 1, 1, 4, 3
+        k = torch.randn(B, G, n, D)
+        v = torch.randn(B, G, n, D)
+        imp = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
+
+        k_entry, v_entry, w_entry, imp_entry = LogStructuredKVCache._compact_tokens(k, v, imp=imp)
+
+        p = (imp / imp.sum(dim=2, keepdim=True)).unsqueeze(-1)
+        expected_k = (p * k).sum(dim=2, keepdim=True)
+        expected_v = (p * v).sum(dim=2, keepdim=True)
+        torch.testing.assert_close(k_entry, expected_k)
+        torch.testing.assert_close(v_entry, expected_v)
+        assert w_entry[0, 0, 0].item() == float(n)
+        torch.testing.assert_close(imp_entry[0, 0, 0], torch.tensor(10.0))
+
+    def test_compact_tokens_uniform_importance_matches_uniform_mean(self):
+        """Equal importance weights should degenerate to the plain uniform
+        mean, for n > 2 (not just the exact-rank-1 n=2 case)."""
+        B, G, n, D = 1, 1, 4, 3
+        k = torch.randn(B, G, n, D)
+        v = torch.randn(B, G, n, D)
+        imp = torch.full((B, G, n), 2.5)
+
+        k_entry, v_entry, _w, _imp = LogStructuredKVCache._compact_tokens(k, v, imp=imp)
+        torch.testing.assert_close(k_entry[0, 0, 0], k[0, 0].mean(dim=0))
+        torch.testing.assert_close(v_entry[0, 0, 0], v[0, 0].mean(dim=0))
+
+    def test_compact_tokens_weighted_stats_are_exact_for_pairs(self):
+        """A weighted 2-token slot's covariance is still exactly rank-1 for
+        any (skewed) imp, not just the unweighted case -- generalizes
+        TestCompactTokens.test_pair_rank1_stats_are_exact."""
+        torch.manual_seed(7)
+        B, G, k_dim, v_dim = 1, 1, 4, 3
+        k = torch.randn(B, G, 2, k_dim)
+        v = torch.randn(B, G, 2, v_dim)
+        imp = torch.tensor([[[1.0, 3.0]]])
+
+        (
+            _k_entry, _v_entry, _w_entry,
+            sigma_u, sigma2, gamma_a, gamma_b, gamma, imp_entry,
+        ) = LogStructuredKVCache._compact_tokens(k, v, with_stats=True, imp=imp)
+
+        k_entry = (imp.unsqueeze(-1) * k).sum(dim=2, keepdim=True) / imp.sum(dim=2, keepdim=True).unsqueeze(-1)
+        v_entry = (imp.unsqueeze(-1) * v).sum(dim=2, keepdim=True) / imp.sum(dim=2, keepdim=True).unsqueeze(-1)
+        p = imp / imp.sum(dim=2, keepdim=True)
+        k_c = k - k_entry
+        v_c = v - v_entry
+        cov = torch.einsum("bgn,bgnd,bgne->bgde", p, k_c, k_c)
+        cross = torch.einsum("bgn,bgnc,bgnd->bgcd", p, v_c, k_c)
+
+        cov_rank1 = sigma2[..., 0, None, None] * torch.einsum(
+            "bgd,bge->bgde", sigma_u[..., 0, :], sigma_u[..., 0, :]
+        )
+        cross_rank1 = gamma[..., 0, None, None] * torch.einsum(
+            "bgc,bgd->bgcd", gamma_b[..., 0, :], gamma_a[..., 0, :]
+        )
+        torch.testing.assert_close(cov_rank1, cov, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(cross_rank1, cross, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(imp_entry[0, 0, 0], torch.tensor(4.0))
+
+    def test_compact_tokens_uniform_importance_stats_match_unweighted(self):
+        """Constant imp over n>2 tokens should exactly reproduce the
+        unweighted (imp=None) rank-1 stats path -- both reduce to the same
+        inv_sqrt_n scaling, so this is a strong consistency check that
+        doesn't depend on rank-1 truncation being exact for n>2 (it generally
+        isn't -- see the module's D1 self-check discussion)."""
+        torch.manual_seed(11)
+        B, G, n, k_dim, v_dim = 1, 1, 4, 5, 3
+        k = torch.randn(B, G, n, k_dim)
+        v = torch.randn(B, G, n, v_dim)
+        imp = torch.full((B, G, n), 7.0)
+
+        unweighted = LogStructuredKVCache._compact_tokens(k, v, with_stats=True)
+        weighted = LogStructuredKVCache._compact_tokens(k, v, with_stats=True, imp=imp)
+
+        for got, exp in zip(weighted[:8], unweighted):
+            torch.testing.assert_close(got, exp, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(weighted[8], torch.full((B, G, 1), 28.0))
+
+    def test_ingest_chunk_default_off_matches_uniform(self):
+        """importance_pooling=False (default) must be bit-identical to the
+        pre-existing uniform-pooling behavior, and level_imp stays unused."""
+        c = LogStructuredKVCache(
+            (1, 1, 64, 8), (1, 1, 64, 8), B=4, device=torch.device("cpu"), dtype=torch.float32,
+        )
+        assert c.importance_pooling is False
+        k = torch.randn(1, 1, 2, 8)
+        v = torch.randn(1, 1, 2, 8)
+        c.ingest_chunk(k, v)
+        torch.testing.assert_close(c.level_k_0[:, :, 0, :], k.mean(dim=2))
+        assert c.level_imp_0[:, :, 0].abs().sum().item() == 0.0
+
+    def test_ingest_chunk_importance_pooling_on(self):
+        """importance_pooling=True should weight by key L2 norm, differing
+        from the uniform mean whenever the two tokens' norms differ, while w
+        (count) stays untouched."""
+        c = LogStructuredKVCache(
+            (1, 1, 64, 8), (1, 1, 64, 8), B=4, device=torch.device("cpu"), dtype=torch.float32,
+            importance_pooling=True,
+        )
+        k = torch.stack([torch.ones(8) * 1.0, torch.ones(8) * 5.0]).view(1, 1, 2, 8)
+        v = torch.randn(1, 1, 2, 8)
+        c.ingest_chunk(k, v)
+
+        imp = k.float().norm(dim=-1)  # (1,1,2)
+        p = imp / imp.sum()
+        expected_k = p[0, 0, 0] * k[0, 0, 0] + p[0, 0, 1] * k[0, 0, 1]
+        torch.testing.assert_close(c.level_k_0[0, 0, 0], expected_k)
+        assert c.level_w_0[0, 0, 0].item() == 2.0
+        torch.testing.assert_close(c.level_imp_0[0, 0, 0], imp.sum())
+        assert not torch.allclose(c.level_k_0[0, 0, 0], k.mean(dim=2)[0, 0])
+
+    def test_streaming_add_recent_importance_pooling_end_to_end(self):
+        """The full add_recent() streaming path (through multiple binary
+        carries) with importance_pooling=True should run without error,
+        preserve token/slot-count bookkeeping identically to the default
+        path, and produce slot content that differs given skewed key norms."""
+        B, G, k_dim, v_dim, Bslots = 1, 1, 8, 8, 4
+        max_seq_length = 64
+        T = 20  # several level-0 fills -> at least one binary carry with B=4
+
+        torch.manual_seed(42)
+        base = torch.randn(B, G, T, k_dim)
+        # Strongly skew per-token key norms so importance-weighted pooling
+        # provably diverges from uniform pooling, not just by noise.
+        scale = torch.linspace(0.1, 10.0, T).view(1, 1, T, 1)
+        k = base * scale
+        v = torch.randn(B, G, T, v_dim)
+
+        c_uniform = LogStructuredKVCache(
+            (B, G, max_seq_length, k_dim), (B, G, max_seq_length, v_dim),
+            B=Bslots, device=torch.device("cpu"), dtype=torch.float32,
+        )
+        c_weighted = LogStructuredKVCache(
+            (B, G, max_seq_length, k_dim), (B, G, max_seq_length, v_dim),
+            B=Bslots, device=torch.device("cpu"), dtype=torch.float32,
+            importance_pooling=True,
+        )
+        add_full_kv_in_chunks(c_uniform, k, v)
+        add_full_kv_in_chunks(c_weighted, k, v)
+
+        assert c_weighted.token_count == c_uniform.token_count == T
+        assert c_weighted.recent_count == c_uniform.recent_count
+        # Carry control flow is a pure function of counts, not content, so
+        # bookkeeping must match exactly regardless of importance weighting.
+        assert torch.equal(c_weighted.level_count, c_uniform.level_count)
+        assert bool((c_weighted.level_count > 0).any())  # a carry actually fired
+
+        slot_k_u, _, slot_w_u = c_uniform.get_attention_state()
+        slot_k_w, _, slot_w_w = c_weighted.get_attention_state()
+        torch.testing.assert_close(slot_w_u, slot_w_w)  # w (count) identical
+        assert not torch.allclose(slot_k_u, slot_k_w)  # pooled content differs
 
 
 # ---------------------------------------------------------------------------

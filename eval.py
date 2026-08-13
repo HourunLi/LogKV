@@ -516,6 +516,7 @@ class LogKVLM(LM):
         log_kv_pin_min_distance: int = 0,
         log_kv_second_order_scale: float = 1.0,
         log_kv_dense_mode: bool = False,
+        log_kv_importance_pooling: bool = False,
         tokenizer_dir: str | None = None,
         pin_diag_recorder: PinDiagRecorder | None = None,
     ):
@@ -530,6 +531,7 @@ class LogKVLM(LM):
         self.log_kv_pin_min_distance = int(log_kv_pin_min_distance)
         self.log_kv_second_order_scale = float(log_kv_second_order_scale)
         self.log_kv_dense_mode = bool(log_kv_dense_mode)
+        self.log_kv_importance_pooling = bool(log_kv_importance_pooling)
         self.pin_diag_recorder = pin_diag_recorder
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
@@ -630,6 +632,7 @@ class LogKVLM(LM):
             pin_obs_window=self.log_kv_pin_obs_window,
             pin_min_distance=self.log_kv_pin_min_distance,
             second_order_scale=self.log_kv_second_order_scale,
+            importance_pooling=self.log_kv_importance_pooling,
         )
         self._eval_cache_ready = True
 
@@ -977,6 +980,10 @@ def main(
     # 0.0 reproduces the first-order LogKV eval path; 1.0 enables full
     # Sigma/Gamma second-order corrections.
     log_kv_second_order_scale: float = 1.0,
+    # 重要性加权池化：level 合并时按启发式每 token 重要性（post-RoPE key
+    # L2 范数）加权，而非均匀 mean-pool；不影响 log(w) mass bias（token 计数
+    # 独立跟踪）。是 k 的纯函数，无新增可学参数，训练/推理天然一致。
+    log_kv_importance_pooling: bool = False,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1056,6 +1063,7 @@ def main(
     log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
     log_kv_pin_min_distance = int(_o("log_kv_pin_min_distance", log_kv_pin_min_distance))
     log_kv_second_order_scale = float(_o("log_kv_second_order_scale", log_kv_second_order_scale))
+    log_kv_importance_pooling = bool(_o("log_kv_importance_pooling", log_kv_importance_pooling))
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
     limit = _o("limit", limit)
     log_kv_diag_mode = _o("log_kv_diag_mode", log_kv_diag_mode)
@@ -1168,7 +1176,8 @@ def main(
                 f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | "
                 f"prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} "
                 f"(obs {log_kv_pin_obs_window}, min_dist {log_kv_pin_min_distance}) | "
-                f"second_order_scale: {log_kv_second_order_scale}"
+                f"second_order_scale: {log_kv_second_order_scale} | "
+                f"importance_pooling: {log_kv_importance_pooling}"
             )
         if diag_active:
             print(
@@ -1211,6 +1220,7 @@ def main(
             log_kv_pin_min_distance=log_kv_pin_min_distance,
             log_kv_second_order_scale=log_kv_second_order_scale,
             log_kv_dense_mode=log_kv_dense_mode,
+            log_kv_importance_pooling=log_kv_importance_pooling,
             tokenizer_dir=tokenizer_dir,
             pin_diag_recorder=pin_diag_recorder,
         )
@@ -1380,6 +1390,7 @@ def main(
                     "benchmark": benchmark,
                     "checkpoint_dir": checkpoint_dir,
                     "log_kv_dense_mode": log_kv_dense_mode,
+                    "log_kv_importance_pooling": log_kv_importance_pooling,
                     "results": results,
                 }
 

@@ -1,11 +1,28 @@
-# LogKV 项目工作记录（存档，更新于 2026-08-12）
+# LogKV 项目工作记录（存档，更新于 2026-08-13）
 
 > 本文件是给下次接续工作时用的存档，记录 LogKV（Fenwick-tree / O(log N) 显存 KV cache
 > 压缩，rank-1 Σ_s/Γ_s 二阶修正）这条线目前做了什么、改了什么、卡在哪、下一步该干嘛。
 > 代码层面的细节（怎么加插件、怎么跑服务）见仓库根目录上一级的 `~/CLAUDE.md`；这份
 > 只讲 LogKV 这一个专题。
 
-## 0. 现状速览（2026-08-12 更新，只想快速接续就读这节，细节看后面对应章节）
+## 0. 现状速览（2026-08-13 更新，只想快速接续就读这节，细节看后面对应章节）
+
+**结论先说（2026-08-13）：pin 这条线已终止**。阶段 4（训推一致，训练时注入 pin
+分布）跑出真实结果——训练后 ≈ 不训练，niah/LongBench/LongBench_e 三项都没有追上
+vanilla（无 pin），详见本节末尾和 6.13。四个独立方向（选择质量、剂量、分数尺度
+机制、训推一致）依次验证均为负，不再往 pin 上投入。下一步的高价值方向是压缩本身
+（阶段 3 揭示的 85+ 个百分点缺口，比 pin 影响大一个数量级）。
+
+**2026-08-13 同日新增：压缩本身这条线的第一个方向——重要性加权池化——已实现
+完毕（代码，非训练结果），见 6.14。核心思路：把 `_flush_pairs`/`compact()` 里
+"槽的 pooling 权重"和"log(w) mass bias 用的 token 计数"解耦成两个独立量，
+pooling 权重按启发式重要性（post-RoPE key L2 范数）加权而不是均匀 1/n，mass
+bias 继续完全不变地用计数 `w`。是 k 的纯函数，无新增可学参数，训练/推理路径自动
+一致（这正是 pin 系列失败的根因之一，这次设计上从一开始就规避掉）。默认关闭时
+（`importance_pooling=False`）跟改动前逐字节相同，124/124 单测通过（113 条既有 +
+11 条新增）。****还没有在真实 checkpoint 上跑过 eval****——本次会话只有本地 CPU
+环境，没有 GPU，下一步是在现有 warmup CPT checkpoint 上跑一次纯 eval-time 决定性
+实验（不需要重新训练，因为这是确定性启发式），命令见 8.5。**
 
 **进展**：warmup CPT（`second_order_scale` 目标 0.2，warmup 100 步）已经完整训练
 1500 步，并跑出了 dense baseline / LogKV vanilla / +importance pin / +2nd order+pins /
@@ -81,25 +98,44 @@ pin 吃掉远超比例的 mass）跟这个 pin 是否真的命中 needle，相�
 语义相关性无关），不是选点选得准不准的问题。这进一步确认阶段 4（训推一致）是
 唯一还没验证过的、有希望的方向。
 
-*阶段 4（当前进行中）—— 训推一致：让模型在训练里见过"精确槽混入池化层级"这件事：*
+*阶段 4【已完成，结论为负，见 6.13】—— 训推一致：让模型在训练里见过"精确槽混入
+池化层级"这件事：*
 (h) 已实现（`model.py`/`log_kv_cache.py`/`demo.py`/`base.yaml`，见 6.13，代码审查
 无 bug）：训练时随机挑 `_log_kv_train_lowmem_forward` 已经流过的历史位置，复制
 一份精确副本混进当前 chunk 的槽序列，配合 `pin_train_prob`/`pin_train_warmup_steps`
-线性爬坡，模拟"精确槽 + 池化槽共存"的输入分布，不追求复刻真实
-`_log_kv_select_pins` 的显著性打分（训练侧只需要让模型见过这种**分布**，不需要
-位置选得多准）。**短续训实验已启动**（`exp/qwen1.7b-32k/pin_train_shortft.yaml`，
-从 warmup CPT checkpoint `resume_dir` 续训，`learning_rate=1e-5`，
-`log_kv_second_order_warmup_steps=0` 保持二阶修正恒定不再爬坡，`pin_train_max=256`
-/`pin_train_prob=0.5`/`pin_train_warmup_steps=150`；`max_steps` 已从最初的 300
-上调到 1700，`resume_dir` 也改成指向自己继续续训，说明这个实验正在延长/续跑，
-**当前具体训练进度需要下次接续时向用户确认**）。跑完之后要用同一套 NMS pin 配置
-（256/64 或 26）重新评测 LongBench/LongBench_e/niah，看 pin=256 能不能追上甚至
-超过 vanilla（0.1716/0.1918/0.0827）。如果有效，验证了训推分布不一致假设，pin
-这条路可以继续投入；如果依然没用，说明问题比"分布没见过"更深，需要重新评估是否
-彻底放弃 pin，转而把训推一致性这个思路用到压缩本身（阶段 3 揭示的更大缺口）上。
+线性爬坡，模拟"精确槽 + 池化槽共存"的输入分布。短续训（`exp/qwen1.7b-32k/
+pin_train_shortft.yaml`，从 step 1400 续跑到 1700，`pin_train_max=256`/
+`pin_train_prob=0.5`）跑完并评测：**common sense 0.6126、LongBench 0.1328、
+LongBench_e 0.1484、niah 0.0213**——common sense 跟 warmup CPT 基线（0.6123）
+基本持平，说明短续训没有破坏原有能力，但 LongBench/LongBench_e/niah 三项都
+**几乎等于 6.9 里未训练的 NMS-64 版本**（0.1313/0.1429/0.0200），仍然明显不如
+vanilla 无 pin（0.1716/0.1918/0.0827）。**结论：训推一致假设也不成立**——即使
+模型在训练里真的见过"精确槽+池化槽混合"这个分布，下游表现完全没有改善。选择
+质量、剂量、分数尺度机制、训推一致，四个独立方向依次验证均为负，**pin 这条线
+到此终止，不再投入**（一个诚实的保留意见：这次续训剂量偏轻——满强度注入只有
+150 步、50% 触发概率、LR 5e-6——理论上不能 100% 排除"没训够"，但考虑到四个方向
+一致指向同一结论、且已投入的验证成本，不建议为排除这个可能性再单独起一轮更长
+训练）。
 
-*继续排在 pin 这条线之后、暂不动的：*
+*下一步的高价值方向 —— 压缩本身，不是 pin：*
+阶段 3（6.10）已经证实压缩本身（不涉及任何 pin）在 niah 上吃掉 85+ 个百分点
+（0.9353 稠密 → 0.0827 压缩无 pin），比 pin 全系列实验的影响（0.011~0.047 之间
+摆动）大一个数量级。往后如果继续做 LogKV，应该把精力放在压缩机制本身——槽宽、
+二阶修正、pooling 方式——而不是继续在 pin 上调参。
+
+*压缩本身·方向 1【已实现代码，未跑评测，见 6.14】—— 重要性加权池化：*
+一阶均值 key 把 needle 稀释成 1/width，二阶修正（rank-1、只能加不能减）救不回一个
+一阶就被冲淡到没法参与 softmax 竞争的槽——这是比继续加高二阶 rank 更根本的杠杆点。
+`log_kv_importance_pooling` 开关（默认关闭，向后兼容）已实现并通过单测，下一步是
+在 warmup CPT checkpoint 上跑一次纯 eval-time 决定性实验（命令见 8.5），不需要
+重新训练。
+
+*继续排在后面、暂不动的：*
 (i) 6.3 提到的"按 layer/width 差异化 second_order_scale"接口改动。
+(ii) 压缩本身·方向 2（稠密→压缩自蒸馏，让压缩前向对齐同序列稠密前向）：天花板更
+高但需要训练时多跑一遍稠密 teacher 前向，成本更大，排在方向 1 出结果之后再评估。
+(iii) 压缩本身·方向 3（rank-2/rank-r 槽统计）：跟方向 1 是替代关系（加权池化让
+均值 key 已经带上 needle 内容后，需要的残差 rank 天然更低），排在方向 1 之后。
 
 ## 1. 这是什么项目
 
@@ -865,6 +901,127 @@ loss 波动有没有收敛，下次接续时需要向用户确认**，本文档�
 做得够多，6.4~6.12 已经把机制层面能查的都查过一遍，每次跑评测都是真实 GPU 开销，
 之后除非下游数字本身不好解释，否则不再为了"多看一眼机制"单独起新的诊断跑）。
 
+**最终结果（2026-08-13，`pin_train_shortft.yaml` 续训到 step 1700 后评测）**：
+
+| 配置 | common sense | LongBench | LongBench_e | niah |
+|---|---:|---:|---:|---:|
+| vanilla（无 pin）| 0.6113 | **0.1716** | **0.1918** | **0.0827** |
+| pin=256, NMS-64，**未训练**（6.9）| – | 0.1313 | 0.1429 | 0.0200 |
+| warmup CPT 基线（6.10，无 pin）| 0.6123 | – | – | – |
+| pin=256, NMS-64，**训练期注入后**（本节）| 0.6126 | 0.1328 | 0.1484 | 0.0213 |
+
+训练后的三项下游指标（0.1328/0.1484/0.0213）跟训练前的未训练版本（0.1313/0.1429/
+0.0200）几乎完全一致，差异在噪声量级；common sense（0.6126）也跟 warmup CPT 基线
+（0.6123）持平，说明这次短续训本身没有破坏模型原有能力，只是**没有起到设计预期的
+作用**。跟 vanilla 相比仍然有明显差距（LongBench 差 0.039、LongBench_e 差 0.043、
+niah 差 0.061）。
+
+**结论：训推一致假设不成立，pin 这条线到此终止**。回顾整条验证链：选择质量（阶段
+1，NMS 修复真实有效但不解决下游问题）→ 剂量效应（阶段 2/6.9，插得越多伤害越大，
+插得再少也是负收益）→ 分数尺度机制（阶段 5/6.11/6.12，塌缩确认存在但跟命中质量
+无关）→ 训推一致（阶段 4/本节，训练后跟不训练一样烂）。四个独立、互不依赖的方向
+依次验证都是负结果，不是同一个假设的不同侧面被同一个 bug 污染——**没有再值得
+尝试的、廉价的下一步假设了**。不建议继续在 pin 机制上投入（含"加长这次续训"这个
+选项：虽然这次剂量偏轻——满强度注入只有 150 步、50% 概率、LR 5e-6——理论上不能
+100% 排除欠训练，但四个方向一致指向同一结论，且阶段 3（6.10）已经证实压缩本身的
+损失比 pin 影响大一个数量级，继续投入验证成本换回的信息价值不高）。后续如果还做
+LogKV，重心应该转向压缩机制本身（槽宽、二阶修正、pooling 方式），而不是 pin。
+
+### 6.14 压缩本身·方向 1：重要性加权池化已实现（2026-08-13，代码完成，未跑评测）
+
+**动机**：6.10 证实压缩本身（不涉及 pin）吃掉 85+ 个百分点，比 pin 全系列实验大
+一个数量级。看 `log_kv_slot_attention` 的打分公式：
+
+```
+score_s = scale·(q·k_s) + 0.5·scale²·sos·sigma2·(q·sigma_u)² + λ·log(w_s)
+          ↑ 一阶：均值 key，needle 被稀释 1/width    ↑ 二阶：rank-1、只能加不能减
+```
+
+二阶修正确实有正贡献（niah 0.032→0.0827，2.6×，见 0 节表格），但它是 rank-1、只能
+沿单一主方向修正，只有当一阶的均值 key 没把 needle 冲淡到"不参与竞争"时才救得回
+来。`_compact_tokens`/`_flush_pairs` 里 `k_entry = k.mean(dim=2)` 这一行是均匀
+1/n 平均——32768 长度、B=512 时槽宽可能到 64/128，needle 被稀释成 1/width。**杠杆
+在一阶的 pooled key，不在继续加二阶的 rank**：把 `k.mean()` 换成按 per-token
+重要性加权的均值，让池化 key 的内容和位置子通道都更指向重要 token，比继续抠二阶
+精度更对症。
+
+**为什么不是 pin 那条老路**：pin 是往压缩层级里混入一个量级迥异的精确 key（6.9/6.11
+证实的"分数尺度失配"是 pin 失败的核心机制），而且训练路径完全没有 pin 存在
+（`_log_kv_select_pins` 是 `@torch.no_grad()`，只在推理期跑，见 6.1）——训推不
+一致是 pin 四个死因之一。重要性加权池化不引入新槽、不改变槽的数量或量级，只改变
+"槽的内容怎么算出来"，而且这个加权是 k 的**确定性纯函数**（无新增可学参数），
+训练和推理天然用同一份代码算出同一个值，从设计上就规避了 pin 系列的训推不一致
+问题。
+
+**设计（六个文件，均已实现并通过单测审查）**：核心是把"槽的 pooling 权重"和
+"`log(w)` mass bias 用的 token 计数"解耦成两个独立追踪的量——`w`（计数）完全不变，
+只服务 mass bias；新增 `imp`（重要性质量），只服务 pooling 的加权平均和 rank-1
+统计量的 Chan 合并公式。默认关闭（`importance_pooling=False`）时两条路径完全不
+接触新代码，逐字节复现改动前的行为。
+
+- `litgpt/log_kv_cache.py`：
+  - `_pair_rank1_stats()` 新增 `frac_a`/`frac_b` 参数（默认 0.5/0.5），把硬编码的
+    `0.25` 泛化成 `frac_a*frac_b`——2 点集合的加权协方差有闭式解
+    `Sigma = p_a*p_b*(k_a-k_b)(k_a-k_b)^T`，对任意 `p_a+p_b=1` 都精确成立（不是
+    只在 0.5/0.5 时），推导见本节末尾；`p_a=p_b=0.5` 时退化成原公式，逐字节不变。
+  - `compact()` 新增可选的 `imp1`/`imp2` 参数：给定时用重要性（不是 `w`）驱动
+    pooling `alpha` 和 Chan 合并公式里的 `frac_a`/`frac_b`（协方差必须用跟 pooling
+    相同的权重居中，否则统计量会不一致），返回值追加一个 `imp_total` 尾元素；
+    省略时是原有 3-元组/8-元组返回，一行代码不多算。
+  - `_compact_tokens()` 新增可选的 `imp` 参数（arbitrary-n 加权均值 + 加权
+    rank-1 统计量，`sqrt(p_i)` 替换原来均匀的 `inv_sqrt_n`，`p_i=1/n` 时精确退化
+    成原公式）。
+  - `LogStructuredKVCache.__init__` 新增 `importance_pooling: bool = False`；每层
+    新增 `level_imp_{ell}` buffer（形状同 `level_w_{ell}`，恒定 fp32——不参与任何
+    跟激活值的 cat/matmul，只做比例计算，fp32 避免 bf16 精度模糊重要性比例）。
+    `_get_level`/`_set_level`/`_clear_level`/`_add_compact_entry`/`_binary_carry`/
+    `_flush_pairs`/`_append_level0`/`ingest_chunk` 都相应加了 `imp` 参数线程。
+  - `_flush_pairs`（真实流式路径，唯一处理原始 token 的入口）里，重要性启发式是
+    `imp_tok = k.float().norm(dim=-1)`（post-RoPE key 的 L2 范数）——不引入新的
+    可学参数，纯 k 的函数，因此训练/推理路径自动一致。
+- `litgpt/model.py`：`build_log_kv_cache`/`set_log_kv_cache`/`enable_log_kv_training`
+  三处新增 `importance_pooling` 参数，一路透传到 `LogStructuredKVCache` 构造。
+- `demo.py`/`eval.py`：新增 `log_kv_importance_pooling`（`bool`，两边都走
+  `run_cli()` 的签名自省，`--log_kv_importance_pooling true` 自动生效，不需要
+  手写 argparse），`demo.py` 的 `_run_eval()` 辅助函数也透传这个参数，保证
+  `demo.py` 驱动的训练+eval 一条龙天然用同一个开关值。
+- `eval.sh`/`majob.sh`：**没有改**——参照 `log_kv_dense_mode`（同类"还在验证阶段"
+  的 bool 开关）的先例，它也没有进核心 `LOG_KV_ARGS` 列表，而是走
+  `DIAG_ARGS="--log_kv_dense_mode true" bash eval.sh ...` 这种 opt-in 覆盖，本次
+  新开关照此惯例处理，见 8.5 的调用命令。
+
+**验证方式**：本次会话只有本地 Mac + CPU 环境，没有 GPU，无法跑真实 checkpoint。
+已做的验证：①手推数学——2 点加权协方差闭式解、n 点加权协方差的 `sqrt(p_i)`
+推导，并用单测核对（含"均匀重要性退化成原无权公式"的一致性检验，规避了"rank-1
+截断对 n>2 不精确"这个陷阱——n>2 时不能拿真实协方差去核对 rank-1 truncation
+的输出，只能核对"均匀 imp 退化成 imp=None 路径"这种自洽性）；②
+`tests/test_log_kv_cache.py` 新增 `TestImportancePooling`（11 个用例：加权公式的
+闭式解核对、`compact()`/`_compact_tokens()` 的 imp 驱动 alpha 而 w 不受影响、
+`ingest_chunk`/`add_recent` 端到端流式路径含多级 carry），config `mineru`
+conda env（`/Users/hourunli/anaconda3/envs/mineru`，Python 3.12）跑
+`test_log_kv_cache.py` 全量 124/124 通过（113 条既有 + 11 条新增，逐条比对过
+关闭改动前后 baseline 是 113 条不变）；③`git stash` 到干净版本重跑同一测试命令，
+确认后 14 个 collection error（`litdata`/`jsonargparse` 缺失、pytest marker 未
+注册）和这唯一的 1 条 warning（`requests`/`urllib3` 版本不匹配）都是环境本身
+就有的、跟这次改动无关。**没有做的**：真实 checkpoint 上的 niah/LongBench 数字，
+需要 GPU 环境接着跑。
+
+**下一步（在有 GPU 的环境接着做）**：先跑 8.5 的纯 eval-time 决定性实验（不需要
+重新训练，因为这是确定性启发式，直接套在已有的 warmup CPT checkpoint 上）——
+如果 niah/LongBench 相对 vanilla（0.0827/0.1716/0.1918）有实质提升，说明这个方向
+有戏，再考虑做一版可学权重（比如把 L2 范数换成一个小 MLP 门控）配合 CPT 训练；
+如果没有提升，说明"稀释"不是（或不是主要）瓶颈，改评估 6.3 的按 width 差异化
+scale 或阶段 3 提到的自适应槽宽/预算分配方向。
+
+**数学推导备忘（2 点加权协方差精确闭式解）**：设 `m = p_a k_a + p_b k_b`
+（`p_a+p_b=1`），则 `k_a - m = p_b(k_a-k_b)`、`k_b - m = -p_a(k_a-k_b)`，代入
+`Sigma = p_a(k_a-m)(k_a-m)^T + p_b(k_b-m)(k_b-m)^T` 化简得
+`Sigma = p_a p_b (k_a-k_b)(k_a-k_b)^T`——对任意 `p_a,p_b` 都精确 rank-1，不需要
+`_rank1_psd_from_factors` 的迭代近似（只是复用同一个函数走统一代码路径，2 点输入
+时该函数本身也精确收敛，见 `_dominant_eigvec_small` 的幂迭代对已经精确 rank-1 的
+输入零误差这一事实——已在 6.7/6.8 NMS 那次会话验证过同一性质）。`p_a=p_b=0.5`
+时代入得 `0.25·(k_a-k_b)(k_a-k_b)^T`，正是原来的无权公式。
+
 ## 7. 有用的坑 / 经验教训（给下次接续的自己看）
 
 - `eval.sh` vs 直接 `torchrun --config <yaml> eval.py`：**语义不同**。`eval.sh` 会把
@@ -1022,3 +1179,25 @@ python unused/pin_collapse_vs_hit.py \
     --pin-diag pin_diag_..._TS.json \
     --out-csv joined.csv
 ```
+
+### 8.5 重要性加权池化决定性实验（2026-08-13 新增，见 6.14）
+
+纯 eval-time 开关，不需要重新训练（确定性启发式，`--config` 后面覆盖同一份
+`arc_warmup.yaml` 加载的 checkpoint 权重不变）。跟 `log_kv_dense_mode` 一样走
+`DIAG_ARGS` opt-in，没有进 `eval.sh`/`majob.sh` 的核心参数列表：
+
+```bash
+DIAG_ARGS="--log_kv_importance_pooling true" \
+    bash eval.sh exp/qwen1.7b-32k/arc_warmup.yaml none niah_single_1,niah_single_2,niah_single_3
+```
+
+对比对象是 0 节表格/6.1 表格里的"+2nd order, no pins"一行（同一 checkpoint，唯一
+区别是加不加这个开关）：
+
+| 配置 | LongBench | LongBench_e | niah |
+|---|---:|---:|---:|
+| vanilla（无 pin，均匀池化，现有基线）| 0.1716 | 0.1918 | 0.0827 |
+| + importance_pooling（本次待验证）| ? | ? | ? |
+
+三项都明显优于 0.1716/0.1918/0.0827 → 方向成立，值得做可学权重版本；没有实质提升
+→ 说明稀释不是主要瓶颈，回到 6.3/阶段 3 提到的槽宽或自适应预算方向。
