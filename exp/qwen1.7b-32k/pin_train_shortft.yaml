@@ -15,9 +15,12 @@ micro_batch_size: 1
 max_steps: 1700
 warmup_steps: 0
 # 续训一个已经收敛的 checkpoint，用比初始 CPT 更低的 LR，避免破坏已经学到的
-# 32K 长上下文能力，只做小幅分布适配。可按效果再调。
-learning_rate: 1e-5
-min_lr: 1e-5
+# 32K 长上下文能力，只做小幅分布适配。2026-08-12：loss 波动较大（0.3~2.4），
+# 从 1e-5 降到 5e-6 留更多安全余量——注意这不会让每一步的 loss 数值本身变
+# 平滑（那取决于这一步的 batch 和有没有触发 pin 注入，跟 LR 无关），但能降低
+# 单个噪声大的 step 把权重带偏、造成级联不稳定的风险。
+learning_rate: 5e-6
+min_lr: 5e-6
 weight_decay: 0.1
 num_devices: 8
 
@@ -57,8 +60,12 @@ log_kv_pin_min_distance: 64
 # - pin_train_max: 目标值，对齐上面的 log_kv_pin_size=256
 # - pin_train_prob: 每个 chunk 边界有 50% 概率触发注入，另外一半保持不注入，
 #   保护模型在没有 pin 时的现有能力不被这次续训破坏
-# - pin_train_warmup_steps: max_steps 的一半，注入强度从 0 线性爬坡上去，
-#   避免续训一开始就骤然引入新分布造成不稳定
+# - pin_train_warmup_steps: 注入强度从 0 线性爬坡到满值，避免骤然引入新分布
+#   造成不稳定。这个值是绝对 global_step（不是相对续训起点的步数偏移）——
+#   get_log_kv_pin_train_schedule 用 global_step 直接算 ratio，auto_resume
+#   修好后 global_step 从 1400 起算，写 150 会导致爬坡在续训第一步就已经
+#   钳到满值（1400/150≫1），等于没有爬坡。2026-08-12 改成 1400+150=1550，
+#   让爬坡窗口正确对齐这次续训的实际起点（1400→1550 爬坡，1550→1700 满强度）。
 log_kv_pin_train_max: 256
 log_kv_pin_train_prob: 0.5
-log_kv_pin_train_warmup_steps: 150
+log_kv_pin_train_warmup_steps: 1550

@@ -844,8 +844,19 @@ CPT checkpoint 纯权重续训（不用 `auto_resume`，优化器/step 全部重
 1700 步；②`majob.sh` 的跳过训练判断原来只看 `checkpoint_exists`（裸文件存在性），
 不看 `global_step` 有没有达到新的 `max_steps`，导致 `save_path` 下已有 step 1400
 的 checkpoint 时会误判成"训练完成"直接跳到评测——已改成叠加 `checkpoint_finished`
-判断。两处都改完了，**具体这次续训跑到第几步、什么时候能跑完，下次接续时需要向
-用户确认**，本文档写下时还不知道最终会在哪一步停。
+判断。两处都改完了。**2026-08-12 又发现并修了第三个 bug**：`auto_resume` 修好之后，
+用户反馈 loss 波动很大（0.3~2.4）——根因是 `get_log_kv_pin_train_schedule` 的
+爬坡比例用的是绝对 `global_step` 算 `ratio = current_step / warmup_steps`，而
+`log_kv_pin_train_warmup_steps` 当时写的是 150（按"从 0 开始的续训"设计的）。
+`auto_resume` 修好后 `global_step` 正确地从 1400 起算，`1400/150 ≫ 1`，爬坡比例
+从续训第一步起就被钳到 1.0——pin 注入从第一步就是满强度（256/0.5），完全没有
+按设计意图爬坡，YAML 里"避免骤然引入新分布造成不稳定"这条注释写的初衷因此落空。
+已改成 `log_kv_pin_train_warmup_steps: 1550`（= 1400 + 150，把爬坡窗口平移到
+从实际续训起点开始算）。同时把 `learning_rate`/`min_lr` 从 `1e-5` 降到 `5e-6`，
+给这次续训多留一点安全余量（注意 LR 调低不会让每一步的 loss 数值本身更平滑——
+那取决于这一步的 batch 和有没有触发 pin 注入——只是降低单个噪声大的 step 把
+权重带偏、造成级联不稳定的风险）。**具体这次续训跑到第几步、什么时候能跑完、
+loss 波动有没有收敛，下次接续时需要向用户确认**，本文档写下时还不知道最终结果。
 
 **跑完之后要做的唯一一件事**：用同一套 NMS pin 配置（256/64 或与 6.9/6.11 一致的
 具体 min_distance）重新跑 LongBench/LongBench_e/niah，对比 vanilla
