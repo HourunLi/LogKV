@@ -29,7 +29,8 @@ log_kv_train_block: 16384
 log_kv_prefill_block: 1024
 log_kv_second_order_scale: 0.2
 log_kv_second_order_warmup_steps: 100
-log_kv_pin_size: 256
-log_kv_pin_obs_window: 64
-log_kv_pin_min_distance: 64
+# pin 调查已终止（见 CLAUDE.md 6.4）：四个独立方向依次验证均为负，不再使用。
+# 这个字段只影响本 yaml 触发的 eval 步骤（训练完全不受影响），默认关掉，
+# 避免任何用这份 yaml 跑 eval 的命令意外带上已经证明有害的 pin。
+log_kv_pin_size: 0
 
