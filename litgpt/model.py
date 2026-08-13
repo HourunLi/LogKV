@@ -360,6 +360,7 @@ class GPT(nn.Module):
         pin_obs_window: int = 64,
         pin_min_distance: int = 0,
         second_order_scale: float = 1.0,
+        importance_pooling: bool = False,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -392,6 +393,11 @@ class GPT(nn.Module):
             second_order_scale: Coupled scale for the persisted Sigma/Gamma
                 corrections. 0.0 reproduces the old first-order LogKV path;
                 CPT can warm this from 0.0 to 1.0.
+            importance_pooling: If True, level merges are weighted by a
+                heuristic per-token importance mass (post-RoPE key L2 norm)
+                instead of a uniform mean. Independent of the token-count
+                weight that drives the ``log(w)`` mass bias. See
+                ``LogStructuredKVCache``.
         """
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
@@ -406,6 +412,7 @@ class GPT(nn.Module):
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size, pin_size=pin_size,
+                importance_pooling=importance_pooling,
             )
             block.attn._log_kv_pending = None
             block.attn._log_kv_pin_indices = None
@@ -474,6 +481,7 @@ class GPT(nn.Module):
         pin_size: int = 0,
         pin_train_max: int = 0,
         pin_train_prob: float = 0.0,
+        importance_pooling: bool = False,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -496,6 +504,11 @@ class GPT(nn.Module):
         and ``pin_train_prob`` control whether a forward pass injects random
         historical exact K/V pins into that buffer; defaults keep the old
         pin-free training objective.
+
+        ``importance_pooling`` is a deterministic function of k (no new
+        learnable params), computed identically in training and inference, so
+        turning it on here keeps train/eval consistent automatically -- see
+        ``set_log_kv_cache``.
         """
         pin_size = int(pin_size)
         pin_train_max = int(pin_train_max)
@@ -521,6 +534,7 @@ class GPT(nn.Module):
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size, pin_size=pin_size,
+                importance_pooling=importance_pooling,
             )
             block.attn.training_log_kv = True
             block.attn._log_kv_pending = None
@@ -1482,6 +1496,7 @@ class CausalSelfAttention(nn.Module):
         B: int = 512,
         recent_size: int = 1024,
         pin_size: int = 0,
+        importance_pooling: bool = False,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1523,6 +1538,7 @@ class CausalSelfAttention(nn.Module):
             k_shape, v_shape,
             B=B, recent_size=recent_size, pin_size=pin_size,
             device=device, dtype=dtype,
+            importance_pooling=importance_pooling,
         )
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:

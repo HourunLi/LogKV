@@ -531,6 +531,11 @@ def main(
     # log_kv_second_order_warmup_steps=0 to start at the target value.
     log_kv_second_order_scale: float = 1.0,
     log_kv_second_order_warmup_steps: int = 10,
+    # Importance-weighted level pooling (training AND eval; a deterministic
+    # function of k, no new learnable params, so both paths stay consistent
+    # automatically). Independent of the token-count weight driving the
+    # log(w) mass bias. See LogStructuredKVCache.
+    log_kv_importance_pooling: bool = False,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -604,6 +609,7 @@ def main(
     log_kv_second_order_warmup_steps = _o(
         "log_kv_second_order_warmup_steps", log_kv_second_order_warmup_steps
     )
+    log_kv_importance_pooling = bool(_o("log_kv_importance_pooling", log_kv_importance_pooling))
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
@@ -759,6 +765,7 @@ def main(
             log_kv_pin_obs_window=log_kv_pin_obs_window,
             log_kv_pin_min_distance=log_kv_pin_min_distance,
             log_kv_second_order_scale=log_kv_second_order_scale,
+            log_kv_importance_pooling=log_kv_importance_pooling,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -882,6 +889,7 @@ def main(
         pin_size=log_kv_pin_train_max,
         pin_train_max=initial_pin_train_max,
         pin_train_prob=initial_pin_train_prob,
+        importance_pooling=log_kv_importance_pooling,
     )
     fabric.print(
         f"logKV training ENABLED: B={log_kv_B}, "
@@ -894,7 +902,8 @@ def main(
         f"(target_max={log_kv_pin_train_max}, "
         f"target_prob={log_kv_pin_train_prob:.3f}, "
         f"warmup_steps={log_kv_pin_train_warmup_steps}), "
-        f"blocks/seq={math.ceil(context_length / max(log_kv_train_block, 1))}"
+        f"blocks/seq={math.ceil(context_length / max(log_kv_train_block, 1))}, "
+        f"importance_pooling={log_kv_importance_pooling}"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))

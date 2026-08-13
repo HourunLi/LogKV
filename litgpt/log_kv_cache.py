@@ -203,14 +203,25 @@ def _pair_rank1_stats(
     kb: torch.Tensor,
     va: torch.Tensor,
     vb: torch.Tensor,
+    frac_a: torch.Tensor | float = 0.5,
+    frac_b: torch.Tensor | float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact rank-1 covariance / cross-covariance stats for a 2-token slot."""
+    """Exact rank-1 covariance / cross-covariance stats for a 2-token slot.
+
+    ``frac_a``/``frac_b`` are the pooling weights used for the slot mean
+    (default 0.5/0.5, i.e. an unweighted pair). For a 2-point set the
+    weighted covariance ``p_a(ka-m)(ka-m)^T + p_b(kb-m)(kb-m)^T`` collapses
+    to exactly ``p_a*p_b * dk dk^T`` (``m = p_a*ka + p_b*kb``, ``dk = ka-kb``)
+    regardless of ``p_a``/``p_b`` — rank-1 with no truncation error, same as
+    the unweighted case (which is this formula at ``p_a=p_b=0.5``).
+    """
     dk = ka - kb
     dv = va - vb
     sigma_u, dk_norm = _normalize(dk)
     gamma_b, dv_norm = _normalize(dv)
-    sigma2 = dk_norm.square() * 0.25
-    gamma = dk_norm * dv_norm * 0.25
+    cross = frac_a * frac_b
+    sigma2 = dk_norm.square() * cross
+    gamma = dk_norm * dv_norm * cross
     gamma_a = sigma_u
     return sigma_u, sigma2, gamma_a, gamma_b, gamma
 
@@ -227,6 +238,10 @@ class LogStructuredKVCache(nn.Module):
         B: slots per level (default 512)
         recent_size: sliding window size (default 0 = 2)
         device / dtype: torch device / dtype
+        importance_pooling: if True, merges are weighted by a per-token
+            importance mass (tracked separately from the token-count weight
+            ``w``, which keeps driving the ``log(w)`` mass bias unchanged)
+            instead of a uniform mean. See ``compact()``/``_compact_tokens()``.
     """
 
     def __init__(
@@ -238,6 +253,7 @@ class LogStructuredKVCache(nn.Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
         pin_size: int = 0,
+        importance_pooling: bool = False,
     ) -> None:
         super().__init__()
 
@@ -254,6 +270,7 @@ class LogStructuredKVCache(nn.Module):
         # Explicit raise (not assert): must survive `python -O`.
         if self.recent_size < 2:
             raise ValueError(f"recent_size ({self.recent_size}) must be >= 2")
+        self.importance_pooling = bool(importance_pooling)
 
         denom = B * 2
         # +1 for the write level (level 0). The formula gives the number of carry
@@ -294,6 +311,18 @@ class LogStructuredKVCache(nn.Module):
             self.register_buffer(
                 f"level_w_{ell}",
                 torch.zeros(batch_size, n_groups, B, device=device, dtype=dtype),
+                persistent=False,
+            )
+            # Cumulative importance mass per slot (only meaningful when
+            # ``importance_pooling`` is True; stays zero and unused
+            # otherwise). Always fp32, independent of the activation dtype:
+            # it only ever feeds merge-fraction ratios, never a matmul with
+            # k/v, so it does not need to track the activation dtype the way
+            # ``level_w_{ell}`` does, and fp32 avoids precision loss on
+            # importance ratios that bf16's ~3 decimal digits could blur.
+            self.register_buffer(
+                f"level_imp_{ell}",
+                torch.zeros(batch_size, n_groups, B, device=device, dtype=torch.float32),
                 persistent=False,
             )
             # Rank-1 key covariance:
@@ -464,6 +493,9 @@ class LogStructuredKVCache(nn.Module):
             getattr(self, f"level_gamma_{ell}"),
         )
 
+    def _get_level_imp(self, ell: int) -> torch.Tensor:
+        return getattr(self, f"level_imp_{ell}")
+
     def _set_level(
         self,
         ell: int,
@@ -475,6 +507,7 @@ class LogStructuredKVCache(nn.Module):
         gamma_a: torch.Tensor | None = None,
         gamma_b: torch.Tensor | None = None,
         gamma: torch.Tensor | None = None,
+        imp: torch.Tensor | None = None,
     ) -> None:
         getattr(self, f"level_k_{ell}").copy_(k)
         getattr(self, f"level_v_{ell}").copy_(v)
@@ -491,6 +524,10 @@ class LogStructuredKVCache(nn.Module):
             getattr(self, f"level_gamma_a_{ell}").copy_(gamma_a)
             getattr(self, f"level_gamma_b_{ell}").copy_(gamma_b)
             getattr(self, f"level_gamma_{ell}").copy_(gamma)
+        if imp is None:
+            getattr(self, f"level_imp_{ell}").zero_()
+        else:
+            getattr(self, f"level_imp_{ell}").copy_(imp)
         self.level_count[ell] = self.B
         self._counts[ell] = self.B
 
@@ -498,6 +535,7 @@ class LogStructuredKVCache(nn.Module):
         getattr(self, f"level_k_{ell}").zero_()
         getattr(self, f"level_v_{ell}").zero_()
         getattr(self, f"level_w_{ell}").zero_()
+        getattr(self, f"level_imp_{ell}").zero_()
         getattr(self, f"level_sigma_u_{ell}").zero_()
         getattr(self, f"level_sigma2_{ell}").zero_()
         getattr(self, f"level_gamma_a_{ell}").zero_()
@@ -515,6 +553,7 @@ class LogStructuredKVCache(nn.Module):
         k: torch.Tensor,  # (B, G, n, k_dim) full post-RoPE keys
         v: torch.Tensor,  # (B, G, n, v_dim)
         with_stats: bool = False,
+        imp: torch.Tensor | None = None,  # (B, G, n) optional per-token importance weights
     ) -> tuple[torch.Tensor, ...]:
         """Compress n tokens into a single compact entry via mean pooling.
 
@@ -525,10 +564,26 @@ class LogStructuredKVCache(nn.Module):
         Returns k_entry (B,G,1,k_dim), v_entry (B,G,1,v_dim), w_entry (B,G,1).
         With ``with_stats=True`` also returns rank-1 approximations to the
         within-slot key covariance and value-key cross covariance.
+
+        ``imp``, when given, replaces the uniform 1/n pooling weight with a
+        per-token importance-weighted mean (need not be pre-normalized); the
+        raw sum of ``imp`` is returned as one extra trailing fp32 tensor (the
+        slot's cumulative importance mass — independent of ``w_entry``, the
+        token count, which is always uniform regardless of ``imp``). Omitting
+        ``imp`` reproduces the exact prior uniform-mean behavior and return
+        shape.
         """
         n = k.size(2)
-        k_entry = k.mean(dim=2, keepdim=True)
-        v_entry = v.mean(dim=2, keepdim=True)
+        has_imp = imp is not None
+        if has_imp:
+            imp = imp.float()
+            imp_entry = imp.sum(dim=2, keepdim=True)  # (B, G, 1), fp32
+            p = (imp / imp_entry.clamp_min(_RANK1_EPS)).unsqueeze(-1)  # (B, G, n, 1)
+            k_entry = (p * k.float()).sum(dim=2, keepdim=True).to(k.dtype)
+            v_entry = (p * v.float()).sum(dim=2, keepdim=True).to(v.dtype)
+        else:
+            k_entry = k.mean(dim=2, keepdim=True)
+            v_entry = v.mean(dim=2, keepdim=True)
         w_entry = torch.full(
             (k.size(0), k.size(1), 1),
             float(n),
@@ -536,14 +591,19 @@ class LogStructuredKVCache(nn.Module):
             dtype=k.dtype,
         )
         if not with_stats:
-            return k_entry, v_entry, w_entry
+            return (k_entry, v_entry, w_entry) if not has_imp else (k_entry, v_entry, w_entry, imp_entry)
 
-        inv_sqrt_n = float(n) ** -0.5
-        k_centered = (k - k_entry).float() * inv_sqrt_n
-        v_centered = (v - v_entry).float() * inv_sqrt_n
+        if has_imp:
+            sqrt_p = p.sqrt()  # (B, G, n, 1), fp32
+            k_centered = (k - k_entry).float() * sqrt_p
+            v_centered = (v - v_entry).float() * sqrt_p
+        else:
+            inv_sqrt_n = float(n) ** -0.5
+            k_centered = (k - k_entry).float() * inv_sqrt_n
+            v_centered = (v - v_entry).float() * inv_sqrt_n
         sigma_u, sigma2 = _rank1_psd_from_factors(k_centered)
         gamma_b, gamma_a, gamma = _rank1_cross_from_factors(v_centered, k_centered)
-        return (
+        stats_out = (
             k_entry,
             v_entry,
             w_entry,
@@ -553,6 +613,7 @@ class LogStructuredKVCache(nn.Module):
             gamma_b.unsqueeze(2).to(k.dtype),
             gamma.unsqueeze(2).to(k.dtype),
         )
+        return stats_out if not has_imp else stats_out + (imp_entry,)
 
     # ------------------------------------------------------------------
     # Compact operation: merge two B-slot blocks -> one B-slot block (adjacent pairs)
@@ -572,6 +633,8 @@ class LogStructuredKVCache(nn.Module):
         gamma_a2: torch.Tensor | None = None,
         gamma_b2: torch.Tensor | None = None,
         gamma2: torch.Tensor | None = None,
+        imp1: torch.Tensor | None = None,
+        imp2: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Merge two B-slot blocks into one B-slot block.
 
@@ -586,6 +649,14 @@ class LogStructuredKVCache(nn.Module):
         the iterative small-matrix routines above (near-optimal, not exact — see
         their docstrings). Without stats, this preserves the old three-tensor
         return for tests and diagnostic callers.
+
+        ``imp1``/``imp2`` are optional per-slot importance-mass tensors (same
+        shape as ``w1``/``w2``), independent of the token-count weights: when
+        given, they (not ``w1``/``w2``) drive the pooling ``alpha`` and the
+        Chan-merge fractions, and their sum is returned as one extra trailing
+        tensor. ``w_total`` (token count, used only for the ``log(w)`` mass
+        bias) is always computed from ``w1``/``w2`` regardless. Omitting them
+        reproduces the exact prior count-weighted behavior and return shape.
         """
         k_cat = torch.cat([k1, k2], dim=-2)  # (B, G, 2B, D)
         v_cat = torch.cat([v1, v2], dim=-2)
@@ -598,13 +669,21 @@ class LogStructuredKVCache(nn.Module):
         wa = w_cat[..., 0::2]
         wb = w_cat[..., 1::2]
 
-        w_total = wa + wb  # (B, G, B)
-        alpha = (wa / w_total.clamp(min=1e-8)).unsqueeze(-1)  # (B, G, B, 1)
+        w_total = wa + wb  # (B, G, B) -- token count, always count-based
+
+        has_imp = imp1 is not None
+        if has_imp:
+            imp_cat = torch.cat([imp1, imp2], dim=-1)
+            impa, impb = imp_cat[..., 0::2], imp_cat[..., 1::2]
+            imp_total = impa + impb
+            alpha = (impa / imp_total.clamp(min=1e-8)).unsqueeze(-1)
+        else:
+            alpha = (wa / w_total.clamp(min=1e-8)).unsqueeze(-1)  # (B, G, B, 1)
 
         k_out = alpha * ka + (1 - alpha) * kb
         v_out = alpha * va + (1 - alpha) * vb
         if sigma_u1 is None:
-            return k_out, v_out, w_total
+            return (k_out, v_out, w_total) if not has_imp else (k_out, v_out, w_total, imp_total)
 
         if any(x is None for x in (
             sigma2_1, gamma_a1, gamma_b1, gamma1,
@@ -624,8 +703,12 @@ class LogStructuredKVCache(nn.Module):
         gba, gbb = gb_cat[..., 0::2, :], gb_cat[..., 1::2, :]
         gma, gmb = gm_cat[..., 0::2], gm_cat[..., 1::2]
 
-        frac_a = wa.float() / w_total.float().clamp_min(1e-8)
-        frac_b = wb.float() / w_total.float().clamp_min(1e-8)
+        if has_imp:
+            frac_a = impa.float() / imp_total.float().clamp_min(1e-8)
+            frac_b = impb.float() / imp_total.float().clamp_min(1e-8)
+        else:
+            frac_a = wa.float() / w_total.float().clamp_min(1e-8)
+            frac_b = wb.float() / w_total.float().clamp_min(1e-8)
         cross_frac = frac_a * frac_b
 
         dk = (ka - kb).float()
@@ -657,7 +740,7 @@ class LogStructuredKVCache(nn.Module):
             dim=-2,
         )
         gamma_b, gamma_a, gamma = _rank1_cross_from_factors(left_factors, right_factors)
-        return (
+        stats_out = (
             k_out,
             v_out,
             w_total,
@@ -667,6 +750,7 @@ class LogStructuredKVCache(nn.Module):
             gamma_b.to(v_out.dtype),
             gamma.to(k_out.dtype),
         )
+        return stats_out if not has_imp else stats_out + (imp_total,)
 
     # ------------------------------------------------------------------
     # Add compact entry to level 0; carry to level 1+ when full
@@ -682,6 +766,7 @@ class LogStructuredKVCache(nn.Module):
         gamma_a_entry: torch.Tensor | None = None,
         gamma_b_entry: torch.Tensor | None = None,
         gamma_entry: torch.Tensor | None = None,
+        imp_entry: torch.Tensor | None = None,
     ) -> None:
         """Add one compact entry to level 0. If level 0 is full, binary carry to levels 1+."""
         idx = self._counts[0]
@@ -702,19 +787,25 @@ class LogStructuredKVCache(nn.Module):
             getattr(self, "level_gamma_a_0")[:, :, idx, :] = gamma_a_entry
             getattr(self, "level_gamma_b_0")[:, :, idx, :] = gamma_b_entry
             getattr(self, "level_gamma_0")[:, :, idx] = gamma_entry
+        if imp_entry is None:
+            getattr(self, "level_imp_0")[:, :, idx].zero_()
+        else:
+            getattr(self, "level_imp_0")[:, :, idx] = imp_entry
         self.level_count[0] = idx + 1
         self._counts[0] = idx + 1
 
         if self._counts[0] >= self.B:
             lk, lv, lw = self._get_level(0)
+            limp = self._get_level_imp(0).clone() if imp_entry is not None else None
             if self.second_order:
                 lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
                 self._binary_carry(
                     lk.clone(), lv.clone(), lw.clone(),
                     lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
+                    block_imp=limp,
                 )
             else:
-                self._binary_carry(lk.clone(), lv.clone(), lw.clone())
+                self._binary_carry(lk.clone(), lv.clone(), lw.clone(), block_imp=limp)
             self._clear_level(0)
 
     # ------------------------------------------------------------------
@@ -731,34 +822,61 @@ class LogStructuredKVCache(nn.Module):
         block_gamma_a: torch.Tensor | None = None,
         block_gamma_b: torch.Tensor | None = None,
         block_gamma: torch.Tensor | None = None,
+        block_imp: torch.Tensor | None = None,
     ) -> None:
         new_k, new_v, new_w = block_k, block_v, block_w
         new_su, new_s2 = block_sigma_u, block_sigma2
         new_ga, new_gb, new_gm = block_gamma_a, block_gamma_b, block_gamma
+        new_imp = block_imp
         for ell in range(1, self.max_levels):
             if self._counts[ell] == 0:
-                self._set_level(ell, new_k, new_v, new_w, new_su, new_s2, new_ga, new_gb, new_gm)
+                self._set_level(ell, new_k, new_v, new_w, new_su, new_s2, new_ga, new_gb, new_gm, imp=new_imp)
                 return
             ek, ev, ew = self._get_level(ell)
+            eimp = self._get_level_imp(ell) if new_imp is not None else None
             if new_su is None:
-                new_k, new_v, new_w = self.compact(ek, ev, ew, new_k, new_v, new_w)
+                if new_imp is None:
+                    new_k, new_v, new_w = self.compact(ek, ev, ew, new_k, new_v, new_w)
+                else:
+                    new_k, new_v, new_w, new_imp = self.compact(
+                        ek, ev, ew, new_k, new_v, new_w, imp1=eimp, imp2=new_imp,
+                    )
             else:
                 esu, es2, ega, egb, egm = self._get_level_stats(ell)
-                (
-                    new_k,
-                    new_v,
-                    new_w,
-                    new_su,
-                    new_s2,
-                    new_ga,
-                    new_gb,
-                    new_gm,
-                ) = self.compact(
-                    ek, ev, ew,
-                    new_k, new_v, new_w,
-                    esu, es2, ega, egb, egm,
-                    new_su, new_s2, new_ga, new_gb, new_gm,
-                )
+                if new_imp is None:
+                    (
+                        new_k,
+                        new_v,
+                        new_w,
+                        new_su,
+                        new_s2,
+                        new_ga,
+                        new_gb,
+                        new_gm,
+                    ) = self.compact(
+                        ek, ev, ew,
+                        new_k, new_v, new_w,
+                        esu, es2, ega, egb, egm,
+                        new_su, new_s2, new_ga, new_gb, new_gm,
+                    )
+                else:
+                    (
+                        new_k,
+                        new_v,
+                        new_w,
+                        new_su,
+                        new_s2,
+                        new_ga,
+                        new_gb,
+                        new_gm,
+                        new_imp,
+                    ) = self.compact(
+                        ek, ev, ew,
+                        new_k, new_v, new_w,
+                        esu, es2, ega, egb, egm,
+                        new_su, new_s2, new_ga, new_gb, new_gm,
+                        imp1=eimp, imp2=new_imp,
+                    )
             self._clear_level(ell)
         raise RuntimeError(
             f"LogStructuredKVCache: binary carry overflow! "
@@ -809,8 +927,23 @@ class LogStructuredKVCache(nn.Module):
         # size-2 dim in the storage dtype), just for all f pairs at once.
         rk_pairs = rk.reshape(B_, G_, f, 2, kd)
         rv_pairs = rv.reshape(B_, G_, f, 2, vd)
-        pk = rk_pairs.mean(dim=3)
-        pv = rv_pairs.mean(dim=3)
+        if self.importance_pooling:
+            # Heuristic per-token importance: post-RoPE key L2 norm (no new
+            # learnable params; a pure function of already-detached k, so no
+            # backward-path change is needed -- see module docstring).
+            imp_tok = rk.float().norm(dim=-1)  # (B, G, flush_len)
+            imp_pairs = imp_tok.reshape(B_, G_, f, 2)
+            imp_a, imp_b = imp_pairs[..., 0], imp_pairs[..., 1]
+            pimp = imp_a + imp_b  # (B, G, f), raw (unclamped) cumulative mass
+            frac_a = (imp_a / pimp.clamp_min(_RANK1_EPS)).unsqueeze(-1)
+            frac_b = 1.0 - frac_a
+            pk = frac_a * rk_pairs[:, :, :, 0, :] + frac_b * rk_pairs[:, :, :, 1, :]
+            pv = frac_a * rv_pairs[:, :, :, 0, :] + frac_b * rv_pairs[:, :, :, 1, :]
+        else:
+            pk = rk_pairs.mean(dim=3)
+            pv = rv_pairs.mean(dim=3)
+            pimp = None
+            frac_a = frac_b = 0.5
         pw = torch.full((B_, G_, f), 2.0, device=rk.device, dtype=rk.dtype)
         if self.second_order:
             psu, ps2, pga, pgb, pgm = _pair_rank1_stats(
@@ -818,10 +951,12 @@ class LogStructuredKVCache(nn.Module):
                 rk_pairs[:, :, :, 1, :],
                 rv_pairs[:, :, :, 0, :],
                 rv_pairs[:, :, :, 1, :],
+                frac_a.squeeze(-1) if self.importance_pooling else frac_a,
+                frac_b.squeeze(-1) if self.importance_pooling else frac_b,
             )
-            self._append_level0(pk, pv, pw, psu, ps2, pga, pgb, pgm)
+            self._append_level0(pk, pv, pw, psu, ps2, pga, pgb, pgm, pimp=pimp)
         else:
-            self._append_level0(pk, pv, pw)
+            self._append_level0(pk, pv, pw, pimp=pimp)
 
         # Shift the survivors to the front. Source/destination overlap in the
         # same storage; PyTorch copy_ with overlapping src/dst is undefined (may
@@ -844,6 +979,7 @@ class LogStructuredKVCache(nn.Module):
         pga: torch.Tensor | None = None,
         pgb: torch.Tensor | None = None,
         pgm: torch.Tensor | None = None,
+        pimp: torch.Tensor | None = None,
     ) -> None:
         """Append f compact entries to level 0 in order, carrying when it fills.
 
@@ -873,19 +1009,25 @@ class LogStructuredKVCache(nn.Module):
                 getattr(self, "level_gamma_a_0")[:, :, idx:idx + take, :] = pga[:, :, off:off + take, :]
                 getattr(self, "level_gamma_b_0")[:, :, idx:idx + take, :] = pgb[:, :, off:off + take, :]
                 getattr(self, "level_gamma_0")[:, :, idx:idx + take] = pgm[:, :, off:off + take]
+            if pimp is None:
+                getattr(self, "level_imp_0")[:, :, idx:idx + take].zero_()
+            else:
+                getattr(self, "level_imp_0")[:, :, idx:idx + take] = pimp[:, :, off:off + take]
             self.level_count[0] = idx + take
             self._counts[0] = idx + take
             off += take
             if self._counts[0] >= self.B:
                 lk, lv, lw = self._get_level(0)
+                limp = self._get_level_imp(0).clone() if pimp is not None else None
                 if self.second_order:
                     lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
                     self._binary_carry(
                         lk.clone(), lv.clone(), lw.clone(),
                         lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
+                        block_imp=limp,
                     )
                 else:
-                    self._binary_carry(lk.clone(), lv.clone(), lw.clone())
+                    self._binary_carry(lk.clone(), lv.clone(), lw.clone(), block_imp=limp)
                 self._clear_level(0)
 
     # ------------------------------------------------------------------
@@ -899,19 +1041,32 @@ class LogStructuredKVCache(nn.Module):
     ) -> None:
         """Compact a chunk of full keys + values straight into level 0.
         Bypasses the buffer. Intended for testing.
+
+        When ``self.importance_pooling`` is set, uses the same heuristic
+        per-token importance (post-RoPE key L2 norm) as the real streaming
+        path (``_flush_pairs``) -- note this pools the whole chunk in one
+        flat weighted average, not the real path's pairwise 2:1 hierarchy,
+        so for ``t_chunk > 2`` this is a testing convenience, not a
+        trajectory-identical stand-in (same caveat already applies to the
+        unweighted default).
         """
         self._count_tokens(k.size(2))
+        imp = k.float().norm(dim=-1) if self.importance_pooling else None
 
-        (
-            k_entry,
-            v_entry,
-            w_entry,
-            sigma_u_entry,
-            sigma2_entry,
-            gamma_a_entry,
-            gamma_b_entry,
-            gamma_entry,
-        ) = self._compact_tokens(k, v, with_stats=True)
+        entries = self._compact_tokens(k, v, with_stats=True, imp=imp)
+        if self.importance_pooling:
+            (
+                k_entry, v_entry, w_entry,
+                sigma_u_entry, sigma2_entry, gamma_a_entry, gamma_b_entry, gamma_entry,
+                imp_entry,
+            ) = entries
+            imp_entry = imp_entry.squeeze(2)
+        else:
+            (
+                k_entry, v_entry, w_entry,
+                sigma_u_entry, sigma2_entry, gamma_a_entry, gamma_b_entry, gamma_entry,
+            ) = entries
+            imp_entry = None
         k_entry = k_entry.squeeze(2)
         v_entry = v_entry.squeeze(2)
         w_entry = w_entry.squeeze(2)
@@ -924,6 +1079,7 @@ class LogStructuredKVCache(nn.Module):
         self._add_compact_entry(
             k_entry, v_entry, w_entry,
             sigma_u_entry, sigma2_entry, gamma_a_entry, gamma_b_entry, gamma_entry,
+            imp_entry=imp_entry,
         )
 
     # ------------------------------------------------------------------
@@ -1154,7 +1310,10 @@ class LogStructuredKVCache(nn.Module):
         safe to call on every forward (mirrors ``KVCache.forward``'s reconcile).
         ``level_count`` stays ``long`` and is deliberately untouched. Compaction
         weights are always powers of two (uniform 2:1), hence exact in bf16/fp16,
-        so converting ``level_w`` does not corrupt token counts.
+        so converting ``level_w`` does not corrupt token counts. ``level_imp``
+        is also deliberately untouched: it always stays fp32 (see ``__init__``)
+        since it never participates in a cat/matmul against activations, only
+        fraction computations in ``compact()``.
         """
         if self.recent_k.dtype == dtype:
             return
