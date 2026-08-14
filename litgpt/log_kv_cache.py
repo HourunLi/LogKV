@@ -242,6 +242,29 @@ class LogStructuredKVCache(nn.Module):
             importance mass (tracked separately from the token-count weight
             ``w``, which keeps driving the ``log(w)`` mass bias unchanged)
             instead of a uniform mean. See ``compact()``/``_compact_tokens()``.
+        importance_pooling_lambda: only consulted when ``importance_pooling``
+            is True. Linearly blends the importance-driven pooling share
+            toward the uniform/count-driven share — ``1.0`` (default) is pure
+            importance pooling, ``0.0`` is numerically equivalent to plain
+            uniform pooling, values in between interpolate. Added after the
+            first decisive eval (2026-08-14) showed importance pooling
+            improves ACC/LongBench but regresses niah — the working
+            hypothesis is that the pure key-norm heuristic over-weights
+            high-norm non-needle tokens, and a partial blend may recover
+            niah while keeping most of the LongBench gain (see CLAUDE.md 6.5).
+        importance_pooling_temperature: only consulted when
+            ``importance_pooling`` is True. Exponent applied to the raw
+            per-token importance heuristic (key L2 norm) before it is
+            normalized into pooling weights: ``imp = raw_imp ** temperature``.
+            ``1.0`` (default) is the original heuristic, unchanged (bit-
+            identical short-circuit). Values ``< 1.0`` compress the dynamic
+            range, damping outlier tokens (e.g. attention-sink-style high-
+            norm tokens) relative to the bulk, without fully discarding the
+            salience signal the way blending the whole distribution toward
+            uniform (``importance_pooling_lambda``) does; ``temperature -> 0``
+            approaches uniform in the limit, ``> 1.0`` sharpens further.
+            Orthogonal to ``importance_pooling_lambda`` — both may be set at
+            once (temperature reshapes first, lambda blends the result).
     """
 
     def __init__(
@@ -254,6 +277,8 @@ class LogStructuredKVCache(nn.Module):
         dtype: torch.dtype | None = None,
         pin_size: int = 0,
         importance_pooling: bool = False,
+        importance_pooling_lambda: float = 1.0,
+        importance_pooling_temperature: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -271,6 +296,16 @@ class LogStructuredKVCache(nn.Module):
         if self.recent_size < 2:
             raise ValueError(f"recent_size ({self.recent_size}) must be >= 2")
         self.importance_pooling = bool(importance_pooling)
+        self.importance_pooling_lambda = float(importance_pooling_lambda)
+        if not 0.0 <= self.importance_pooling_lambda <= 1.0:
+            raise ValueError(
+                f"importance_pooling_lambda must be in [0, 1], got {self.importance_pooling_lambda}"
+            )
+        self.importance_pooling_temperature = float(importance_pooling_temperature)
+        if self.importance_pooling_temperature <= 0.0:
+            raise ValueError(
+                f"importance_pooling_temperature must be > 0, got {self.importance_pooling_temperature}"
+            )
 
         denom = B * 2
         # +1 for the write level (level 0). The formula gives the number of carry
@@ -554,6 +589,7 @@ class LogStructuredKVCache(nn.Module):
         v: torch.Tensor,  # (B, G, n, v_dim)
         with_stats: bool = False,
         imp: torch.Tensor | None = None,  # (B, G, n) optional per-token importance weights
+        imp_lambda: float = 1.0,
     ) -> tuple[torch.Tensor, ...]:
         """Compress n tokens into a single compact entry via mean pooling.
 
@@ -571,14 +607,23 @@ class LogStructuredKVCache(nn.Module):
         slot's cumulative importance mass — independent of ``w_entry``, the
         token count, which is always uniform regardless of ``imp``). Omitting
         ``imp`` reproduces the exact prior uniform-mean behavior and return
-        shape.
+        shape. ``imp_lambda`` (only consulted when ``imp`` is given) linearly
+        blends the importance-normalized weights toward the uniform ``1/n``
+        weights — ``1.0`` (default) is pure importance pooling (unchanged
+        expression, bit-identical to the pre-``imp_lambda`` code), ``0.0`` is
+        numerically equivalent to uniform pooling (same shares as ``imp=None``,
+        via a different, imp-carrying code path so not bit-identical).
         """
         n = k.size(2)
         has_imp = imp is not None
         if has_imp:
             imp = imp.float()
             imp_entry = imp.sum(dim=2, keepdim=True)  # (B, G, 1), fp32
-            p = (imp / imp_entry.clamp_min(_RANK1_EPS)).unsqueeze(-1)  # (B, G, n, 1)
+            if imp_lambda >= 1.0:
+                p = (imp / imp_entry.clamp_min(_RANK1_EPS)).unsqueeze(-1)  # (B, G, n, 1)
+            else:
+                p_imp = imp / imp_entry.clamp_min(_RANK1_EPS)
+                p = (imp_lambda * p_imp + (1.0 - imp_lambda) * (1.0 / n)).unsqueeze(-1)
             k_entry = (p * k.float()).sum(dim=2, keepdim=True).to(k.dtype)
             v_entry = (p * v.float()).sum(dim=2, keepdim=True).to(v.dtype)
         else:
@@ -635,6 +680,7 @@ class LogStructuredKVCache(nn.Module):
         gamma2: torch.Tensor | None = None,
         imp1: torch.Tensor | None = None,
         imp2: torch.Tensor | None = None,
+        imp_lambda: float = 1.0,
     ) -> tuple[torch.Tensor, ...]:
         """Merge two B-slot blocks into one B-slot block.
 
@@ -657,6 +703,11 @@ class LogStructuredKVCache(nn.Module):
         tensor. ``w_total`` (token count, used only for the ``log(w)`` mass
         bias) is always computed from ``w1``/``w2`` regardless. Omitting them
         reproduces the exact prior count-weighted behavior and return shape.
+        ``imp_lambda`` (only consulted when ``imp1``/``imp2`` are given) linearly
+        blends the importance share toward the count share ``wa/w_total`` —
+        ``1.0`` (default) is pure importance (unchanged expression, bit-identical
+        to the pre-``imp_lambda`` code), ``0.0`` is numerically equivalent to the
+        count-weighted path.
         """
         k_cat = torch.cat([k1, k2], dim=-2)  # (B, G, 2B, D)
         v_cat = torch.cat([v1, v2], dim=-2)
@@ -676,7 +727,12 @@ class LogStructuredKVCache(nn.Module):
             imp_cat = torch.cat([imp1, imp2], dim=-1)
             impa, impb = imp_cat[..., 0::2], imp_cat[..., 1::2]
             imp_total = impa + impb
-            alpha = (impa / imp_total.clamp(min=1e-8)).unsqueeze(-1)
+            if imp_lambda >= 1.0:
+                alpha = (impa / imp_total.clamp(min=1e-8)).unsqueeze(-1)
+            else:
+                alpha_imp = impa / imp_total.clamp(min=1e-8)
+                alpha_w = wa / w_total.clamp(min=1e-8)
+                alpha = (imp_lambda * alpha_imp + (1.0 - imp_lambda) * alpha_w).unsqueeze(-1)
         else:
             alpha = (wa / w_total.clamp(min=1e-8)).unsqueeze(-1)  # (B, G, B, 1)
 
@@ -704,8 +760,15 @@ class LogStructuredKVCache(nn.Module):
         gma, gmb = gm_cat[..., 0::2], gm_cat[..., 1::2]
 
         if has_imp:
-            frac_a = impa.float() / imp_total.float().clamp_min(1e-8)
-            frac_b = impb.float() / imp_total.float().clamp_min(1e-8)
+            frac_a_imp = impa.float() / imp_total.float().clamp_min(1e-8)
+            frac_b_imp = impb.float() / imp_total.float().clamp_min(1e-8)
+            if imp_lambda >= 1.0:
+                frac_a, frac_b = frac_a_imp, frac_b_imp
+            else:
+                frac_a_w = wa.float() / w_total.float().clamp_min(1e-8)
+                frac_b_w = wb.float() / w_total.float().clamp_min(1e-8)
+                frac_a = imp_lambda * frac_a_imp + (1.0 - imp_lambda) * frac_a_w
+                frac_b = imp_lambda * frac_b_imp + (1.0 - imp_lambda) * frac_b_w
         else:
             frac_a = wa.float() / w_total.float().clamp_min(1e-8)
             frac_b = wb.float() / w_total.float().clamp_min(1e-8)
@@ -839,7 +902,8 @@ class LogStructuredKVCache(nn.Module):
                     new_k, new_v, new_w = self.compact(ek, ev, ew, new_k, new_v, new_w)
                 else:
                     new_k, new_v, new_w, new_imp = self.compact(
-                        ek, ev, ew, new_k, new_v, new_w, imp1=eimp, imp2=new_imp,
+                        ek, ev, ew, new_k, new_v, new_w,
+                        imp1=eimp, imp2=new_imp, imp_lambda=self.importance_pooling_lambda,
                     )
             else:
                 esu, es2, ega, egb, egm = self._get_level_stats(ell)
@@ -875,7 +939,7 @@ class LogStructuredKVCache(nn.Module):
                         new_k, new_v, new_w,
                         esu, es2, ega, egb, egm,
                         new_su, new_s2, new_ga, new_gb, new_gm,
-                        imp1=eimp, imp2=new_imp,
+                        imp1=eimp, imp2=new_imp, imp_lambda=self.importance_pooling_lambda,
                     )
             self._clear_level(ell)
         raise RuntimeError(
@@ -932,10 +996,17 @@ class LogStructuredKVCache(nn.Module):
             # learnable params; a pure function of already-detached k, so no
             # backward-path change is needed -- see module docstring).
             imp_tok = rk.float().norm(dim=-1)  # (B, G, flush_len)
+            temp = self.importance_pooling_temperature
+            if temp != 1.0:
+                imp_tok = imp_tok.clamp_min(_RANK1_EPS) ** temp
             imp_pairs = imp_tok.reshape(B_, G_, f, 2)
             imp_a, imp_b = imp_pairs[..., 0], imp_pairs[..., 1]
             pimp = imp_a + imp_b  # (B, G, f), raw (unclamped) cumulative mass
-            frac_a = (imp_a / pimp.clamp_min(_RANK1_EPS)).unsqueeze(-1)
+            frac_a_imp = imp_a / pimp.clamp_min(_RANK1_EPS)
+            lam = self.importance_pooling_lambda
+            # Raw tokens each carry w=1, so the uniform share of a pair is
+            # exactly 0.5 -- blending toward it is `lam * frac_a_imp + (1-lam) * 0.5`.
+            frac_a = (frac_a_imp if lam >= 1.0 else (lam * frac_a_imp + (1.0 - lam) * 0.5)).unsqueeze(-1)
             frac_b = 1.0 - frac_a
             pk = frac_a * rk_pairs[:, :, :, 0, :] + frac_b * rk_pairs[:, :, :, 1, :]
             pv = frac_a * rv_pairs[:, :, :, 0, :] + frac_b * rv_pairs[:, :, :, 1, :]
@@ -1052,8 +1123,12 @@ class LogStructuredKVCache(nn.Module):
         """
         self._count_tokens(k.size(2))
         imp = k.float().norm(dim=-1) if self.importance_pooling else None
+        if imp is not None and self.importance_pooling_temperature != 1.0:
+            imp = imp.clamp_min(_RANK1_EPS) ** self.importance_pooling_temperature
 
-        entries = self._compact_tokens(k, v, with_stats=True, imp=imp)
+        entries = self._compact_tokens(
+            k, v, with_stats=True, imp=imp, imp_lambda=self.importance_pooling_lambda,
+        )
         if self.importance_pooling:
             (
                 k_entry, v_entry, w_entry,

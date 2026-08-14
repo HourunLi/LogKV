@@ -361,6 +361,8 @@ class GPT(nn.Module):
         pin_min_distance: int = 0,
         second_order_scale: float = 1.0,
         importance_pooling: bool = False,
+        importance_pooling_lambda: float = 1.0,
+        importance_pooling_temperature: float = 1.0,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -398,6 +400,15 @@ class GPT(nn.Module):
                 instead of a uniform mean. Independent of the token-count
                 weight that drives the ``log(w)`` mass bias. See
                 ``LogStructuredKVCache``.
+            importance_pooling_lambda: only consulted when
+                ``importance_pooling`` is True. Blends the importance share
+                toward the uniform/count share (1.0 = pure importance,
+                0.0 = uniform). See ``LogStructuredKVCache``.
+            importance_pooling_temperature: only consulted when
+                ``importance_pooling`` is True. Exponent reshaping the raw
+                importance heuristic before normalization (1.0 = unchanged,
+                < 1.0 dampens outlier tokens). Orthogonal to
+                ``importance_pooling_lambda``. See ``LogStructuredKVCache``.
         """
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
@@ -413,6 +424,8 @@ class GPT(nn.Module):
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size, pin_size=pin_size,
                 importance_pooling=importance_pooling,
+                importance_pooling_lambda=importance_pooling_lambda,
+                importance_pooling_temperature=importance_pooling_temperature,
             )
             block.attn._log_kv_pending = None
             block.attn._log_kv_pin_indices = None
@@ -482,6 +495,8 @@ class GPT(nn.Module):
         pin_train_max: int = 0,
         pin_train_prob: float = 0.0,
         importance_pooling: bool = False,
+        importance_pooling_lambda: float = 1.0,
+        importance_pooling_temperature: float = 1.0,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -507,7 +522,9 @@ class GPT(nn.Module):
 
         ``importance_pooling`` is a deterministic function of k (no new
         learnable params), computed identically in training and inference, so
-        turning it on here keeps train/eval consistent automatically -- see
+        turning it on here keeps train/eval consistent automatically --
+        ``importance_pooling_lambda``/``importance_pooling_temperature`` are
+        likewise plain scalars (no new learnable params) -- see
         ``set_log_kv_cache``.
         """
         pin_size = int(pin_size)
@@ -535,6 +552,8 @@ class GPT(nn.Module):
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size, pin_size=pin_size,
                 importance_pooling=importance_pooling,
+                importance_pooling_lambda=importance_pooling_lambda,
+                importance_pooling_temperature=importance_pooling_temperature,
             )
             block.attn.training_log_kv = True
             block.attn._log_kv_pending = None
@@ -1497,6 +1516,8 @@ class CausalSelfAttention(nn.Module):
         recent_size: int = 1024,
         pin_size: int = 0,
         importance_pooling: bool = False,
+        importance_pooling_lambda: float = 1.0,
+        importance_pooling_temperature: float = 1.0,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1539,6 +1560,8 @@ class CausalSelfAttention(nn.Module):
             B=B, recent_size=recent_size, pin_size=pin_size,
             device=device, dtype=dtype,
             importance_pooling=importance_pooling,
+            importance_pooling_lambda=importance_pooling_lambda,
+            importance_pooling_temperature=importance_pooling_temperature,
         )
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:

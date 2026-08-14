@@ -569,9 +569,310 @@ class TestImportancePooling:
         assert not torch.allclose(slot_k_u, slot_k_w)  # pooled content differs
 
 
-# ---------------------------------------------------------------------------
-# _flush_recent / ingest_chunk tests
-# ---------------------------------------------------------------------------
+class TestImportancePoolingLambda:
+    """``importance_pooling_lambda`` blends the importance-driven pooling
+    share toward the uniform/count-driven share. Added after the 2026-08-14
+    decisive eval showed pure importance pooling (lambda=1.0) regresses niah
+    despite improving ACC/LongBench -- see CLAUDE.md 6.5."""
+
+    def test_init_validates_lambda_range(self):
+        for bad in (-0.1, 1.1, 2.0):
+            with pytest.raises(ValueError):
+                LogStructuredKVCache(
+                    (1, 1, 64, 8), (1, 1, 64, 8), B=4,
+                    device=torch.device("cpu"), dtype=torch.float32,
+                    importance_pooling=True, importance_pooling_lambda=bad,
+                )
+
+    def test_init_default_lambda_is_one(self):
+        c = LogStructuredKVCache(
+            (1, 1, 64, 8), (1, 1, 64, 8), B=4, device=torch.device("cpu"), dtype=torch.float32,
+        )
+        assert c.importance_pooling_lambda == 1.0
+
+    def test_compact_lambda_default_is_bit_identical_to_explicit_one(self):
+        """Omitting imp_lambda and passing imp_lambda=1.0 explicitly must take
+        the exact same code branch (>=1.0 short-circuit) -- regression safety
+        for the pre-existing pure-importance behavior."""
+        k1 = torch.tensor([[[[1.0], [5.0]]]])
+        v1 = torch.tensor([[[[2.0], [6.0]]]])
+        w1 = torch.tensor([[[10.0, 10.0]]])
+        k2 = torch.tensor([[[[3.0], [7.0]]]])
+        v2 = torch.tensor([[[[4.0], [8.0]]]])
+        w2 = torch.tensor([[[10.0, 10.0]]])
+        imp1 = torch.tensor([[[1.0, 3.0]]])
+        imp2 = torch.tensor([[[3.0, 1.0]]])
+
+        out_default = LogStructuredKVCache.compact(k1, v1, w1, k2, v2, w2, imp1=imp1, imp2=imp2)
+        out_lambda1 = LogStructuredKVCache.compact(
+            k1, v1, w1, k2, v2, w2, imp1=imp1, imp2=imp2, imp_lambda=1.0,
+        )
+        for a, b in zip(out_default, out_lambda1):
+            assert torch.equal(a, b)
+
+    def test_compact_lambda_zero_matches_count_weighted(self):
+        """lambda=0.0 must numerically recover the pure count-weighted alpha
+        (same as omitting imp1/imp2 entirely), even though imp is deliberately
+        set to the opposite skew of w -- proves lambda=0.0 actually ignores
+        imp rather than coincidentally agreeing with it."""
+        k1 = torch.tensor([[[[1.0], [5.0]]]])
+        v1 = torch.tensor([[[[2.0], [6.0]]]])
+        w1 = torch.tensor([[[3.0, 7.0]]])
+        k2 = torch.tensor([[[[3.0], [7.0]]]])
+        v2 = torch.tensor([[[[4.0], [8.0]]]])
+        w2 = torch.tensor([[[2.0, 9.0]]])
+        imp1 = torch.tensor([[[100.0, 1.0]]])
+        imp2 = torch.tensor([[[1.0, 100.0]]])
+
+        k_uniform, v_uniform, w_uniform = LogStructuredKVCache.compact(k1, v1, w1, k2, v2, w2)
+        k_out, v_out, w_out, _imp_out = LogStructuredKVCache.compact(
+            k1, v1, w1, k2, v2, w2, imp1=imp1, imp2=imp2, imp_lambda=0.0,
+        )
+        torch.testing.assert_close(k_out, k_uniform, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(v_out, v_uniform, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(w_out, w_uniform)
+
+    def test_compact_lambda_interpolates_exactly(self):
+        """For 0 < lambda < 1, alpha must equal
+        lambda*alpha_imp + (1-lambda)*alpha_w exactly (closed form)."""
+        k1 = torch.tensor([[[[1.0], [5.0]]]])
+        w1 = torch.tensor([[[3.0, 7.0]]])
+        k2 = torch.tensor([[[[3.0], [7.0]]]])
+        w2 = torch.tensor([[[2.0, 9.0]]])
+        v1 = torch.zeros_like(k1)
+        v2 = torch.zeros_like(k2)
+        imp1 = torch.tensor([[[1.0, 3.0]]])
+        imp2 = torch.tensor([[[3.0, 1.0]]])
+        lam = 0.3
+
+        k_out, _v_out, _w_out, _imp_out = LogStructuredKVCache.compact(
+            k1, v1, w1, k2, v2, w2, imp1=imp1, imp2=imp2, imp_lambda=lam,
+        )
+        alpha_imp = torch.tensor([1.0 / 4.0, 3.0 / 4.0])
+        alpha_w = torch.tensor([3.0 / 10.0, 2.0 / 11.0])
+        alpha = lam * alpha_imp + (1 - lam) * alpha_w
+        expected_k0 = alpha[0] * 1.0 + (1 - alpha[0]) * 5.0
+        expected_k1 = alpha[1] * 3.0 + (1 - alpha[1]) * 7.0
+        torch.testing.assert_close(k_out[0, 0, 0, 0], expected_k0)
+        torch.testing.assert_close(k_out[0, 0, 1, 0], expected_k1)
+
+    def test_compact_tokens_lambda_zero_matches_uniform(self):
+        B, G, n, D = 1, 1, 4, 3
+        torch.manual_seed(3)
+        k = torch.randn(B, G, n, D)
+        v = torch.randn(B, G, n, D)
+        imp = torch.tensor([[[1.0, 50.0, 2.0, 30.0]]])
+
+        k_uniform, v_uniform, _w = LogStructuredKVCache._compact_tokens(k, v)
+        k_out, v_out, _w2, _imp = LogStructuredKVCache._compact_tokens(
+            k, v, imp=imp, imp_lambda=0.0,
+        )
+        torch.testing.assert_close(k_out, k_uniform, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(v_out, v_uniform, atol=1e-6, rtol=1e-6)
+
+    def test_compact_tokens_lambda_interpolates_exactly(self):
+        B, G, n, D = 1, 1, 4, 2
+        torch.manual_seed(5)
+        k = torch.randn(B, G, n, D)
+        v = torch.randn(B, G, n, D)
+        imp = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
+        lam = 0.4
+
+        k_out, v_out, _w, imp_entry = LogStructuredKVCache._compact_tokens(
+            k, v, imp=imp, imp_lambda=lam,
+        )
+        p_imp = imp / imp.sum(dim=2, keepdim=True)
+        p_uniform = torch.full_like(p_imp, 1.0 / n)
+        p = (lam * p_imp + (1 - lam) * p_uniform).unsqueeze(-1)
+        expected_k = (p * k).sum(dim=2, keepdim=True)
+        expected_v = (p * v).sum(dim=2, keepdim=True)
+        torch.testing.assert_close(k_out, expected_k)
+        torch.testing.assert_close(v_out, expected_v)
+        torch.testing.assert_close(imp_entry[0, 0, 0], torch.tensor(10.0))  # imp sum unaffected by lambda
+
+    def test_streaming_lambda_zero_close_to_uniform_pooling(self):
+        """importance_pooling=True with lambda=0.0 should be numerically close
+        to plain uniform pooling end-to-end through the real streaming path
+        (_flush_pairs), even though it's not bit-identical (the imp-carrying
+        branch does an fp32 round-trip that the pure uniform branch skips)."""
+        B, G, k_dim, v_dim, Bslots = 1, 1, 8, 8, 4
+        max_seq_length = 64
+        T = 8
+
+        torch.manual_seed(21)
+        base = torch.randn(B, G, T, k_dim)
+        scale = torch.linspace(0.1, 10.0, T).view(1, 1, T, 1)
+        k = base * scale
+        v = torch.randn(B, G, T, v_dim)
+
+        c_uniform = LogStructuredKVCache(
+            (B, G, max_seq_length, k_dim), (B, G, max_seq_length, v_dim),
+            B=Bslots, device=torch.device("cpu"), dtype=torch.float32,
+        )
+        c_lambda0 = LogStructuredKVCache(
+            (B, G, max_seq_length, k_dim), (B, G, max_seq_length, v_dim),
+            B=Bslots, device=torch.device("cpu"), dtype=torch.float32,
+            importance_pooling=True, importance_pooling_lambda=0.0,
+        )
+        add_full_kv_in_chunks(c_uniform, k, v)
+        add_full_kv_in_chunks(c_lambda0, k, v)
+
+        slot_k_u, _, slot_w_u = c_uniform.get_attention_state()
+        slot_k_l0, _, slot_w_l0 = c_lambda0.get_attention_state()
+        torch.testing.assert_close(slot_w_u, slot_w_l0)
+        torch.testing.assert_close(slot_k_u, slot_k_l0, atol=1e-5, rtol=1e-5)
+
+    def test_streaming_lambda_half_between_uniform_and_full_importance(self):
+        """A partial lambda's pooled slot content should sit strictly between
+        the lambda=0 (~uniform) and lambda=1 (full importance) outputs on an
+        axis where the two disagree -- sanity check that the blend actually
+        interpolates end-to-end, not just in the single-pair closed form."""
+        B, G, k_dim, v_dim, Bslots = 1, 1, 8, 8, 4
+        max_seq_length = 64
+        T = 8
+
+        torch.manual_seed(23)
+        base = torch.randn(B, G, T, k_dim)
+        scale = torch.linspace(0.1, 10.0, T).view(1, 1, T, 1)
+        k = base * scale
+        v = torch.randn(B, G, T, v_dim)
+
+        def build(lam):
+            c = LogStructuredKVCache(
+                (B, G, max_seq_length, k_dim), (B, G, max_seq_length, v_dim),
+                B=Bslots, device=torch.device("cpu"), dtype=torch.float32,
+                importance_pooling=True, importance_pooling_lambda=lam,
+            )
+            add_full_kv_in_chunks(c, k, v)
+            return c
+
+        c0, chalf, c1 = build(0.0), build(0.5), build(1.0)
+        k0, _, _ = c0.get_attention_state()
+        khalf, _, _ = chalf.get_attention_state()
+        k1, _, _ = c1.get_attention_state()
+
+        assert not torch.allclose(k0, k1)  # sanity: lambda actually matters here
+        lo = torch.minimum(k0, k1)
+        hi = torch.maximum(k0, k1)
+        assert bool(((khalf >= lo - 1e-5) & (khalf <= hi + 1e-5)).all())
+
+
+class TestImportancePoolingTemperature:
+    """``importance_pooling_temperature`` reshapes the raw importance
+    heuristic's dynamic range before normalization -- orthogonal to
+    ``importance_pooling_lambda``, added as a second lever to test the
+    "attention-sink outlier" hypothesis for the niah regression (CLAUDE.md
+    6.5): compressing the heuristic's own range vs. blending toward uniform."""
+
+    def test_init_validates_temperature_positive(self):
+        for bad in (0.0, -0.1, -5.0):
+            with pytest.raises(ValueError):
+                LogStructuredKVCache(
+                    (1, 1, 64, 8), (1, 1, 64, 8), B=4,
+                    device=torch.device("cpu"), dtype=torch.float32,
+                    importance_pooling=True, importance_pooling_temperature=bad,
+                )
+
+    def test_init_default_temperature_is_one(self):
+        c = LogStructuredKVCache(
+            (1, 1, 64, 8), (1, 1, 64, 8), B=4, device=torch.device("cpu"), dtype=torch.float32,
+        )
+        assert c.importance_pooling_temperature == 1.0
+
+    def test_ingest_chunk_temperature_default_is_bit_identical(self):
+        """Omitting temperature and passing 1.0 explicitly must take the same
+        `!= 1.0` short-circuit -- regression safety for the pre-existing
+        pure key-norm heuristic."""
+        k = torch.stack([torch.ones(8) * 1.0, torch.ones(8) * 5.0]).view(1, 1, 2, 8)
+        v = torch.randn(1, 1, 2, 8)
+
+        c_default = LogStructuredKVCache(
+            (1, 1, 64, 8), (1, 1, 64, 8), B=4, device=torch.device("cpu"), dtype=torch.float32,
+            importance_pooling=True,
+        )
+        c_temp1 = LogStructuredKVCache(
+            (1, 1, 64, 8), (1, 1, 64, 8), B=4, device=torch.device("cpu"), dtype=torch.float32,
+            importance_pooling=True, importance_pooling_temperature=1.0,
+        )
+        c_default.ingest_chunk(k, v)
+        c_temp1.ingest_chunk(k, v)
+        assert torch.equal(c_default.level_k_0, c_temp1.level_k_0)
+        assert torch.equal(c_default.level_imp_0, c_temp1.level_imp_0)
+
+    def test_ingest_chunk_temperature_matches_manual_pow_of_key_norm(self):
+        """ingest_chunk's internal imp = k.norm(dim=-1) ** temperature should
+        produce the exact same pooled slot as calling _compact_tokens
+        directly with that manually-computed, pre-reshaped imp tensor."""
+        B, G, n, D = 1, 1, 4, 3
+        torch.manual_seed(9)
+        k = torch.randn(B, G, n, D)
+        v = torch.randn(B, G, n, D)
+        temp = 0.3
+        raw_imp = k.float().norm(dim=-1)
+
+        k_expected, v_expected, _w, _imp = LogStructuredKVCache._compact_tokens(
+            k, v, imp=raw_imp ** temp,
+        )
+
+        c = LogStructuredKVCache(
+            (B, G, 64, D), (B, G, 64, D), B=4, device=torch.device("cpu"), dtype=torch.float32,
+            importance_pooling=True, importance_pooling_temperature=temp,
+        )
+        c.ingest_chunk(k, v)
+        torch.testing.assert_close(c.level_k_0[:, :, 0, :], k_expected.squeeze(2))
+        torch.testing.assert_close(c.level_v_0[:, :, 0, :], v_expected.squeeze(2))
+
+    def test_temperature_below_one_moves_toward_uniform(self):
+        """A skewed raw importance ratio should become less skewed (closer to
+        uniform) after temperature < 1 reshaping -- direct closed-form check
+        on the ratio implied by two token norms."""
+        imp = torch.tensor([1.0, 9.0])  # 9x skew
+        temp = 0.5
+        reshaped = imp ** temp  # sqrt: [1, 3] -> 3x skew, strictly less extreme
+        p_raw = imp / imp.sum()
+        p_reshaped = reshaped / reshaped.sum()
+        # both still favor the larger-norm token, but reshaped is closer to 0.5
+        assert p_raw[1] > p_reshaped[1] > 0.5
+
+    def test_streaming_temperature_zero_point_five_between_one_and_uniform_lambda(self):
+        """temperature=0.5 should sit strictly between temperature=1.0 (raw
+        heuristic) and lambda=0.0 (~uniform) on an axis where they disagree --
+        sanity check end-to-end through the real streaming path."""
+        B, G, k_dim, v_dim, Bslots = 1, 1, 8, 8, 4
+        max_seq_length = 64
+        T = 8
+
+        torch.manual_seed(31)
+        base = torch.randn(B, G, T, k_dim)
+        scale = torch.linspace(0.1, 10.0, T).view(1, 1, T, 1)
+        k = base * scale
+        v = torch.randn(B, G, T, v_dim)
+
+        def build(temp):
+            c = LogStructuredKVCache(
+                (B, G, max_seq_length, k_dim), (B, G, max_seq_length, v_dim),
+                B=Bslots, device=torch.device("cpu"), dtype=torch.float32,
+                importance_pooling=True, importance_pooling_temperature=temp,
+            )
+            add_full_kv_in_chunks(c, k, v)
+            return c
+
+        c_uniform = LogStructuredKVCache(
+            (B, G, max_seq_length, k_dim), (B, G, max_seq_length, v_dim),
+            B=Bslots, device=torch.device("cpu"), dtype=torch.float32,
+        )
+        add_full_kv_in_chunks(c_uniform, k, v)
+        c_raw, c_half = build(1.0), build(0.5)
+
+        k_uniform, _, _ = c_uniform.get_attention_state()
+        k_raw, _, _ = c_raw.get_attention_state()
+        k_half, _, _ = c_half.get_attention_state()
+
+        assert not torch.allclose(k_uniform, k_raw)  # sanity: heuristic matters here
+        lo = torch.minimum(k_uniform, k_raw)
+        hi = torch.maximum(k_uniform, k_raw)
+        assert bool(((k_half >= lo - 1e-5) & (k_half <= hi + 1e-5)).all())
+
 
 class TestIngest:
     def test_single_ingest(self, small_cache):

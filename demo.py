@@ -536,6 +536,15 @@ def main(
     # automatically). Independent of the token-count weight driving the
     # log(w) mass bias. See LogStructuredKVCache.
     log_kv_importance_pooling: bool = False,
+    # Only consulted when log_kv_importance_pooling=True. Blends the
+    # importance share toward the uniform/count share (1.0 = pure
+    # importance, 0.0 = uniform). See LogStructuredKVCache.
+    log_kv_importance_pooling_lambda: float = 1.0,
+    # Only consulted when log_kv_importance_pooling=True, orthogonal to
+    # lambda: exponent reshaping the raw importance heuristic before
+    # normalization (1.0 = unchanged, < 1.0 dampens outlier tokens).
+    # See LogStructuredKVCache.
+    log_kv_importance_pooling_temperature: float = 1.0,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -610,6 +619,12 @@ def main(
         "log_kv_second_order_warmup_steps", log_kv_second_order_warmup_steps
     )
     log_kv_importance_pooling = bool(_o("log_kv_importance_pooling", log_kv_importance_pooling))
+    log_kv_importance_pooling_lambda = float(
+        _o("log_kv_importance_pooling_lambda", log_kv_importance_pooling_lambda)
+    )
+    log_kv_importance_pooling_temperature = float(
+        _o("log_kv_importance_pooling_temperature", log_kv_importance_pooling_temperature)
+    )
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
@@ -766,6 +781,8 @@ def main(
             log_kv_pin_min_distance=log_kv_pin_min_distance,
             log_kv_second_order_scale=log_kv_second_order_scale,
             log_kv_importance_pooling=log_kv_importance_pooling,
+            log_kv_importance_pooling_lambda=log_kv_importance_pooling_lambda,
+            log_kv_importance_pooling_temperature=log_kv_importance_pooling_temperature,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -890,6 +907,8 @@ def main(
         pin_train_max=initial_pin_train_max,
         pin_train_prob=initial_pin_train_prob,
         importance_pooling=log_kv_importance_pooling,
+        importance_pooling_lambda=log_kv_importance_pooling_lambda,
+        importance_pooling_temperature=log_kv_importance_pooling_temperature,
     )
     fabric.print(
         f"logKV training ENABLED: B={log_kv_B}, "
@@ -903,7 +922,8 @@ def main(
         f"target_prob={log_kv_pin_train_prob:.3f}, "
         f"warmup_steps={log_kv_pin_train_warmup_steps}), "
         f"blocks/seq={math.ceil(context_length / max(log_kv_train_block, 1))}, "
-        f"importance_pooling={log_kv_importance_pooling}"
+        f"importance_pooling={log_kv_importance_pooling} "
+        f"(lambda={log_kv_importance_pooling_lambda}, temperature={log_kv_importance_pooling_temperature})"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))

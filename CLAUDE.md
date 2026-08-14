@@ -15,16 +15,18 @@
 本身——阶段 3 揭示压缩本身（不涉及任何 pin）就吃掉 85+ 个百分点，比 pin 全系列
 实验的影响大一个数量级。
 
-**2026-08-13 同日新增：压缩本身这条线的第一个方向——重要性加权池化——已实现
-完毕（代码，非训练结果），见 6.5。核心思路：把 `_flush_pairs`/`compact()` 里
-"槽的 pooling 权重"和"log(w) mass bias 用的 token 计数"解耦成两个独立量，
-pooling 权重按启发式重要性（post-RoPE key L2 范数）加权而不是均匀 1/n，mass
-bias 继续完全不变地用计数 `w`。是 k 的纯函数，无新增可学参数，训练/推理路径自动
-一致（这正是 pin 系列失败的根因之一，这次设计上从一开始就规避掉）。默认关闭时
-（`importance_pooling=False`）跟改动前逐字节相同，124/124 单测通过（113 条既有 +
-11 条新增）。**还没有在真实 checkpoint 上跑过 eval**——本次会话只有本地 CPU
-环境，没有 GPU，下一步是在现有 warmup CPT checkpoint 上跑一次纯 eval-time 决定性
-实验（不需要重新训练，因为这是确定性启发式），命令见 8.5。**
+**2026-08-13 新增、2026-08-14 跑出决定性实验结果：压缩本身这条线的第一个方向
+——重要性加权池化——代码已实现（见 6.5），eval-time 决定性实验已跑出分裂结果
+（ACC/LongBench/LongBench_e 小幅变好，niah 反而从 0.0827 掉到 0.0787），详细
+数字和解读见 6.5/8.5。核心思路：把 `_flush_pairs`/`compact()` 里"槽的 pooling
+权重"和"log(w) mass bias 用的 token 计数"解耦成两个独立量，pooling 权重按启发式
+重要性（post-RoPE key L2 范数）加权而不是均匀 1/n，mass bias 继续完全不变地用
+计数 `w`。是 k 的纯函数，无新增可学参数，训练/推理路径自动一致（这正是 pin 系列
+失败的根因之一，这次设计上从一开始就规避掉）。默认关闭时（`importance_pooling=
+False`）跟改动前逐字节相同，124/124 单测通过（113 条既有 + 11 条新增）。**结论：
+不建议直接采用这版启发式**——niah 定向变差，说明"key L2 范数"这个显著性代理和
+"needle-ness"不是一回事（很可能是 attention-sink 式高范数干扰 token 把 needle
+的池化权重从均匀池化保证的 1/n 挤压下去了），下一步候选见 6.5 结尾。**
 
 **进展**：warmup CPT（`second_order_scale` 目标 0.2，warmup 100 步）已经完整训练
 1500 步，并跑出了 dense baseline / LogKV vanilla / +importance pin / +2nd order+pins /
@@ -41,6 +43,7 @@ bias 继续完全不变地用计数 `w`。是 k 的纯函数，无新增可学�
 | + importance pin | 0.6146 | 0.1363 | 0.1441 | 0.0313 |
 | + 2nd order + pins | 0.6113 | 0.1214 | 0.1331 | 0.0467 |
 | + 2nd order, no pins | 0.6113 | 0.1716 | 0.1918 | 0.0827 |
+| + 2nd order, no pins, + importance pooling | 0.6157 | 0.1753 | 0.196 | 0.0787 |
 
 **pin 调查结论摘要（完整证据链见 6.4）**：二阶修正本身是正贡献（niah 0.032→0.0827，
 2.6×），但大部分下游损失在纯均值池化阶段就已经发生，rank-1 表达能力本身不够。
@@ -53,19 +56,33 @@ needle），但选择质量修好之后（NMS 空间分散约束，near-hit 从�
 
 **下一步方向**：
 
-*压缩本身·方向 1【已实现代码，未跑评测，见 6.5】—— 重要性加权池化：*
-一阶均值 key 把 needle 稀释成 1/width，二阶修正（rank-1、只能加不能减）救不回一个
-一阶就被冲淡到没法参与 softmax 竞争的槽——这是比继续加高二阶 rank 更根本的杠杆点。
-`log_kv_importance_pooling` 开关（默认关闭，向后兼容）已实现并通过单测，下一步是
-在 warmup CPT checkpoint 上跑一次纯 eval-time 决定性实验（命令见 8.5），不需要
-重新训练。
+*压缩本身·方向 1【已实现代码、已跑决定性实验、两个正交旋钮（lambda +
+temperature）代码均已完成，待 GPU 侧扫描，见 6.5/8.5】—— 重要性加权池化：*
+lambda=1.0（纯重要性）的结果是 ACC/LongBench/LongBench_e 小幅变好、niah 定向
+变差（0.0827→0.0787），推翻了"稀释是 niah 主瓶颈、加权池化能救回来"这个核心
+机制假设的直接验证——key L2 范数是个还行的通用显著性代理，但和"needle-ness"
+不是一回事。**不建议直接采用 lambda=1.0**。已实现两个正交旋钮：
+`importance_pooling_lambda`（往均匀份额整体混合）和
+`importance_pooling_temperature`（只压缩启发式自身的动态范围，更针对性地
+压制离群高范数 token），代码/单测均已完成，可以在 GPU 上并行跑两条扫描（命令见
+8.5）：如果存在中间点同时保住 LongBench 增益、niah 不再倒退，这个方向值得继续
+投入；如果两条曲线都只是端点间插值、没有任何中间点两头都好，说明 needle 保护
+和这类从 k 范数出发的确定性启发式结构性冲突，转 6.2 方向。
 
-*继续排在后面、暂不动的：*
-(i) 6.3 提到的"按 layer/width 差异化 second_order_scale"接口改动。
+*继续排在后面、暂不动的（都没有新代码，需要先讨论范围再决定值不值得写）：*
+(i) 6.2/6.3 提到的"按 layer/width 差异化 second_order_scale"生产接口改动——**唯一
+例外**：诊断门控本身（3.1 节，`log_kv_diag_second_order_max_width`/
+`_max_layer`，已经在 `eval.py` 里接好、从未接入生产路径）零代码就能跑，只是
+测的是 oracle 输出误差而不是真实 LongBench/niah 分数，命令见 8.5，可以作为
+"值不值得做这个接口改动"的免费前置信号，跟方向 1 的两条扫描一起并行提交。
 (ii) 压缩本身·方向 2（稠密→压缩自蒸馏，让压缩前向对齐同序列稠密前向）：天花板更
-高但需要训练时多跑一遍稠密 teacher 前向，成本更大，排在方向 1 出结果之后再评估。
+高但需要改训练循环（多跑一遍稠密 teacher 前向 + KD loss），工程量和出 bug 的
+风险都明显更大，且这次没有 GPU 能自己先跑一轮验证正确性，不建议在没有更多信号
+前贸然写——想推进的话应该先讨论清楚 loss 形式和触发时机，再动手实现。
 (iii) 压缩本身·方向 3（rank-2/rank-r 槽统计）：跟方向 1 是替代关系（加权池化让
-均值 key 已经带上 needle 内容后，需要的残差 rank 天然更低），排在方向 1 之后。
+均值 key 已经带上 needle 内容后，需要的残差 rank 天然更低），需要把 Chan-merge
+和 rank-1 截断的数学（`_rank1_psd_from_factors` 等）推广到 rank-r，改动面大、
+正确性依赖需要在 GPU 上迭代验证，原因同 (ii)，不建议这次盲写。
 
 ## 1. 这是什么项目
 
@@ -351,7 +368,7 @@ LongBench/niah，结果全系列 pin 变体（含极小 pin_size=4 对照组）�
 价值不高）。诊断基建（`log_kv_pin_diag.py`/`pin_diag.py`/`log_kv_pin_score_diag.py`/
 `pin_collapse_vs_hit.py`）仍在代码库里，具备通用性，需要时可以复用或参考。
 
-### 6.5 压缩本身·方向 1：重要性加权池化已实现（2026-08-13，代码完成，未跑评测）
+### 6.5 压缩本身·方向 1：重要性加权池化——已实现、已跑决定性实验，分裂结果（2026-08-13 代码 / 2026-08-14 结果，见本节末尾和 8.5）
 
 **动机**：6.3 证实压缩本身（不涉及 pin）吃掉 85+ 个百分点，比 pin 全系列实验大
 一个数量级。看 `log_kv_slot_attention` 的打分公式：
@@ -429,12 +446,20 @@ conda env（`/Users/hourunli/anaconda3/envs/mineru`，Python 3.12）跑
 就有的、跟这次改动无关。**没有做的**：真实 checkpoint 上的 niah/LongBench 数字，
 需要 GPU 环境接着跑。
 
-**下一步（在有 GPU 的环境接着做）**：先跑 8.5 的纯 eval-time 决定性实验（不需要
-重新训练，因为这是确定性启发式，直接套在已有的 warmup CPT checkpoint 上）——
-如果 niah/LongBench 相对 vanilla（0.0827/0.1716/0.1918）有实质提升，说明这个方向
-有戏，再考虑做一版可学权重（比如把 L2 范数换成一个小 MLP 门控）配合 CPT 训练；
-如果没有提升，说明"稀释"不是（或不是主要）瓶颈，改评估 6.2 的按 width 差异化
-scale 或自适应槽宽/预算分配方向。
+**结果（2026-08-14）**：8.5 的决定性实验已跑出，是分裂结果而不是预想的"整体
+提升"或"整体无提升"——ACC/LongBench/LongBench_e 相对 vanilla（0.6113/0.1716/
+0.1918）小幅提升到 0.6157/0.1753/0.196，但 niah 相对 vanilla（0.0827）反而降到
+0.0787。这否定了"稀释是 niah 的主瓶颈、加权池化直接能救"这个假设的最简版本
+（如果对，niah 应该最先受益，结果却是唯一变差的指标），但也不是"稀释完全不是
+瓶颈"的干净否定（毕竟其它三个指标确实都在变好，说明这个杠杆点本身不是无效的，
+只是当前这版启发式——key L2 范数——对 needle 类 token 是负相关而非正相关代理）。
+下一步不是直接冲可学权重（MLP 门控）：2026-08-14 决定跳过"诊断 needle 范数分布"
+这一步，直接实现了 `importance_pooling_lambda` 混合权重（部分走加权、部分走均匀，
+代码/单测均已完成，见本节末尾），下一步是在 GPU 上扫一遍 lambda（命令见 8.5）——
+如果混合权重能找到 sweet spot（LongBench 增益还在、niah 不再倒退），说明问题
+出在"过度偏离均匀"而不是"方向整体错了"，才值得投入可学权重；如果混合权重也
+救不回 niah，说明 needle 保护和这类显著性代理天然冲突，应该转 6.2 的按 width
+差异化 scale 或自适应槽宽/预算分配方向。
 
 **数学推导备忘（2 点加权协方差精确闭式解）**：设 `m = p_a k_a + p_b k_b`
 （`p_a+p_b=1`），则 `k_a - m = p_b(k_a-k_b)`、`k_b - m = -p_a(k_a-k_b)`，代入
@@ -594,29 +619,220 @@ yaml 还是 8.5/6.5 决定性实验和其它默认 eval 用的主力配置——
 这两份 yaml 触发的 eval 步骤），下面的命令现在不需要额外覆盖 pin 就是对的：
 
 ```bash
-DIAG_ARGS="--log_kv_importance_pooling true" \
-    bash eval.sh exp/qwen1.7b-32k/arc_warmup.yaml none niah_single_1,niah_single_2,niah_single_3
+DIAG_ARGS="--log_kv_importance_pooling true" bash majob.sh exp/qwen1.7b-32k/arc_warmup.yaml
 ```
+
+**注意（曾经踩过）**：早前这里写的是
+`bash eval.sh ... none niah_single_1,niah_single_2,niah_single_3`——把主 benchmark
+参数设成 `none`。`majob.sh` 的 `DEFAULT_BENCHMARKS`（主列表）和 `NIAH_BENCHMARKS`
+（niah_single_1/2/3）是两个独立变量，**LongBench/LongBench_e 的数字来自主列表里的
+`longbench_*` 子任务，不来自 NIAH_BENCHMARKS**——`none` 会把 LongBench/LongBench_e
+整段跳过，只测出 niah，凑不出下面这张表。用 `majob.sh` 不传 `BENCHMARKS`/
+`NIAH_BENCHMARKS`（吃默认值）就是当年跑基线用的同一套方法，最保险；如果只想要
+LongBench/LongBench_e/niah、不想陪跑常识任务，改用
+`DIAG_ARGS="..." bash eval.sh exp/qwen1.7b-32k/arc_warmup.yaml <逗号分隔的 longbench_* 任务列表> niah_single_1,niah_single_2,niah_single_3`，
+任务列表从 `majob.sh` 的 `DEFAULT_BENCHMARKS` 里摘 `longbench_*` 那部分（20+ 个），
+手动摘容易打错，不确定就用 `majob.sh` 全量。
 
 对比对象是 0 节表格/6.1 表格里的"+2nd order, no pins"一行（同一 checkpoint，唯一
 区别是加不加这个开关）：
 
-| 配置 | LongBench | LongBench_e | niah |
-|---|---:|---:|---:|
-| vanilla（无 pin，均匀池化，现有基线）| 0.1716 | 0.1918 | 0.0827 |
-| + importance_pooling（本次待验证）| ? | ? | ? |
+| 配置 | ACC | LongBench | LongBench_e | niah |
+|---|---:|---:|---:|---:|
+| vanilla（无 pin，均匀池化，现有基线）| 0.6113 | 0.1716 | 0.1918 | 0.0827 |
+| + importance_pooling（2026-08-14 实测）| 0.6157 | 0.1753 | 0.196 | 0.0787 |
 
-**结果怎么解读（重要，不要套用 pin 系列"eval-only 结果=最终结论"那个模式）**：
-CPT 训练那 1500 步模型只见过**均匀**池化的输入分布，换成加权池化后池化 key 的内容
-变了，这仍是一次真实的分布偏移——只是比 pin 温和得多：槽的数量/类型/量级完全不变
-（同一种"pooled key + dot product"表示形式内的连续扰动），不像 pin 是混入一个
-量级迥异的精确 key 造成结构性的分数尺度失配（见 6.4）。所以：
-- **明显变好** → 强信号，哪怕模型没适应过这个新池化方式也直接受益，值得投入训练
-  一版可学权重（比如 L2 范数换成小 MLP 门控）配合 CPT，天花板大概率更高。
-- **没变化或变差** → **有歧义，不能直接判死刑**：可能是"稀释不是瓶颈"（方向错），
-  也可能是"机制有用但模型需要在训练里见过这个分布才会用"（类比 6.3：base 模型
-  没做 CPT 时 dense 检索也是 0，训练后才学会）。这种情况下一步应该是找同一个
-  checkpoint 做短续训（`demo.py --config arc_warmup.yaml` 之类，加
-  `--log_kv_importance_pooling true` 续训几百步——不需要像 pin 那次专门设计训练期
-  注入机制，因为这次训练/推理复用的是同一份池化代码），训练后再看一次是否追平/
-  反超，而不是照搬 pin 系列"一次 eval 结果定论"的判断方式。
+**结果（2026-08-14，已跑出）：分裂结果，不是干净的赢或输**。ACC/LongBench/
+LongBench_e 都小幅变好（+0.3~0.4pp），niah 反而变差（0.0827→0.0787，相对 -4.8%）。
+"vanilla"这行是本次重新跑出来复现的，跟 6.1 存档数字逐位一致，确认 checkpoint/
+评测流程本身没有漂移，这次的差异是开关本身造成的，不是噪声或环境问题。
+
+**这打破了 6.5 提出这个方向时的核心机制假设，而不只是"没达到预期"**：6.5 的
+motivation 是"均匀池化把 needle 稀释成 1/width，二阶修正救不回一个一阶就被冲淡
+到没法参与 softmax 竞争的槽"——如果这个机制假设对，importance pooling 应该优先
+救 niah（因为 niah 是最典型的单点稀释受害者），结果却是 niah 单独变差、恰恰是
+其它任务在变好。合理的解释：post-RoPE key L2 范数是一个还不错的**通用显著性**
+代理（对 LongBench 这类"整体内容摘要/理解"任务有帮助），但**不是"needle-ness"
+的代理**——niah 的 needle 是随机插入的事实，没有理由天然具有更高的 key 范数；
+而已知的"attention sink"现象（少数 token 因为位置/句法原因具有异常高的范数，
+和语义重要性无关）意味着这些高范数 token 可能在加权平均里系统性地把 needle
+的权重从均匀池化保证的 1/n 挤压到更低——均匀池化对 needle 是"保底"的，重要性
+加权反而可能撤掉这个保底。这也解释了为什么不是"没变化"（模型没见过这个分布，
+不会用）而是特意在 niah 上定向变差：如果纯粹是分布偏移噪声，应该四个指标同向
+或至少无规律，不会恰好精准打在这个方向假设最依赖的那个指标上。
+
+**结论**：不建议直接采用当前这版（key L2 范数、lambda=1.0）重要性池化——它换来的
+ACC/LongBench 小提升不能抵消 niah 的定向回退，尤其 niah 一直是本项目最受关注的
+压缩质量信号（2nd order 修正当年就是靠 niah 0.032→0.0827 论证有效的，见 6.1）。
+
+**2026-08-14 决定跳过诊断步骤，直接实现混合权重（代码已完成）**：新增
+`importance_pooling_lambda`（默认 `1.0` = 纯重要性，向后兼容；`0.0` 数值上等价于
+均匀池化）。六个文件都已改完并通过单测：
+
+- `litgpt/log_kv_cache.py`：`compact()`/`_compact_tokens()` 新增 `imp_lambda`
+  参数，`>=1.0` 时走原表达式（逐字节不变），否则把 alpha/份额线性插值到
+  count-based 份额——`alpha = lambda*alpha_imp + (1-lambda)*alpha_w`；Chan-merge
+  用的 `frac_a`/`frac_b` 用同一个 lambda 同步插值（协方差居中权重必须跟 pooling
+  权重一致，见 6.5 原文）。`_flush_pairs`（真实流式路径）单独实现同样的插值——
+  原始 token 的 count 恒为 1，均匀份额就是 0.5，所以是
+  `frac_a = lambda*frac_a_imp + (1-lambda)*0.5`。`LogStructuredKVCache.__init__`
+  新增 `importance_pooling_lambda: float = 1.0`，显式校验落在 `[0, 1]`。
+- `litgpt/model.py`：`build_log_kv_cache`/`set_log_kv_cache`/
+  `enable_log_kv_training` 三处新增 `importance_pooling_lambda` 参数，透传方式
+  跟 `importance_pooling` 完全一致。
+- `demo.py`/`eval.py`：新增 `log_kv_importance_pooling_lambda: float = 1.0`
+  （走 `run_cli()`/`_o()`，`--log_kv_importance_pooling_lambda 0.3` 直接生效），
+  透传到 `set_log_kv_cache`/`enable_log_kv_training`，打印语句和 eval 的 JSON
+  输出 metadata 里都加了这个字段。
+- `tests/test_log_kv_cache.py`：新增 `TestImportancePoolingLambda`（9 个用例：
+  取值校验、`compact()`/`_compact_tokens()` 的插值闭式解核对、lambda=0 数值上
+  等价于纯均匀池化、lambda=1 逐字节等价于改动前的纯重要性代码路径、端到端流式
+  路径里 lambda=0.5 的槽内容确实落在 lambda=0 和 lambda=1 之间）。全量
+  133/133 通过（124 条既有 + 9 条新增）。
+
+**下一步（在有 GPU 的环境接着做）**：对同一个 warmup CPT checkpoint 扫一遍
+`lambda`，寻找"LongBench 增益还在、niah 不再倒退"的甜点：
+
+```bash
+for LAM in 0.7 0.5 0.3 0.15; do
+    DIAG_ARGS="--log_kv_importance_pooling true --log_kv_importance_pooling_lambda ${LAM}" \
+        bash majob.sh exp/qwen1.7b-32k/arc_warmup.yaml
+done
+```
+
+对比对象还是上面那张表（vanilla 0.6113/0.1716/0.1918/0.0827，lambda=1.0
+0.6157/0.1753/0.196/0.0787）。解读：
+- 如果存在某个 `lambda` 使 niah ≥ 0.0827（不再倒退）且 LongBench/LongBench_e
+  仍高于 vanilla，说明"部分信息"确实有用、问题出在"极端偏离均匀"，这个方向值得
+  继续投入（比如训一版可学权重）。
+- 如果 niah 随 `lambda` 从 1 降到 0 单调地从 0.0787 爬回 0.0827、且爬升过程中
+  LongBench 的增益也跟着线性消失（即整条曲线只是在两个端点间插值，没有任何
+  中间点同时优于两个端点），说明"needle 保护"和"这类显著性代理"是结构性冲突，
+  不存在两全的 lambda，应该转 6.2 的按 layer/width 差异化 scale 方向。
+
+**2026-08-14 又追加了第二个正交旋钮：`importance_pooling_temperature`（代码已
+完成，理由见下）。** lambda 是"整体往均匀分布混合"——即使某个 token 的范数只是
+略高（不是离谱的 attention-sink 式异常值），lambda<1 也会连带把它的显著性信号
+一起打折。如果 niah 的问题具体是"少数极端高范数 token 抢走份额"，更对症的手术是
+只压制那些极端值，不动中等显著性的部分——这正是 temperature 做的事：
+`imp = raw_imp.clamp_min(eps) ** temperature`，`temperature=1.0`（默认）不变，
+`<1.0` 压缩动态范围（比如 0.5 就是开平方，把 9 倍的范数差压缩成 3 倍），
+`temperature -> 0` 极限下所有 token 权重都趋于相等（等价于均匀池化），和 lambda
+数学上是两条不同的插值路径，可以叠加使用（先 temperature 重塑，再 lambda 混合）。
+六个文件的改法跟 lambda 完全对称：
+
+- `litgpt/log_kv_cache.py`：`__init__` 新增 `importance_pooling_temperature:
+  float = 1.0`，显式校验 `> 0`。在两处计算原始启发式的地方（`_flush_pairs` 的
+  `imp_tok = rk.float().norm(...)`、`ingest_chunk` 的 `imp = k.float().norm(...)`）
+  各加一行 `if temp != 1.0: imp = imp.clamp_min(eps) ** temp`——`compact()`/
+  `_compact_tokens()` 完全不用改，它们已经是"消费任意 imp 张量"的通用接口，不
+  关心这个张量是怎么来的。
+- `litgpt/model.py`/`demo.py`/`eval.py`：三处 `build_log_kv_cache`/
+  `set_log_kv_cache`/`enable_log_kv_training` 新增 `importance_pooling_temperature`
+  参数，透传方式跟 `importance_pooling_lambda` 完全一致；`demo.py`/`eval.py` 新增
+  `log_kv_importance_pooling_temperature: float = 1.0`（走 `_o()`）。
+- `tests/test_log_kv_cache.py`：新增 `TestImportancePoolingTemperature`（6 个
+  用例：取值校验、默认值 1.0 逐字节不变、`ingest_chunk` 内部 reshaping 跟手算
+  `k.norm()**temp` 再喂给 `_compact_tokens` 完全一致、temperature<1 确实让一个
+  9 倍范数比压缩成更接近 0.5 的份额、端到端流式路径里 temperature=0.5 的槽内容
+  落在 temperature=1（原始启发式）和 lambda=0（约等于均匀）之间）。全量
+  139/139 通过（133 条既有 + 6 条新增）。
+
+**下一步**：
+
+```bash
+for TEMP in 0.7 0.5 0.3 0.15; do
+    DIAG_ARGS="--log_kv_importance_pooling true --log_kv_importance_pooling_temperature ${TEMP}" \
+        bash majob.sh exp/qwen1.7b-32k/arc_warmup.yaml
+done
+```
+
+**关于"并行"的一个真实踩坑点，写在这里免得周末浪费 GPU 时间**：
+`majob.sh`/`eval.sh` 的 eval 输出路径是 `${save_path}/evaluate/eval_results_<秒级
+时间戳>.json`，`save_path` 只由 yaml 决定（`arc_warmup.yaml` 没有按 lambda/
+temperature 分目录），**不会**按超参数自动分开——多个值不同的运行会把结果都堆到
+同一个 `evaluate/` 目录下，靠文件名里的时间戳互不覆盖，具体是哪次跑的靠 JSON
+内部的 `log_kv_importance_pooling_lambda`/`_temperature` 字段区分（已经加进
+metadata 了，见上面的实现清单）。**推荐串行跑**（就是上面 for 循环那样，一个
+跑完再跑下一个）——这样零冲突风险，"周末不用盯着"和"串行"并不矛盾，反正每个
+任务本身要跑较久，你只是不需要在两次之间手动敲命令。如果真的要在多台机器/多个
+GPU 节点上同时跑：①**千万不要为了"隔开结果"去改 `MY_REAL_NAME`**——这个变量
+同时决定 checkpoint 的 `save_path`，换一个新值会让 `majob.sh` 找不到已训练好的
+checkpoint，从而误判成"没有现成权重"去重新跑 1500 步训练（几个小时的 GPU 时间
+白费，而且训出来也不是这次要测的东西）；②确认没有其它进程占用同一批 GPU
+（`majob.sh`/`eval.sh` 会读 `MASTER_PORT` 等环境变量，同机同端口的两个 torchrun
+会互相冲突），不同物理节点之间没有这个问题。
+
+同一张对比表，同样的"存在中间点两头都好 vs 端点间纯插值"判读逻辑。如果 lambda
+和 temperature 两条扫描曲线形状相似（都是端点间单调插值、没有中间甜点），说明
+问题不是"精确的插值方式"，而是这整类"从 k 范数出发的确定性启发式"跟 needle
+保护结构性冲突，两条路都不用再细调，直接转 6.2 方向；如果其中一条（尤其
+temperature，因为它更针对性地只压制离群值）找到了甜点而另一条没有，说明"精确
+压制离群值"和"整体打折"这两种数学操作对这个任务不等价，值得针对表现好的那条
+再细化（比如更小的 temperature 步长，或者两者联合网格）。
+
+**额外一个零代码、零风险的任务：6.2 的 width/layer 门控诊断**（3.1 节，早就
+接好在 `eval.py` 里，从未接入生产路径）。这个不是跑 lm-eval 拿真实分数，是拿
+`log_kv_diag_mode` 那套 oracle-误差诊断，回答"如果二阶修正只在 width≤N 且
+layer≤M 时生效，逐 token 输出误差会怎么变"——用来在真正去改生产接口（6.2 里
+明确说的"先看有没有更多信号再动"）之前，先低成本看一眼这个方向值不值。跟上面
+两个 lambda/temperature 扫描完全独立，可以一起排队跑：
+
+```bash
+DIAG_ARGS="--log_kv_diag_mode baseline --log_kv_diag_second_order_max_width 4 --log_kv_diag_second_order_max_layer 14" \
+    bash eval.sh exp/qwen1.7b-32k/diag_warmup.yaml niah_single_1,niah_single_2,niah_single_3 none
+```
+
+（`diag_warmup.yaml` 已经把 pin 关掉、`log_kv_diag_mode` 留了 null 能被 CLI
+覆盖，见文件头注释；`second_order_max_width`/`max_layer` 随便换组合扫，这条不
+产出 ACC/LongBench 分数，产出的是 `err_width_gated` 这类误差指标，解读方式见
+`log_kv_diag.py` 文档字符串，不是这张主对比表能直接拼进去的数字，先当独立参考。）
+
+**三条任务加起来的执行顺序建议**：lambda 扫描、temperature 扫描、这条诊断三者
+互相独立，可以任选顺序、也可以分给不同 GPU 节点各跑一条；同一条内部（比如同一个
+`for LAM in ...` 循环）按上面说的串行执行最安全。
+
+### 8.6 第四条任务（可选、需要先看完前三条的结果）：短续训 importance_pooling
+
+**为什么不是一开始就做**：eval-only 扫描（8.5 上面两条）测的是"CPT 权重从没见过
+这个池化分布，能不能直接受益"；如果扫描完全无效（niah 在所有 lambda/temperature
+下都没恢复），更可能是"信息在池化那一步就被结构性丢弃了"（比如 needle 的内容被
+高范数干扰 token 在加权平均里挤出去），这种情况续训救不回来——训练只能让下游层
+更好地利用"槽里已经有的信息"，不能凭空找回从未进入槽的信息。反过来，如果扫描
+找到了部分有效但没完全打平 vanilla 的点，"模型没适应这个新分布"就是一个合理
+解释，续训才值得投入（这正是 6.3 里"base 模型没 CPT 时 dense 检索也是 0，CPT
+后才行"那个先例）。**结论：先跑完 8.5 的两条扫描，挑一个最有希望的具体
+lambda/temperature 值，只续训这一个配置，不要对着整个网格续训**——续训比纯
+eval 贵得多，没有先验信号的情况下对着网格挨个续训是在浪费 GPU。
+
+准备好的配置文件：`exp/qwen1.7b-32k/arc_warmup_importance_continue.yaml`。
+用法：先把文件里 `log_kv_importance_pooling_lambda`/
+`log_kv_importance_pooling_temperature` 改成扫描里选中的具体数值（这两个字段
+必须是非 null 的具体值——`majob.sh` 的训练阶段只传 `--config`，不经过
+`DIAG_ARGS`，跟 eval 阶段的调用方式不同，见文件内注释），然后：
+
+```bash
+bash majob.sh exp/qwen1.7b-32k/arc_warmup_importance_continue.yaml
+```
+
+**这份 yaml 的安全设计（已经读过 `demo.py` 的 resume 逻辑才这样写，别自己改
+`save_path`/`resume_dir` 的关系）**：
+- `save_path` 是一个全新目录，跟 `arc_warmup.yaml` 的 `save_path` 不同——续训
+  绝不能写回原始 checkpoint，那份 checkpoint 是所有对比表格（0.6113/0.1716/
+  0.1918/0.0827 等）的锚点，一旦被覆盖这些数字就再也复现不出来了。
+- 用 `resume_dir`（只读原 checkpoint 的模型权重）而不是 `auto_resume`（会去读
+  `save_path` 下自己的完整训练状态）——`auto_resume` 语义是"续自己"，跟这里
+  "读别人的权重、存到新地方"不匹配。代价：Adam 的 momentum/variance 从零重新
+  累积，不是逐 bit 精确续训，但对几百步的短续训这是标准做法。
+- `max_steps: 300` 是"续训步数"不是"目标 step"——`resume_dir` 只读权重不读
+  step 计数，`global_step` 从 0 开始算。
+- `log_kv_second_order_warmup_steps` 设成 `0`（不是原来的 `100`）：加载进来的
+  权重已经在 `second_order_scale=0.2` 收敛，重新 warmup 100 步等于人为制造一次
+  跟 importance_pooling 无关的分布扰动，会污染这次实验的结论。
+
+跑完之后照常用 `eval.sh`/`majob.sh` 评测这个新 checkpoint（`checkpoint_dir` 指向
+新 `save_path`），跟 vanilla（0.6113/0.1716/0.1918/0.0827）和同一 lambda/
+temperature 下的 eval-only 数字三方对比：如果续训后的 niah 明显高于 eval-only
+版本、逼近或超过 vanilla，说明"训练里见过这个分布"确实关键，值得投入更多步数或
+换成可学权重；如果续训后跟 eval-only 版本差不多，说明问题不在"模型没适应"，
+是这版启发式本身在结构性丢信息，回到 8.5 结尾的"转 6.2 方向"结论。

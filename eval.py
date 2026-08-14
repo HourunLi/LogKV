@@ -517,6 +517,8 @@ class LogKVLM(LM):
         log_kv_second_order_scale: float = 1.0,
         log_kv_dense_mode: bool = False,
         log_kv_importance_pooling: bool = False,
+        log_kv_importance_pooling_lambda: float = 1.0,
+        log_kv_importance_pooling_temperature: float = 1.0,
         tokenizer_dir: str | None = None,
         pin_diag_recorder: PinDiagRecorder | None = None,
     ):
@@ -532,6 +534,8 @@ class LogKVLM(LM):
         self.log_kv_second_order_scale = float(log_kv_second_order_scale)
         self.log_kv_dense_mode = bool(log_kv_dense_mode)
         self.log_kv_importance_pooling = bool(log_kv_importance_pooling)
+        self.log_kv_importance_pooling_lambda = float(log_kv_importance_pooling_lambda)
+        self.log_kv_importance_pooling_temperature = float(log_kv_importance_pooling_temperature)
         self.pin_diag_recorder = pin_diag_recorder
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
@@ -633,6 +637,8 @@ class LogKVLM(LM):
             pin_min_distance=self.log_kv_pin_min_distance,
             second_order_scale=self.log_kv_second_order_scale,
             importance_pooling=self.log_kv_importance_pooling,
+            importance_pooling_lambda=self.log_kv_importance_pooling_lambda,
+            importance_pooling_temperature=self.log_kv_importance_pooling_temperature,
         )
         self._eval_cache_ready = True
 
@@ -984,6 +990,18 @@ def main(
     # L2 范数）加权，而非均匀 mean-pool；不影响 log(w) mass bias（token 计数
     # 独立跟踪）。是 k 的纯函数，无新增可学参数，训练/推理天然一致。
     log_kv_importance_pooling: bool = False,
+    # 只在 log_kv_importance_pooling=True 时生效：把重要性份额往均匀/计数
+    # 份额上混合，1.0（默认）= 纯重要性，0.0 数值上等价于均匀池化，中间值
+    # 插值。2026-08-14 决定性实验发现纯重要性（lambda=1.0）在 niah 上比
+    # vanilla 均匀池化倒退（虽然 ACC/LongBench 涨了），加这个参数是为了低成本
+    # 扫一遍 lambda 找 niah 不倒退的甜点（见 CLAUDE.md 6.5）。
+    log_kv_importance_pooling_lambda: float = 1.0,
+    # 同样只在 log_kv_importance_pooling=True 时生效，跟 lambda 正交：对原始
+    # 重要性启发式（key 范数）取指数再归一化，1.0（默认）=不变，<1.0 压缩
+    # 极端值的动态范围（比如 attention-sink 式异常高范数 token），不像 lambda
+    # 整体往均匀分布混合那样连带压掉中等显著性 token 的信号；两个参数可以同时
+    # 设置（先 temperature 重塑，再 lambda 混合）。
+    log_kv_importance_pooling_temperature: float = 1.0,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1064,6 +1082,12 @@ def main(
     log_kv_pin_min_distance = int(_o("log_kv_pin_min_distance", log_kv_pin_min_distance))
     log_kv_second_order_scale = float(_o("log_kv_second_order_scale", log_kv_second_order_scale))
     log_kv_importance_pooling = bool(_o("log_kv_importance_pooling", log_kv_importance_pooling))
+    log_kv_importance_pooling_lambda = float(
+        _o("log_kv_importance_pooling_lambda", log_kv_importance_pooling_lambda)
+    )
+    log_kv_importance_pooling_temperature = float(
+        _o("log_kv_importance_pooling_temperature", log_kv_importance_pooling_temperature)
+    )
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
     limit = _o("limit", limit)
     log_kv_diag_mode = _o("log_kv_diag_mode", log_kv_diag_mode)
@@ -1177,7 +1201,9 @@ def main(
                 f"prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} "
                 f"(obs {log_kv_pin_obs_window}, min_dist {log_kv_pin_min_distance}) | "
                 f"second_order_scale: {log_kv_second_order_scale} | "
-                f"importance_pooling: {log_kv_importance_pooling}"
+                f"importance_pooling: {log_kv_importance_pooling} "
+                f"(lambda={log_kv_importance_pooling_lambda}, "
+                f"temperature={log_kv_importance_pooling_temperature})"
             )
         if diag_active:
             print(
@@ -1221,6 +1247,8 @@ def main(
             log_kv_second_order_scale=log_kv_second_order_scale,
             log_kv_dense_mode=log_kv_dense_mode,
             log_kv_importance_pooling=log_kv_importance_pooling,
+            log_kv_importance_pooling_lambda=log_kv_importance_pooling_lambda,
+            log_kv_importance_pooling_temperature=log_kv_importance_pooling_temperature,
             tokenizer_dir=tokenizer_dir,
             pin_diag_recorder=pin_diag_recorder,
         )
@@ -1391,6 +1419,8 @@ def main(
                     "checkpoint_dir": checkpoint_dir,
                     "log_kv_dense_mode": log_kv_dense_mode,
                     "log_kv_importance_pooling": log_kv_importance_pooling,
+                    "log_kv_importance_pooling_lambda": log_kv_importance_pooling_lambda,
+                    "log_kv_importance_pooling_temperature": log_kv_importance_pooling_temperature,
                     "results": results,
                 }
 
