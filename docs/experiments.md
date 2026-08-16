@@ -96,6 +96,7 @@ Stage 2 有信号后再投入。v3 没有需要 warmup 的新标量（v2 的 `κ
 | 旋钮 | 取值 | 回答的问题 |
 |---|---|---|
 | **`(g_max, ℓ_block)`** | 纯语义 → 完全分段 | **语义分组 vs 分段边界，谁贡献大？（S0.0 的 eval 版）** |
+| **query 位置** | prompt 尾部 / 中部 / 前置 | **区分本方案与 eviction 类方法的关键设定**（§9-A）——尾部 query 是 retrieval-head 类方法的最佳工况 |
 | `K_max` | 1 / 4 / 16 / 64 | 语义分组本身值多少分？1 是现状锚点。**覆盖默认值时要连带重算 `L_alloc`**（§5.6）|
 | `K:B′` 分配 | 32×4 / 16×8 / 8×16 | 语义分辨率 vs 时序分辨率，总预算固定 |
 | `anchor_mode` | `lo_hi_mid` / `lo_hi` / `mid` / `z` | 锚点表示 vs v2 的 z 统计量 |
@@ -104,6 +105,10 @@ Stage 2 有信号后再投入。v3 没有需要 warmup 的新标量（v2 的 `κ
 | `γ`（遗忘因子）| 0 / 0.5 / 1 | centroid 门控更新值不值 |
 | rank-1 Σ/Γ | 关 / 现有构造 / delta-rule 构造 | 第三档取决于 S0.7 |
 | vanilla memory-matched | B 调大到同 entry 数 | **排除"只是多用了内存"** |
+
+**multi-needle 行必须同时报告 `K_max` 的绑定频率**（§5.6）：needle 数逼近 `K_max` 时
+Ward 会把 needle 漏斗进同一个簇，分数下降到底是聚类不行还是预算被撑爆，不报这个数
+无法归因。
 
 指标沿用现有四项（ACC/LongBench/LongBench_e/niah@32768），**另加 multi-needle**——
 单 needle 一旦从 0.08 提上去就会迅速失去区分度。v3 的锚点表示对 multi-needle 应有
