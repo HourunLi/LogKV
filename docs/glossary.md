@@ -77,7 +77,7 @@ cache（每 layer 一个）
 | `λ` | `log_kv_lambda` | **mass bias 系数**，`+λ·log(w/M)`。沿用现有语义 |
 | `λ_new` | — | 开新簇的距离阈值 = `λ_rel · s_h` |
 | `λ_rel` | `log_kv_cluster_lambda_rel` | 上面那个的相对系数。**全方案最敏感的超参** |
-| `s_h` | — | 每 (layer, head) 的 key 尺度估计 `E‖k−k̄‖²`。**估计方式尚未定案**（§12-B）|
+| `s_h` | — | 每 (layer, head) 的 key 尺度估计 `E‖k−k̄‖²`。**v1 用离线标定**（§5.21-4），标定值须写进 eval metadata；在线估计降级为消融 |
 | `η` | `log_kv_seg_eta` | join cost 的时序权重。**只影响候选排序，不做决策**（§5.3）|
 | `g0` | `log_kv_seg_g0` | 时序项 `φ(g)=g/(g+g0)` 的饱和尺度 |
 | `g_max` | `log_kv_seg_gap_max` | 开新 segment 的间隔阈值 |
@@ -105,7 +105,7 @@ cache（每 layer 一个）
 | `v̄` | entry 的 value 均值 |
 | `p_lo` / `p_hi` | 锚点：该 entry 内最早 / 最晚成员的**真实位置**。min/max 合并，幂等 |
 | `sum_wp` | `Σ_j w_j·p_j` 的 **int64** 累加器。合并就是加法，精确可结合。**必须 int64**（量程 `n²`）|
-| `p_mid` | `clamp(round(sum_wp/w), p_lo, p_hi)`，位置的加权均值。**是质心，不是真实成员位置**——早期版本用"继承权重更大一侧"的规则，不满足结合律且在平衡 Fenwick 路径下恒等于 `p_lo`（CLAUDE.md §2.2 更正框）|
+| `p_mid` | `clamp((2·sum_wp + w) // (2·w), p_lo, p_hi)`，位置的加权均值，**round-half-up 的整数实现**（不是 floor，也不是浮点 round，理由见 §5.14）。**是质心，不是真实成员位置**——早期版本用"继承权重更大一侧"的规则，不满足结合律且在平衡 Fenwick 路径下恒等于 `p_lo`（CLAUDE.md §2.2 更正框）|
 | `μ_c` | 簇 `c` 的 centroid |
 | `Σ`（`sigma_u`,`sigma2`）| 槽内 key 协方差的 rank-1 近似，供**分数侧**二阶修正 |
 | `Γ`（`gamma_a`,`gamma_b`,`gamma`）| **读出侧**的 rank-1 修正。结构上就是 `qᵀ(γa γbᵀ)`，一个秩 1 线性 state（§2.4）|

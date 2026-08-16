@@ -535,7 +535,9 @@ def merge_anchors(lo1, hi1, swp1, lo2, hi2, swp2):
 
 # 质心锚点：读出时才由累加器算出，并夹回 [lo, hi]
 def mid_anchor(lo, hi, sum_wp, w):
-    mid = torch.div(sum_wp, w.clamp_min(1), rounding_mode="floor")
+    """round-half-up，全整数运算（理由见下方"舍入规则"）。sum_wp/w 都是 int64。"""
+    ww  = w.clamp_min(1)
+    mid = torch.div(2 * sum_wp + ww, 2 * ww, rounding_mode="floor")   # = round-half-up
     return torch.clamp(mid, lo, hi)
 
 
@@ -570,6 +572,19 @@ def dedup_anchors(lo, hi, mid):
 - **`p_lo`/`p_hi` 永远真实**：随机构造合并树，断言这两个锚点都属于原始成员位置
   集合（`p_mid` 是质心，**不**满足这条，别误写进断言）。
 - **`p_mid` 落在区间内**：`p_lo ≤ p_mid ≤ p_hi` 恒成立（clamp 之后）。
+- **舍入规则**：`p_mid` 必须用 **round-half-up 的整数实现** `(2·sum_wp + w) // (2·w)`，
+  单测要覆盖 `w=2` 且两成员位置和为奇数的情形（此时真值恰好是 `k+0.5`）。
+
+> **为什么不是 `floor`，也不是浮点 `round`**：
+> - `floor` 对**所有**非整数结果都向下取，系统性左偏约 0.5 个位置；而 `round` 只在
+>   恰好平局时才有 ±0.5 的偏差。平局并不罕见——`w=2` 的 entry 有约一半会遇到。
+> - 浮点 `round` 在 1M 上下文下不安全：`sum_wp` 量程到 `10¹²`，**超出 fp32 的精确
+>   整数范围**（`2²⁴≈1.7e7`），必须 fp64 才不丢位。
+> - 更关键的是 **§11-A 的重放要求逐位可复现**。整数运算天然满足；浮点除法在不同后端/
+>   不同 kernel 下末位可能不同，而 `p_mid` 的一位之差会改变锚点、改变去重后的 `M`、
+>   进而改变 mass bias。**所以这里必须是整数算术，不是"用整数比较快"的问题。**
+> - 平局取上（偏向 `p_hi`）是个约定：entry 内更晚的成员更"新鲜"。`2·sum_wp` 在
+>   int64 下最大约 `2×10¹²`，不会溢出。
 - **mass bias 的计数守恒**（§2.3 那个 bug 的回归测试，**必须有**）。注意断言要写对，
   下面两条是不同强度的命题：
   - **可以断言（精确，不依赖 score）**：M 个虚拟槽的计数因子之和等于单槽的，即
@@ -600,10 +615,17 @@ def dedup_anchors(lo, hi, mid):
 
 ### 5.16 `litgpt/model.py`
 
-唯一的接口性改动：cache 现在需要 **pre-RoPE 的 k** 和该 token 的**绝对位置索引**。
-模型本来就持有这两样，所以是传参改动而非新计算。`build_log_kv_cache`/
-`set_log_kv_cache`/`enable_log_kv_training` 三处透传。读出侧需要访问 RoPE cache
+核心的接口性改动：cache 现在需要 **pre-RoPE 的 k** 和该 token 的**绝对位置索引**，
+模型本来就持有这两样，所以这部分是传参而非新计算；`build_log_kv_cache`/
+`set_log_kv_cache`/`enable_log_kv_training` 三处透传；读出侧需要访问 RoPE cache
 做锚点物化。
+
+> **但这远不是全部改动面——不要按"多传两个参数"来估工作量。** 完整清单在 §5.21-1：
+> `q` 仍需 post-RoPE，所以要**同时持有 `k_roped` 和 `k_raw`**（现有代码把两者写进同一个
+> `k` 变量）；training 与 inference 是**两个不同的调用点**；`append_exact_tokens` 的
+> in-flight chunk 必须用 post-RoPE 且与 `w=1` entry 物化出的键**逐位一致**；
+> `_log_kv_pending` 挂起的元组要带 `k_raw`；`model.py:805-808` 那段 expected-RoPE 注释
+> 描述的正是被替换掉的机制，必须同步改写。
 
 ### 5.17 矩形张量与 batching
 
