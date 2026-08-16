@@ -19,10 +19,12 @@
 | [`docs/algorithm-spec.md`](docs/algorithm-spec.md) | §5 | 算法规格与实现方案：记号、分簇、簇内压缩、buffer 清单、文件级改动、实现顺序、**tips 与易错点**、**复用边界** |
 | [`docs/experiments.md`](docs/experiments.md) | §6–§7 | 实验协议（Stage 0–3，含决策门）、消融表 |
 | [`docs/risks-and-open-questions.md`](docs/risks-and-open-questions.md) | §8、§11–§13 | 风险与对策、**技术难点清单**、未决问题、压缩机制的剩余空间 |
+| [`docs/glossary.md`](docs/glossary.md) | —（速查） | **术语表**：结构层次、维度记号、参数、废弃记号、代码符号、外部概念 |
 
 **先读顺序**：想知道"为什么这么设计"读本文件 §2；想动手实现读
 `algorithm-spec.md` 的 §5.19/§5.20 加 `risks-and-open-questions.md` 的 §11；
-想知道"值不值得做"读 `experiments.md` 的 Stage 0 决策门。
+想知道"值不值得做"读 `experiments.md` 的 Stage 0 决策门；**看不懂某个词或符号就查
+`glossary.md`**（尤其 `B` 在代码里有两个含义这个坑）。
 
 ## 0. 现状速览（2026-08-14）
 
@@ -356,6 +358,14 @@ block pool + 动态分配（vLLM PagedAttention 的结构），推迟到工程�
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-14｜新增 `docs/glossary.md` 术语表。** 动机：用户问 ladder 是什么、
+  `(B, G, ...)` 里的 B 和 G 是什么，暴露出这些词一直在用但从没定义过。**最值得记的
+  是 `B` 在代码库里被重载了**：张量 shape 注释里是 batch size，而构造函数参数
+  `B`、`self.B`、CLI `--log_kv_B`、`compact` docstring 的 "B-slot block" 全都是
+  **每层 entry 数**（默认 512）——这就是设计文档里改叫 `B′` 的原因。术语表另收了
+  结构层次的嵌套关系（cache → cluster → segment → ladder → level → entry → slot）、
+  维度记号、当前参数、**已废弃记号**（`z`/`ρ`/`β`/`κ`/`τ`/`SEG_max`，它们只出现在
+  变更记录里，读旧条目时需要）、代码符号和外部概念。
 - **2026-08-14｜文档拆分成四个文件（内容逐字不变）。** 动机：单文件到 1392 行，每次
   接续都要读全文，开销持续上升。拆法见文件开头的**文档地图**：CLAUDE.md 留 §0–§4
   （动机与核心设计）、§9、§10、§14（变更记录）；§5 进 `docs/algorithm-spec.md`；
