@@ -35,7 +35,7 @@ cache（每 layer 一个）
 | **segment（段）** | 一个 cluster 内一段不被时序打断的连续访问。**不各自分配 ladder**，只通过对齐填充约束合并（§5.11）|
 | **ladder** | 本项目自造的词，代码里没有。指一个 cluster 内部那**一摞 level**，越往上每个 entry 覆盖的 token 越多，像梯子 |
 | **level（层）** | ladder 的一级。level 0 是写入层（部分可填），level ≥1 是进位层 |
-| **entry** | 存储的最小单位：`k̄_raw`、`v̄`、`w`、`(p_lo,p_hi,p_mid)`、Σ/Γ。**这是算内存时该数的东西** |
+| **entry** | 存储的最小单位：`k̄_raw`、`v̄`、`w`、`p_lo`/`p_hi`/`sum_wp`、Σ/Γ。**这是算内存时该数的东西** |
 | **slot（槽 / 虚拟槽）** | 读出时 entry 按锚点展开后喂给 attention 的单位。一个 entry → 1~3 个 slot。**只影响瞬时计算量，不影响持久内存**（§4）|
 | **block** | `_binary_carry` 里一次进位搬运的整块 `B′` 个 entry。二进制计数器的"一位" |
 
@@ -103,7 +103,9 @@ cache（每 layer 一个）
 |---|---|
 | `k̄_raw` | entry 的 **pre-RoPE** 内容均值。**改存 pre-RoPE 是 v3 的核心改动** |
 | `v̄` | entry 的 value 均值 |
-| `p_lo/p_hi/p_mid` | 锚点：该 entry 内最早/最晚/权重更大一侧的**真实成员位置**。整数，不是统计量 |
+| `p_lo` / `p_hi` | 锚点：该 entry 内最早 / 最晚成员的**真实位置**。min/max 合并，幂等 |
+| `sum_wp` | `Σ_j w_j·p_j` 的 **int64** 累加器。合并就是加法，精确可结合。**必须 int64**（量程 `n²`）|
+| `p_mid` | `clamp(round(sum_wp/w), p_lo, p_hi)`，位置的加权均值。**是质心，不是真实成员位置**——早期版本用"继承权重更大一侧"的规则，不满足结合律且在平衡 Fenwick 路径下恒等于 `p_lo`（CLAUDE.md §2.2 更正框）|
 | `μ_c` | 簇 `c` 的 centroid |
 | `Σ`（`sigma_u`,`sigma2`）| 槽内 key 协方差的 rank-1 近似，供**分数侧**二阶修正 |
 | `Γ`（`gamma_a`,`gamma_b`,`gamma`）| **读出侧**的 rank-1 修正。结构上就是 `qᵀ(γa γbᵀ)`，一个秩 1 线性 state（§2.4）|

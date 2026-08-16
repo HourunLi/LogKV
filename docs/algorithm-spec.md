@@ -313,9 +313,9 @@ merge(A, B):                          # B 在到达顺序上更晚
     w    = w_A + w_B
     k̄    = (w_A·k̄_A + w_B·k̄_B) / w     # pre-RoPE 内容空间
     v̄    = (w_A·v̄_A + w_B·v̄_B) / w
-    p_lo = min(A.p_lo, B.p_lo)          # 锚点：精确、幂等（§2.2）
-    p_hi = max(A.p_hi, B.p_hi)
-    p_mid = A.p_mid if w_A ≥ w_B else B.p_mid
+    p_lo   = min(A.p_lo, B.p_lo)        # 锚点：精确、幂等（§2.2）
+    p_hi   = max(A.p_hi, B.p_hi)
+    sum_wp = A.sum_wp + B.sum_wp        # int64 累加器；p_mid 在读出时才由它算出
     Σ, Γ : 现有 Chan-style 二阶矩合并 + rank-1 截断（唯一有损的一步）
 ```
 
@@ -349,7 +349,7 @@ post-RoPE 换成 pre-RoPE。**顺带的好处**：Σ 不再混入位置相位方
 - 内容：`alpha = wa/(wa+0) = 1` → `k_out = ka`，真实 entry 原样通过
 - 计数：`w_total = wa + 0 = wa`
 - 锚点：空位初始化成 `p_lo=+INT_MAX, p_hi=-1`，`min/max` 自动返回真实 entry 的锚点；
-  `p_mid` 的 `w1 ≥ w2` 判据下 `wa ≥ 0` 恒真，也自动选中真实那侧
+  `sum_wp` 初始化成 `0`，加法后不变（`w=0` 的 entry 对加权和的贡献本就是 0）
 
 **注意一个陷阱**：`compact` 里有 `w_total.clamp(min=1e-8)`，两侧都为 0 时
 `alpha = 0` → `k_out = kb`（垃圾值，但 `w=0`）。所以**填充槽必须在读出侧被掩码
@@ -448,9 +448,12 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 (B, G, K_max, L_alloc, B′, ·)
 ```
 
-每 entry 存 `k̄_raw(d)`、`v̄(d)`、`w`、`(p_lo,p_hi,p_mid)`、以及现有 rank-1 统计
-`σu/σ2/γa/γb/γ`（约 3d）。按 `K=15, B′=8, L_alloc=11` 是 **1320 个 entry**，
-对比 vanilla 的约 2560 槽——**我们更小**。
+每 entry 存 `k̄_raw(d)`、`v̄(d)`、`w`、`p_lo`/`p_hi`（int32）、`sum_wp`（**int64**，
+`p_mid` 由它在读出时算出）、以及现有 rank-1 统计 `σu/σ2/γa/γb/γ`（约 3d）。按
+`K=15, B′=8, L_alloc=11` 是 **1320 个 entry**，对比 vanilla 的约 2560 槽——**我们更小**。
+
+> `sum_wp` **必须是 int64**：量程是 `Σ w_j p_j ≤ n²`，1M 上下文下达 `10¹²`，int32
+> 会静默溢出。
 
 **ladder 簿记**（对现有代码改动最大的地方）：
 
@@ -482,12 +485,18 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 无状态、无可学参数、CPU 可测。
 
 ```python
-# 锚点合并：精确、可结合、幂等
-def merge_anchors(lo1, hi1, mid1, w1, lo2, hi2, mid2, w2):
+# 锚点合并：精确、可结合。lo/hi 是幂等半格，sum_wp 是整数加法
+def merge_anchors(lo1, hi1, swp1, lo2, hi2, swp2):
     lo  = torch.minimum(lo1, lo2)
     hi  = torch.maximum(hi1, hi2)
-    mid = torch.where(w1 >= w2, mid1, mid2)   # 永远是某个真实成员的真实位置
-    return lo, hi, mid
+    swp = swp1 + swp2            # int64；不要在这里除，除法留到读出（否则累积舍入）
+    return lo, hi, swp
+
+
+# 质心锚点：读出时才由累加器算出，并夹回 [lo, hi]
+def mid_anchor(lo, hi, sum_wp, w):
+    mid = torch.div(sum_wp, w.clamp_min(1), rounding_mode="floor")
+    return torch.clamp(mid, lo, hi)
 
 
 # 锚点 -> 虚拟槽键：就是标准 RoPE，在真实位置上取现成的 cos/sin cache 行
@@ -515,8 +524,12 @@ def dedup_anchors(lo, hi, mid):
 **单测（S0.1，纯 CPU，不依赖 dump）**：
 - **嵌套精确性**：单 token entry（`p_lo=p_hi=p_mid`）→ M=1，输出与 `model.apply_rope`
   在该位置上逐位一致。
-- **合并的幂等性与结合律**：任意二叉合并顺序结果一致；`merge(A,A) == A`。
-- **锚点永远真实**：随机构造合并树，断言每个输出锚点都属于原始成员位置集合。
+- **合并的结合律**：任意二叉合并顺序**逐位一致**——`sum_wp` 是整数加法，这条应当
+  精确成立而非近似。**这正是旧的 `p_mid` 继承规则挂掉的地方（§2.2 的更正框），
+  所以三个等权成员的两种结合顺序必须作为定向回归用例写进去。**
+- **`p_lo`/`p_hi` 永远真实**：随机构造合并树，断言这两个锚点都属于原始成员位置
+  集合（`p_mid` 是质心，**不**满足这条，别误写进断言）。
+- **`p_mid` 落在区间内**：`p_lo ≤ p_mid ≤ p_hi` 恒成立（clamp 之后）。
 - **mass bias 守恒**：M 个虚拟槽在 `λ·log(w/M)` 下的 softmax 质量加总，等于单槽在
   `λ·log(w)` 下的质量（§2.3 那个 bug 的回归测试，**必须有**）。
 - **`w=0` 填充是恒等元**：`merge(A, ∅) == A`，含锚点（§5.11）。
@@ -625,7 +638,7 @@ def dedup_anchors(lo, hi, mid):
 |---|---|
 | `_counts[ell]` | 全局标量 → 每 (簇, 层) 独立；且"同层等宽"假设要放开。**最集中的风险点（§5.19-2）** |
 | Σ/Γ 的统计空间 | post-RoPE → pre-RoPE。**数学不变**，只是喂进去的张量换了 |
-| `compact()` 签名 | 多带 `(p_lo, p_hi, p_mid)` 走 `merge_anchors`，一行 |
+| `compact()` 签名 | 多带 `(p_lo, p_hi, sum_wp)` 走 `merge_anchors`，一行 |
 | mass bias | `λ·log(w)` → `λ·log(w/M)`（§2.3，必须做的正确性修正）|
 | `get_attention_state()` | 多返回一个有效位掩码与每 entry 的 `M_s` |
 | cache 入口 | 收 pre-RoPE k + 绝对位置，而不是 post-RoPE k |
