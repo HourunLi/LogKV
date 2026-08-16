@@ -128,7 +128,7 @@ cache（每 layer 一个）
 | `importance_pooling` | 已验证为负结果的邻近方案（niah 0.0827→0.0787）。**建议保持关闭** |
 
 **新增的 buffer**（§5.13）：`centroid`、`n_c`、`p_hi_c`、`alive`、`level_count`、
-`pad_mask`、`route_log`、`s_h`。
+`pad_mask`、`op_log`、`s_h`。
 
 ## T8. 外部概念
 

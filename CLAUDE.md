@@ -16,7 +16,7 @@
 | 文件 | 章节 | 内容 |
 |---|---|---|
 | **CLAUDE.md**（本文件）| §0–§4、§9、§10、§14 | 现状速览、背景、**核心设计**、捞针论证、最坏情况兜底、相关工作、另一分支的教训、**变更记录** |
-| [`docs/algorithm-spec.md`](docs/algorithm-spec.md) | §5 | 算法规格与实现方案：记号、分簇、簇内压缩、buffer 清单、文件级改动、实现顺序、**tips 与易错点**、**复用边界** |
+| [`docs/algorithm-spec.md`](docs/algorithm-spec.md) | §5 | 算法规格与实现方案：记号、分簇、簇内压缩、buffer 清单、文件级改动、实现顺序、**tips 与易错点**、**复用边界**、**开工前必须定死的五个决定** |
 | [`docs/experiments.md`](docs/experiments.md) | §6–§7 | 实验协议（Stage 0–3，含决策门）、消融表 |
 | [`docs/risks-and-open-questions.md`](docs/risks-and-open-questions.md) | §8、§11–§13 | 风险与对策、**技术难点清单**、未决问题、压缩机制的剩余空间 |
 | [`docs/glossary.md`](docs/glossary.md) | —（速查） | **术语表**：结构层次、维度记号、参数、废弃记号、代码符号、外部概念 |
@@ -62,8 +62,12 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
    仅仅来自更好的分段边界"。纯 CPU 可测，**排在所有事情之前**。
 2. Stage 0 其余离线证伪实验（§7）——一次 dump + CPU 分析，决定方案值不值得往下做。
 3. `litgpt/log_kv_position.py` 纯函数 + 单测（§5.14），CPU 可测，不依赖 dump 结果。
-4. 视 Stage 0 结果决定是否继续 Stage 1（生产代码）。**动手前先读 `risks-and-open-questions.md`
-   的 §11 和 `algorithm-spec.md` 的 §5.19/§5.20。**
+4. 视 Stage 0 结果决定是否继续 Stage 1（生产代码）。**动手前先读 `algorithm-spec.md`
+   的 §5.21（开工前必须定死的五个决定）、§5.19/§5.20，以及 `risks-and-open-questions.md`
+   的 §11。**
+
+> **实际的第 0 步是 Stage 0 的 dump 脚本**（规格见 `experiments.md`）——它是上面第 1、2
+> 项全部结论的输入，应当是本项目写的第一段代码。
 
 ## 1. 背景：为什么从位置分桶转向语义分簇
 
@@ -165,8 +169,7 @@ k_eff_a = apply_rope( k̄_raw, cos_cache[p_a], sin_cache[p_a] )     a ∈ {lo, m
 ```
 
 每个虚拟槽都在**单一确定位置**上旋转（`p_lo`/`p_hi` 是真实成员位置，`p_mid` 是质心），
-`ρ ≡ 1`，相消不可能发生。不需要复数 buffer、
-gain 公式、`κ`、频率汇总——整套机制就是原封不动的 `apply_rope`，只是在几个真实坐标
+`ρ ≡ 1`，相消不可能发生。不需要复数 buffer、gain 公式、`κ`、频率汇总——整套机制就是原封不动的 `apply_rope`，只是在几个真实坐标
 上各调用一次。**"和 token 级 RoPE 一样优美"在这里是字面意义上的：它就是 token 级
 RoPE。**
 
@@ -412,6 +415,32 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-14｜新增 §5.21「开工前必须定死的五个决定」与 Stage 0 的 dump 规格。**
+  动机：用户指出五处"写得太轻、会在实现到一半卡死"的地方。逐条给了结论：
+  ① **pre-RoPE 接口不是"多传两个参数"**。核实 `model.py:790-816` 后确认，pre-RoPE 精确
+  指**qk-norm 之后、apply_rope 之前**（Qwen3 `norm_qk=True`），取错位置会让度量落在
+  未归一化空间、`s_h` 标定失效。影响面列了七项：`q` 仍需 post-RoPE 所以要**同时持有
+  `k_roped` 和 `k_raw`**；training 与 inference 是**两个不同调用点**；`append_exact_tokens`
+  的 in-flight chunk 必须用 post-RoPE，且与 cache 里 `w=1` entry 物化出的键**逐位一致**
+  （硬性单测）；`_log_kv_pending` 挂起的元组要带 `k_raw`；partial rotary 下只有前段需
+  区分；GQA 折叠只在读出侧、写入侧无影响；`model.py:805-808` 那段 expected-RoPE 注释
+  **正是被替换的东西，必须同步改**。
+  ② **`route_log` 规格不足，改为 `op_log`**。`K_max` 满时 Ward 合并会**释放并复用
+  cluster id**，只记 token→cluster 无法重建结构。改成六类操作的日志，其中
+  **`WARD_MERGE` 必须记明保留/释放哪个槽**、**`PAD_INSERT` 必须记**（否则重放时对齐
+  位置错位、后续配对全错）。代价 224MB/32k（比 route_log 贵一个量级），是正确性的价格。
+  ③ **carry 必须全 GPU 向量化，`_counts` 的 host 镜像要删掉而非扩展**。现实现靠它避免
+  GPU sync 且所有控制流读它；按 `(B,G,K,L)` 展开后 Python 标量分支语义上不成立。决定：
+  **循环轴换成 level（静态界 `L_alloc`），对全部 (B,G,K) 用掩码并行 carry**——级联深度
+  虽数据相关但被 `L_alloc` 静态界住，于是数据相关性从控制流挪进掩码。代价是不能提前
+  退出，被 §5.4 把 flush 粒度提到 128 吸收。
+  ④ **`s_h` 定案为离线标定**，在线估计降级为消融。理由：在线会引入 §11-E 的新变体、
+  序列开头未收敛（而早期路由错误不可恢复）、跨层曲线不可比。**标定值必须写进 eval
+  metadata**。
+  ⑤ **Stage 0 dump 规格补全并提为第 0 步**（hook 点、张量清单、维度约定、层子集、
+  needle span 对齐、落盘格式）。其中两条关键：**不要 dump 完整 attention**（32k 下
+  172 亿元素），§13.2 需要的距离分桶质量应在 hook 内就地累加；**needle span 必须是
+  分词后绝对 token 下标且与 eval 用同一份转换代码**，否则 S0.3 全是噪声。
 - **2026-08-14｜给"小簇合并零损失"加条件；补 CompressKV / ChunkKV 进相关工作并新增
   §9-A 正视其数字。** 动机：用户指出两处。
   ① **"零信息损失"说得太绝对**。它只覆盖**单次**合并且合并后该层占用 `≤ B′` 的情形，
@@ -483,7 +512,7 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
   的加权均值、`_binary_carry`、整套 Chan + rank-1 机制、打分/读出结构、GQA 折叠全部
   一行不改。**唯一一处"看起来能复用实际不能"的是训练重放的依据**——docstring 把确定性
   论证为"count-based binary carries"（只依赖计数不依赖数据），而语义路由打破了这个
-  前提，必须改成重放 `route_log`（§11-A），不处理不报错但梯度属于另一个函数。
+  前提，必须改成重放 `op_log`（§11-A、§5.21-2），不处理不报错但梯度属于另一个函数。
   ② 顺带发现**二阶修正的精度应该变好**：现在 Σ 统计在 post-RoPE 空间，槽内差异里混着
   方向弥散的**位置相位方差**，白白吃掉 rank-1 唯一的那个秩；改到 pre-RoPE 后 Σ 只量
   内容方差，而簇内同质正是聚类在优化的目标。所以 D1 自检 width≥8 的失真可能有一部分
@@ -528,7 +557,7 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
   ⑤ 由 ④ 推出**矩形预分配超配 1.3~1.4 倍**，`L_alloc` 改按均衡界定尺，极端不均衡时
   **顶层做饱和累加**（`compact` 本就不要求两侧等宽）。
   ⑥ 新增 §5.13 buffer 清单、§5.18 实现顺序、**§5.19 实现 tips 与易错点**（其中
-  `route_log` 与 `reset_parameters()` 的时序冲突、锚点哨兵值越界、`w=0` 槽必须显式
+  `op_log` 与 `reset_parameters()` 的时序冲突、锚点哨兵值越界、`w=0` 槽必须显式
   掩码三条是会静默出错的）。
   ⑦ 新增 **§12 未决问题清单**：decode 阶段、`s_h` 估计方式、sink 占预算、`K_max` 与
   multi-needle 的冲突、Config A 闸门无容差、缺 eval-time 探针。

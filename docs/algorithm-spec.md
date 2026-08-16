@@ -54,10 +54,11 @@
 λ_new = λ_rel · s_h        s_h = 该 (layer, head) 上 E‖k − k̄‖² 的估计
 ```
 
-**`s_h` 怎么估计还没定案（§13-D）**，两个候选各有代价：在线估计（用 recent window
-里现成的 token，零额外前向）会让阈值随序列演化，引入新的训推一致性风险；离线标定成
-每 (layer, head) 的固定常数更安全，但需要一个标定 pass。**这一条如果不做，S0.2 扫出
-来的 `K_eff` 曲线在层间完全没有可比性**，整个 Stage 0 会得出无意义的结论。
+**`s_h` 已定案：v1 用离线标定**（完整取舍见 §5.21-4）。在留出样本上跑一次前向，
+记录每 (layer, head) 的 `E‖k − k̄‖²`，存成常量随 config 走，**并写进 eval metadata**。
+在线估计会让阈值随序列演化、引入 §11-E 的新变体，且序列开头估计未收敛——而 §5.6 说
+早期路由错误不可恢复，所以它降级为后续消融项。**这一条如果不做，S0.2 扫出来的
+`K_eff` 曲线在层间完全没有可比性**，整个 Stage 0 会得出无意义的结论。
 
 ### 5.3 分簇：三路判定
 
@@ -290,7 +291,7 @@ K(t) < K_target  →  调低 λ_new（有富余，允许更细的划分）
    顶层溢出 → 饱和累加（§5.12）
 
 4. 释放其中一个槽位（alive=false），新簇写进去
-5. route_log 记录这次合并（backward 重放需要，§11-A）
+5. op_log 记录 `WARD_MERGE(keep_slot, free_slot)`（**合并方向必须记**，§5.21-2）
 ```
 
 **第 3 步的 `if 总数 ≤ B′` 是整个机制的关键**：合并两个簇**不必然合并它们的 entry**。
@@ -504,7 +505,8 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 
 | buffer | shape | dtype | 用途 |
 |---|---|---|---|
-| `route_log` | `(B,G,T_max)` | int16 | 每 token 的簇 id + 是否开新段（最高位打包）。backward **重放它而不是重算** |
+| `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**。只记 token 归属
+不足以重建结构，见 §5.21-2 |
 
 32k 序列下 `(1,8,32768)` int16 = 512KB/层，28 层共 14MB，可忽略。
 
@@ -591,7 +593,7 @@ def dedup_anchors(lo, hi, mid):
 - `compact()`/`_binary_carry()` 增加锚点合并（一行 `merge_anchors`），Σ/Γ 改在
   pre-RoPE 内容空间统计（§5.10）；`_counts[ell]` 的"同层等宽"假设要放开（§5.19-2）。
 - 路由 `_route()`：按 §5.2–§5.6 实现，`@torch.no_grad()`，与 cache 更新同路径。
-  **必须同时把路由决策写进 `route_log` 供 backward 重放**（§11-A，硬性要求）。
+  **必须同时把路由决策写进 `op_log` 供 backward 重放**（§11-A、§5.21-2，硬性要求）。
 - `get_attention_state()` 额外返回有效位掩码与每 entry 的 `M_s`；
   `log_kv_slot_attention` 增加可选槽有效性掩码参数（fp32 分数上填 `-inf`），与现有
   `causal_tail` 正交；**mass bias 改用 `λ·log(w_s / M_s)`**。
@@ -613,6 +615,8 @@ def dedup_anchors(lo, hi, mid):
 
 ### 5.18 实现顺序（每一步都有可验证的中间态）
 
+0. **Stage 0 的 dump 脚本**（规格见 experiments.md）——它是所有 Stage 0 结论的输入，
+   排在生产代码之前（§5.21-5）。
 1. **`log_kv_position.py` + 单测**（纯 CPU，不依赖任何 dump）。
 2. **CPU 参考实现的路由**（朴素串行版，慢但正确）——它同时是 S0.8 的对照基准，
    不要跳过。
@@ -620,7 +624,7 @@ def dedup_anchors(lo, hi, mid):
    （注意 §12 的容差问题）。
 4. **多簇路由 + 向量化**（§5.4 三阶段），拿第 2 步的参考实现测分歧率。
 5. **段对齐填充**（§5.11）+ `level_count` 簿记改造。
-6. **训练路径**：`route_log` 的保存与重放（§11-A）。
+6. **训练路径**：`op_log` 的保存与重放（§11-A、§5.21-2）。
 
 ### 5.19 实现 tips 与易错点
 
@@ -639,9 +643,9 @@ def dedup_anchors(lo, hi, mid):
    但 `cos_cache[anchors]` 会因此索引越界。物化前必须 `clamp(0, N-1)` 或先按有效位
    掩码筛掉——**这是最容易在长序列上才暴露的崩溃**。
 
-5. **`route_log` 不能被 `reset_parameters()` 清掉。** `LogKVStreamTrainingAttention.
+5. **`op_log` 不能被 `reset_parameters()` 清掉。** `LogKVStreamTrainingAttention.
    forward` 开头就调 `cache.reset_parameters()`，而 backward 要重放 forward 期间
-   记录的路由。所以 `route_log` 要么存在 `ctx` 里，要么在 reset 时显式豁免。
+   记录的路由。所以 `op_log` 要么存在 `ctx` 里，要么在 reset 时显式豁免。
    **这个时序冲突不处理的话，训练会静默地用错误的梯度。**
 
 6. **路由的距离计算强制 fp32。** §11-A 的重放确定性依赖它；TF32 下 einsum 的归约
@@ -705,6 +709,113 @@ post-RoPE 空间——槽内 token 位置不同，`R(p_j)k_j` 之间的差异里
 > "compaction is pure mean-pooling with **count-based binary carries**"
 
 **"只依赖计数、不依赖数据"这个前提被语义路由打破了。** 框架保留，但重建 cache 时的
-依据必须从"重算路由"换成"重放 `route_log` 记录的 id 序列"（§11-A）。不处理不会报错，
+依据必须从"重算路由"换成"重放 `op_log` 记录的操作序列"（§11-A、§5.21-2）。不处理不报错，
 只会让梯度属于另一个函数——**这是全部改动里最容易静默出错的一处**。
 
+### 5.21 开工前必须定死的五个决定
+
+这五条都会在实现到一半时把人卡住，且都不是"写着写着就知道了"的类型。**在写第一行
+生产代码之前必须有结论**，否则返工成本极高。
+
+#### 5.21-1 pre-RoPE 接口改动的完整影响面（远不止"多传两个参数"）
+
+现状（`model.py:790-816`）的实际顺序是：
+
+```
+qkv.split → norm_q / norm_k（Qwen3 是 norm_qk=True, type="default"）
+          → apply_rope( k[..., :rope_n_elem] )        ← 只旋转前段
+          → cat( k_roped, k[..., rope_n_elem:] )      ← 尾部内容通道原样
+          → 交给 LogKV（training / inference 两条路径）
+```
+
+所以**"pre-RoPE k"精确地说是"qk-norm 之后、apply_rope 之前"**，不是 qkv 投影的原始
+输出。取错位置会让簇的度量落在未归一化的空间里，`s_h` 标定直接失效。
+
+**受影响的地方（逐条都要处理，不能只改一个入口）**：
+
+| 位置 | 影响 |
+|---|---|
+| `q` 必须保持 post-RoPE | query 照常旋转。所以要**同时持有 `k_roped` 和 `k_raw`**，现有代码把两者写进同一个 `k` 变量，得拆开 |
+| 两条调用路径 | `_log_kv_train_lowmem_forward`（training）与 `_log_kv_training_forward`（inference prefill/decode）是**两个不同的调用点**，都要传 |
+| in-flight chunk | `append_exact_tokens` 把当前 chunk 作为精确槽拼在扁平池尾部做 chunk 内因果——这条路**必须用 post-RoPE k**。它与"cache 里 `w=1` entry 物化出来的键"必须逐位一致，**这是一条硬性单测**（两条路径不同，但数学上应当同一） |
+| `_log_kv_pending` | 奇数长度 prompt 会把末尾单 token 挂起、与首个 decode token 配对。**挂起的元组必须同时带上 `k_raw`**，否则它被 flush 进 cache 时没有 pre-RoPE 形态 |
+| partial rotary | 尾部 `[rope_n_elem:]` 旋不旋转都一样，所以**只有前 `rope_n_elem` 维需要区分 raw/roped**。存储上可以只存 raw，物化时旋前段、拼尾部（§5.14 已如此） |
+| GQA | `k` 在这一步已经是 `(B, G, T, hs)` 的 per-KV-group 形态，**写入侧不涉及 rf 折叠**，折叠只发生在读出侧的 `log_kv_slot_attention`。这条是好消息 |
+| 那段注释 | `model.py:805-808` 明确写着 expected-RoPE 的设计前提（"LogKV mean-pools the FULL key … expected rotation over the span"）——**那正是被替换掉的东西，注释必须同步改**，否则下一个读代码的人会按旧模型理解 |
+
+#### 5.21-2 `op_log` 而不是 `route_log`：只记 token→cluster 不足以重放
+
+原设计写的是"每 token 的簇 id + 是否开新段"。**这不够**：`K_max` 满时会 Ward 合并、
+释放槽位、**复用 cluster id**——同一个 id 在合并前后指的是不同的簇，仅凭 token 归属
+无法重建结构。backward 重放会建出一个 forward 从未 attend 过的 cache（§11-A）。
+
+改成**操作日志**，每条 4 个 int32：
+
+```
+(op_type, arg0, arg1, arg2)
+
+NEW_CLUSTER   (slot_idx,  -1,       -1)      # 在哪个空槽建新簇
+JOIN          (cluster,   segment,  -1)      # 归入既有簇的哪个段
+NEW_SEGMENT   (cluster,   new_seg,  -1)      # 同簇开新段
+WARD_MERGE    (keep_slot, free_slot, -1)     # 合并方向必须记：谁留谁释放
+PAD_INSERT    (cluster,   level,    count)   # 对齐填充插在哪、插几个（§5.11）
+CARRY         (cluster,   level,    -1)      # 进位（可由计数推出，但记下来便于断言）
+```
+
+要点：
+- **`WARD_MERGE` 必须记明保留哪个槽、释放哪个槽**，因为新簇随后会复用被释放的 id。
+- **`PAD_INSERT` 必须记**，否则重放时对齐位置对不上，后续所有配对全错位。
+- `CARRY` 严格来说可由计数推出，但记下来能让重放做逐步断言，调试成本回本很快。
+
+容量：`OP_max` 取 `T_max + 2·K_max·(预期合并次数)` 的保守上界；实测应远小于
+`2·T_max`。`(1,8,2·32768,4)` int32 ≈ 8MB/层，28 层 224MB——**比 `route_log` 的
+14MB 贵一个量级，但这是正确性的价格，不是可选项**。
+
+#### 5.21-3 carry 必须全 GPU 向量化：`_counts` 的 host 镜像要**删掉**而不是扩展
+
+现实现（`log_kv_cache.py:393` 附近）里 `level_count` 是设备张量，但 `self._counts` 是
+它的 **host 端镜像**，注释写明存在理由就是避免 GPU sync；而 `if self._counts[0] >=
+self.B`、`if self._counts[ell] == 0` 这些**控制流全读它**。
+
+一旦按 `(B,G,K,L)` 展开，每个 (batch, KV头, 簇) 的进位深度都不同，**Python 标量分支
+在语义上就不成立了**；硬要保留 host 镜像则每次 flush 每层都要一次设备→主机同步，
+性能上等于自杀。
+
+**决定：循环轴换掉。**
+
+```
+外层：for ℓ in range(L_alloc)      ← Python 循环，但界是静态的（11~15），与数据无关
+内层：对全部 (B,G,K) 同时做带掩码的 carry —— 纯张量操作，不读任何标量
+```
+
+关键认识是**进位的级联深度虽然数据相关，但被 `L_alloc` 静态界住**。所以把"按需级联"
+改成"固定跑 `L_alloc` 轮、每轮用掩码决定谁真的进位"，就把数据相关性从控制流挪进了
+掩码。代价是不能提前退出，每次 flush 固定 `L_alloc` 次 kernel——而 §5.4 把 flush 粒度
+从 2 提到 128 之后，flush 频率降了 64 倍，这个代价被吸收掉了。
+
+**所以 `_counts` 的 host 镜像在语义簇路径上必须删除，不能扩展。** 保留它等于保留一个
+每 flush 一次的同步点。CPU 参考实现（§5.18 第 2 步）可以继续用 Python 控制流——它本来
+就只用于 S0.8 的对拍。
+
+#### 5.21-4 `s_h` 先选**离线标定**，在线估计降级为消融
+
+`λ_rel · s_h` 直接决定 `K_eff`、needle 隔离率和跨层可比性，它不是小空白，是阈值体系
+的地基。两种方案的取舍：
+
+| | 在线估计 | **离线标定（选这个）** |
+|---|---|---|
+| 阈值随序列演化 | 是 → **引入 §11-E 的新变体**（训练与推理的估计轨迹不同 ⇒ 簇划分不同）| 否，常量 |
+| 序列开头 | 估计未收敛，而 §5.6 说早期路由错误**不可恢复** | 从第一个 token 起就正确 |
+| 跨层可比性 | 各层估计器收敛速度不同，S0.2 曲线不可比 | 天然可比 |
+| 成本 | 零 | 一次标定 pass |
+
+**决定：v1 用离线标定。** 在留出样本上跑一次前向，记录每 (layer, head) 的
+`E‖k − k̄‖²`，存成常量张量随 checkpoint/config 走。**标定常量必须写进 eval 的
+metadata 字段**——否则不同 run 用了不同标定值却无从分辨，所有对比作废。在线估计
+作为后续消融项，不进 v1。
+
+#### 5.21-5 Stage 0 的 dump 脚本排在生产实现之前
+
+规格见 [`experiments.md`](experiments.md) 的"Stage 0 dump 规格"一节。它本来就是
+Stage 0 全部结论的输入，却一直只有一句"dump 每层每头 pre-RoPE k/v"，没有可执行细节。
+**这个脚本应当是本项目写的第一段代码**，排在 §5.18 的第 1 步之前。
