@@ -416,6 +416,65 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-14｜代码核实驱动的复查：修掉五处会静默产生错误结构/分数的实现级 bug，
+  补三处规格空白。** 动机：用户对照 HEAD `8b1ec8a` 的实际代码逐条给出 file:line
+  级证据，指出文档里"看起来定了"的几处实际经不起代码核实。逐条给出结论：
+  ① **`PAD_INSERT` 记录顺序原来是反的**：§5.11 的例子要求填充插在新 segment 第一个
+  token **之前**（`a3, ∅, b1`），但 §5.21-2 原文把它记在服务的 `NEW_SEGMENT` 之后，
+  replay 会先 append 新 token 再补填充，实际产出 `a3, b1, ∅`，对齐填充完全失效。
+  改成 `PAD_INSERT` 先于它服务的 `NEW_SEGMENT`，并把 `pos[token_ptr]` 显式加进
+  replay 的 `append_to_ladder` 调用——锚点是绝对位置的函数，重放没有 pos 无法定义。
+  ② **`n_c` 被同时用作 centroid 混合权重和 Ward 簇大小，语义冲突**：`γ` 衰减过的
+  计数拿去算 Ward 代价，会让历史长、内容多但衰减过的簇被误判成小簇、廉价合并。
+  拆成 `n_eff`（浮点，`γ` 衰减，只喂 §5.5 centroid 更新）和 `n_total`（整数，单调
+  不减，Ward 代价 §5.6 与 §5.8 的 O(log n) 空间界都用它）。
+  ③ **Σ/Γ 挪到 pre-RoPE 空间后，读出侧从没跟着改**：`log_kv_slot_attention` 现有
+  公式用 post-RoPE `q` 点乘 `sigma_u`/`gamma_a`，若这两个方向仍存 pre-RoPE 空间，
+  点积就是在错坐标系里算。把 `_rotate_at_anchors` 从只服务 `k_raw` 泛化成
+  `materialize_anchor_directions`，`sigma_u`/`gamma_a` 和 `k_raw` 走同一套按锚点
+  RoPE 物化；`gamma_b`（value 方向）和 `gamma`（标量）不需要，因为 value 从不
+  被 RoPE。新增两条单测（锚点物化嵌套精确性、坐标系回归）。
+  ④ **Phase 1 的批量快速路径和 §5.3 的串行判定不等价**：原文用全局
+  `min_c ‖k−μ_c‖² ≤ λ_new` 做批量直接分配的判据，但 §5.3 的真实规则是先用统一
+  代价（含 η 时序项）选出 `c*`，再检查 `c*` 自己的语义距离——当语义最近簇和统一
+  代价赢家不是同一个簇时两者会给出不同答案。改成同一遍里把 `D`（统一代价）和
+  `S`（纯语义距离）都算出来，`c* = argmin D`，用 `gather(S, c*)` 判定，额外开销
+  可忽略。
+  ⑤ **decode pending 的推广公式写反了**：文档说要留
+  `flush_granularity − (T mod flush_granularity)` 个，但这是"还差多少补满一批"，
+  和真正该留的残留数（`T mod flush_granularity`）互补而非相等；`T mod g == 0` 时
+  错误公式给出 `g`（整批都标记成待补），正确公式给出 `0`。已改并在
+  `risks-and-open-questions.md` 加更正框。
+
+  另外三处规格空白：
+  ⑥ **`OP_max = 4·T_max` 隐含了未声明的前提**：这个上界只有在 `ℓ_block ≤ 2`、
+  `PAD_INSERT` 按 `count` 字段聚合（不是每个填充槽一条独立 op）、`PAD_INSERT`
+  顺序正确（见①）三条同时成立时才安全；`ℓ_block` 若能取到 Stage 0 探索范围
+  `L_alloc`（32k 下 11~15），`count` 会超过单层容量 `B′`，聚合假设失效，指数项会
+  压垮上界。补上生产路径构造时的硬校验 `ℓ_block ∈ {0,1,2}`（不满足直接
+  `raise ValueError`），并注明 Stage 0 的 S0.0 扫描是离线 CPU 模拟、不经过
+  `op_log`/真实 cache，不受这条约束。
+  ⑦ **`K_eff` 的两种口径混在一起会自相矛盾**：S0.2 说 32k 下 `K_eff` 应在 10² 量级，
+  但默认 `K_max` 在 32k 只有 15，若不说清楚测的是哪个量，S0.2 的结果和 §4 的
+  2344-entry 内存故事看起来互相打脸。明确 S0.2 测的是 **unclipped DP-means**
+  `K_eff`（离线分析口径，回答"内容本身有多少语义多样性"），和生产路径里被
+  `K_max` 截断后的实际簇数是两个不同的量，前者大不直接推翻后者的内存预算——
+  它是路由质量信号，不是内存溢出信号。
+  ⑧ **Stage 0 机制 B 的手算分数没有复现真实 attention 的三个步骤**：`model.py`
+  确认真实计算用的是拼接完整通道后的 post-RoPE `q`/`k`（`816-817`，
+  `q_roped`/`k_roped` 只是被旋转的位置子通道切片，Qwen3-1.7B 因为
+  `rotary_percentage=1.0` 恰好两者相等，这是这个模型特例而非通用结论）、GQA 在
+  算分数前把 `k` 按 `q_per_kv=2` `repeat_interleave` 展开到查询头数（`857-860`）、
+  以及可选的 softcapping（`1454-1456`，Qwen3-1.7B 不启用）。原文的伪代码
+  `q_roped @ k_roped.mT` 三者都没做。已在 `experiments.md` 把这三步显式写成
+  机制 B 的必经步骤。
+
+  三处次要点顺带修掉：`log_kv_semantic_clusters=True` 现在构造时硬性拒绝
+  `importance_pooling=True`/`pin_size>0`（两者与 Ward/DP-means 依赖的"`w` 就是
+  真实计数权重"这个前提冲突，共存数学未推导）；`glossary.md` 的 `n_c`/`K_eff`
+  词条同步拆分/澄清；`risks-and-open-questions.md` 里引用 Ward 尺寸加权的地方
+  统一改成 `n_total`。
+
 - **2026-08-14｜补齐六处会导致训练/统计静默出错的实现难点。** 动机：用户逐条指出
   `op_log`、Stage 0 dump、`w=0` 填充、decode 阶段都还停在"有原则没规格"的状态。
   逐条给出结论：

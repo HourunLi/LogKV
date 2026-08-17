@@ -125,8 +125,9 @@ pre-RoPE key，flush 时机也不区分 prefill/decode（这本来就是训推�
   prompt 事实——长 CoT 推理反复引用早期事实时，若那个簇的 centroid 已经被后续
   decode 内容的 Ward 合并污染，等于在回答生成到一半时才发现参考资料被顶掉了。
 - **有一个自然的缓解，但只是部分缓解，不能当结论**：Ward 代价带尺寸加权
-  （`(n_a n_b)/(n_a+n_b)`，§5.6），真正重要、内容丰富的 prompt 簇往往 `n_c`
-  较大，合并代价高，天然比新开的小 decode 簇更难被挤掉。但同样按 §5.6 的分析，
+  （`(n_a n_b)/(n_a+n_b)`，§5.6，用的是 `n_total` 不是 `n_eff`），真正重要、内容
+  丰富的 prompt 簇往往 `n_total` 较大，合并代价高，天然比新开的小 decode 簇更难被
+  挤掉。但同样按 §5.6 的分析，
   **needle 式的小簇**（无论来自 prompt 还是 decode）恰恰最便宜、最容易被合并——
   所以这只是把"decode 挤掉 prompt"的问题变成了"decode 挤掉 prompt 里的稀有事实"，
   没有消除风险，只是换了个形状。
@@ -140,8 +141,17 @@ prefill：至少要在长 CoT 或多轮场景下，观察 decode 期间是否发
 **顺带一个必须核对但相对机械的点**：现有 `_log_kv_pending`（`model.py`）把奇数长度
 prompt 的末尾单 token 和第一个 decode token 配对，是为了配合 `train_block=2` 的
 flush 粒度。§5.4 把 flush 粒度提到最多 128 之后，这个"留 1 个 token 挂起"的逻辑要
-推广成"留最多 `flush_granularity − (T mod flush_granularity)` 个"，否则 prefill
-结尾会按旧粒度切出一个不完整的批，语义簇路由那批 token 数就和后面的批不一致。
+推广成**"留 `T mod flush_granularity` 个"**，否则 prefill 结尾会按旧粒度切出一个
+不完整的批，语义簇路由那批 token 数就和后面的批不一致。
+
+> **一处曾经写反的公式**：早期版本写的是"留最多
+> `flush_granularity − (T mod flush_granularity)` 个"。这个量不是残留 token 数，
+> 是**还差多少个未来 token 才能补满当前批**——两者互补（`r + (g−r) = g`），符号
+> 刚好取反。`T mod g == 0` 时最容易看出问题：这时 prefill 恰好被 flush 粒度整除，
+> 应该**留 0 个**挂起（没有不完整的尾批），而错误公式会算出
+> `g − 0 = g`，把整整一批 `g` 个已经处理完的 token 又错误地标记成"待补齐"。
+> 正确公式 `r = T mod g` 在这个边界情况下直接给出 `0`，不需要额外的特判分支。
+
 这是flush 粒度改动的机械推论，不是 decode 特有的新问题，但容易被漏掉，一并记在
 这里。
 
