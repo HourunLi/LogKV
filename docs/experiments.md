@@ -41,15 +41,41 @@ Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生�
 未归一化空间，`s_h` 标定和全部方差统计作废。
 
 **机制 B（`attn_mass_by_dist` 专用，不是简单 hook，dump 脚本要显式接管这一步）**：
-在 `apply_rope` **之后**捕获 `q_roped`/`k_roped`，脱离模型的融合 SDPA 调用，
-在 dump 脚本里自己按 query 分块手算：
+在 `apply_rope` **之后**捕获，脱离模型的融合 SDPA 调用，在 dump 脚本里自己按 query
+分块手算——但必须**逐位复现** `model.py:816-817`/`857-860`/`1450-1466` 那三步，
+否则算出来的 `attn_mass_by_dist` 和模型真实算的注意力不是同一个量，S0.0/§13.2 的
+结论建立在错误的基准上：
+
+1. **完整 post-RoPE q/k，不是旋转切片**。`model.py:816-817` 拼的是
+   `q = cat(q_roped, q[..., rope_n_elem:])`——`q_roped`/`k_roped` 只是前
+   `rope_n_elem` 维（位置通道），真实 attention 用的是拼上未旋转内容通道尾部之后
+   的**完整向量**。partial rotary 模型下漏掉尾部会让分数系统性偏小。**Qwen3-1.7B
+   的 `rotary_percentage=1.0`（`rope_n_elem == head_size`），尾部为空，
+   `q_roped` 恰好等于完整 `q`**——这是这个模型上机制 B 能简化成只 dump
+   `q_roped`/`k_roped` 的唯一原因，不是通用结论；换一个 partial-rotary 模型，
+   dump 脚本必须同时落盘尾部通道并在这一步拼接。
+2. **GQA 展开**：`model.py:857-860` 在算分数前把 `k`（`(B, n_query_groups, T, hs)`，
+   这里 `n_query_groups=G=8`）按 `q_per_kv = n_head/n_query_groups = 2` 
+   `repeat_interleave` 到 `(B, nh_q, T, hs)`（`nh_q=16`），即每个 KV group 被
+   **2 个相邻 query head 共享**。dump 出来的 `k_roped` 是 `(G, T, hs)`，必须先做
+   同样的 `repeat_interleave(q_per_kv, dim=0)` 展开到 `(nh, T, hs)` 再和
+   `q_roped` 相乘——否则退化成 `nh_q` 和 `G` 直接错位相乘（`16` 头对 `8` 组，
+   形状都对不上，或者对上了也是语义错的配对）。
+3. **可选 softcapping**：`model.py:1454-1456` 若 `config.attention_logit_softcapping
+   is not None`，在 softmax 前对 `scores` 做 `do_softcapping`（`tanh` 压缩）。
+   **Qwen3-1.7B 不启用 softcapping**（那是 Gemma2 系列的机制），所以这一步在当前
+   实验里是 no-op，但脚本要把这一步作为条件分支写出来，换模型配置时才不会静默漏掉。
 
 ```
-for query_block in chunks(q_roped, block_size):
-    scores = query_block @ k_roped.mT * scale        # 只对这一块，不是整个 (T,T)
-    scores = causal_mask(scores)                       # 该块相对完整 k 序列的因果掩码
+q_per_kv = nh // G                                     # GQA 展开倍数，Qwen3-1.7B 是 2
+k_expanded = k_roped.repeat_interleave(q_per_kv, dim=0)  # (G,T,hs) -> (nh,T,hs)
+for query_block in chunks(q_roped, block_size):          # q_roped 在本模型上即完整 post-RoPE q
+    scores = query_block @ k_expanded.mT * scale          # 只对这一块，不是整个 (T,T)
+    if attention_logit_softcapping is not None:            # 当前模型是 no-op，保留分支
+        scores = do_softcapping(scores, attention_logit_softcapping)
+    scores = causal_mask(scores)                           # 该块相对完整 k 序列的因果掩码
     probs  = softmax(scores, dim=-1)
-    attn_mass_by_dist += bincount_by_|i-j|(probs)       # 累加进分桶直方图，立刻丢掉 probs
+    attn_mass_by_dist += bincount_by_|i-j|(probs)           # 累加进分桶直方图，立刻丢掉 probs
 ```
 
 这是 Stage 0 **专用**的离线计算，刻意绕开生产路径的融合 kernel——可以接受，因为它
@@ -92,7 +118,7 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
 |---|---|---|
 | **S0.0** | **扫 `(g_max, ℓ_block)`：一端纯语义聚类，一端完全连续分段。看槽内内容方差与锚点跨度的联合曲线** | **全课题最根本的问题：收益来自语义分组本身，还是仅仅来自更好的分段边界？** |
 | S0.1 | §5.14 单测（含 mass bias **计数**守恒、`w=0` 恒等元）| 数学正确性，纯 CPU，不需要 dump |
-| S0.2 | **`K_eff(n)` 整条曲线**（n 从 1k 到 32k）+ 每簇 segment 数，拟合饱和/log/幂律 | 预算故事成不成立；外推到 1M；**并决定 §5.11 走 Fenwick 还是扁平贪心** |
+| S0.2 | **`K_eff(n)` 整条曲线**（n 从 1k 到 32k）+ 每簇 segment 数，拟合饱和/log/幂律。**`K_eff` 定义为 unclipped DP-means 在 dump 出的 `k_raw` 上跑出的簇数，不设 `K_max` 上限**——这是离线 CPU 分析，衡量的是"内容本身有多少语义多样性"，与生产路径里被 `K_max` 截断后的实际簇数（§5.6）是两个不同的量，后者永远 `≤ K_max` | 预算故事成不成立；外推到 1M；**并决定 §5.11 走 Fenwick 还是扁平贪心** |
 | S0.3 | needle 隔离率：所在簇的成员数分布（关键是 `≤ B′` 的比例）| §3 + §5.9 的核心机制成不成立 |
 | S0.4 | 簇内 **key 方差**与 **value 方差**（两个都要）/ 现有位置槽内方差 | key 方差管分数侧，**value 方差管读出侧**，只测前者会高估收益（§11-D）|
 | S0.5 | entry 的 `(p_hi − p_lo)` 跨度分布，随 `(g_max, ℓ_block)` 变化 | 验证段机制确实压住了跨度 |
@@ -104,9 +130,17 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
 - **S0.0**：如果"完全连续分段"已经拿到大部分收益，语义聚类这条线的边际价值有限，
   应当直接转向更简单的"语义分段"方案（工程量小一个量级、不需要 CPT）。
   **这个门开在最前面，就是为了避免在错误的复杂度上投入。**
-- **S0.2（三重）**：①32k 下 `K_eff` 应在 10² 量级；②曲线形状若是幂律，论文定位从
-  `O(log n)` 改为 `O(n^d log n)` 并重新评估内存公平性；③每簇 segment 数 `S ≪ B′`
-  则 §5.11 走对齐填充，`S ~ B′` 则改走扁平贪心。
+- **S0.2（三重）**：①32k 下**unclipped** `K_eff` 应在 10² 量级；②曲线形状若是幂律，
+  论文定位从 `O(log n)` 改为 `O(n^d log n)` 并重新评估内存公平性；③每簇 segment 数
+  `S ≪ B′` 则 §5.11 走对齐填充，`S ~ B′` 则改走扁平贪心。
+  > **这三条测的都是 unclipped `K_eff`，不是生产路径里被 `K_max` 截断后的簇数**——
+  > 后者被 §5.6 的默认公式 `K_max = max(4, ⌈log₂N⌉)` 卡死在 32k 下 15，必然远小于
+  > 10²。若 unclipped `K_eff` 真的测到 ~100，说明**内容的语义多样性**远超当前
+  > `K_max` 表，但这不直接推翻 §4 的 2344-entry 内存故事——那笔账算的是 `K_max`
+  > 截断之后、Ward 合并生效之后的持久 cache 占用，`K_max` 本来就是设计成"绑定后
+  > 退化为现有 LogKV 行为"（§4）的安全阀。unclipped `K_eff` 大只说明安全阀会经常
+  > 触发，不说明内存会超预算；它是"路由质量有多少损失"的信号，不是"内存会不会
+  > 超"的信号，两者不要混着读。
 - **S0.3**：needle 落在成员数 `≤ B′` 的簇里的比例应显著高于随机基线。若 needle 大多
   并入大簇，§3 的机制不成立，方案应就地停止。
 - **S0.4**：key 方差应显著低于现有位置槽；**若 value 方差没有同步下降**，说明读出侧

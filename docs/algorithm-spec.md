@@ -34,6 +34,24 @@
 默认必须写 `null`**（否则会被同名 CLI 参数静默覆盖，见 §12），不进 `eval.sh`/
 `majob.sh` 核心列表，走 `DIAG_ARGS` opt-in。
 
+**`log_kv_semantic_clusters=True` 必须拒绝 `importance_pooling=True` 与
+`pin_size>0`，在构造时硬失败，不是静默忽略**：
+
+```python
+if log_kv_semantic_clusters and (importance_pooling or pin_size > 0):
+    raise ValueError(
+        "semantic clusters 与 importance_pooling/pin 尚未定义共存语义，"
+        "构造时二选一"
+    )
+```
+
+理由：`compact()` 现有的 `imp1`/`imp2` 路径（`log_kv_cache.py:238-246`、
+`695-706`）会让槽内加权均值偏离纯 `w`-计数均值，改变的正是 Ward 合并代价、
+DP-means 分配阈值、mass bias `log(w/M)` 全部依赖的那个"`w` 就是真实权重"的前提。
+两套机制不是不能共存，是共存的数学还没推导——**pin 系列本身也是另一条独立技术
+路线（CLAUDE.md 顶部已声明），在没有专门推导之前默认禁止组合，比默认允许后产出
+无法解释的分数更安全。**
+
 ### 5.2 分簇：度量与阈值
 
 **用原始（未归一化）pre-RoPE key 上的平方欧氏距离，不用 cosine。** 理由不是习惯，
@@ -97,33 +115,69 @@ v3 的 fork 行为了。
 
 ```
 Phase 1（并行，覆盖绝大多数 token）:
-    冻结 centroid，一次 einsum 算出 (m, K) 距离矩阵
-    所有 min_c ‖k−μ_c‖² ≤ λ_new 的 token 直接按 §5.3 分配到位
+    冻结 centroid 与 p_hi_c，一次算出统一代价矩阵
+        D[t,c] = ‖k_t − μ_c‖² + η·φ(p_t − p_hi_c)      # (m, K)，就是 §5.3 的 d_c
+        S[t,c] = ‖k_t − μ_c‖²                            # (m, K)，纯语义距离，同一次算出
+    c*[t]   = argmin_c D[t,c]                              # 每个 token 的统一代价赢家
+    s*[t]   = gather(S[t,:], c*[t])                        # c* 自己的纯语义距离
+    所有 s*[t] ≤ λ_new 的 token 直接分配到 c*[t]（是否新开 segment 仍按 §5.3 的
+    第二个判据 p_t − p_hi_{c*[t]} > g_max 决定）
 
 Phase 2（串行，只处理 orphan）:
-    min_c ‖·‖² > λ_new 的 token 需要开新簇，它们之间还可能互相成簇
+    s*[t] > λ_new 的 token 需要开新簇，它们之间还可能互相成簇
     在这批 orphan 内部跑一个小 DP-means（O(m_orphan²) 的距离矩阵即可）
 
 Phase 3:
     批末统一更新 centroid 一次（§5.5）
 ```
 
+> **更正（曾经写错）**：早期版本的 Phase 1 判据是"`min_c ‖k−μ_c‖² ≤ λ_new` 的
+> token 直接按 §5.3 分配"——**这不等价于 §5.3**。§5.3 的 `c*` 由统一代价 `d_c`
+> （语义 + 时序 tie-break）的 argmin 决定，不是纯语义距离最小的那个簇；如果纯语义
+> 最近的簇 X 因为太久没被访问、时序项把它排到了后面，而统一代价选中的是簇 Y，
+> 旧判据会把这个 token 当作"安全批量分配"处理，但分配去向和判定阈值用的却是两个
+> 不同的簇（判"要不要开新簇"用 X 的语义距离，`c*` 却该是 Y）。**这不是近似误差，
+> 是判据本身选错了对象**。修法是先按统一代价选出 `c*`，再取 `c*` 自己的语义距离
+> 去比较 `λ_new`——和上面重写的伪代码一致，计算量不变（`S` 和 `D` 本就是同一次
+> einsum 的副产品，多一次 `gather` 可忽略）。
+
 **摊还论证**：Phase 2 的总执行次数被"新簇事件总数"界住，即 `E[K]`，**不是 `O(T)`**。
 所以串行部分的总代价是 `O(K)` 而非 `O(T)`，flush 粒度因此可以从 2 提到 128。
 
-**这是一个近似**（批内冻结 centroid）。**必须测它与严格串行版的分歧率**——S0.8。
+**这是一个近似**（批内冻结 centroid**和** `p_hi_c`）。**必须测它与严格串行版的
+分歧率**——S0.8。`p_hi_c` 冻结这条单独更值得关注：见 §5.21-2 里对它的展开分析
+（同批内连续同簇 token 会因为看到"批前"的 `p_hi_c` 而被误判成隔了很久）。
 
 ### 5.5 分簇：centroid 更新
 
 段内话题稳定 ⇒ 计数均值是对的；跨段可能已漂移 ⇒ 新成员该占更大权重：
 
 ```
-段内:      μ_c ← μ_c + (k − μ_c) / n_c ,   n_c ← n_c + 1
-开新段时:  n_c ← γ · n_c                    # γ=1 纯均值，γ=0 直接替换
+段内:      μ_c ← μ_c + (k − μ_c) / n_eff ,   n_eff ← n_eff + 1
+开新段时:  n_eff ← γ · n_eff                  # γ=1 纯均值，γ=0 直接替换
 ```
 
 这是 §2.4 里说的"零副作用的门控更新"——centroid 只是路由元数据，不参与 attention
-读出，擦它不丢任何信息。注意 **`n_c` 因此必须是浮点而非整数**。
+读出，擦它不丢任何信息。注意 **`n_eff` 因此必须是浮点而非整数**。
+
+> **更正（曾经写错）**：早期版本只维护一个 `n_c`，同时拿它喂 centroid 的在线均值
+> **和** §5.6 Ward 合并代价里的 `n_a, n_b`。**这是两件不同的事,用同一个量会互相
+> 污染**：centroid 更新要的是"新成员该多大程度上拉动 centroid"，`γ` 衰减故意让
+> 历史久远的段贡献变小,这是对的;但 Ward 代价 `(n_a n_b)/(n_a+n_b)·‖μ_a-μ_b‖²`
+> 要近似的是"合并这两个簇会让簇内平方和增加多少",这个量该反映**真实物理规模**
+> （簇里实际存了多少 token/entry），不该被 `γ` 衰减。用被衰减过的 `n_c` 算 Ward
+> 代价，会让一个**跨越多个段、历史很长、真实内容很多**的簇因为 `γ` 反复衰减而显得
+> "小"，被 Ward 误判成廉价可合并——恰恰挑中了最不该被廉价合并的那类簇。
+>
+> **拆成两个独立量**：
+> - **`n_eff`**：上面这条公式,只喂 centroid 更新,`γ` 衰减。
+> - **`n_total`**：单调递增,**从不衰减**,每次该簇收到一个 primary 操作
+>   （`NEW_CLUSTER`/`JOIN`/`NEW_SEGMENT`，见 §5.21-2）就 `+1`——它精确等于这个簇
+>   从建立以来收到过的**真实 token 数**（等价于对该簇 ladder 里所有 entry 的
+>   `w` 求和，但维护一个运行计数器比每次现场求和便宜）。**Ward 代价改用
+>   `n_total_a, n_total_b`**，§5.6 的合并过程相应更新：`n_total_new = n_total_a
+>   + n_total_b`（简单加法，单调不减，和 `n_eff_new = n_eff_a + n_eff_b`
+>   分开维护——后者继续喂 centroid 混合，前者只喂 Ward 代价）。
 
 ### 5.6 分簇：新簇的形成条件、`K_max` 的定尺与自适应
 
@@ -274,14 +328,17 @@ K(t) < K_target  →  调低 λ_new（有富余，允许更细的划分）
 ```
 触发条件: 需要开新簇 且 K_max 个槽位全部 alive
 
-1. Ward 代价矩阵
-   Δ[a,b] = (n_a·n_b)/(n_a+n_b) · ‖μ_a − μ_b‖²
+1. Ward 代价矩阵（**用 `n_total`，不是 `n_eff`**——理由见 §5.5 的更正框：Ward 代价
+   要反映真实物理规模，`n_eff` 会被 `γ` 衰减，用它算代价会让历史长、内容多的簇
+   显得"小"而被误判成廉价可合并）
+   Δ[a,b] = (n_total_a·n_total_b)/(n_total_a+n_total_b) · ‖μ_a − μ_b‖²
    屏蔽对角线与 dead 槽位（§5.19-7），取 (a*,b*) = argmin Δ
 
-2. 合并簇级元数据
-   μ_new    = (n_a·μ_a + n_b·μ_b) / (n_a + n_b)
-   n_new    = n_a + n_b
-   p_hi_new = max(p_hi_a, p_hi_b)
+2. 合并簇级元数据（centroid 混合继续用 `n_eff`，物理规模计数继续用 `n_total`）
+   μ_new       = (n_eff_a·μ_a + n_eff_b·μ_b) / (n_eff_a + n_eff_b)
+   n_eff_new   = n_eff_a + n_eff_b
+   n_total_new = n_total_a + n_total_b
+   p_hi_new    = max(p_hi_a, p_hi_b)
 
 3. 合并两条 ladder —— 逐层归并 + 级联进位
    for ℓ in 0 .. L_alloc-1:
@@ -326,10 +383,12 @@ Every merged slot covers a contiguous span."——配对是**时间序上相邻*
 
 ### 5.8 簇内压缩：O(log n) 保证的准确陈述
 
-单簇容纳 `n_c` 个 token 需要 `L_c = ⌈log₂(n_c/B′ + 1)⌉` 层，占 `B′·L_c` 个 entry：
+单簇容纳 `n_total_c` 个 token 需要 `L_c = ⌈log₂(n_total_c/B′ + 1)⌉` 层，占 `B′·L_c`
+个 entry（这里的 `n_total_c` 就是 §5.5/§5.6 定义的**未衰减**簇物理规模，不是
+`n_eff`——两者在这条空间论证里必须是同一个量，否则界不成立）：
 
 ```
-Σ_c B′·log₂(n_c/B′)  ≤  K·B′·log₂( n / (K·B′) )  =  O( K·B′·log n )
+Σ_c B′·log₂(n_total_c/B′)  ≤  K·B′·log₂( n / (K·B′) )  =  O( K·B′·log n )
 ```
 
 不等号来自 log 的**凹性**：给定总 token 数，簇均衡分布时求和最大。所以
@@ -509,7 +568,8 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 | buffer | shape | dtype | 用途 |
 |---|---|---|---|
 | `centroid` | `(B,G,K_max,d)` | fp32 | 语义身份，路由用 |
-| `n_c` | `(B,G,K_max)` | **fp32** | 有效计数。**必须浮点**——`γ` 衰减会产生非整数 |
+| `n_eff` | `(B,G,K_max)` | **fp32** | centroid 混合权重。**必须浮点**——`γ` 衰减会产生非整数。**只喂 §5.5 的 centroid 更新，不进 Ward 代价**（§5.5/§5.6 的更正框）|
+| `n_total` | `(B,G,K_max)` | int32 | 簇的真实物理规模（token 数），单调不减、从不衰减。**Ward 代价（§5.6）和 §5.8 的空间界都用这个** |
 | `p_hi_c` | `(B,G,K_max)` | int32 | 该簇最近一次收到成员的位置（join cost + segment 判定）|
 | `alive` | `(B,G,K_max)` | bool | 槽位占用。**每个头实际用几个簇可以不同**，`K_max` 只是共享上界 |
 
@@ -543,7 +603,15 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 32k 下 `(1,8,4·32768,4)` int32 ≈ 16MB/层，28 层共 **约 448MB**——是 §5.21-2 那份
 正确性升级的代价，不是可选项。
 
-**per-head 尺度估计**（§5.2）：`s_h (B,G)` 加配套的 `k_mean_h (B,G,d)`。
+**per-head 尺度估计**（§5.2）：**形状是 `(n_layer, G)`，不是 `(B, G)`**——`s_h`
+是 §5.21-4 定案的**离线标定常量**,标定的是模型本身在每个 (layer, KV头) 上的 key
+尺度,和当前跑的是哪个 batch 元素无关。它应该是从标定 artifact 加载的常量张量、
+随 config 走,使用时（例如 §5.2 的 `λ_new = λ_rel·s_h` 计算）再广播到 batch 维,
+**不是每次 `reset_parameters()` 都要初始化的 per-cache 运行时 buffer**。之前把它
+写成 `(B,G)` 运行时 buffer 是和"离线标定"这个决定不一致的残留——§5.19-8 那条
+"`s_h` 要在 `reset_parameters()` 里初始化成一个合理常数"说的是**没有标定值可用时
+的兜底默认**（比如刚加进配置、还没跑过标定 pass 的层）,不是"每次 reset 都要重新
+估计",两者不矛盾但容易读错,这里一并澄清。
 
 **两个布局上的好处**：
 
@@ -574,19 +642,35 @@ def mid_anchor(lo, hi, sum_wp, w):
     return torch.clamp(mid, lo, hi)
 
 
-# 锚点 -> 虚拟槽键：就是标准 RoPE，在真实位置上取现成的 cos/sin cache 行
-def materialize_anchor_keys(k_raw, anchors, cos_cache, sin_cache, rope_n_elem):
-    """anchors: (..., S, M) int64 真实位置; 返回 (..., S, M, d)
-    每个锚点一次 apply_rope —— rho 恒为 1，不存在相消。
+# 锚点 -> 任意 key 空间向量的旋转版本：标准 RoPE 数学，在几个确定的整数坐标上
+# 各转一次。k_raw 和 sigma_u/gamma_a 是同一个函数的两次不同调用（见下方说明），
+# 不是两套机制。
+def _rotate_at_anchors(content, anchors, cos_cache, sin_cache, rope_n_elem):
+    """anchors: (..., S, M) int64，**确定的整数坐标**（p_lo/p_hi 是真实成员位置，
+    p_mid 是质心，两者对这个函数完全一样——它不关心坐标"真不真实"，只要求是单一
+    确定的整数，rho 就恒为 1，不存在相消）。返回 (..., S, M, d)。
     调用前必须 clamp 无效锚点（哨兵值会越界，见 §5.19-4）。"""
     cos = cos_cache[anchors]        # (..., S, M, rope_n_elem)
     sin = sin_cache[anchors]
-    x   = k_raw.unsqueeze(-2)[..., :rope_n_elem]
+    x   = content.unsqueeze(-2)[..., :rope_n_elem]
     h   = rope_n_elem // 2
     rot = torch.cat((-x[..., h:], x[..., :h]), -1)
     roped = x * cos + rot * sin
-    tail  = k_raw.unsqueeze(-2)[..., rope_n_elem:].expand(*roped.shape[:-1], -1)
+    tail  = content.unsqueeze(-2)[..., rope_n_elem:].expand(*roped.shape[:-1], -1)
     return torch.cat([roped, tail], -1)
+
+
+def materialize_anchor_keys(k_raw, anchors, cos_cache, sin_cache, rope_n_elem):
+    return _rotate_at_anchors(k_raw, anchors, cos_cache, sin_cache, rope_n_elem)
+
+
+def materialize_anchor_directions(sigma_u_raw, gamma_a_raw, anchors, cos_cache, sin_cache, rope_n_elem):
+    """Σ/Γ 的 key 空间方向必须和 k_raw 同一套旋转，理由见下方"为什么 Σ/Γ 也要转"。
+    sigma2/gamma（标量特征值）和 gamma_b（value 空间方向）不经过这个函数——
+    value 从不被 RoPE，标量没有方向可转。"""
+    sigma_u_eff = _rotate_at_anchors(sigma_u_raw, anchors, cos_cache, sin_cache, rope_n_elem)
+    gamma_a_eff = _rotate_at_anchors(gamma_a_raw, anchors, cos_cache, sin_cache, rope_n_elem)
+    return sigma_u_eff, gamma_a_eff
 
 
 # 去重 + mass bias 摊薄因子
@@ -596,7 +680,41 @@ def dedup_anchors(lo, hi, mid):
     ...
 ```
 
+**为什么 Σ/Γ 也要按锚点转，不能只转 `k_raw`。** §5.10/§5.20-B 说"Σ/Γ 的统计空间
+post-RoPE → pre-RoPE，数学不变，只是喂进去的张量换了"——这句话覆盖了**累积**这一步
+（Chan merge 在 pre-RoPE 空间做，正确），但没覆盖**读出**这一步。现有打分/读出公式
+（`log_kv_cache.py:1500-1501`）是：
+
+```
+score_s = scale·(q · k_s) + 0.5·scale²·sigma2_s·(q · sigma_u_s)² + λ·log(w_s)
+read_s  = v_s + scale·gamma_s·(q · gamma_a_s)·gamma_b_s
+```
+
+`q` 是 post-RoPE（query 从来都是），如果 `sigma_u_s`/`gamma_a_s` 现在存的是
+pre-RoPE 方向却直接拿去和 post-RoPE 的 `q` 做点积，两边活在不同的坐标系里，点积
+的值没有意义——**这不是精度损失，是算错了坐标系**，和当初"pre-RoPE k 不能直接喂
+attention"是同一类错误。`gamma_b`（value 空间方向，value 从不 RoPE）和 `sigma2`/
+`gamma`（标量特征值，没有方向）不受影响，只有 `sigma_u`/`gamma_a` 这两个"key 空间
+方向"字段需要物化。
+
+**做法和 `k_raw` 完全对称，复用同一个旋转原语**（上面 `_rotate_at_anchors`）：每个
+entry 展开出 `M` 个虚拟槽时，`sigma_u`/`gamma_a` 也各自展开出 `M` 个版本
+（`materialize_anchor_directions`），和 `k_eff_a` 用**同一个锚点、同一次旋转**——
+数学上这是合法的，因为旋转是线性映射，一个方向向量在 pre-RoPE 空间代表的协方差
+主轴，转到某个确定位置的 post-RoPE 空间后仍然是那个位置上的协方差主轴，和
+`k_raw → k_eff_a` 的道理一模一样。**不新增任何持久存储**——`sigma_u`/`gamma_a`
+仍然是每 entry 存一份（pre-RoPE），`M` 份只在读出时瞬时物化，和 `k_eff` 同样是
+读出槽池的一部分，不是 cache 内存的一部分（§4 那两笔账的区分在这里依然适用）。
+
 **单测（S0.1，纯 CPU，不依赖 dump）**：
+- **Σ/Γ 锚点物化的嵌套精确性**：单 token entry（`M=1`）时，`materialize_anchor_
+  directions` 对 `sigma_u`/`gamma_a` 的旋转应与直接对该 token 位置做
+  `model.apply_rope` 逐位一致——和 `materialize_anchor_keys` 的嵌套精确性单测
+  结构完全对称，因为底层是同一个 `_rotate_at_anchors`。
+- **坐标系回归**：构造一个简单二阶修正非零的合成 entry，断言"score 里的二阶项
+  用旋转后的 `sigma_u_eff` 算"和"用未旋转的 `sigma_u` 直接点乘 `q`"两者**不相等**
+  （只要该 entry 的锚点不在原点）——这条测的是"没有人漏转"，而不是"转得准不准"，
+  是防回归最便宜的一条。
 - **嵌套精确性**：单 token entry（`p_lo=p_hi=p_mid`）→ M=1，输出与 `model.apply_rope`
   在该位置上逐位一致。
 - **合并的结合律**：任意二叉合并顺序**逐位一致**——`sum_wp` 是整数加法，这条应当
@@ -769,11 +887,13 @@ def dedup_anchors(lo, hi, mid):
 |---|---|
 | `_binary_carry()` 的驱动逻辑 | **核心控制流重写，不是增量改动**。合并算子本身复用，但驱动它的 `_counts` host 镜像 + Python 标量分支必须整体替换成按 level 静态循环、对 (B,G,K) 掩码并行的向量化 carry（§5.21-3）|
 | `_counts[ell]` | 全局标量 → **删除**（不是扩展成 `(B,G,K,L)`）。host 镜像的存在理由是避免 GPU sync，语义簇路径下每个 (batch,头,簇) 独立进位，同步点会变成每 flush 一次，必须走 §5.21-3 的向量化方案 |
-| Σ/Γ 的统计空间 | post-RoPE → pre-RoPE。**数学不变**，只是喂进去的张量换了 |
+| Σ/Γ 的统计空间 | post-RoPE → pre-RoPE。**累积数学不变**，只是喂进去的张量换了；**但读出侧必须新增一步**——`sigma_u`/`gamma_a` 现在是 pre-RoPE 方向，不能直接和 post-RoPE 的 `q` 点积，要走 §5.14 的 `materialize_anchor_directions`，和 `k_raw→k_eff` 对称展开成 `M` 份（§5.14 那段"为什么 Σ/Γ 也要转"）|
 | `compact()` 签名 | 多带 `(p_lo, p_hi, sum_wp)` 走 `merge_anchors`，一行 |
+| `n_c` | 拆成 `n_eff`（centroid 混合，`γ` 衰减）和 `n_total`（Ward 代价 + §5.8 空间界，单调不减）——原来单个 `n_c` 两处混用会让 Ward 误判长历史簇是"小簇"（§5.5/§5.6 的更正框）|
 | mass bias | `λ·log(w)` → `λ·log(w/M)`（§2.3，必须做的正确性修正）|
 | `get_attention_state()` | 多返回一个有效位掩码与每 entry 的 `M_s` |
 | cache 入口 | 收 pre-RoPE k + 绝对位置，而不是 post-RoPE k |
+| `level_w`/entry `w` 的 dtype | 不能继承 activation dtype（现有 `log_kv_cache.py:346-349` 是 `torch.zeros(..., dtype=dtype)`，跟着 fp16/bf16 走）。fp16 整数精确表示上限是 2048、溢出上限 65504；1M 上下文下一个高冗余大簇的 `w` 可以到几十万，**必须 fp32 或 int32**，`log(w/M)` 之前再转 fp32 |
 
 **二阶修正的精度应该变好，不是变差**：D1 自检里 width≥8 的失真，根因之一是 Σ 统计在
 post-RoPE 空间——槽内 token 位置不同，`R(p_j)k_j` 之间的差异里混着**位置相位方差**，
@@ -843,14 +963,24 @@ JOIN          (cluster,   segment,  -1)      # 归入既有簇的当前段
 
 ── 结构操作：不消费 token，作为主操作的副作用穿插出现 ──
 WARD_MERGE    (keep_slot, free_slot, -1)     # 给某个 NEW_CLUSTER 腾位，必然紧邻其前
-PAD_INSERT    (cluster,   level,    count)   # 给某个 NEW_SEGMENT 做对齐填充，紧邻其后
+PAD_INSERT    (cluster,   level,    count)   # 给某个 NEW_SEGMENT 做对齐填充，必然紧邻其前
 CARRY         (cluster,   level,    -1)      # ladder 进位，可由计数推出，记下来便于断言
 ```
 
 **顺序规则**：`op_log` 按 token 到达顺序线性写入。主操作严格一一对应"下一个待处理的
 token"；结构操作插在触发它的主操作旁边（`WARD_MERGE` 在它服务的 `NEW_CLUSTER` **之前**
-——先腾位再建簇；`PAD_INSERT` 在它服务的 `NEW_SEGMENT` **之后**——先确认开了新段、
-再决定要不要对齐填充；`CARRY` 跟在导致进位的那次 ladder 追加后面）。
+——先腾位再建簇；`PAD_INSERT` 也在它服务的 `NEW_SEGMENT` **之前**——先把上一个段的
+尾部对齐填好，再让新段的第一个 token 进场；`CARRY` 跟在导致进位的那次 ladder 追加
+后面）。
+
+> **一处曾经写错的顺序，务必别再犯**：早期版本把 `PAD_INSERT` 写在它服务的
+> `NEW_SEGMENT` **之后**。§5.11 自己举的例子已经说明了正确顺序应该是什么样——
+> `[a1][a2][a3][∅] | [b1][b2]`，空位要插在**旧段尾部、新段第一个成员之前**。
+> 但按"PAD 在 NEW_SEGMENT 之后"这条错误顺序重放，`NEW_SEGMENT` 会先把 `b1`
+> append 进 ladder，`PAD_INSERT` 才轮到执行——填充槽这时候只能插在 `b1`**后面**，
+> 变成 `a3, b1, ∅`，跨段配对的问题根本没解决，§5.11 整节的动机落空。**填充必须
+> 在新段第一个 token 被真正 append 之前完成**，所以 `PAD_INSERT` 必须先于它服务的
+> `NEW_SEGMENT`，不是之后。
 
 **重放算法**（backward 只需要这一个循环，不需要重新跑 §5.2–§5.6 的任何一步）：
 
@@ -858,16 +988,20 @@ token"；结构操作插在触发它的主操作旁边（`WARD_MERGE` 在它服�
 token_ptr = 0
 for op in op_log:
     if op.type in {NEW_CLUSTER, JOIN, NEW_SEGMENT}:
-        # 消费 token_ptr 指向的原始 (k_raw, v)，按 op 指定的 (cluster, segment)
-        # 追加进该簇的 ladder —— 用的是 compact()/_binary_carry() 那套纯算术，
-        # 不依赖任何浮点比较，所以给定同样的 (token, cluster, segment) 三元组，
-        # 结果必然逐位相同。
-        append_to_ladder(k_raw[token_ptr], v[token_ptr], op.cluster, op.segment)
+        # 消费 token_ptr 指向的原始 (k_raw, v, pos) —— 位置必须一起传，锚点
+        # (p_lo/p_hi/sum_wp) 是绝对位置的函数，缺了 pos 这一步没法定义。
+        # 按 op 指定的 (cluster, segment) 追加进该簇的 ladder —— 用的是
+        # compact()/_binary_carry() 那套纯算术，不依赖任何浮点比较，所以给定
+        # 同样的 (token, pos, cluster, segment) 四元组，结果必然逐位相同。
+        append_to_ladder(k_raw[token_ptr], v[token_ptr], pos[token_ptr],
+                          op.cluster, op.segment)
         token_ptr += 1
     elif op.type == WARD_MERGE:
         merge_cluster_ladders(op.keep_slot, op.free_slot)   # §5.6 的五步过程
     elif op.type == PAD_INSERT:
-        insert_pad_entries(op.cluster, op.level, op.count)   # §5.11
+        insert_pad_entries(op.cluster, op.level, op.count)   # §5.11，必须在它
+        # 服务的 NEW_SEGMENT 之前执行到——这靠 op_log 里的写入顺序保证，此处的
+        # 遍历只是忠实按顺序回放，不需要额外判断"是不是该我了"。
     elif op.type == CARRY:
         pass   # 已经隐含在 append_to_ladder 里发生，这里只做断言用
 ```
@@ -893,20 +1027,60 @@ centroid** 并行分配一整个 flush 批（多达 128 个 token），但 §5.3
 连带 S0.2 的 segment 数统计来判定**——如果膨胀量在 §5.11 对齐填充的预算内可以吸收，
 可以先不修，留作已知近似。
 
-**容量：`OP_max` 现在有一个可证明的硬上界，不是经验估计。** 逐项数一遍：
+**容量：`OP_max` 现在有一个可证明的硬上界，不是经验估计——但这个上界本身有前提，
+不是对任意 `ℓ_block` 都成立。** 逐项数一遍：
 
 ```
 主操作     恰好 T 条（每 token 一条，互斥，精确）
 WARD_MERGE 最坏 O(T)（病态输入下，K_max 绑定后几乎每个 token 都需要先腾位再建簇——
            这不是罕见事件的假设，是 §4"最坏情况"本身就该覆盖的场景）
-PAD_INSERT 最坏 O(T)（每条 NEW_SEGMENT 至多配一条，同阶）
+PAD_INSERT 最坏 O(T)（每条 NEW_SEGMENT 至多配一条——**前提是 `count` 字段把一次
+           边界的全部填充聚合进同一条 op**，不是每个填充槽一条 op，否则这一项
+           会变成 O(T·2^ℓ_block)，指数项直接压垮整个上界）
 CARRY      O(T/B′)（标准二进制计数器的摊还论证：n 次自增的总进位次数是 O(n) 而非
            O(n log n)——第 i 层每 2^i 次自增才翻一次，比其它三项低一个量级，可并进
            余量而非单独扩容）
 ```
 
-**结论**：`OP_max = c · T_max`，`c` 取一个能覆盖"1 主操作 + 1 WARD_MERGE + 1
-PAD_INSERT + CARRY 余量"的小常数，**`c = 4` 足够**。这比早期"`T_max +
+**`PAD_INSERT` 那一行的 O(T) 依赖三个前提，缺一个都会让 `OP_max = 4·T_max` 不成立**：
+
+1. **`ℓ_block ≤ 2`**。这不是为了让 §5.11 那张"每边界浪费 `2^ℓ_block−1` 槽位"的表
+   本身好看——那张表管的是槽位预算，跟这里的 op 计数是两件事。真正的原因是
+   `count` 字段的取值范围必须有界：若 `ℓ_block` 可以取到 Stage 0 探索范围
+   `L_alloc`（32k 下约 11~15），单次填充就可能要求 `count` 达到 `2^11` 量级，超过
+   单层容量 `B′`（512）——这时"一条边界一条 `PAD_INSERT` op"这个聚合假设本身
+   失效（填充量超出该层能装下的范围，必须拆成多条、甚至跨层的 op），O(T) 退化成
+   O(T·ℓ_block) 甚至更差。**`ℓ_block ≤ 2` 把 `count` 的上界摁在 3，永远不会撞
+   `B′`，这是 O(T) 成立的充分条件。**
+2. **`PAD_INSERT` 的实现确实按 `count` 聚合，不是把每个填充槽拆成独立 op**——这是
+   op 格式 `(cluster, level, count)` 里 `count` 字段存在的唯一理由；实现时若偷懒
+   展开成 `count` 条独立 op，这一项直接退化成上面第 1 点里的指数情形，且退化的
+   触发条件与 `ℓ_block` 是否 ≤ 2 无关（哪怕 `ℓ_block=2`，展开成独立 op 也会让
+   常数从 1 变成 3，只是没那么致命）。
+3. **`PAD_INSERT` 先于它服务的 `NEW_SEGMENT`**（§5.21-2 上面的顺序规则）——这条
+   只影响语义正确性，不影响计数，但错误顺序产生的 op 仍然占用 `OP_max` 里的一个
+   位置，所以列在这里作为"这三条同时成立，`OP_max=4·T_max` 才是安全上界"的一部分。
+
+**生产路径必须在 cache 构造时（不是训练/推理运行到一半才发现）硬校验
+`ℓ_block ∈ {0,1,2}`**：
+
+```python
+if log_kv_seg_block_level not in (0, 1, 2):
+    raise ValueError(
+        f"log_kv_seg_block_level={log_kv_seg_block_level} 超出生产路径支持范围 "
+        f"{{0,1,2}}——OP_max 的 PAD_INSERT 聚合假设、§5.11 的槽位预算表都只在这个"
+        f"范围内成立，更大的值只能用于 Stage 0 离线扫描"
+    )
+```
+
+**Stage 0 的 S0.0 豁免于这条校验**：S0.0 扫 `(g_max, ℓ_block)`（§7）是在 dump 出来
+的 `k_raw` 上做纯 CPU/NumPy 模拟，复现簇/段边界的计数逻辑，**完全不经过 `op_log`
+或真实 cache 构造路径**——`ℓ_block` 在那里只是一个统计口径参数，不会真的驱动一次
+GPU cache 写入，所以不受这条校验约束。等 S0.0 选出生产候选值后，才会以该值（必然
+落在 `{0,1,2}` 内）进入 Stage 1 实现，届时这条校验才第一次生效。
+
+**结论（三条前提成立时）**：`OP_max = c · T_max`，`c` 取一个能覆盖"1 主操作 + 1
+WARD_MERGE + 1 PAD_INSERT + CARRY 余量"的小常数，**`c = 4` 足够**。这比早期"`T_max +
 2·K_max·(预期合并次数)`"的经验估计更大（后者隐含假设合并很少见，是期望而非最坏
 情况），但现在是**证明过的上界**，可以像现有 `_count_tokens` 对 `max_seq_length`
 那样，**溢出直接硬失败**（`raise RuntimeError`），不做动态扩容、不做静默截断——

@@ -63,12 +63,13 @@ cache（每 layer 一个）
 |---|---|
 | `K` | 当前实际簇数，内容驱动，每个 (batch, KV头) 各不相同 |
 | `K_max` | 簇数硬上界。**默认** `max(4, ⌈log₂N⌉)` 由 `max_seq_length` 推导，**但可用 `--log_kv_cluster_k_max` 覆盖**（消融正是在扫它，§5.6）|
-| `K_eff` | 实测的"内容真正需要多少簇"。**S0.2 要测它随 n 的整条曲线** |
+| `K_eff` | 实测的"内容真正需要多少簇"，**unclipped DP-means，不设 `K_max` 上限**——是离线 CPU 分析口径，不是生产路径里被 `K_max` 截断后的实际簇数（两者不是同一个量，见 `experiments.md` S0.2）。**S0.2 要测它随 n 的整条曲线** |
 | `L_alloc` | 每簇 ladder 的层数，按均衡界推导（§5.12）。**纯推导量，无 CLI 开关**；覆盖 `K_max` 时必须连带重算，否则预算算术失效 |
 | `L_max` | "单簇独吞整条序列"所需层数。只用于说明超配，不用于定尺 |
 | `ℓ` | 层索引 |
-| `ℓ_block` | 段对齐保护到第几层。代价 `2^ℓ_block − 1` 槽/边界，**指数增长，只能取 1~2** |
-| `n_c` | 簇 `c` 的有效计数。**必须是浮点**——`γ` 衰减会产生非整数 |
+| `ℓ_block` | 段对齐保护到第几层。代价 `2^ℓ_block − 1` 槽/边界，**指数增长，只能取 1~2**；生产路径构造时硬校验 `ℓ_block ∈ {0,1,2}`，Stage 0 的离线扫描（不经过 `op_log`/真实 cache）不受此约束（§5.21-2）|
+| `n_eff` | 簇 `c` 的 centroid 混合权重，**`γ` 衰减，浮点**。只喂 §5.5 的在线均值更新，不进 Ward 代价 |
+| `n_total` | 簇 `c` 的真实物理规模（token/entry 数），**单调不减，从不衰减，整数**。Ward 合并代价（§5.6）和 §5.8 的 O(log n) 空间界都用这个，不能用 `n_eff`——早期版本只有一个 `n_c` 两处混用，会让 Ward 把"历史长但被衰减过"的簇误判成小簇（§5.5/§5.6 更正框）|
 
 ## T4. 算法参数（当前有效）
 
@@ -107,8 +108,8 @@ cache（每 layer 一个）
 | `sum_wp` | `Σ_j w_j·p_j` 的 **int64** 累加器。合并就是加法，精确可结合。**必须 int64**（量程 `n²`）|
 | `p_mid` | `clamp((2·sum_wp + w) // (2·w), p_lo, p_hi)`，位置的加权均值，**round-half-up 的整数实现**（不是 floor，也不是浮点 round，理由见 §5.14）。**是质心，不是真实成员位置**——早期版本用"继承权重更大一侧"的规则，不满足结合律且在平衡 Fenwick 路径下恒等于 `p_lo`（CLAUDE.md §2.2 更正框）|
 | `μ_c` | 簇 `c` 的 centroid |
-| `Σ`（`sigma_u`,`sigma2`）| 槽内 key 协方差的 rank-1 近似，供**分数侧**二阶修正 |
-| `Γ`（`gamma_a`,`gamma_b`,`gamma`）| **读出侧**的 rank-1 修正。结构上就是 `qᵀ(γa γbᵀ)`，一个秩 1 线性 state（§2.4）|
+| `Σ`（`sigma_u`,`sigma2`）| 槽内 key 协方差的 rank-1 近似，供**分数侧**二阶修正。存储在 pre-RoPE 空间，读出时 `sigma_u` 必须和 `k_raw` 一样按锚点物化成 post-RoPE 才能和 `q` 点乘，否则坐标系不匹配（§5.14）|
+| `Γ`（`gamma_a`,`gamma_b`,`gamma`）| **读出侧**的 rank-1 修正。结构上就是 `qᵀ(γa γbᵀ)`，一个秩 1 线性 state（§2.4）。`gamma_a` 和 `sigma_u` 一样需要按锚点 RoPE 物化；`gamma_b`（value 方向）和 `gamma`（标量特征值）不需要——value 从不被 RoPE |
 | Ward 代价 | `(n_a n_b)/(n_a+n_b)·‖μ_a−μ_b‖²`，簇内平方和的增量。**与聚类距离、rank-1 残差是同一个量**（§5.2）|
 | Chan merge | 并行计算两组数据合并后二阶矩的标准公式，`compact` 里用它合并 Σ/Γ |
 
@@ -125,10 +126,10 @@ cache（每 layer 一个）
 | `LogKVStreamTrainingAttention` | 训练用的自定义 autograd。**forward 不建图，backward 重置 cache 并重放整条流**——语义路由打破了它的确定性前提（§11-A）|
 | `second_order` / `second_order_scale` | 是否构建 Σ/Γ / 它们的运行时缩放（CPT 期间 warmup 爬坡）|
 | `causal_tail` | 在途 chunk 的因果掩码，省掉一个全尺寸 mask |
-| `importance_pooling` | 已验证为负结果的邻近方案（niah 0.0827→0.0787）。**建议保持关闭** |
+| `importance_pooling` | 已验证为负结果的邻近方案（niah 0.0827→0.0787）。**建议保持关闭**；语义簇开关打开时与 `pin` 一起被构造时硬性禁止组合（§5.1），共存数学尚未推导 |
 
-**新增的 buffer**（§5.13）：`centroid`、`n_c`、`p_hi_c`、`alive`、`level_count`、
-`pad_mask`、`op_log`、`s_h`。
+**新增的 buffer**（§5.13）：`centroid`、`n_eff`、`n_total`、`p_hi_c`、`alive`、
+`level_count`、`pad_mask`、`op_log`、`s_h`。
 
 ## T8. 外部概念
 
