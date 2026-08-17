@@ -121,7 +121,7 @@ cache（每 layer 一个）
 | `_append_level0()` | 往 level 0 追加 entry，满 `B′` 个就触发进位 |
 | `_flush_pairs()` | 批量版的窗口 flush。**它存在的唯一理由就是消除逐对串行**——语义路由会把这个串行请回来（§11-B）|
 | `_pair_rank1_stats()` | 算两个槽合并时新增的协方差，rank-1 化 |
-| `log_kv_slot_attention()` | 槽级 attention：`score = scale·(q·k) + ½scale²σ²(q·σu)² + λ·log w`，`read = v̄ + scale·γ(q·γa)·γb` |
+| `log_kv_slot_attention()` | 槽级 attention。**这一行描述的是现有代码**：`score = scale·(q·k) + ½scale²σ²(q·σu)² + λ·log w`，`read = v̄ + scale·γ(q·γa)·γb`。语义簇版本把 `log w` 换成 **`log(w/M)`**，见 §2.3/§5.15，**写单测时不要抄这一行的公式** |
 | `LogKVStreamTrainingAttention` | 训练用的自定义 autograd。**forward 不建图，backward 重置 cache 并重放整条流**——语义路由打破了它的确定性前提（§11-A）|
 | `second_order` / `second_order_scale` | 是否构建 Σ/Γ / 它们的运行时缩放（CPT 期间 warmup 爬坡）|
 | `causal_tail` | 在途 chunk 的因果掩码，省掉一个全尺寸 mask |

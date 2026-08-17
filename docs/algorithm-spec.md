@@ -508,7 +508,9 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 | `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**。只记 token 归属
 不足以重建结构，见 §5.21-2 |
 
-32k 序列下 `(1,8,32768)` int16 = 512KB/层，28 层共 14MB，可忽略。
+容量与内存：`OP_max` 取 `T_max + 2·K_max·(预期合并次数)` 的保守上界。32k 下
+`(1,8,2·32768,4)` int32 ≈ 8MB/层，28 层共 **224MB**——比早期版本估的 `route_log`
+（14MB）贵一个量级，是 §5.21-2 那份正确性升级的代价，不是可选项。
 
 **per-head 尺度估计**（§5.2）：`s_h (B,G)` 加配套的 `k_mean_h (B,G,d)`。
 
@@ -600,6 +602,12 @@ def dedup_anchors(lo, hi, mid):
 - **`w=0` 填充是恒等元**：`merge(A, ∅) == A`，含锚点（§5.11）。
 - **v2 对照**：保留 z 统计量实现与其 Dirichlet 闭式解单测，供 §8 消融使用。
 
+**这条 v2 对照单测同时是"新代码复现旧数学"的正式正确性检验，不是可有可无的消融
+配件。** 在 `anchor_mode=z` 且 gain 强制取 honest-decay（即 v2 的 β=1 分支，`gain≡1`）
+的合成序列上，验证物化出的 pooled key 与手算的 Dirichlet 闭式解 `sin(wθ/2)/(w·sin(θ/2))`
+逐位一致——这就是现有 LogKV 的位置数学，一位不差。**这条测试只需要几个 token 的合成
+数据，不需要 K_max=1、不需要 eval、不需要 GPU。**
+
 ### 5.15 `litgpt/log_kv_cache.py`
 
 - 新增 §5.13 的全部 buffer。
@@ -647,6 +655,14 @@ def dedup_anchors(lo, hi, mid):
 4. **多簇路由 + 向量化**（§5.4 三阶段），拿第 2 步的参考实现测分歧率。
 5. **段对齐填充**（§5.11）+ `level_count` 簿记改造。
 6. **训练路径**：`op_log` 的保存与重放（§11-A、§5.21-2）。
+
+> **`K_max=1` 的 eval-time 数字不是正确性闸门，即使实现完全正确也不会复现旧数字。**
+> 原因是 §2.1 的 ladder level 0 从"2-token 合并"改成"单 token（`w=1`）"——这是设计里
+> 明说的**不可选、承重**的改动（§3 needle 论证、§5.9 都靠它），跟 `K_max` 无关。所以
+> `K_max=1` 只是把**簇轴**退化成 1 条 ladder，**层轴**（level 0 的宽度）仍然是新的、
+> 更细的。真正验证"新代码复现旧数学"的是上面那条 `anchor_mode=z` 的 CPU 单测——它
+> 绕开层轴差异，只测位置公式本身。`K_max=1` 的 eval 数字请当**消融参考点**看待，
+> 不要设容差、不要拿它当 pass/fail（§6 Stage 2、§12-E）。
 
 ### 5.19 实现 tips 与易错点
 
@@ -696,9 +712,8 @@ def dedup_anchors(lo, hi, mid):
 | 组件 | 为什么能直接用 |
 |---|---|
 | `compact()` 的加权均值 | 按 `w` 加权、不要求两侧等宽；且已核实配对是**时间序相邻**的（§5.7）|
-| `_binary_carry()` 的进位逻辑 | 二进制计数器与"成员从哪来"无关，簇内成员序列同样是有序流 |
 | Chan-style 二阶矩合并 + rank-1 截断 | 纯代数，与内容语义无关。`_pair_rank1_stats`、`_dominant_eigvec_small`、`_rank1_psd_from_factors`、`_rank1_cross_from_factors` 全部原样 |
-| `log_kv_slot_attention` 的打分/读出结构 | `score = scale·(q·k) + ½scale²σ²(q·σu)² + λ·log w`、`read = v̄ + scale·γ(q·γa)·γb` 不变 |
+| `log_kv_slot_attention` 的打分/读出结构 | 公式骨架 `score = 点积 + 二阶项 + λ·log(质量因子)`、`read = v̄ + scale·γ(q·γa)·γb` 不变；**但质量因子从 `w` 变成 `w/M`，这个改动记在下表 B，不要以为这行说的是「连质量因子也不变」** |
 | GQA 的 rf 折叠、fp32 分数缓冲、`causal_tail` | 与压缩机制正交 |
 | `LogKVStreamTrainingAttention` 的流式重放**框架** | 骨架、内存论证、per-block 梯度正确性论证全部不变（但重放的**依据**要换，见 C）|
 
@@ -706,11 +721,17 @@ def dedup_anchors(lo, hi, mid):
 `_pair_rank1_stats` 已经在算的那个量的迹。**聚类要的距离、簇合并要的代价、二阶修正
 要吸收的残差，是同一个量**，不需要引入任何新的数值原语（§5.2）。
 
+> **`_binary_carry` 不属于这张表——它是核心控制流重写，不是"一行不改"。** 只有
+> **合并算子本身**（"level 空放下、非空 compact 后带着翻倍宽度上浮"这套算术）复用；
+> **驱动它的控制流**（现在靠 `_counts` 的 host 端镜像做 Python 标量判断）必须删掉，
+> 换成对全部 (B,G,K) 的掩码并行 carry（§5.21-3）。放进下表 B，不放这里。
+
 #### B. 需要改动（按改动量排序）
 
 | 组件 | 改动 |
 |---|---|
-| `_counts[ell]` | 全局标量 → 每 (簇, 层) 独立；且"同层等宽"假设要放开。**最集中的风险点（§5.19-2）** |
+| `_binary_carry()` 的驱动逻辑 | **核心控制流重写，不是增量改动**。合并算子本身复用，但驱动它的 `_counts` host 镜像 + Python 标量分支必须整体替换成按 level 静态循环、对 (B,G,K) 掩码并行的向量化 carry（§5.21-3）|
+| `_counts[ell]` | 全局标量 → **删除**（不是扩展成 `(B,G,K,L)`）。host 镜像的存在理由是避免 GPU sync，语义簇路径下每个 (batch,头,簇) 独立进位，同步点会变成每 flush 一次，必须走 §5.21-3 的向量化方案 |
 | Σ/Γ 的统计空间 | post-RoPE → pre-RoPE。**数学不变**，只是喂进去的张量换了 |
 | `compact()` 签名 | 多带 `(p_lo, p_hi, sum_wp)` 走 `merge_anchors`，一行 |
 | mass bias | `λ·log(w)` → `λ·log(w/M)`（§2.3，必须做的正确性修正）|
