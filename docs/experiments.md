@@ -27,22 +27,47 @@ needle 的 token span（复用另一分支已有的 `log_kv_pin_diag.py` 定位�
 
 Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生产代码之前**（§5.21-5）。
 
-**hook 点**：`CausalSelfAttention.forward` 里 **`norm_q`/`norm_k` 之后、`apply_rope`
-之前**（`model.py:~813`）。取的就是 §5.21-1 定义的那个 `k_raw`。取错位置（比如取
-`qkv.split` 的原始输出）会让度量落在未归一化空间，`s_h` 标定和全部方差统计作废。
+**两套机制，不是一个 hook——`attn_mass_by_dist` 在原来那个 hook 点算不出来。**
+原设计把它写成"在 hook 里就地累加"，但真实注意力质量需要**已经做完 RoPE 的 q、k
+和真实的 attention score**，而 `norm_q`/`norm_k` 之后、`apply_rope` 之前这个点还
+没旋转，且默认无 softcapping 路径直接调用 `F.scaled_dot_product_attention`
+（`model.py:1464`，融合 kernel）——**中间的 score 张量根本不会被实例化，没有地方
+可挂 hook 去拿它**。核对过 `model.py:1447-1467` 后确认，手动展开 score 的分支只在
+`attention_logit_softcapping is not None` 时才走，默认路径拿不到。
+
+**机制 A（cheap，现成的 hook 点）**：`CausalSelfAttention.forward` 里
+**`norm_q`/`norm_k` 之后、`apply_rope` 之前**（`model.py:~813`），取
+§5.21-1 定义的那个 `k_raw`。取错位置（比如取 `qkv.split` 的原始输出）会让度量落在
+未归一化空间，`s_h` 标定和全部方差统计作废。
+
+**机制 B（`attn_mass_by_dist` 专用，不是简单 hook，dump 脚本要显式接管这一步）**：
+在 `apply_rope` **之后**捕获 `q_roped`/`k_roped`，脱离模型的融合 SDPA 调用，
+在 dump 脚本里自己按 query 分块手算：
+
+```
+for query_block in chunks(q_roped, block_size):
+    scores = query_block @ k_roped.mT * scale        # 只对这一块，不是整个 (T,T)
+    scores = causal_mask(scores)                       # 该块相对完整 k 序列的因果掩码
+    probs  = softmax(scores, dim=-1)
+    attn_mass_by_dist += bincount_by_|i-j|(probs)       # 累加进分桶直方图，立刻丢掉 probs
+```
+
+这是 Stage 0 **专用**的离线计算，刻意绕开生产路径的融合 kernel——可以接受，因为它
+不是训练/推理路径的一部分，只在这一次 dump 里跑。
 
 **dump 什么**：
 
-| 张量 | shape | dtype | 用途 |
-|---|---|---|---|
-| `k_raw` | `(G, T, hs)` | fp16 | 全部聚类统计的输入 |
-| `v` | `(G, T, hs)` | fp16 | **S0.4 的 value 方差、S0.7 的 supersession** |
-| `q` | `(nh, T, hs)` | fp16 | §13.2 的注意力质量-距离曲线 |
-| `attn_mass_by_dist` | `(nh, n_bins)` | fp32 | **在 hook 里就地累加，不要落 attention 矩阵** |
+| 张量 | shape | dtype | 来源 | 用途 |
+|---|---|---|---|---|
+| `k_raw` | `(G, T, hs)` | fp16 | 机制 A | 全部聚类统计的输入 |
+| `v` | `(G, T, hs)` | fp16 | 机制 A | **S0.4 的 value 方差、S0.7 的 supersession** |
+| `q_roped` | `(nh, T, hs)` | fp16 | 机制 B（分块用完即弃，不必整块落盘）| §13.2 的注意力质量-距离曲线 |
+| `attn_mass_by_dist` | `(nh, n_bins)` | fp32 | 机制 B | 落盘的是这个分桶直方图，不是 `q_roped` 本身 |
 
-> **不要 dump 完整 attention。** `(nh, T, T)` 在 32k 下是 16×32768² ≈ 172 亿个元素，
-> 落盘不可行。§13.2 需要的是"注意力质量随距离的分布"，**在 hook 内按距离分桶累加**
-> 即可，输出只有 `(nh, n_bins)`。
+> **不要 dump 完整 attention，也不需要 dump `q_raw`。** `(nh, T, T)` 在 32k 下是
+> 16×32768² ≈ 172 亿个元素，落盘不可行，机制 B 的分块计算天生避开了它。`q_raw`
+> （旋转前的 query）在这份规格里没有任何用途——**聚类只在 k 空间做**，从不碰
+> `q`，所以只需要 `q_roped`，不必再引入一个 `q_raw` 制造歧义。
 
 **维度约定**：
 - **`B` 固定为 1**。batch 维保留会引入 padding 对齐问题，而 Stage 0 不需要吞吐。

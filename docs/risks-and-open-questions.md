@@ -111,13 +111,39 @@ no-op——这决定了是否该做成"只对部分层/头启用"。
 按"会不会影响结论"排序。这些**不是**已知风险（那些在 §8/§11），而是**尚未形成方案**
 的空白。
 
-### A. decode 阶段完全没讨论
+### A. decode 阶段 —— **v1 有默认决定，但风险未测，不算完全解决**
 
-所有设计都围绕 prompt 的 prefill，但 **niah 和 LongBench 都是生成式评测**。生成的
-token 同样会滑出 recent window 并被路由，于是：生成内容会**消耗 cluster 预算**、和
-prompt 抢 `K_max`；长推理链可能占掉大半个簇池；生成 token 语义紧扣答案，可能反复
-触发新簇。**至少要决定：生成 token 是否参与聚类、是否共享同一个 `K_max`、还是单独
-留一块预算。**
+**决定：v1 不特殊处理，生成 token 和 prompt token 共享同一套簇/同一个 `K_max`。**
+理由是路由机制本身对"这个 token 是 prompt 还是生成出来的"一无所知——它只看
+pre-RoPE key，flush 时机也不区分 prefill/decode（这本来就是训推一致性要求的一部分，
+见 §11 pin 死因 1）。不引入特殊路径是默认选项，不是被动忽略。
+
+**但这不是没有代价，必须显式测，不能当作"自动没问题"**：
+
+- **`K_max` 撞满是真风险，而且比 prompt-only 场景更危险。** Prefill 阶段 Ward
+  合并挤掉的是"已经用完"的旧内容；decode 阶段挤掉的可能是**模型接下来还要用**的
+  prompt 事实——长 CoT 推理反复引用早期事实时，若那个簇的 centroid 已经被后续
+  decode 内容的 Ward 合并污染，等于在回答生成到一半时才发现参考资料被顶掉了。
+- **有一个自然的缓解，但只是部分缓解，不能当结论**：Ward 代价带尺寸加权
+  （`(n_a n_b)/(n_a+n_b)`，§5.6），真正重要、内容丰富的 prompt 簇往往 `n_c`
+  较大，合并代价高，天然比新开的小 decode 簇更难被挤掉。但同样按 §5.6 的分析，
+  **needle 式的小簇**（无论来自 prompt 还是 decode）恰恰最便宜、最容易被合并——
+  所以这只是把"decode 挤掉 prompt"的问题变成了"decode 挤掉 prompt 里的稀有事实"，
+  没有消除风险，只是换了个形状。
+
+**操作后果**：Stage 0/2 的 dump 和 eval 都要**覆盖真实生成过程**，不能只测
+prefill：至少要在长 CoT 或多轮场景下，观察 decode 期间是否发生了会影响后续答案
+的 prompt 簇合并/centroid 漂移，并与"prompt 事实在答案后半段是否被正确引用"做
+关联。这条现在没有单独的 S0.x 编号，等 multi-turn/long-CoT 相关实验设计出来时
+（§7 的消融表已经列了 query 位置、multi-needle，decode 风险应该并进同一批）。
+
+**顺带一个必须核对但相对机械的点**：现有 `_log_kv_pending`（`model.py`）把奇数长度
+prompt 的末尾单 token 和第一个 decode token 配对，是为了配合 `train_block=2` 的
+flush 粒度。§5.4 把 flush 粒度提到最多 128 之后，这个"留 1 个 token 挂起"的逻辑要
+推广成"留最多 `flush_granularity − (T mod flush_granularity)` 个"，否则 prefill
+结尾会按旧粒度切出一个不完整的批，语义簇路由那批 token 数就和后面的批不一致。
+这是flush 粒度改动的机械推论，不是 decode 特有的新问题，但容易被漏掉，一并记在
+这里。
 
 ### B. ~~`s_h` 的估计方式~~ —— **已定案，移出未决清单**
 
