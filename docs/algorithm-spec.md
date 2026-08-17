@@ -394,6 +394,38 @@ post-RoPE 换成 pre-RoPE。**顺带的好处**：Σ 不再混入位置相位方
 `alpha = 0` → `k_out = kb`（垃圾值，但 `w=0`）。所以**填充槽必须在读出侧被掩码
 屏蔽，不能只靠 `w=0` 自然消失**。
 
+**上面只验证了均值和锚点，Σ/Γ 的 rank-1 路径要单独核实——它不是自动成立的。**
+核对 `compact()` 现有实现（`log_kv_cache.py:723-816`）：`frac_a = wa/w_total`、
+`frac_b = wb/w_total`、`cross_frac = frac_a·frac_b`。`wb=0` 时 `frac_a=1,
+frac_b=0` 精确成立，于是 Σ 的三个 factor 是：
+
+```
+factor_a     = sqrt(frac_a · s2a) · sua = sqrt(s2a) · sua        ← 就是 A 自己，未受扰动
+factor_b     = sqrt(frac_b · s2b_pad) · sub_pad = sqrt(0) · sub_pad = 0 · sub_pad
+factor_cross = sqrt(cross_frac) · dk = 0 · (ka − k_pad)
+```
+
+**`factor_b`/`factor_cross` 的安全性不是"乘 0 天然为 0"能保证的**——`0 × 有限数 = 0`
+没错，但 `0 × NaN = NaN`、`0 × Inf = NaN`。所以 `merge(A, pad) == A` 成立的真实
+前提是**填充槽的 `k`、`v`、`sigma_u`、`sigma2`、`gamma_a`、`gamma_b`、`gamma`
+全部是有限的零值**，不能是未初始化的垃圾内存——一旦有一个字段带着 NaN/Inf，
+即使它的权重是 0，也会通过这几个乘法把 NaN 传染进一次原本应该是恒等操作的合并里，
+污染一个真实槽。
+
+**硬性实现规则**：填充槽的**全部**字段（不只是 `w`/锚点）必须显式 `zero_()`，
+不能依赖"权重为 0 所以内容无所谓"的直觉。这不是新发明——`_append_level0`
+（`log_kv_cache.py:1069-1076`）在 `second_order=False` 时已经对着同一批 buffer
+做了这件事："Zero in place instead of materializing zero tensors to copy from"。
+填充槽只是把同一条纪律用在另一个触发条件上。
+
+**对应的单测（S0.1，必须有，不是"w=0 恒等元"那条的可选补充）**：`merge(A, pad)`
+要复现 `A` 的**完整**统计元组——`k, v, w, p_lo, p_hi, sum_wp, sigma_u, sigma2,
+gamma_a, gamma_b, gamma`——逐位一致，不能只测均值和锚点。给定上面的推导，
+`_rank1_psd_from_factors`/`_rank1_cross_from_factors` 在只有一个非零 factor 时，
+Gram 矩阵本就是秩 1 且只有一个非零对角元，幂迭代在这个退化情形下不是"近似收敛"
+而是精确解，所以这条单测应当断言逐位相等（或 `TestRank1Approximation` 已用的
+同一档 float 容差），不是近似值。
+
 #### 代价是指数的，这直接定死了 `ℓ_block`
 
 要保护到第 ℓ 层不被跨段污染，段的起始下标必须是 `2^ℓ` 的倍数（第 ℓ 层的一个 entry
@@ -505,12 +537,11 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 
 | buffer | shape | dtype | 用途 |
 |---|---|---|---|
-| `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**。只记 token 归属
-不足以重建结构，见 §5.21-2 |
+| `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**，只记 token 归属不足以重建结构，完整语义/顺序/重放算法见 §5.21-2 |
 
-容量与内存：`OP_max` 取 `T_max + 2·K_max·(预期合并次数)` 的保守上界。32k 下
-`(1,8,2·32768,4)` int32 ≈ 8MB/层，28 层共 **224MB**——比早期版本估的 `route_log`
-（14MB）贵一个量级，是 §5.21-2 那份正确性升级的代价，不是可选项。
+容量与内存：`OP_max = 4·T_max`，这不是经验估计，是有推导的硬上界，见 §5.21-2。
+32k 下 `(1,8,4·32768,4)` int32 ≈ 16MB/层，28 层共 **约 448MB**——是 §5.21-2 那份
+正确性升级的代价，不是可选项。
 
 **per-head 尺度估计**（§5.2）：`s_h (B,G)` 加配套的 `k_mean_h (B,G,d)`。
 
@@ -599,7 +630,9 @@ def dedup_anchors(lo, hi, mid):
   > **不要断言一般情况下的 softmax 质量恒等。** 不同锚点的 `k_eff_a` 不同 ⇒ `s_a`
   > 不同 ⇒ 总质量本来就会变——**这正是锚点展开的目的**（位置敏感的检索靠它实现），
   > 不是需要被修掉的偏差。
-- **`w=0` 填充是恒等元**：`merge(A, ∅) == A`，含锚点（§5.11）。
+- **`w=0` 填充是恒等元**：`merge(A, ∅) == A`，**覆盖完整统计元组，不只是均值和锚点**
+  ——`sigma_u/sigma2/gamma_a/gamma_b/gamma` 也要断言逐位相等，理由和填充槽字段必须
+  全零初始化的硬性规则见 §5.11 那段推导（0 × 有限数才安全，0 × NaN/Inf 不安全）。
 - **v2 对照**：保留 z 统计量实现与其 Dirichlet 闭式解单测，供 §8 消融使用。
 
 **这条 v2 对照单测同时是"新代码复现旧数学"的正式正确性检验，不是可有可无的消融
@@ -673,9 +706,13 @@ def dedup_anchors(lo, hi, mid):
    （§5.12）。**这是整个实现里最集中的风险点**，建议一开始就把 level 簿记设计成
    "每 (簇, 层) 存 (count, 含填充数)"，而不是先按等宽写完再回来补。
 
-3. **`w=0` 填充槽必须显式掩码。** `compact` 里的 `w_total.clamp(min=1e-8)` 会让
-   两个空槽合并出 `alpha=0` → `k_out=kb`（垃圾值）。虽然 `w=0` 使它在 mass bias 里
-   贡献 `log(0)` → 需要在掩码层拦掉，不能指望它自然消失。
+3. **`w=0` 填充槽必须显式掩码，且填充槽的每个字段都必须显式清零。** `compact` 里
+   的 `w_total.clamp(min=1e-8)` 会让两个空槽合并出 `alpha=0` → `k_out=kb`
+   （垃圾值），需要在掩码层拦掉，不能指望它自然消失。**更隐蔽的一条**：Σ/Γ 的
+   rank-1 合并路径会用 `frac_b`/`cross_frac`（`wb=0` 时精确为 0）去乘填充槽的
+   `sigma_u/sigma2/gamma_*` 和 `k−k_pad`——`0×有限数=0` 但 `0×NaN=NaN`，
+   所以填充槽如果只清零了 `w` 和锚点、其余字段是未初始化内存，一次看似安全的
+   `w=0` 合并会把 NaN 传染进真实槽（详见 §5.11、§5.14）。
 
 4. **锚点哨兵值会越界。** 空槽用 `p_lo=+INT_MAX, p_hi=-1` 让 min/max 自动正确，
    但 `cos_cache[anchors]` 会因此索引越界。物化前必须 `clamp(0, N-1)` 或先按有效位
@@ -786,33 +823,98 @@ qkv.split → norm_q / norm_k（Qwen3 是 norm_qk=True, type="default"）
 | GQA | `k` 在这一步已经是 `(B, G, T, hs)` 的 per-KV-group 形态，**写入侧不涉及 rf 折叠**，折叠只发生在读出侧的 `log_kv_slot_attention`。这条是好消息 |
 | 那段注释 | `model.py:805-808` 明确写着 expected-RoPE 的设计前提（"LogKV mean-pools the FULL key … expected rotation over the span"）——**那正是被替换掉的东西，注释必须同步改**，否则下一个读代码的人会按旧模型理解 |
 
-#### 5.21-2 `op_log` 而不是 `route_log`：只记 token→cluster 不足以重放
+#### 5.21-2 `op_log`：完整的操作语义、顺序、重放算法
 
 原设计写的是"每 token 的簇 id + 是否开新段"。**这不够**：`K_max` 满时会 Ward 合并、
 释放槽位、**复用 cluster id**——同一个 id 在合并前后指的是不同的簇，仅凭 token 归属
-无法重建结构。backward 重放会建出一个 forward 从未 attend 过的 cache（§11-A）。
+无法重建结构。backward 重放会建出一个 forward 从未 attend 过的 cache（§11-A）。上一轮
+补的六类操作解决了"记什么"，但没定"什么顺序、谁消费哪个 token、centroid 要不要重放"
+——这三条不定死，实现到重放逻辑那一步会直接卡住。
 
-改成**操作日志**，每条 4 个 int32：
+**六类操作分两组，这个区分是重放算法的基础**：
 
 ```
-(op_type, arg0, arg1, arg2)
+(op_type, arg0, arg1, arg2)   # 每条 4 个 int32
 
-NEW_CLUSTER   (slot_idx,  -1,       -1)      # 在哪个空槽建新簇
-JOIN          (cluster,   segment,  -1)      # 归入既有簇的哪个段
-NEW_SEGMENT   (cluster,   new_seg,  -1)      # 同簇开新段
-WARD_MERGE    (keep_slot, free_slot, -1)     # 合并方向必须记：谁留谁释放
-PAD_INSERT    (cluster,   level,    count)   # 对齐填充插在哪、插几个（§5.11）
-CARRY         (cluster,   level,    -1)      # 进位（可由计数推出，但记下来便于断言）
+── 主操作：每个 flush 出来的 token 恰好触发一个，且互斥（直接对应 §5.3 的三路判定）──
+NEW_CLUSTER   (slot_idx,  -1,       -1)      # 语义 novelty：在哪个空槽建新簇
+NEW_SEGMENT   (cluster,   new_seg,  -1)      # 时序打断：同簇开新段
+JOIN          (cluster,   segment,  -1)      # 归入既有簇的当前段
+
+── 结构操作：不消费 token，作为主操作的副作用穿插出现 ──
+WARD_MERGE    (keep_slot, free_slot, -1)     # 给某个 NEW_CLUSTER 腾位，必然紧邻其前
+PAD_INSERT    (cluster,   level,    count)   # 给某个 NEW_SEGMENT 做对齐填充，紧邻其后
+CARRY         (cluster,   level,    -1)      # ladder 进位，可由计数推出，记下来便于断言
 ```
 
-要点：
-- **`WARD_MERGE` 必须记明保留哪个槽、释放哪个槽**，因为新簇随后会复用被释放的 id。
-- **`PAD_INSERT` 必须记**，否则重放时对齐位置对不上，后续所有配对全错位。
-- `CARRY` 严格来说可由计数推出，但记下来能让重放做逐步断言，调试成本回本很快。
+**顺序规则**：`op_log` 按 token 到达顺序线性写入。主操作严格一一对应"下一个待处理的
+token"；结构操作插在触发它的主操作旁边（`WARD_MERGE` 在它服务的 `NEW_CLUSTER` **之前**
+——先腾位再建簇；`PAD_INSERT` 在它服务的 `NEW_SEGMENT` **之后**——先确认开了新段、
+再决定要不要对齐填充；`CARRY` 跟在导致进位的那次 ladder 追加后面）。
 
-容量：`OP_max` 取 `T_max + 2·K_max·(预期合并次数)` 的保守上界；实测应远小于
-`2·T_max`。`(1,8,2·32768,4)` int32 ≈ 8MB/层，28 层 224MB——**比 `route_log` 的
-14MB 贵一个量级，但这是正确性的价格，不是可选项**。
+**重放算法**（backward 只需要这一个循环，不需要重新跑 §5.2–§5.6 的任何一步）：
+
+```
+token_ptr = 0
+for op in op_log:
+    if op.type in {NEW_CLUSTER, JOIN, NEW_SEGMENT}:
+        # 消费 token_ptr 指向的原始 (k_raw, v)，按 op 指定的 (cluster, segment)
+        # 追加进该簇的 ladder —— 用的是 compact()/_binary_carry() 那套纯算术，
+        # 不依赖任何浮点比较，所以给定同样的 (token, cluster, segment) 三元组，
+        # 结果必然逐位相同。
+        append_to_ladder(k_raw[token_ptr], v[token_ptr], op.cluster, op.segment)
+        token_ptr += 1
+    elif op.type == WARD_MERGE:
+        merge_cluster_ladders(op.keep_slot, op.free_slot)   # §5.6 的五步过程
+    elif op.type == PAD_INSERT:
+        insert_pad_entries(op.cluster, op.level, op.count)   # §5.11
+    elif op.type == CARRY:
+        pass   # 已经隐含在 append_to_ladder 里发生，这里只做断言用
+```
+
+**关键认识：重放完全不需要 centroid，一步都不需要。** centroid（以及驱动它的 Phase
+1/2/3 批量路由、Ward 代价矩阵、join cost 的浮点比较）**只用于决定"这个 token 该去
+哪"**——这个决定的结果已经被 op_log 忠实记录了。而 `compact()`/`_binary_carry()` 那套
+决定"槽内数值算出来是多少"的数学，只依赖"哪些 token 按什么顺序进了哪个 (簇,段)"，
+和 centroid 的具体数值毫无关系（centroid 是纯路由元数据，不参与 attention 读出，
+§2.4）。所以 backward 重放**跳过整个路由阶段**，直接把 op_log 当作"已经决定好的
+安置计划"来执行——这样一来，路由阶段所有的浮点敏感操作（distance 比较、argmin、
+Ward 代价）都被彻底隔离在 forward 侧，backward 侧只剩纯整数索引 + 确定性算术。
+
+**批量路由（§5.4）留下的一个未解决风险，需要 S0.8 专门测**：Phase 1 用**冻结的
+centroid** 并行分配一整个 flush 批（多达 128 个 token），但 §5.3 的 join cost 里
+`p_hi_c`（该簇最近一次收到成员的位置）如果也在整批内冻结，同一批里连续多个 token
+被分到同一个簇时，**除第一个之外**看到的都是"批次开始前"的 `p_hi_c`，会把彼此明明
+紧挨着的 token 误判成"隔了很久"，触发不必要的 `NEW_SEGMENT`。**这不是路由准确率的
+损失，是段计数会被系统性推高**，连带推高 `PAD_INSERT` 的频率——直接侵蚀预算（§4）。
+缓解方向是在 Phase 1 内部对 `p_hi_c` 做一次按簇分组的前缀扫描（只需遍历批内**出现过
+的簇数**，通常远小于批大小，不是回到逐 token 串行），把"批内同簇的最近成员位置"
+更新进去再判定 join cost。**这条修正是否必要、批冻结造成的段膨胀有多大，由 S0.8
+连带 S0.2 的 segment 数统计来判定**——如果膨胀量在 §5.11 对齐填充的预算内可以吸收，
+可以先不修，留作已知近似。
+
+**容量：`OP_max` 现在有一个可证明的硬上界，不是经验估计。** 逐项数一遍：
+
+```
+主操作     恰好 T 条（每 token 一条，互斥，精确）
+WARD_MERGE 最坏 O(T)（病态输入下，K_max 绑定后几乎每个 token 都需要先腾位再建簇——
+           这不是罕见事件的假设，是 §4"最坏情况"本身就该覆盖的场景）
+PAD_INSERT 最坏 O(T)（每条 NEW_SEGMENT 至多配一条，同阶）
+CARRY      O(T/B′)（标准二进制计数器的摊还论证：n 次自增的总进位次数是 O(n) 而非
+           O(n log n)——第 i 层每 2^i 次自增才翻一次，比其它三项低一个量级，可并进
+           余量而非单独扩容）
+```
+
+**结论**：`OP_max = c · T_max`，`c` 取一个能覆盖"1 主操作 + 1 WARD_MERGE + 1
+PAD_INSERT + CARRY 余量"的小常数，**`c = 4` 足够**。这比早期"`T_max +
+2·K_max·(预期合并次数)`"的经验估计更大（后者隐含假设合并很少见，是期望而非最坏
+情况），但现在是**证明过的上界**，可以像现有 `_count_tokens` 对 `max_seq_length`
+那样，**溢出直接硬失败**（`raise RuntimeError`），不做动态扩容、不做静默截断——
+矩形预分配 + 硬失败是这个项目一贯的选择（§5.17），`OP_max` 没有理由是例外。
+
+32k 下 `(1,8,4·32768,4)` int32 ≈ 16MB/层，28 层约 **448MB**——比早期估的
+224MB 贵一倍，但那 224MB 本来就是经验值，不是这次算出的真实上界。这是正确性的价格，
+不是可选项。
 
 #### 5.21-3 carry 必须全 GPU 向量化：`_counts` 的 host 镜像要**删掉**而不是扩展
 
