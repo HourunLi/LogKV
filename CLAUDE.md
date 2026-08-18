@@ -430,6 +430,65 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-14｜第九轮核实：修掉 `ctx.save_for_backward` 存裸引用而非快照的
+  bug、Phase 1 reset-scan 的 off-by-one、变长本地缓冲的索引分配公式、`K`
+  未满/冷启动路径与 Ward 分支的初始化不一致，并澄清 `current_segment` 合并后
+  的语义边界与更新 `glossary.md` 的漂移。** 动机：用户逐条核实上一轮的四处
+  修复都已生效，同时指出一处 P0、四处 P1/P2 级的实现缺口。逐条结论：
+  ① **P0：`ctx.save_for_backward(cache.op_log, cache.op_log_len)` 存的是
+  裸引用，不是快照**——PyTorch 的 `save_for_backward` 不会自动 deep copy，
+  而本项目一贯用预分配 buffer + `reset_parameters()` 原地 `zero_()` 复用
+  （不是每次重新分配），下一次 `forward()` 的 reset 会直接清空 `ctx` 里
+  "存"的那个引用指向的底层数据——`backward()` 读到的可能已经是被清空的
+  `op_log`。虽然 PyTorch 的 saved-tensor 版本计数器可能会让这种误用在
+  `backward()` 访问时报错，但这不是能依赖的安全网。**修法**：
+  `ctx.save_for_backward` 时对 `cache.op_log`/`cache.op_log_len` 显式
+  `.detach().clone()`；`q`/`k_raw`/`k_roped`/`v` 不需要同样处理，因为它们
+  是每次 forward 新建的激活张量，不是会被 cache 对象在未来原地清零复用的
+  buffer，不存在这个别名风险。
+  ② **P1：Phase 1 的 PAD_INSERT reset-scan 有一处 off-by-one，且两个分支
+  会以同一个方向同时出错**——`steps_since` 如果直接算成"组内下标减最近一次
+  new_seg 的下标"（不减 1），对"已有上一次新段"和"本批还没开过新段"两个
+  分支都会多算 1 步，因为 `new_seg=True` 那个 token 自己那一步已经被"计数器
+  重置到 1"这条化简吸收掉了，不能再计入距离。补了从头展开递推
+  `M_r = 1 + (r-1-r')` 的完整推导，钉死统一公式
+  `steps_since[t] = rank[t] - last_new_rank_before[t] - 1`（哨兵 `-1`
+  代表"本批还没开过新段"，代入后两个分支自动给出正确结果，不需要分别记两条
+  公式），并强调这个 `-1` 是这条公式唯一容易做错、又不容易被单测覆盖到的
+  地方（需要专门测"本批第一次开新段"这个边界）。
+  ③ **P1：Phase 1 写入本地缓冲的变长展开缺一个索引分配公式**——`PAD_INSERT`
+  必须紧邻且先于它服务的 `NEW_SEGMENT`，但不同 token 展开出的 op 数量不同
+  （1 或 2 条），Phase 1 是向量化路径不能逐 token 决定行号。补了
+  `extra[t]=new_seg[t] and count[t]>0`、
+  `main_idx[t]=base+t+inclusive_prefix_sum(extra)[t]`、
+  `pad_idx[t]=main_idx[t]-1` 的完整公式，并用一个三 token 的例子验证了
+  "inclusive 前缀和"是必须的，用 exclusive 会导致两个 token 的 op 写进
+  同一行、互相覆盖。
+  ④ **P1：`K` 未满/冷启动的新簇初始化写得过于简略，容易和 Ward 分支的详细
+  步骤脱节**——Ward 分支的 `alive`/元数据清零、`NEW_CLUSTER` 写入、
+  `local_p_hi`/`local_segment` 初始化写得很细，但"K 未满"在 §5.6 的表里
+  只有"占用第一个 false 槽位"一句，容易让实现者以为这条路径不需要同样的
+  初始化。**修法**：把 Ward 分支步骤 4 开始的全部内容形式化为共享原语
+  `allocate_new_cluster(slot_idx, group)`，三条路径（冷启动/K 未满/K 已满）
+  只在"如何拿到一个空 `slot_idx`"这一步分叉，初始化逻辑完全共用；同时点出
+  一条隐含前提——"K 未满"分支依赖"一个从未 `alive` 过的槽本来就是全零"，
+  这必须由 `reset_parameters()` 的显式 `torch.zeros(...)` 保证，不能依赖
+  `torch.empty` 之类不保证清零的分配，否则 `n_eff_pre==0` 这条判据会在
+  垃圾值上失效。
+  ⑤ **P2：`current_segment=max(a,b)` 的语义边界需要精确重新表述**——原表述
+  "不会和调试/分析工具已经见过的旧 id 撞车"不准确：`max` 只保证合并后
+  `keep_slot` 未来新开的 segment id 大于 `a`/`b` 双方的历史最大值，不保证
+  `a`/`b` 各自独立计数（都从 0 开始）的历史 segment id 互不相同——但这天然
+  没关系，因为 `op_log` 里两段历史各自带着原本的 `cluster` 字段（没有被
+  重定向），本来就可以区分；真正需要小心的是"同一个物理槽先后被两个不同
+  逻辑簇使用"这种槽位复用场景，这正是 `derive_final_cluster` 的
+  `(slot, epoch)` 版本化身份已经解决过的问题，不是 segment 机制独有的新
+  坑。结论：需要跨这类边界分组的分析工具必须按 `(slot, epoch, segment)`
+  做 key，且跨 lineage 的时间先后顺序只能从 `op_log` 线性位置读，不能比较
+  两个独立 lineage 的 segment 数值大小。
+  ⑥ **P2：`glossary.md` 的"新增 buffer"列表漏了这两轮新加的
+  `current_segment`/`op_log_len`**——已同步补上。
+
 - **2026-08-14｜第八轮核实：补上 Phase 1 缺失的持久 segment 状态与批内向量化
   segment-id/PAD_INSERT 计算、`op_log` 的有效长度规格与 backward ctx 生命周期
   定案、`derive_final_cluster` 的切片安全性，并删掉一处从未有过定义、和已证明
