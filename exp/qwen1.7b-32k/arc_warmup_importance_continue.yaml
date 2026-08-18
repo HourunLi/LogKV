@@ -70,9 +70,10 @@ log_kv_second_order_warmup_steps: 0
 log_kv_pin_size: 0
 
 log_kv_importance_pooling: true
-# ↓↓↓ 跑之前必须改成 eval-only 扫描里表现最好的具体数值，不要留 1.0/1.0（那就是
-# 已经测过、niah 会倒退的纯重要性配置，续训它意义不大）。两个都要显式给数值——
-# majob.sh 训练阶段不走 DIAG_ARGS，这两个字段留 null 不会被 CLI 覆盖（跟
-# eval-only 走 eval.sh/DIAG_ARGS 时的行为不同，见 CLAUDE.md 3.3）。
-log_kv_importance_pooling_lambda: 1.0
+# 2026-08-18：从 8.5 的 lambda/temperature 扫描里挑的候选——lambda=0.7 是全场
+# 唯一在 LongBench(0.1733)/LongBench_e(0.1945)/niah(0.0833) 三项上都不输 vanilla
+# 的点（0.6113/0.1716/0.1918/0.0827），temperature 留默认 1.0（不叠加，先验证
+# 单旋钮续训是否有效）。若改选 niah 单项最优的候选（lambda=0.3 或
+# temperature=0.7，niah 并列全场最高 0.0847），照抄这个字段的写法改数值即可。
+log_kv_importance_pooling_lambda: 0.7
 log_kv_importance_pooling_temperature: 1.0

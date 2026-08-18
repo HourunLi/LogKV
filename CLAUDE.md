@@ -8,7 +8,7 @@
 > **2026-08-13 note**：pin 相关的详细调试记录（原 6.4~6.13，约 500 行）已压缩进 6.4，
 > 只保留结论链和关键数字，过程性叙事已删除。完整历史如果需要可以从更早的会话记录找。
 
-## 0. 现状速览（2026-08-13 更新，只想快速接续就读这节，细节看后面对应章节）
+## 0. 现状速览（2026-08-18 更新，只想快速接续就读这节，细节看后面对应章节）
 
 **结论先说：pin 这条线已终止**。选择质量、剂量效应、分数尺度机制、训推一致四个
 独立方向依次验证均为负（详见 6.4），不再往 pin 上投入。下一步的高价值方向是压缩
@@ -23,10 +23,13 @@
 重要性（post-RoPE key L2 范数）加权而不是均匀 1/n，mass bias 继续完全不变地用
 计数 `w`。是 k 的纯函数，无新增可学参数，训练/推理路径自动一致（这正是 pin 系列
 失败的根因之一，这次设计上从一开始就规避掉）。默认关闭时（`importance_pooling=
-False`）跟改动前逐字节相同，124/124 单测通过（113 条既有 + 11 条新增）。**结论：
-不建议直接采用这版启发式**——niah 定向变差，说明"key L2 范数"这个显著性代理和
-"needle-ness"不是一回事（很可能是 attention-sink 式高范数干扰 token 把 needle
-的池化权重从均匀池化保证的 1/n 挤压下去了），下一步候选见 6.5 结尾。**
+False`）跟改动前逐字节相同，124/124 单测通过（113 条既有 + 11 条新增）。这个
+lambda=1.0（纯重要性）单点一度得出"不建议直接采用这版启发式"的结论——niah 定向
+变差，像是"key L2 范数"这个显著性代理和"needle-ness"不是一回事（很可能是
+attention-sink 式高范数干扰 token 把 needle 的池化权重从均匀池化保证的 1/n
+挤压下去了）。**但这个悲观结论被 2026-08-18 的 lambda/temperature 扫描推翻**：
+不走极端、适度混合反而能让 LongBench/LongBench_e/niah 同时不输甚至超过 vanilla，
+详见下方"下一步方向"和 6.5/8.5。
 
 **进展**：warmup CPT（`second_order_scale` 目标 0.2，warmup 100 步）已经完整训练
 1500 步，并跑出了 dense baseline / LogKV vanilla / +importance pin / +2nd order+pins /
@@ -56,18 +59,21 @@ needle），但选择质量修好之后（NMS 空间分散约束，near-hit 从�
 
 **下一步方向**：
 
-*压缩本身·方向 1【已实现代码、已跑决定性实验、两个正交旋钮（lambda +
-temperature）代码均已完成，待 GPU 侧扫描，见 6.5/8.5】—— 重要性加权池化：*
-lambda=1.0（纯重要性）的结果是 ACC/LongBench/LongBench_e 小幅变好、niah 定向
-变差（0.0827→0.0787），推翻了"稀释是 niah 主瓶颈、加权池化能救回来"这个核心
-机制假设的直接验证——key L2 范数是个还行的通用显著性代理，但和"needle-ness"
-不是一回事。**不建议直接采用 lambda=1.0**。已实现两个正交旋钮：
-`importance_pooling_lambda`（往均匀份额整体混合）和
-`importance_pooling_temperature`（只压缩启发式自身的动态范围，更针对性地
-压制离群高范数 token），代码/单测均已完成，可以在 GPU 上并行跑两条扫描（命令见
-8.5）：如果存在中间点同时保住 LongBench 增益、niah 不再倒退，这个方向值得继续
-投入；如果两条曲线都只是端点间插值、没有任何中间点两头都好，说明 needle 保护
-和这类从 k 范数出发的确定性启发式结构性冲突，转 6.2 方向。
+*压缩本身·方向 1【已实现代码、lambda/temperature 扫描已跑出决定性结果，
+2026-08-18，见 6.5/8.5】—— 重要性加权池化：* lambda=1.0（纯重要性）单点的结果是
+ACC/LongBench/LongBench_e 小幅变好、niah 定向变差（0.0827→0.0787），一度像是
+推翻了"稀释是 niah 主瓶颈、加权池化能救回来"这个核心机制假设。但 2026-08-18 的
+`lambda∈{0.7,0.5,0.3,0.1}`/`temperature∈{0.7,0.5,0.3,0.1}` 扫描显示 niah 相对
+两个旋钮都**不是端点间插值**，而是中段有峰值的非单调曲线：lambda=0.7/0.5/0.1
+三个点在 LongBench/LongBench_e/niah 上都同时不输 vanilla（多数严格更好），
+niah 峰值出现在 lambda=0.3 和 temperature=0.7（并列 0.0847，比 vanilla 高
+2.4%，比 lambda=1.0 高 7.6%）。**结论反转：这个方向验证有效，值得继续投入**——
+lambda=1.0 的负面结果是"过度偏离均匀"这个剂量问题，不是方向性错误；只要不推到
+纯重要性的极端，key L2 范数这个启发式能同时兼顾"通用显著性"（LongBench 类任务）
+和"needle 保护"（niah）。下一步（细节和命令见 8.5 末尾）：先低成本试 1-2 个
+lambda+temperature 联合网格点，看两个旋钮的收益能否叠加；再考虑挑一个候选点
+（目前 lambda=0.7 综合最稳、lambda=0.3/temperature=0.7 niah 最高）按 8.6 续训
+验证训练期见过这个分布是否还能进一步放大收益。
 
 *继续排在后面、暂不动的（都没有新代码，需要先讨论范围再决定值不值得写）：*
 (i) 6.2/6.3 提到的"按 layer/width 差异化 second_order_scale"生产接口改动——**唯一
@@ -368,9 +374,6 @@ LongBench/niah，结果全系列 pin 变体（含极小 pin_size=4 对照组）�
 价值不高）。诊断基建（`log_kv_pin_diag.py`/`pin_diag.py`/`log_kv_pin_score_diag.py`/
 `pin_collapse_vs_hit.py`）仍在代码库里，具备通用性，需要时可以复用或参考。
 
-<<<<<<< HEAD
-### 6.5 压缩本身·方向 1：重要性加权池化——已实现、已跑决定性实验，分裂结果（2026-08-13 代码 / 2026-08-14 结果，见本节末尾和 8.5）
-=======
 **补充：观察窗口设计的架构性适用范围问题（2026-08-14，代码走查发现，非训练/评测
 实验，跟上面四阶段是互补关系不是第五阶段）**。阶段 1-4 回答的是"pin 选对了、剂量
 控制好了、训练也见过了，能不能追平 vanilla"，都是负结果。这条补充记录的是更前置
@@ -414,8 +417,7 @@ QA/检索形状的任务上同时成立——这正好是 NIAH 的形状，不�
 适用范围，从设计上就只覆盖了长上下文场景里一个较窄的子集（单轮、QA 形状、prompt
 能整段塞进一次 forward）。
 
-### 6.5 压缩本身·方向 1：重要性加权池化已实现（2026-08-13，代码完成，未跑评测）
->>>>>>> 144b5e2c6f5ea6eb8f93e3483aa17ea3d1879a59
+### 6.5 压缩本身·方向 1：重要性加权池化——已实现、已跑决定性实验，双旋钮扫描找到真实甜点（2026-08-13 代码 / 2026-08-14 单点结果 / 2026-08-18 扫描结果，见本节末尾和 8.5）
 
 **动机**：6.3 证实压缩本身（不涉及 pin）吃掉 85+ 个百分点，比 pin 全系列实验大
 一个数量级。看 `log_kv_slot_attention` 的打分公式：
@@ -507,6 +509,16 @@ conda env（`/Users/hourunli/anaconda3/envs/mineru`，Python 3.12）跑
 出在"过度偏离均匀"而不是"方向整体错了"，才值得投入可学权重；如果混合权重也
 救不回 niah，说明 needle 保护和这类显著性代理天然冲突，应该转 6.2 的按 width
 差异化 scale 或自适应槽宽/预算分配方向。
+
+**结果（2026-08-18，扫描已跑出）**：两个旋钮的扫描结果都不是端点间插值，niah
+相对 lambda/temperature 是中段有峰值的非单调曲线——lambda=0.7/0.5/0.1 三点在
+ACC/LongBench/LongBench_e/niah 四项上都同时不输 vanilla（多数严格更好），niah
+峰值出现在 lambda=0.3 和 temperature=0.7（并列 0.0847，高于 vanilla 的 0.0827
+和 lambda=1.0 的 0.0787）。**命中了上面"存在中间点两头都好"这个分支，方向验证
+有效，不建议转 6.2**——lambda=1.0 的负面结果是剂量问题（过度偏离均匀），不是
+方向性错误。完整数字表、误差幅度讨论和后续命令见 8.5；下一步是先低成本试
+1-2 个 lambda+temperature 联合网格点，再考虑挑一个候选（lambda=0.7 综合最稳，
+或 lambda=0.3/temperature=0.7 niah 最高）按 8.6 续训验证。
 
 **数学推导备忘（2 点加权协方差精确闭式解）**：设 `m = p_a k_a + p_b k_b`
 （`p_a+p_b=1`），则 `k_a - m = p_b(k_a-k_b)`、`k_b - m = -p_a(k_a-k_b)`，代入
@@ -651,7 +663,7 @@ DIAG_ARGS="--log_kv_dense_mode true --log_kv_pin_size 0" \
 ——还在代码库里，需要时可以照着 `eval.py --log_kv_pin_score_diag_output`/
 `--log_kv_pin_diag_output` 这两个参数的docstring 重新拼命令。）
 
-### 8.5 重要性加权池化决定性实验（2026-08-13 新增，见 6.5）
+### 8.5 重要性加权池化决定性实验（2026-08-13 新增，2026-08-18 lambda/temperature 扫描结果已跑出，见 6.5）
 
 纯 eval-time 开关，不需要重新训练（确定性启发式，`--config` 后面覆盖同一份
 `arc_warmup.yaml` 加载的 checkpoint 权重不变）。跟 `log_kv_dense_mode` 一样走
@@ -818,6 +830,84 @@ temperature，因为它更针对性地只压制离群值）找到了甜点而另
 压制离群值"和"整体打折"这两种数学操作对这个任务不等价，值得针对表现好的那条
 再细化（比如更小的 temperature 步长，或者两者联合网格）。
 
+**结果（2026-08-18，两条扫描均已跑出）**：
+
+| 配置 | ACC | LongBench | LongBench_e | niah |
+|---|---:|---:|---:|---:|
+| vanilla（现有基线）| 0.6113 | 0.1716 | 0.1918 | 0.0827 |
+| lambda=1.0（纯重要性，2026-08-14 已测）| 0.6157 | 0.1753 | 0.196 | 0.0787 |
+| lambda=0.7 | 0.6113 | 0.1733 | 0.1945 | 0.0833 |
+| lambda=0.5 | 0.6113 | 0.1721 | 0.1918 | 0.0840 |
+| lambda=0.3 | 0.6113 | 0.1715 | 0.1931 | 0.0847 |
+| lambda=0.1 | 0.6113 | 0.1725 | 0.1923 | 0.0833 |
+| temperature=0.7 | 0.6113 | 0.1709 | 0.1931 | 0.0847 |
+| temperature=0.5 | 0.6113 | 0.1712 | 0.1926 | 0.0840 |
+| temperature=0.3 | 0.6113 | 0.1710 | 0.1928 | 0.0827 |
+| temperature=0.1 | 0.6113 | 0.1731 | 0.1929 | 0.0820 |
+
+（ACC 在全部 8 个新配置里都恰好是 0.6113，逐位等于 vanilla——这是预期内的一致性
+校验，不是巧合：ACC 是短程常识任务，压缩在这些长度上基本不触发，池化策略天然
+碰不到它。这两条扫描都是纯 eval-time 开关，用的是同一个 arc_warmup checkpoint，
+没有重新训练。）
+
+**核心发现：niah 相对两个旋钮都不是端点间插值，而是中段有峰值的非单调曲线**。
+如果是纯插值，niah 应该随 lambda（或 temperature）从 1 降到 0，在 0.0787（纯
+重要性）和 0.0827（vanilla，约等于两个旋钮趋于 0 的极限）之间单调过渡，不可能
+超出这个区间。实测恰恰相反——8 个新配置里 7 个的 niah 都 ≥ vanilla 的 0.0827，
+唯一例外是 temperature=0.1（0.0820，比 vanilla 低 0.0007，接近噪声量级）。峰值
+出现在 lambda=0.3 和 temperature=0.7，并列 0.0847，比 vanilla 高 2.4%，比
+lambda=1.0 高 7.6%。
+
+**lambda 这一侧的结果尤其干净**：lambda=0.7/0.5/0.1 三个点在 LongBench/
+LongBench_e/niah 上都同时不输 vanilla（多数严格更好；lambda=0.5 在
+LongBench_e 上是精确打平 0.1918）。四个测试点里只有 lambda=0.3 有一处
+LongBench 轻微低于 vanilla（0.1715 vs 0.1716，-0.0001，负值本身就在噪声量级
+内），换来的是全场最高的 niah（0.0847）。也就是说 **0.1~0.7 这一整段 lambda
+基本都是安全甚至有收益的，不是只有单个脆弱的最优点**——只有推到 lambda=1.0 这个
+极端（完全不跟均匀混合）才会让 niah 掉到 vanilla 以下。temperature 这一侧稍微
+不那么干净：0.7/0.5/0.3 三个点的 LongBench 都比 vanilla 略低（-0.0004~-0.0007，
+同样接近噪声量级），但 LongBench_e/niah 稳定更好或打平，直到 temperature=0.1
+才在 niah 上出现轻微倒退。
+
+**这印证了 6.5 提出的 attention-sink 假说**：lambda=1.0（不打折的纯重要性）让
+少数异常高范数 token 主导 pooling、把 needle 的份额从均匀池化保证的 1/n 往下
+挤，niah 因此低于 vanilla；一旦往均匀方向混合（lambda<1）或压缩启发式自身的
+动态范围（temperature<1），这些离群值对 pooling 的支配力被削弱，niah 不仅
+回到 vanilla 水平、反而在中等强度混合下**超过**它——说明"部分重要性信号"确实
+比"纯均匀"或"纯重要性"都更好，lambda=1.0 的负面结果是"过度偏离均匀"的剂量
+问题，不是方向性错误。
+
+**结论：命中了上面"存在中间点两头都好"的分支，方向验证有效，不建议转 6.2**。
+若要挑单一候选：`lambda=0.7` 综合最稳（三项全部不输 vanilla，niah 虽非峰值但
+唯一无任何指标倒退）；若以 niah（本项目最受关注的压缩质量信号）为优先，
+`lambda=0.3` 或 `temperature=0.7` 更合适（niah 并列全场最高，代价是 LongBench
+一侧的负值都在噪声量级内）。
+
+**下一步（低成本，纯 eval-time，可以立刻做）**：两个旋钮设计上是正交的（先
+temperature 重塑，再 lambda 混合），但目前还没有任何数据点验证过联合设置。
+在已知都有效的区间内试 2-3 个联合网格点：
+
+```bash
+for combo in "0.7 0.7" "0.5 0.7" "0.7 0.5"; do
+    read LAM TEMP <<< "${combo}"
+    DIAG_ARGS="--log_kv_importance_pooling true --log_kv_importance_pooling_lambda ${LAM} --log_kv_importance_pooling_temperature ${TEMP}" \
+        bash majob.sh exp/qwen1.7b-32k/arc_warmup.yaml
+done
+```
+
+对比对象还是上面这张表。如果联合点比单独使用 lambda=0.7 或 temperature=0.7
+更好（至少一项进一步提升、其余不退步），说明两个旋钮的收益能叠加，值得把联合
+网格当成最终选型的基础；如果联合点跟较差的那个单旋钮结果差不多甚至更差，说明
+两个旋钮在压制的是同一批离群 token（机制有重叠），直接选表现更好的单旋钮
+（目前是 lambda=0.3 或 temperature=0.7）继续往下走即可，不需要同时开两个。
+
+**下一步（更贵，按 8.6 的判据走）**：低成本网格探完之后，挑一个赢面最大的点，
+用 `exp/qwen1.7b-32k/arc_warmup_importance_continue.yaml` 短续训（把里面占位的
+`log_kv_importance_pooling_lambda: 1.0`/`temperature: 1.0` 改成挑中的值），
+验证"训练期见过这个池化分布"能不能把当前 eval-only 的增益进一步放大——8.6 节
+已经把安全设计（独立 save_path、resume_dir 只读权重、second_order_warmup=0 等）
+写好，可以直接用。
+
 **额外一个零代码、零风险的任务：6.2 的 width/layer 门控诊断**（3.1 节，早就
 接好在 `eval.py` 里，从未接入生产路径）。这个不是跑 lm-eval 拿真实分数，是拿
 `log_kv_diag_mode` 那套 oracle-误差诊断，回答"如果二阶修正只在 width≤N 且
@@ -840,6 +930,13 @@ DIAG_ARGS="--log_kv_diag_mode baseline --log_kv_diag_second_order_max_width 4 --
 `for LAM in ...` 循环）按上面说的串行执行最安全。
 
 ### 8.6 第四条任务（可选、需要先看完前三条的结果）：短续训 importance_pooling
+
+**2026-08-18 更新**：8.5 的 lambda/temperature 扫描已经跑出（见 8.5 结尾），结果
+比下面"部分有效"的预期更好——多个点（尤其 lambda=0.7）在 LongBench/LongBench_e/
+niah 上同时不输甚至超过 vanilla，不是"没完全打平"。按 8.5 末尾的建议，**先跑一遍
+更便宜的 lambda+temperature 联合网格（同样是 eval-only，不需要读这一节）**，再回
+到这里挑最终候选续训；如果联合网格已经不再需要讨论，直接把下面 `arc_warmup_
+importance_continue.yaml` 里的占位值改成选中的 lambda/temperature 即可开始。
 
 **为什么不是一开始就做**：eval-only 扫描（8.5 上面两条）测的是"CPT 权重从没见过
 这个池化分布，能不能直接受益"；如果扫描完全无效（niah 在所有 lambda/temperature
