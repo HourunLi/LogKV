@@ -341,6 +341,16 @@ RoPE）这些改动是设计里不可选的（§2.1、§5.6 的 `K_max=1` 讨论
 memory-matched 公平性"这两个 serving 侧的论证是两件独立的事——放进同一张表比较
 会把训练开销和推理内存预算混为一谈，所以单独列出，不进上面那张表。
 
+> **这笔账中途差点被算错一次，教训值得留着**：为了让 `op_log` 安全地活过
+> `backward()`（不被下一次 `forward()` 的 reset 清空），中间一版实现是
+> `ctx.save_for_backward(cache.op_log.detach().clone(), ...)`——这个 `clone`
+> 让训练峰值一度变成 448+448=896MB，因为 cache 自己的持久 448MB 和 ctx 里的
+> 克隆同时存在。**最终方案不是克隆，是让 `op_log`/`op_log_len` 不再走"持久
+> buffer + `reset_parameters()` 原地清零复用"这条路**——它们改成每次
+> `forward()` 开头重新绑定成全新分配的张量，直接存进 `ctx`，不需要克隆，
+> 训练峰值因此回到单份 448MB，就是本节这笔账的数字，不是 896MB。完整推导见
+> `algorithm-spec.md` §5.21-2"训练峰值显存"更正框。
+
 **关于"期望 O(log n)、最坏 O(N)"这个契约**：作为**论文的空间复杂度主张**它成立，
 而且比"期望"更强——CRP 簇数是独立 Bernoulli 之和，Chernoff 给出多项式小的尾概率，
 是**高概率界**。但作为**实现契约**不能照字面做，因为预分配必须按最坏情况，最坏
@@ -429,6 +439,71 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-14｜第十轮核实：解决"op_log 跨 Phase 顺序"这个此前一直没钉死的
+  根本问题——主操作改成显式携带 `token_idx`，不再靠隐式位置对应原始 token；
+  同时钉死 Ward 合并的物理执行顺序、拆开 `derive_final_cluster` 避免分段
+  结果过期、把 Phase 1 的向量化公式显式限定在 direct 子序列上、并把训练期
+  `op_log` 显存从"克隆导致翻倍"改成"重新分配、不翻倍"。** 动机：用户指出
+  两处 P0——本质都是"批量化路由（Phase 1 向量化 + Phase 2 串行）产生的
+  op_log，和 backward 重放/Phase 3 assumed 的东西不是同一个顺序"这一个更
+  根本问题的不同表现——外加三处 P1。这是目前为止改动面最大的一轮，因为
+  两处 P0 的修法（显式 `token_idx`）触及 op 格式、Phase 1/2 的全部伪代码、
+  重放循环、以及 `derive_final_cluster`。逐条结论：
+  ① **P0：`op_log` 的顺序契约自相矛盾**——§5.21-2 早就承认"op_log 的线性
+  顺序是逻辑顺序，不是 forward 真实物理顺序"，但 backward 重放的
+  `token_ptr` 是一个从 0 开始的隐式递增计数器，悄悄假设了"op_log 第 i 条
+  就对应原始第 i 个 token"。具体反例：批次 `[direct τ0, orphan τ1,
+  direct τ2]`，Phase 1（向量化）先写 `τ0`/`τ2` 的 op，Phase 2（串行）再写
+  `τ1` 的 op——本地缓冲顺序是 `[τ0, τ2, τ1]`，不是 `[τ0, τ1, τ2]`，
+  `token_ptr` 会把 `τ2` 的 `JOIN` 错误地喂上 `τ1` 的数据。**修法**：三类
+  主操作的 `arg2`（此前恒为 `-1`，未使用）改存显式 `token_idx`，重放/
+  `derive_final_cluster`/Phase 3 一律用 `op.token_idx` 索引原始
+  `(k_raw,v,pos)`，不再依赖隐式位置。同时把顺序契约精确改写为三条（同簇
+  内部按真实到达顺序、结构操作紧邻其主操作、跨簇顺序不重要），并证明
+  "Phase 1 全体先写、Phase 2 全体后写"满足这三条——关键前提是"同一个逻辑
+  簇的主操作在一个 flush 批内只可能整个来自 Phase 1 或整个来自 Phase 2，
+  不会两边都有"（orphan 的语义距离恒 `>λ_new`，不可能 JOIN 一个 Phase 1
+  也在写的既有簇；Ward 合并只改写 `keep_slot` 的聚合元数据，不产生新主
+  操作，不会把 Phase 2 的东西混进 `keep_slot` 的主操作序列）。
+  ② **P0：Ward 合并的物理执行顺序此前没有明确定义**——如果"Phase 1 只记
+  日志、物理写入推迟到批末"，Ward 合并看不到 Phase 1 已分配的 token；如果
+  "Phase 1 提前把全部 direct token 物理写入"，Ward 合并又会提前看到本该
+  更晚到达的内容——两种读法都会让 forward 真实发生的事和 op_log 记录的
+  顺序对不上。**修法**：钉死"Phase 1（路由决策 + 向量化物理写入）作为一个
+  原子步骤完整跑完，Phase 2（串行，含 Ward 合并）才开始"这一条实现契约，
+  不是"日志 vs 物理写入"的分界，是"Phase 1 整体 vs Phase 2 整体"的分界。
+  这个顺序和①确定的 op_log 物理顺序完全对应，所以"严格按 op_log 顺序
+  重放"自动等价于 forward 的真实执行，不需要另外证明。
+  ③ **P1：`derive_final_cluster` 分段串联会让早期 token 的 final slot
+  过期**——第 1 段扫完返回的 `final_slot` 一旦被调用方当作最终答案存起来，
+  第 2 段里如果发生 `WARD_MERGE` 继续合并第 1 段某个 token 所在的槽，那个
+  存起来的值就悄悄过期了，且没有任何机制通知调用方。**修法**：拆成
+  `scan_op_log`（只累积 `token_identity`/`epoch`/`parent`，从不解析"最终
+  归属"）和 `resolve_final_slots`（对累积下来的**全部** `token_identity`
+  统一解析一次，只应该在扫完全部你关心的段之后调用一次）两个函数——
+  中间任何一次 `scan_op_log` 的返回值都不包含"最终"这个概念，也就没有
+  "过期"的可能性。
+  ④ **P1：Phase 1 的向量化公式（segment id / PAD count / 本地缓冲索引
+  分配）没有排除 orphan**——公式按全批 `c*[t]` 分组，但 Phase 1 只该处理
+  `s*[t]≤λ_new` 的 direct token，orphan 的 `c*[t]` 是"离哪个既有簇最近"
+  而非"它真的会去哪"，混进分组会污染真实 direct token 所在簇的统计。
+  **修法**：显式定义 `direct[τ]=(s*[τ]≤λ_new)` 和压缩后的 `direct_idx`，
+  下面所有公式的下标 `t` 改指压缩后 direct 子序列（`t=0..m_direct-1`），
+  orphan 完全不出现在这些公式里，也不占本地缓冲的任何一行。
+  ⑤ **P1：训练期 `op_log` 显存少算了一份 clone**——上一轮修的
+  `.detach().clone()` 解决了别名 bug，但 cache 自己的持久 448MB 和 ctx 里
+  的克隆同时存在，训练峰值实际是 896MB，`CLAUDE.md` 的"约 448MB"因此过时
+  了。**没有选择接受翻倍**：重新审视后发现 `op_log`/`op_log_len` 是本表
+  唯一"必须活过 `reset_parameters()`"的 buffer（其它 buffer 的内容 backward
+  从不直接读，靠重放 `op_log` 重建，不需要活过自己所在的 forward() 调用）
+  ——这个独有的需求，本就不该套用其它 buffer"预分配一次、原地清零复用"
+  的模式。**修法**：`op_log`/`op_log_len` 改成每次 `forward()` 开头重新
+  绑定成全新分配的张量（不是原地 `zero_()`），直接存进 `ctx`，不需要
+  克隆——下一次 `reset_parameters()` 只会让属性名指向另一块全新存储，
+  完全不触碰 `ctx` 里这次调用留下的对象。训练峰值显存回到单份 448MB，
+  代价是分配频率变高，但 PyTorch 显存缓存分配器在稳态训练循环里能把这个
+  代价压得很低，远小于峰值翻倍的代价。
 
 - **2026-08-14｜第九轮核实：修掉 `ctx.save_for_backward` 存裸引用而非快照的
   bug、Phase 1 reset-scan 的 off-by-one、变长本地缓冲的索引分配公式、`K`
