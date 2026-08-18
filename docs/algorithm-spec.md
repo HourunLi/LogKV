@@ -630,6 +630,42 @@ Gram 矩阵本就是秩 1 且只有一个非零对角元，幂迭代在这个退
 而是精确解，所以这条单测应当断言逐位相等（或 `TestRank1Approximation` 已用的
 同一档 float 容差），不是近似值。
 
+#### 填充槽的实际写入模板
+
+`insert_pad_entries(cluster, level=0, count)` 不应该绕开普通追加路径；它应该循环
+`count` 次，把一个"零权重 entry"追加到该 cluster 的 level 0，然后复用同一套
+`_binary_carry`/级联进位逻辑。这样 pad 和真实 token 经过完全相同的配对顺序，replay
+时也不需要第二套高层插入语义。
+
+每个填充槽必须按下面这张表初始化；这张表是实现约束，不是建议：
+
+| 字段/掩码 | 填充值 | 原因 |
+|---|---|---|
+| `w` | `0` | 让 pad 在均值与计数上成为恒等元 |
+| `pad_mask` | `true` | 标注纯 pad/做断言；compact 输出侧必须按 `w_out==0` 重算 |
+| `k`, `v` | 全 0 且 finite | 防止 `0 × NaN/Inf` 经 `dk` 或均值路径污染真实 entry |
+| `sigma_u`, `sigma2` | 全 0 且 finite | 防止 rank-1 PSD 路径里的零权重 factor 传播 NaN/Inf |
+| `gamma_a`, `gamma_b`, `gamma` | 全 0 且 finite | 防止 rank-1 cross 路径里的零权重 factor 传播 NaN/Inf |
+| `p_lo` | `+INT_MAX` | 让 `min(real.p_lo, pad.p_lo)` 返回真实锚点 |
+| `p_hi` | `-1` | 让 `max(real.p_hi, pad.p_hi)` 返回真实锚点 |
+| `sum_wp` | `0` | `w=0` 的位置贡献必须为 0 |
+
+两个实现不变量必须同时成立：
+
+1. **compact 不变量**：`compact(real, pad)` 与 `compact(pad, real)` 在有效输出上都等价于
+   `real`；`compact(pad, pad)` 允许产生内容为 0 的无效 entry，但输出必须保持
+   `w=0`，并在读出侧被过滤。**`pad_mask` 不能用输入两侧的 OR 直接传播**，否则
+   `compact(real, pad)` 会把一个真实输出误标成 pad；compact 输出侧的 `pad_mask`
+   应按 `w_out == 0` 重新生成，或由同等语义的有效位反推。
+2. **读出不变量**：扁平化 slot 池时先用 `w > 0` 生成 entry 级有效位，再做锚点去重和
+   slot 展开；`pad_mask` 只用于调试断言/统计纯 pad 占用，不参与把真实 `w>0` entry
+   排除出读出。任何 `p_lo=+INT_MAX, p_hi=-1` 的纯 pad entry 都不能进入
+   `dedup_anchors` 或 `apply_rope`。
+
+`n_total_c` 只统计真实 token，不随 pad 增加；否则下一次 `count = (-n_total_c) mod
+2^ℓ_block` 会把"为了对齐插入的空位"也当作真实成员，导致边界越补越偏。需要记录 pad
+占用时使用 `pad_mask`/`level_count`，不要复用 `n_total_c`。
+
 #### 代价是指数的，这直接定死了 `ℓ_block`
 
 要保护到第 ℓ 层不被跨段污染，段的起始下标必须是 `2^ℓ` 的倍数（第 ℓ 层的一个 entry
