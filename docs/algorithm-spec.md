@@ -224,6 +224,89 @@ Phase 3:
 分歧率**——S0.8。`p_hi_c` 冻结这条单独更值得关注：见 §5.21-2 里对它的展开分析
 （同批内连续同簇 token 会因为看到"批前"的 `p_hi_c` 而被误判成隔了很久）。
 
+#### op_log 跨 Phase 的顺序契约：token 归属改成显式字段，不再依赖隐式位置
+
+**§5.21-2 已经承认"op_log 里的线性 token 顺序是一个逻辑顺序，不是 forward 实际
+执行的物理顺序"，但 backward 重放的 `token_ptr` 却假设两者是同一个顺序——这是
+一个真实的矛盾，不是文字表述问题，必须先在这里解决，下面 Phase 1 的具体公式才
+有稳固的地基。** 具体反例：一个 flush 批是 `[direct τ0, orphan τ1, direct τ2]`
+（`τ0`/`τ2` 被 Phase 1 判定为 direct，直接路由；`τ1` 是 orphan，交给 Phase 2）。
+按现有设计，Phase 1（向量化）先把它处理的 direct token 的 ops 写进本地缓冲
+（`τ0`、`τ2`），Phase 2（串行）随后处理 orphan、把 `τ1` 的 op 追加在后面——本地
+缓冲里三条主 op 的物理顺序是 `[τ0 的 op, τ2 的 op, τ1 的 op]`，**不是**
+`[τ0, τ1, τ2]` 这个真实到达顺序。但重放循环的 `token_ptr` 只是一个从 0 开始的
+递增计数器，它会把这三条 op 依次对应到 `k_raw[0], k_raw[1], k_raw[2]`——也就是
+`τ0, τ1, τ2` 的原始数据——第二条 op（实际是 `τ2` 的 `JOIN`）会被错误地喂上
+`τ1` 的 `(k_raw, v, pos)`，第三条 op（实际是 `τ1` 的 `NEW_CLUSTER`）会被错误地
+喂上 `τ2` 的数据。**这不是边界情形，只要一个批里 direct 和 orphan 交替出现就会
+发生。**
+
+**修法：主操作的 `arg2` 字段改存显式 `token_idx`（该 token 在这次 forward 处理
+的整条序列里的绝对位置），重放直接用 `op.token_idx` 索引 `k_raw`/`v`/`pos`，
+不再依赖任何隐式递增的 `token_ptr`。** `arg2` 对 `NEW_CLUSTER`/`NEW_SEGMENT`/
+`JOIN` 这三类主操作此前恒为 `-1`（未使用），现在改存 `token_idx`——不需要扩大
+op 的 4-int32 格式。结构操作（`WARD_MERGE`/`PAD_INSERT`/`CARRY`）不消费具体
+token，`arg2` 保留原有语义（`count`/`resulting_count`/`-1`），不受影响，也
+不需要 `token_idx`。
+
+**这个修法同时回答了"op_log 的物理顺序到底要不要等于真实到达顺序"这个问题
+——不需要，只要每条主操作显式携带自己的 `token_idx`。** 精确的顺序契约改写为
+三条，都不要求跨 Phase 的全局到达顺序：
+
+1. **同一个逻辑簇（`(slot, epoch)` 身份）自己的主操作序列，必须按真实到达
+   顺序出现**——这是 `compact()`"时间序相邻配对"数学成立的前提（§5.21-2 已经
+   论证过），Phase 1 的 `main_idx` 公式（见下方）和 Phase 2 的串行处理各自
+   保证了这一点。
+2. **结构操作紧邻它服务的主操作**（`WARD_MERGE` 在其 `NEW_CLUSTER` 之前，
+   `PAD_INSERT` 在其 `NEW_SEGMENT` 之前）——已有规则，不变。
+3. **不同逻辑簇之间的主操作，互相的相对顺序不重要**——因为 Phase 3 逐簇独立
+   处理元数据、`compact()`/`_binary_carry()` 的数学也是逐簇独立的，两个不同
+   簇的 op 谁先谁后不影响任何计算结果。
+
+**为什么"Phase 1（direct）全部先写，Phase 2（orphan）再写"满足这三条契约，
+不需要让两组在本地缓冲里按真实到达顺序交错**：关键前提是**同一个逻辑簇的
+主操作，在一个 flush 批内只可能全部来自 Phase 1 或全部来自 Phase 2，不会
+两边都有**：
+
+- Phase 1 只处理 `direct[τ] = True`（`s*[τ] ≤ λ_new`）的 token，把它们路由到
+  **既有**簇（批前就 alive 的槽）。
+- Phase 2 只处理 orphan（`s*[τ] > λ_new`），它们要么加入本批 Phase 2 内部
+  mini DP-means 分到的**新**临时簇（一个从未在这个 `(slot,epoch)` 身份下出现
+  过的全新逻辑簇），要么（在 Ward 合并腾位的情形下）落进一个**被释放又复用**
+  的槽——复用之后是一个新的 `epoch`，逻辑上同样是全新身份，和被合并走的旧
+  身份不是同一个簇（`scan_op_log`/`resolve_final_slots` 那节已经用
+  `(slot,epoch)` 讲过这一点）。orphan **永远不会** JOIN 一个 Phase 1 本批也
+  在写的既有簇——按定义，orphan 到所有既有簇（含被 Phase 1 命中的那些）的语义距离都
+  `> λ_new`，否则它就不是 orphan。
+- Ward 合并本身（`ward_merge_only` 步骤 1）只**读写 `keep_slot` 的聚合元数据**
+  （μ/n_eff/n_total/p_hi/current_segment 的合并），**不会给 `keep_slot` 产生
+  新的主操作**——orphan 自己的主操作全部落在 `free_slot`（腾出来的槽）上，不
+  是 `keep_slot`。所以即使 `keep_slot` 恰好是本批 Phase 1 也写过 direct token
+  的既有簇，Ward 合并也不会在它的主操作序列里插入任何 Phase 2 的东西，
+  `keep_slot` 自己那条主操作序列依旧完整地、只由 Phase 1 贡献。
+
+  所以：**每个逻辑簇的主操作序列要么整个来自 Phase 1（保序由下面的
+  `main_idx` 保证），要么整个来自 Phase 2（保序由串行处理本身保证）**，
+  两组之间没有交叉。"先写完 Phase 1 那一组、再写 Phase 2 那一组"这个物理
+  顺序，天然满足契约第 1 条——不需要让两组在缓冲区里按 τ 交错。
+
+**这不只是一个记录格式的决定，它同时钉死了 forward 的真实执行顺序，回答了
+"Ward 合并的物理状态和重放顺序如何闭合"这个问题**：既然 op_log 的物理顺序
+就是"Phase 1 组、然后 Phase 2 组"，为了让"重放严格按 op_log 顺序执行"与
+"forward 实际发生的事情"逐位一致（§5.21-2 的既有要求），**forward 自己也
+必须按这个顺序真的去做**——即：Phase 1 的向量化路由**和**它对应的向量化
+ladder 物理写入（§5.21-3 的掩码并行 carry）在这一步内一起完成，产出一个已经
+完整反映全部 direct token 内容的 ladder；Phase 2 才开始运行，它看到的、Ward
+合并要读要写的就是这个已经被 Phase 1 更新过的真实 ladder，不是批前快照。
+**"Phase 1 只记日志、不动 ladder，等 Phase 2 跑完再统一物理写入"和"Phase 1
+先把全部 direct token 物理写入、Ward 合并提前看到本该更晚到达的 token"这两种
+读法都不对**——正确的分界线不是"日志 vs 物理写入"，是"Phase 1 整体 vs
+Phase 2 整体"：Phase 1（日志 + 物理写入一起）作为一个原子步骤完整跑完，
+Phase 2（日志 + 物理写入一起，含 Ward 合并）才开始，两者之间没有交错，也
+没有谁"抢跑"谁。这个顺序和 op_log 的物理顺序完全对应，所以 replay（严格按
+op_log 顺序执行）自动等价于 forward 的真实执行——不需要另外证明，这是构造
+出来的，不是巧合。
+
 #### Phase 1 缺持久 segment 状态，且批内同簇的 segment id / PAD_INSERT count 不能各算各的
 
 **这是比"`p_hi_c` 冻结"更基础的一处空白：`JOIN(cluster, segment)` 和
@@ -258,10 +341,10 @@ segment id（下一次开新段时用 `current_segment + 1`），进 §5.13 的�
 > 簇 X 用槽 5，X 被合并走或整体让位后，槽 5 又被拿去 `NEW_CLUSTER` 建立
 > 一个和 X 无关的新簇 Y），这种情况下 X 和 Y 的 segment 计数都从 0 开始，
 > `(cluster=5, segment=0)` 这个裸 key 确实会撞——但这正是"槽位复用"问题
-> 本身（`derive_final_cluster` 那节已经用 `(slot, epoch)` 版本化身份解决
-> 过一次），不是 segment 机制独有的新问题。**结论：任何需要跨这类边界做
-> 分组/画图的分析工具，必须按 `(slot, epoch, segment)`（复用
-> `derive_final_cluster` 已经维护的同一套 `epoch`）做 key，不能只用裸
+> 本身（`scan_op_log`/`resolve_final_slots` 那节已经用 `(slot, epoch)`
+> 版本化身份解决过一次），不是 segment 机制独有的新问题。**结论：任何需要
+> 跨这类边界做分组/画图的分析工具，必须按 `(slot, epoch, segment)`（复用
+> `scan_op_log` 已经维护的同一套 `epoch`）做 key，不能只用裸
 > `(cluster, segment)`；而跨 `a`/`b` 两段历史的真实时间先后顺序，只能从
 > `op_log` 本身的线性位置读，不能靠比较两个 lineage 各自的 `segment` 数值
 > 大小去推断——它们不是同一个可比较的计数序列。**
@@ -280,9 +363,30 @@ segment id（下一次开新段时用 `current_segment + 1`），进 §5.13 的�
 
 **解法：两个都是标准的向量化分段扫描（segmented scan）原语，不需要任何数据
 相关的有界循环轮数——这一点和 §5.21-3 的 ladder carry 不同，值得说明为什么。**
-先固定记号：本批 `m` 个 token 按到达顺序排好，`c*[t]` 是 Phase 1 算出的目标簇，
-`new_seg[t]` 是 §5.3 第二判据算出的布尔值（是否开新段，仍然用批前冻结的
-`p_hi_c`，这部分近似不变）。
+**先定死一个此前没写清楚的过滤步骤：下面所有公式只跑在 direct 子序列上，
+orphan 完全不参与。** 本批 `m` 个 token 按到达顺序排好，绝对批内位置记为
+`τ = 0..m-1`；Phase 1 开头的统一代价矩阵（本节最上方的伪代码）已经给出
+`c*[τ]`（每个 token 的目标簇）和 `s*[τ]`（`c*[τ]` 自己的语义距离），对**全部**
+`m` 个 token 都算了一遍（这一步没法只对 direct 算，因为还不知道谁是 direct）。
+但从这里开始：
+
+```
+direct[τ]  = (s*[τ] ≤ λ_new)                         # τ = 0..m-1，覆盖全批
+direct_idx = 把 {τ : direct[τ]=True} 按 τ 递增排好的列表，长度 m_direct
+```
+
+下面 `rank`/`last_new_rank_before`/`steps_since`/`main_idx` 等全部公式里的
+`t`，指的是**压缩后 direct 子序列的下标**（`t = 0..m_direct-1`），不是原始批内
+位置 `τ`——读取 `c*[t]`/`new_seg[t]` 实际上是 `c*[direct_idx[t]]`/
+`new_seg[direct_idx[t]]`（gather），`new_seg[τ]` 由 §5.3 第二判据算出（是否
+开新段，仍然用批前冻结的 `p_hi_c`，这部分近似不变）。**orphan（`direct[τ]=False`
+的 token）不会出现在任何 `t` 位置上，既不贡献 `nsg_incl`/`steps_since` 这类
+按簇分组的前缀扫描，也不占用 Phase 1 本地缓冲的任何一行**——它们的语义距离
+`> λ_new`，根本没有一个"既有簇"可供它们贡献 segment/pad 计数，混进这些公式
+只会污染真正 direct token 所在簇的统计（例如让一个 haystack 簇的 `nsg_incl`
+被一个凑巧 `c*` 相同、但实际是 orphan、根本不会真的 JOIN 这个簇的 token
+污染）。orphan 的主 op 完全由 Phase 2 产生，参见上面"op_log 跨 Phase 的顺序
+契约"一节。
 
 **Segment id（对应上面新增 `current_segment` 要解决的问题）**：
 
@@ -377,12 +481,13 @@ count[t]     = (-prev_mod[t]) mod 2^ℓ_block         # 只有 new_seg[t]=True �
 掩码 carry"。
 
 **必须有 CPU 参考实现和对拍单测（S0.1，纯 CPU 可测）**：和 §5.21-2 对批量
-ladder 写入的要求同一个模式——写一个逐 token 串行的朴素参考实现（对每个到达
-的 token，读当前 `current_segment`/`level_count[cluster,0]`，立即决定
-`segment`/`count`，立即"执行"更新，供下一个 token 读到最新值），断言它和上面
-向量化公式在任意合成批次（含同簇多次开新段、含多个不同簇交错到达）上逐位
-一致。这条测试没通过之前，"segment id / PAD_INSERT count 的批量化是对的"这个
-论证是未经验证的假设。
+ladder 写入的要求同一个模式——写一个逐 token 串行的朴素参考实现（对每个**到达
+的 direct token**，先过滤掉 orphan，再读当前 `current_segment`/
+`level_count[cluster,0]`，立即决定 `segment`/`count`，立即"执行"更新，供下一个
+token 读到最新值），断言它和上面向量化公式在任意合成批次（含同簇多次开新段、
+含多个不同簇交错到达、**含 direct 和 orphan 交替出现**）上逐位一致。这条测试
+没通过之前，"segment id / PAD_INSERT count 的批量化是对的"这个论证是未经验证
+的假设。
 
 **上面只算出了每个 token 的 `segment`/`count`，还没说这些 op 怎么写进本地缓冲
 ——`PAD_INSERT` 和它服务的 `NEW_SEGMENT` 是两条 op，主操作永远只有一条，每个
@@ -390,15 +495,25 @@ token 展开出的 op 数量不一样，这是一个变长写入问题，Phase 1
 不能逐 token 决定"我这条写在第几行"。**
 
 ```
-extra[t]    = new_seg[t] and (count[t] > 0)   # 这个 token 除了主操作，还需要
-                                                # 额外一条 PAD_INSERT
-main_idx[t] = base + t + inclusive_prefix_sum(extra)[t]   # base 是本地缓冲
-                                                             # 提交前的 local_op_len
-                                                             # （Phase 1 总是本批
-                                                             # 第一个写入者，实践中
-                                                             # base=0，但公式写通用
-                                                             # 形式）
+extra[t]     = new_seg[t] and (count[t] > 0)   # 这个 token 除了主操作，还需要
+                                                 # 额外一条 PAD_INSERT
+main_idx[t]  = base + t + inclusive_prefix_sum(extra)[t]   # base 是本地缓冲
+                                                              # 提交前的 local_op_len
+                                                              # （Phase 1 总是本批
+                                                              # 第一个写入者，实践中
+                                                              # base=0，但公式写通用
+                                                              # 形式）
 若 extra[t]：pad_idx[t] = main_idx[t] - 1
+token_idx[t] = batch_start_offset + direct_idx[t]   # 写进主 op 的 arg2，见前面
+                                                      # "op_log 跨 Phase 的顺序
+                                                      # 契约"一节——batch_start_
+                                                      # offset 是这个 flush 批
+                                                      # 第一个 token 在整条序列
+                                                      # 里的绝对位置，direct_idx[t]
+                                                      # 把压缩后的 t 映回批内原始
+                                                      # 位置 τ，两者相加才是 replay
+                                                      # 要用来索引 k_raw/v/pos 的
+                                                      # 全局绝对 token 位置
 ```
 
 `inclusive_prefix_sum(extra)[t]`（**含 `t` 自己**，标准的向量化前缀和，不是
@@ -569,37 +684,58 @@ token 最终在哪个簇里"都要完整重放一遍。**这个便利可以完�
 > 种子参数，函数变成可以对同一条 `op_log` 分段串联调用的形式**，而不是只能
 > 一次性喂完整日志。
 
+> **更正（这一轮修的）：分段串联会让早期 token 的 final slot 过期，必须把
+> "扫描/累积"和"解析出最终槽号"拆成两个函数，不能在扫完一段就提前算
+> `final_slot`。** 上一版每次调用都返回本段的 `final_slot`（对本段
+> `token_identity` 里的每个 token 立即用当前的 `parent` 状态跑一次
+> `find()`）——问题是**后续段里的 `WARD_MERGE` 可能继续改变早期 token 的
+> 最终归属**：假设第 1 段处理完时，`find()` 把 token 500 解析成槽 C，函数
+> 照原设计把 `final_slot[500] = C` 返回给调用方；但第 2 段里发生了
+> `WARD_MERGE(D, C)`——槽 C 的内容被合并进 D。**token 500 真正的最终归属
+> 现在是 D，但调用方手里存的 `final_slot[500]` 还是过期的 C，而且没有任何
+> 机制通知调用方这个值已经失效。** 只传 `epoch`/`parent` 状态不够，因为
+> 早期 token 的 `(slot, epoch)` 版本化身份（`token_identity` 里的值）已经
+> 在返回 `final_slot` 时被"解析掉"、没有保留下来——即使调用方后续想用新的
+> `parent` 重新解析 token 500，也拿不到它当初的版本化身份了。**修法：把
+> 函数拆成 `scan_op_log`（只扫描、累积 `token_identity`，从不调用
+> `find()`、从不产出任何"最终"结果）和 `resolve_final_slots`（对累积下来
+> 的**全部** `token_identity` 统一跑一次 `find()`）——调用方的职责变成
+> "先把所有关心的段都 `scan_op_log` 完、把每段的 `token_identity` 累积到
+> 一个字典里，最后才调用一次 `resolve_final_slots`"，中间任何一次
+> `scan_op_log` 的返回值都不包含"最终归属"这个概念，也就没有"过期"的
+> 可能性——这不是这个函数的一个可选优化，是唯一避免过期结果的做法。**
+
 ```python
-def derive_final_cluster(
+def scan_op_log(
     op_log,
-    token_offset: int = 0,
     initial_epoch: dict[int, int] | None = None,
     initial_parent: dict[tuple[int, int], tuple[int, int]] | None = None,
-) -> tuple[dict[int, int], dict[int, int], dict[tuple[int, int], tuple[int, int]]]:
-    """只读、离线，供调试/S0.8 对拍/下游分析工具使用；从不写回 op_log，也不是
-    forward/backward 正确性契约的一部分——这一点必须显式声明，否则容易被误用成
-    重放的一部分。对 WARD_MERGE 的合并方向做一次并查集(union-find)，但身份是
-    (slot, epoch) 而不是裸 slot——见上方更正框，槽位复用后的新身份不能被误认成
-    被合并走的旧身份。op_log 本身已经完整记录了每次合并的方向，这里只是在
-    不可变记录上做一次只读遍历，和"篡改历史记录"是两件完全不同的事。
+) -> tuple[dict[int, tuple[int, int]], dict[int, int], dict[tuple[int, int], tuple[int, int]]]:
+    """只读、离线，扫一段 op_log（完整日志，或任意切片，比如一个 flush 批的
+    本地缓冲）。**只累积状态，从不解析"最终归属"**——见上面的更正框，final
+    slot 的解析被故意挪到一个单独的函数，且只应该在扫完全部你关心的段之后
+    调用一次。从不写回 op_log，也不是 forward/backward 正确性契约的一部分。
+    对 WARD_MERGE 的合并方向做一次并查集(union-find)，身份是 (slot, epoch)
+    而不是裸 slot——见上方更正框，槽位复用后的新身份不能被误认成被合并走的
+    旧身份。
 
-    **前提（函数不做任何隐式校验，调用方必须自己保证）**：
-    1. `op_log` 参数必须是**有效前缀**（按 §5.13 新增的 `op_log_len` 截断，
-       不是整个静态 `(OP_max, 4)` buffer——尾部未写入的行不是合法 op，混进来
-       会产生未定义行为，见下方"op_log 的有效长度"一节）。
-    2. 若这是从冷启动（空 cache，所有槽从未被 `alive` 过）开始的完整、连续
-       日志：`initial_epoch`/`initial_parent` 留默认 `None`（等价于假设这段
-       之前没有发生过任何 `NEW_CLUSTER`/`WARD_MERGE`，对冷启动完整日志这个
-       假设成立）。
-    3. 若这只是一段切片（比如某一个 flush 批自己的本地缓冲，或者想分段处理
-       一条很长的 op_log 而不是一次性喂完）：**必须**传入这一段开始之前的
-       `epoch`/`parent` 状态——用上一次调用本函数返回的 `final_epoch`/
-       `final_parent` 直接传进来即可串联，见下方"串联调用"。不满足 1-3 条
-       之一，结果不可信。
+    前提（函数不做任何隐式校验，调用方必须自己保证）：
+    1. `op_log` 参数必须是**有效前缀**（按 §5.13 的 `op_log_len` 截断，不是
+       整个静态 `(OP_max, 4)` buffer）。
+    2. 主操作必须携带真实的 `token_idx`（arg2，§5.21-2 这一轮的更正——旧格式
+       `arg2` 恒为 `-1` 的日志不能喂给这个函数，`token_identity` 直接用
+       `op.token_idx` 做 key，不再用递增计数器去猜"这条 op 对应哪个 token"，
+       原因见 §5.4"op_log 跨 Phase 的顺序契约"）。
+    3. 若这是从冷启动（所有槽从未 `alive` 过）开始的完整日志：
+       `initial_epoch`/`initial_parent` 留默认 `None`。若这只是一段切片：
+       必须传入这一段开始之前的 `epoch`/`parent` 状态——用上一段调用的
+       返回值直接传进来即可串联。
 
-    返回三元组：(token_idx -> 最终槽号，token_idx 已经加上 token_offset；
-    本段结束时的 epoch 状态；本段结束时的 parent 状态）。后两者可以原样作为
-    下一段调用的 `initial_epoch`/`initial_parent`。"""
+    返回三元组：(本段的 token_identity：token_idx -> 记录时的版本化身份；
+    本段结束时的 epoch 状态；本段结束时的 parent 状态)。后两者原样传给下一段
+    调用的 initial_epoch/initial_parent；第一项**必须由调用方自行累积**（和
+    之前所有段的 token_identity 合并到一个字典里），不能丢弃，因为
+    `resolve_final_slots` 需要看到全部 token 才能给出不会过期的答案。"""
     epoch = dict(initial_epoch) if initial_epoch else {}    # 槽号 -> 当前 epoch
     parent = dict(initial_parent) if initial_parent else {}  # (槽号,epoch) -> (槽号,epoch)
     def find(v):
@@ -608,32 +744,54 @@ def derive_final_cluster(
             v = parent[v]
         return v
 
-    token_identity = {}               # token_idx（本段内，从 0 开始）-> 记录时的版本化身份
-    token_ptr = 0
+    token_identity = {}               # token_idx -> 记录时的版本化身份 (slot, epoch)
     for op in op_log:
         if op.type == NEW_CLUSTER:
             epoch[op.cluster] = epoch.get(op.cluster, -1) + 1   # 首次建立 -1->0，
                                                                   # 每次复用再 +1
-            token_identity[token_ptr] = (op.cluster, epoch[op.cluster])
-            token_ptr += 1
+            token_identity[op.token_idx] = (op.cluster, epoch[op.cluster])
         elif op.type in (JOIN, NEW_SEGMENT):
-            token_identity[token_ptr] = (op.cluster, epoch.get(op.cluster, 0))
-            token_ptr += 1
+            token_identity[op.token_idx] = (op.cluster, epoch.get(op.cluster, 0))
         elif op.type == WARD_MERGE:
             keep_v = (op.keep_slot, epoch.get(op.keep_slot, 0))
             free_v = (op.free_slot, epoch.get(op.free_slot, 0))
             parent[find(free_v)] = find(keep_v)   # 只 union 当前这一代，不碰 epoch 本身
 
-    final_slot = {token_offset + t: find(v)[0] for t, v in token_identity.items()}
-    return final_slot, epoch, parent
+    return token_identity, epoch, parent
+
+
+def resolve_final_slots(
+    token_identity: dict[int, tuple[int, int]],
+    parent: dict[tuple[int, int], tuple[int, int]],
+) -> dict[int, int]:
+    """把（可能横跨多次 scan_op_log 调用累积下来的）token_identity，用**最终**
+    的 parent 状态解析成每个 token 的最终物理槽号。**只应该在扫完你关心的
+    整段 op_log 之后调用一次**——如果后面还会有更多 op_log 段要 scan，这里
+    算出来的结果可能被后续的 WARD_MERGE 弄过期，不要提前调用、也不要缓存
+    中间结果当作最终答案。"""
+    def find(v):
+        while parent.get(v, v) != v:
+            v = parent.get(v, v)
+        return v
+    return {t: find(v)[0] for t, v in token_identity.items()}
 ```
 
-**串联调用**：处理一条很长的 `op_log`（或按 flush 批分段的本地缓冲序列）时，
-不需要一次性喂完整日志——`epoch`/`parent` 就是这段计算的全部"记忆"，把它们
-从上一段的返回值原样传进下一段的 `initial_epoch`/`initial_parent`，`token_offset`
-累加上一段消费掉的 token 数，就能保持和"一次性喂完整日志"完全等价的结果，
-`find` 的并查集路径压缩也会在多段调用之间正确保留（因为 `parent` 是原样
-传递，不是每段重新清空）。
+**典型用法（串联多段）**：
+
+```python
+all_identity, epoch, parent = {}, None, None
+for segment in op_log_segments:               # 完整日志，或按 flush 批切片
+    identity, epoch, parent = scan_op_log(segment, epoch, parent)
+    all_identity.update(identity)              # 累积，不丢弃
+
+final_slot = resolve_final_slots(all_identity, parent)   # 只在这里、扫完全部
+                                                            # 段之后调用一次
+```
+
+`scan_op_log` 本身仍然可以按段串联调用（`epoch`/`parent` 是这段计算的全部
+"记忆"，从上一段的返回值原样传进下一段），这部分不变；变化的只是"什么时候
+可以安全地把结果当作最终答案"——答案是"扫完全部你关心的段之后，且只调用
+`resolve_final_slots` 一次"，不是"每扫完一段就问一次"。
 
 **不新增任何持久 buffer,不改变 §4/§5.13 的内存账目**——`epoch`/`parent` 是
 调用方自己持有、自己决定生命周期的普通 Python 对象，不属于 cache 状态的一
@@ -690,6 +848,7 @@ Phase 2 处理每个 orphan（或一小簇互相接近的 orphan，由批内 min
                                                  # 新簇写进去
     3. append WARD_MERGE(keep_slot, free_slot, -1) 到本地缓冲   # 日志写入是
        # 调用方（这里）的职责，不是 ward_merge_only 自己的职责，见 §5.6 的更正
+       # （WARD_MERGE 是结构操作，arg2 保留 -1，不需要 token_idx）
     4. slot_idx = free_slot   # 释放出来的槽立即交给这个 orphan（组）的新簇使用
        —— 这一步开始就是 allocate_new_cluster(slot_idx, group) 这个共享原语
        的内容（见本小节末尾"K 未满/冷启动复用同一个原语"一段），**只**初始化
@@ -699,8 +858,12 @@ Phase 2 处理每个 orphan（或一小簇互相接近的 orphan，由批内 min
           **数值元数据不在这里赋值**——统一交给 Phase 3 从本批完整的 op 序列
           重新构造（见下方"Phase 3 的簇级元数据更新"），避免和 Phase 3 的更新
           重复计入同一批 token
-       append NEW_CLUSTER(slot_idx, 0, -1) 到本地缓冲，对应这个 orphan（组）
-       里**到达顺序最早**的那个 token（绝对位置记为 p0）
+       append NEW_CLUSTER(slot_idx, 0, tok0) 到本地缓冲，对应这个 orphan（组）
+       里**到达顺序最早**的那个 token（绝对位置记为 p0，**绝对 token_idx 记为
+       tok0**——位置和 token_idx 是两个不同的量，见"op_log 跨 Phase 的顺序
+       契约"一节，orphan 自己在 Phase 2 里既知道它在序列中的绝对位置 `p_t`
+       用于 g_max 判据，也知道它的绝对 `token_idx` 用于喂给 op 的 arg2，两者
+       都要显式带着，不能只留一个）
        local_p_hi[slot_idx]    = p0   # Phase 2 私有的临时状态，只活在本次
        local_segment[slot_idx] = 0    # Phase 2 调用期间——不是 p_hi_c/全局
                                         # segment 计数，见下方说明
@@ -714,15 +877,15 @@ Phase 2 处理每个 orphan（或一小簇互相接近的 orphan，由批内 min
     `p_t − p_hi_c` 恒等于 `p_t − 0`，对任何有意义长度的文档都会远超 `g_max`，
     组内除最早成员外的所有成员都会被错误地判成"时序打断"，被迫各自开一个新
     segment——而它们本来就是同一次 mini DP-means 判定为彼此接近、大概率也在
-    时间上紧挨着到达的一组 token。对每个后续成员（绝对位置 `p_t`），按组内
-    到达顺序：
+    时间上紧挨着到达的一组 token。对每个后续成员（绝对位置 `p_t`，绝对
+    token_idx 记为 `tok_t`），按组内到达顺序：
 
         if p_t − local_p_hi[slot_idx] > g_max:
             local_segment[slot_idx] += 1
-            append NEW_SEGMENT(slot_idx, local_segment[slot_idx], -1) 到本地缓冲
+            append NEW_SEGMENT(slot_idx, local_segment[slot_idx], tok_t) 到本地缓冲
             （照常触发 §5.11 的 PAD_INSERT，插在这条 NEW_SEGMENT 之前）
         else:
-            append JOIN(slot_idx, local_segment[slot_idx], -1) 到本地缓冲
+            append JOIN(slot_idx, local_segment[slot_idx], tok_t) 到本地缓冲
         local_p_hi[slot_idx] = p_t   # 不论 JOIN 还是 NEW_SEGMENT，p_hi 都要推进
                                        # 到"最近一次收到成员的位置"——这是 p_hi
                                        # 的定义（§5.13），和是否开新段无关
@@ -862,8 +1025,12 @@ Phase 3 的具体做法：按本批本地缓冲（Phase 1 + Phase 2 全部写完
 从不改写，所以这就是最终版本，不需要额外等待或过滤任何"修正"）里的主操作
 （`NEW_CLUSTER`/`JOIN`/`NEW_SEGMENT`），逐簇按 §5.5 的在线均值公式更新
 `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`（后者只在遇到
-`NEW_SEGMENT` 时被那条 op 的 `segment` 字段覆写，`JOIN` 不改它）。**新建簇的
-第一个成员不需要特判**——
+`NEW_SEGMENT` 时被那条 op 的 `segment` 字段覆写，`JOIN` 不改它）。**这里同样
+要用 `op.token_idx` 去取这条 op 对应的 `k_raw`，不能假设"本地缓冲里的第几条
+op 就对应本批第几个 token"**——原因和 backward 重放的 `token_ptr` 问题完全
+一样（§5.4"op_log 跨 Phase 的顺序契约"一节），Phase 3 处理的是同一份本地
+缓冲，同样受 Phase 1/Phase 2 分组书写、不等于全局到达顺序这条约束影响。
+**新建簇的第一个成员不需要特判**——
 Phase 2 已经把它的 `n_eff` 清零，§5.5 公式里 `n_eff_pre == 0 时 μ_c ← k` 这条
 分支（本就是为"冷启动或 γ=0 归零"设计的）会自动接住"这是一个刚建立、从未有过
 成员的簇"这个情形，和"γ=0 导致的段内归零重启"是同一段代码，不需要为"这个簇是
@@ -1701,8 +1868,8 @@ rank-1 统计 `σu/σ2/γa/γb/γ`（约 3d，activation dtype，fp16/bf16 均�
 
 | buffer | shape | dtype | 用途 |
 |---|---|---|---|
-| `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**，只记 token 归属不足以重建结构，完整语义/顺序/重放算法见 §5.21-2 |
-| `op_log_len` | `(B,G)` | int32 | `op_log` 当前**有效**行数——`op_log[b,g,:op_log_len[b,g],:]` 才是已写入的合法内容，之后的行是未写入/未定义，**任何遍历 `op_log` 的代码（重放、`derive_final_cluster`、S0.8 对拍）都必须先按这个长度截断，不能扫整个 `(OP_max,4)`**，见 §5.21-2 的更正框 |
+| `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**，只记 token 归属不足以重建结构，完整语义/顺序/重放算法见 §5.21-2。**生命周期和本表其它 buffer 不同**：不是 `reset_parameters()` 原地 `zero_()` 复用的持久 buffer，而是每次 `forward()` 开头重新绑定成全新分配的张量，原因和训练峰值显存的权衡见 §5.21-2"训练峰值显存"更正框 |
+| `op_log_len` | `(B,G)` | int32 | `op_log` 当前**有效**行数——`op_log[b,g,:op_log_len[b,g],:]` 才是已写入的合法内容，之后的行是未写入/未定义，**任何遍历 `op_log` 的代码（重放、`scan_op_log`、S0.8 对拍）都必须先按这个长度截断，不能扫整个 `(OP_max,4)`**，见 §5.21-2 的更正框 |
 
 容量与内存：`OP_max = 4·T_max`，这不是经验估计，是有推导的硬上界，见 §5.21-2。
 32k 下 `(1,8,4·32768,4)` int32 ≈ 16MB/层，28 层共 **约 448MB**——是 §5.21-2 那份
@@ -2058,14 +2225,21 @@ entry 展开出 `M` 个虚拟槽时，`sigma_u`/`gamma_a` 也各自展开出 `M`
    但 `cos_cache[anchors]` 会因此索引越界。物化前必须 `clamp(0, N-1)` 或先按有效位
    掩码筛掉——**这是最容易在长序列上才暴露的崩溃**。
 
-5. **`op_log`（连同 `op_log_len`）要在 `forward()` 结束时存进 `ctx`，不要给
-   cache 对象的 reset 生命周期开特例。** `LogKVStreamTrainingAttention.forward`
+5. **`op_log`（连同 `op_log_len`）要在 `forward()` 结束时存进 `ctx`，且
+   `reset_parameters()` 对它俩必须是"重新绑定成全新张量"，不能是像其它
+   buffer 那样的"原地 `zero_()`"。** `LogKVStreamTrainingAttention.forward`
    开头就调 `cache.reset_parameters()`，而 backward 要重放 forward 期间记录的
    路由；**定案是把 `op_log`/`op_log_len` 和 `q`/`k_raw`/`k_roped`/`v` 一起存
-   进 `ctx`**（§5.21-2 的"`op_log` 的有效长度"一节有完整推导和理由），
-   backward 只读 `ctx` 里的快照，cache 对象自己的 `op_log`/`op_log_len` 该在
-   下次 `forward()` 被 `reset_parameters()` 清空就清空，不需要任何豁免逻辑。
-   **这个时序冲突不处理的话，训练会静默地用错误的梯度。**
+   进 `ctx`**（§5.21-2 的"`op_log` 的有效长度"一节有完整推导和理由）。
+   **这确实是 cache 对象生命周期里的一个特例**——其它 buffer（ladder/
+   centroid/`level_count`/`alive`/...）继续用原地 `zero_()` 复用；只有
+   `op_log`/`op_log_len` 改成每次 `forward()` 开头重新分配一块全新存储、
+   把属性名重新指过去，**不能沿用"原地清零复用"这条其它 buffer 都在用的
+   规则**——原地清零会让 `ctx` 里存的（不管是不是克隆过）内容跟着被清空，
+   这正是训练会静默用错误梯度的根源，也是曾经在这里踩过的坑（完整推导和
+   "为什么不能直接克隆代替重新分配"见 §5.21-2"训练峰值显存"更正框）。
+   backward 只读 `ctx` 里这份专属分配的张量，不需要关心 cache 对象后续
+   发生了什么。**这个时序冲突不处理的话，训练会静默地用错误的梯度。**
 
 6. **路由的距离计算强制 fp32。** §11-A 的重放确定性依赖它；TF32 下 einsum 的归约
    顺序差异足以在阈值边界上翻转一个决策。
@@ -2222,23 +2396,22 @@ def forward(ctx, q, k_raw, k_roped, v, cache, scale, train_block, second_order_s
     # op_log/op_log_len 不是这个 Function 的输入参数——它们是 forward 处理完
     # 整条序列全部 block/flush 之后，cache 对象上累积出来的最终状态，在这里
     # 读出来一起存进 ctx（§5.21-2"op_log 的有效长度"一节的定案）。
-    # 必须 .detach().clone()，不能存裸引用——见下方"ctx 存的必须是快照，
-    # 不是引用"一节，cache.op_log/op_log_len 是会被下一次 reset_parameters()
-    # 原地清零复用的持久 buffer，直接存引用会让 backward 读到已经被清空的内容
-    ctx.save_for_backward(
-        q, k_raw, k_roped, v,
-        cache.op_log.detach().clone(), cache.op_log_len.detach().clone(),
-    )
+    # 不需要 .detach().clone()——cache.op_log/op_log_len 不是 reset_parameters()
+    # 原地 zero_() 复用的持久 buffer，而是每次 forward() 开头被重新绑定成
+    # 全新分配的张量（见下方"训练峰值显存"更正框），下一次 reset_parameters()
+    # 只会让 cache.op_log 这个属性名指向另一块全新存储，不会动这次 ctx 里存的
+    # 这个对象——两者从一开始就是不同的张量，没有别名，不存在需要克隆去
+    # 撇清的共享关系
+    ctx.save_for_backward(q, k_raw, k_roped, v, cache.op_log, cache.op_log_len)
     ...
 
 @staticmethod
 @once_differentiable
 def backward(ctx, grad_y):
     q, k_raw, k_roped, v, op_log, op_log_len = ctx.saved_tensors
-    # op_log/op_log_len 是 forward 结束时的独立克隆，不是 cache 对象的引用——
-    # 重放只读这份快照，不碰 cache 对象自己的 op_log/op_log_len，也不需要关心
-    # cache 对象在这之间发生了什么（包括被下一次 forward() 的
-    # reset_parameters() 清空）
+    # op_log/op_log_len 是 forward 那次调用专属分配的张量，本来就不会被
+    # 任何其它 forward()/reset_parameters() 调用触碰——重放只读它们，也不需要
+    # 关心 cache 对象在这之间发生了什么
     ...
     grad_q       = ...   # 不变：in-flight exact attention 对 q 的梯度
     grad_k_roped = ...   # 不变：in-flight exact attention 对 k 的梯度，和现状代码里
@@ -2302,16 +2475,27 @@ naive reference 实现（哪怕慢、哪怕只能跑小规模，用来核对解�
 (op_type, arg0, arg1, arg2)   # 每条 4 个 int32
 
 ── 主操作：每个 flush 出来的 token 恰好触发一个，且互斥（直接对应 §5.3 的三路判定）──
-NEW_CLUSTER   (slot_idx,  0,        -1)      # 语义 novelty：在哪个空槽建新簇，
-                                              # segment 恒为 0（新簇的第一段）
-NEW_SEGMENT   (cluster,   new_seg,  -1)      # 时序打断：同簇开新段
-JOIN          (cluster,   segment,  -1)      # 归入既有簇的当前段
+NEW_CLUSTER   (slot_idx,  0,        token_idx)   # 语义 novelty：在哪个空槽建
+                                                  # 新簇，segment 恒为 0（新簇的
+                                                  # 第一段），token_idx 是这个
+                                                  # token 在整条序列里的绝对位置
+NEW_SEGMENT   (cluster,   new_seg,  token_idx)   # 时序打断：同簇开新段
+JOIN          (cluster,   segment,  token_idx)   # 归入既有簇的当前段
 
 ── 结构操作：不消费 token，作为主操作的副作用穿插出现 ──
 WARD_MERGE    (keep_slot, free_slot, -1)     # 给某个 NEW_CLUSTER 腾位，必然紧邻其前
 PAD_INSERT    (cluster,   level,    count)   # 给某个 NEW_SEGMENT 做对齐填充，必然紧邻其前
 CARRY         (cluster,   level,    resulting_count)  # ladder 进位，**非权威、可选**，见下方说明
 ```
+
+> **`arg2` 对三类主操作的含义，这一轮从"未使用的 `-1`"改成了`token_idx`**——
+> 见前面§5.4"op_log 跨 Phase 的顺序契约"一节：重放不能再靠一个隐式递增的
+> `token_ptr` 去猜"这条主操作对应哪个原始 token"，因为 Phase 1（direct）和
+> Phase 2（orphan）各自向本地缓冲追加 op 的顺序，和这些 token 的真实到达顺序
+> 并不是同一个顺序（Phase 1 全体先写，Phase 2 全体后写，两者内部各自保序，
+> 但交替出现的 direct/orphan 之间不保证全局顺序）。`token_idx` 把"这条 op
+> 消费哪个 token"从"隐式位置"变成"显式字段"，重放不再需要假设这两个顺序
+> 相同。
 
 > **一处曾经和下面的重放伪代码对不上的字段**：`NEW_CLUSTER` 原来写的是
 > `(slot_idx, -1, -1)`——arg1（对 `JOIN`/`NEW_SEGMENT` 而言就是 `op.segment`）
@@ -2325,11 +2509,17 @@ CARRY         (cluster,   level,    resulting_count)  # ladder 进位，**非权
 > 操作保持同一套字段语义，重放循环就能保持完全通用、不需要按 op 类型分叉，这也
 > 是为什么选择改数据格式而不是改重放代码。
 
-**顺序规则**：`op_log` 按 token 到达顺序线性写入。主操作严格一一对应"下一个待处理的
-token"；结构操作插在触发它的主操作旁边（`WARD_MERGE` 在它服务的 `NEW_CLUSTER` **之前**
-——先腾位再建簇；`PAD_INSERT` 也在它服务的 `NEW_SEGMENT` **之前**——先把上一个段的
-尾部对齐填好，再让新段的第一个 token 进场；`CARRY` 跟在导致进位的那次 ladder 追加
-后面）。
+**顺序规则**：主操作严格一一对应"某个 token"，每条都显式携带这个 token 的
+`token_idx`（arg2，见上面的更正框）；结构操作插在触发它的主操作旁边
+（`WARD_MERGE` 在它服务的 `NEW_CLUSTER` **之前**——先腾位再建簇；`PAD_INSERT`
+也在它服务的 `NEW_SEGMENT` **之前**——先把上一个段的尾部对齐填好，再让新段的
+第一个 token 进场；`CARRY` 跟在导致进位的那次 ladder 追加后面）。**op_log 的
+线性顺序不等于 token 到达顺序**——精确的顺序契约是§5.4"op_log 跨 Phase 的
+顺序契约"一节给出的三条：同一逻辑簇自己的主操作序列按真实到达顺序、结构操作
+紧邻它服务的主操作、不同簇之间的相对顺序不重要。Phase 1（direct）整体先写、
+Phase 2（orphan）整体后写，满足这三条，但**不**等于"整条 op_log 就是把 `m`
+个 token 按 `τ=0..m-1` 原样排一遍"——这也是为什么主操作必须显式带 `token_idx`
+而不能靠位置推断。
 
 > **一处曾经写错的顺序，务必别再犯**：早期版本把 `PAD_INSERT` 写在它服务的
 > `NEW_SEGMENT` **之后**。§5.11 自己举的例子已经说明了正确顺序应该是什么样——
@@ -2343,20 +2533,20 @@ token"；结构操作插在触发它的主操作旁边（`WARD_MERGE` 在它服�
 **重放算法**（backward 只需要这一个循环，不需要重新跑 §5.2–§5.6 的任何一步）：
 
 ```
-token_ptr = 0
 for op in op_log[:op_log_len]:   # 只遍历有效前缀，§5.13 新增的 op_log_len；
                                    # 扫整个静态 (OP_max,4) buffer 会把尾部未
                                    # 写入的行当成合法 op，见下方"op_log 的
                                    # 有效长度"一节
     if op.type in {NEW_CLUSTER, JOIN, NEW_SEGMENT}:
-        # 消费 token_ptr 指向的原始 (k_raw, v, pos) —— 位置必须一起传，锚点
-        # (p_lo/p_hi/sum_wp) 是绝对位置的函数，缺了 pos 这一步没法定义。
-        # 按 op 指定的 (cluster, segment) 追加进该簇的 ladder —— 用的是
+        # 消费 op.token_idx 指向的原始 (k_raw, v, pos)——不是隐式递增的计数器，
+        # 见 §5.4"op_log 跨 Phase 的顺序契约"一节：op_log 的线性顺序不等于
+        # token 到达顺序，必须用 op 自己携带的 token_idx 显式索引，位置必须
+        # 一起传，锚点 (p_lo/p_hi/sum_wp) 是绝对位置的函数，缺了 pos 这一步
+        # 没法定义。按 op 指定的 (cluster, segment) 追加进该簇的 ladder —— 用的是
         # compact()/_binary_carry() 那套纯算术，不依赖任何浮点比较，所以给定
         # 同样的 (token, pos, cluster, segment) 四元组，结果必然逐位相同。
-        append_to_ladder(k_raw[token_ptr], v[token_ptr], pos[token_ptr],
+        append_to_ladder(k_raw[op.token_idx], v[op.token_idx], pos[op.token_idx],
                           op.cluster, op.segment)
-        token_ptr += 1
     elif op.type == WARD_MERGE:
         ward_merge_only(op.keep_slot, op.free_slot)   # §5.6 的 1-2 步（纯状态
         # mutation，不写 op_log——这条 WARD_MERGE 是在读，不是在写，§5.6 已更正）
@@ -2395,10 +2585,26 @@ entry 数"，重放时可以据此断言"我这一步重算出的 ladder 状态�
 的**。forward 侧的实际实现**不是**上面这个 per-token 的 Python 循环——§5.4 的
 Phase 1/2/3 是批量路由（一次处理整个 flush 批，多达 128 个 token），§5.21-3 进一步
 要求 ladder 的实际写入/进位也是**向量化的**（`(B,G,K,L)` 掩码并行 carry，不是逐
-token 调用）。`op_log` 里的线性 token 顺序因此是一个**逻辑顺序**——"如果这批 token
-被逐个串行处理，会产生的顺序"——而不是 forward 实际执行的物理顺序。重放算法（上面
-那个 for 循环）假定"按 `op_log` 顺序逐条串行执行"和"forward 的批量向量化实现"
-产生**逐位相同**的最终 ladder 状态，这个假定成立的理由和它对实现提出的具体要求：
+token 调用）。
+
+> **更正：`op_log` 的线性顺序不是"forward 实际执行的物理顺序之外的另一个逻辑
+> 顺序"，它就是 forward 的真实执行顺序，两者被构造成完全一致，不是两个需要
+> 分开论证再对齐的东西。** 早期表述说 op_log 的顺序是"如果这批 token 被逐个
+> 串行处理，会产生的顺序"，暗示存在一个假想的、更细粒度的"真串行顺序"，
+> op_log 只是它的一个**逻辑**近似——这个说法不精确，且和 §5.4"op_log 跨
+> Phase 的顺序契约"一节的结论矛盾：op_log 的物理顺序（Phase 1 全体先写、
+> Phase 2 全体后写）**不等于**把全批 `m` 个 token 按真实到达顺序 `τ=0..m-1`
+> 原样排一遍（direct 和 orphan 交替出现时，两者不是同一个顺序）——但这不是
+> "近似"或"简化"，而是**被证明为安全的、故意选择的**顺序：只要三条顺序契约
+> （同簇内部保序、结构操作紧邻主操作、跨簇顺序不重要）成立，"Phase 1 组
+> 先、Phase 2 组后"就是 forward 真实发生的事，op_log 忠实记录了它，不多不少。
+> 下面两条理由针对的是**同一个 Phase 内部**（尤其是 Phase 1 的向量化批处理）
+> 是否等价于对这个 Phase 自己负责的 token 子集做严格串行处理，不是跨 Phase
+> 的顺序问题——那个问题已经在§5.4解决，这里不重复。
+
+重放算法（上面那个 for 循环）假定"按 `op_log` 顺序逐条串行执行"和"forward 的
+批量向量化实现"产生**逐位相同**的最终 ladder 状态，这个假定成立的理由和它对
+实现提出的具体要求：
 
 - **成立的理由**：`compact()`/`_binary_carry()` 的正确性只依赖"同一个簇收到的成员
   按什么**相对顺序**到达"，不依赖"这些成员是被一次一个地处理，还是被一批一起写入
@@ -2407,14 +2613,16 @@ token 调用）。`op_log` 里的线性 token 顺序因此是一个**逻辑顺�
   docstring），只要落进同一层的成员在被配对之前，其相对到达顺序和串行版一致，
   配对结果就一致。
 - **对实现的具体要求**：批量写入必须**保序**——一个 flush 批内，凡是路由到同一个
-  `(cluster, level=0)` 的 token，必须按它们在批内的原始位置顺序（`t=0..m-1`，也就是
-  真实的到达顺序）被写入/参与 carry，不能因为向量化 scatter 而被打乱。这一点对
-  当前设计**几乎是免费的**——Phase 1/2/3 的路由结果 `c*[t]` 本就是逐位置索引对齐的
-  张量，没有引入任何重排；真正需要小心的是**批量 carry 本身**：如果一批里有
-  `K > 1` 个 token 落进同一个此前尚有空位的 `(cluster, level=0)`，向量化实现必须
-  用等价于"依次单个 carry 调用 `K` 次"的方式处理这批到达（标准二进制计数器的
-  "批量加 `K`"和"逐一自增 `K` 次"在最终数字模式上永远一致，这是可以直接引用的
-  经典结果），而不是任何会重排到达顺序或跳过中间进位状态的捷径。
+  `(cluster, level=0)` 的 token，必须按它们的真实到达顺序被写入/参与 carry，
+  不能因为向量化 scatter 而被打乱（Phase 1 内部是 direct 子序列的压缩下标 `t`，
+  Phase 2 内部是 orphan 处理的串行顺序，两者各自都是真实到达顺序的子序列，
+  §5.4 已经论证过跨这两者不需要额外保序）。这一点对当前设计**几乎是免费的**
+  ——Phase 1 的路由结果 `c*[t]` 本就是逐位置索引对齐的张量，没有引入任何重排；
+  真正需要小心的是**批量 carry 本身**：如果一批里有 `K > 1` 个 token 落进同一个
+  此前尚有空位的 `(cluster, level=0)`，向量化实现必须用等价于"依次单个 carry
+  调用 `K` 次"的方式处理这批到达（标准二进制计数器的"批量加 `K`"和"逐一自增
+  `K` 次"在最终数字模式上永远一致，这是可以直接引用的经典结果），而不是任何
+  会重排到达顺序或跳过中间进位状态的捷径。
 - **必须落地成单测**（S0.1/S0.8 之间，纯 CPU 可测）：构造一批同簇 token，分别用
   (a) 批量向量化路径、(b) 把该批的 `op_log` 结果拿去跑上面的串行重放循环，断言两条
   路径产出的 ladder 张量（`k̄/v̄/w/p_lo/p_hi/sum_wp/σu/σ2/γa/γb/γ` 全部字段）逐位
@@ -2513,7 +2721,7 @@ WARD_MERGE + 1 PAD_INSERT + CARRY 余量"的小常数，**`c = 4` 足够**。这
 
 **`op_log_len: (B,G)` int32**（已加进 §5.13 的表）：`op_log` 当前写到第几行。
 追加一条 op 就是 `op_log[b,g,op_log_len[b,g],:] = new_op; op_log_len[b,g] += 1`；
-任何读 `op_log` 的代码（重放、`derive_final_cluster`、S0.8 对拍脚本）都必须先用
+任何读 `op_log` 的代码（重放、`scan_op_log`、S0.8 对拍脚本）都必须先用
 它截断成 `op_log[b,g,:op_log_len[b,g],:]`，未写入的尾部行内容未定义，不能假设
 它们是全零或任何特定哨兵值。
 
@@ -2540,9 +2748,10 @@ op_log_len[b,g] += local_op_len[b,g]
 整条序列的最后一个 block/flush 之后（此时 `op_log`/`op_log_len` 已经是这次
 forward 完整、最终的状态），把它们和 `q`/`k_raw`/`k_roped`/`v` 一起存进
 `ctx`。`backward()` 从 `ctx` 读回这份快照来重放，**不读取、也不依赖 cache
-对象自己的 `op_log`/`op_log_len`**——cache 对象上的这两个 buffer 在下一次
-`forward()` 开头被 `reset_parameters()` 清空是完全正常、预期内的行为，不需要
-任何特殊豁免逻辑。这样选的理由：
+对象自己的 `op_log`/`op_log_len`**——cache 对象上的这两个属性在下一次
+`forward()` 开头被 `reset_parameters()` **重新绑定到全新分配的张量**（不是
+原地清空旧张量，两者的区别、以及为什么必须是前者，见下方"训练峰值显存"
+更正框）是完全正常、预期内的行为，不需要任何特殊豁免逻辑。这样选的理由：
 - 和 `q`/`k_raw`/`k_roped`/`v` 已经在用的模式完全一致，不需要给 `op_log` 发明
   第二套"豁免 reset"的特殊生命周期规则；
 - `ctx.save_for_backward` 是 PyTorch autograd 的标准机制，`backward()` 只依赖
@@ -2553,7 +2762,7 @@ forward 完整、最终的状态），把它们和 `q`/`k_raw`/`k_roped`/`v` 一
 - 不需要引入"reset 时哪些字段该跳过"这种容易被后续修改者忘记维护的例外
   清单。
 
-> **更正（这一轮修的）：`ctx.save_for_backward(cache.op_log, cache.op_log_len)`
+> **更正（上一轮）：`ctx.save_for_backward(cache.op_log, cache.op_log_len)`
 > 存的是裸引用，不是快照，必须改成 `.detach().clone()`。** `ctx.save_for_
 > backward` 保存的是张量对象（指向底层 storage），不会自动 deep copy——这一点
 > 上面"不做 reset 豁免"的论证里已经预设了"存进 ctx 的是一份独立快照"，但没有
@@ -2562,29 +2771,62 @@ forward 完整、最终的状态），把它们和 `q`/`k_raw`/`k_roped`/`v` 一
 > 不是每次重新分配——`cache.op_log`/`cache.op_log_len` 大概率也是这样实现的。
 > 这意味着如果只是把 `cache.op_log` 这个张量对象本身存进 `ctx`（不克隆），
 > 下一次 `forward()` 里 `reset_parameters()` 对同一块底层 storage 做原地
-> 清零时，`ctx` 里"存"的那个引用指向的数据也会被一起清空——`ctx` 拿到的从来
-> 不是一份独立快照，只是一个指针。**PyTorch 的 saved-tensor 版本计数器可能会
-> 在这种情况下让 `backward()` 访问 `ctx.saved_tensors` 时报错**（原地修改过的
-> 张量被检测到，抛 `RuntimeError`），但这依赖 `reset_parameters()` 具体怎么
-> 实现、要不要触发这个检测机制，不是一个可以依赖的安全网——不能指望"如果算错
-> 了它会崩溃"来代替"从一开始就不让它有机会算错"。**修法就是显式
-> `.detach().clone()`**：`.detach()` 确保不会意外带上任何计算图（`op_log`/
-> `op_log_len` 本来就是不需要梯度的整数簿记，这一步更多是防御性的显式声明），
-> `.clone()` 真正复制底层数据，之后 `reset_parameters()` 无论怎么原地清零
-> 复用原 buffer，都不会影响 `ctx` 里这份独立副本。**`q`/`k_raw`/`k_roped`/`v`
-> 不需要同样处理**——它们是这个 Function 的输入参数，是调用方（模型的前向
-> 计算）每次新创建的激活张量，不是 cache 对象持有、会被 `reset_parameters()`
-> 复用清零的 buffer，不存在这个别名风险，不需要类比着也加克隆。
+> 清零时，`ctx` 里"存"的那个引用指向的数据也会被一起清空。**修法当时是显式
+> `.detach().clone()`**——这解决了正确性问题，但引入了一个没算清楚的内存
+> 代价，见下一条更正。
+
+> **更正（这一轮修的）：`.detach().clone()` 会让训练峰值显存翻倍，这笔账
+> 之前没算过，必须重新设计而不是接受这个代价。** `cache.op_log` 作为
+> `reset_parameters()` 管理的持久 buffer，本身就占 448MB（32k/28 层，
+> §5.21-2 已算过）；克隆一份进 `ctx` 又是一份独立的 448MB；`ctx` 持有这份
+> 克隆直到 `backward()` 跑完才释放，而 cache 自己的 448MB 从来不会被释放
+> （它是预分配、常驻的持久 buffer）。**这意味着从"这次 forward() 结束"到
+> "这次 backward() 跑完"这段窗口——也就是每个训练 step 都会经过的窗口——
+> `op_log` 相关的显存不是 448MB，是 448+448=896MB。** `CLAUDE.md` §4 只写了
+> "训练期 op_log 约 448MB"，在有这次克隆之后已经不准确。
 >
-> 代价：一次 `(B,G,OP_max,4)` int32 克隆，32k 下约 16MB/层——相对这个 Function
-> 本来就要处理的激活量级可以忽略，用一次可忽略的拷贝换掉一类"取决于
-> `reset_parameters()` 具体实现细节、可能表现为静默错误也可能表现为运行时
-> 崩溃"的别名 bug，是明确划算的，不是可选的性能优化项。
+> **根因是"op_log 到底需不需要`reset_parameters()`那种`预分配一次、原地
+> 复用`的持久 buffer 待遇"这个前提没有被重新审视过，只是照搬了其它 buffer
+> 的既有模式。** 其它 buffer（ladder entry、centroid、`level_count` 等）
+> 需要这种待遇，是因为反复分配大张量的开销真实存在，而它们的内容**不需要
+> 活过它们自己所在的这次 forward() 调用**——backward 从不直接读取它们的
+> 持久状态，而是通过重放 `op_log` **重建**需要的 ladder 张量（"重放完全
+> 不需要 centroid"那段已经确立）。`op_log` 是唯一的例外：它是重放的
+> **依据本身**，没有"重建"这回事，`backward()` 必须读到 forward 当时写下的
+> 真实内容——这正是它需要活过 `reset_parameters()` 的原因，也是它和其它
+> buffer 唯一的本质区别。
+>
+> **既然这个"必须存活到 backward"的需求是 `op_log` 独有的，解法也应该只
+> 改 `op_log`，不是给所有 buffer 引入克隆。修法：`op_log`/`op_log_len`
+> 不再是`reset_parameters()`原地`zero_()`复用的持久 buffer，改成
+> `forward()`每次调用时用`torch.zeros(...)`重新绑定成一个全新张量对象**
+> （不是"清空已有张量的内容"，是"让 `cache.op_log` 这个属性名指向一块
+> 全新分配的存储"）。`forward()` 全程往这个新对象里写，结束时直接把它存进
+> `ctx`——**不需要 `.detach().clone()`**，因为没有第二个持有者会去修改它：
+> 下一次 `forward()` 调用会把 `cache.op_log` **重新绑定**到另一块全新存储
+> 上，这次调用留在 `ctx` 里的那个对象完全不受影响（"重新绑定属性名指向新
+> 对象"和"原地清零旧对象的存储"是两回事——前者不会影响任何仍持有旧对象
+> 引用的人，后者会）。`reset_parameters()` 对**其它**buffer（ladder/
+> centroid/`level_count`/`alive`/...）继续用原地 `zero_()` 复用，不受
+> 影响——只有 `op_log`/`op_log_len` 这两个字段换成"每次重新分配"，因为
+> 只有它们需要"活过下一次 reset"这条独有的性质。
+>
+> **代价重新核算**：训练期显存回到单份 448MB（32k/28 层），不再翻倍——
+> `CLAUDE.md` §4 那句"约 448MB"现在又是准确的，不需要改成 896MB。**多付的
+> 代价是分配频率**：`op_log` 从"预分配一次、之后每次 forward 原地复用"变成
+> "每次 forward 都重新 `torch.zeros`"——但 PyTorch 的显存缓存分配器在稳态
+> 训练循环里会把上一次调用释放的同尺寸块直接复用给这次的 `torch.zeros`
+> 调用，不会真的每次都发起底层 `cudaMalloc`，所以这个代价在实践中很小，
+> 远小于"峰值显存翻倍"这个代价。**这一轮相对上一轮的改变，是把
+> `ctx.save_for_backward` 里的 `cache.op_log.detach().clone()` 换回不带
+> `.detach().clone()` 的 `cache.op_log`**——上一轮加克隆是为了解决别名 bug，
+> 这一轮发现更好的解法是让 `cache.op_log` 从一开始就不是一个会被复用/清零的
+> 别名来源，克隆因此变得不再必要，下面的代码示例同步更新。
 
 **`op_log`（完整 `(B,G,OP_max,4)`）和 `op_log_len`（`(B,G)`）一起进 `ctx`，
 不做切片**：虽然不同 `(b,g)` 的有效长度不同，但保存前按最长有效长度裁剪成
 ragged 张量既没必要也麻烦（batched 张量本来就不支持 ragged shape），直接连同
-静态形状一起克隆、backward 时再用 `op_log_len` 截断读取，是最简单、和张量的
+静态形状一起存、backward 时再用 `op_log_len` 截断读取，是最简单、和张量的
 矩形约束天然兼容的做法——这和"矩形预分配 + 掩码"这个贯穿全文档的原则是同一
 类选择。
 
