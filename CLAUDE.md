@@ -440,10 +440,18 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
   不对**：`n_total_c` 只数真实 token、不含已插入的 pad，而对齐要保护的是"真实
   + pad 混合而成的 level 0 逻辑插入流"，两个量从第一次填充起就分叉，用具体反例
   （`ℓ_block=1`，段 A 长 3 插 1 个 pad，段 B 长 1 后公式误判"不需要再填充"）
-  验证。新增第三个计数器 `n_unit_c`（真实 token + 历史 pad，单调不减，只喂
-  `PAD_INSERT`），`n_total_c` 继续只服务 Ward 代价和 §5.8 空间界——这是
-  "一个计数器身兼数职导致下游算错"这类问题第二次出现（第一次是 `n_eff`/
-  `n_total` 拆分），模式相同：先问计数器服务几个下游，语义不一致就拆。
+  验证。**这个 bug 被两个人独立发现**——远端 `44826b0` 提交（"Clarify segment
+  padding entry invariants"）同时到达，指出不能复用 `n_total_c`、建议改用
+  `pad_mask`/`level_count`；核实后确认 `level_count[cluster,0]`（现有 buffer，
+  簇 level 0 的当前占用数）单独就够，不需要再引入新计数器——因为只要 `B′` 是
+  `2^ℓ_block` 的倍数（默认组合天然满足），"当前占用数 mod 2^ℓ_block"和"累积
+  逻辑插入数 mod 2^ℓ_block"全程相等，且这个量在 Ward 合并后自动保持正确（合并
+  过程本就会重写 `level_count`），不需要额外的合并时手工同步。补一条新校验：
+  `B′` 必须是 `2^ℓ_block` 的倍数，和 `ℓ_block∈{0,1,2}` 那条放一起。`n_total_c`
+  继续只服务 Ward 代价和 §5.8 空间界不变——"一个计数器身兼数职导致下游算错"这类
+  问题第二次出现（第一次是 `n_eff`/`n_total` 拆分），但这次的修法不是拆出第三
+  个计数器，而是发现已有的 `level_count` 就能兼任，模式相同（先问计数器服务
+  几个下游，语义不一致就拆或复用），结论比最初判断的更省。
   ② **批量路由（§5.4）里 Phase 2 的 Ward 合并会让 Phase 1 已经写进 op_log 的
   槽位引用失效**：Phase 1 用批前快照把大多数 token 批量分配到某些槽，Phase 2
   处理 orphan 时若触发 Ward 合并，可能释放/复用一个 Phase 1 本批已经写过的槽，
