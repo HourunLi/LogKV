@@ -430,6 +430,65 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-14｜第八轮核实：补上 Phase 1 缺失的持久 segment 状态与批内向量化
+  segment-id/PAD_INSERT 计算、`op_log` 的有效长度规格与 backward ctx 生命周期
+  定案、`derive_final_cluster` 的切片安全性，并删掉一处从未有过定义、和已证明
+  不变量矛盾的 Ward 合并 fallback。** 动机：用户对照最新远端逐条核实上一轮的
+  四处修复都已生效，同时指出五处更底层的实现缺口——本质上都是"看起来定了，
+  细究会发现某个边界情形没人接住"。逐条结论：
+  ① **P0 级缺口：Phase 1 没有持久 `current_segment` 状态，且同批同簇多个
+  token 独立开新段时会互相踩踏**——`JOIN`/`NEW_SEGMENT` 都要写具体的
+  `segment` 整数，但 §5.13 只有 `p_hi_c`，从没有一个持久 buffer 记"这个簇
+  现在 segment id 是多少"；上一轮为 Phase 2 orphan 组加的 `local_p_hi`/
+  `local_segment` 只覆盖新建簇，覆盖不了 Phase 1 批量路由到既有簇的 token
+  （恰恰是每批处理量最大的路径）。同时，若批内同簇多个 token 都判定"该开
+  新段"，各自读批前持久值计算 `segment`/`PAD_INSERT count` 会给出重复或
+  过期的结果——这和 Phase 2 那个 bug 同构，只是发生在向量化路径上，不能退回
+  逐 token 串行去修。**修法**：新增持久 buffer `current_segment: (B,G,K_max)`
+  （Phase 3 唯一写入点，`ward_merge_only` 合并时取 `max`，和 `p_hi_new` 同一
+  模式）；批内 segment id 分配用一次 **segmented inclusive cumsum**
+  （`op.segment[t] = current_segment[c*[t]] + 组内到 t 为止 new_seg 的包含性
+  前缀和`，一个公式同时覆盖 JOIN 和 NEW_SEGMENT）；`PAD_INSERT` 的 count 用
+  一次 **segmented reset-scan**（关键化简：每次新段事件后，level-0 的 mod
+  计数器必然精确回到 `1 mod 2^ℓ_block`，与之前 pad 了多少无关，于是只需要
+  "距离本簇上一次开新段过了几步"这一个无状态量，不需要像 §5.21-3 的 carry
+  那样模拟计数器怎么折返）。两者都是标准向量化原语，不需要数据相关的有界
+  循环轮数，要求补 CPU 参考实现对拍单测。
+  ② **P1：`PAD_INSERT` 读 `level_count[cluster,0]` 的公式本身是对的（上一轮
+  已修），但没说清楚"批内多次触发时读的是哪个 level_count"**——这个疑问随①
+  一并解决：`level_count[c*[t],0] mod 2^ℓ_block` 只在"本批内这个簇还没开过
+  新段"时作为 `base_mod` 使用，一旦本批内发生过一次新段事件，后续同簇的
+  `count` 计算改用"距离那次事件几步"，不再依赖是否读到"批前"还是"批内更新
+  过"的 `level_count`——化简后这个问题不需要维护一份额外的"本地 level_count"
+  也能正确处理。
+  ③ **P1：`op_log` 缺有效长度规格，replay 伪代码 `for op in op_log` 会扫到
+  未写入的尾部行**——新增 `op_log_len: (B,G)`（§5.13）记录当前写到第几行，
+  一切遍历 `op_log` 的代码（重放、`derive_final_cluster`、S0.8 对拍）必须先
+  按它截断；本地缓冲同样需要 `local_op_len`，提交进持久 `op_log` 就是一次
+  定长拷贝 + 两个指针相加，不需要逐条判断。**顺带把 `op_log` 和
+  `reset_parameters()`/backward `ctx` 的生命周期从"两个选项都列出但没拍板"
+  改成定案**：`op_log`/`op_log_len` 在 `forward()` 处理完整条序列后，和
+  `q`/`k_raw`/`k_roped`/`v` 一起存进 `ctx`，`backward()` 只读这份快照，cache
+  对象自己的 `op_log`/`op_log_len` 该被下一次 `forward()` 的
+  `reset_parameters()` 清空就清空，不需要任何豁免逻辑——和已有 `v`/`k_raw`
+  的处理方式完全对称，不给 `op_log` 发明第二套生命周期规则。
+  ④ **P1：`derive_final_cluster` 只对"从冷启动开始的完整日志"安全，拿切片
+  调用会让上一轮刚修的槽位复用 bug 以另一种方式复活**——`epoch.get(slot,0)`
+  的默认值会把"切片开始前已经复用过的槽"重新当成第一次出现。**修法**：把
+  `epoch`/`parent` 做成可选种子参数（`initial_epoch`/`initial_parent`），
+  函数变成可以对同一条 `op_log` 分段串联调用的形式，返回值里带上本段结束时
+  的 `epoch`/`parent` 状态供下一段调用直接传入；`op_log` 参数本身也要求是
+  按 `op_log_len` 截断过的有效前缀，不是整个静态 buffer，和③统一。
+  ⑤ **P2：`K` 已满时"合并失败必须有 fallback：强制并入最近簇"这句话和文档
+  别处已经证明的不变量矛盾，必须删掉**——`K_max≥2` 时 Ward 候选池必然非空
+  （§5.6 已证明），这个 fallback 对应的前提根本不成立，硬留着只会制造一个
+  从未定义过语义（该写 JOIN 还是 NEW_SEGMENT？消费哪个 token？）的死代码分支。
+  **改法**：从"新簇形成条件"表里删掉这句话，替换成"这一步不会失败，不需要
+  fallback"的说明；实现层面该有的是一条 `assert alive[keep_slot] and
+  alive[free_slot] and keep_slot != free_slot`，断言失败说明前面状态维护
+  出了 bug，需要去修那个 bug，不是在这里兜底掩盖。连带清掉 `K_max=1` 分支
+  里一处指向这条 fallback、且用了脆弱行号引用（"第 192 行"）的交叉引用。
+
 - **2026-08-14｜第七轮核实：修掉离线派生工具的槽位复用 bug、`docs/position.md`
   里 PAD_INSERT 公式的回归、Phase 3 元数据写入权限的过强表述，并补上 orphan
   组内后续成员的局部时序状态。** 动机：用户对照最新远端 `semanticLogKV`
