@@ -430,6 +430,51 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-14｜第五轮核实：把批内重定向从"原则"钉成"可实现的规格"——区分
+  重定向该改哪些 op 字段、`WARD_MERGE` 何时落地、本地缓冲的真实容量、同一新簇
+  多个 orphan 的 op 序列、合并 primitive 拆分、Phase 3 该读哪份数据、单测该测
+  哪个性质，外加训练梯度文档里一处容易踩的表述。** 动机：用户对上一轮"批内
+  重定向"设计再做一遍逐条核实，指出两处 P0（会让实现者写出结构错误或语义模糊
+  的版本）、五处 P1、一处 P2。逐条结论：
+  ① **P0：重定向笼统写成"改 `op.cluster`"，但六类 op 字段异构**——`WARD_MERGE`
+  的 `arg0/arg1` 是 `keep_slot/free_slot`，是历史记录而非"簇身份"，重定向如果
+  也去改它就是在篡改已发生的合并事实。补一张类型表，明确重定向只碰
+  `NEW_CLUSTER`/`NEW_SEGMENT`/`JOIN`/`PAD_INSERT`/`CARRY` 这五类的 `arg0`，
+  `WARD_MERGE` 排除在外；改写用 `is_target_type & (arg0==free_slot)` 这样的
+  类型感知掩码，不是无条件的 `where`。
+  ② **P0：`WARD_MERGE` 该在本地缓冲的哪个位置落地，新伪代码没写**——补上：物理
+  合并（`ward_merge_only`）执行后立即 `append WARD_MERGE`，再做重定向，最后才
+  `append NEW_CLUSTER`——`WARD_MERGE` 落在"紧邻 `NEW_CLUSTER` 之前"这个既有
+  顺序要求里，且因为①的类型排除，它自己不会被同一次重定向误伤。
+  ③ **P1：本地缓冲容量按"batch token 数"分配是错的**——缓冲最终要装下会提交进
+  持久 `op_log` 的完整内容，必须像全局 `OP_max` 一样按"每 token 最坏 4 条 op"
+  分配：`local_op_cap = 4 × flush_granularity`，不是 `≤128`。
+  ④ **P1："多个 orphan 共享一个 `NEW_CLUSTER`"和"每 token 恰好一个主操作"直接
+  冲突**——mini DP-means 分进同一临时簇的 orphan 里，只有到达顺序最早的那个
+  产生 `NEW_CLUSTER`，其余对同一 `slot_idx` 产生 `JOIN`/`NEW_SEGMENT`，和"一个
+  已存在的簇收到新成员"是同一套逻辑。
+  ⑤ **P1：`merge_cluster_ladders` 到底是"只合并"还是"合并并写新簇"，两处伪
+  代码用法不一致**——把 §5.6 步骤 4（"释放槽位，新簇写进去"）拆成两句：
+  `ward_merge_only`（步骤 1-3+5，只合并、只释放）是一个 primitive，"新簇写
+  进去"是调用方（无论是单 orphan 场景还是批量 Phase 2）自己的职责，不属于这个
+  primitive；连带把 replay 伪代码里 `WARD_MERGE` 分支调用的函数名同步改过来。
+  ⑥ **P1：重定向会改变本批部分 token 的最终归属，但 Phase 3 该用哪份数据更新
+  centroid/`n_eff`/`n_total`/`p_hi_c` 没写清楚**——补硬规则：只能读"重定向执行
+  完毕、提交进持久 `op_log` 之前"的最终本地缓冲，不能读 Phase 1 原始输出，否则
+  会把 token 计入它最终并不属于的簇。
+  ⑦ **P1：把"批量近似 vs 严格串行路由"的分歧率测试和"批量前向 vs 重放"的逐位
+  一致性测试混成一条**——两者拆开：前者是 S0.8 已经在测的近似质量问题（Phase 1
+  冻结 centroid/`p_hi_c` 本来就承认是近似），不要求逐位一致；后者才是需要逐位
+  精确的正确性契约（"`op_log` 忠实记录了批量前向做了什么"），Ward 合并撞见
+  Phase 1 已分配槽位只是作为 S0.8 分歧率统计必须覆盖的一类特殊输入，不该单独
+  拔高成正确性要求。
+  ⑧ **P2：训练梯度那节说"`k_raw` 传进来 detach 与否都无所谓"容易被误读成
+  "可以在算 `k_roped` 之前把上游 qk-norm 输出整体 detach"**——补充区分：这句
+  话只针对"这个 Function 的 `k_raw` 输入参数本身"，`k_roped` 必须从未经任何
+  detach 的 qk-norm 输出算出，否则 `k_roped` 的梯度链会被一并切断——"`k_raw`
+  不产生梯度"完全由这个 Function 的 `backward()` 恒返回 `None` 保证，不需要、
+  也不应该在调用方源头做任何 detach。
+
 - **2026-08-14｜第四轮核实：推翻上一轮的"屏蔽+顺延"设计（会让 token 在
   attention 里凭空消失），改用批内向量化重定向；纠正训练梯度目标与现有
   stop-gradient 前提的直接冲突；补 Ward 合并后 `level_count` 的硬性不变量；
