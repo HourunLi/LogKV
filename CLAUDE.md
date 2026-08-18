@@ -430,6 +430,67 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-14｜第四轮核实：推翻上一轮的"屏蔽+顺延"设计（会让 token 在
+  attention 里凭空消失），改用批内向量化重定向；纠正训练梯度目标与现有
+  stop-gradient 前提的直接冲突；补 Ward 合并后 `level_count` 的硬性不变量；
+  扣上虚拟槽展开与 `causal_tail` 的 API；三处 P2 级残留说法同步更新。** 动机：
+  用户逐条指出两处 P0（会让实现出现"看似能跑但语义已经变了"的版本）、三处 P1、
+  三处 P2。逐条结论：
+  ① **P0：上一轮"屏蔽 touched 槽 + 无候选时顺延到下一批"的修法本身有更严重的
+  问题**：语义簇路径的 flush 复用现有 recent window"溢出即驱逐"的语义
+  （`log_kv_cache.py:1169-1188` `add_recent`），token 一旦被挤出 recent
+  window 就没有"留着等下一批"这个中间态可用。"顺延"发明了一个现有架构里不
+  存在的第三态（既不在 recent window、也不在 ladder cache），对 attention
+  可不可见、算不算 recent、进不进 `op_log`、连续顺延时因果顺序怎么保证，一个
+  都答不上。**推翻重做**：让 Ward 合并保持完全不受限（不再有 `touched_mask`），
+  在合并发生的那一刻，对"本批目前为止已经写入的本地 op 缓冲"做一次有界、
+  向量化的重定向改写（`torch.where(ops.cluster==free_slot, keep_slot,
+  ops.cluster)`，只碰本批本地缓冲，不碰跨批持久 `op_log`），新建的
+  `NEW_CLUSTER` 写在重定向**之后**，天然不会被误伤。副作用是"顺延"这个概念
+  整个消失——`K_max≥2` 时 Ward 永远有候选（§5.6 已证明的性质），每个 orphan
+  都能在自己所在的批次内拿到真实归宿，不再需要面对 recent window 的语义空洞。
+  上一轮拒绝"回填修补"是因为把它想象成动态回溯，这次意识到它可以是一次有界
+  向量化操作，判断错了，此处更正。
+  ② **P0：训练 autograd 的 `grad_k_raw`（通过 `op_log` 重放对 `compact()` 求
+  解析梯度）和现有训练目标直接矛盾**：`LogKVStreamTrainingAttention` 的
+  docstring 明确写着"gradient reaches q/k/v only through each token's own
+  block (the cache commits detached copies)"——这是整个 Function 能把训练
+  内存从 `O(T·S)` 压到 `O(T+train_block·S)` 的数学基础，不是可以顺手改掉的
+  实现细节。上一轮把"接口怎么传参"和"训练目标要不要变"混成一个问题，答案
+  错了。**推翻重做**：v1 不改训练目标，`k_raw` 和 cache 写入这条路完全不参与
+  反向传播，和现状代码里 `v` 的处理方式完全对称（`backward()` 对 `k_raw` 的
+  梯度槽位恒返回 `None`）；`k_roped` 继续扮演现状代码里 `k` 的角色，梯度计算
+  一字不改。`op_log` 存在的理由回到最初就讲清楚的那条——只是为了让重放能正确
+  重建"某一时刻 cache 的（依然完全 detached 的）内容"，不支持任何新梯度路径。
+  "cache 写入也可微"列为明确不在 v1 范围内的独立方向，需要先证明计算图有界、
+  配 naive reference 和 backward 数值对拍。
+  ③ **P1：`touched_mask` 只解决 Ward 候选冲突，没说同批多个 orphan 能不能
+  互相 join**：随①的重做一并解决——§5.4 Phase 2"在这批 orphan 内部跑一个小
+  DP-means"这个既有设计本就在分配槽位**之前**把互相接近的 orphan 分进同一个
+  临时簇，不存在"orphan 2 处理完才发现该并入 orphan 1 刚建的簇"这种事后修正
+  的情形。
+  ④ **P1：Ward 合并后"`level_count` 天然自修复"只是解释里的一句话，没有硬性
+  不变量和测试**：补上——`merge_cluster_ladders` 第 3 步结束时，每一层的
+  `level_count` 必须由构造过程直接写出（尤其是"总数 ≤ B′ 直接放入"这个不触发
+  compact 的分支，容易被误认为不需要更新计数），不能沿用任一侧合并前的旧值；
+  新增单测要求既断言数值对，也要断言"用这个数值算出的下一次 `PAD_INSERT`
+  确实让 level 0 流对齐"，不只测计数器本身。
+  ⑤ **P1：虚拟槽展开的 `slot_valid` 掩码和现有 `causal_tail` API 没扣上**：
+  `mask` 和 `causal_tail` 现有互斥，且 `causal_tail` 假设"最后 `causal_tail`
+  个 slot 是逐 token 对齐的 in-flight chunk、之前的 slot 无条件可见"，完全没有
+  "pooled 区域某些槽无效"这个概念。新增第三个、与另外两者正交的
+  `slot_valid: (B,G,S_pooled)` 参数，只覆盖 pooled 前缀、可以和 `causal_tail`
+  同时使用；钉死 flatten 顺序（pooled 在前、exact in-flight 在后，沿用
+  `append_exact_tokens` 现有约定），in-flight chunk 从不参与锚点展开。
+  ⑥ **P2：Stage 2 Config B（纯语义参考点）仍写 `K=16, g_max=∞`，没设
+  `η=0`**：按 §5.3 已经钉死的"纯语义 = `η=0` 且 `(g_max=∞` 或 `ℓ_block=0)`"
+  精确定义补上 `η=0`，否则这一档实际跑出来的不是真正的纯语义端点。
+  ⑦ **P2：glossary.md 仍把 Config A 说成"`K_max=1` 正确性闸门"**，与
+  experiments.md 早就把 A/B/C 三档降级为 eval-time 消融参考点（不设通过/
+  失败容差）矛盾，同步改口。
+  ⑧ **P2：`K_eff→c` 的决策规则说明有重复且过时的措辞**（"拟合斜率怎么换算成
+  `c`"），合并成一条，统一成"观测区间上界 + `K_max` 绑定率校正"。
+
 - **2026-08-14｜第三轮代码核实复查：修掉 `PAD_INSERT` 对齐公式在第一次填充后
   失准的 bug，闭合批量路由撞见 Ward 合并的槽位冲突，修好 `NEW_CLUSTER` 与重放
   伪代码的字段不一致，收紧"纯语义聚类"端点的定义，钉死训练 autograd 的

@@ -228,7 +228,8 @@ Phase 3:
 
 **这是比 `p_hi_c` 冻结更严重的一类冲突，此前完全没处理。** Phase 1 用**批前**的
 `alive`/`centroid` 快照把一批 token 里的大多数直接分配到某个槽（比如槽 X），并
-已经把这些 `JOIN`/`NEW_SEGMENT` op 写进了本批的 op_log。**但 Phase 2 处理 orphan
+已经把这些 `JOIN`/`NEW_SEGMENT` op 写进了本批的**本地** op 缓冲（还没提交进跨批
+持久的 `op_log`，见下方"本地缓冲 vs 持久 op_log"）。**但 Phase 2 处理 orphan
 时若触发 `K_max` 满的 Ward 合并（§5.6 五步过程），会释放并复用某个槽**——如果被
 释放复用的恰好是槽 X（Phase 1 这一批已经往里面写过东西的槽），Phase 1 写下的那些
 `op.cluster=X` 就会产生歧义：它们该被理解成"合并前的旧簇 X"（内容已经被
@@ -238,61 +239,96 @@ orphan 而建立的、和旧簇 X 毫无关系的另一个语义身份）？两�
 只记了合并这一步，没有记"这次合并是否使某个本批更早的 op 的 `cluster` 字段失效"）
 不足以消歧。
 
-**决定：禁止 Ward 合并选中本批已经被 Phase 1（或本批更早的 Phase 2 orphan）写过
-的槽，而不是合并之后回去修补已写的 op。** 具体地：
+> **上一轮的修法是"屏蔽 touched 槽 + 无候选时把 orphan 顺延到下一个 flush 批"，
+> 这个修法本身有一个更严重的问题，必须推翻重做**：语义簇路径的"flush"复用的是
+> 现有 recent window 溢出即驱逐的语义（`log_kv_cache.py:1169-1188`
+> `add_recent`）——token 一旦被 recent window 挤出去，就**没有"还留在 recent
+> window 里等下一批"这个中间状态**，它必须在同一步里进入某个真实的 (簇,段)。
+> "顺延"意味着这个 orphan 本批完全不被写入任何 cache 槽位，但它已经不在 recent
+> window 里了——这是一个"flush 出来了但 cache 里暂时没有"的语义空洞：这个 token
+> 在顺延期间对 attention 到底可不可见？算不算 recent？要不要进 `op_log`？连续
+> 顺延多批时因果顺序怎么保证？**这些问题没有一个能用现有架构自然回答**，因为
+> "顺延"发明了一种现有系统里根本不存在的第三态（既不在 recent window、也不在
+> ladder cache）。引入一个新的 staging buffer 来装它是可能的，但代价高、状态机
+> 复杂，且没有必要——下面给出一个不需要这种 buffer 的修法。
+
+**决定：让 Ward 合并保持完全不受限（和 §5.6 单 token 场景一模一样，不额外屏蔽
+任何槽），改为在 Ward 合并发生的那一刻，立即对"本批目前为止已经写入的本地 op
+缓冲"做一次有界的、向量化的重定向改写。** 这样每个 orphan 在它自己所在的批次内
+**总能**拿到一个真实槽位——`K_max ≥ 2` 时 Ward 永远有候选（§5.6 已证明的性质，
+不受本批是否有槽被"摸过"影响），deferred/顺延这个概念因此整个不再需要，上面那
+一整段语义空洞问题随之消失。
+
+**本地缓冲 vs 持久 `op_log`**：本节说的"本地 op 缓冲"是 Phase 1/2 处理**当前
+这一个 flush 批**期间用的临时张量（大小就是这一批的 token 数，`≤128`），**不是**
+跨批持久存在的 `op_log`（`(B,G,OP_max,4)`，见 §5.13）。批内 Phase 1（一次性
+向量化写入）和 Phase 2（串行循环，逐个处理 orphan）都往这个本地缓冲里追加，
+整个批处理完（Phase 3 之后）才**一次性**把本地缓冲追加进持久 `op_log`。这个
+两级结构本身不是新设计——批量化路由本就需要一个地方暂存"这一批算出来的 op"，
+新增的只是"重定向改写只发生在提交进持久 `op_log` 之前，只碰本地缓冲"这一条。
 
 ```
-Phase 1 结束后，维护一个本批范围内的 touched_mask: (B,G,K_max) bool
-    touched_mask[c] = True   若本批已有任意 op（Phase 1 的批量分配，或 Phase 2
-                              到目前为止处理过的更早的 orphan）把 c 当作目标槽
+Phase 2 处理每个 orphan（或一小簇互相接近的 orphan，由批内 mini DP-means 决定，
+见下方"同批多个 orphan 要不要互相 join"）时，若 K_max 已满、需要 Ward 合并腾位：
 
-Phase 2 处理每个 orphan 时，若需要 Ward 合并腾位：
-    Ward 代价矩阵在 §5.6 已有的"屏蔽对角线与 dead 槽位"之上，
-    再屏蔽 touched_mask 为 True 的槽（作为候选的 a 或 b 都不行）
-    —— 这一条掩码的更新完全在 Phase 2 已经是串行循环这个既有结构里完成，
-       不需要额外引入向量化以外的机制：Phase 1 的 touched_mask 更新是一次性
-       向量化 scatter，Phase 2 循环内每处理完一个 orphan（不论是并入其它
-       orphan 形成的临时簇、还是新建一个槽）就把结果槽标进 touched_mask，
-       供本批后续的 orphan 使用
-
-    若屏蔽后 Ward 代价矩阵没有可选的 (a,b) 对（例如本批已经把所有 alive 槽都
-    摸过一遍）：**这个 orphan 本批不处理，顺延进下一个 flush 批**（见下方
-    "顺延队列"），不允许退化成"忽略 touched_mask、还是合并了本批已写的槽"这种
-    静默走捷径的选项——那正是本条要防止的 bug。
+    1. Ward 代价矩阵不做任何本批专属的额外屏蔽——就用 §5.6 已有的"屏蔽对角线
+       与 dead 槽位"，取 (keep_slot, free_slot) = argmin Δ
+    2. merge_cluster_ladders(keep_slot, free_slot)   # §5.6 五步过程，立即执行，
+                                                       # 物理内容此刻已经正确合并
+    3. 重定向改写（向量化，一次 torch.where 覆盖整个本地缓冲）：
+           local_ops.cluster = where(local_ops.cluster == free_slot,
+                                      keep_slot, local_ops.cluster)
+       —— 只改本地缓冲里**已经写入**的条目（Phase 1 的全部 + Phase 2 到目前为止
+          处理过的更早的 orphan），free_slot 这个数值此刻在本地缓冲里只可能来自
+          "合并前的旧簇"，因为这次合并刚刚发生，之后任何新写入的 op 才会赋予
+          free_slot 新的含义
+    4. slot_idx = free_slot   # 释放出来的槽立即交给这个 orphan 的新簇使用
+       append NEW_CLUSTER(slot_idx, 0, -1) 到本地缓冲   # 这条写在第 3 步的
+                                                          # 重定向**之后**，
+                                                          # 天然不会被那次改写
+                                                          # 误伤——它引用的
+                                                          # free_slot 说的是
+                                                          # "新簇"，不是"旧簇"
 ```
 
-**为什么选"屏蔽+顺延"而不是"合并后回填修补已写的 op"或"把所有 Ward 合并推迟到
-批末"**：
+**为什么这个顺序（先合并、再重定向、最后才写新 op）是正确性的关键，不是随意的
+先后安排**：第 3 步的重定向只碰**已经存在**于本地缓冲里的条目，第 4 步的新
+`NEW_CLUSTER` 是在重定向**执行完之后**才追加的，因此不会被同一次 `torch.where`
+误伤——这正是靠时间顺序消歧"槽 X 在合并前指旧簇、合并后指新簇"这个歧义的
+方式，不依赖任何显式的版本号或额外字段。**这比屏蔽方案更简单，也更彻底**：
+不需要 `touched_mask`，不需要判断"有没有候选"，也就不需要顺延——Ward 的候选池
+永远是"全部 alive、非对角线的槽"，`K_max≥2` 时保证非空（§5.6），所以这条路径
+**不会失败**，每个 orphan 都在自己所在的批次内拿到真实归宿。
 
-- **回填修补**需要在 Phase 2 每次 Ward 合并后反查并重写本批之前已经写入 op_log
-  的条目，这是一个动态的、依赖数据的回溯操作，直接违反"Phase 1 是一次性向量化
-  scatter、写完即不再改"这个已经建立的批量化前提（§5.21-2 关于批量写入必须保序
-  的讨论），会重新引入本该被批量化消除的串行依赖。
-- **推迟到批末**（先收集本批所有需要新槽的 orphan，批末一次性决定所有 Ward 合并）
-  表面上更彻底，但需要在合并生效前用"虚拟槽 id"给批内的 orphan 占位，且这些虚拟
-  id 还要和同批 Phase 1 已经用的真实槽 id 共享同一个去重/masking 逻辑，复杂度
-  不比"屏蔽+顺延"低，还额外引入一层"批末才物化的间接层"，与"op_log 记录的是
-  最终决定"这个既有不变量（§5.21-2）摩擦更大。
-- **屏蔽+顺延**只需要扩展已经存在的"Ward 屏蔽对角线/dead 槽位"掩码机制（多一个
-  布尔条件），语义上等价于"这一批里已经动过的槽本批内'临时不可合并'"，不产生
-  回溯，也不需要虚拟身份——是三个选项里对现有结构改动最小的一个。
+**为什么这不违反"Phase 1 是一次性向量化 scatter"这个批量化前提**：第 3 步的
+重定向确实是"回去改已经写的东西"，但它是**一次 `torch.where`、覆盖整批**的
+张量操作，不是逐条目的动态回溯——一批内 Ward 合并最多触发 `K_max` 次（§5.6 的
+既有界），所以整个批次最多附加 `K_max` 次这样的向量化改写，仍然是
+`O(batch_size)` 级别、完全向量化、没有引入标量控制流或数据依赖的串行链。
+"改已经写的东西"这件事本身不是问题，"改的方式是不是标量级、数据依赖的回溯"
+才是——第 3 步不是。
 
-**顺延队列的代价是有界的，不是新的无界风险**：一批内需要顺延的 orphan 数最多是
-`K_max`（一旦 `K_max` 个槽全部被 touched，Ward 无论如何都没有候选，无关顺延与否），
-且顺延只是把这个 token 的路由决策推迟到下一个 flush 批的 Phase 1/2 输入最前面
-（按原始位置顺序插在下一批最前面，不打乱到达顺序，满足 §5.21-2 对批量写入保序的
-要求）——**这在效果上类似 `_log_kv_pending` 已经维护的"跨 flush 边界挂起 token"
-队列，但服务的是不同的原因**（那个是 flush 粒度对齐的残留 token，这个是本批
-Ward 冲突导致的延迟路由），两者不共享同一个 buffer，避免混淆各自的语义。极端情况
-下一个 orphan 连续多批都撞见"本批 K_max 个槽全被摸过"，会被反复顺延——这只会发生
-在 `K_max` 很小、批很大、内容极端多样的病态配置下，且顺延不丢失任何信息（token
-只是晚一批被路由，不会被丢弃或错误合并），所以不需要额外的超时/强制机制兜底。
+> **上一轮拒绝"回填修补"时低估了它的实现代价，这里更正**：上一轮把"回填修补"
+> 想象成"每次合并后反查并重写"的动态操作，判断它会重新引入串行依赖，所以选了
+> "屏蔽+顺延"。**这个判断错了**——"回填"完全可以是本节这样一次有界的向量化
+> `where`，代价不比维护 `touched_mask` 更高，而且换来的是**不需要顺延、不需要
+> 面对 recent window 语义空洞**这个更大的好处。教训是：评估一个方案"是否违反
+> 批量化前提"要具体到"改写本身能不能整批向量化完成"，不能只看"是不是在改已经
+> 写过的东西"就直接判死刑。
+
+**同批多个 orphan 要不要互相 join**：这个问题和上面的槽位冲突是两回事，**已经
+由 §5.4 Phase 2 自身的设计回答了**——"在这批 orphan 内部跑一个小 DP-means"意味着
+互相接近的 orphan 在**分配槽位之前**就已经被分进同一个临时簇，一起共享一个
+`NEW_CLUSTER`，不存在"orphan 2 处理完之后才发现该并入 orphan 1 刚建的簇"这种
+需要事后修正的情形——批内 join 关系在 Phase 2 开始时就已经通过 mini DP-means
+确定好了，不依赖任何"已建立槽位是否可见"的运行时状态。
 
 **必须补一条单测**（S0.1/S0.8 之间，和批量-vs-串行等价性那条测试同一档次）：
 构造一个批内既有 Phase 1 大量分配、又有 Phase 2 orphan 触发 Ward 合并、且合并
-候选恰好会撞上 Phase 1 已分配槽位的合成场景，断言（a）touched_mask 正确阻止了
-这次合并选中那个槽，（b）如果因此没有可用候选，orphan 被正确顺延而不是被错误
-处理，（c）顺延后下一批能正确把它路由掉，不丢失、不重复。
+候选恰好会撞上 Phase 1 已分配槽位的合成场景，断言（a）重定向正确地把本批所有
+引用旧槽的条目改写成新槽，（b）合并之后新建的 `NEW_CLUSTER` 没有被误伤，仍然
+指向刚释放的槽，（c）整批处理完之后提交进持久 `op_log` 的条目和"先做一遍严格
+串行路由，逐 token 处理，永远不会撞见槽复用歧义"这个基准逐位一致。
 
 ### 5.5 分簇：centroid 更新
 
@@ -603,6 +639,28 @@ Ward 代价的尺寸加权恰好与"entry 会不会被迫合并"同向，所以 
 代价 `O(K²d) + O(L·B′·d)`，事件罕见（次数被"超出 `K_max` 的新簇事件数"界住）。
 **注意合并后两簇的 segment 对齐（§5.11）被破坏**，这是可接受的（罕见、预算逼出来的
 事件）。`K_max ≥ 2` 时永远存在可合并的一对，所以这一步不会失败。
+
+**硬性不变量（`merge_cluster_ladders` 必须满足，不是"大概率如此"）**：第 3 步
+结束时，对**每一层** `ℓ`，`level_count[new_cluster, ℓ]` 必须精确等于该层归并
+之后新 ladder 里真实存活的 entry 数——**这个值必须由第 3 步的构造过程直接
+写出，不能事后靠"应该是对的"去推断，也不能沿用 `a`/`b` 任一侧合并前的旧值**。
+这条不变量是上面"§5.11 的 `PAD_INSERT` 直接读 `level_count[cluster,0]`"这个
+设计能够成立的**前提**，不是自动附带的性质：如果 `merge_cluster_ladders` 的
+实现在某条分支忘了同步更新 `level_count`（比如"总数 ≤ B′，直接放进新簇第 ℓ 层"
+这个分支——它不触发 compact/carry，容易被误认为"不需要更新计数"，但它同样
+改变了该层的占用数，`level_count` 必须一并写），下一次 `PAD_INSERT` 读到的
+就是过期值，§5.11 那条修法会立刻重新失准——和这次修正之前一模一样的错误，只是
+触发条件从"第一次填充"变成了"第一次 Ward 合并之后的填充"。
+
+**必须补的单测**（和 §5.11 的对齐单测同一档次，S0.1）：构造一个合成的 Ward
+合并场景（两个簇各自有已知的 ladder 状态，含至少一层触发 compact、至少一层
+`总数 ≤ B′` 直接放入），合并后：（a）断言 `level_count` 在**每一层**都等于用
+`pad_mask`/`w>0` 独立统计出的真实占用数——不能只测 level 0；（b）在合并后的
+簇上模拟一次后续的 `PAD_INSERT`（用刚更新的 `level_count[cluster,0]` 算
+`count`），断言按这个 `count` 填充之后，下一次段边界前的 level 0 逻辑流长度
+确实对齐到 `2^ℓ_block` 的倍数——即，不仅测"计数器数值对不对"，还要测"用这个
+计数器算出来的对齐填充确实达到了对齐的效果"，这才是这条不变量真正要保证的
+最终结果。
 
 #### `K_max = 1` 是退化边界，不是这一步的一个普通实例，必须单独判定
 
@@ -1132,6 +1190,60 @@ entry 算出 `M=0`。如果不 clamp，调用方算 `w/M` 就是 `0/0`——**�
 `M` 的唯一合法用途就是做这个除法，把安全性钉在产出 `M` 的地方，调用方就不可能
 漏掉。
 
+#### 虚拟槽展开必须扣上 `log_kv_slot_attention` 现有的 `causal_tail`/`mask` API
+
+**现有 `causal_tail` 机制的假设和语义簇的虚拟槽展开不兼容，必须新增一个第三种
+掩码，不能复用现有两种。** 核对 `log_kv_cache.py:1477-1545` 确认：
+
+- `mask`（`(T_q, S)` bool）和 `causal_tail`（int）**互斥**（`causal_tail`
+  非零时传 `mask` 直接 `raise ValueError`）。
+- `causal_tail` 假设**最后 `causal_tail` 个 slot 是逐 token 对齐的 in-flight
+  精确 chunk**（`causal_tail == T_q` 是硬校验），它之前的所有 slot **无条件
+  可见**——现有实现完全没有"pooled 区域里某些 slot 无效，需要挡掉"这个概念，
+  因为位置分桶方案里每个 pooled slot 永远代表真实存在的合并结果，不存在"这个
+  slot 是去重后的占位、不该被 attend"的情形。
+- `append_exact_tokens`（`log_kv_cache.py:1435-1474`）把 in-flight chunk
+  拼在 pooled slot **之后**（`k_all = cat([slot_k, k_new], dim=2)`）——**flatten
+  顺序是 pooled 在前、exact 在后，这是既有约定，语义簇路径必须原样保留**，
+  否则 `causal_tail` "最后 `causal_tail` 个是 in-flight"这条假设直接失效。
+
+语义簇路径新增的 `slot_valid`（`dedup_anchors` 的输出，标记锚点去重后哪些虚拟槽
+是重复/无效的）只覆盖 **pooled 区域**——**exact in-flight chunk 从不参与锚点
+展开**（它是逐 token 精确条目，每个 token 天然只有一个真实位置，不需要
+`p_lo/p_mid/p_hi` 三个候选，也就没有"去重"这回事），所以 `slot_valid` 的形状是
+`(B,G,S_pooled)`（`S_pooled = K_max·L_alloc·B′·3` 去重前的上界，实际展开后
+flatten 成一维），**不覆盖、也不需要覆盖 exact 尾部**。
+
+**新增第三个、与另外两个正交的掩码参数**：
+
+```python
+def log_kv_slot_attention(
+    q, slot_k, slot_v, slot_w, scale,
+    mask=None,           # 不变：(T_q, S) bool，仍与 causal_tail 互斥
+    causal_tail=0,        # 不变：仍要求 causal_tail == T_q
+    slot_valid=None,      # 新增：(B, G, S_pooled) bool，只盖 pooled 前缀，
+                           # 可以和 causal_tail 同时使用，也可以和 mask 同时使用
+                           # ——它和另外两者不是同一个轴（entry 级有效性 vs
+                           # query-time 因果可见性），不存在互斥关系
+    ...
+):
+```
+
+**应用方式**：`slot_valid` 是**逐 slot、不随 query 变化**的一维掩码（不像
+`mask` 是 `(T_q,S)`），所以可以用一次广播 `masked_fill_` 覆盖 score 张量的
+pooled 列（`score[..., :S_pooled]`），代价和 `causal_tail` 现有的"只填 tail
+切片"同一量级——不需要构造一个 `(T_q, S)` 的全尺寸掩码，`slot_valid` 本身已经
+是比 `mask` 更便宜的表示。应用顺序上，`slot_valid` 的 `masked_fill_` 和
+`causal_tail`/`mask` 的 `masked_fill_`互不依赖，谁先谁后不影响最终结果（都是
+把对应位置置 `-inf`，结合律成立），实现时可以按顺手的顺序各做一次。
+
+**必须补的单测**：构造一个同时有 pooled 无效槽（需要 `slot_valid` 遮住）和
+in-flight exact chunk（需要 `causal_tail`）的合成场景，断言两种掩码同时生效
+——pooled 区域的无效槽在所有 query 上都拿不到注意力权重，exact 区域仍然正确
+respects 逐 token 因果关系，且这条路径下的输出与"手工构造等价的 `(T_q,S)`
+`mask`（同时编码两种约束）"数值一致，验证"两个正交掩码分别加"和"揉成一个
+掩码"是同一件事，只是前者更便宜。
+
 **为什么 Σ/Γ 也要按锚点转，不能只转 `k_raw`。** §5.10/§5.20-B 说"Σ/Γ 的统计空间
 post-RoPE → pre-RoPE，数学不变，只是喂进去的张量换了"——这句话覆盖了**累积**这一步
 （Chan merge 在 pre-RoPE 空间做，正确），但没覆盖**读出**这一步。现有打分/读出公式
@@ -1395,10 +1507,33 @@ qkv.split → norm_q / norm_k（Qwen3 是 norm_qk=True, type="default"）
 | GQA | `k` 在这一步已经是 `(B, G, T, hs)` 的 per-KV-group 形态，**写入侧不涉及 rf 折叠**，折叠只发生在读出侧的 `log_kv_slot_attention`。这条是好消息 |
 | 那段注释 | `model.py:805-808` 明确写着 expected-RoPE 的设计前提（"LogKV mean-pools the FULL key … expected rotation over the span"）——**那正是被替换掉的东西，注释必须同步改**，否则下一个读代码的人会按旧模型理解 |
 
-**上表说了"要同时持有 `k_roped` 和 `k_raw`"，但没说 autograd `Function` 的签名
-该怎么变、`ctx.save_for_backward` 存什么、`k_raw` 要不要 detach、`k_roped` 的梯度
-怎么回到同一个 qkv 投影输出——这四个问题此前完全没有答案，训练路径写不下去。**
-核对现有 `LogKVStreamTrainingAttention`（`log_kv_cache.py:1838` 起）：
+**上表说了"要同时持有 `k_roped` 和 `k_raw`"，但没把最关键的一条钉死：autograd
+`Function` 的训练目标本身有没有变**。核对现有 `LogKVStreamTrainingAttention`
+（`log_kv_cache.py:1838` 起）的 docstring 后确认，这条此前被隐式地答错了，必须
+先定死它，`Function` 签名、`ctx.save_for_backward` 存什么、要不要 detach 这些
+接口细节才有意义——顺序反了会把"怎么传参"和"训练目标要不要变"混成一个问题。
+
+**现有训练目标是 stop-gradient through cache commit，这是不可动摇的 v1 前提，
+不是可以顺手改掉的实现细节**：docstring 原文——"gradient reaches q/k/v only
+through each token's own block (the cache commits detached copies)"——是整个
+`LogKVStreamTrainingAttention` 存在的数学基础。它把 backward 需要的计算图限制
+在**每个 `train_block` 局部**，这正是它能把训练内存从 `O(T·S)` 压到
+`O(T + train_block·S)` 的原因（docstring 开头那段"the naive training graph
+saves... hundreds of GB"正是为了避免这件事才写了这整个 Function）。**v1 必须
+原样保留这条前提，不能让语义簇路径悄悄改变训练目标。**
+
+> **一处曾经写错的设计**：上一轮文档给 `backward()` 写了一个 `grad_k_raw`，
+> 声称要"通过 `op_log` 重放链路对 `compact()` 的加权统计求解析梯度"，把 cache
+> 写入这条路径变成可微分的。**这和上面那条 stop-gradient 前提直接矛盾**——如果
+> cache 写入可微分，某个 token 的梯度就要一路穿过它所在簇此后全部的合并历史，
+> 传回到构成每一次合并结果的**所有**原始 token，这正是 docstring 开头"避免跨越
+> 整个流的计算图"这句话要防止的情形，等于把这个 Function 存在的理由重新引入了
+> 一遍。要不要真的做"cache 写入可微"是一个训练目标层面的决定，不是一个"顺手在
+> 写 `Function` 签名时可以捎带手做的接口改动"——上一轮把两个问题混在了一起，
+> 答案是错的：**v1 不改训练目标，`k_raw` 和 cache 写入这条路完全不参与反向
+> 传播，和现状代码里 `v` 的处理方式完全一样**（`v` 也是既参与 cache 写入的数值
+> 计算、又从这个 Function 拿不到梯度——`k_raw` 现在只是显式地遵守同一条早就
+> 存在的前提，不是新规则）。
 
 ```python
 # 现状（单 k，post-RoPE）：
@@ -1416,7 +1551,7 @@ def backward(ctx, grad_y):
     return grad_q, grad_k, grad_v, None, None, None, None, ...
 ```
 
-**改动**：
+**v1 改动（接口变了，训练目标没变）**：
 
 ```python
 @staticmethod
@@ -1431,39 +1566,37 @@ def backward(ctx, grad_y):
     q, k_raw, k_roped, v = ctx.saved_tensors
     ...
     grad_q       = ...   # 不变：in-flight exact attention 对 q 的梯度
-    grad_k_raw   = ...   # 新增：cache 写入路径（compact/Chan merge）对 k_raw 的梯度，
-                          # 通过 op_log 重放链式法则累积（见下方）
-    grad_k_roped = ...   # 新增：in-flight exact attention 对 k 的梯度，
-                          # 和现状代码里 grad_k 的计算方式完全一样，只是改了变量名
-    return grad_q, grad_k_raw, grad_k_roped, grad_v, None, None, None, None, ...
+    grad_k_roped = ...   # 不变：in-flight exact attention 对 k 的梯度，和现状代码里
+                          # grad_k 的计算方式完全一样，只是改了变量名
+    return grad_q, None, grad_k_roped, grad_v, None, None, None, None, ...
+    #             ^^^^ k_raw 的梯度槽位恒为 None——cache 写入这条路从设计上就
+    #                  不可微，和 grad_v 只从 in-block exact attention 来、
+    #                  cache 内容本身不贡献梯度是同一条已有规则
 ```
 
-**`k_raw` 和 `k_roped` 都不能 detach，理由是它们是同一个上游张量（qk-norm 输出）
-的两个下游消费者，不是两个独立叶子**：调用方（`model.py`）算出
-`k_raw = norm_k(...)` 之后，一边把它原样传给这个 Function 做 cache 写入，一边
-另算 `k_roped = apply_rope(k_raw[..., :rope_n_elem])`（普通、不包在任何自定义
-`Function` 里的可微分算子）再传进来。只要两者都**保持 `requires_grad`、不手动
-`.detach()`**，PyTorch 的常规 autograd 就会在这个 Function 的边界之外，把
-`grad_k_raw`（这个 Function 直接返回的）和"`grad_k_roped` 经过 `apply_rope`
-的 `backward` 拉回来的梯度"**在共享祖先（qk-norm 输出）处自动相加**——这是
-autograd 处理"一个张量被多个下游消费"的标准行为，不需要这个 Function 自己做
-任何特殊的梯度合并逻辑。**这里的"detach"特指不要对 `k_raw`/`k_roped` 这两个
-输入张量本身调用 `.detach()`**——和 `forward()` 方法体内部那个已经存在的
-`with torch.no_grad():` 块（包裹 cache 写入的数值计算，§5.18 第 0 步就已经在
-用）不是一回事：那个 `no_grad` 块管的是"cache 内部的 compact/carry 算术不建
-autograd 图"（这本来就是这整个自定义 `Function` 存在的意义——用解析梯度公式
-替代对一个巨大重放图求导），和"输入张量该不该被当作可微分变量对待"是两个独立
-的问题。
+**`k_raw` 的角色和现状代码里的 `v` 完全对称，不是新引入的一类张量**：两者都
+（a）参与 cache 写入的数值计算（在 `forward()` 方法体内部已有的
+`with torch.no_grad():` 块里，`v` 今天就是这么处理的），（b）从这个 Function
+拿到的梯度恒为 `None`。`k_roped` 则和现状代码里的 `k` 完全对称：参与 in-flight
+exact attention，正常传播梯度，算法和现状一字不改，只是改了变量名。**`k_raw`
+传进来要不要 detach 都无所谓**——`forward()` 整个方法体本来就在
+`torch.no_grad()` 里跑，`Function.forward` 本身也从不记录图，传一个
+`requires_grad=True` 的张量进来不会意外泄漏梯度出这个函数；调用方
+（`model.py`）不需要为 `k_raw` 额外做 `.detach()`，只要让 `backward()` 稳定
+返回 `None` 就够，和现有 `v` 的处理方式完全一致，不需要新写任何代码模式。
 
-**`grad_k_raw` 从哪来**：`compact()`/Chan-merge 的正确性论证（§11-A）已经确立
-"backward 重放 `op_log`、不重跑路由"，`grad_k_raw` 就是在这条重放链路上，对
-"每个 token 的 `k_raw` 如何通过 `compact()` 的加权均值/协方差累积一路影响到
-最终读出的 `score`/`read`"应用链式法则算出来的解析梯度——这部分是**新增的
-计算**，现状代码里的单一 `grad_k` 完全没有这一路（现状是位置分桶，没有"这个
-token 的原始 key 通过分簇统计间接影响别处读出"这种间接路径，语义簇路径新增了
-这条路径，必须新写）。**`grad_k_roped` 不需要新写**——in-flight exact attention
-这条路数学上和现状完全一样（都是普通因果注意力对 key 的梯度），只是现状代码里
-变量叫 `k`、语义簇版本里叫 `k_roped`，改名不改算法。
+**`op_log` 存在的理由因此比上一轮写得更清楚了：它不是为了支持某种新梯度路径，
+是为了让 backward 的重放能正确重建"某一时刻 cache 的（依然完全 detached 的）
+内容"，从而让 in-flight exact attention 那部分重算出正确的数**——这和
+§5.21-2"重放完全不需要 centroid"那段已经确立的结论完全一致，需要更正的只是
+上一轮误加的 `grad_k_raw` 这一条，op_log 重放算法本身的设计不受这次修正影响。
+
+**如果未来真的要做"cache 写入也可微"这个更激进的方向**：那是一次独立的、
+训练目标层面的重新设计，至少需要（i）先证明新的计算图仍然有界（不能退回
+`O(T·S)`，否则重新引入这整个 Function 存在的理由要解决的 OOM 问题）、（ii）一个
+naive reference 实现（哪怕慢、哪怕只能跑小规模，用来核对解析梯度公式对不对）、
+（iii）reference 和 replay 版本的 backward 数值对拍。这三条现在都没有着落，
+所以明确列为**不在 v1 范围内**，不是"以后顺手加上"的小事。
 
 #### 5.21-2 `op_log`：完整的操作语义、顺序、重放算法
 
