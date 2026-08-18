@@ -128,8 +128,9 @@ cache（每 layer 一个）
 | `causal_tail` | 在途 chunk 的因果掩码，省掉一个全尺寸 mask |
 | `importance_pooling` | 已验证为负结果的邻近方案（niah 0.0827→0.0787）。**建议保持关闭**；语义簇开关打开时与 `pin` 一起被构造时硬性禁止组合（§5.1），共存数学尚未推导 |
 
-**新增的 buffer**（§5.13）：`centroid`、`n_eff`、`n_total`、`p_hi_c`、`alive`、
-`level_count`、`pad_mask`、`op_log`、`s_h`。
+**新增的 buffer**（§5.13）：`centroid`、`n_eff`、`n_total`、`p_hi_c`、
+`current_segment`、`alive`、`level_count`、`pad_mask`、`op_log`、
+`op_log_len`、`s_h`。
 
 ## T8. 外部概念
 

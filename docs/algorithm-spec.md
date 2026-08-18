@@ -242,9 +242,29 @@ segment id（下一次开新段时用 `current_segment + 1`），进 §5.13 的�
 字段——因为 Phase 3 本就按时间顺序逐簇处理，这个赋值天然收敛到本批最后一次
 `NEW_SEGMENT` 的值，不需要额外的 `max`），`ward_merge_only` 步骤 1 合并两个既有
 簇时取 `current_segment_new = max(current_segment_a, current_segment_b)`（和
-`p_hi_new = max(p_hi_a, p_hi_b)` 同一个模式——segment id 除了"两两不同"没有别的
-代数要求，取 max 保证合并后下一次真正的 `NEW_SEGMENT` 拿到的 id 严格大于两个
-历史里出现过的任何 id，不会和调试/分析工具已经见过的旧 id 撞车）。
+`p_hi_new = max(p_hi_a, p_hi_b)` 同一个模式）。
+
+> **`current_segment_new = max(...)` 保证的是什么、不保证什么，必须说清楚，
+> 不能只说"不会撞车"——那句话不准确。** `max` 只保证**合并之后、`keep_slot`
+> 这个身份未来还会产生的新 segment id**，严格大于合并前 `a`/`b` 双方各自
+> 出现过的任何旧 id——这防的是"未来新 id 撞上过去旧 id"。它**不**保证、也
+> **不需要**保证"合并前 `a` 和 `b` 两段独立历史里的旧 segment id 互不相同"
+> ——`a` 和 `b` 在合并前都是从 0 开始独立计数的（`NEW_CLUSTER` 的 `arg1=0`
+> 约定），`a` 的 segment 0 和 `b` 的 segment 0 是两个完全不同的时间段，数值
+> 相同纯属巧合，这从一开始就不是、也不需要是同一个命名空间。**`op_log` 里
+> 这两段历史的 op 各自带着自己原本的 `cluster` 字段（`a`/`b` 各自的槽号，
+> 没有被重定向改写，见前面"op_log 永不改写"一节），所以它们天然是可区分
+> 的——真正需要小心的场景是"同一个物理槽先后被两条不同的逻辑簇使用"（先是
+> 簇 X 用槽 5，X 被合并走或整体让位后，槽 5 又被拿去 `NEW_CLUSTER` 建立
+> 一个和 X 无关的新簇 Y），这种情况下 X 和 Y 的 segment 计数都从 0 开始，
+> `(cluster=5, segment=0)` 这个裸 key 确实会撞——但这正是"槽位复用"问题
+> 本身（`derive_final_cluster` 那节已经用 `(slot, epoch)` 版本化身份解决
+> 过一次），不是 segment 机制独有的新问题。**结论：任何需要跨这类边界做
+> 分组/画图的分析工具，必须按 `(slot, epoch, segment)`（复用
+> `derive_final_cluster` 已经维护的同一套 `epoch`）做 key，不能只用裸
+> `(cluster, segment)`；而跨 `a`/`b` 两段历史的真实时间先后顺序，只能从
+> `op_log` 本身的线性位置读，不能靠比较两个 lineage 各自的 `segment` 数值
+> 大小去推断——它们不是同一个可比较的计数序列。**
 
 **但只有持久 buffer 还不够——同一批内，同一簇的多个 token 各自决定"是否开新段"
 时，必须知道彼此的决定，否则会产生和 Phase 2 那个 bug 同构的错误：** 若 Phase 1
@@ -291,15 +311,35 @@ op.segment[t] = current_segment[c*[t]] + nsg_incl[t]
 真实 entry"（batch-start 之前的持久状态只在本批还没发生过新段事件时才需要）：
 
 ```
-steps_since[t] = 按 c*[t] 分组、按 t 排序，"距离上一个 new_seg=True 的位置有
-                  多少步"（不含该位置自身，t 自己若 new_seg=True 则 steps_since=0）
-                  # 标准 segmented "reset scan"：等价于 t 的组内下标减去"最近一次
-                  # new_seg=True 的组内下标"，可以用 running max（对 new_seg=True
-                  # 的位置打上组内下标、其余置 -1，做前缀 max）实现，同样是
-                  # GPU 上有现成模式的原语，不需要逐 token 串行
+rank[t]        = 按 c*[t] 分组、按 t 排序，t 在自己这个簇的批内子序列中的
+                  0-indexed 组内下标（第一个同簇 token 是 0，第二个是 1，……）
 
-base_mod[t]  = 1                                   如果本批内 c*[t] 之前已经有
-                                                     new_seg=True 发生过
+last_new_rank_before[t] = 严格排在 t 之前、且 new_seg=True 的同簇 token 里，
+                  组内下标最大的那个；若不存在（本批内 c*[t] 在 t 之前还没
+                  开过新段），取哨兵值 -1
+                  # 标准 segmented "reset scan"：对 new_seg=True 的位置打上
+                  # 自己的组内下标、其余位置置 -1，做一次**exclusive**（不含
+                  # 自身）的组内前缀 max。exclusive 是关键——如果拿 inclusive
+                  # 前缀 max 直接用，t 自己若 new_seg=True 会把自己算进去，
+                  # 得到 last_new_rank_before[t] == rank[t]，下面的公式会用
+                  # t 自己的下标减自己，产出荒谬的负数或零。exclusive 前缀
+                  # max 可以直接用 inclusive 前缀 max 整体右移一位得到
+                  # （标准技巧，同样是现成的向量化原语，不需要逐 token 串行）
+
+steps_since[t] = rank[t] - last_new_rank_before[t] - 1   # 注意这个 "-1"，
+                  # 两个分支都要减：
+                  #   有上一次新段（last_new_rank_before[t] = r' ≥ 0）：
+                  #     steps_since = rank[t] - r' - 1，不是 rank[t] - r'——
+                  #     r' 这个 token 自己的那一步已经被"重置到 1"吸收掉了，
+                  #     不能再算一次
+                  #   本批内还没开过新段（哨兵 last_new_rank_before[t]=-1）：
+                  #     steps_since = rank[t] - (-1) - 1 = rank[t]，也就是
+                  #     "t 前面有多少个同簇批内成员"——同一个 "-1" 在两个
+                  #     分支里自动给出正确结果，不需要为两个分支分别记两条
+                  #     不同的公式
+
+base_mod[t]  = 1                                   如果 last_new_rank_before[t] ≠ -1
+                                                     （本批内 c*[t] 之前已经开过新段）
              = level_count[c*[t], 0] mod 2^ℓ_block  否则（本批这个簇还没开过新段，
                                                      用批前持久值）
 prev_mod[t]  = (base_mod[t] + steps_since[t]) mod 2^ℓ_block
@@ -308,6 +348,24 @@ count[t]     = (-prev_mod[t]) mod 2^ℓ_block         # 只有 new_seg[t]=True �
                                                        PAD_INSERT op（沿用既有
                                                        "count=0 不产生 op"规则）
 ```
+
+> **这个 "-1" 不是可以省略的细节，是这条公式唯一容易做错的地方，必须显式钉死
+> 并给出推导。** 从头验证：设一批内某簇的子序列按组内下标排好，`M_r` 表示
+> 处理完第 `r` 个成员之后（即将处理第 `r+1` 个成员之前）的 mod 计数器值，
+> `M_0 = level_count[cluster,0] mod 2^ℓ_block`（批前持久值）。递推关系是
+> `M_{r+1} = 1`（若第 `r` 个成员 `new_seg=True`）或 `(M_r+1) mod 2^ℓ_block`
+> （否则）——这就是"每次新段事件后计数器精确回到 1"这条化简的直接展开。
+> 设 `r'` 是严格小于 `r` 的、最近一次 `new_seg=True` 的组内下标：从
+> `M_{r'+1}=1` 开始，之后 `r-1-r'` 个成员全是 `new_seg=False`（否则 `r'`
+> 就不是"最近一次"），每个贡献 `+1`，所以 `M_r = 1 + (r - 1 - r') =
+> r - r'`。而 `prev_mod[t]` 就是 `M_{rank[t]}`——代入 `steps_since[t] =
+> rank[t] - r' - 1` 和 `base_mod[t]=1`，`prev_mod[t] = 1 + (rank[t]-r'-1)
+> = rank[t]-r'`，和直接展开算出的 `M_{rank[t]} = rank[t]-r'` 完全一致。
+> 若不减这个 "1"（即错误地令 `steps_since = rank[t]-r'`），会算出
+> `prev_mod[t] = rank[t]-r'+1`，比真值多 1，`count[t]` 也会系统性算错——
+> 且两个分支（有无上一次新段）用同一个哨兵 `-1` 统一处理后，错误会以
+> **同样的方向**（多算 1 步）同时出现在两个分支里，不会只在一个分支里
+> 暴露，容易在单测覆盖不到"本批第一次开新段"这个边界情形时被放过。
 
 **为什么这不需要像 §5.21-3 的 carry 那样上有界轮数的循环**：§5.21-3 的 carry
 需要模拟"进位可能级联多少层"，这个深度虽然有静态上界（`L_alloc`）但每一层都要
@@ -325,6 +383,53 @@ ladder 写入的要求同一个模式——写一个逐 token 串行的朴素参
 向量化公式在任意合成批次（含同簇多次开新段、含多个不同簇交错到达）上逐位
 一致。这条测试没通过之前，"segment id / PAD_INSERT count 的批量化是对的"这个
 论证是未经验证的假设。
+
+**上面只算出了每个 token 的 `segment`/`count`，还没说这些 op 怎么写进本地缓冲
+——`PAD_INSERT` 和它服务的 `NEW_SEGMENT` 是两条 op，主操作永远只有一条，每个
+token 展开出的 op 数量不一样，这是一个变长写入问题，Phase 1 是向量化路径，
+不能逐 token 决定"我这条写在第几行"。**
+
+```
+extra[t]    = new_seg[t] and (count[t] > 0)   # 这个 token 除了主操作，还需要
+                                                # 额外一条 PAD_INSERT
+main_idx[t] = base + t + inclusive_prefix_sum(extra)[t]   # base 是本地缓冲
+                                                             # 提交前的 local_op_len
+                                                             # （Phase 1 总是本批
+                                                             # 第一个写入者，实践中
+                                                             # base=0，但公式写通用
+                                                             # 形式）
+若 extra[t]：pad_idx[t] = main_idx[t] - 1
+```
+
+`inclusive_prefix_sum(extra)[t]`（**含 `t` 自己**，标准的向量化前缀和，不是
+新原语，§5.4 别处已经在用同类操作）是关键：它等于"到 `t` 为止，包括 `t` 自己，
+总共有多少个 token 需要额外的 `PAD_INSERT` 槽位"。用一个小例子验证为什么必须是
+inclusive（含自身）而不是 exclusive（不含自身）：三个 token `t=0,1,2`，只有
+`t=1` 需要 pad（`extra=[F,T,F]`）。inclusive 前缀和是 `[0,1,1]`：
+
+```
+main_idx[0] = 0+0+0 = 0        # t=0 主操作 -> 本地缓冲第 0 行
+main_idx[1] = 0+1+1 = 2        # t=1 主操作 -> 第 2 行；pad_idx = 2-1 = 1
+                                #   -> 第 1 行是 t=1 的 PAD_INSERT，恰好紧邻在
+                                #      它服务的 NEW_SEGMENT（第 2 行）之前
+main_idx[2] = 0+2+1 = 3        # t=2 主操作 -> 第 3 行，紧接第 2 行，没有空隙
+```
+
+四行（0,1,2,3）恰好装下 `3` 个主操作 + `1` 个 pad，`local_op_len` 本批结束后
+推进到 `4 = m + Σextra`。**如果错用 exclusive 前缀和**（不含自身），`t=1` 的
+`main_idx` 会算成 `0+1+0=1`，`pad_idx=0`——但第 0 行已经被 `t=0` 的主操作占了，
+两个 token 的 op 写进同一行，互相覆盖。**inclusive 是必须的，不是随意选择**：
+`t` 自己若需要 pad，这条 pad 本该排在它主操作的前一行，而 `t` 自己贡献的那个
+`+1`（inclusive 才有）恰好把它的主操作向后多推一行，腾出这个空位；exclusive
+少算了 `t` 自己这一份，主操作和它自己的 pad 会挤到同一行。
+
+**这条公式只覆盖生产路径的主操作 + `PAD_INSERT`。** 调试 build 的 `CARRY`
+不参与这个索引分配——它不需要精确的行间位置关系（§5.21-2 已经说明重放从不读
+`CARRY`），要不要把它也塞进这套向量化索引分配是调试工具自己的问题，不在这里
+展开。**必须补的单测**（和上面 segment/count 的对拍单测同一批数据即可复用）：
+断言按这套公式写出的本地缓冲，逐行类型和参数与逐 token 串行执行的参考实现
+（每次决定一个 op 就模拟"追加"一次，行号自然递增）完全一致，尤其要覆盖"连续
+多个 token 都需要 pad"和"本批最后一个 token 需要 pad"这两个边界情形。
 
 **这个技巧的适用范围不止这里，顺带记一笔留给以后**：Phase 3 对 `n_eff`/`centroid`
 的在线更新（§5.5）在没有 `γ` 衰减重启（即本批内该簇没有 `NEW_SEGMENT`）时会
@@ -586,7 +691,9 @@ Phase 2 处理每个 orphan（或一小簇互相接近的 orphan，由批内 min
     3. append WARD_MERGE(keep_slot, free_slot, -1) 到本地缓冲   # 日志写入是
        # 调用方（这里）的职责，不是 ward_merge_only 自己的职责，见 §5.6 的更正
     4. slot_idx = free_slot   # 释放出来的槽立即交给这个 orphan（组）的新簇使用
-       —— 这一步**只**初始化结构性状态：alive[slot_idx]=true，
+       —— 这一步开始就是 allocate_new_cluster(slot_idx, group) 这个共享原语
+       的内容（见本小节末尾"K 未满/冷启动复用同一个原语"一段），**只**初始化
+       结构性状态：alive[slot_idx]=true，
           centroid/n_eff/n_total/p_hi_c/current_segment 全部清零（"白纸"状态，
           不沿用旧簇残留值）。
           **数值元数据不在这里赋值**——统一交给 Phase 3 从本批完整的 op 序列
@@ -646,6 +753,52 @@ Phase 2 处理每个 orphan（或一小簇互相接近的 orphan，由批内 min
 > 而是"用一个哨兵值参与运算"——这是一个正确性 bug，不是近似误差，必须用
 > `local_p_hi` 修掉，不能归入 Phase 1 那类"已知、可接受、留给 S0.8 测量"的
 > 近似里一并放过。
+
+**`K` 未满/冷启动必须复用同一个 `allocate_new_cluster(slot_idx, group)` 原语，
+不能各写一套**：上面第 4 步到"这和『一个已存在的簇后续收到新成员』用的是
+同一套判据"结束的全部内容——`alive`/元数据清零、`append NEW_CLUSTER`、
+`local_p_hi`/`local_segment` 初始化、组内后续成员的 `JOIN`/`NEW_SEGMENT`
+判据循环——**只依赖一个已经确定是空槽的 `slot_idx`，和这个 `slot_idx` 是
+"Ward 合并腾出来的"还是"本来就空着的"完全无关**。§5.6 的"新簇形成的条件"表把
+`K 未满`写成一句"占用 `alive` 为 false 的第一个槽位"，`冷启动`写成"第一个
+flush 的 token 必然建簇 0"——这两行只回答了"`slot_idx` 从哪来"，没有回答
+"拿到 `slot_idx` 之后怎么初始化"，容易让实现者误以为这两条路径不需要
+`current_segment` 清零、不需要 `local_p_hi`/`local_segment`，因为详细的
+初始化步骤只在"K 已满"分支里写全了。**这是错的：三条路径（冷启动、K 未满、
+K 已满）在"如何初始化一个新簇"这一步必须是同一份代码，唯一的差别在前一步
+"如何拿到一个空槽"**：
+
+```
+def new_cluster_slot() -> int:
+    if K_max_slots_full():
+        keep_slot, free_slot = argmin_ward_cost(...)   # K 已满：先合并腾位
+        ward_merge_only(keep_slot, free_slot)
+        append WARD_MERGE(keep_slot, free_slot, -1) 到本地缓冲
+        return free_slot
+    else:
+        return (~alive).float().argmax(-1)   # K 未满/冷启动：直接找第一个空槽，
+                                                # 冷启动时"全部 alive=False"是
+                                                # 这条路径的一个特例，不需要
+                                                # 单独分支
+
+slot_idx = new_cluster_slot()
+allocate_new_cluster(slot_idx, group)   # 上面第 4 步开始的全部内容，三条路径
+                                          # 共用同一次调用，不分叉
+```
+
+**`K` 未满/冷启动分支里，`alive[slot_idx]` 进入 `allocate_new_cluster` 之前
+为什么必然是"白纸"，还有一个隐含前提必须显式点出**：Ward 分支的"白纸"是
+`ward_merge_only`/第 4 步显式 `zero_()` 出来的，`K` 未满分支的"白纸"则依赖
+"一个从未被 `alive` 过的槽，它的 `centroid`/`n_eff`/`n_total`/`p_hi_c`/
+`current_segment` 本来就是全零"——**这个前提不是自动成立的，必须由
+`reset_parameters()` 在整个 cache 生命周期开始时显式 `torch.zeros(...)`
+（或等价的显式清零）保证，不能依赖 `torch.empty` 之类不保证清零的分配**，
+否则一个"从未使用过"的槽可能带着未初始化的垃圾内存，`allocate_new_cluster`
+里"数值元数据不在这里赋值，统一交给 Phase 3 重新构造"这条设计（依赖
+`n_eff_pre==0` 触发 §5.5 的直接替换分支）会在这类槽上失效——`n_eff` 如果不是
+真正的 0 而是垃圾值，`n_eff_pre==0` 这个判据就不成立，代码会走进错误的加权
+混合分支。这条前提和 §5.11"填充槽必须显式清零，不能依赖默认值"是同一类
+纪律，放在这里一并点出，不是重复。
 
 **Ward 合并候选池不受限（不排除本批内新建的簇）不再需要任何补偿机制**：上一轮
 需要重定向，是因为担心"Phase 1 已经写下的、引用了后来被合并掉的槽的 op"会在
@@ -833,8 +986,8 @@ Phase 2 已经把它的 `n_eff` 清零，§5.5 公式里 `n_eff_pre == 0 时 μ_
 | 路径 | 说明 |
 |---|---|
 | 冷启动 | 第一个 flush 的 token 必然建簇 0；开头若干 token 会快速填出初始簇集（§11-F 的风险来源）|
-| K 未满 | 占用 `alive` 为 false 的第一个槽位 |
-| K 已满 | 先 Ward 合并腾位，再建新簇。`K_max ≥ 2` 时 Ward 候选池必然非空（§5.6 已证明），**这一步不会失败，因此不需要定义任何 fallback 行为**——见下方更正框 |
+| K 未满 | 占用 `alive` 为 false 的第一个槽位，然后调用和"K 已满"分支完全相同的 `allocate_new_cluster(slot_idx, group)` 原语初始化（§5.4"`K` 未满/冷启动必须复用同一个 `allocate_new_cluster` 原语"一段）——这两条路径的差别只在"`slot_idx` 从哪来"，初始化步骤不分叉 |
+| K 已满 | 先 Ward 合并腾位，再调用同一个 `allocate_new_cluster`。`K_max ≥ 2` 时 Ward 候选池必然非空（§5.6 已证明），**这一步不会失败，因此不需要定义任何 fallback 行为**——见下方更正框 |
 
 **同样重要的是哪些情况「不」建新簇**：时序被打断 → 开新 **segment**，不开新 cluster
 （v3.1 的核心修正）；位置远 → 与簇身份无关，只进 join cost 的排序项和 segment 判定。
@@ -1080,9 +1233,12 @@ op_log，见下方更正）：
    n_eff_new   = n_eff_a + n_eff_b
    n_total_new = n_total_a + n_total_b
    p_hi_new    = max(p_hi_a, p_hi_b)
-   current_segment_new = max(current_segment_a, current_segment_b)   # 见 §5.4，
-                          # segment id 除了两两不同没有别的代数要求，取 max 保证
-                          # 下一次真正的 NEW_SEGMENT 严格大于两段历史里任何旧 id
+   current_segment_new = max(current_segment_a, current_segment_b)   # 见 §5.4
+                          # 那条更正框：这只保证合并后 keep_slot 未来新开的
+                          # segment id 大于 a/b 双方的历史最大值，不保证 a/b
+                          # 各自的历史 segment id 互相之间不重复（它们本来就
+                          # 是两个独立计数、都从 0 开始，天然靠 op_log 里各自
+                          # 原本的 cluster 字段区分，不靠 segment 数值区分）
 
 2. 合并两条 ladder —— 逐层归并 + 级联进位
    for ℓ in 0 .. L_alloc-1:
@@ -2065,16 +2221,24 @@ def forward(ctx, q, k_raw, k_roped, v, cache, scale, train_block, second_order_s
     ...
     # op_log/op_log_len 不是这个 Function 的输入参数——它们是 forward 处理完
     # 整条序列全部 block/flush 之后，cache 对象上累积出来的最终状态，在这里
-    # 读出来一起存进 ctx（§5.21-2"op_log 的有效长度"一节的定案）
-    ctx.save_for_backward(q, k_raw, k_roped, v, cache.op_log, cache.op_log_len)
+    # 读出来一起存进 ctx（§5.21-2"op_log 的有效长度"一节的定案）。
+    # 必须 .detach().clone()，不能存裸引用——见下方"ctx 存的必须是快照，
+    # 不是引用"一节，cache.op_log/op_log_len 是会被下一次 reset_parameters()
+    # 原地清零复用的持久 buffer，直接存引用会让 backward 读到已经被清空的内容
+    ctx.save_for_backward(
+        q, k_raw, k_roped, v,
+        cache.op_log.detach().clone(), cache.op_log_len.detach().clone(),
+    )
     ...
 
 @staticmethod
 @once_differentiable
 def backward(ctx, grad_y):
     q, k_raw, k_roped, v, op_log, op_log_len = ctx.saved_tensors
-    # 重放只读这份 ctx 快照，不碰 cache 对象自己的 op_log/op_log_len——后者在
-    # 下一次 forward() 开头被 reset_parameters() 清空是正常行为，不需要豁免
+    # op_log/op_log_len 是 forward 结束时的独立克隆，不是 cache 对象的引用——
+    # 重放只读这份快照，不碰 cache 对象自己的 op_log/op_log_len，也不需要关心
+    # cache 对象在这之间发生了什么（包括被下一次 forward() 的
+    # reset_parameters() 清空）
     ...
     grad_q       = ...   # 不变：in-flight exact attention 对 q 的梯度
     grad_k_roped = ...   # 不变：in-flight exact attention 对 k 的梯度，和现状代码里
@@ -2375,13 +2539,10 @@ op_log_len[b,g] += local_op_len[b,g]
 自己猜。**定案：存进 `ctx`，不做 reset 豁免。** 具体地，`forward()` 处理完
 整条序列的最后一个 block/flush 之后（此时 `op_log`/`op_log_len` 已经是这次
 forward 完整、最终的状态），把它们和 `q`/`k_raw`/`k_roped`/`v` 一起存进
-`ctx`——`op_log` 是普通 int32 张量，可以直接进 `ctx.save_for_backward`；
-`op_log_len` 同理（或作为一个不需要走 autograd 存取路径的普通 `ctx` 属性，
-因为它不是模型输入/输出张量，只是一个长度记号，二选一都可以，不影响正确性）。
-`backward()` 从 `ctx` 读回这份快照来重放，**不读取、也不依赖 cache 对象自己的
-`op_log`/`op_log_len`**——cache 对象上的这两个 buffer 在下一次 `forward()`
-开头被 `reset_parameters()` 清空是完全正常、预期内的行为，不需要任何特殊豁免
-逻辑。这样选的理由：
+`ctx`。`backward()` 从 `ctx` 读回这份快照来重放，**不读取、也不依赖 cache
+对象自己的 `op_log`/`op_log_len`**——cache 对象上的这两个 buffer 在下一次
+`forward()` 开头被 `reset_parameters()` 清空是完全正常、预期内的行为，不需要
+任何特殊豁免逻辑。这样选的理由：
 - 和 `q`/`k_raw`/`k_roped`/`v` 已经在用的模式完全一致，不需要给 `op_log` 发明
   第二套"豁免 reset"的特殊生命周期规则；
 - `ctx.save_for_backward` 是 PyTorch autograd 的标准机制，`backward()` 只依赖
@@ -2392,10 +2553,38 @@ forward 完整、最终的状态），把它们和 `q`/`k_raw`/`k_roped`/`v` 一
 - 不需要引入"reset 时哪些字段该跳过"这种容易被后续修改者忘记维护的例外
   清单。
 
+> **更正（这一轮修的）：`ctx.save_for_backward(cache.op_log, cache.op_log_len)`
+> 存的是裸引用，不是快照，必须改成 `.detach().clone()`。** `ctx.save_for_
+> backward` 保存的是张量对象（指向底层 storage），不会自动 deep copy——这一点
+> 上面"不做 reset 豁免"的论证里已经预设了"存进 ctx 的是一份独立快照"，但没有
+> 显式写出**怎么**让它独立。本项目一贯的风格是预分配 buffer、`reset_parameters()`
+> 原地 `zero_()` 复用（§5.19 tip 3、§5.11 的 pad 槽清零讨论都是同一个模式），
+> 不是每次重新分配——`cache.op_log`/`cache.op_log_len` 大概率也是这样实现的。
+> 这意味着如果只是把 `cache.op_log` 这个张量对象本身存进 `ctx`（不克隆），
+> 下一次 `forward()` 里 `reset_parameters()` 对同一块底层 storage 做原地
+> 清零时，`ctx` 里"存"的那个引用指向的数据也会被一起清空——`ctx` 拿到的从来
+> 不是一份独立快照，只是一个指针。**PyTorch 的 saved-tensor 版本计数器可能会
+> 在这种情况下让 `backward()` 访问 `ctx.saved_tensors` 时报错**（原地修改过的
+> 张量被检测到，抛 `RuntimeError`），但这依赖 `reset_parameters()` 具体怎么
+> 实现、要不要触发这个检测机制，不是一个可以依赖的安全网——不能指望"如果算错
+> 了它会崩溃"来代替"从一开始就不让它有机会算错"。**修法就是显式
+> `.detach().clone()`**：`.detach()` 确保不会意外带上任何计算图（`op_log`/
+> `op_log_len` 本来就是不需要梯度的整数簿记，这一步更多是防御性的显式声明），
+> `.clone()` 真正复制底层数据，之后 `reset_parameters()` 无论怎么原地清零
+> 复用原 buffer，都不会影响 `ctx` 里这份独立副本。**`q`/`k_raw`/`k_roped`/`v`
+> 不需要同样处理**——它们是这个 Function 的输入参数，是调用方（模型的前向
+> 计算）每次新创建的激活张量，不是 cache 对象持有、会被 `reset_parameters()`
+> 复用清零的 buffer，不存在这个别名风险，不需要类比着也加克隆。
+>
+> 代价：一次 `(B,G,OP_max,4)` int32 克隆，32k 下约 16MB/层——相对这个 Function
+> 本来就要处理的激活量级可以忽略，用一次可忽略的拷贝换掉一类"取决于
+> `reset_parameters()` 具体实现细节、可能表现为静默错误也可能表现为运行时
+> 崩溃"的别名 bug，是明确划算的，不是可选的性能优化项。
+
 **`op_log`（完整 `(B,G,OP_max,4)`）和 `op_log_len`（`(B,G)`）一起进 `ctx`，
 不做切片**：虽然不同 `(b,g)` 的有效长度不同，但保存前按最长有效长度裁剪成
 ragged 张量既没必要也麻烦（batched 张量本来就不支持 ragged shape），直接连同
-静态形状一起存、backward 时再用 `op_log_len` 截断读取，是最简单、和张量的
+静态形状一起克隆、backward 时再用 `op_log_len` 截断读取，是最简单、和张量的
 矩形约束天然兼容的做法——这和"矩形预分配 + 掩码"这个贯穿全文档的原则是同一
 类选择。
 
