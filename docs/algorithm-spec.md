@@ -162,6 +162,26 @@ v3 的 fork 行为了。
 > 既不是纯语义也不是纯分段。真正在两端之间插值的是 **`(g_max, ℓ_block)`**：
 > `g_max → ∞` 或 `ℓ_block = 0` 是纯语义聚类；`g_max` 小且 `ℓ_block` 大是连续分段。
 > S0.0 已相应改为扫这一对。
+>
+> **第二处需要收紧：即使 `g_max → ∞` 或 `ℓ_block = 0`，只要 `η > 0`，"纯语义聚类"
+> 这个说法仍然不精确。** `(g_max, ℓ_block)` 控制的是**要不要分段**，但 `c*` 本身
+> 由统一代价 `d_c = ‖k_x−μ_c‖² + η·φ(p−p_hi_c)` 的 argmin 决定——只要 `η>0`，
+> `c*` 就可能不是纯语义最近的那个簇（时序 tie-break 把它换成了另一个），而
+> `novelty` 判据 `‖k_x−μ_{c*}‖² > λ_new` 恰恰是在 `c*`（不是纯语义最近簇）上
+> 判定的。也就是说 `g_max→∞`/`ℓ_block=0` 只保证"不因为时序打断而开 segment"，
+> **不保证 novelty 判定不受时序影响**——`η` 仍然可能让一个 token 被判定为"该开
+> 新簇"或"该并入某簇"，而这个判定和纯语义距离矩阵的 argmin 不一致。
+>
+> **两种处理方式，选第一种**：①把"纯语义聚类"端点精确定义为
+> `η=0 且 (g_max=∞ 或 ℓ_block=0)`——`η=0` 时 `d_c` 退化成纯语义距离
+> `‖k_x−μ_c‖²`，`c*` 就是真正的语义最近簇，此时"纯语义聚类"这个描述才是字面
+> 精确的；S0.0 扫 `(g_max, ℓ_block)` 时应固定 `η=0`，而不是沿用生产默认值——
+> `η` 的作用（打破近似语义平局）是生产路由要的性质，不是"分离语义贡献与分段
+> 贡献"这个受控实验要的性质，混进去会让 S0.0 的"纯语义"端点带有一个未受控的
+> 时序污染源。②退一步只把"纯语义"重新定义成"不分段"（不做上述收紧，接受
+> `η` 的残余影响）——**不采用**，因为 S0.0 存在的意义就是要干净地回答"收益
+> 来自语义分组本身，还是仅仅来自更好的分段边界"（CLAUDE.md §0），一个端点里
+> 混入未受控的时序因素会让这个问题本身变得不适定。
 
 ### 5.4 分簇：批量化路由（三阶段）
 
@@ -203,6 +223,76 @@ Phase 3:
 **这是一个近似**（批内冻结 centroid**和** `p_hi_c`）。**必须测它与严格串行版的
 分歧率**——S0.8。`p_hi_c` 冻结这条单独更值得关注：见 §5.21-2 里对它的展开分析
 （同批内连续同簇 token 会因为看到"批前"的 `p_hi_c` 而被误判成隔了很久）。
+
+#### Phase 2 的 Ward 合并会让 Phase 1 已经写下的 op 指向错误的槽——必须显式防止
+
+**这是比 `p_hi_c` 冻结更严重的一类冲突，此前完全没处理。** Phase 1 用**批前**的
+`alive`/`centroid` 快照把一批 token 里的大多数直接分配到某个槽（比如槽 X），并
+已经把这些 `JOIN`/`NEW_SEGMENT` op 写进了本批的 op_log。**但 Phase 2 处理 orphan
+时若触发 `K_max` 满的 Ward 合并（§5.6 五步过程），会释放并复用某个槽**——如果被
+释放复用的恰好是槽 X（Phase 1 这一批已经往里面写过东西的槽），Phase 1 写下的那些
+`op.cluster=X` 就会产生歧义：它们该被理解成"合并前的旧簇 X"（内容已经被
+`WARD_MERGE` 转移进了保留槽），还是"合并后占据槽 X 的新簇"（Phase 2 因为这个
+orphan 而建立的、和旧簇 X 毫无关系的另一个语义身份）？两种理解在 replay 时会产出
+完全不同的 cache 结构，而 op_log 本身的字段（`WARD_MERGE(keep_slot, free_slot)`
+只记了合并这一步，没有记"这次合并是否使某个本批更早的 op 的 `cluster` 字段失效"）
+不足以消歧。
+
+**决定：禁止 Ward 合并选中本批已经被 Phase 1（或本批更早的 Phase 2 orphan）写过
+的槽，而不是合并之后回去修补已写的 op。** 具体地：
+
+```
+Phase 1 结束后，维护一个本批范围内的 touched_mask: (B,G,K_max) bool
+    touched_mask[c] = True   若本批已有任意 op（Phase 1 的批量分配，或 Phase 2
+                              到目前为止处理过的更早的 orphan）把 c 当作目标槽
+
+Phase 2 处理每个 orphan 时，若需要 Ward 合并腾位：
+    Ward 代价矩阵在 §5.6 已有的"屏蔽对角线与 dead 槽位"之上，
+    再屏蔽 touched_mask 为 True 的槽（作为候选的 a 或 b 都不行）
+    —— 这一条掩码的更新完全在 Phase 2 已经是串行循环这个既有结构里完成，
+       不需要额外引入向量化以外的机制：Phase 1 的 touched_mask 更新是一次性
+       向量化 scatter，Phase 2 循环内每处理完一个 orphan（不论是并入其它
+       orphan 形成的临时簇、还是新建一个槽）就把结果槽标进 touched_mask，
+       供本批后续的 orphan 使用
+
+    若屏蔽后 Ward 代价矩阵没有可选的 (a,b) 对（例如本批已经把所有 alive 槽都
+    摸过一遍）：**这个 orphan 本批不处理，顺延进下一个 flush 批**（见下方
+    "顺延队列"），不允许退化成"忽略 touched_mask、还是合并了本批已写的槽"这种
+    静默走捷径的选项——那正是本条要防止的 bug。
+```
+
+**为什么选"屏蔽+顺延"而不是"合并后回填修补已写的 op"或"把所有 Ward 合并推迟到
+批末"**：
+
+- **回填修补**需要在 Phase 2 每次 Ward 合并后反查并重写本批之前已经写入 op_log
+  的条目，这是一个动态的、依赖数据的回溯操作，直接违反"Phase 1 是一次性向量化
+  scatter、写完即不再改"这个已经建立的批量化前提（§5.21-2 关于批量写入必须保序
+  的讨论），会重新引入本该被批量化消除的串行依赖。
+- **推迟到批末**（先收集本批所有需要新槽的 orphan，批末一次性决定所有 Ward 合并）
+  表面上更彻底，但需要在合并生效前用"虚拟槽 id"给批内的 orphan 占位，且这些虚拟
+  id 还要和同批 Phase 1 已经用的真实槽 id 共享同一个去重/masking 逻辑，复杂度
+  不比"屏蔽+顺延"低，还额外引入一层"批末才物化的间接层"，与"op_log 记录的是
+  最终决定"这个既有不变量（§5.21-2）摩擦更大。
+- **屏蔽+顺延**只需要扩展已经存在的"Ward 屏蔽对角线/dead 槽位"掩码机制（多一个
+  布尔条件），语义上等价于"这一批里已经动过的槽本批内'临时不可合并'"，不产生
+  回溯，也不需要虚拟身份——是三个选项里对现有结构改动最小的一个。
+
+**顺延队列的代价是有界的，不是新的无界风险**：一批内需要顺延的 orphan 数最多是
+`K_max`（一旦 `K_max` 个槽全部被 touched，Ward 无论如何都没有候选，无关顺延与否），
+且顺延只是把这个 token 的路由决策推迟到下一个 flush 批的 Phase 1/2 输入最前面
+（按原始位置顺序插在下一批最前面，不打乱到达顺序，满足 §5.21-2 对批量写入保序的
+要求）——**这在效果上类似 `_log_kv_pending` 已经维护的"跨 flush 边界挂起 token"
+队列，但服务的是不同的原因**（那个是 flush 粒度对齐的残留 token，这个是本批
+Ward 冲突导致的延迟路由），两者不共享同一个 buffer，避免混淆各自的语义。极端情况
+下一个 orphan 连续多批都撞见"本批 K_max 个槽全被摸过"，会被反复顺延——这只会发生
+在 `K_max` 很小、批很大、内容极端多样的病态配置下，且顺延不丢失任何信息（token
+只是晚一批被路由，不会被丢弃或错误合并），所以不需要额外的超时/强制机制兜底。
+
+**必须补一条单测**（S0.1/S0.8 之间，和批量-vs-串行等价性那条测试同一档次）：
+构造一个批内既有 Phase 1 大量分配、又有 Phase 2 orphan 触发 Ward 合并、且合并
+候选恰好会撞上 Phase 1 已分配槽位的合成场景，断言（a）touched_mask 正确阻止了
+这次合并选中那个槽，（b）如果因此没有可用候选，orphan 被正确顺延而不是被错误
+处理，（c）顺延后下一批能正确把它路由掉，不丢失、不重复。
 
 ### 5.5 分簇：centroid 更新
 
@@ -254,6 +344,10 @@ Phase 3:
 >   `n_total_a, n_total_b`**，§5.6 的合并过程相应更新：`n_total_new = n_total_a
 >   + n_total_b`（简单加法，单调不减，和 `n_eff_new = n_eff_a + n_eff_b`
 >   分开维护——后者继续喂 centroid 混合，前者只喂 Ward 代价）。
+>
+> **后续还会再拆出第三个计数器 `n_unit_c`**（§5.11 的 `PAD_INSERT` 对齐计算要用，
+> 真实 token 数 + 历史 pad 数，`n_total_c` 不能兼任——原因和这里拆 `n_eff`/
+> `n_total` 是同一类问题，细节见 §5.11 那条更正框，不在这里重复）。
 
 ### 5.6 分簇：新簇的形成条件、`K_max` 的定尺与自适应
 
@@ -338,11 +432,45 @@ K_max_default = max( 4, ⌈ c · log₂ N ⌉ )        c = 1（占位值，由 S
 **unclipped** `K_eff(n)` 的整条曲线，但"测到了曲线之后怎么定 `c`、什么时候该往上
 调、什么时候该整个放弃这条线"此前从未落成规则。分三步：
 
+**第 0 步，先定死 S0.2 测的是哪个 `K_eff`——这不是同一个量的两种叫法，是两个
+不同的实验**：
+
+- **纯 DP-means 口径**（不含 `η`/`g_max`/`γ`，只用"`min_c ‖k−μ_c‖² > λ_new` 就
+  开新簇"这一条规则，`K_max` 不设上限）：测的是**内容本身的语义多样性**，回答
+  "填充数假设站不站得住"这个理论问题（§5.6"第一个假设理论上最站得住"那段），不
+  受批量路由的时序 tie-break 影响，是拟合"对数 / 幂律 / 饱和常数"三种曲线形状
+  时应该用的口径。
+- **生产三路路由口径**（`η`/`g_max`/`γ` 全部按生产默认值打开，只是把 `K_max` 设
+  成一个不会绑定的大数，其余和 §5.3/§5.4 的真实路由逻辑完全一致）：测的是**这套
+  路由算法实际会产生多少簇**——`η` 的平局裁决会让极少数边界 token 的归属偏离纯
+  语义最近簇，进而可能多开或少开簇，这个偏差只有跑真实路由才能测到。
+
+**下面第 1 步的 `c` 必须用生产三路路由口径的 `K_eff` 算，不能用纯 DP-means 口径**
+——`K_max` 要size 的是"这套算法实际会尝试开多少簇"，不是"内容理论上有多少语义
+多样性"；两者数值接近但不保证相等，混用会让 `c` 定得系统性偏松或偏紧而不自知。
+纯 DP-means 口径只喂上面的曲线形状判定（§5.6 决策门），不喂 `c`。
+
 1. **若 S0.2 确认对数形状成立**（曲线在 `α·log n` 拟合下残差显著小于另外两种
-   假设）：直接用拟合出的斜率定 `c`。S0.2 多半会用自然对数拟合 `K_eff ≈ α·ln(n)
-   + β`，换成本方案用的 `log₂`：`c = α · ln(2)`（因为 `α·ln n = α·ln(2)·log₂ n`）。
-   取 `⌈c⌉`——和"取上取整、宁松勿紧"的既有原则一致（§5.6 上面那条 blockquote）。
-   这一步把 S0.2 的曲线测量和生产参数直接挂钩，不再需要另外拍一个数。
+   假设）：**不要只用拟合斜率**——如果截距 `β` 较大，"`c = α·ln(2)`"这个只看
+   渐近斜率的算法会在 32k/128k 这种曲线还没跑远、截距项仍占相当比重的区间**系统性
+   低估** `K_max`，而这恰恰是本方案实际部署的主战场（1M 才是渐近区间，32k/128k
+   是现在就要跑分的地方）。改用**观测区间上界法**：
+
+   ```
+   c = max_{n ∈ 已测区间} ⌈ (K_eff(n) + margin) / log₂(n) ⌉
+   ```
+
+   即取 S0.2 实际扫过的每个 `n`（1k 到 32k），用该点的**实测** `K_eff(n)`（不是
+   拟合曲线的外推值）算出"这个点至少需要多大的 `c` 才能覆盖它"，再取所有点里的
+   最大值——这保证了 `K_max_default` 在**已验证的整个区间**上都不低估，而不是只
+   在 `n→∞` 的极限下渐近正确。`margin` 给一个固定安全余量（比如 S0.2 曲线拟合
+   的残差标准差的若干倍），对冲测量噪声。**只有当曲线形状在整个已测区间都干净地
+   贴合对数曲线、拟合优度很高时**，`c = α·ln(2)` 这个渐近斜率法才和观测区间上界
+   法给出接近的数字；只要贴合不完美或截距不可忽略，观测区间上界法更保守也更
+   诚实——它不依赖"外推到 1M 时曲线形状不变"这个额外假设，只依赖"已经测过的区间
+   确实够用"这个可以直接验证的事实。取 `⌈c⌉`——和"取上取整、宁松勿紧"的既有
+   原则一致（§5.6 上面那条 blockquote）。这一步把 S0.2 的曲线测量和生产参数直接
+   挂钩，不再需要另外拍一个数。
 2. **新增一个必须在 Stage 1/2 测的运行时指标：`K_max` 绑定率**——一次 eval/训练
    跑下来，"因为 K 已满而触发 Ward 强制合并"的事件数 / 总 `NEW_CLUSTER` 尝试数。
    这是 S0.2 的 unclipped `K_eff`（离线、无 `K_max` 上限）和生产路径实际表现之间
@@ -654,8 +782,8 @@ Gram 矩阵本就是秩 1 且只有一个非零对角元，幂迭代在这个退
 **`level` 恒为 0，`count` 有闭式公式，两者都不是运行时才决定的自由量**：
 
 ```
-count = (-n_total_c) mod 2^ℓ_block        # n_total_c 取"这一刻、开新段之前"的值
-level = 0                                  # 恒定，v1 不支持在别的层直接插 pad
+count = (-n_unit_c) mod 2^ℓ_block     # 注意：n_unit_c，不是 n_total_c，见下方更正框
+level = 0                              # 恒定，v1 不支持在别的层直接插 pad
 ```
 
 **为什么 `level` 恒为 0**：填充遵循"和普通 entry 同一条纪律"（本节开头已经定的
@@ -667,18 +795,41 @@ entry 覆盖一个跨度，"插一个空的高层 entry"意味着什么本身就
 字段现在纯粹是**日志格式的自描述占位**，v1 里读到的值必须恒为 `0`，为将来（如果
 真的出现直接高层填充的需求）保留 schema 空间，但当前不使用。
 
-**为什么 `count` 是 `(-n_total_c) mod 2^ℓ_block`**：这正是"把 `n_total_c` 补到下一个
-`2^ℓ_block` 的倍数"所需的余数——标准的对齐到 2 的幂边界的公式，和内存分配器的
-padding 计算是同一件事。用 `n_total_c`（§5.5/§5.6 定义的、单调不减的簇物理规模，
-不是 `n_eff`）而不是"level 0 当前占用数"，是因为对齐要保护的是**从簇建立以来的
-累积计数**在 `ℓ_block` 层以下不被跨段配对污染，不是某一层瞬时的占用状态——两者在
-没有中途合并（Ward）时数值相同，但 `n_total_c` 是更本质、定义更清晰的量，且已经是
-一个现成维护的计数器，不需要额外去读某一层的 `level_count`。
+**为什么 `count` 是"把某个累积计数补到下一个 `2^ℓ_block` 的倍数"所需的余数**：
+标准的对齐到 2 的幂边界的公式，和内存分配器的 padding 计算是同一件事。
+
+> **一处曾经写错的计数器**：早期版本用 `n_total_c`（§5.5/§5.6 定义的、单调不减
+> 的簇**真实**物理规模，不含 pad）来算这个余数。**这在第一次填充之后就是错的**：
+> `n_total_c` 只数真实 token，不数已经插过的 pad，而 `PAD_INSERT` 真正要对齐的是
+> **level 0 的逻辑插入流长度**（真实 token 和 pad 混在一起、按到达顺序排成的那条
+> 流），两者从第一次填充起就分叉。举一个 `ℓ_block=1` 的反例：段 A 有 3 个真实
+> token，`n_total_c=3`，`count=(-3) mod 2=1`，插 1 个 pad，level 0 流变成 4 个
+> （对齐）；段 B 来了 1 个真实 token，若用 `n_total_c` 计数（不含 pad），此时
+> `n_total_c=4`（3 真实 + 1 新真实，pad 从不计入），下一次开新段时公式给出
+> `count=(-4) mod 2=0`——**但 level 0 流的真实长度是 `3+1(pad)+1=5`，是奇数，
+> 下一个边界前明明还需要再插 1 个 pad 才能对齐，公式却说不需要**。用真实 token
+> 数去驱动一个要对齐"真实+pad 混合流"的计算，从设计上就注定会在第一次填充后
+> 失准，不是边界条件疏漏。
+>
+> **修法**：新增 `n_unit_c`——簇 level 0 的累积**逻辑插入数**（真实 token 数
+> + 历史插过的所有 pad 数之和），单调不减，每次追加一个真实 token 或一个 pad
+> 都 `+1`（pad 一次插 `count` 个就 `+count`）。`PAD_INSERT` 的对齐计算改用
+> `n_unit_c`：`count = (-n_unit_c) mod 2^ℓ_block`，插入后立刻
+> `n_unit_c += count`。**`n_total_c` 保持不变、继续只数真实 token**——它是
+> Ward 代价（§5.6）和 §5.8 空间界要的量，这两处算的是"这个簇的真实内容有多少"，
+> 混入 pad 计数会让 Ward 代价虚高（簇看起来比实际更"大"）、让 §5.8 的
+> `L_c = ⌈log₂(n_total_c/B′+1)⌉` 层数估计虚高。**`n_total` 和 `n_unit` 是同一类
+> "两个用途不同的计数器不能共用一个变量"问题的第二次出现**——第一次是 §5.5/§5.6
+> 的 `n_eff`/`n_total` 拆分（centroid 混合权重 vs Ward 代价），这次是
+> `n_total`/`n_unit`（Ward 代价/空间界 vs pad 对齐），模式相同：先问"这个计数器
+> 服务几个不同的下游"，再问"这些下游要求的语义是否一致"，不一致就拆。
 
 代入前面的表可以直接验证一致性：`ℓ_block=2` 时 `count ∈ {0,1,2,3}`，最坏 `count=3`，
 正好等于"每边界浪费 ≤ `2^ℓ_block−1` = 3"这行——**这条公式和上面代价表用的是同一个
-量，不是巧合，是同一个约束的两种写法**。`count=0` 的情况（`n_total_c` 本来就已经
-对齐）意味着这次不需要填充，此时不应该产生 `PAD_INSERT` op（省一个 `OP_max` 名额）。
+量，不是巧合，是同一个约束的两种写法**（代价表本身谈的也是 level 0 逻辑流的浪费，
+和 `n_unit_c` 是同一个记账口径，这一点在换成 `n_unit_c` 后依然成立，不受这次修正
+影响）。`count=0` 的情况（`n_unit_c` 本来就已经对齐）意味着这次不需要填充，此时
+不应该产生 `PAD_INSERT` op（省一个 `OP_max` 名额）。
 
 #### 更深一层：阻断不创造预算，它只是换了合并哪一对
 
@@ -745,7 +896,8 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 |---|---|---|---|
 | `centroid` | `(B,G,K_max,d)` | fp32 | 语义身份，路由用 |
 | `n_eff` | `(B,G,K_max)` | **fp32** | centroid 混合权重。**必须浮点**——`γ` 衰减会产生非整数。**只喂 §5.5 的 centroid 更新，不进 Ward 代价**（§5.5/§5.6 的更正框）|
-| `n_total` | `(B,G,K_max)` | int32 | 簇的真实物理规模（token 数），单调不减、从不衰减。**Ward 代价（§5.6）和 §5.8 的空间界都用这个** |
+| `n_total` | `(B,G,K_max)` | int32 | 簇的真实物理规模（**只数真实 token，不含 pad**），单调不减、从不衰减。**Ward 代价（§5.6）和 §5.8 的空间界都用这个** |
+| `n_unit_c` | `(B,G,K_max)` | int32 | 簇 level 0 累积逻辑插入数（**真实 token + 历史插过的 pad**），单调不减。**只喂 §5.11 的 `PAD_INSERT` 对齐计算，不进 Ward 代价、不进 §5.8 空间界**（那两处要的是真实内容量，混入 pad 计数会让它们失真）|
 | `p_hi_c` | `(B,G,K_max)` | int32 | 该簇最近一次收到成员的位置（join cost + segment 判定）|
 | `alive` | `(B,G,K_max)` | bool | 槽位占用。**每个头实际用几个簇可以不同**，`K_max` 只是共享上界 |
 
@@ -873,8 +1025,10 @@ def dedup_anchors(lo, hi, mid, w):
     ragged list）：
         anchors:    (..., S, 3) int64   —— 固定 3 槽，顺序恒为 [lo, mid, hi]
         slot_valid: (..., S, 3) bool    —— 这个虚拟槽是否参与 attention
-        M:          (..., S)    int64   —— slot_valid.sum(-1)，调用方用
-                                            log(w / M) 而不是 log(w) 做 mass bias（§2.3）
+        M:          (..., S)    int64   —— slot_valid.sum(-1).clamp_min(1)，**返回前
+                                            已经 clamp**，调用方用 log(w / M) 而不是
+                                            log(w) 做 mass bias（§2.3），不需要、也
+                                            不应该自己再 clamp 一次
 
     计算顺序固定为下面两步，**顺序不能换**——先处理"entry 本身是否有效"，
     再在有效 entry 内部做去重，因为无效 entry 的 lo/hi 本身就是哨兵值，
@@ -906,6 +1060,24 @@ def dedup_anchors(lo, hi, mid, w):
 M)` 没说清楚 `M` 的形状，读起来容易以为是一个全局标量或者某种变长列表长度。矩形化
 之后 `M` 就是普通的 `(..., S)` int 张量，`log(w_s / M_s)` 是逐元素运算，和现有
 `log_kv_slot_attention` 的其它逐槽张量运算完全同构，不需要特殊处理。
+
+**为什么 `M` 必须在 `dedup_anchors` 内部就 `clamp_min(1)`，不能留给调用方**：无效
+entry（`w=0`）三个槽的 `slot_valid` 全部是 `False`，`slot_valid.sum(-1)` 对这类
+entry 算出 `M=0`。如果不 clamp，调用方算 `w/M` 就是 `0/0`——**这个 NaN 和 `w`
+本身是否等于 0 无关，是除法本身的 0/0，`log_kv_slot_attention` 现有的
+"`slot_w >= 1 by construction`"这条不变量（`log_kv_cache.py:1626`）到语义簇路径
+上不再成立，必须显式补回来**。补法完全类比 `mid_anchor` 已经在用的
+`ww = w.clamp_min(1)`（§5.14）：`M.clamp_min(1)` 之后，无效 entry 的
+`w/M = 0/1 = 0`，`log(0) = -inf`（IEEE754 良定义，不是 NaN），`λ·(-inf)` 在
+`λ≠0` 的分支里是良定义的 `-inf`（不是 `0·(-inf)` 那种会产出 NaN 的模式——现有
+代码用 `if lam != 0.0:` 门控防的正是那一种，这里从一开始就没有落入那个模式）。
+`score.add_(-inf)` 让该槽分数变成 `-inf`，随后现有的 `masked_fill_(~mask, -inf)`
+再把它显式盖成 `-inf` 一次——**两者顺序不需要改变，`log_kv_slot_attention` 现有
+的"先加 bias、后 mask"这个顺序原封不动地对语义簇路径安全**，`M.clamp_min(1)`
+这一处补丁就足够，不需要像"先构造 mask、再算 bias"那样重排整个计算顺序。这也是
+为什么这个 clamp 被放进 `dedup_anchors` 内部而不是留给每个调用方各自记得写一遍：
+`M` 的唯一合法用途就是做这个除法，把安全性钉在产出 `M` 的地方，调用方就不可能
+漏掉。
 
 **为什么 Σ/Γ 也要按锚点转，不能只转 `k_raw`。** §5.10/§5.20-B 说"Σ/Γ 的统计空间
 post-RoPE → pre-RoPE，数学不变，只是喂进去的张量换了"——这句话覆盖了**累积**这一步
@@ -1170,6 +1342,76 @@ qkv.split → norm_q / norm_k（Qwen3 是 norm_qk=True, type="default"）
 | GQA | `k` 在这一步已经是 `(B, G, T, hs)` 的 per-KV-group 形态，**写入侧不涉及 rf 折叠**，折叠只发生在读出侧的 `log_kv_slot_attention`。这条是好消息 |
 | 那段注释 | `model.py:805-808` 明确写着 expected-RoPE 的设计前提（"LogKV mean-pools the FULL key … expected rotation over the span"）——**那正是被替换掉的东西，注释必须同步改**，否则下一个读代码的人会按旧模型理解 |
 
+**上表说了"要同时持有 `k_roped` 和 `k_raw`"，但没说 autograd `Function` 的签名
+该怎么变、`ctx.save_for_backward` 存什么、`k_raw` 要不要 detach、`k_roped` 的梯度
+怎么回到同一个 qkv 投影输出——这四个问题此前完全没有答案，训练路径写不下去。**
+核对现有 `LogKVStreamTrainingAttention`（`log_kv_cache.py:1838` 起）：
+
+```python
+# 现状（单 k，post-RoPE）：
+@staticmethod
+def forward(ctx, q, k, v, cache, scale, train_block, second_order_scale, *pin_args):
+    ...
+    ctx.save_for_backward(q, k, v)
+    ...
+
+@staticmethod
+@once_differentiable
+def backward(ctx, grad_y):
+    q, k, v = ctx.saved_tensors
+    ...
+    return grad_q, grad_k, grad_v, None, None, None, None, ...
+```
+
+**改动**：
+
+```python
+@staticmethod
+def forward(ctx, q, k_raw, k_roped, v, cache, scale, train_block, second_order_scale, *pin_args):
+    ...
+    ctx.save_for_backward(q, k_raw, k_roped, v)   # 四个而不是三个
+    ...
+
+@staticmethod
+@once_differentiable
+def backward(ctx, grad_y):
+    q, k_raw, k_roped, v = ctx.saved_tensors
+    ...
+    grad_q       = ...   # 不变：in-flight exact attention 对 q 的梯度
+    grad_k_raw   = ...   # 新增：cache 写入路径（compact/Chan merge）对 k_raw 的梯度，
+                          # 通过 op_log 重放链式法则累积（见下方）
+    grad_k_roped = ...   # 新增：in-flight exact attention 对 k 的梯度，
+                          # 和现状代码里 grad_k 的计算方式完全一样，只是改了变量名
+    return grad_q, grad_k_raw, grad_k_roped, grad_v, None, None, None, None, ...
+```
+
+**`k_raw` 和 `k_roped` 都不能 detach，理由是它们是同一个上游张量（qk-norm 输出）
+的两个下游消费者，不是两个独立叶子**：调用方（`model.py`）算出
+`k_raw = norm_k(...)` 之后，一边把它原样传给这个 Function 做 cache 写入，一边
+另算 `k_roped = apply_rope(k_raw[..., :rope_n_elem])`（普通、不包在任何自定义
+`Function` 里的可微分算子）再传进来。只要两者都**保持 `requires_grad`、不手动
+`.detach()`**，PyTorch 的常规 autograd 就会在这个 Function 的边界之外，把
+`grad_k_raw`（这个 Function 直接返回的）和"`grad_k_roped` 经过 `apply_rope`
+的 `backward` 拉回来的梯度"**在共享祖先（qk-norm 输出）处自动相加**——这是
+autograd 处理"一个张量被多个下游消费"的标准行为，不需要这个 Function 自己做
+任何特殊的梯度合并逻辑。**这里的"detach"特指不要对 `k_raw`/`k_roped` 这两个
+输入张量本身调用 `.detach()`**——和 `forward()` 方法体内部那个已经存在的
+`with torch.no_grad():` 块（包裹 cache 写入的数值计算，§5.18 第 0 步就已经在
+用）不是一回事：那个 `no_grad` 块管的是"cache 内部的 compact/carry 算术不建
+autograd 图"（这本来就是这整个自定义 `Function` 存在的意义——用解析梯度公式
+替代对一个巨大重放图求导），和"输入张量该不该被当作可微分变量对待"是两个独立
+的问题。
+
+**`grad_k_raw` 从哪来**：`compact()`/Chan-merge 的正确性论证（§11-A）已经确立
+"backward 重放 `op_log`、不重跑路由"，`grad_k_raw` 就是在这条重放链路上，对
+"每个 token 的 `k_raw` 如何通过 `compact()` 的加权均值/协方差累积一路影响到
+最终读出的 `score`/`read`"应用链式法则算出来的解析梯度——这部分是**新增的
+计算**，现状代码里的单一 `grad_k` 完全没有这一路（现状是位置分桶，没有"这个
+token 的原始 key 通过分簇统计间接影响别处读出"这种间接路径，语义簇路径新增了
+这条路径，必须新写）。**`grad_k_roped` 不需要新写**——in-flight exact attention
+这条路数学上和现状完全一样（都是普通因果注意力对 key 的梯度），只是现状代码里
+变量叫 `k`、语义簇版本里叫 `k_roped`，改名不改算法。
+
 #### 5.21-2 `op_log`：完整的操作语义、顺序、重放算法
 
 原设计写的是"每 token 的簇 id + 是否开新段"。**这不够**：`K_max` 满时会 Ward 合并、
@@ -1184,7 +1426,8 @@ qkv.split → norm_q / norm_k（Qwen3 是 norm_qk=True, type="default"）
 (op_type, arg0, arg1, arg2)   # 每条 4 个 int32
 
 ── 主操作：每个 flush 出来的 token 恰好触发一个，且互斥（直接对应 §5.3 的三路判定）──
-NEW_CLUSTER   (slot_idx,  -1,       -1)      # 语义 novelty：在哪个空槽建新簇
+NEW_CLUSTER   (slot_idx,  0,        -1)      # 语义 novelty：在哪个空槽建新簇，
+                                              # segment 恒为 0（新簇的第一段）
 NEW_SEGMENT   (cluster,   new_seg,  -1)      # 时序打断：同簇开新段
 JOIN          (cluster,   segment,  -1)      # 归入既有簇的当前段
 
@@ -1193,6 +1436,18 @@ WARD_MERGE    (keep_slot, free_slot, -1)     # 给某个 NEW_CLUSTER 腾位，�
 PAD_INSERT    (cluster,   level,    count)   # 给某个 NEW_SEGMENT 做对齐填充，必然紧邻其前
 CARRY         (cluster,   level,    resulting_count)  # ladder 进位，**非权威、可选**，见下方说明
 ```
+
+> **一处曾经和下面的重放伪代码对不上的字段**：`NEW_CLUSTER` 原来写的是
+> `(slot_idx, -1, -1)`——arg1（对 `JOIN`/`NEW_SEGMENT` 而言就是 `op.segment`）
+> 填 `-1`。但下面的重放循环对**三类主操作一视同仁**，统一调用
+> `append_to_ladder(..., op.cluster, op.segment)`，从不对 `op.type` 做特判。
+> 这意味着一个新簇的第一个 token 会被 append 成 `segment=-1`——一个不存在的
+> 段号，下游任何按段号索引/比较的逻辑（§5.11 的对齐填充、§2.1 的 segment 语义）
+> 遇到它都是未定义行为。**改法是让 `NEW_CLUSTER` 的 arg1 显式填 `0`**（新簇的
+> 第一段天然是段 0），而不是给重放循环加一个"只有 `NEW_CLUSTER` 特殊处理
+> segment"的分支——**字段自洽比处理逻辑自洽更简单**：让日志格式本身对所有主
+> 操作保持同一套字段语义，重放循环就能保持完全通用、不需要按 op 类型分叉，这也
+> 是为什么选择改数据格式而不是改重放代码。
 
 **顺序规则**：`op_log` 按 token 到达顺序线性写入。主操作严格一一对应"下一个待处理的
 token"；结构操作插在触发它的主操作旁边（`WARD_MERGE` 在它服务的 `NEW_CLUSTER` **之前**
