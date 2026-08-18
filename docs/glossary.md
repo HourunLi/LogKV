@@ -78,7 +78,7 @@ cache（每 layer 一个）
 | `λ` | `log_kv_lambda` | **mass bias 系数**，`+λ·log(w/M)`。沿用现有语义 |
 | `λ_new` | — | 开新簇的距离阈值 = `λ_rel · s_h` |
 | `λ_rel` | `log_kv_cluster_lambda_rel` | 上面那个的相对系数。**全方案最敏感的超参** |
-| `s_h` | — | 每 (layer, head) 的 key 尺度估计 `E‖k−k̄‖²`。**v1 用离线标定**（§5.21-4），标定值须写进 eval metadata；在线估计降级为消融 |
+| `s_h` | — | 每 (layer, **KV group**，不是 query head——聚类只在 k 空间做，一个 KV group 只有一份 k) 的 key 尺度估计 `E‖k−k̄‖²`，`k̄` 是整个标定集上的全局均值。**v1 用离线标定**（§5.21-4），标定值须写进 eval metadata；在线估计降级为消融 |
 | `η` | `log_kv_seg_eta` | join cost 的时序权重。**只影响候选排序，不做决策**（§5.3）|
 | `g0` | `log_kv_seg_g0` | 时序项 `φ(g)=g/(g+g0)` 的饱和尺度 |
 | `g_max` | `log_kv_seg_gap_max` | 开新 segment 的间隔阈值 |

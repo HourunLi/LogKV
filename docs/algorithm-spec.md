@@ -52,6 +52,42 @@ DP-means 分配阈值、mass bias `log(w/M)` 全部依赖的那个"`w` 就是真
 路线（CLAUDE.md 顶部已声明），在没有专门推导之前默认禁止组合，比默认允许后产出
 无法解释的分数更安全。**
 
+**同样，`log_kv_semantic_clusters=True` 必须拒绝 `rope_interleave=True`**：
+
+```python
+if log_kv_semantic_clusters and config.rope_interleave:
+    raise ValueError(
+        "semantic clusters 的 _rotate_at_anchors 目前只实现了 split-half 布局的"
+        "RoPE（对应 apply_rope），未覆盖 rope_interleave=True 用的 "
+        "apply_rope_interleave 布局；两者数据排布不同（偶奇分组 vs 前后半），"
+        "混用会静默产生错误的旋转"
+    )
+```
+
+理由：§5.14 的 `_rotate_at_anchors` 复刻的是 `apply_rope`（`model.py:2074` 附近）的
+split-half 数学——`rot = cat(-x[h:], x[:h])`。但 `model.py:810-812` 显示模型层还有
+一条 `config.rope_interleave=True` 时启用的 `apply_rope_interleave` 路径，先把
+`[x0,x1,x2,x3,...]` 重排成 `[x0,x2,x4,...,x1,x3,x5,...]`（偶奇分组）再做旋转
+（`model.py:2106-2128`），是**完全不同的数据排布**，不是同一个函数换个参数。
+Qwen3-1.7B（本项目的目标模型）的 `rope_interleave` 默认 `False`，走 `apply_rope`，
+`_rotate_at_anchors` 的实现覆盖了这个模型；但仓库里其它配置确实会打开这个开关
+（如 `tests/test_yarn.py`），如果不做这条校验，换一个用 interleaved RoPE 的模型
+跑 semantic clusters，锚点旋转会静默算错，且不会有任何报错——和 `ℓ_block`、
+`importance_pooling`/`pin` 是同一类"宁可拒绝、不可算错"的风险，处理方式对齐：v1
+硬性拒绝，覆盖 interleaved 布局留作后续泛化（把 `_rotate_at_anchors` 拆成两个
+分支，复用 `apply_rope_interleave` 同款的重排逻辑），不在当前范围内。
+
+**同类的第三条：`log_kv_semantic_clusters=True` 只支持 `CausalSelfAttention`，
+遇到 `MultiheadLatentAttention` 必须硬失败。** `litgpt/model.py` 里这两个是完全
+独立的类（`656` 起 / `1579` 起）——本节从 §5.2 的度量到 §5.14 的锚点物化，通篇
+假设的都是 `CausalSelfAttention` 的显式 K/V-per-group 布局（clustering 直接作用于
+`k_raw: (B,G,T,hs)`）。MLA 的 KV 是低秩 latent（`kv_lora_rank`）+ 独立的
+`qk_rope_head_dim`/`qk_nope_head_dim` 拆分，压根没有一份"每 KV 头一条"的原始
+`k_raw` 可供聚类——把本节的设计直接套上去在概念上就不成立，不是"实现起来麻烦"，
+是**没有对应的输入**。构造时校验 `isinstance(attn_module, CausalSelfAttention)`，
+否则 `raise NotImplementedError`；MLA 需要的话是一次独立的设计，不是本方案的
+参数扩展。
+
 ### 5.2 分簇：度量与阈值
 
 **用原始（未归一化）pre-RoPE key 上的平方欧氏距离，不用 cosine。** 理由不是习惯，
@@ -66,17 +102,37 @@ DP-means 分配阈值、mass bias `log(w/M)` 全部依赖的那个"`w` 就是真
 因为距离所有 centroid 都远而自动隔离——正是想要的行为（对比重要性池化是把 sink
 加权**放大**，方向相反）。
 
-**阈值必须相对化，否则跨层不可比**：`k` 的范数在不同层、不同头之间差好几个数量级。
+**阈值必须相对化，否则跨层不可比**：`k` 的范数在不同层、不同 KV group 之间差好几个
+数量级。
 
 ```
-λ_new = λ_rel · s_h        s_h = 该 (layer, head) 上 E‖k − k̄‖² 的估计
+λ_new = λ_rel · s_h        s_h = 该 (layer, KV group) 上 E‖k − k̄‖² 的估计
 ```
+
+> **口径统一：这里的粒度是 KV group（`G=8`），不是 query head（`nh=16`）**。聚类
+> 只在 k 空间做（§2.5），而一个 KV group 只有一份 `k`——GQA 下 `q_per_kv=2` 个
+> query head 共享同一份 k/v（`model.py:857-860`），所以"每个头一个 `s_h`"这个
+> 说法本身就有歧义：在 query-head 粒度上，两个共享同一 KV group 的 query head
+> 天生就该有相同的 `s_h`（它们看到的是同一份 `k`），单独给它们估计两份值既浪费
+> 又制造出两个理应恒等却可能因为标定噪声而不等的常量。**`s_h` 的物理粒度是
+> KV group**，后文所有"per-head"措辞统一改读作"per-KV-group"，buffer 形状
+> `(n_layer, G)`（§5.13）已经是对的，是文字表述滞后了。
+
+**`k̄` 的定义**：`k̄` 是该 (layer, KV group) 在**整个标定集**上的全局均值——不是
+按 prompt 分别求均值再平均，也不是逐层逐组维护的运行均值。具体地，标定 pass 对
+每个 (layer, KV group) 累积**标定集里所有 prompt、所有位置**的 `k_raw`，先算出
+一个全局 `k̄`，再算 `s_h = mean_t ‖k_t − k̄‖²`（对全体标定 token 取平均，一次
+过、离线、非流式）。理由：`s_h` 要刻画的是"这个 (layer, KV group) 的 key
+分布本身有多分散"，是一个**总体统计量**，不是"某条 prompt 内部有多分散"（后者
+会被单条 prompt 的话题数系统性左右，不是我们想要的、跨 prompt 稳定的尺度参考）；
+也不是运行均值（那是在线估计的做法，已经在下面被否决，理由见 §5.21-4）。
 
 **`s_h` 已定案：v1 用离线标定**（完整取舍见 §5.21-4）。在留出样本上跑一次前向，
-记录每 (layer, head) 的 `E‖k − k̄‖²`，存成常量随 config 走，**并写进 eval metadata**。
-在线估计会让阈值随序列演化、引入 §11-E 的新变体，且序列开头估计未收敛——而 §5.6 说
-早期路由错误不可恢复，所以它降级为后续消融项。**这一条如果不做，S0.2 扫出来的
-`K_eff` 曲线在层间完全没有可比性**，整个 Stage 0 会得出无意义的结论。
+记录每 (layer, KV group) 的 `E‖k − k̄‖²`，存成常量随 config 走，**并写进 eval
+metadata**。在线估计会让阈值随序列演化、引入 §11-E 的新变体，且序列开头估计未
+收敛——而 §5.6 说早期路由错误不可恢复，所以它降级为后续消融项。**这一条如果不做，
+S0.2 扫出来的 `K_eff` 曲线在层间完全没有可比性**，整个 Stage 0 会得出无意义的
+结论。
 
 ### 5.3 分簇：三路判定
 
@@ -153,12 +209,32 @@ Phase 3:
 段内话题稳定 ⇒ 计数均值是对的；跨段可能已漂移 ⇒ 新成员该占更大权重：
 
 ```
-段内:      μ_c ← μ_c + (k − μ_c) / n_eff ,   n_eff ← n_eff + 1
-开新段时:  n_eff ← γ · n_eff                  # γ=1 纯均值，γ=0 直接替换
+开新段时（在这一段第一个成员到达之前执行一次）:
+    n_eff_pre ← γ · n_eff                     # γ=1 保留全部历史权重，γ=0 归零
+
+收到成员 k（段内的每一个成员，包括刚开新段后的第一个）:
+    n_eff_pre ← n_eff                          # 沿用当前值（新段的第一次是上面刚写的衰减值）
+    n_eff     ← n_eff_pre + 1
+    if n_eff_pre == 0:
+        μ_c ← k                                 # γ=0 或冷启动：没有历史可混，直接替换
+    else:
+        μ_c ← (n_eff_pre · μ_c + k) / n_eff      # 等价于 μ_c + (k − μ_c) / n_eff，用新计数做分母
 ```
 
 这是 §2.4 里说的"零副作用的门控更新"——centroid 只是路由元数据，不参与 attention
 读出，擦它不丢任何信息。注意 **`n_eff` 因此必须是浮点而非整数**。
+
+> **一处曾经写错的公式**：早期版本写的是"`μ_c ← μ_c + (k − μ_c) / n_eff`，
+> 然后 `n_eff ← n_eff + 1`"——字面实现有两个问题。**Off-by-one**：标准在线均值第
+> `n` 个样本要除以**新**计数 `n`，不是旧计数 `n−1`；把"先用旧 `n_eff` 算 μ、再
+> 递增"读成两条独立语句，除数错了一位，`n_eff` 越界越大越不明显（相对误差
+> `O(1/n)`），小簇（正是 needle 最关心的那类）反而误差最大。**除零**：`γ=0` 时
+> `n_eff_pre = 0`，新段第一个成员按原公式要除以"递增前的 `n_eff`"即 `0`，
+> `(k−μ_c)/0` 直接炸。上面改写后 `n_eff_pre==0` 时走 `μ_c ← k` 这条专门分支，
+> 既避免除零，又精确对应 `γ=0`"直接替换"这个已经写在注释里但从未在公式里兑现的
+> 语义。`n_eff_pre==0` 只可能在 `γ=0` 或该簇刚建立、从未有过成员时出现，两种情形
+> 都应该是"没有历史可混"，直接替换是唯一自洽的选择，不是特判，是补上被遗漏的
+> 边界情况。
 
 > **更正（曾经写错）**：早期版本只维护一个 `n_c`，同时拿它喂 centroid 的在线均值
 > **和** §5.6 Ward 合并代价里的 `n_a, n_b`。**这是两件不同的事,用同一个量会互相
@@ -255,6 +331,39 @@ K_max_default = max( 4, ⌈ c · log₂ N ⌉ )        c = 1（占位值，由 S
 **若实测是幂律**，1M 下 `K_max ≈ 1024`，总 entry 数约 13.9 万（仍是 1M 稠密的 13%），
 但"对数空间"的卖点没了，论文定位要改成 `O(n^d log n)`，且内存对齐的公平性论证要
 重新评估。**这是 S0.2 的决策门。**
+
+#### 从 `K_eff` 到 `c` 的决策规则（此前是空白）
+
+`K_max_default = max(4, ⌈c·log₂N⌉)` 里的 `c=1` 只是占位——S0.2 会测出
+**unclipped** `K_eff(n)` 的整条曲线，但"测到了曲线之后怎么定 `c`、什么时候该往上
+调、什么时候该整个放弃这条线"此前从未落成规则。分三步：
+
+1. **若 S0.2 确认对数形状成立**（曲线在 `α·log n` 拟合下残差显著小于另外两种
+   假设）：直接用拟合出的斜率定 `c`。S0.2 多半会用自然对数拟合 `K_eff ≈ α·ln(n)
+   + β`，换成本方案用的 `log₂`：`c = α · ln(2)`（因为 `α·ln n = α·ln(2)·log₂ n`）。
+   取 `⌈c⌉`——和"取上取整、宁松勿紧"的既有原则一致（§5.6 上面那条 blockquote）。
+   这一步把 S0.2 的曲线测量和生产参数直接挂钩，不再需要另外拍一个数。
+2. **新增一个必须在 Stage 1/2 测的运行时指标：`K_max` 绑定率**——一次 eval/训练
+   跑下来，"因为 K 已满而触发 Ward 强制合并"的事件数 / 总 `NEW_CLUSTER` 尝试数。
+   这是 S0.2 的 unclipped `K_eff`（离线、无 `K_max` 上限）和生产路径实际表现之间
+   缺的那一环：`K_eff` 大不直接等于内存超预算（已在 experiments.md S0.2 的
+   决策门里讲清楚），但绑定率高**确实**直接等于路由质量下降——这才是需要盯着的
+   量，且是可以在真实 eval 里量出来的，不需要额外的离线分析。
+   - **绑定率 < 10%**：`c` 定得够用，不用动。
+   - **绑定率持续偏高（比如 > 30%）**，先按第 1 步用更大的参考上下文重新拟合/
+     加倍 `c` 重测——如果加倍 `c` 后绑定率明显下降，说明只是常数没给够，继续加到
+     绑定率落回可接受区间即可（`Θ(log²N)` 的预算表已经说明加大 `c` 是线性代价，
+     不是灾难性的）。
+   - **加大 `c` 之后绑定率没有随之明显下降**：这是信号，说明第 1 步的前提
+     （对数形状）本身站不住——真实内容的语义多样性不是 `log n` 能刻画的，回到
+     §5.6 上面"若实测是幂律"那条决策门，**这不是继续调 `c` 能解决的问题，是需要
+     重新评估整条曲线形状假设的问题**，调 `c` 和换假设是两件事，不要混着做。
+3. **停止条件**：如果为了把绑定率压到可接受区间，`c` 必须大到让 `K_max`
+   逼近"总 entry 数不再显著小于 vanilla"的地步（§4 那张 1×/1.13×/1.46× 的表
+   失去意义），那么"次线性压缩"这个卖点本身对这类工作负载不成立——这时候
+   应该停止扩大 `c`，转而如实报告"这条工作负载下语义多样性太高，本方案退化为
+   与 vanilla 相当"，而不是无限调大 `c` 直到分数好看。这与 CLAUDE.md §4 的
+   退化论证是一致的：退化的终点是现状，不是通过無限加大内存把现状伪装成改进。
 
 #### 不设按序列长度的运行时配额
 
@@ -364,6 +473,42 @@ Ward 代价的尺寸加权恰好与"entry 会不会被迫合并"同向，所以 
 代价 `O(K²d) + O(L·B′·d)`，事件罕见（次数被"超出 `K_max` 的新簇事件数"界住）。
 **注意合并后两簇的 segment 对齐（§5.11）被破坏**，这是可接受的（罕见、预算逼出来的
 事件）。`K_max ≥ 2` 时永远存在可合并的一对，所以这一步不会失败。
+
+#### `K_max = 1` 是退化边界，不是这一步的一个普通实例，必须单独判定
+
+`K_max ≥ 2` 的保证——"永远存在可合并的一对"——**在 `K_max = 1` 时不成立**：只有一个
+alive 槽位，Ward 的 `(K,K)` 代价矩阵屏蔽掉对角线后是空的，`argmin` 无定义。这不是
+"罕见失败需要 fallback"，是**结构性地没有第二个槽可腾**——"K 已满 → Ward 合并腾位"
+这条路径在 `K_max=1` 下根本不适用，必须在进入 Ward 之前就分流掉。
+
+**决定：`K_max = 1` 时彻底跳过语义新簇判定，novelty 检测不改变任何 op 类型。**
+具体地：
+
+```
+if K_max == 1:
+    # 建立/合并的判定被短路：cluster 0 一旦存在，此后所有 primary op
+    # 只能是 JOIN 或 NEW_SEGMENT，取决于 §5.3 的时序判据——novelty 距离
+    # (‖k − μ_0‖² > λ_new) 仍然照常计算并写进 metadata/日志供分析用，
+    # 但**从不触发新簇路径**，因为没有第二个槽可以腾，"强制并入最近簇"
+    # 在只有一个簇时是平凡的（最近的簇就是唯一的那个）。
+    op = NEW_SEGMENT if (p_t − p_hi_0 > g_max) else JOIN
+else:
+    # 正常三路判定（§5.3），K 满时按上面五步过程走 Ward
+    ...
+```
+
+这精确回答了"novelty token 到底降级为 JOIN、NEW_SEGMENT，还是特殊 fallback op"：
+**是 JOIN 或 NEW_SEGMENT 之一，由时序判据独立决定，不产生新的 op 类型、不经过
+Ward、也不经过第 192 行那条"合并失败强制并入最近簇"的通用 fallback**——那条通用
+fallback 服务的是 `K_max ≥ 2` 时 Ward 矩阵**理论上不该失败但工程上留一道保险**的
+场景（§5.19 会要求这道保险的断言覆盖），`K_max=1` 不落在它的适用范围内，两者不是
+同一段代码路径。**`K_max=1` 本质上退化成"关闭语义路由、只保留 §5.11 的时序分段
+机制"**——这与 Stage 2 Config A 想要隔离出的"仅簇轴退化"基线在设计意图上完全一致
+（`experiments.md` Config A 一行），现在有了精确到 op 类型的实现依据，不再是两处
+文档"看起来应该兼容"但没人验证过的默认假设。
+
+CPU 参考实现（§5.18 第 2 步）和生产路径必须共享这条 `K_max==1` 分支，否则 Stage 2
+的 A 档和 CPU reference 会在这个边界上分叉——这正是本条修正要防止的事。
 
 ### 5.7 簇内压缩：ladder 结构
 
@@ -504,6 +649,37 @@ Gram 矩阵本就是秩 1 且只有一个非零对角元，幂迭代在这个退
 
 **所以 `ℓ_block` 实际只能取 1 或 2**，这不是拍脑袋，是指数增长逼出来的。
 
+#### `PAD_INSERT(cluster, level, count)` 的字段定死
+
+**`level` 恒为 0，`count` 有闭式公式，两者都不是运行时才决定的自由量**：
+
+```
+count = (-n_total_c) mod 2^ℓ_block        # n_total_c 取"这一刻、开新段之前"的值
+level = 0                                  # 恒定，v1 不支持在别的层直接插 pad
+```
+
+**为什么 `level` 恒为 0**：填充遵循"和普通 entry 同一条纪律"（本节开头已经定的
+原则）——普通 token 只在 level 0 追加，靠自然的进位级联往上传播到更高层；填充槽
+同理，**从不直接插到 level ≥ 1**。往 level 0 插入 `count` 个 `w=0` 空位，`_binary_
+carry` 的标准级联逻辑会自动把它们和真实成员一起向上折叠，折叠出的高层空位天然
+对齐——不需要一个"往 level 3 直接插空位"的分支，那种分支也没有良定义的语义（高层
+entry 覆盖一个跨度，"插一个空的高层 entry"意味着什么本身就不清楚）。所以 `level`
+字段现在纯粹是**日志格式的自描述占位**，v1 里读到的值必须恒为 `0`，为将来（如果
+真的出现直接高层填充的需求）保留 schema 空间，但当前不使用。
+
+**为什么 `count` 是 `(-n_total_c) mod 2^ℓ_block`**：这正是"把 `n_total_c` 补到下一个
+`2^ℓ_block` 的倍数"所需的余数——标准的对齐到 2 的幂边界的公式，和内存分配器的
+padding 计算是同一件事。用 `n_total_c`（§5.5/§5.6 定义的、单调不减的簇物理规模，
+不是 `n_eff`）而不是"level 0 当前占用数"，是因为对齐要保护的是**从簇建立以来的
+累积计数**在 `ℓ_block` 层以下不被跨段配对污染，不是某一层瞬时的占用状态——两者在
+没有中途合并（Ward）时数值相同，但 `n_total_c` 是更本质、定义更清晰的量，且已经是
+一个现成维护的计数器，不需要额外去读某一层的 `level_count`。
+
+代入前面的表可以直接验证一致性：`ℓ_block=2` 时 `count ∈ {0,1,2,3}`，最坏 `count=3`，
+正好等于"每边界浪费 ≤ `2^ℓ_block−1` = 3"这行——**这条公式和上面代价表用的是同一个
+量，不是巧合，是同一个约束的两种写法**。`count=0` 的情况（`n_total_c` 本来就已经
+对齐）意味着这次不需要填充，此时不应该产生 `PAD_INSERT` op（省一个 `OP_max` 名额）。
+
 #### 更深一层：阻断不创造预算，它只是换了合并哪一对
 
 ladder 的自然行为——level 0 存单 token、满了才合并——**本身就已经是"能负担就保持
@@ -579,12 +755,21 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 (B, G, K_max, L_alloc, B′, ·)
 ```
 
-每 entry 存 `k̄_raw(d)`、`v̄(d)`、`w`、`p_lo`/`p_hi`（int32）、`sum_wp`（**int64**，
-`p_mid` 由它在读出时算出）、以及现有 rank-1 统计 `σu/σ2/γa/γb/γ`（约 3d）。按
-`K=15, B′=8, L_alloc=11` 是 **1320 个 entry**，对比 vanilla 的约 2560 槽——**我们更小**。
+每 entry 存 `k̄_raw(d)`、`v̄(d)`、`w`（**fp32/int32，不跟 activation dtype 走**）、
+`p_lo`/`p_hi`（int32）、`sum_wp`（**int64**，`p_mid` 由它在读出时算出）、以及现有
+rank-1 统计 `σu/σ2/γa/γb/γ`（约 3d，activation dtype，fp16/bf16 均可，这些是内容
+向量不是计数）。按 `K=15, B′=8, L_alloc=11` 是 **1320 个 entry**，对比 vanilla 的约
+2560 槽——**我们更小**。
 
 > `sum_wp` **必须是 int64**：量程是 `Σ w_j p_j ≤ n²`，1M 上下文下达 `10¹²`，int32
 > 会静默溢出。
+>
+> `w` **不能沿用现有 `level_w` 那样跟着 activation dtype 建 buffer**（现有
+> `log_kv_cache.py:346-349` 是 `torch.zeros(..., dtype=dtype)`）。fp16 整数精确
+> 表示上限是 2048、溢出上限 65504，而 1M 上下文下一个高冗余大簇的 `w` 可以到几十
+> 万，必须显式声明 `w` 的 buffer 为 fp32 或 int32，`log(w/M)` 之前再转 fp32——这条
+> 在 §5.20-B 的改动对照表里也有，这里是实现者最先会看到的地方，直接标出来，不要
+> 让人照抄旁边 `k̄_raw`/`v̄` 的 dtype 建错。
 
 **ladder 簿记**（对现有代码改动最大的地方）：
 
@@ -636,7 +821,14 @@ def merge_anchors(lo1, hi1, swp1, lo2, hi2, swp2):
 
 # 质心锚点：读出时才由累加器算出，并夹回 [lo, hi]
 def mid_anchor(lo, hi, sum_wp, w):
-    """round-half-up，全整数运算（理由见下方"舍入规则"）。sum_wp/w 都是 int64。"""
+    """round-half-up，全整数运算（理由见下方"舍入规则"）。sum_wp/w 都是 int64。
+    **前提：调用方必须先过滤掉 w=0 的纯 pad/dead entry（见下方 dedup_anchors 的
+    说明），这个函数不对 lo>hi 的倒置区间负责。** 对纯 pad entry（`lo=+INT_MAX,
+    hi=-1`，§5.11 的合并恒等元哨兵），`clamp(mid, lo, hi)` 按 `min(max(x,lo),hi)`
+    的标准定义展开是 `min(max(x, INT_MAX), -1) = min(INT_MAX, -1) = -1`——一个
+    确定但无效的坐标，直接喂给 `_rotate_at_anchors` 会用 `-1` 去索引
+    `cos_cache`，Python/张量的负索引语义会**静默环绕到最后一个位置**而不是报错，
+    产出一个看似合法实则完全错误的旋转结果，比越界崩溃更危险。"""
     ww  = w.clamp_min(1)
     mid = torch.div(2 * sum_wp + ww, 2 * ww, rounding_mode="floor")   # = round-half-up
     return torch.clamp(mid, lo, hi)
@@ -673,12 +865,47 @@ def materialize_anchor_directions(sigma_u_raw, gamma_a_raw, anchors, cos_cache, 
     return sigma_u_eff, gamma_a_eff
 
 
-# 去重 + mass bias 摊薄因子
-def dedup_anchors(lo, hi, mid):
-    """返回 (unique_anchors, M) —— p_lo==p_hi 的年轻 entry 自动收敛为 M=1。
-    调用方必须用 log(w / M) 而不是 log(w) 做 mass bias（§2.3）。"""
+# 去重 + mass bias 摊薄因子 + 无效锚点净化，三件事在一个函数里做，顺序固定
+def dedup_anchors(lo, hi, mid, w):
+    """
+    输入 lo/hi/mid/w: (..., S) —— 每个 entry 一份。
+    返回矩形张量，**不做变长去重**（GPU attention 需要固定形状 + mask，不是
+    ragged list）：
+        anchors:    (..., S, 3) int64   —— 固定 3 槽，顺序恒为 [lo, mid, hi]
+        slot_valid: (..., S, 3) bool    —— 这个虚拟槽是否参与 attention
+        M:          (..., S)    int64   —— slot_valid.sum(-1)，调用方用
+                                            log(w / M) 而不是 log(w) 做 mass bias（§2.3）
+
+    计算顺序固定为下面两步，**顺序不能换**——先处理"entry 本身是否有效"，
+    再在有效 entry 内部做去重，因为无效 entry 的 lo/hi 本身就是哨兵值，
+    先去重会用哨兵参与比较，产出未定义结果：
+
+    1. entry_valid = (w > 0)                          # 覆盖§5.11的显式 pad
+       #                                                和从未写入过的原生空槽
+       #                                                ——两者在存储上都是
+       #                                                w=0，不需要区分来源
+       对 entry_valid=False 的 entry：三个槽的 slot_valid 全部置 False，
+       **三个槽的 anchors 全部覆写成安全哨兵 0**（不是 INT_MAX/-1，那一对是
+       §5.11 merge 阶段的恒等元哨兵，只在"作为 merge 的输入"时安全；到了这里
+       已经是 merge 之后的最终读出阶段，绝不能把 INT_MAX/-1 传给
+       `_rotate_at_anchors` 去索引 cos_cache——理由见 mid_anchor 的 docstring）。
+       这一步必须先于第 2 步执行，否则第 2 步会拿 INT_MAX/-1 之类的哨兵去和
+       其它候选比较"是否重复"，比较结果没有意义。
+
+    2. 对 entry_valid=True 的 entry，在 [lo, mid, hi] 三元组内部去重：
+       第一次出现的位置 slot_valid=True，其后数值相同的位置 slot_valid=False
+       （anchors 数值本身保留不覆写——重复值本来就等于第一次出现的值，覆写与否
+       不影响正确性，但不覆写更便于调试时肉眼核对）。
+       p_lo==p_hi 的年轻 entry（level 0、只有一个真实成员）三槽数值相同，
+       去重后收敛为 M=1，与 CLAUDE.md §2.3 的论证一致。
+    """
     ...
 ```
+
+**为什么 `M_s` 现在是 per-entry 张量而不是标量**：早期的伪代码签名 `(unique_anchors,
+M)` 没说清楚 `M` 的形状，读起来容易以为是一个全局标量或者某种变长列表长度。矩形化
+之后 `M` 就是普通的 `(..., S)` int 张量，`log(w_s / M_s)` 是逐元素运算，和现有
+`log_kv_slot_attention` 的其它逐槽张量运算完全同构，不需要特殊处理。
 
 **为什么 Σ/Γ 也要按锚点转，不能只转 `k_raw`。** §5.10/§5.20-B 说"Σ/Γ 的统计空间
 post-RoPE → pre-RoPE，数学不变，只是喂进去的张量换了"——这句话覆盖了**累积**这一步
@@ -964,7 +1191,7 @@ JOIN          (cluster,   segment,  -1)      # 归入既有簇的当前段
 ── 结构操作：不消费 token，作为主操作的副作用穿插出现 ──
 WARD_MERGE    (keep_slot, free_slot, -1)     # 给某个 NEW_CLUSTER 腾位，必然紧邻其前
 PAD_INSERT    (cluster,   level,    count)   # 给某个 NEW_SEGMENT 做对齐填充，必然紧邻其前
-CARRY         (cluster,   level,    -1)      # ladder 进位，可由计数推出，记下来便于断言
+CARRY         (cluster,   level,    resulting_count)  # ladder 进位，**非权威、可选**，见下方说明
 ```
 
 **顺序规则**：`op_log` 按 token 到达顺序线性写入。主操作严格一一对应"下一个待处理的
@@ -1003,7 +1230,9 @@ for op in op_log:
         # 服务的 NEW_SEGMENT 之前执行到——这靠 op_log 里的写入顺序保证，此处的
         # 遍历只是忠实按顺序回放，不需要额外判断"是不是该我了"。
     elif op.type == CARRY:
-        pass   # 已经隐含在 append_to_ladder 里发生，这里只做断言用
+        # 非权威：不做任何状态改变，已经隐含在 append_to_ladder/insert_pad_entries
+        # 里发生。仅当 op_log 是用调试 build 记录的（见下方说明）才有内容可断言：
+        assert live_entry_count(op.cluster, op.level) == op.resulting_count
 ```
 
 **关键认识：重放完全不需要 centroid，一步都不需要。** centroid（以及驱动它的 Phase
@@ -1014,6 +1243,47 @@ for op in op_log:
 §2.4）。所以 backward 重放**跳过整个路由阶段**，直接把 op_log 当作"已经决定好的
 安置计划"来执行——这样一来，路由阶段所有的浮点敏感操作（distance 比较、argmin、
 Ward 代价）都被彻底隔离在 forward 侧，backward 侧只剩纯整数索引 + 确定性算术。
+
+**`CARRY` 为什么标"非权威、可选"，以及第三个字段现在存什么**：上面的重放循环从不
+读 `CARRY`，进位效果完全由重复调用 `append_to_ladder`/`insert_pad_entries` 自然
+产生——这是设计使然，不是遗漏。`CARRY` 存在的唯一价值是**给调试/对拍提供一个可断言
+的检查点**：`resulting_count` 记录"这次进位完成后，`(cluster, level)` 上存活的
+entry 数"，重放时可以据此断言"我这一步重算出的 ladder 状态和 forward 当时观察到的
+状态一致"，在 S0.8（批量 vs 严格串行的对拍）里直接有用。**生产 `op_log` 默认不写
+`CARRY`**——它对最终结果没有贡献，纯粹是 `OP_max` 预算里的死重（§5.21-2 的容量
+推导本就已经把它算作"低一个量级、可并入余量"的部分，去掉它只会让预算更宽松，不会
+让已经证明的上界失效）；只在专门的调试/对拍 build 里打开，此时它才需要
+`resulting_count` 这个字段有真实内容，其余情况可以直接省略这一整类 op。
+
+**批量前向写入和串行重放必须逐位等价，这是一个需要显式验证的契约，不是自动成立
+的**。forward 侧的实际实现**不是**上面这个 per-token 的 Python 循环——§5.4 的
+Phase 1/2/3 是批量路由（一次处理整个 flush 批，多达 128 个 token），§5.21-3 进一步
+要求 ladder 的实际写入/进位也是**向量化的**（`(B,G,K,L)` 掩码并行 carry，不是逐
+token 调用）。`op_log` 里的线性 token 顺序因此是一个**逻辑顺序**——"如果这批 token
+被逐个串行处理，会产生的顺序"——而不是 forward 实际执行的物理顺序。重放算法（上面
+那个 for 循环）假定"按 `op_log` 顺序逐条串行执行"和"forward 的批量向量化实现"
+产生**逐位相同**的最终 ladder 状态，这个假定成立的理由和它对实现提出的具体要求：
+
+- **成立的理由**：`compact()`/`_binary_carry()` 的正确性只依赖"同一个簇收到的成员
+  按什么**相对顺序**到达"，不依赖"这些成员是被一次一个地处理，还是被一批一起写入
+  的"——`p_lo`/`p_hi` 取 min/max、`sum_wp` 是整数加法，这两类运算本身与批处理粒度
+  无关；真正对顺序敏感的是 `compact()` 的"时间序相邻配对"语义（§5.7 已核实的
+  docstring），只要落进同一层的成员在被配对之前，其相对到达顺序和串行版一致，
+  配对结果就一致。
+- **对实现的具体要求**：批量写入必须**保序**——一个 flush 批内，凡是路由到同一个
+  `(cluster, level=0)` 的 token，必须按它们在批内的原始位置顺序（`t=0..m-1`，也就是
+  真实的到达顺序）被写入/参与 carry，不能因为向量化 scatter 而被打乱。这一点对
+  当前设计**几乎是免费的**——Phase 1/2/3 的路由结果 `c*[t]` 本就是逐位置索引对齐的
+  张量，没有引入任何重排；真正需要小心的是**批量 carry 本身**：如果一批里有
+  `K > 1` 个 token 落进同一个此前尚有空位的 `(cluster, level=0)`，向量化实现必须
+  用等价于"依次单个 carry 调用 `K` 次"的方式处理这批到达（标准二进制计数器的
+  "批量加 `K`"和"逐一自增 `K` 次"在最终数字模式上永远一致，这是可以直接引用的
+  经典结果），而不是任何会重排到达顺序或跳过中间进位状态的捷径。
+- **必须落地成单测**（S0.1/S0.8 之间，纯 CPU 可测）：构造一批同簇 token，分别用
+  (a) 批量向量化路径、(b) 把该批的 `op_log` 结果拿去跑上面的串行重放循环，断言两条
+  路径产出的 ladder 张量（`k̄/v̄/w/p_lo/p_hi/sum_wp/σu/σ2/γa/γb/γ` 全部字段）逐位
+  相等。这条测试没通过之前，`op_log` 重放的正确性论证是**未经验证的假设**，不能
+  当作已解决问题写进实现顺序表。
 
 **批量路由（§5.4）留下的一个未解决风险，需要 S0.8 专门测**：Phase 1 用**冻结的
 centroid** 并行分配一整个 flush 批（多达 128 个 token），但 §5.3 的 join cost 里
@@ -1128,10 +1398,10 @@ self.B`、`if self._counts[ell] == 0` 这些**控制流全读它**。
 | 跨层可比性 | 各层估计器收敛速度不同，S0.2 曲线不可比 | 天然可比 |
 | 成本 | 零 | 一次标定 pass |
 
-**决定：v1 用离线标定。** 在留出样本上跑一次前向，记录每 (layer, head) 的
-`E‖k − k̄‖²`，存成常量张量随 checkpoint/config 走。**标定常量必须写进 eval 的
-metadata 字段**——否则不同 run 用了不同标定值却无从分辨，所有对比作废。在线估计
-作为后续消融项，不进 v1。
+**决定：v1 用离线标定。** 在留出样本上跑一次前向，记录每 (layer, KV group) 的
+`E‖k − k̄‖²`（`k̄` 是整个标定集上的全局均值，定义见 §5.2），存成常量张量随
+checkpoint/config 走。**标定常量必须写进 eval 的 metadata 字段**——否则不同 run
+用了不同标定值却无从分辨，所有对比作废。在线估计作为后续消融项，不进 v1。
 
 #### 5.21-5 Stage 0 的 dump 脚本排在生产实现之前
 
