@@ -319,37 +319,71 @@ forward 当时发生的事情逐位一致——这不是一个需要额外机制
 token 最终在哪个簇里"都要完整重放一遍。**这个便利可以完全在 `op_log` 之外拿到，
 不需要付出改写历史的代价：**
 
+> **更正（这一轮修的）：上一版 `derive_final_cluster` 直接对裸槽号做并查集，
+> 槽位复用会被错误合并成同一个身份，必须改成版本化身份。** 具体反例：
+> `token0` 进入 `NEW_CLUSTER(B)`；之后 `WARD_MERGE(C, B)` 把 B 合并进 C（B 变成
+> `free_slot`）；再之后又一次 `NEW_CLUSTER(B)`——B 被后续某个 orphan 复用，建立
+> 了一个和"旧 B"毫无关系的全新簇，`token1` 属于这个新簇。上一版的
+> `parent[find(op.free_slot)] = find(op.keep_slot)` 只认槽号，`token1` 记录时
+> 的槽号也是 `B`，会被同一次并查集查找路由到 `C`——`derive_final_cluster` 把
+> "旧 B 被并入 C"和"后来复用同一物理槽建立的新 B"错误地当成了同一个身份，
+> `token1` 的最终归属被算错。**这正是 §5.4 反例（同批 Ward 合并选中刚建立的
+> 簇）在离线派生工具这一侧的镜像问题**——正确执行路径（forward/replay）不会
+> 犯这个错，因为它们严格按时间顺序执行、槽的"当前身份"永远是最后一次写入决定
+> 的；但这个派生函数是**离线、跳过时间顺序、只看 `WARD_MERGE` 边**做并查集，
+> 裸槽号不足以区分"同一个物理槽在不同时期代表的不同簇"，必须显式引入版本。
+>
+> **修法：给每个槽维护一个只在这个函数内部使用的 `epoch` 计数器，身份是
+> `(slot, epoch)` 而不是裸 `slot`。** 每次遇到 `NEW_CLUSTER(slot, ...)`（无论是
+> 该槽第一次被建立，还是被 Ward 合并释放后又一次被复用）就把该槽的 `epoch`
+> 加一，这个 token 及此后同槽的 `JOIN`/`NEW_SEGMENT` 都记在这一代身份下；
+> `WARD_MERGE(keep_slot, free_slot)` 只 union **当前这一代** `free_slot` 的身份
+> 到**当前这一代** `keep_slot` 的身份，不触碰 `free_slot` 的 `epoch`——`epoch`
+> 只在下一次真正的 `NEW_CLUSTER` 复用这个槽时才前进，从而让"旧 B"（被合并走的
+> 那一代）和"新 B"（后来复用建立的下一代）天然是两个不同的并查集节点，不会被
+> 误连。`epoch` 只是这个只读函数内部的临时簿记，不是持久 buffer，不影响
+> forward/backward/replay 的任何状态——真正的执行路径本来就不需要它。
+
 ```python
-def derive_final_cluster(op_log) -> tuple[dict[int, int], dict[int, int]]:
+def derive_final_cluster(op_log) -> tuple[dict[int, int], dict[tuple[int, int], tuple[int, int]]]:
     """只读、离线，供调试/S0.8 对拍/下游分析工具使用；从不写回 op_log，也不是
     forward/backward 正确性契约的一部分——这一点必须显式声明，否则容易被误用成
-    重放的一部分。对 WARD_MERGE 的合并方向做一次并查集(union-find)，
-    op_log 本身已经完整记录了每次合并的方向,这里只是在不可变记录上做一次
-    只读遍历,和"篡改历史记录"是两件完全不同的事。
-    返回 (token_idx -> 最终槽号, 原始槽号 -> 最终槽号) 两张表。"""
-    parent = {}                      # 槽号 -> 槽号，标准并查集，路径压缩
-    def find(s):
-        while parent.get(s, s) != s:
-            parent[s] = parent.get(parent[s], parent[s])
-            s = parent[s]
-        return s
+    重放的一部分。对 WARD_MERGE 的合并方向做一次并查集(union-find)，但身份是
+    (slot, epoch) 而不是裸 slot——见上方更正框，槽位复用后的新身份不能被误认成
+    被合并走的旧身份。op_log 本身已经完整记录了每次合并的方向，这里只是在
+    不可变记录上做一次只读遍历，和"篡改历史记录"是两件完全不同的事。
+    返回 (token_idx -> 最终槽号, 版本化身份 -> 版本化身份) 两张表。"""
+    epoch = {}                        # 槽号 -> 当前 epoch，懒初始化（未出现过视为 -1）
+    parent = {}                       # (槽号, epoch) -> (槽号, epoch)，标准并查集，路径压缩
+    def find(v):
+        while parent.get(v, v) != v:
+            parent[v] = parent.get(parent[v], parent[v])
+            v = parent[v]
+        return v
 
-    token_slot = {}                  # token_idx -> 记录时的槽号（不追溯合并）
+    token_identity = {}               # token_idx -> 记录时的版本化身份（不追溯合并）
     token_ptr = 0
     for op in op_log:
-        if op.type in (NEW_CLUSTER, JOIN, NEW_SEGMENT):
-            token_slot[token_ptr] = op.cluster
+        if op.type == NEW_CLUSTER:
+            epoch[op.cluster] = epoch.get(op.cluster, -1) + 1   # 首次建立 -1->0，
+                                                                  # 每次复用再 +1
+            token_identity[token_ptr] = (op.cluster, epoch[op.cluster])
+            token_ptr += 1
+        elif op.type in (JOIN, NEW_SEGMENT):
+            token_identity[token_ptr] = (op.cluster, epoch.get(op.cluster, 0))
             token_ptr += 1
         elif op.type == WARD_MERGE:
-            parent[find(op.free_slot)] = find(op.keep_slot)
+            keep_v = (op.keep_slot, epoch.get(op.keep_slot, 0))
+            free_v = (op.free_slot, epoch.get(op.free_slot, 0))
+            parent[find(free_v)] = find(keep_v)   # 只 union 当前这一代，不碰 epoch 本身
 
-    final_slot = {t: find(s) for t, s in token_slot.items()}
+    final_slot = {t: find(v)[0] for t, v in token_identity.items()}   # 只关心最终落在哪个物理槽
     return final_slot, parent
 ```
 
-**不新增任何持久 buffer,不改变 §4/§5.13 的内存账目**——这是一个按需调用的纯
-函数,S0.8 对拍、调试工具需要"token 最终去了哪"时调用它,forward/backward 的
-正确性路径永远不依赖它、也不会被它影响。
+**不新增任何持久 buffer,不改变 §4/§5.13 的内存账目**——`epoch`/`parent` 都是这个
+按需调用的纯函数的局部状态，调用结束就丢弃。S0.8 对拍、调试工具需要"token 最终
+去了哪"时调用它,forward/backward 的正确性路径永远不依赖它、也不会被它影响。
 
 **本地缓冲 vs 持久 `op_log`**：本节说的"本地 op 缓冲"是 Phase 1/2 处理**当前
 这一个 flush 批**期间用的临时张量，**不是**跨批持久存在的 `op_log`
@@ -408,17 +442,59 @@ Phase 2 处理每个 orphan（或一小簇互相接近的 orphan，由批内 min
           重新构造（见下方"Phase 3 的簇级元数据更新"），避免和 Phase 3 的更新
           重复计入同一批 token
        append NEW_CLUSTER(slot_idx, 0, -1) 到本地缓冲，对应这个 orphan（组）
-       里**到达顺序最早**的那个 token
+       里**到达顺序最早**的那个 token（绝对位置记为 p0）
+       local_p_hi[slot_idx]    = p0   # Phase 2 私有的临时状态，只活在本次
+       local_segment[slot_idx] = 0    # Phase 2 调用期间——不是 p_hi_c/全局
+                                        # segment 计数，见下方说明
 
     若这个 orphan 组里还有其它成员（mini DP-means 分进同一临时簇的其余
-    token）：**它们不能再产生 `NEW_CLUSTER`**——每个 token 恰好对应一个主
-    操作，`NEW_CLUSTER` 已经被组内最早的成员用掉了。其余成员按各自的绝对
-    位置相对 `slot_idx` 当前 `p_hi` 的时序判据（§5.3 第二个判据），逐个产生
-    `JOIN(slot_idx, 当前 segment, -1)` 或 `NEW_SEGMENT(slot_idx, new_seg, -1)`
-    （后者照常触发 §5.11 的 `PAD_INSERT`），按组内到达顺序追加到本地缓冲，
-    顺序在 `NEW_CLUSTER` 之后——这和"一个已存在的簇后续收到新成员"完全是
-    同一套逻辑，唯一的特殊之处是这个簇是本批刚建的。
+    token，按到达顺序逐个处理）：**它们不能再产生 `NEW_CLUSTER`**——每个 token
+    恰好对应一个主操作，`NEW_CLUSTER` 已经被组内最早的成员用掉了。**它们的
+    `JOIN`/`NEW_SEGMENT` 判据必须读 `local_p_hi[slot_idx]`，不能读全局
+    `p_hi_c[slot_idx]`**——全局 `p_hi_c` 此刻仍是第 4 步刚清零的占位值，要到
+    整个批次处理完、Phase 3 跑完才会变成真实值；如果这里读全局值，
+    `p_t − p_hi_c` 恒等于 `p_t − 0`，对任何有意义长度的文档都会远超 `g_max`，
+    组内除最早成员外的所有成员都会被错误地判成"时序打断"，被迫各自开一个新
+    segment——而它们本来就是同一次 mini DP-means 判定为彼此接近、大概率也在
+    时间上紧挨着到达的一组 token。对每个后续成员（绝对位置 `p_t`），按组内
+    到达顺序：
+
+        if p_t − local_p_hi[slot_idx] > g_max:
+            local_segment[slot_idx] += 1
+            append NEW_SEGMENT(slot_idx, local_segment[slot_idx], -1) 到本地缓冲
+            （照常触发 §5.11 的 PAD_INSERT，插在这条 NEW_SEGMENT 之前）
+        else:
+            append JOIN(slot_idx, local_segment[slot_idx], -1) 到本地缓冲
+        local_p_hi[slot_idx] = p_t   # 不论 JOIN 还是 NEW_SEGMENT，p_hi 都要推进
+                                       # 到"最近一次收到成员的位置"——这是 p_hi
+                                       # 的定义（§5.13），和是否开新段无关
+
+    这和"一个已存在的簇后续收到新成员"用的是同一套判据（§5.3 第二个判据），
+    唯一的特殊之处是这个簇是本批刚建的，所以判据读的是 Phase 2 自己维护的
+    局部状态而不是全局 buffer。
 ```
+
+> **`local_p_hi`/`local_segment` 只是 Phase 2 处理单个 orphan 组时的临时脚本
+> 状态，不是新增的持久 buffer，不进 §4/§5.13 的内存账目，Phase 3 也不需要读
+> 它。** 它按 `slot_idx` 存在一个小 dict/scratch 数组里，某个 slot 被第 4 步
+> 重新 `NEW_CLUSTER` 时（不论是首次建立还是本批内被 Ward 合并释放后再次复用）
+> 直接覆盖重置，不需要跨 orphan 组保留，处理完当前 orphan 组即可丢弃。Phase 3
+> 判断"这是不是一次新 segment"直接读 op 类型本身（`NEW_SEGMENT` vs `JOIN`），
+> §5.5 的 γ 衰减规则只依赖"这条 op 是不是 `NEW_SEGMENT`"，不需要重新计算时序
+> 判据，因此也不需要知道 `local_p_hi` 的具体数值——两者是完全独立的状态，互不
+> 依赖。
+>
+> **为什么这个问题只出现在 Phase 2 的 orphan 组，Phase 1 不需要类似修复**：
+> Phase 1 对整批 token 使用同一份**批前冻结**的 `p_hi_c` 快照做时序判据——这是
+> 一个已经承认、已经在 S0.8 测的近似（§5.4 开头"这是一个近似"那段）。它读到的
+> 值虽然不是全批最新的，但**始终是一个真实存在过的历史值**（这个簇在本批开始
+> 前最后一次收到成员的位置），只是没有随批内进展更新，误差方向明确、幅度
+> 有界（顶多让本该 `JOIN` 的 token 误判成 `NEW_SEGMENT`，不会反过来）。Phase 2
+> orphan 组的问题性质不同：第 4 步把 `p_hi_c` **清零**到一个不代表任何真实
+> 历史的占位值，如果后续成员直接读这个占位值，得到的不是"稍微过时的近似"，
+> 而是"用一个哨兵值参与运算"——这是一个正确性 bug，不是近似误差，必须用
+> `local_p_hi` 修掉，不能归入 Phase 1 那类"已知、可接受、留给 S0.8 测量"的
+> 近似里一并放过。
 
 **Ward 合并候选池不受限（不排除本批内新建的簇）不再需要任何补偿机制**：上一轮
 需要重定向，是因为担心"Phase 1 已经写下的、引用了后来被合并掉的槽的 op"会在
@@ -440,15 +516,43 @@ orphan）本身也完全不受影响——它们只往本地缓冲**追加**，�
 逼出来的，不是新规则；批内 join 关系（谁和谁分进同一个临时簇）在 Phase 2 开始时
 已经通过 mini DP-means 确定好了，不依赖任何"已建立槽位是否可见"的运行时状态。
 
-**Phase 3 是簇级数值元数据（centroid/`n_eff`/`n_total`/`p_hi_c`）唯一的写入点
-——对 Phase 1 分配到的既有簇和 Phase 2 新建的簇一视同仁，不再有第二个入口。**
-这是相对上一轮的一处简化，直接消掉了一类此前存在的 bug：上一轮让 Phase 2 的
-"新簇写进去"那一步（旧编号第 5 步）**同时**给新簇的 centroid/`n_eff`/`n_total`/
-`p_hi_c` 按 orphan（组）内容设初值，随后 Phase 3 又对**整个**本地缓冲统一跑一遍
-同样的更新——这会把新建簇的 orphan token 计入两次：一次在 Phase 2 初始化时，
-一次在 Phase 3 统一更新时。上面第 4 步已经改为"只置 `alive=true`，数值元数据
-全部清零"，原因就在这里：**Phase 2 不再对任何 token 做数值更新，Phase 3 是
-唯一做这件事的地方，天然不会有双计数**。
+**Phase 3 是本批"主操作 token 内容贡献"唯一的写入点——对 Phase 1 分配到的既有簇
+和 Phase 2 新建的簇一视同仁，不再有第二个入口。** 这是相对上一轮的一处简化，
+直接消掉了一类此前存在的 bug：上一轮让 Phase 2 的"新簇写进去"那一步（旧编号第 5
+步）**同时**给新簇的 centroid/`n_eff`/`n_total`/`p_hi_c` 按 orphan（组）内容设
+初值，随后 Phase 3 又对**整个**本地缓冲统一跑一遍同样的更新——这会把新建簇的
+orphan token 计入两次：一次在 Phase 2 初始化时，一次在 Phase 3 统一更新时。上面
+第 4 步已经改为"只置 `alive=true`，数值元数据全部清零"，原因就在这里：**Phase 2
+不再对任何 token 的内容做数值更新，Phase 3 是唯一做这件事的地方，天然不会有
+双计数**。
+
+> **这句话必须精确到"token 内容贡献"，不能笼统说成"Phase 3 是这些字段唯一的
+> 写入点"——后者是过强表述，会和 §5.6 的 `ward_merge_only` 直接冲突。**
+> `ward_merge_only` 的步骤 1（"合并簇级元数据"）本来就会写 `μ_new`/`n_eff_new`/
+> `n_total_new`/`p_hi_new`——这是必须存在的第二个写入来源，不是需要消灭的
+> 冗余：它写的是**把两个既有簇已经积累的历史值合并成一个**，不处理本批任何
+> 一个 token 的原始内容，和 Phase 3 处理的"这批新到达的 token 该怎么在线更新
+> centroid"是两类不重叠的写入。两者不冲突，是因为它们在时间上和作用对象上都
+> 天然分开：
+> - `ward_merge_only` 只在 Phase 2 处理某个 orphan、触发 Ward 合并腾位时才执行，
+>   写入的是 `keep_slot`（被保留的那个簇）的元数据——把 `keep_slot` 和
+>   `free_slot` 合并前各自的历史值组合成一份新的历史值。
+> - Phase 2 紧接着把 `free_slot`（被释放、即将复用为新簇的那个槽，和上面的
+>   `keep_slot` 是**不同的槽**）的数值元数据清零，为它即将承载的新簇准备一张
+>   白纸——这一步不读、不写 `keep_slot` 的任何字段。
+> - Phase 3 在本批 Phase 1、Phase 2（含其中所有 Ward 合并）全部完成之后才运行，
+>   它读到的每个簇的起点值——不论是 `keep_slot` 的"合并后历史值"还是
+>   `free_slot`（复用后）的"清零白纸"——都已经是这一批唯一、确定的最终状态，
+>   Phase 3 只需要在这个起点上按 §5.5 的公式叠加本批 token 的贡献，不需要关心
+>   这个起点是"未被合并的原值"还是"刚被合并出来的新值"，两种情况用的是同一套
+>   在线更新公式。
+>
+> 所以准确的分工是：**Ward 合并（`ward_merge_only` 步骤 1）是"结构性合并事件"
+> 的元数据写入点，处理的是既有历史值的组合；Phase 3 是"本批 token 内容"的唯一
+> 元数据写入点，处理的是新到达内容的在线更新。** 二者的写入范围（`keep_slot`
+> 的历史值 vs. 本批所有被触碰的簇的新内容增量）不重叠，顺序上 Ward 合并总是
+> 先于 Phase 3（它发生在 Phase 2 内部），所以 Phase 3 读到的永远是"本批全部
+> 结构变动都已经落地之后"的起点，不存在竞争或覆盖。
 
 Phase 3 的具体做法：按本批本地缓冲（Phase 1 + Phase 2 全部写完之后，`op_log`
 从不改写，所以这就是最终版本，不需要额外等待或过滤任何"修正"）里的主操作
@@ -794,7 +898,10 @@ K(t) < K_target  →  调低 λ_new（有富余，允许更细的划分）
 ward_merge_only(keep_slot, free_slot) 的完整内容（纯状态 mutation，不写
 op_log，见下方更正）：
 
-1. 合并簇级元数据（centroid 混合继续用 `n_eff`，物理规模计数继续用 `n_total`）
+1. 合并簇级元数据（centroid 混合继续用 `n_eff`，物理规模计数继续用 `n_total`。
+   **这是 `keep_slot` 元数据的合法写入点，和 §5.4 的 Phase 3 不冲突**——这里写的
+   是"两个既有簇已积累的历史值怎么组合"，Phase 3 写的是"本批新到达 token 的内容
+   贡献"，两类写入不重叠也不需要互相知道对方，详见 §5.4 那条更正框）
    μ_new       = (n_eff_a·μ_a + n_eff_b·μ_b) / (n_eff_a + n_eff_b)
    n_eff_new   = n_eff_a + n_eff_b
    n_total_new = n_total_a + n_total_b

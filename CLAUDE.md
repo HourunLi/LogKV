@@ -430,6 +430,59 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-14｜第七轮核实：修掉离线派生工具的槽位复用 bug、`docs/position.md`
+  里 PAD_INSERT 公式的回归、Phase 3 元数据写入权限的过强表述，并补上 orphan
+  组内后续成员的局部时序状态。** 动机：用户对照最新远端 `semanticLogKV`
+  （HEAD `01ce49e`，已含 PR #17 合并结果和一个独立提交新增的 `docs/position.md`）
+  逐条核实上一轮的修复，指出一处 P0、三处需要立即澄清/修正的问题。逐条结论：
+  ① **`derive_final_cluster` 仍有严重漏洞：槽位复用会被 union-find 错误合并**
+  ——上一版直接对裸槽号做并查集，`WARD_MERGE(C,B)` 之后 `free_slot=B` 被后续
+  `NEW_CLUSTER(B)` 复用建立一个全新、无关的簇时，裸槽号并查集会把这个新簇的
+  token 也错误地路由到 C（具体反例：`token0` 进 B，`WARD_MERGE(C,B)`，`token1`
+  又 `NEW_CLUSTER(B)`，离线 derive 会把 `token1` 也推到 C）。**这是 §5.4 反例
+  在离线派生工具这一侧的镜像问题**——真正的执行路径（forward/replay）不会犯
+  这个错，因为它们按时间顺序执行，槽的"当前身份"由最后一次写入决定；但这个
+  离线函数跳过时间顺序、只扫 `WARD_MERGE` 边，裸槽号不足以区分"同一物理槽在
+  不同时期代表的不同簇"。**修法**：引入版本化身份 `(slot, epoch)`——每次
+  `NEW_CLUSTER(slot,...)`（首次建立或复用）都让该槽 `epoch` 前进一代，
+  `WARD_MERGE` 只 union 当前这一代的身份，不触碰 `epoch` 本身；`epoch` 只是这个
+  只读函数内部的临时簿记，不影响 forward/backward/replay 的任何状态。
+  ② **`docs/position.md` 的 `PAD_INSERT` 公式写回了已经被证伪的版本**——位置
+  手册的 P7.1 写着 `count = (-n_total_c) mod 2^ℓ_block`，这正是
+  `algorithm-spec.md` §5.11 更正框已经用反例否定过的公式（`n_total_c` 不含 pad，
+  第一次填充后就会和 level 0 真实插入流分叉）。已改成
+  `count = (-level_count[cluster,0]) mod 2^ℓ_block`，并加一段简短说明加指向
+  `algorithm-spec.md` 的权威引用，防止两份文档再次漂移。
+  ③ **"Phase 3 是簇级元数据唯一写入点"是过强表述，和 `ward_merge_only` 冲突**
+  ——`ward_merge_only` 步骤 1（合并簇级元数据）本来就会写
+  `μ_new`/`n_eff_new`/`n_total_new`/`p_hi_new`，这是必须存在的第二个写入来源，
+  不是需要消灭的冗余。**改成精确表述**：Phase 3 是本批"主操作 token 内容贡献"
+  唯一的写入点；Ward 合并是"结构性合并事件"的写入点，处理的是两个既有簇已
+  积累的历史值组合，不处理本批任何 token 的原始内容。两者写入范围不重叠
+  （`keep_slot` 的历史值 vs. 本批新内容增量），顺序上 Ward 合并总在 Phase 3
+  之前（发生在 Phase 2 内部），所以 Phase 3 读到的永远是"本批结构变动都已落地
+  之后"的起点，不存在竞争。
+  ④ **orphan 组内后续成员的 `JOIN`/`NEW_SEGMENT` 判据读的是刚被清零的
+  `p_hi_c`，时序判据会错**——Phase 2 第 4 步把新簇的 `p_hi_c` 清零备用，但
+  紧接着又说组内后续成员按"`slot_idx` 当前 `p_hi`"判断要不要开新段；若这个
+  "当前 p_hi"指全局 buffer，读到的就是刚清零的占位值 0，`p_t − 0` 对任何有
+  意义长度的文档都远超 `g_max`，组内除最早成员外全部被错误判成"时序打断"，
+  各自被迫开新 segment——而它们本来就是同一次 mini DP-means 判定为彼此接近、
+  到达时间上也大概率紧挨着的一组 token。**修法**：引入 Phase 2 私有的局部
+  状态 `local_p_hi[slot_idx]`/`local_segment[slot_idx]`（不是新持久 buffer，
+  不进 §4/§5.13 账目，Phase 3 也不需要读它——Phase 3 判断新段直接看 op 类型
+  本身），由第 4 步用最早成员的位置初始化，组内后续成员读写这个局部状态而
+  非全局 `p_hi_c`。同时说明这个 bug 为什么只出现在 Phase 2 的 orphan 组、
+  不出现在 Phase 1：Phase 1 的"批前冻结 `p_hi_c`"是一个已知、已在 S0.8 测的
+  近似（读到的始终是真实历史值，只是不够新），而 Phase 2 这里读到的是一个不
+  代表任何历史的占位哨兵，是正确性 bug 不是近似误差，两者不能混为一谈。
+  ⑤ **新簇的 segment 初始化一并定案**——`local_segment[slot_idx]` 从 0 开始
+  （与 `NEW_CLUSTER` 的 `arg1=0`"新簇第一段"约定一致），后续成员按
+  `p_t − local_p_hi[slot_idx] > g_max` 决定 `JOIN` 还是 `NEW_SEGMENT`（后者
+  照常触发 §5.11 的 `PAD_INSERT`），处理完毕后 `local_p_hi` 无条件推进到
+  `p_t`（不论是否开了新段）——这就是 `p_hi` 的既有定义"最近一次收到成员的
+  位置"，随④一并解决，不再是未定义行为。
+
 - **2026-08-14｜第六轮核实：推翻上一轮（第五轮）刚钉死的"批内重定向"机制本身
   ——它会把可执行的 `op_log` 改坏，改用"op_log 只追加、永不改写 + 需要时按需
   派生最终归属"。** 动机：用户指出上一轮把"可执行日志"和"最终归属索引"这两个
