@@ -159,6 +159,6 @@ cache（每 layer 一个）
 | **Stage 1 / 2 / 3** | 实现 / eval-time 探测 / CPT |
 | **S0.0** | 扫 `(g_max, ℓ_block)`——**最高优先级**，回答"收益来自语义分组还是分段边界" |
 | S0.1–S0.8 | 单测 / `K_eff` 曲线 / needle 隔离率 / 簇内 key+value 方差 / 跨度分布 / 锚点膨胀 `E[M]` / supersession 比例 / 批量化近似的分歧率 |
-| **Config A/B/C** | Stage 2 的三档：`K_max=1` 正确性闸门 / 纯语义 / 主实验 |
+| **Config A/B/C** | Stage 2 的三档，**全部是 eval-time 消融参考点，不设通过/失败容差**（正确性检验在 Stage 0/1 的纯 CPU 单测，不在这里）：`K_max=1` 参考基线（不预期复现旧数字）/ 纯语义（`η=0, g_max=∞`）/ 主实验 |
 | **D1 自检** | 另一分支的诊断实验，测出 width≥8 时 rank-1 失真明显 |
 | **memory-matched** | 把 vanilla 的 `B` 调大到同 entry 数再比，**排除"只是多用了内存"** |
