@@ -217,12 +217,46 @@ Phase 3a（紧接 Phase 1 之后、Phase 2 开始前，向量化，**不是**批
 
 Phase 2（串行，只处理 orphan）:
     s*[t] > λ_new 的 token 需要开新簇，它们之间还可能互相成簇
+    （s*[t]/c*[t] 沿用 Phase 1 算出的值，不因 Phase 3a 随后更新了 centroid
+    就重新判断——见下方"orphan 集合冻结"说明）
     在这批 orphan 内部跑一个小 DP-means（O(m_orphan²) 的距离矩阵即可）
     每个 orphan（组）的主操作一旦写入本地缓冲，立即（Phase 3b，内联，不等
     批末）用同一套 §5.5 公式更新它目标槽的元数据——Ward 合并、centroid 混合
     因此全程读到的都是本批目前为止的真实状态，见下方"Phase 3 拆成 3a/3b"
     一节
 ```
+
+> **orphan 集合冻结：Phase 3a 更新的 metadata 不反过来影响它，这是一个
+> 明确决定，不是留白。** Phase 1 算出的 `c*[t]`/`s*[t]`（进而
+> `direct[τ]`/orphan 划分）只在 Phase 1 这一步计算一次，此后原样沿用到
+> 这一批处理完毕——即使 Phase 3a 紧接着把某个簇的 `centroid`/`n_eff`
+> 更新了（可能让某个原本 `s*[t] > λ_new` 的 orphan，相对更新后的 centroid
+> 已经不再超过阈值），Phase 2 也**不会**拿这份更新后的 metadata 去重新
+> 判断该 token 是不是还该算 orphan。Phase 3a 写出的 metadata 只服务两处
+> 消费者：Ward 代价矩阵（`Δ[a,b]` 需要**当前**的 `n_total`/`μ`，包含本批
+> Phase 1 已经贡献的部分，见 §5.6）和 Phase 3b 自己的 §5.5 在线更新
+> （需要**当前**的 `n_eff`/`μ` 作为"批前"状态）——从不用于重新检验 Phase 1
+> 已经做出的 direct/orphan 分类。
+>
+> **为什么必须冻结，不能重判**：如果允许重判，一个被重新判定为"该并入某
+> 既有簇 X"的 orphan（X 恰好是本批 Phase 1 也写过 direct token 的簇），会
+> 在本地缓冲里给 X 产生一条 `JOIN`——但物理写入顺序是"Phase 1 整组先写、
+> Phase 2 整组后写"（见下方"为什么……满足这三条契约"一节），这条本该按
+> 真实到达顺序排在 X 某些 Phase 1 成员之间的 `JOIN`，会被无条件排到 X 在
+> 本地缓冲里全部 Phase 1 成员的**后面**，直接违反契约第 1 条（"同一逻辑
+> 簇自己的主操作序列必须按真实到达顺序出现"，`compact()` 的"时间序相邻
+> 配对"正确性依赖这一条）。这不是这条契约偶尔失效的一个例外，是它赖以
+> 成立的前提被直接打破——契约成立依赖"同一逻辑簇的主操作在一个 flush
+> 批内只可能整体来自 Phase 1 或整体来自 Phase 2"（下方论证），允许重判
+> 会让这个前提不再自动成立，下方那整节证明也随之失效。
+>
+> **这不是一个新的近似类别，是"Phase 1 冻结 centroid"这个已经接受、已经
+> 在 S0.8 测的近似（本节开头"这是一个近似"那段）的直接延伸**——批前冻结
+> 意味着 Phase 1 的分类从一开始就没有用到"本批最新"的 centroid，Phase 3a
+> 的更新只是让这份"过时"在批内更明显了一点，不改变近似的性质。S0.8 的
+> cluster assignment divergence 指标（`experiments.md` §6）用的是"批量
+> 路径 vs 严格串行、每个 token 都用当时最新 centroid 重算一次"的对拍，
+> 天然覆盖这类分歧，不需要为它单独定义新的度量。
 
 > **更正（曾经写错）**：早期版本的 Phase 1 判据是"`min_c ‖k−μ_c‖² ≤ λ_new` 的
 > token 直接按 §5.3 分配"——**这不等价于 §5.3**。§5.3 的 `c*` 由统一代价 `d_c`
@@ -289,7 +323,10 @@ token，`arg2` 保留原有语义（`count`/`resulting_count`/`-1`），不受�
 两边都有**：
 
 - Phase 1 只处理 `direct[τ] = True`（`s*[τ] ≤ λ_new`）的 token，把它们路由到
-  **既有**簇（批前就 alive 的槽）。
+  **既有**簇（批前就 alive 的槽）。**这个划分只在 Phase 1 算一次，Phase 3a
+  随后更新 centroid 不会让它反悔**（上方"orphan 集合冻结"说明）——下一条
+  "orphan 永远不会 JOIN 一个 Phase 1 本批也在写的既有簇"正是建立在这个
+  划分不会被事后改写这个前提上，如果允许重判，这条就不再成立。
 - Phase 2 只处理 orphan（`s*[τ] > λ_new`），它们要么加入本批 Phase 2 内部
   mini DP-means 分到的**新**临时簇（一个从未在这个 `(slot,epoch)` 身份下出现
   过的全新逻辑簇），要么（在 Ward 合并腾位的情形下）落进一个**被释放又复用**
@@ -571,9 +608,22 @@ main_idx[2] = 0+2+1 = 3        # t=2 主操作 -> 第 3 行，紧接第 2 行，
 **这个技巧的适用范围不止这里，顺带记一笔——这一轮已经从"留给以后"变成必须
 履行的义务，见下方"Phase 3 拆成 3a/3b"一节**：Phase 3a 对 `n_eff`/`centroid`
 的在线更新（§5.5）在没有 `γ` 衰减重启（即本批内该簇没有 `NEW_SEGMENT`）时会
-逐项相消、化简成一个简单的批量加权和，但一旦出现 `NEW_SEGMENT`（触发 `γ` 衰减
-重启），就需要和上面完全同构的"segmented reset scan"才能向量化——这里不重复
-推导，只留一个指针：套用上面 `steps_since`/reset 的思路，不是另一个新问题。
+逐项相消、化简成一个简单的批量加权和。
+
+> **更正（这一轮修的）：上一版说"一旦出现 NEW_SEGMENT，就需要和上面完全
+> 同构的『segmented reset scan』才能向量化……套用上面 steps_since/reset
+> 的思路，不是另一个新问题"——这是错的，两者的"重置"不是同一类操作，不能
+> 直接套用。** `PAD_INSERT` 的重置落在一个固定值上（mod 计数器精确回到
+> `1`，与之前发生过多少次 pad、pad 了多少个都无关）——这正是"距离上一次
+> 重置过了几步"这个无状态的相对量足以决定当前值的根本原因：重置把对
+> 更早历史的依赖彻底切断了。但 `n_eff` 的 `γ` 衰减是"把累积历史打一个
+> 折扣，不是清零"（`n_eff_pre ← γ·n_eff`，`γ∈(0,1]` 时结果通常仍非零），
+> 衰减后的值依然依赖**衰减前**的完整历史，而那段历史可能又包含更早的
+> 一次衰减——`steps_since` 这类"只看最近一次重置发生在哪"的单层查询在
+> 这里不够用，必须知道每次衰减发生**那一刻**的累积值，这是一条真正跨越
+> 整个批内子序列的递推，不能被压成一个无状态的相对位置查询。完整推导
+> 挪到下方"Phase 3a 的具体做法"一节给出，不再是"留一个指针，不重复推导"。
+
 **这一步不再是可以无限期推迟的优化项**：下方"Phase 3 拆成 3a/3b"一节会说明，
 Phase 3a 必须在 Phase 2 开始之前完成，否则 Ward 合并会读到本批 Phase 1 贡献
 缺失的 stale metadata。
@@ -833,6 +883,24 @@ final_slot = resolve_final_slots(all_identity, parent)   # 只在这里、扫完
 粒度问题，和上面推翻的重定向无关**——本地缓冲和持久 `op_log` 一样，条目一旦
 追加就不再改写，两者遵守同一条不变量，只是提交时机不同。
 
+> **本地缓冲的构建和消费不受 `record_op_log` 影响，训练/推理两条路径都会
+> 执行——不要把它和"持久 `op_log`"的 gating 混为一谈。** `record_op_log`
+> 精确的门控范围见 §5.21"`op_log` 只能在训练路径分配"一节：它唯一决定的是
+> "这一批（Phase 1 → Phase 3a → Phase 2 全部结束、本地缓冲已经写满）之后，
+> 要不要把本地缓冲整体拷贝进跨批持久的 `op_log`"，仅此一步。本节从头到尾
+> 描述的 Phase 1/2/3 机制本身——DP-means 路由、Ward 合并候选选择与执行、
+> segment id/`PAD_INSERT` count 的向量化 scan、Phase 3a/3b 的 metadata
+> 更新、ladder 的物理写入——是让 cache 在两条路径上行为一致的核心机制
+> （CLAUDE.md §10 死因 1"训推走同一条路径"），本地缓冲只是这套机制内部用来
+> 在一次 flush 批处理期间传递"这一步产生了什么 op"的临时载体，不是
+> `op_log` 持久化功能的附属品。**`record_op_log=False` 时它照常被构建、
+> 照常驱动 Phase 3a/3b 和 ladder 写入，只是这一批处理完之后不再被拷贝进
+> 任何持久结构，随即被丢弃或被下一批覆盖复用**。本地缓冲自身的容量
+> （`local_op_cap = 4×flush_granularity`，默认配置下 512 行 int32、约
+> 8KB，见下方）远小于持久 `op_log` 的 `OP_max=4·T_max`（32k 下约
+> 448MB），两条路径都构建它的开销可以忽略不计，不会重新引入那笔训练
+> 专属的内存账目。
+
 > **本地缓冲的容量不是"这一批的 token 数"，是"这一批的 token 数 × 每 token 的
 > op 倍数"**——早期版本把本地缓冲的大小写成"就是这一批的 token 数，`≤128`"，
 > 只数了主操作。但本地缓冲既然要承载**最终会提交进持久 `op_log` 的完整内容**，
@@ -1079,10 +1147,13 @@ Phase——Ward 合并看到的 ladder 是对的，看到的 metadata 却是错�
   Phase 1 产出的主操作（direct token 的 `JOIN`/`NEW_SEGMENT`——direct token
   不会产生 `NEW_CLUSTER`，那是 orphan 专属），用 §5.5 的公式批量更新它们各自
   目标簇的 `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`。这正是
-  前面"这个技巧的适用范围不止这里"那个指针指向的向量化任务（含 `NEW_SEGMENT`
-  触发的 `γ` 衰减重启需要的 segmented reset scan，与 segment id/pad count 的
-  向量化同构）——这里第一次把它从"留给以后"变成"必须在这里执行"，因为现在
-  明确了它必须在 Phase 2 开始前完成，不能再推迟。
+  前面"这个技巧的适用范围不止这里"那个指针指向的向量化任务——但含
+  `NEW_SEGMENT` 触发的 `γ` 衰减重启时，`n_eff`/`centroid` 需要的是一个
+  仿射变换复合的并行扫描，**不是**和 segment id/pad count 同构的
+  `steps_since` 式重置扫描（上方"更正"框已说明两者的"重置"不是同一类
+  操作），完整推导见下方"Phase 3a 的具体做法"——这里第一次把它从"留给
+  以后"变成"必须在这里执行"，因为现在明确了它必须在 Phase 2 开始前完成，
+  不能再推迟。
 - **Phase 3b**（内联，逐 token，不是批处理）：Phase 2 本身已经是串行循环
   （§11-B 的摊还论证只要求它的**总执行次数**被 `E[K]` 界住，从未要求它的
   metadata 更新也批量化）。每处理完一个 orphan（组）的主操作、把它 append
@@ -1134,17 +1205,113 @@ stale 值），不是近似精度问题（近似应该多准），两者正交�
 > 巧合。
 
 **Phase 3a 的具体做法**：Phase 1 结束、Phase 2 开始之前，对本地缓冲里刚刚由
-Phase 1 写入的主操作（只有 `JOIN`/`NEW_SEGMENT`），逐簇按 §5.5 的在线均值
-公式更新 `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`（后者只在
-遇到 `NEW_SEGMENT` 时被那条 op 的 `segment` 字段覆写，`JOIN` 不改它）。**这里
-同样要用 `op.token_idx` 去取这条 op 对应的 `k_raw`，不能假设"本地缓冲里的
-第几条 op 就对应本批第几个 token"**——原因和 backward 重放的 `token_ptr`
-问题完全一样（§5.4"op_log 跨 Phase 的顺序契约"一节）。**顺序要求**：同一个
-簇收到的多个成员必须按它们在本地缓冲里的相对顺序被应用（在线均值本身是顺序
-敏感的，可以复用前面已经给出的 segmented-scan 技巧按簇分组扫描），不同簇之间
-彼此独立、可以任意顺序或并行处理——这和 §5.21-2 对批量 ladder 写入提的"保序"
-要求是同一类约束，同一个理由（"结果只依赖同簇成员的相对到达顺序，不依赖
-处理粒度"）。
+Phase 1 写入的主操作（只有 `JOIN`/`NEW_SEGMENT`），逐簇更新
+`centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`（`current_segment`
+只在遇到 `NEW_SEGMENT` 时被那条 op 的 `segment` 字段覆写，`JOIN` 不改它）。
+**这里同样要用 `op.token_idx` 去取这条 op 对应的 `k_raw`，不能假设"本地
+缓冲里的第几条 op 就对应本批第几个 token"**——原因和 backward 重放的
+`token_ptr` 问题完全一样（§5.4"op_log 跨 Phase 的顺序契约"一节）。
+
+**五个字段里，三个是平凡的分组归约（reduce），不需要扫描（scan）**，直接
+复用 §5.4"Segment id"/"PAD_INSERT 的 count"两节已经定义好的
+`c*[t]`（`t=0..m_direct-1`，direct 子序列下标）、`rank[t]`（组内到达序，
+0-indexed）、`nsg_incl[t]`（组内 `new_seg` 的包含性前缀和）：
+
+```
+n_total_new[c] = n_total_old[c] + count(t : c*[t] == c)      # 分组计数，
+                                                                # 不依赖顺序
+last[c]        = argmax_{t : c*[t]==c} rank[t]                 # 组内到达
+                                                                # 最晚的 t
+p_hi_new[c]        = p_{last[c]}                                # p_hi 的定义
+                                                                 # 就是"最近
+                                                                 # 一次收到
+                                                                 # 成员的位置"
+current_segment_new[c] = op.segment[last[c]]                    # 同一个 t，
+                                                                 # 直接读它已经
+                                                                 # 算好的
+                                                                 # segment 字段
+```
+
+三者都只需要"这一组最后一个成员是谁"，`argmax`/`gather` 是标准原语，不需要
+中间任何一步的值。
+
+**`n_eff`/`centroid` 是唯一需要真正扫描（scan）的两个字段——这是 Phase 3a
+里唯一困难的部分**，值得把 §5.5 的逐成员递推摊开重新过一遍，给出闭式的
+向量化方案（上方"更正"框已经说明了为什么不能照搬 `PAD_INSERT` 的
+`steps_since` 技巧）。记组内到达序为 `r = rank[t]`，`n_eff_{-1} :=
+n_eff_old[c]`、`μ_{-1} := centroid_old[c]` 是批前持久值，§5.5 的递推是：
+
+```
+d[t]    = γ  若 new_seg[t]，否则 1                # 衰减因子，标量，∈(0,1]
+n_eff_r = d[t]·n_eff_{r-1} + 1
+μ_r     = (d[t]·n_eff_{r-1}·μ_{r-1} + k_t) / n_eff_r
+```
+
+**这是一串仿射变换（affine map）的复合**：每个成员把 `(n_eff, μ)` 映射成
+`x ↦ d[t]·x + 常数项` 的形式，仿射变换在复合下满足结合律——这正是它可以
+被压成一次并行扫描的原因，和 `_binary_carry`（§5.21-3）能被压成固定轮数的
+掩码 carry 是同一类"用结合律换并行"，只是这里的幺半群（monoid）是仿射
+复合，不是二进制进位。
+
+**做法**：给每个成员一个仿射状态三元组 `(A, Bn, S)`（`A`、`Bn` 是标量，`S`
+和 `k`/`μ` 同维），代表"从这一段开始到当前位置为止，`n_eff` 和
+`n_eff·μ` 各自被复合成什么仿射变换"：
+
+```
+成员 t 自己的状态（scan 的叶子/base case）：
+    A_t  = d[t]
+    Bn_t = 1
+    S_t  = k_t
+
+合并两段状态（"先" ⊕ "后"，把"后"接在"先"之后，标准仿射复合，结合律成立）：
+    A   = A_后 · A_先
+    Bn  = A_后 · Bn_先 + Bn_后
+    S   = A_后 · S_先  + S_后
+```
+
+按 `c*[t]` 分组做一次**包含性（inclusive）前缀扫描**（分组/排序用的是和
+`nsg_incl` 完全相同的 `(c*[t], rank[t])`，只是归约算子换成上面的仿射
+复合，不是求和或求最大——**这不是现成的库原语**，不同于前面 segment
+id/PAD count 依赖的原生 segmented cumsum/cummax，这里需要手写一个
+Hillis-Steele 式的倍增扫描：`⌈log₂ flush_granularity⌉` 轮，**静态轮数，
+和 §5.21-3 同一个纪律**——第 `s` 轮里每个位置和"组内比它早 `2^s` 步的
+位置"合并，跨组或越界的位置用幺元 `(1, 0, 向量 0)` 代替）。扫描结束后，
+每个成员 `t` 手里的 `(A_r, Bn_r, S_r)` 就是"从组内 rank 0 到 `rank[t]`
+（含）"的复合仿射变换，取组内最后一个成员（上面已经算出的 `last[c]`）
+即得整簇这一批的最终变换：
+
+```
+n_eff_new[c]    = A_{last[c]} · n_eff_old[c] + Bn_{last[c]}
+centroid_new[c] = (A_{last[c]} · n_eff_old[c] · centroid_old[c] + S_{last[c]})
+                  / n_eff_new[c]
+```
+
+（可以对一个 2 成员的组手动展开验证：`n_eff_r1 = d1·(d0·n_eff_{-1}+1)+1
+= (d1·d0)·n_eff_{-1} + (d1·1+1)`，和 `A=d1·d0`、`Bn=A_后·Bn_先+Bn_后
+=d1·1+1` 逐项相符；`S` 同理展开也一致。）
+
+**为什么不直接写闭式解，要用扫描**：把上面的递推展开成闭式确实存在
+（`A_r=γ^{nsg_incl[t]}`，`Bn_r`/`S_r` 展开后会出现形如 `γ^{-nsg_incl[j]}`
+的负指数项），但**负指数在这里是真实的数值风险，不是理论洁癖**——一个
+病态批次（`flush_granularity=128`，同一个簇的全部 128 个 direct token
+每个都触发 `NEW_SEGMENT`，即 `g_max` 设得极小）在默认 `γ=0.5` 下会要求
+算出 `γ^{-128} = 2^128 ≈ 3.4×10^38`，逼近 fp32 的溢出边界。上面的扫描
+完全避开这个问题——`A` 全程是若干个 `∈(0,1]` 的数相乘，只会变小不会
+变大；`Bn`/`S` 每一步合并都只用**当前已经算出的、有界的**中间结果做
+加乘，从不出现负指数或除以一个可能趋近于 0 的量，是数值稳定的标准做法
+（需要算"衰减累加"的实现——比如强化学习里的 GAE——回避闭式解、改用
+扫描，是同一个理由）。
+
+**顺序要求**：不同簇之间彼此独立，可以任意顺序或并行处理；同一个簇的扫描
+必须尊重组内到达顺序（`rank[t]`），这靠分组排序后再扫描保证——和 §5.21-2
+对批量 ladder 写入提的"保序"要求是同一类约束，同一个理由（"结果只依赖同簇
+成员的相对到达顺序，不依赖处理粒度"）。
+
+**正确性验证复用已有的测试，不需要新增一条**：§5.4"必须补的单测"第 3 条
+（Phase 3a/3b 元数据更新的正确性）已经要求生产路径的向量化结果和一个逐
+token 串行、按 §5.5 未向量化原始递推逐步执行的朴素参考实现逐位对拍——上面
+给出的三个平凡归约和这条仿射扫描，就是"生产路径"这一侧具体做的事，这条
+既有的对拍天然覆盖它们对不对，不需要单独再定义一套断言。
 
 **Phase 3b 的具体做法**：Phase 2 每处理完一个 orphan（组）的一条主操作
 （`NEW_CLUSTER`/`JOIN`/`NEW_SEGMENT`）、把它 append 进本地缓冲之后，立即用
@@ -1198,8 +1365,34 @@ Phase 1 之后、Phase 2 之前运行一次（向量化）；Phase 3b 内联在 
    断言，不要和"重放正确性"共用同一个测试）**：用同一批合成数据，分别用
    (a) 生产路径（Phase 1 → Phase 3a → Phase 2-含内联 Phase 3b 完整跑一遍）
    得到的最终 `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`，和
-   (b) 把本批最终本地缓冲里原样的主操作序列喂给一个独立的、按 §5.5 公式逐簇
-   顺序重算的参考实现（本质上是 Phase 3a/3b 逻辑的一份朴素、非批量化复刻），
+   (b) 一个独立的、逐条重放的参考实现，断言两者逐位一致。
+
+   > **更正（这一轮修的）：参考实现只喂"主操作序列"是错的，必须喂完整 op
+   > 序列（含 `WARD_MERGE`）。** 上一版让参考实现只吃"本批最终本地缓冲里
+   > 原样的主操作序列"——但 `WARD_MERGE` 是结构操作，不在"主操作"之列，
+   > 如果参考实现真的看不到它，下面 (i)/(ii) 两条断言根本无法成立：参考
+   > 实现既无法把被合并簇（`free_slot`）批内已经收到的贡献并入
+   > `keep_slot`（(i) 断言的正是这份贡献有没有被正确合并），也无法在
+   > 复用槽位建新簇之前清空旧内容（(ii) 断言的正是新簇有没有干净地不
+   > 包含旧内容）——而验证这两条正是这个测试项存在的全部意义（见上面
+   > "未闭合的漏洞"一节的反例）。**正确做法**：参考实现按物理顺序走
+   > **完整**的本地缓冲（主操作 + `WARD_MERGE`，`PAD_INSERT`/`CARRY`
+   > 对这五个字段没有任何影响，原样跳过），处理模式和 backward 重放循环
+   > （§5.21-2）完全同构，只是把 `append_to_ladder` 换成对 metadata 的
+   > 操作：遇到主操作（`NEW_CLUSTER`/`JOIN`/`NEW_SEGMENT`）按 §5.5 公式
+   > 更新 `op.cluster` 这个槽的 scratch 元数据（`NEW_CLUSTER` 先把该槽
+   > scratch 清零，是"白纸"状态，再应用 §5.5，和 `allocate_new_cluster`
+   > 的语义一致）；遇到 `WARD_MERGE(keep,free)` 对 scratch 状态套用和
+   > §5.6"K_max 满时的完整合并过程"步骤 1 完全相同的合并公式
+   > （`μ_new=(n_eff_a·μ_a+n_eff_b·μ_b)/(n_eff_a+n_eff_b)`、
+   > `n_total_new=n_total_a+n_total_b`、`p_hi_new=max(p_hi_a,p_hi_b)`、
+   > `current_segment_new=max(...)`），再把 `free` 的 scratch 清零。
+   > **不需要引入 `derive_final_cluster` 那套 `(slot,epoch)` 版本化
+   > 身份**——那套机制是为了让一个跳过时间顺序、只看 `WARD_MERGE` 边的
+   > 离线并查集派生保持正确；这里是一次真正按时间顺序逐条执行的模拟，
+   > "遇到 `NEW_CLUSTER` 就清零 scratch"已经天然处理了槽位复用，不会
+   > 把"旧 X"和复用同一物理槽的"新 X"混成一个身份。
+
    断言两者逐位一致，且**新建簇（本批内 Ward 合并腾出槽位后建立的那些）的
    最终 `n_total` 精确等于它实际收到的 token 数，不多不少**——这条直接抓住
    "Phase 2 初始化和 Phase 3 更新双计数"这类 bug：如果双计数复现，这里的
@@ -2976,20 +3169,47 @@ forward()` 内部。** 两个入口共享同一套路由/flush/ladder 写入逻�
 
 ```python
 def route_and_flush_batch(..., record_op_log: bool):
-    ...  # DP-means / Ward / ladder 写入，训练和推理完全一致
+    ...  # Phase 1（向量化）→ Phase 3a（向量化）→ Phase 2（串行，含内联
+         # Phase 3b）完整跑一遍：DP-means 路由、Ward 合并候选选择与执行、
+         # segment id / PAD_INSERT count 的向量化 scan、centroid/n_eff/
+         # n_total/p_hi_c/current_segment 的 Phase 3a/3b 更新、ladder 物理
+         # 写入——训练和推理完全一致，全部读写本地缓冲（local_buffer/
+         # local_op_len），不受 record_op_log 影响，见上方"本地缓冲 vs
+         # 持久 op_log"一节的更正框
     if record_op_log:
-        append_ops_to_local_buffer(...)   # 只有这一步是训练独有的
+        commit_local_buffer_to_persistent_op_log(...)   # 只有这一步是训练
+                                                           # 独有的：把这一批
+                                                           # 已写满的本地缓冲
+                                                           # 整体拷贝进跨批
+                                                           # 持久的 op_log
+                                                           # （§5.4 的
+                                                           # local_op_len
+                                                           # 定长拷贝公式），
+                                                           # 供 backward 重放用
     ...
 ```
 
+**上一版把 `append_ops_to_local_buffer(...)` 整体挂在 `if record_op_log`
+之下，这是错的，必须更正**：本地缓冲从 Phase 1 第一次写入到 Phase 2/3b
+最后一次写入全程无条件发生（见上方"本地缓冲 vs 持久 op_log"一节的更正
+框）——如果字面照抄旧版本这段伪代码，`record_op_log=False` 的推理路径会
+连本地缓冲都不构建，Phase 3a 无 op 可读，metadata 更新、Ward 合并候选选择、
+ladder 物理写入全部失去输入，路由机制在推理路径上直接失效。真正只属于
+训练路径的，只有"把已经写满的本地缓冲提交进跨批持久 `op_log`"这最后一步。
+
 `LogKVStreamTrainingAttention.forward()` 调用时传 `record_op_log=True`，且
-只有在这个分支里才会执行"`op_log`/`op_log_len` 重新绑定成全新张量"这一步
-（forward 一开始，处理第一个 flush 批之前）。`LogStructuredKVCache.forward()`
-（推理/生成，`litgpt/generate/base.py`、`speculative_decoding.py` 等用的
-入口）调用同一个共享函数时传 `record_op_log=False`——`op_log`/`op_log_len`
-这两个属性在推理路径上应该**从未被访问**，不只是"分配了但不用"，因为哪怕
-只是每次 forward 都重新 `torch.zeros(...)` 一次 448MB 又立即丢弃，也是纯
-浪费的分配器压力，且容易让人误以为这块内存"反正都要分配"从而不再警惕。
+只有在这个分支里才会执行"`op_log`/`op_log_len` 重新绑定成全新张量"（forward
+一开始，处理第一个 flush 批之前）和"批末把本地缓冲提交进持久 `op_log`"这
+两步。`LogStructuredKVCache.forward()`（推理/生成，`litgpt/generate/base.py`、
+`speculative_decoding.py` 等用的入口）调用同一个共享函数时传
+`record_op_log=False`——跨批持久的 `op_log`/`op_log_len` 这两个属性在推理
+路径上应该**从未被访问、从未分配**，不只是"分配了但不用"，因为哪怕只是每次
+forward 都重新 `torch.zeros(...)` 一次 448MB 又立即丢弃，也是纯浪费的分配器
+压力，且容易让人误以为这块内存"反正都要分配"从而不再警惕。**但这条 gating
+只覆盖跨批持久的 `op_log`/`op_log_len`，不覆盖本节开头描述的本地缓冲**——
+Phase 1/2/3 的路由决策、metadata 更新、ladder 写入本身，以及驱动它们的本地
+缓冲，在 `record_op_log=False` 时同样完整执行，唯一被跳过的是"把这批已经
+处理完的本地缓冲再拷贝一份进持久结构"这一步。
 
 **不能靠 `torch.is_grad_enabled()` 做这个判断，必须是显式的调用路径/参数**：
 本方案的路由决策（DP-means 距离比较、`argmin`）本身就**恒定** `no_grad`
