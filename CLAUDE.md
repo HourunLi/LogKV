@@ -469,6 +469,80 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第十四轮核实：给 S0.8 3b 的 query 来源补一个明确决定（复用
+  机制 B 的现场 query 循环，不落盘）、新增 `scan_op_log_for_ward_events`
+  给 Ward 事件比较提供合并前成员快照、把 Phase 3a/3b 元数据对拍的"逐位
+  一致"拆成整数字段精确/浮点字段容差、把成对共簇一致率从 O(T²) 全对枚举
+  改写成 O(T+K²) 的列联表算法、并钉死仿射 scan 的累加器必须是 fp32。**
+  动机：用户逐条核实上一轮的四处修复，指出四处 P1、一处 P2——都是"实验/
+  调试接口和数值测试口径"这类会让实现卡在"指标算不出来"或"正确代码过不了
+  逐位测试"的缺口，不是新的 P0。逐条结论：
+  ① **P1：S0.8 的 3b（attention 读出 L2 误差）需要 query，但 Stage 0 dump
+  规格明确 `q_roped` 不整块落盘（"分块用完即弃"）。** 两处独立写的规格互相
+  矛盾：3b 要"同一批 query 跑 attention"，dump 表却不给这批 query 留后路。
+  **决定：S0.8 本来就不是纯粹"对 Stage 0 静态 dump 事后做 CPU 分析"**——
+  它已经需要先用 `k_raw`/`v`/`pos`（不需要 q）跑两条路由/cache 构造路径
+  （批量近似 + 严格串行参考，可以离线 CPU 做，复用 S0.1 同款参考实现）；
+  3b 真正要 q 的地方只有"用这两份 cache 状态各做一次 readout"，这一步
+  **复用机制 B 已有的、按 query block 处理、用完即弃的循环**——在机制 B
+  本来就要为 `attn_mass_by_dist` 算一次 `q_roped @ k_expanded.mT` 的
+  同一个循环、同一个 block 上，额外用两份 cache 状态各算一次读出、累积
+  L2 误差的分子分母，算完这块就跟着 `q_roped` 一起丢弃，q 全程不落盘。
+  为保证因果性，3b 只用序列**尾部**的 query block（此时两条路径的最终
+  cache 都已构造完毕，尾部 query 因果地有权看到整个 cache）。**不选**
+  "额外持久化一份 q_roped 供事后用"——会给"Stage 0 只落盘 k/v/直方图"
+  开一个例外，且抽样 query 能不能代表真实误差是一个新的未验证假设。
+  `experiments.md` §6 的 dump 表 `q_roped` 行、S0.8 3b 定义处分别补上
+  这条决定和交叉引用。
+  ② **P1：Ward 事件 Jaccard 说"scan 到这一步即可得到合并前 token 集合"，
+  但 `scan_op_log` 的接口拿不到这个快照。** 核实后确认这不是文字表述
+  问题——`scan_op_log` 的 `WARD_MERGE` 分支只做 `parent[find(free_v)] =
+  find(keep_v)`，从不维护"某身份此刻实际持有哪些 token"这个反向索引，
+  结构性拿不出 `keep_set_before`/`free_set_before`。**不改 `scan_op_log`
+  本身**（它已被 `resolve_final_slots`、S0.1 依赖，足够简单可信正是因为
+  只维护最小状态）：新增专供 S0.8 用的姊妹函数 `scan_op_log_for_ward_events`
+  ——在 union-find 基础上额外维护 `members: 身份 -> token_idx 集合`，每遇
+  `WARD_MERGE` 就在合并生效前把 `keep`/`free` 双方当前的 members 集合
+  快照进一条 `WardEvent(trigger_token_idx, keep_identity, free_identity,
+  keep_set_before, free_set_before)`。`trigger_token_idx` 不需要额外
+  状态去猜——按已有的顺序契约（结构操作紧邻它服务的主操作），`WARD_MERGE`
+  后紧跟的下一条 op 必然是它服务的 `NEW_CLUSTER`，用一个 pending 指针
+  记住"刚追加、还没等到 trigger 的事件"，下一次遇到 `NEW_CLUSTER` 直接
+  补上，不需要向前看。同时把"触发这次合并的 orphan 的绝对 token 位置"
+  精确定义为 `tok0`（§5.4 Phase 2 早就命名过的量：orphan 组里到达顺序
+  最早的那个 token），不是新概念，两条路径对同一份输入天然能算出可比的
+  `tok0`。`experiments.md` §6 的 Ward 事件比较一节同步改成直接调用这个
+  新函数，不再重复描述"scan 到这一步"这种含糊做法。
+  ③ **P1：Phase 3a/3b metadata 要求"逐位一致"不现实，除非参考实现复刻
+  同一棵 scan。** Phase 3a 的生产路径用仿射 scan（并行组合律重排运算
+  顺序），S0.1 的参考实现用 §5.5 原始递推逐条顺序执行——两者数学上算的
+  是同一个量，但浮点加法/乘法不满足结合律，fp32 下最后几位完全可能不同，
+  这是任何"并行 scan vs 顺序循环"比较的标准情形，不是 bug。**决定**：
+  按字段类型拆开比较口径——`n_total`/`p_hi_c`/`current_segment`（纯
+  整数字段，过程不出现浮点运算）继续要求逐位精确；`centroid`/`n_eff`
+  （fp32）改用数值容差（建议 `rtol=1e-4`，远大于 `flush_granularity≤128`
+  下 `⌈log₂128⌉=7` 轮扫描能积累的舍入误差，但足够收紧到能抓真正的逻辑
+  bug）。**不选"参考实现也按同样的 Hillis-Steele 轮次跑"**——那样两个
+  实现会变成同一段扫描逻辑的两份拷贝，一份的 bug 会在另一份里被逐位
+  复现，参考实现"独立交叉验证"这件事名存实亡，比不设容差更糟。
+  ④ **P2：pairwise co-assignment 若按"所有 token 对"字面实现是 `O(T²)`**
+  ——32k 单层单头就是 `C(32768,2)≈5.4×10⁸` 对，乘上层数和 KV group 数会
+  直接拖垮 Stage 0。**修法**：写成标准的 contingency-table 算法——把两条
+  路径的最终身份映射成整数标签，建 `K_A×K_B` 列联表 `n_{ab}`（一次分组
+  统计，`O(T)`），用标准 Rand Index 恒等式
+  `agree_pairs = C(T,2) − Σ_i C(a_i,2) − Σ_j C(b_j,2) + 2·Σ_{ab} C(n_{ab},2)`
+  算一致 pair 数（`O(T+K_A·K_B)`，`sklearn.rand_score` 用的就是这个
+  恒等式，不是新推导），32k 下也是毫秒级；同时明确排除 self-pair、
+  分母用 `T(T-1)/2`。
+  ⑤ **P2：Phase 3a 仿射 scan 的 dtype 没有钉死**——`k_raw` 以 fp16/bf16
+  存储/传递，但 `centroid`/`n_eff` buffer 是 fp32，若实现者顺手让
+  `S_t = k_t` 沿用 `k_t` 自己的低精度 dtype（最容易踩的默认写法：逐元素
+  运算"跟着输入 dtype 走"），累加器会被低精度污染。**这比一次性 fp16
+  计算更危险**：`centroid` 是跨整条序列在线更新的量，每个 flush 批都要
+  混合一次，量化噪声会跨批次反复注入、累积，不是单次可忽略的舍入。
+  **决定**：`(A, Bn, S)` 全程 fp32，`S_t = k_t.float()` 显式转型，最终
+  写回 `centroid`/`n_eff` buffer 时两者 dtype 已经一致，不需要额外转换。
+
 - **2026-08-19｜第十三轮核实：把 Phase 3a 仿射 scan 的 `γ` 定义域从 `(0,1]`
   改成 `[0,1]` 并说明 `γ=0` 时公式仍精确成立、把 S0.8 的 Ward 事件比较从
   "逐一比较候选对"细化成可执行的对齐算法、把最终 cache/readout 差异拆成
