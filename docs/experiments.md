@@ -255,9 +255,15 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
        `best_orientation_jaccard` 把两种配对方向都试一遍、取总相似度更高
        的一种，返回 `side_1_jaccard`/`side_2_jaccard`（不再叫
        keep/free——它们只在这一次结果内部有意义，不是跨路径可比的固定
-       标签）和 `orientation_flipped`（是否选中了交换方向），三者都要
-       报告，不要只留相似度丢掉是否翻转——翻转本身也是一个诊断信号
-       （翻转频繁可能说明两条路径的 Ward 候选选择存在系统性差异）。这是
+       标签）、`orientation_flipped`（是否选中了交换方向）、
+       `orientation_margin`/`orientation_ambiguous`（两种方向总分之差，
+       以及这个差是否小到分不清方向——`algorithm-spec.md` 同一节已经
+       论证过单个 Jaccard 估计本身就有 ≈0.5/√k 的标准误差，两种方向
+       总分接近时 `orientation_flipped` 可能只是抽样噪声，`ambiguous`
+       为真的事件不该被当作"方向真的翻转了"去归因，只把 `side_1/2_
+       jaccard` 当点估计使用），四者都要报告，不要只留相似度丢掉方向
+       信息——翻转（且不 ambiguous）本身也是一个诊断信号（翻转频繁
+       可能说明两条路径的 Ward 候选选择存在系统性差异）。这是
        一个**估计值**，标准误差上界 `0.5/√k`（默认 `k=128` 时 ≈4.4%），
        `k` 必须和这个数字一起写进 eval metadata；连带报告
        `keep_size_before`/`free_size_before`（精确整数，不经估计，用来
@@ -317,7 +323,9 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
        > 无关，可以离线用 `algorithm-spec.md` §5.4/§5.18 那套 CPU 参考
        > 实现做（S0.1 已经在用同一类参考实现，不需要额外 GPU）。**3b
        > 真正要用到 q 的地方只有"拿这两份已经构造好的 cache 状态各做
-       > 一次 attention 读出"这一步。**
+       > 一次 attention 读出"这一步，只用序列尾部一个固定大小的窗口——
+       > 窗口大小是独立的 `tail_query_count` 参数，不派生自
+       > `block_size`（见下方"更正"）。**
        >
        > **更正（这一轮修的，P0）：上一版"序列尾部的 query 因果地有权
        > 看到整个 cache"这句话只对 `tail_query_count=1`（字面意义上的
@@ -348,54 +356,91 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
        > in-flight 精确 chunk、彼此三角因果互相掩蔽；它之前的所有
        > pooled slot 无条件可见"——字面上就是 3b 需要的东西，前提是
        > pooled 区域里确实不含任何比这批 query 里最早那个位置更"新"的
-       > 内容。只要这个前提满足，`causal_tail` 不需要新写任何因果
-       > 逻辑：把整条序列的最终 cache 当 pooled 前缀，把
-       > `[T−tail_query_count, T)` 这些原始 token 自己的 `k_raw`/`v`
-       > 当 in-flight chunk，调用现成的 `log_kv_slot_attention(...,
-       > causal_tail=tail_query_count)`，它内部的三角掩码天然保证位置
-       > `p` 只能 attend 到 in-flight chunk 里 `≤p` 的部分。
+       > 内容。
        >
-       > **前提必须显式校验，不能默认成立**：要求"最近一次 flush
-       > （compaction）边界必须在位置 `T−tail_query_count` 之前"，即
-       > 整个尾部窗口自始至终都还没被挤出 recent window、没有被任何一次
-       > flush 处理过。用两条路径各自 recent window 里"自上次 flush
-       > 以来已摄入的 token 数"（记为 `since_last_flush`——两条路径本来
-       > 就在维护这个量，flush 触发条件天然要用它）断言
-       > `since_last_flush ≥ tail_query_count`，**两条路径分别断言，
-       > 不能只查一条**（批量近似和严格串行参考的 flush 时机可能因为
-       > 路由近似而略有不同）。不满足就是配置错误，**硬失败**——换更小
-       > 的 `tail_query_count`，或另挑一条不是刚好卡在 flush 边界上的
-       > prompt，不做静默截断或自动缩小（同 §5.21-2"预分配 + 硬失败"
-       > 原则）。默认 `tail_query_count` 借用 `flush_granularity` 的
-       > 量级（≤128）、`recent_size` 默认 1024，正常情况下这条断言
-       > 天然满足，只有病态/边界配置才会触发。
+       > **前提必须用真实存在的状态量表达，不能凭空发明一个**：
+       > cache 唯一持久维护的滑窗状态是 `recent_count`——当前 recent
+       > window 里还没被挤出去的 token 数，核对
+       > `litgpt/log_kv_cache.py:1246-1336`（`get_attention_state()`
+       > 现有实现）确认这是真实字段，函数本来就要读它。前提精确写作
+       > `recent_count ≥ tail_query_count`：尾部 `tail_query_count`
+       > 个 token 此刻是否**完整位于 recent window 内**，直接决定它们
+       > 会不会出现在 `get_attention_state()` 返回值的"recent 部分"里
+       > （见下方修法，这正是让 `causal_tail` 免于重新拼接的关键）。
+       > 两条路径分别断言，不能只查一条（批量近似和严格串行参考各自的
+       > `recent_count` 可能因为路由近似而略有不同）。不满足就是配置
+       > 错误，**硬失败**——换更小的 `tail_query_count`，或另挑一条不是
+       > 刚好卡在 flush 边界上的 prompt，不做静默截断或自动缩小（同
+       > §5.21-2"预分配 + 硬失败"原则）。`tail_query_count` **默认取
+       > `flush_granularity` 这个数值做初始化，但保存成独立字段**——
+       > 不是运行时去读 `flush_granularity` 这种隐式耦合，改
+       > `flush_granularity` 不会连带改变已经跑过的实验用的
+       > `tail_query_count`，复现实验只需要 `tail_query_count` 这一个
+       > 数字，不需要连带确认 `flush_granularity` 当时是多少。
+       > `recent_size` 默认 1024，正常情况下这条断言天然满足，只有
+       > 病态/边界配置才会触发。
        >
-       > 具体做法（压缩侧，两条路径各跑一次）：
+       > **更正（这一轮修的，P0）：具体做法上一版还有两个坑，不是加了
+       > `causal_tail` 就完事。** ①**忘了真正拼接 in-flight chunk，
+       > `causal_tail` 会遮错对象**：上一版手工算出
+       > `k_tail_roped`/`v_tail`，但调用 `log_kv_slot_attention` 时传
+       > 的 `slot_k`/`slot_v` 是 `get_attention_state()` 的原始返回值，
+       > 从未把算出来的 `k_tail_roped`/`v_tail` 真正拼进去——`causal_
+       > tail` 遮住的是"调用方传入的张量最后 `causal_tail` 个位置"，
+       > 如果那里还是 `get_attention_state()` 原样返回的东西，被当成
+       > in-flight chunk 三角因果掩蔽的就是它恰好排在最后的那几个
+       > pooled slot，不是真正的尾部 token。②**`get_attention_state()`
+       > 是否已经包含 recent window 没说清楚，叠上①就会双计**：核对
+       > 上面引用的实现确认，它的返回值本来就是"压缩 levels（老到新）
+       > + recent window（原始顺序，`w=1` 精确槽）"拼接后的完整状态，
+       > **recent window 已经在里面**，不是只有 pooled 前缀——上一版
+       > "# pooled 前缀"这条注释是错的。若真的又手工拼一份
+       > `k_tail_roped`/`v_tail` 上去，尾部这 `tail_query_count` 个
+       > token 会在最终 attend 到的集合里出现两次。
+       >
+       > **两个坑一起看，修法反而比上一版更简单**：只要上面
+       > `recent_count ≥ tail_query_count` 的前提成立，`tail_query_
+       > count` 这批 token 本来就是 recent window 末尾的那部分，
+       > `get_attention_state()` 原样返回的 `slot_k`/`slot_v` 最后
+       > `tail_query_count` 个位置恰好已经是它们——**不需要任何手工
+       > 重建或拼接**，直接把这个原始返回值传给
+       > `log_kv_slot_attention(..., causal_tail=tail_query_count)`
+       > 即可。之前的压缩 levels，以及 recent window 里比尾部窗口更早
+       > 的那部分（`recent_count > tail_query_count` 时会有），保持
+       > 无条件可见对它们同样正确——它们的位置全都严格早于
+       > `T−tail_query_count`，早于尾部窗口里的任意一个 query，
+       > `p_earlier < p_query` 恒成立，不需要区分"是压缩 level 还是
+       > 较早的 recent token"，"无条件可见"这条假设的前提对它们从未
+       > 被违反过。
        >
        > ```python
-       > assert since_last_flush(cache) >= tail_query_count   # 前提，两条路径各查一次
-       > slot_k, slot_v, slot_w, slot_valid, M_s = cache.get_attention_state()  # pooled
-       >                                                        # 前缀，§5.14/§5.20-B
-       > k_tail_roped = apply_rope(k_raw[T-tail_query_count:T], pos[T-tail_query_count:T])
-       > v_tail       = v[T-tail_query_count:T]         # in-flight chunk，flatten 顺序
-       > q_tail       = q_roped[T-tail_query_count:T]   # 与 append_exact_tokens 一致：
-       >                                                  # pooled 在前、exact 在后
+       > assert cache.recent_count >= tail_query_count   # 前提，两条路径各查一次
+       > slot_k, slot_v, slot_w, slot_valid, M_s = cache.get_attention_state()
+       >     # 压缩 levels + 完整 recent window；尾部窗口已经是它的最后
+       >     # tail_query_count 个位置，不需要另外构造/拼接
+       > q_tail = q_roped[T-tail_query_count:T]   # 唯一需要额外切的东西——
+       >                                            # q 不在 cache 状态里
        > out_compressed = log_kv_slot_attention(
-       >     q_tail, slot_k, slot_v, slot_w, scale,     # slot_w 原样传，**不要**在
-       >     causal_tail=tail_query_count,                # 调用前手工除以 M_s——mass
-       >     slot_valid=slot_valid, M_s=M_s,              # bias λ·log(w_s/M_s) 是函数
-       > )                                                 # 内部算的（§5.14/表 B），
-       >                                                    # M_s 和 slot_valid 一样只
-       >                                                    # 覆盖 pooled 前缀，exact
-       >                                                    # 尾部不需要调用方补 M_s
+       >     q_tail, slot_k, slot_v, slot_w, scale,   # slot_k/v/w 原样传，
+       >     causal_tail=tail_query_count,              # 不手工重建、不手工
+       >     slot_valid=slot_valid, M_s=M_s,            # 拼接、不在调用前
+       > )                                               # 除以 M_s——这些
+       >                                                  # 都是函数自己算的
+       >                                                  # （M_s/slot_valid
+       >                                                  # 只覆盖压缩
+       >                                                  # levels 那段
+       >                                                  # 前缀，recent
+       >                                                  # window 部分
+       >                                                  # 隐式 M=1，见
+       >                                                  # §5.14 表 B）
        > ```
        >
        > 这不只是修正因果性，顺带也回答了"3b 的压缩侧读出要不要和生产
        > 路径逐项对齐（GQA 折叠、`slot_valid`、`M_s`、`λ log(w/M)`、
-       > fp32 分数缓冲）"这个单独提过的问题——**直接调用生产函数
-       > `log_kv_slot_attention`/`get_attention_state()` 本身，而不是
-       > 照抄一份平行实现**，这些细节全部自动保持一致，不需要在这里
-       > 重新枚举、也不会因为文档和代码各自演化而漂移。
+       > fp32 分数缓冲）"这个单独提过的问题——**直接、原样传递生产函数
+       > `get_attention_state()` 的返回值给 `log_kv_slot_attention`，
+       > 不做任何手工重建或平行实现**，这些细节全部自动保持一致，不
+       > 需要在这里重新枚举、也不会因为文档和代码各自演化而漂移。
        >
        > **稠密侧（mechanism B 给出的 ground truth）不受这次更正
        > 影响**：它的 `causal_mask(scores)` 这一步（"Stage 0 dump 规格"
