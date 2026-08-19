@@ -1187,6 +1187,13 @@ def scan_op_log_for_ward_events(
             assert pending is None    # 上一个 Ward 事件必须已被消费，见 docstring
             keep_v = find((op.keep_slot, epoch.get(op.keep_slot, 0)))
             free_v = find((op.free_slot, epoch.get(op.free_slot, 0)))
+            assert keep_v != free_v, (
+                f"scan_op_log_for_ward_events: self-merge，keep_v == free_v == "
+                f"{keep_v}——生产路由的代价矩阵会 mask 对角线（§5.6）排除这种"
+                f"情况，但这里扫的是 op_log，不应该假设日志一定合法；不挡住会"
+                f"静默损坏状态：下面 sizes[keep_v]=keep_size+free_size 会把同一个"
+                f"身份的计数翻倍，随后 sketches.pop(free_v)/sizes.pop(free_v) 又"
+                f"会把刚更新的条目整个删掉，把一次自合并变成一次静默的状态丢失")
             keep_size, free_size = _require(sizes, keep_v, "sizes"), _require(sizes, free_v, "sizes")
             assert keep_size > 0 and free_size > 0, (
                 "scan_op_log_for_ward_events: keep/free 的精确成员数不能是 0"
@@ -2925,6 +2932,32 @@ def log_kv_slot_attention(
     ...
 ):
 ```
+
+**形状契约必须在函数入口显式断言，不能只在 docstring 里说一句"只覆盖
+pooled 前缀"就当作调用方自然会保证。** 记 `S_total = slot_k.shape[-2]`
+（`slot_k` 拼接了 pooled 前缀和 exact 后缀之后的总宽度）：
+
+- `S_pooled ≤ S_total`——`slot_valid`/`M_s` 的宽度不能超过 `slot_k`
+  实际拥有的总宽度，否则下标越界。
+- `S_total − S_pooled ≥ causal_tail`——pooled 前缀之后剩下的宽度必须
+  至少能装下 `causal_tail` 那批 in-flight 精确 token；等号成立时剩下
+  的部分恰好全部是 in-flight chunk（`recent_count == tail_query_count`
+  的情形），大于号成立时说明 recent window 里还有比 in-flight chunk
+  更早、但仍在 pooled 前缀之后的精确 token（`recent_count >
+  tail_query_count`），两种情形函数都要正确处理，不能假设恰好相等。
+- **`w[i] == 0 ⟹ slot_valid[i] == False`（单向蕴含，不是等价）**：
+  `dedup_anchors` 保证无效 entry（`w=0`）的三个槽 `slot_valid` 全部
+  是 `False`（§5.14），但反过来不成立——**有效** entry（`w>0`）内部
+  重复的锚点槽同样 `slot_valid=False`，这是去重的正常结果，不是
+  "该 entry 无效"的信号，调用方/单测不能把 `slot_valid=False` 误读成
+  `w=0` 的充分条件。
+- **exact 后缀（`S_pooled` 之后的全部位置，含 recent window 和
+  in-flight chunk）由调用方保证 `slot_w` 恒为 `1`**——这不是
+  `log_kv_slot_attention` 内部校验的东西（它只是隐式按 `M_s≡1` 处理
+  `S_pooled` 之外的 mass bias，不反过来检查 `w` 的取值），但
+  `get_attention_state()` 的构造本身保证了这一点（recent window 每个
+  槽是单个真实 token，见 `litgpt/log_kv_cache.py:1246-1336` 的
+  `slot_w`赋值），调用方不需要、也不应该为这段额外传 `w≠1` 的值。
 
 **应用方式**：`slot_valid` 是**逐 slot、不随 query 变化**的一维掩码（不像
 `mask` 是 `(T_q,S)`），所以可以用一次广播 `masked_fill_` 覆盖 score 张量的
