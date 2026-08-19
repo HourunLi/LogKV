@@ -56,6 +56,19 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 
 **当前阶段：设计与算法规格已完成（§5），代码尚未开始写。**
 
+> **务必读清楚这句话字面的意思，不要被下面大段的伪代码/公式/`raise
+> ValueError(...)` 片段误导。** `litgpt/`、`tests/` 里不存在
+> `log_kv_semantic_clusters`、`op_log`、`current_segment` 等任何本文档描述
+> 的字段或分支——可以用 `grep -rn log_kv_semantic_clusters litgpt/ tests/`
+> 自行验证，应该零匹配。`LogKVStreamTrainingAttention` 这个类名确实在
+> `litgpt/log_kv_cache.py`/`litgpt/model.py` 里存在，但那是它在语义簇设计
+> 之前、位置分桶时代就有的版本，本文档在它之上设计的改动尚未落地。变更记录
+> （§14）里反复出现的"更正""这一轮修的""P0/P1"，改的都是**这份规格文本
+> 自身的逻辑漏洞**——两处描述互相矛盾、一条公式在某个边界条件下算错、一个
+> 反例说明某条规则不成立——不是已经在跑的代码里发现的 bug。**连 Stage 0
+> 的 dump 脚本（§5.21-5，本项目该写的第一行代码）都还没有写**，Stage 1
+> （生产实现）完全没有开始。
+
 **下一步（按优先级）**：
 1. **S0.0（§7）：扫 `(g_max, ℓ_block)`。** 全课题最根本的实验——一端是纯语义聚类，
    另一端退化成"连续性约束语义分段"，扫它等于直接回答"收益来自语义分组本身，还是
@@ -332,14 +345,30 @@ RoPE）这些改动是设计里不可选的（§2.1、§5.6 的 `K_max=1` 讨论
 **锚点展开的 `M` 只影响读出时的瞬时槽池，不影响持久 cache 内存**——每 entry 存的是
 3 个整数，不是 3 份键值。
 
-**第三笔账，此前漏记：训练期 `op_log` 重放元数据，约 448MB/28 层@32k
-（`algorithm-spec.md` §5.21-2 的推导）。这笔账只属于训练侧，不属于上面两笔里的
-任何一笔，也不进 memory-matched 对比**——`op_log` 是给 backward 重放用的操作日志
-（§11-A），serving/推理路径不做反向传播，**不分配、不持有这块内存**；上面两笔账
-比较的是"cache 里究竟存了多少 entry"和"读出时瞬时展开多大"，两者都是 serving 也
-会付的代价，`op_log` 不是。训练时这笔额外的 448MB 是真实成本，但它和"压缩率""
-memory-matched 公平性"这两个 serving 侧的论证是两件独立的事——放进同一张表比较
-会把训练开销和推理内存预算混为一谈，所以单独列出，不进上面那张表。
+**第三笔账，此前漏记：训练期 `op_log` 重放元数据，约 448MB/28 层@32k，**且是
+每个尚未执行 `backward()` 的 in-flight forward 各付一份**（`algorithm-spec.md`
+§5.21-2 的推导）。这笔账只属于训练侧，不属于上面两笔里的任何一笔，也不进
+memory-matched 对比**——`op_log` 是给 backward 重放用的操作日志（§11-A），
+serving/推理路径不做反向传播，**不分配、不持有这块内存**；这不是"推理时反正
+用不上所以顺便不管"的隐式结果，是共享的路由/flush 逻辑显式接收一个
+`record_op_log` 开关，只有训练专用的 `LogKVStreamTrainingAttention.forward()`
+传 `True`，推理用的 `LogStructuredKVCache.forward()` 传 `False`，见
+`algorithm-spec.md` §5.21-2 新增的"`op_log` 只能在训练路径分配"一节。上面
+两笔账比较的是"cache 里究竟存了多少 entry"和"读出时瞬时展开多大"，两者都是
+serving 也会付的代价，`op_log` 不是。
+
+**"448MB" 不是训练期的固定开销，是每个 in-flight forward 的单价**：只要
+下一次 `forward()` 在这次 forward 对应的 `backward()` 跑完之前发生，两份
+448MB 就会同时存活，训练峰值因此是 `448MB × 同一时刻并存的 in-flight
+forward 数`。本仓库 `litgpt/pretrain.py` 的梯度累积循环每个 microbatch 都
+立即调用 `fabric.backward()`（只有 `optimizer.step()` 被推迟），所以在这条
+训练循环下 in-flight 数恒为 1，"448MB"就是准确的峰值；但"累积 loss、只在
+最后统一调一次 `backward()`"或 pipeline 并行的 microbatch 调度会让这个数字
+按并发 forward 数相乘，完整分析、以及哪些模式安全/哪些需要重新核算，见
+`algorithm-spec.md` §5.21-2 新增的"『448MB』只是每个 in-flight forward 的
+代价"一节——训练时这笔额外的显存是真实成本，但它和"压缩率""memory-matched
+公平性"这两个 serving 侧的论证是两件独立的事——放进同一张表比较会把训练
+开销和推理内存预算混为一谈，所以单独列出，不进上面那张表。
 
 > **这笔账中途差点被算错一次，教训值得留着**：为了让 `op_log` 安全地活过
 > `backward()`（不被下一次 `forward()` 的 reset 清空），中间一版实现是
@@ -439,6 +468,101 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-19｜第十一轮核实：解决"Phase 3 批末运行"这个此前一直没被注意到的
+  P0——它和"Ward 合并不受限、op_log 永不改写"这两条上一轮才证明成立的设计
+  互相冲突；同时把训练期 `op_log` 显存账目精确到"per in-flight forward"、
+  把它的分配显式限定到训练路径、在入口文档补一条不容错过的"未实现"声明、
+  并把 S0.8 的分歧率从一个模糊标量拆成三条可执行指标。** 动机：用户对照最新
+  远端逐条核实，指出一处 P0、两处 P1、一处 P2、外加一条工作流建议。逐条结论：
+  ① **P0：Phase 3 若像此前写的那样"批末统一运行"，会和上一轮才证明成立的
+  两条设计互相冲突，导致 Ward 合并读到 stale metadata、token 内容被错误地
+  计入错误的簇。** 具体反例：Phase 1 把 direct token `tok0` 路由到既有簇 X、
+  写下 `JOIN(X, seg, tok0)`；Phase 2 处理某个 orphan 时 `K_max` 已满，Ward
+  代价矩阵选中 `(keep_slot=C, free_slot=X)`——X 恰好是本批刚被 Phase 1 触碰
+  过的簇（Ward 尺寸加权对"批内刚建立、暂时还小"的簇的偏好，上一轮已经用
+  几乎一样的场景证明过这不是边界情形）。若 Phase 3 严格等 Phase 1、Phase 2
+  都跑完才统一 walk 本批 ops、按裸 `op.cluster` 分组更新
+  `centroid`/`n_eff`/`n_total`/`p_hi_c`，`ward_merge_only(C,X)` 执行那一刻
+  X 的 metadata 仍是批前快照（不含 `tok0`），于是 `tok0` 对 X 的内容贡献在
+  合并这一步被丢弃；紧接着 X 被复用建立一个全新的簇，Phase 3 用裸槽号回头
+  处理 `JOIN(X,seg,tok0)` 时，又会把 `tok0` 错误地计入这个和它毫无关系的
+  新簇。**根因**：本节此前已经确立"Phase 1 整体（含 ladder 物理写入）必须
+  先于 Phase 2 完整跑完"这条原则，理由是 Ward 合并需要看到真实、最新的
+  ladder——但同一条逻辑对 metadata 同样成立，而"Phase 3 批末运行"这个设计
+  从未被拿去对照这条原则重新检查，是一个被漏掉的推论，不是一个新的独立
+  问题。**修法**：把"Phase 3"从"批末的第三个步骤"改成按内容来源拆开、各自
+  在能拆的最早时刻执行——**Phase 3a**（向量化，紧跟 Phase 1 完成之后、
+  Phase 2 开始之前）批量更新 Phase 1 产出的主操作对应的 metadata；**Phase
+  3b**（内联，逐 token）在 Phase 2 本就是串行的循环内部，每个 orphan 主操作
+  写入本地缓冲后立即更新它的 metadata，不再等批末。这样任何一次
+  `ward_merge_only` 执行时，它要读的两个槽的 metadata 都已经是本批目前
+  为止的真实值，"stale metadata"这类输入结构性不可能出现。这不是重新引入
+  上一轮刚推翻的"批内重定向"——`op_log` 依然纯追加、永不改写，改变的只是
+  "消费这些 op 去更新 metadata 的时机"，一个纯调度问题，不触及 op_log 顺序
+  契约本身。相应修正了：§5.4 的三阶段伪代码、"Phase 3 是唯一写入点"那段
+  论证里"Ward 总是先于 Phase 3"这句被证明是错的话、"Phase 3 的具体做法"
+  拆成 3a/3b 两段、"执行时机"的表述、`current_segment` buffer 的写入点
+  说明、`ward_merge_only` 步骤 1 里"和 Phase 3 不冲突"那句话补上它依赖的
+  调度前提、以及 S0.1 单测第 3 条补上必须覆盖这个反例场景（且要双向验证：
+  `keep_slot` 精确包含被合并簇的批内贡献、复用槽建立的新簇精确不包含）。
+  ② **P1：训练期 `op_log` 448MB 这个数字只对"任意时刻最多一个 in-flight
+  forward"成立，不是训练期的固定开销。** `ctx.save_for_backward` 只要
+  下一次 `forward()` 在这次 forward 对应的 `backward()` 跑完之前发生，两份
+  448MB 就会同时存活，峰值因此是`448MB × 同一时刻并存的 in-flight forward
+  数`。核对本仓库 `litgpt/pretrain.py:351-355` 后确认，梯度累积循环每个
+  microbatch 都立即调用 `fabric.backward()`（`no_backward_sync` 只跳过
+  DDP all-reduce，不推迟 backward 本身），只有 `optimizer.step()` 被推迟——
+  这条训练循环下 in-flight 数恒为 1，"448MB"是准确的。但"累积 loss、只在
+  最后统一调一次 `backward()`"（峰值 `microbatch 数 × 448MB`）和 pipeline
+  并行的 microbatch 调度（峰值 `pipeline depth × 448MB`）会让这个数字按
+  并发相乘，必须显式排除或预算，不能假设"训练期就是 448MB"对它们也成立；
+  activation checkpointing 不属于这两类（不推高 in-flight 数），但会让
+  `op_log` 多分配一次可被立即回收的 throwaway 448MB，是效率问题不是峰值
+  问题。`algorithm-spec.md` §5.21-2 新增专门一节写清楚这个换算规则和这三类
+  模式各自的结论，CLAUDE.md §4 的第三笔账同步更新措辞。
+  ③ **P1：推理是否分配 `op_log` 的规格不一致，必须把"不分配"从隐式默认行为
+  改成显式 gate。** CLAUDE.md 说 serving"不分配、不持有"，但 §5.13 的
+  buffer 表只说"每次 `forward()` 开头重新绑定"，没说是哪一个
+  `forward()`——`LogStructuredKVCache` 有两个独立入口（推理用的
+  `forward()`，训练用的 `LogKVStreamTrainingAttention.forward()`），字面
+  读容易让实现者把 448MB 的分配也带进推理路径。**修法**：两个入口共享的
+  路由/flush 逻辑显式接收 `record_op_log: bool`，训练侧传 `True`、推理侧传
+  `False`；不能靠 `torch.is_grad_enabled()` 判断，因为路由决策本身（DP-means
+  距离比较、`argmin`）在训练和推理下都恒定 `no_grad`（CLAUDE.md §10 死因
+  1），这个信号在两条路径上是一样的，真正的区分点（这次 forward 之后会不会
+  有对应的 backward）只有调用方知道，必须显式传。`algorithm-spec.md`
+  §5.21-2、§5.13 的 `op_log` 行、CLAUDE.md §4 三处同步补上这条 gate 的
+  说明。
+  ④ **P1（工作流问题，非规格漏洞）：入口文档没有一句话能让人在读到一半时
+  就确认"这一切都还没写成代码"。** 上一轮已经在 §0 写了"代码尚未开始写"，
+  但整篇文档充满可直接复制的 Python 伪代码、`raise ValueError(...)` 片段、
+  精确到字段名的 buffer 表，读者很容易在读了十几轮"这一轮修的""P0/P1"
+  之后，把"规格文本的逻辑漏洞被反复修正"误读成"代码在跑、bug 在修"。核对
+  `litgpt/`、`tests/` 确认零匹配 `log_kv_semantic_clusters`/`op_log`/
+  `current_segment` 等任何本设计的字段（`LogKVStreamTrainingAttention` 类名
+  确实存在，但那是语义簇设计之前、位置分桶时代的版本）。在 CLAUDE.md §0 和
+  `algorithm-spec.md` 顶部/§5.1 参数表前都补了不容错过的"未实现"声明，附
+  `grep` 自证命令，并明确"更正/这一轮修的"指的是规格文本自身的逻辑漏洞。
+  ⑤ **P2：S0.8"分歧率 < 5%"是一个未定义统计口径的单一标量，拆成三项**：
+  ①cluster assignment divergence（含 Ward 事件）——用已有的
+  `scan_op_log`/`resolve_final_slots` 解析出每个 token 的 `(slot,epoch)`
+  最终身份，因为槽号在两条路径下不保证对齐，改用成对共簇一致率
+  （pairwise co-assignment agreement）而不是直接比较槽号，Ward 事件的
+  合并候选对单独比较、不并进这个一致率里被平均掉；②segment/PAD
+  overhead——`segment_count_ratio`/`pad_entry_ratio`，预期方向确定
+  （`p_hi_c` 批内冻结只会让批量路径多开 segment，不会少开），报告"大多少"
+  而非"有没有偏差"；③最终 cache/readout 差异——两条路径的 ladder 在按
+  ①的身份对齐之后比较相对误差，或直接比较一次 attention 读出的相对 L2
+  误差，这是唯一直接回答"近似值不值得用"的一项，**决策门只挂在这一项**
+  （<5%）。①②是诊断信号，用于在③超标时决定修法：cluster assignment/Ward
+  事件分歧主导时收紧 Phase 1 近似（如缩小 flush 粒度）；segment/PAD
+  overhead 主导且①本身一致率高时按 §5.4"批量路由留下的一个未解决风险"
+  那节的方向，给 `p_hi_c` 加按簇分组的前缀扫描，而不是缩小 flush 粒度
+  （对这类分歧没有针对性，代价却是实打实的）；`γ` 更保守只在分歧确实由
+  centroid 冻结导致漂移过大时对症，不是对所有分歧类型都有效的旋钮。
+  `experiments.md` §6 的 S0.8 行与决策门、`algorithm-spec.md` §5.4 里
+  引用 S0.8 的地方同步更新。
 
 - **2026-08-14｜第十轮核实：解决"op_log 跨 Phase 顺序"这个此前一直没钉死的
   根本问题——主操作改成显式携带 `token_idx`，不再靠隐式位置对应原始 token；
