@@ -469,6 +469,94 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第二十一轮核实：修掉 S0.8 3b 伪代码的调用签名/张量
+  维度两处会直接阻塞实现的 bug，补上 `dedup_anchors` 输出到
+  `log_kv_slot_attention` 输入之间缺失的 per-entry→per-virtual-slot
+  广播契约，钉死此前一直是黑盒的 `relative_l2` 定义，给 Ward scanner
+  补上"新簇是否复用了刚释放的槽"这一校验，把 Stage 0"1 次 GPU dump +
+  全部 CPU 分析"的两阶段划分与 3b 的"`q_tail` 不落盘"显式对齐，并给
+  成对共簇一致率补上 ARI + same-cluster precision/recall/F1。** 动机：
+  用户对第二十轮的修复复核，指出上一轮清掉了"3b 混入 dense ground
+  truth"这个概念性 P0 之后，剩下的是更底层的可执行性问题——伪代码字面
+  拿去实现会直接报错或悄悄传错参数，这类"方向对了、细节仍然错"的 bug
+  同样危险。逐条结论：
+  ① **P0：3b 调用 `log_kv_slot_attention` 时把 `get_attention_state()`
+  的返回值整个展开成位置参数，与真实签名对不上。** 签名是 `(q, slot_k,
+  slot_v, slot_w, scale, mask=None, causal_tail=0, slot_valid=None,
+  M_s=None, ...)`——`scale` 是第 5 个位置参数，排在 `slot_w` 之后、
+  `mask` 之前；`slot_valid`/`M_s` 是更靠后的具名参数。上一版
+  `log_kv_slot_attention(q_tail, *cache.get_attention_state(),
+  causal_tail=...)` 把 5 元组 `(slot_k,slot_v,slot_w,slot_valid,M_s)`
+  展开后，第 4、5 个位置会把 `slot_valid` 误传成 `scale`、`M_s` 误传成
+  `mask`，两者类型都不对，真正的 `slot_valid`/`M_s` 反而没被传上。
+  **修法**：显式拆包 `slot_k, slot_v, slot_w, slot_valid, M_s =
+  cache.get_attention_state()`，`scale` 复用 mechanism B 循环里已有的
+  同一个 `scale`，`slot_valid`/`M_s` 按关键字传递（`experiments.md`
+  S0.8 3b 一节）。
+  ② **P0：`q_tail` 的组装伪代码按错了轴索引，且缺 batch 维。**
+  `q_roped` 是 `(nh,T,hs)`（dump 约定省略 batch 维），但
+  `len(query_block)` 在 PyTorch 张量上返回的是 `shape[0]`（即 `nh`）
+  而不是这一块的 T 长度，`abs_idx`/`block_start` 全部算错；
+  `query_block[tail_mask]` 同样按 dim 0（`nh` 轴）索引，和长度为 T 的
+  `tail_mask` 对不上，多数情况下会直接因形状不匹配报错。**修法**：
+  改用 `query_block.shape[1]` 取真实 T 长度，`query_block[:, tail_mask,
+  :]` 按 T 轴（dim 1）取子集；`q_tail` 拼出的
+  `(nh, tail_query_count, hs)` 还需 `.unsqueeze(0)` 补回
+  `log_kv_slot_attention` 要求的显式 `(B, nh, T_q, k_dim)`。
+  ③ **P1：`dedup_anchors` 的输出 `M`（per-entry，`(...,S)`）和
+  `log_kv_slot_attention` 需要的 `M_s`（per-virtual-slot，
+  `(B,G,S_pooled)`，`S_pooled=S·3`）之间，此前没有任何代码或文字把
+  这一步展开写清楚。** 补上 `algorithm-spec.md` §5.14 新增小节：`v̄`/
+  `w`/`M` 三者都是"entry 级、不随锚点变化"的量，各自
+  `unsqueeze(-1/-2).expand(...,3)` 广播到 3 个虚拟槽（每个虚拟槽拿到
+  同一个标量，不能拆分成三份分别赋值——那样会让 `log(w/M)` 在虚拟槽
+  维度上被重复稀释），再与 `slot_k`（来自 `materialize_anchor_keys`，
+  天然是 `(...,S,3,k_dim)`，每个虚拟槽因锚点不同而不同）、`slot_valid`
+  用同一次 flatten 合并 `(S,3)` 两维成 `S_pooled`，保证顺序对齐。
+  **自查发现并修正了草稿中的一处指标错误**：`S_pooled` 最初写成
+  `anchors.shape[-3]`，但 `anchors` 形状是 `(...,S,3)`，倒数第三维是
+  `S` 之前的那一维（通常是 `G`），不是 `S`——改用 `w.shape[-1]`（`w`
+  形状 `(...,S)`，末维无歧义就是 `S`），避免负索引数错。
+  ④ **P2：`relative_l2` 此前只是一个从未定义的函数名，直接用在硬性
+  决策门（<5%）上。** 补上精确定义：误差在 fp32 里算（避免 fp16 舍入
+  噪声和真实信号量级相当）；分母固定取 `‖out_serial‖`（严格串行参考
+  是这次比较的真值，不是对称范数）；`eps` 只防止分母接近零时除零；
+  范数按 `(tail_query_count, v_dim)` 联合展平后取，返回 `(B, nh)`，
+  不在函数内部跨 head/layer 平均——呼应 §2.5"贯穿性硬要求"，3b 的
+  <5% 决策门同样要逐 (layer, head) 判定，不能被好头平均掉坏头。
+  ⑤ **P1：Ward scanner 只校验"紧跟的是不是 `NEW_CLUSTER` 类型"，没
+  校验"这个 `NEW_CLUSTER` 用的是不是刚释放出来的那个槽"。** §5.4
+  Phase 2 步骤 4 的既有约定是 `slot_idx = free_slot`，若上游路由/日志
+  代码有 bug 让 `WARD_MERGE` 后紧跟的 `NEW_CLUSTER` 落在了别的槽上，
+  原有检查（只看 `op.type`）不会发现，`trigger_token_idx` 会被安到
+  一个不相关的 token 上，产出的 `WardEvent` 表面合法、实际张冠李戴。
+  补 `assert op.cluster == pending.free_identity[0]`，和类型检查放在
+  同一处、同等严格。
+  ⑥ **P1：Stage 0 顶层"1 次 GPU dump + 全部 CPU 分析"的两阶段划分，
+  与 3b"`q_tail` 不落盘、用完即弃"的既有决定没有显式对齐，独立的
+  后处理脚本理论上拿不到 q。** 补充：这个两阶段划分对 S0.0–S0.7 及
+  S0.8 的第 1/2/3a 项精确成立（只吃已落盘的 `k_raw`/`v`/`pos`/
+  `attn_mass_by_dist`，随时可用独立 CPU 脚本重跑）；**3b 是唯一的
+  例外**——它的读出比较必须在 GPU dump 那个进程内、`q_tail` 还没被
+  丢弃时就地完成（mechanism A 给出 `k_raw`/`v` 后，紧跟 mechanism B
+  凑齐 `q_tail`，立即在同一调用栈里跑 CPU 参考实现构造
+  `cache_batch`/`cache_serial` 并做读出比较，然后才能丢弃
+  `q_tail`），不能是一个独立于 dump 的后处理脚本。
+  ⑦ **P2：cluster assignment 的成对共簇一致率（Rand Index 风格）会被
+  "两条路径都判不同簇"这一类 pair 结构性撑高，掩盖真实分歧。**
+  用 `K_max=15`（32k 默认）代入独立随机模型算出：即便两条路径的聚类
+  完全独立无关，raw agreement 期望也能到 ≈87.6%（这正是 Rand Index
+  发明 Adjusted Rand Index 的原始动机）。补上 ARI（用同一张列联表
+  免费算出，不需要额外遍历）与 same-cluster 口径的
+  precision/recall/F1（能看出分歧偏向"过度合并"还是"过度拆分"），
+  四组数字一起报告，不用一个代替另一个。
+  ⑧ 用户重申代码仍处于纯规格阶段——独立重新扫了
+  `litgpt/`、`tests/`（124 个 `.py` 文件）里的
+  `SemanticLogKV`/`log_kv_semantic_clusters`/`slot_valid`/
+  `WARD_EVENT_SKETCH_K`/`scan_op_log_for_ward_events`/`dedup_anchors`
+  等关键词，确认零匹配，核实与 CLAUDE.md §0 已有声明一致，不需要
+  改动，仅在此确认。
+
 - **2026-08-19｜第二十轮核实：删掉第二轮起混进 3b 的一处 P0 自相
   矛盾——"稠密侧 ground truth"从来不是 3b 的比较对象，3b 自始至终是
   批量近似 cache 与严格串行参考 cache 互相比较——顺带把 `q_tail` 的
