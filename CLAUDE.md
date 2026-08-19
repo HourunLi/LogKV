@@ -469,6 +469,37 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第十六轮核实：修 `docs/position.md` §P8.4"弱学习：learned
+  anchor bias"公式漏掉的 `/M_s`，其余四点核对结论是"已在上一轮修过、还没
+  合并"。** 动机：用户对照远端仓库逐条复核，指出的前四点（co-assignment
+  标签、S0.8 3b 统计口径、`scan_op_log_for_ward_events` 的 `pending` 状态、
+  Phase 3a 残留的"逐位对拍"措辞+`atol`）和第十五轮已经修过的四处完全对应。
+  **核实结论：这四处在本分支（`claude/cool-fermi-vjbb7n`，含第十五轮的
+  commit）里都已经是修过的状态**——逐条对照当前文件内容确认：
+  `experiments.md` 的 co-assignment 标签已钉死"必须是 `resolve_final_
+  slots` 解析后的最终槽号"；S0.8 3b 已经是"整条序列处理完后的单次测量"
+  加精确定义的尾部 query block；`scan_op_log_for_ward_events` 已经有
+  `initial_pending` 参数和对应的返回值；Phase 3a 的"正确性验证复用已有的
+  测试"一段已经改成"按该条给出的比较口径"，容差公式也已经带 `atol`。
+  用户看到的旧状态是因为**上一轮（第十五轮）的 commit 还停留在未合并的
+  PR 上**，`semanticLogKV` 分支当时还是第十四轮的状态——不是回归，是
+  评审快照落后于分支。这四点本轮不再重复修改，只在这里记一笔核对结论，
+  留给下次合并后自然对齐。
+  **第五点是新问题，已修**：`docs/position.md` §P8.4"弱学习：learned
+  anchor bias"的公式写的是 `score_{s,a} = q·R(p_a)k_s + λ log(w_s) +
+  b_a(entry_stats)`——`log(w_s)` 漏了 `/M_s`，和同一份文件 §P5.2 刚证明
+  过的"这不是调参项、是正确性修正"直接矛盾：一个 entry 展开成 `M_s` 个
+  anchor 时若每个都用未除过 `M_s` 的 `log(w_s)`，softmax 总质量会被静默
+  放大约 `M_s` 倍，多 anchor 的 entry（大跨度 entry）会系统性占到不该有
+  的额外注意力质量。**修法**：改成 `λ log(w_s/M_s) + b_a(entry_stats)`，
+  并补一句说明 `b_a` 和 `/M_s` 是两件独立的事——`b_a` 是在已经修正过的
+  mass bias 之上**额外**学到的 logit 偏置，不能也不该被指望去替代
+  `/M_s` 这个归一化（`b_a` 只吃单个 entry 自己的 `entry_stats`，不知道
+  其它 anchor 的存在，没有信息量学出一个跨 anchor 的归一化项）。扫了一遍
+  `position.md` 其余 `log(w...)` 出现的地方，其它全部已经正确带 `/M`
+  （包括两处特意写错误形式 `log(w)`/`log(w_s)` 来举反例的地方，不是
+  同类 bug，不需要改）。
+
 - **2026-08-19｜第十五轮核实：把 pairwise co-assignment 的标签钉死为
   `resolve_final_slots` 解析后的最终身份（不能用原始 `(slot,epoch)`）、
   拍死 S0.8 3b 是"整条序列处理完后的单次测量"并精确定义尾部 query block、
