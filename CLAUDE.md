@@ -469,6 +469,79 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第十二轮核实：厘清 `record_op_log=False` 下本地 op 缓冲的
+  构建/持久化边界、把 Phase 2 的 orphan 判定钉死为"批内冻结、不随 Phase 3a
+  的 metadata 更新重判"、把 S0.1 的 Ward 场景参考实现从"只吃主操作"改成
+  "吃完整 op 序列"、并给出 Phase 3a 的 `n_eff`/`centroid` 向量化更新此前
+  缺失的仿射扫描推导。** 动机：用户对照 `algorithm-spec.md`（HEAD
+  `3aca2dc`）逐条核实，指出三处 P1、一处 P2——均属于"接口边界和实现公式
+  还没钉死"，不是大方向错误。逐条结论：
+  ① **P1：`record_op_log=False` 和"本地 op 缓冲"此前自相矛盾。** §5.4
+  通篇（Phase 1/2/3 的伪代码）假设本地缓冲无条件存在、由 Phase 3a/3b
+  消费去驱动 metadata 更新、Ward 合并候选选择、ladder 物理写入；但
+  §5.21 的 `record_op_log` 门控代码块把 `append_ops_to_local_buffer`
+  整体挂在 `if record_op_log` 之下，字面读会让推理路径的 Phase 3a 无 op
+  可读，路由机制直接失效。**决定：本地缓冲（含它驱动的全部路由、
+  metadata 更新、ladder 物理写入）在训练/推理两条路径上无条件构建和
+  消费，不受 `record_op_log` 影响；`record_op_log` 唯一门控的是这一批
+  处理完之后，要不要把已经写满的本地缓冲整体提交进跨批持久的
+  `op_log`（供 backward 重放）——这一步在推理路径上跳过，本地缓冲随即
+  被丢弃/被下一批复用，不留任何持久状态。** 本地缓冲自身很小
+  （`local_op_cap=4×flush_granularity`，默认 512 行 int32、约 8KB），
+  两条路径都构建它的开销可忽略，不会重新引入 448MB 那笔训练专属账目。
+  §5.4"本地缓冲 vs 持久 op_log"一节补一条更正框，§5.21 的门控伪代码从
+  "整体挂 if record_op_log"改成"路由/metadata/ladder 写入 unconditional，
+  只有『提交进持久 op_log』这一步挂 if record_op_log"。
+  ② **P1：Phase 3a 更新 metadata 后，Phase 2 是否重新判断 orphan 此前
+  未钉死。** Phase 1 用批前冻结的 centroid 算出 `c*[t]`/`s*[t]`，据此把
+  token 分成 direct/orphan；Phase 3a 随后更新 centroid；若 Phase 2 处理
+  orphan 时用更新后的 centroid 重新判断，可能让某个 orphan 相对新
+  centroid 已经 `≤λ_new`——但允许它转投一个本批 Phase 1 也在写的既有簇 X，
+  会把这条 `JOIN` 排到 X 在本地缓冲里全部 Phase 1 成员的物理顺序**之后**
+  （因为"Phase 1 整组先写、Phase 2 整组后写"），直接违反"同一逻辑簇的
+  主操作必须按真实到达顺序出现"这条契约，并击穿§5.4"为什么 Phase1 先于
+  Phase2 满足三条契约"那节证明依赖的前提。**决定：冻结。** `s*[t]`/
+  `c*[t]`/direct-orphan 划分只在 Phase 1 计算一次，Phase 3a 更新后的
+  metadata 只喂 Phase 2 的 Ward 代价计算和 Phase 3b 自己的在线更新，绝不
+  重新拿去判断某个 orphan 该不该转投现有簇——这是"Phase 1 冻结 centroid
+  是一个已知近似，S0.8 测"这条既有框架的直接延伸，不是新的近似类别。
+  §5.4 的 Phase 1/3a/2 伪代码块、"为什么满足三条契约"一节分别补一句
+  钉死这一点。
+  ③ **P1：S0.1 的 Ward 场景参考实现描述不完整，只喂"主操作序列"验证不了
+  它本该验证的东西。** 原文让参考实现"把本批最终本地缓冲里原样的主操作
+  序列喂给一个……逐簇顺序重算的参考实现"，但 `WARD_MERGE` 是结构操作、
+  不在"主操作"之列——参考实现看不到它，就既无法把被合并簇（`free_slot`）
+  批内收到的贡献并入 `keep_slot`（断言 (i) 需要），也无法在复用槽位建新
+  簇前清空旧内容（断言 (ii) 需要），而验证这两条正是这条测试存在的全部
+  意义。**修法**：参考实现改为按物理顺序走完整本地缓冲（主操作 +
+  `WARD_MERGE`，`PAD_INSERT`/`CARRY` 对 metadata 无影响可跳过），遇到
+  `WARD_MERGE(keep,free)` 时对自己的 scratch 状态套用和 `ward_merge_only`
+  步骤 1 完全相同的合并公式，再把 `free` 的 scratch 清零——不需要引入
+  `derive_final_cluster` 那套 `(slot,epoch)` 版本化身份，因为这是一次
+  真正按时间顺序执行的模拟（不是跳过时间顺序的离线并查集派生），"遇到
+  NEW_CLUSTER 就清零"天然处理了槽位复用。本质上是把 backward 重放循环
+  （§5.21-2）的 `append_to_ladder`/`ward_merge_only` 换成对 metadata 的
+  操作，同一个模式。
+  ④ **P2：Phase 3a 的 `n_eff`/`centroid` 向量化公式此前只说"复用
+  pad-count 的 segmented reset scan 技巧"，这个类比是错的，补上实际
+  推导。** `PAD_INSERT` 的重置落在一个固定值（mod 计数器精确回到 1），
+  "距离上一次重置几步"这个无状态相对量就够了；但 `n_eff` 的 `γ` 衰减是
+  把历史打折扣、不是清零（`n_eff_pre←γ·n_eff`），衰减后的值依然依赖
+  衰减前的完整历史，"steps_since"这类单层查询在这里不成立。**补上的
+  推导**：先识别出五个待更新字段里 `n_total`/`p_hi_c`/`current_segment`
+  其实是平凡的分组归约（不需要扫描，直接复用已有的 `rank`/`nsg_incl` 取
+  组内最后一个成员）；只有 `n_eff`/`centroid` 需要真正的扫描——把逐成员
+  递推看成仿射变换的复合（`x↦d[t]·x+常数项`，`d[t]=γ` 或 `1`），复合
+  满足结合律，可以用固定 `⌈log₂flush_granularity⌉` 轮的 Hillis-Steele
+  掩码扫描算出（三元组 `(A,Bn,S)` 及合并公式已给出），和 §5.21-3 的
+  `_binary_carry` 是同一类"结合律换并行"技巧，只是幺半群从二进制进位
+  换成仿射复合。**特别指出**：这个仿射复合不是现成库原语（不同于
+  `nsg_incl` 依赖的原生 segmented cumsum/max），需要手写扫描；也指出了
+  为什么不用负指数闭式解——病态批次会算出 `γ^{-128}` 量级的中间值，
+  逼近 fp32 溢出边界，扫描全程只做有界量的乘加，规避了这个风险。不需要
+  新增单测，§5.4 已有的 Phase 3a/3b 元数据对拍单测（③修完之后）天然
+  覆盖这条公式对不对。
+
 - **2026-08-19｜第十一轮核实：解决"Phase 3 批末运行"这个此前一直没被注意到的
   P0——它和"Ward 合并不受限、op_log 永不改写"这两条上一轮才证明成立的设计
   互相冲突；同时把训练期 `op_log` 显存账目精确到"per in-flight forward"、
