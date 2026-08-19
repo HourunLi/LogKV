@@ -469,6 +469,84 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第二十轮核实：删掉第二轮起混进 3b 的一处 P0 自相
+  矛盾——"稠密侧 ground truth"从来不是 3b 的比较对象，3b 自始至终是
+  批量近似 cache 与严格串行参考 cache 互相比较——顺带把 `q_tail` 的
+  组装方式从"裸切片"改成跨 mechanism B 分块循环累积，补上 CPU 参考
+  实现必须真正维护 recent window（不能只做 op_log 重放）的要求，给
+  `slot_valid`/`M_s` 补上断言级的 shape 契约，给 Ward scanner 补上
+  self-merge 防御，并集中列全 Stage 0 manifest 的必需字段。** 动机：
+  用户这轮重新拉取 `origin/semanticLogKV` 复核前几轮的 3b/S0.8 修法，
+  指出最要命的一处是"3b 到底比较谁"这个定义本身自相矛盾——这类"两处
+  互相矛盾的表述都各自看起来合理"的 bug 比单处错误更危险，因为读者
+  可能只看到其中一处就信以为真。逐条结论：
+  ① **P0：3b 的定义存在两个互相矛盾的版本，根源是第二轮引入
+  `causal_tail` 修法时，把"3b 蹭 mechanism B 的循环拿 `q_roped`"和
+  "3b 拿 mechanism B 算出的 dense score/probs 当比较对象"这两件不
+  相关的事混成了一件。** 3b 从条目定义（本节最上面、S0.8 的条目
+  说明）起就只说"批量路径与严格串行参考给出的注意力输出的相对 L2
+  误差"——两个压缩 cache 互相比较，不涉及任何稠密 attention。但第
+  十八轮为了修因果性漏洞，在下面新增了"稠密侧（mechanism B 给出的
+  ground truth）...用来算 3b 的分子/分母另一半"，把 mechanism B 的
+  dense 计算错误地拉进了 3b 的比较对象里，与条目定义直接冲突，两处
+  同时挂在文档里、都读起来像是权威定义。**这处矛盾同时让"dense
+  readout（`out_dense=probs@v`、GQA 展开、dtype/softcap 口径）要不要
+  补全"这个问题看起来是真问题**——如果 3b 真的需要 dense 端参与比较，
+  mechanism B 现有伪代码（只算到 `probs`，从不算 `out_dense`）确实
+  不完整；但一旦确认 3b 从不吃 dense 读出结果，这个问题就不存在，
+  `attn_mass_by_dist` 需要的只是 `probs` 本身，mechanism B 对它自己
+  的目的一直是完整的。**修法**：删掉"稠密侧...另一半"那一整段设计
+  （不是改措辞），`q_tail` 只从 mechanism B 循环里"顺路"累积（省一次
+  重复算 RoPE 的开销），mechanism B 自己的 `scores`/`probs`/
+  `attn_mass_by_dist` 全程只服务它自己的目的（§13.2），3b 拿到完整
+  `q_tail` 后在循环**外面**独立对两个压缩 cache 各做一次
+  `log_kv_slot_attention` 读出、互相比较，和 mechanism B 的 dense
+  计算没有任何关系。
+  ② **P1（①的直接推论）：`tail_query_count > block_size` 时压缩侧
+  需要整批 `q_tail`，但上一版的伪代码是 `q_roped[T-tail_query_count:T]`
+  这样的裸切片，隐含假设 `q_roped` 整条可用——和"`q_roped` 分块用完
+  即弃、不整块落盘"这条既定原则矛盾。** 改成在 mechanism B 循环内部
+  按 `tail_mask` 逐块把命中的 query 追加进 `q_tail_parts`，循环结束后
+  一次性 `cat`——不要求 `tail_query_count ≤ block_size`，也不需要为
+  3b 单独引入 ring buffer；`block_size` 因此不影响 3b 的任何输出值
+  （`k_expanded` 从不按 `block_size` 切片，`softmax` 永远在完整 key
+  维度上做），只影响凑齐 `q_tail` 要跑几次循环，不需要和
+  `tail_query_count` 一起进复现实验的必需 metadata。
+  ③ **P1：`recent_count ≥ tail_query_count` 这条前提能否成立，取决于
+  CPU 参考实现是否真的维护了一个忠实的 recent window 缓冲，但文档
+  之前没有显式要求这一点。** 若某个批量近似/严格串行 CPU 实现图省事，
+  只保留压缩层级或者只靠 `op_log` 重放去重建 pooled 部分，
+  `recent_count` 就没有对应的真实状态可查，断言要么执行不了要么查到
+  假值，产出一个"看起来能跑但因果尾部已经错位"的 cache。补一条显式
+  要求：两条 CPU 参考实现都必须复刻"滑窗、按到达顺序追加、溢出时把
+  最老的 `flush_granularity` 个 token 推出去做压缩"这条既有语义（同
+  CLAUDE.md §10），S0.1 用到的同一套参考实现同样适用，不是 3b 专属的
+  新增负担。
+  ④ **P2：`slot_valid`/`M_s` 的 shape 约束只在 docstring 里散见几句，
+  没有断言级的钉死。** 补齐四条：`S_pooled≤S_total`；
+  `S_total−S_pooled≥causal_tail`（等号是 `recent_count==tail_query_
+  count` 的情形，大于号是 recent window 里还有比尾部窗口更早内容的
+  情形，两种都要处理）；`w=0⟹slot_valid=False` 是单向蕴含，不是
+  等价（有效 entry 内部去重掉的锚点槽同样 `slot_valid=False`，不能
+  被误读成"该 entry 无效"）；exact 后缀由调用方（`get_attention_
+  state()` 的构造本身）保证 `w` 恒为 1，函数不反过来校验这一点。
+  ⑤ **P2：Ward scanner 的 `WARD_MERGE` 分支没有防御 `keep_v==free_v`
+  的 self-merge。** 生产路由的代价矩阵会 mask 对角线排除这种情况
+  （§5.6），但 scanner 处理的是 op_log，不该假设日志一定合法——不挡
+  住的话会静默腐化状态：`sizes[keep_v]=keep_size+free_size` 把同一
+  身份的计数翻倍，紧接着 `sketches.pop(free_v)`/`sizes.pop(free_v)`
+  又把刚更新的条目整个删掉，自合并被静默转换成状态丢失。补
+  `assert keep_v != free_v`，在合并逻辑执行前现场报错。
+  ⑥ **P2：Stage 0 manifest 的字段列表分散在多处新增，没有集中维护，
+  容易漏记。** 把 `tail_query_count`（3b 必需）、MinHash 三元组
+  `hash_algorithm`/`k`/`master_seed`（Ward 事件 Jaccard 必需）和已有
+  的 `s_h` 标定值集中列进"落盘格式"一节的 manifest schema；同时明确
+  `block_size` **不**属于这份必需清单（见②的论证），避免过度收紧。
+  ⑦ 用户额外指出代码仍处于纯规格阶段（`litgpt/`、`tests/`、
+  `demo.py`、`eval.py`、`exp/` 扫描 `SemanticLogKV`/`M_s`/`slot_valid`/
+  `WARD_EVENT_SKETCH_K` 等关键词零匹配）——核实与 CLAUDE.md §0 已有
+  声明一致，不是新发现，不需要改动，仅在此确认。
+
 - **2026-08-19｜第十九轮核实：修 3b 压缩侧读出伪代码里两个自己引入的
   P0——忘了把尾部 exact token 真正拼进 slot 张量导致 `causal_tail` 遮错
   对象、且和 `get_attention_state()` 已经包含 recent window 这件事撞在

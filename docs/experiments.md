@@ -116,9 +116,29 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   eval 用的是同一份**，否则 S0.3 的隔离率统计全是噪声；
 - 复用另一分支 `log_kv_pin_diag.py` 已有的定位逻辑，不要重写。
 
-**落盘格式**：每层一个 `.npy`（或单个 `.npz`），外加一份 JSON manifest 记录：
-prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、模型 config hash、
-**以及 §5.21-4 的 `s_h` 标定值**。manifest 是后续所有分析的唯一真相来源。
+**落盘格式**：每层一个 `.npy`（或单个 `.npz`），外加一份 JSON manifest。
+**manifest 是后续所有分析的唯一真相来源，schema 必须在这里集中列全，
+不能散落在各处分析里各自约定各自需要的字段**——本文档后文陆续为不同
+分析引入了新的必需字段，不集中到这一处很容易漏记，导致复现实验时缺
+某个字段而不自知：
+
+- 基础信息：prompt id、tokenizer、序列长度、needle 的 token span、
+  层/头索引、模型 config hash；
+- **`s_h` 标定值**（§5.21-4）；
+- **`tail_query_count`**（S0.8 3b 的尾部窗口大小，见下方 S0.8 一节）
+  ——直接影响 3b 那个 5% 数字本身，是复现它**必需**的字段；
+- **MinHash 三元组：`hash_algorithm`（`"splitmix64-v1"`）、`k`
+  （即 `WARD_EVENT_SKETCH_K`）、`master_seed`**（`algorithm-spec.md`
+  §5.4"S0.8 的 Ward 事件比较需要合并前的成员快照"一节）——三者共同
+  决定两次 dump 的 Ward 事件 Jaccard 估计是否可比，缺一都不算完整
+  复现。
+
+  `block_size`（机制 B 的分块粒度）**不属于这份"必需复现"清单**：
+  `k_expanded` 从不按 `block_size` 切片，`softmax` 永远在完整 key
+  维度上做，改 `block_size` 不改变 `attn_mass_by_dist` 或 3b 的任何
+  输出值，只改变跑多快、峰值内存多大——记录它对调优/复现运行时表现
+  有用，但缺了它不影响"能不能认定复现了同一个实验结果"，不要和上面
+  几个字段混进同一个"必需"清单里。
 
 | 编号 | 测什么 | 为什么 |
 |---|---|---|
@@ -380,6 +400,22 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
        > `recent_size` 默认 1024，正常情况下这条断言天然满足，只有
        > 病态/边界配置才会触发。
        >
+       > **CPU 参考实现必须真正维护一个 recent window 缓冲区，不能只做
+       > `op_log` 重放/只保留压缩后的层级。** `recent_count`/
+       > `get_attention_state()` 这条前提能不能立住，取决于两条模拟
+       > 路径（批量近似、严格串行参考）各自的 CPU 实现是否忠实复刻了
+       > "滑窗、按到达顺序追加、溢出时把最老的 `flush_granularity` 个
+       > token 推出去做压缩"这条既有语义（同 CLAUDE.md §10"现有 recent
+       > window 溢出即驱逐的语义"）——如果某个实现图省事，只维护"最终
+       > 压缩层级"，或者只靠 `op_log` 重放去重建 pooled 部分而不单独
+       > 维护一段忠实的 recent-window 缓冲，`recent_count` 这个量就没有
+       > 对应的真实状态可查：上面的断言要么无法执行，要么执行了但查到
+       > 的是一个不代表真实滑窗状态的值——产出一个"看起来能跑"但因果
+       > 尾部已经错位的 cache，且没有任何报错信号提示这一点。这条要求
+       > 同样适用于 S0.1 用到的同一套 CPU 参考实现（§5.4"必须补的
+       > 单测"），不是 3b 专属的新增负担，只是把已经隐含的要求显式
+       > 写出来。
+       >
        > **更正（这一轮修的，P0）：具体做法上一版还有两个坑，不是加了
        > `causal_tail` 就完事。** ①**忘了真正拼接 in-flight chunk，
        > `causal_tail` 会遮错对象**：上一版手工算出
@@ -413,66 +449,90 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
        > 较早的 recent token"，"无条件可见"这条假设的前提对它们从未
        > 被违反过。
        >
+       > **更正（这一轮修的，P0）：3b 的比较对象一度被错误地混进了"稠密
+       > 侧 ground truth"，必须收回，不是措辞问题，是要删掉一整段设计。**
+       > 上一版在这里加了"稠密侧（mechanism B 给出的 ground truth）...
+       > 用来算 3b 的分子/分母另一半"——这和 3b 从一开始的定义（本节
+       > 最上面："比较批量路径与严格串行参考给出的注意力输出的相对 L2
+       > 误差"；S0.8 的条目定义同样只说"批量化路由与严格串行版的分歧率"）
+       > 直接矛盾：**3b 比较的自始至终是两个压缩 cache（批量近似、严格
+       > 串行参考）各自的读出结果，不涉及任何稠密 attention 输出。**
+       > 这处矛盾的根源是把两件不相关的事混成了一件——"3b 蹭机制 B 的
+       > 循环拿 `q_roped`，省一次重复算 RoPE 的开销"和"3b 拿机制 B 算出
+       > 的 dense score/probs 当比较对象"——前者是设计里一直都有的，
+       > 后者从来不是。**修法**：`q_tail` 只从机制 B 循环里"顺路"累积，
+       > 机制 B 自己的 `scores`/`probs`/`attn_mass_by_dist` 全程只服务
+       > 它自己原来的目的（§13.2 的距离-质量曲线），3b 拿到完整
+       > `q_tail` 之后在循环**外面**独立做两次压缩侧读出、互相比较，和
+       > 机制 B 的 dense 计算结果没有任何关系：
+       >
        > ```python
-       > assert cache.recent_count >= tail_query_count   # 前提，两条路径各查一次
-       > slot_k, slot_v, slot_w, slot_valid, M_s = cache.get_attention_state()
-       >     # 压缩 levels + 完整 recent window；尾部窗口已经是它的最后
-       >     # tail_query_count 个位置，不需要另外构造/拼接
-       > q_tail = q_roped[T-tail_query_count:T]   # 唯一需要额外切的东西——
-       >                                            # q 不在 cache 状态里
-       > out_compressed = log_kv_slot_attention(
-       >     q_tail, slot_k, slot_v, slot_w, scale,   # slot_k/v/w 原样传，
-       >     causal_tail=tail_query_count,              # 不手工重建、不手工
-       >     slot_valid=slot_valid, M_s=M_s,            # 拼接、不在调用前
-       > )                                               # 除以 M_s——这些
-       >                                                  # 都是函数自己算的
-       >                                                  # （M_s/slot_valid
-       >                                                  # 只覆盖压缩
-       >                                                  # levels 那段
-       >                                                  # 前缀，recent
-       >                                                  # window 部分
-       >                                                  # 隐式 M=1，见
-       >                                                  # §5.14 表 B）
+       > q_tail_parts = []
+       > for query_block in chunks(q_roped, block_size):   # 机制 B 已经在跑
+       >                                                      # 的循环，不
+       >                                                      # 新增一次遍历
+       >     ...（attn_mass_by_dist 的既有累积，见"Stage 0 dump 规格"，原样不变）...
+       >     abs_idx = block_start + arange(len(query_block))
+       >     tail_mask = abs_idx >= T - tail_query_count
+       >     if tail_mask.any():
+       >         q_tail_parts.append(query_block[tail_mask])   # 可能跨不止
+       >                                                          # 一块，也
+       >                                                          # 可能只是
+       >                                                          # 某一块的
+       >                                                          # 一部分，
+       >                                                          # 两种情形
+       >                                                          # 都正确
+       >                                                          # 累积
+       >     block_start += len(query_block)
+       >
+       > q_tail = torch.cat(q_tail_parts, dim=-2)   # 循环结束后才拼成完整的
+       >     # (nh, tail_query_count, hs)；3b 的两次 log_kv_slot_attention
+       >     # 调用在循环外面、只做一次，不逐块调用
+       > assert cache_batch.recent_count  >= tail_query_count   # 前提，两条
+       > assert cache_serial.recent_count >= tail_query_count   # 路径各查一次
+       > out_batch = log_kv_slot_attention(
+       >     q_tail, *cache_batch.get_attention_state(),   # (slot_k,slot_v,
+       >     causal_tail=tail_query_count,                   # slot_w,slot_valid,
+       > )                                                    # M_s) 原样传，不
+       > out_serial = log_kv_slot_attention(                  # 手工重建、不拼接
+       >     q_tail, *cache_serial.get_attention_state(),
+       >     causal_tail=tail_query_count,
+       > )
+       > error_3b = relative_l2(out_batch, out_serial)   # 3b 的分子/分母；
+       >                                                    # 两次调用用的是
+       >                                                    # 同一个 q_tail
        > ```
        >
-       > 这不只是修正因果性，顺带也回答了"3b 的压缩侧读出要不要和生产
-       > 路径逐项对齐（GQA 折叠、`slot_valid`、`M_s`、`λ log(w/M)`、
-       > fp32 分数缓冲）"这个单独提过的问题——**直接、原样传递生产函数
-       > `get_attention_state()` 的返回值给 `log_kv_slot_attention`，
-       > 不做任何手工重建或平行实现**，这些细节全部自动保持一致，不
-       > 需要在这里重新枚举、也不会因为文档和代码各自演化而漂移。
+       > 这也顺带回答了"dense readout（`out_dense=probs@v`、GQA 展开、
+       > dtype/softcap 口径）要不要补全"这个单独提过的问题——**不需要**，
+       > 因为 3b 从来不吃 dense 的最终读出结果，`attn_mass_by_dist` 需要
+       > 的只是 `probs` 本身（分桶累加），机制 B 现有伪代码对它自己的
+       > 目的已经是完整的，缺的从来不是 dense readout 公式，是"3b 不该
+       > 向它要东西"这条边界。压缩侧两次调用**直接、原样传递生产函数
+       > `get_attention_state()` 的返回值给 `log_kv_slot_attention`，不
+       > 做任何手工重建或平行实现**（GQA 折叠、`slot_valid`、`M_s`、
+       > `λ log(w/M)`、fp32 分数缓冲这些细节因此全部自动保持一致，不
+       > 需要在这里重新枚举）。
        >
-       > **稠密侧（mechanism B 给出的 ground truth）不受这次更正
-       > 影响**：它的 `causal_mask(scores)` 这一步（"Stage 0 dump 规格"
-       > 机制 B 伪代码第 3 行）本来就是逐 query 位置精确因果的，从第
-       > 一版开始就没有这个 bug，只是此前压缩侧没有对齐它。稠密侧继续
-       > 走下面的 `block_size` 分块循环 + `tail_mask`，用来算 3b 的
-       > 分子/分母另一半。
-       >
-       > 机制 B 原有的按 `block_size` 分块的循环结构不变（它服务的是
-       > 内存/计算峰值控制，和 `attn_mass_by_dist` 的其它职责一样）；3b
-       > 稠密侧的累积逻辑在这个既有循环内部新增一个与块边界无关的
-       > 掩码：对每个 `query_block`，取
-       > `abs_idx = block_start + arange(len(query_block))`，
-       > `tail_mask = abs_idx >= T - tail_query_count`，只用 `tail_mask`
-       > 选中的子集累积 3b 的 L2 误差分子/分母——`tail_query_count` 大于
-       > `block_size` 时这个窗口会跨越不止一块，小于 `block_size` 时只
-       > 覆盖最后一块的一部分，两种情形这个掩码写法都正确处理，不需要
-       > 分支特判。**压缩侧（上面新增的 `causal_tail` 调用）不参与这个
-       > 分块循环，是独立的一次调用**——`causal_tail == tail_query_count`
-       > 硬校验本来就要求整批 `tail_query_count` 个 query 一次性传入，
-       > 不能再按 `block_size` 二次切块。3b 依然是这一次性的窗口给出的
-       > 单个相对 L2 误差数字，不按 block 取平均。**`block_size` 和
-       > `tail_query_count` 必须一起写进 eval metadata**（与 §5.21-4
-       > `s_h` 标定值同一纪律）——引用这个 5% 数字时，两者缺一都不算
-       > 完整复现实验设置。
+       > `tail_query_count > block_size` 时 `q_tail` 会跨越不止一块——
+       > 上面"先逐块累积、循环结束后统一 `cat`"的写法对这种情形和
+       > `tail_query_count ≤ block_size` 的情形处理方式完全相同，**不
+       > 需要 `tail_query_count ≤ block_size` 这条约束，也不需要为 3b
+       > 单独引入一个 ring buffer**——机制 B 本来就要完整跑一遍全部
+       > block（服务 `attn_mass_by_dist`），跑到覆盖尾部窗口的那几块时
+       > 顺路多存一份切片，循环天然会覆盖到全部需要的位置。**`block_size`
+       > 不影响 3b 的结果，只影响需要几次循环迭代才能凑齐 `q_tail`**——
+       > 3b 复现实验只需要记录 `tail_query_count`；`block_size` 是否要
+       > 记录是 `attn_mass_by_dist`/§13.2 那条独立诊断线的复现需求，和
+       > 3b 的 5% 数字无关，不要求两者一起进 metadata。
        >
        > **不选"额外持久化一份 q_roped（或它的抽样子集）供事后用"这条
        > 路**：那样会让 S0.8 依赖的输入和"Stage 0 只落盘
        > k/v/`attn_mass_by_dist` 直方图"这条既定原则产生一个例外，且
        > 抽样出来的 query 子集能不能代表真实 readout 误差是一个新的、
-       > 未经验证的假设；上面的做法两侧都只切一个固定大小的尾部窗口，
-       > 不引入这个假设，也不需要改动上面的 dump 表。
+       > 未经验证的假设；上面的做法全程只在内存里累积一个
+       > `(nh, tail_query_count, hs)` 的小切片、用完即弃，不落盘，不
+       > 引入这个假设。
 
   **决策门只挂在 3b 上**：注意力读出的相对 L2 误差应 < 5%（沿用原来的
   数字，但现在明确它挂在哪一项，且不再依赖 3a 那套需要精确 token 集合
