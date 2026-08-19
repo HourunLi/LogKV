@@ -469,6 +469,92 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第十六轮核实：修 `docs/position.md` §P8.4"弱学习：learned
+  anchor bias"公式漏掉的 `/M_s`，其余四点核对结论是"已在上一轮修过、还没
+  合并"。** 动机：用户对照远端仓库逐条复核，指出的前四点（co-assignment
+  标签、S0.8 3b 统计口径、`scan_op_log_for_ward_events` 的 `pending` 状态、
+  Phase 3a 残留的"逐位对拍"措辞+`atol`）和第十五轮已经修过的四处完全对应。
+  **核实结论：这四处在本分支（`claude/cool-fermi-vjbb7n`，含第十五轮的
+  commit）里都已经是修过的状态**——逐条对照当前文件内容确认：
+  `experiments.md` 的 co-assignment 标签已钉死"必须是 `resolve_final_
+  slots` 解析后的最终槽号"；S0.8 3b 已经是"整条序列处理完后的单次测量"
+  加精确定义的尾部 query block；`scan_op_log_for_ward_events` 已经有
+  `initial_pending` 参数和对应的返回值；Phase 3a 的"正确性验证复用已有的
+  测试"一段已经改成"按该条给出的比较口径"，容差公式也已经带 `atol`。
+  用户看到的旧状态是因为**上一轮（第十五轮）的 commit 还停留在未合并的
+  PR 上**，`semanticLogKV` 分支当时还是第十四轮的状态——不是回归，是
+  评审快照落后于分支。这四点本轮不再重复修改，只在这里记一笔核对结论，
+  留给下次合并后自然对齐。
+  **第五点是新问题，已修**：`docs/position.md` §P8.4"弱学习：learned
+  anchor bias"的公式写的是 `score_{s,a} = q·R(p_a)k_s + λ log(w_s) +
+  b_a(entry_stats)`——`log(w_s)` 漏了 `/M_s`，和同一份文件 §P5.2 刚证明
+  过的"这不是调参项、是正确性修正"直接矛盾：一个 entry 展开成 `M_s` 个
+  anchor 时若每个都用未除过 `M_s` 的 `log(w_s)`，softmax 总质量会被静默
+  放大约 `M_s` 倍，多 anchor 的 entry（大跨度 entry）会系统性占到不该有
+  的额外注意力质量。**修法**：改成 `λ log(w_s/M_s) + b_a(entry_stats)`，
+  并补一句说明 `b_a` 和 `/M_s` 是两件独立的事——`b_a` 是在已经修正过的
+  mass bias 之上**额外**学到的 logit 偏置，不能也不该被指望去替代
+  `/M_s` 这个归一化（`b_a` 只吃单个 entry 自己的 `entry_stats`，不知道
+  其它 anchor 的存在，没有信息量学出一个跨 anchor 的归一化项）。扫了一遍
+  `position.md` 其余 `log(w...)` 出现的地方，其它全部已经正确带 `/M`
+  （包括两处特意写错误形式 `log(w)`/`log(w_s)` 来举反例的地方，不是
+  同类 bug，不需要改）。
+
+- **2026-08-19｜第十五轮核实：把 pairwise co-assignment 的标签钉死为
+  `resolve_final_slots` 解析后的最终身份（不能用原始 `(slot,epoch)`）、
+  拍死 S0.8 3b 是"整条序列处理完后的单次测量"并精确定义尾部 query block、
+  把 `scan_op_log_for_ward_events` 的 `pending` 状态纳入可分段传递的
+  参数/返回值、清掉 Phase 3a 段落里残留的"逐位对拍"旧措辞、并给浮点容差
+  补上 `atol` 和 dead slot 的处理方式。** 动机：用户逐条核实上一轮的五处
+  修复，指出三处 P1、两处 P2——都是细节但都会让实现在具体数值/边界情形上
+  出错。逐条结论：
+  ① **P1：co-assignment 的标签说"`(slot,epoch)` 或 `resolve_final_slots`
+  给出的槽号都可以"，这句话会诱导实现者直接用原始 `(slot,epoch)`，
+  产出错误结果。** `scan_op_log` 返回的 `token_identity` 是"记录时"的
+  `(slot,epoch)`，Ward 合并发生在**之后**——同一个最终簇完全可能由多个
+  不同的记录时 `(slot,epoch)` 合并而成。直接拿未解析的 `(slot,epoch)`
+  当标签，会把语义上已经属于同一个最终簇的 token 错误拆成多个标签，
+  人为压低一致率，哪怕两条路径的最终聚类结构完全等价。**修法**：钉死
+  必须先经 `resolve_final_slots` 解析到最终身份才能用作标签，标签解析
+  后再怎么编号不影响结果，但解析这一步不能省。
+  ② **P1：S0.8 3b 的统计对象前后不一致**——3b 的主定义说"这批处理完之后
+  立即"做一次读出（读起来像逐 flush 批重复测量），但补充说明里又说
+  "只用序列尾部的 query block"（意味着只在整条序列处理完之后测一次）。
+  两者是不同的指标，5% 门槛挂在哪个上不可复现。**决定：3b 是针对整条
+  序列处理完毕后那个最终 cache 状态的单次测量**，不是逐批重复；同时把
+  "尾部 query block"精确定义为机制 B 按 `chunks(q_roped, block_size)`
+  分块处理时产生的**最后一个** `query_block`——不额外引入新的"tail block
+  大小"参数，直接复用机制 B 已有的 `block_size`，这是唯一同时满足"因果地
+  看到完整最终 cache"和"不需要新参数"的选择。同步修掉这处改动引入的一个
+  markdown 嵌套加粗渲染 bug（`**A**B**C**` 这种写法在 markdown 里不是
+  "整体加粗、中间再嵌套强调"，而是交替 toggle，会把想强调的词渲染成不
+  加粗、反而把周围文字加粗）。
+  ③ **P1：`scan_op_log_for_ward_events` 声称可以像 `scan_op_log` 一样
+  分段串联调用，但 `pending`（记录"刚追加、还没等到 trigger_token_idx
+  的 WardEvent"）是函数内部的局部变量，不是可传递的状态。** 如果调用方
+  按任意边界切片 `op_log`（`scan_op_log` 自己的 docstring 明确允许"任意
+  切片"），切片边界完全可能落在某个 `WARD_MERGE` 和它服务的 `NEW_CLUSTER`
+  之间——`pending` 若不能跨调用传递，这条事件会在函数返回时直接丢失，且
+  没有任何信号提示调用方。**修法**：把 `pending` 做成第五个可选种子
+  参数，返回值里也带上它，和 `epoch`/`parent`/`members` 走同一套"调用方
+  负责在段之间原样传递"的纪律；这里没有类似 `resolve_final_slots` 的
+  额外 finalize 步骤（`WardEvent` 一旦 append 就是最终结果，不会过期），
+  调用方唯一要做的是**扫完最后一段之后显式断言 `pending is None`**——
+  不为 `None` 说明切片/拼接逻辑本身有 bug（漏段、段序错），不是函数的
+  正常行为。补了对应的"典型用法"示例代码。
+  ④ **P2：Phase 3a"正确性验证复用已有的测试"一段仍写着"逐位对拍"**，
+  和后面已经拆开的"整数字段逐位精确、浮点字段容差内"比较口径不一致，
+  容易让读者以为这是两套不同的要求。改成显式指向"按 §5.4 第 3 条给出的
+  比较口径"，不再重复"逐位"这个可能过时的措辞。
+  ⑤ **P2：浮点容差只给了 `rtol=1e-4`，没有 `atol`，且没说 dead/未触碰的
+  槽算不算数。** 纯相对误差公式在参考值为 0 处除零/未定义，而 `n_eff`/
+  `centroid` 在从未被这批任何 token 触碰过的槽上恰好精确是 0（不论
+  `alive` 是否为 `True`）。**修法**：改用标准的"绝对+相对"组合公式
+  （`|a−b| ≤ atol + rtol·|b|`，比如 `torch.testing.assert_close(rtol=
+  1e-4, atol=1e-5)`），并明确 dead/未触碰的槽**不需要**从比较范围里
+  单独摘除——两边都精确是 0（由 `reset_parameters()` 的显式 `zeros(...)`
+  保证），`|0−0| ≤ atol` 对任意正 `atol` 恒成立，天然通过，不会产生噪声。
+
 - **2026-08-19｜第十四轮核实：给 S0.8 3b 的 query 来源补一个明确决定（复用
   机制 B 的现场 query 循环，不落盘）、新增 `scan_op_log_for_ward_events`
   给 Ward 事件比较提供合并前成员快照、把 Phase 3a/3b 元数据对拍的"逐位
