@@ -1170,6 +1170,12 @@ def scan_op_log_for_ward_events(
             assert op.type == NEW_CLUSTER, (
                 f"scan_op_log_for_ward_events: 顺序契约违反——WARD_MERGE 之后"
                 f"必须紧跟它服务的 NEW_CLUSTER，但遇到了 {op.type}")
+            assert op.cluster == pending.free_identity[0], (
+                f"scan_op_log_for_ward_events: 顺序契约违反——NEW_CLUSTER 写入"
+                f"的槽 {op.cluster} 不是这次 WARD_MERGE 刚释放的槽 "
+                f"{pending.free_identity[0]}（§5.4 Phase 2 步骤 4 的既有约定："
+                f"释放出来的槽立即交给这个 orphan 的新簇使用，这里违反了这条"
+                f"约定）")
         if op.type == NEW_CLUSTER:
             epoch[op.cluster] = epoch.get(op.cluster, -1) + 1
             ident = (op.cluster, epoch[op.cluster])
@@ -1216,7 +1222,7 @@ def scan_op_log_for_ward_events(
     return ward_events, epoch, parent, sketches, sizes, pending
 ```
 
-> **更正（这一轮修的）：两处此前会静默吞掉 bug，必须改成硬失败。**
+> **更正（这一轮修的）：三处此前会静默吞掉 bug，必须改成硬失败。**
 > ① **`pending`/`NEW_CLUSTER` 的紧邻关系此前只是"等到了就消费"，从不校验
 > "等到的是不是它"。** 原循环只在 `op.type == NEW_CLUSTER` 分支内部检查
 > `pending is not None`，中间如果插了一条 `JOIN`/`NEW_SEGMENT`/
@@ -1240,6 +1246,24 @@ def scan_op_log_for_ward_events(
 > `_require` 顺带盖住（`_require` 抓的是"身份完全未知"，这一条抓的是
 > "身份已知但计数被错误清零"，两种失效模式不同）。`EMPTY_SKETCH` 不再
 > 用作缺省值，只保留它"min 幺元"这个数学定义本身。
+> ③ **只校验了"紧跟着的是不是 `NEW_CLUSTER` 类型"，没校验"这个
+> `NEW_CLUSTER` 用的是不是刚释放出来的那个槽"。** §5.4 Phase 2 步骤 4
+> 的既有约定是 `slot_idx = free_slot`——释放出来的槽立即交给这个
+> orphan（组）建新簇，不是随便一个 alive 槽。若上游（真正执行路由/写
+> 日志的代码，不是这个扫描函数本身）因为某个 bug 让 `WARD_MERGE` 之后
+> 紧跟的 `NEW_CLUSTER` 落在了另一个槽上，①的类型检查照样通过——它只看
+> `op.type`，不看 `op.cluster`——函数会把 `trigger_token_idx` 安到一个
+> 和这次合并毫不相关的 token 上，产出的 `WardEvent` 表面完全合法，实际
+> 已经张冠李戴。**修法**：紧跟在①的类型断言之后，追加
+> `assert op.cluster == pending.free_identity[0]`——`pending.
+> free_identity` 是这次 `WARD_MERGE` 构造时就已经记录好的
+> `(free_slot, epoch)` 身份（见 `WARD_MERGE` 分支的 `free_v =
+> find((op.free_slot, ...))`，构造那一刻它还未被 union，`find` 对它是
+> 恒等映射，所以 `free_identity[0]` 精确等于当时的 `op.free_slot`），
+> 取其槽号分量与这条 `NEW_CLUSTER` 实际写入的槽号比较，不等就地报错。
+> 这个函数存在的意义就是"不假设 op_log 一定合法"（本节其它断言的一贯
+> 立场），槽号复用是这条设计里少数几个跨结构操作/主操作的强不变量，
+> 值得和类型检查放在同一处、同等严格地校验。
 
 **典型用法（分段串联，末尾断言 `pending` 已被消费干净）**：
 
@@ -2879,6 +2903,60 @@ entry 算出 `M=0`。如果不 clamp，调用方算 `w/M` 就是 `0/0`——**�
 为什么这个 clamp 被放进 `dedup_anchors` 内部而不是留给每个调用方各自记得写一遍：
 `M` 的唯一合法用途就是做这个除法，把安全性钉在产出 `M` 的地方，调用方就不可能
 漏掉。
+
+#### `dedup_anchors`/`materialize_anchor_keys` 的输出到 `log_kv_slot_attention` 输入之间还缺一步展开
+
+**`dedup_anchors` 的 `M` 和输入的 `w` 都是 per-entry 张量（`(...,S)`，`S` 是
+entry 数），但下面"新增第三个掩码参数"一节里 `log_kv_slot_attention` 要的
+`M_s`/`slot_w` 是 per-virtual-slot 张量（`(B,G,S_pooled)`，`S_pooled=S·3`，
+flatten 了每个 entry 展开出的 3 个虚拟槽）——中间必须有一次显式广播，前面的
+文字从未把这一步写成代码，容易被实现者跳过，或者对着两个不同含义的轴形状
+硬凑出一个不对的 reshape。**
+
+沿用§5.13"读出不需要 gather"一节的约定，entry 张量在喂进这条流水线之前，
+已经从 `(B,G,K_max,L_alloc,B′,·)` reshape 成 `(B,G,S,·)`，
+`S=K_max·L_alloc·B′`——下面 `lo`/`hi`/`mid`/`w`/`k̄_raw`/`v̄` 全部在这个
+形状下：
+
+```python
+anchors, slot_valid_3, M = dedup_anchors(lo, hi, mid, w)   # (B,G,S,3)/(B,G,S,3)/(B,G,S)
+
+slot_k_3 = materialize_anchor_keys(k_raw, anchors, cos_cache, sin_cache, rope_n_elem)
+                                                              # (B,G,S,3,k_dim)——
+                                                              # 每个虚拟槽的 key 在
+                                                              # 不同锚点位置各转
+                                                              # 一次，天然不同
+
+# v̄/w/M 是"entry 内容"，不随锚点 a 变化——3 个虚拟槽共享同一份，只是广播
+# （不经过 _rotate_at_anchors，value 从不被 RoPE）：
+v_3      = v.unsqueeze(-2).expand(*v.shape[:-1], 3, v.shape[-1])   # (B,G,S,3,v_dim)
+                                                                      # value_{s,a}=v̄_s
+                                                                      # （CLAUDE.md §2.3）
+slot_w_3 = w.unsqueeze(-1).expand(*w.shape, 3)                      # (B,G,S,3)
+M_3      = M.unsqueeze(-1).expand(*M.shape, 3)                      # (B,G,S,3)
+
+# 五者用同一种 flatten（合并 (S,3) 那一对轴），保证顺序对齐；带内容维
+# （k_dim/v_dim）的两个张量合并的是导数第三、第二维，不带内容维的三个
+# 张量合并的是最后两维。S 取自 w（形状 (...,S)，末维无歧义就是 S）——
+# 不取自 anchors（形状 (...,S,3)，倒数第二维才是 S，容易数错）：
+S_pooled   = w.shape[-1] * 3
+slot_k     = slot_k_3.reshape(*slot_k_3.shape[:-3], S_pooled, slot_k_3.shape[-1])
+slot_v     = v_3.reshape(*v_3.shape[:-3], S_pooled, v_3.shape[-1])
+slot_w     = slot_w_3.reshape(*slot_w_3.shape[:-2], S_pooled)
+slot_valid = slot_valid_3.reshape(*slot_valid_3.shape[:-2], S_pooled)
+M_s        = M_3.reshape(*M_3.shape[:-2], S_pooled)
+```
+
+`M_s`/`slot_w` 里每个 entry 的 3 个虚拟槽拿到的是**同一个**标量（entry 级的
+`M`/`w`，不随锚点变化）——这是故意的，不是偷懒广播出来的近似。mass bias
+公式 `λ·log(w_s/M_s)`（§2.3）里的 `w_s`/`M_s` 描述的是"这个 entry 整体代表
+了多少原始 token、这些原始 token 被这个 entry 展开成了几个虚拟槽"，两个量
+的定义域都是 entry 而不是虚拟槽；3 个虚拟槽只是同一个 entry 在 3 个不同
+位置上的只读投影，`w`/`M` 的份额怎么在它们之间分摊，交给 softmax 按各自的
+`score` 竞争，不需要（事实上也不应该）把 `w`/`M` 人为拆成三份、分别赋给三个
+虚拟槽——拆分反而是错的：`log(w/M)` 会在虚拟槽维度上被重复稀释，而且已经
+展开出来的 3 个虚拟槽本来就不是三个各自独立的 1/3 个 entry，它们共享同一份
+底层内容，区别只在旋转它们的锚点位置不同。
 
 #### 虚拟槽展开必须扣上 `log_kv_slot_attention` 现有的 `causal_tail`/`mask` API
 
