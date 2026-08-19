@@ -469,6 +469,92 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第十七轮核实：修 S0.1/S0.8 六处测试与实现规格的坑——
+  alive-but-untouched 槽的元数据基线被错误写成 0、Ward 事件成员快照有
+  O(T²) 内存/时间风险、S0.8 3b 的决策门隐式绑定了机制 B 的性能参数、
+  `tok0`"不受路由近似影响"的说法过强、`WardEvent.trigger_token_idx`
+  类型标注与 pending 用法矛盾、`resolve_final_slots` 的返回值口径表述
+  前后不一致。** 动机：用户逐条指出这六处都是"文字上看似定了，真去实现
+  测试/工具时会踩坑"的问题，集中在 `algorithm-spec.md` 的 S0.1（Phase
+  3a/3b 元数据正确性单测）、S0.8 Ward 事件比较两节，以及 `experiments.md`
+  对应的消费侧描述。逐条结论：
+  ① **P0：S0.1 元数据对拍测试的前提是错的。** 文档说
+  `centroid`/`n_eff` 在"从未被这批任何 token 触碰过的槽"上精确是 0，
+  且明确包含"`alive=True` 但本批没有主操作命中"这一类——不成立：一个
+  在更早批次建立、此后一直存活的簇，本批未被命中时该保留**进入本批之前
+  的旧值**（一般非零），不是白纸 0。根子在参考实现的描述上——它按物理
+  顺序重放"本批本地缓冲"这一件事本身没错，但从未交代 scratch 起点该
+  从哪里来；如果测试只构造孤立单批、隐式让 scratch 全局起点为空，这套
+  参考实现结构性地只能覆盖"整条序列的第一批"，长序列下最常见的"alive
+  但本批未被命中"或"本批 JOIN 进更早批次建立的簇"反而测不到。**修法**：
+  参考实现与生产路径对拍都必须接受一个显式 `initial_scratch` 种子（进入
+  本批之前的完整状态，可以全零代表冷启动，也可以非零代表"已经跑过若干
+  批"）；dead/未被触碰槽"不需要单独摘除"这条结论保留，但理由从"两边都是
+  0"改成"两边都源自同一份 `initial_scratch` clone"（对死槽恰好是 0，
+  对 alive-but-untouched 槽是真实旧值，两条路径下都相等）；新增第 (iii)
+  条必测场景：两个连续批次，第一批建立某簇并积累非零内容，第二批完全不
+  引用它，断言处理完第二批后该簇的五个字段精确/容差内等于第一批结束时
+  的值——单批次合成数据结构性地测不出这类 bug。
+  ② **P1：`WardEvent` 存完整 `frozenset[int]` 成员集合有 O(T²) 内存/
+  时间风险，规格没给有界方案。** `OP_max` 摊还论证已经证明过
+  `WARD_MERGE` 事件数最坏 O(T)，每个事件的 `keep`（往往是持续吸收新
+  成员的大簇）成员集合最坏也是 O(T)，32k 下用 Python `frozenset[int]`
+  估算能到数十 GB，会拖死 Stage 0。**修法**：把精确集合换成固定宽度
+  `k`（默认 128）的 MinHash（bottom-k）草图——MinHash 在集合并运算下
+  精确合成（`sketch(A∪B)=elementwise_min(...)`，不是近似的近似），
+  唯一误差来自用有限 `k` 估计 Jaccard 本身（标准误差上界 `0.5/√k`），
+  总内存 O(事件数×k)，与 `T` 无关。`WardEvent.keep_set_before`/
+  `free_set_before` 改名为 `keep_sketch_before`/`free_sketch_before`，
+  精确成员数单独用 O(1) 计数器维护（不经估计）；这一项在 S0.8 里本来就
+  是诊断信号而非决策门（决策门只挂 3b），能接受有界误差的估计。深挖某个
+  具体事件的精确成员仍然可行，用 `scan_op_log`/`resolve_final_slots`
+  重放到该事件为止即可，只是不再是默认路径。`k` 和它产出的 Jaccard 数字
+  必须一起写进 eval metadata。
+  ③ **P1：S0.8 3b 的硬性 5% 决策门绑定到机制 B 的 `block_size`，让一个
+  正确性阈值隐式依赖一个纯性能/分块参数。** 上一版直接用
+  `chunks(q_roped, block_size)` 的最后一块划定 3b 的尾部窗口，理由是
+  "不引入新参数"——但调 `block_size`（为了跑得更快或适配显存）会顺带
+  改变最后一块的 query 数量和位置集合，5% 判据可能因为纯粹的性能调参
+  改变结论，而 §7 消融表另有"query 位置：尾部/中部/前置"一行，两者一旦
+  混用会让 3b 的尾部专属结论被错误地当成对中部/前置也成立。**修法**：
+  拆出独立的 `tail_query_count` 参数（默认借用 `flush_granularity` 量级
+  但不派生自它，也不派生自 `block_size`），窗口按绝对位置
+  `[T−tail_query_count, T)` 定义，机制 B 原有分块循环不变，3b 的累积
+  只是在循环内加一个与块边界无关的掩码，可以跨块也可以只覆盖最后一块的
+  一部分。`block_size`/`tail_query_count` 必须一起写进 eval metadata；
+  §6 决策门段落与 §7 表格都补了交叉引用，明确 3b 的 <5% 结论只覆盖尾部
+  query，不能承担中部/前置的结论，也不被后者借用。
+  ④ **P1：`tok0`/`trigger_token_idx`"不受路由近似影响、两条路径天然
+  可比"的说法过强，且与同一份文档几行之后的让步自相矛盾。**
+  `algorithm-spec.md` 原文一边说"批量路径和严格串行参考在这一点上天然
+  一致"，一边紧接着承认"若两条路径路由近似分出不同 orphan 分组，各自
+  的 tok0 依然是各自路径下良定义的量"——后半句已经在说两者可能不同。
+  **修法**：改成准确的 path-local 契约——`trigger_token_idx` 在单条
+  路径内部良定义、不依赖实现细节；但两条路径的路由决策本身可以分歧
+  （Phase 1 冻结 centroid 快照 vs 严格串行逐 token 重算），导致同一次
+  语义合并在两条路径下产出不同的 `tok0`。这不是需要修补的 bug，是
+  `experiments.md` 已经准备好的处理路径——值相同代表强对齐，只在一条
+  路径出现就计入 `ward_event_inserted`/`ward_event_deleted`，不强行
+  配对。`algorithm-spec.md`、`experiments.md` 两处对应措辞同步改正。
+  ⑤ **P2：`WardEvent.trigger_token_idx` 标注成 `int`，但 pending 事件
+  创建时赋值 `None`，类型标注与实际用法矛盾。** 改成 `int | None`，并在
+  字段注释里钉死更强的不变量：只有仍在函数内部传递、未被下一条
+  `NEW_CLUSTER` 消费的 pending 事件才可能是 `None`——顺序契约保证任何
+  真正 append 进函数**返回的** `ward_events` 列表的 `WardEvent`，这个
+  字段恒为 `int`（append 只发生在 `pending._replace(trigger_token_idx=
+  ...)` 之后）。不拆成 `PendingWardEvent`/`WardEvent` 两个类型，保留
+  现有 `_replace` 惯用法，改动面更小。
+  ⑥ **P2：`resolve_final_slots` 的调用方描述说"得到每个 token 最终的
+  `(slot, epoch)` 身份"，但函数实际返回 `dict[int, int]`，只保留物理
+  槽号，丢弃 epoch。** 核实后确认这不是代码的 bug——在 `resolve_final_
+  slots` 被调用的那一刻（扫完全部关心的段之后），同一个物理槽号不可能
+  同时有两个不同 epoch 的身份还是并查集的根（任何复用槽号的
+  `NEW_CLUSTER` 必然紧邻在释放它的 `WARD_MERGE` 之后，旧 epoch 在新
+  epoch 出现前就已经不是根），所以只取 `find(v)[0]` 天然无损。**修法
+  是文本口径而非代码**：`algorithm-spec.md` 在函数定义处补上这条证明，
+  `experiments.md` 的调用方描述统一改成"最终物理槽号"，不再写
+  "`(slot, epoch)` 身份"，避免继续诱导实现者误用未解析的原始身份。
+
 - **2026-08-19｜第十六轮核实：修 `docs/position.md` §P8.4"弱学习：learned
   anchor bias"公式漏掉的 `/M_s`，其余四点核对结论是"已在上一轮修过、还没
   合并"。** 动机：用户对照远端仓库逐条复核，指出的前四点（co-assignment
