@@ -861,6 +861,21 @@ def resolve_final_slots(
     return {t: find(v)[0] for t, v in token_identity.items()}
 ```
 
+**返回值是 `dict[int, int]`——每个 token 最终的物理槽号，不是 `(slot,
+epoch)`。** 这不是文档偷懒省略了 epoch，是可以证明安全的：**在
+`resolve_final_slots` 被调用的那一刻（扫完全部你关心的段之后），同一个
+物理槽号不可能同时有两个不同 epoch 的身份还是并查集的根**。因为按顺序
+契约，任何复用某个槽号的 `NEW_CLUSTER`（把该槽 `epoch` 从 `e` 推进到
+`e+1`）必然紧邻在释放这个槽号的 `WARD_MERGE` 之后——也就是说，`epoch=e`
+的身份在 `epoch=e+1` 出现之前就已经被 `parent[find((slot,e))] =
+find(keep_v)` 指向别处，不再是根。所以对 `token_identity` 里出现的任意
+版本化身份，`find(v)[0]` 在同一时刻至多对应一个仍是根的身份——`[0]`
+天然无损，不会把两个不同的最终簇错误地折叠成同一个标签。**下游（比如
+`experiments.md` 的成对共簇一致率）可以放心只用这个整数做标签，不需要、
+也不应该退回未解析的 `(slot, epoch)`**——`experiments.md` 引用这个函数
+时统一说"最终物理槽号"，不要再写"`(slot, epoch)` 身份"，两种说法字面上
+指的不是一回事，容易诱导实现者去改函数签名塞回 epoch，而那其实是多余的。
+
 **典型用法（串联多段）**：
 
 ```python
@@ -887,42 +902,117 @@ final_slot = resolve_final_slots(all_identity, parent)   # 只在这里、扫完
 
 `experiments.md` §6 S0.8 决策门的 Ward 事件分歧统计要求对齐两条路径各自的
 `WARD_MERGE` 事件、比较"合并前 `keep`/`free` 两个簇各自包含的原始 token
-集合"，但上面 `scan_op_log` 的 `WARD_MERGE` 分支只做了
+集合有多相似"，但上面 `scan_op_log` 的 `WARD_MERGE` 分支只做了
 `parent[find(free_v)] = find(keep_v)`——它从不维护"某个 `(slot,epoch)`
 身份此刻实际持有哪些 token"这个反向索引，扫到 `WARD_MERGE` 的那一刻吐不出
-`keep_set_before`/`free_set_before`。**不要改 `scan_op_log` 本身去做这件
-事**——它的返回值和调用方式已经被 `resolve_final_slots`、S0.1 的重放正确性
+任何可以拿来算相似度的东西。**不要改 `scan_op_log` 本身去做这件事**——
+它的返回值和调用方式已经被 `resolve_final_slots`、S0.1 的重放正确性
 测试等多处依赖，它足够简单可信的原因正是"只维护解析最终归属需要的最小
 状态"，把 S0.8 才需要的东西塞进去会破坏这一点。新增一个专供 S0.8 用的
-姊妹函数：
+姊妹函数（下面会看到，它维护的不是精确 token 集合本身，而是一个有界的
+近似表示——理由见下方更正框）：
+
+> **更正（这一轮修的）：存完整 `frozenset[int]` 有 O(T²) 的内存/时间风险，
+> 必须换成有界的近似表示。** 上一版每次 `WARD_MERGE` 都把 `keep`/`free`
+> 两侧**当前完整的** token 集合各复制进一条 `WardEvent`；`keep` 侧尤其
+> 危险——它往往是一个持续吸收新成员的大簇（Ward 的尺寸加权本就偏好把
+> 小簇并进大簇，§5.6），体积可以逼近整条序列。上面 §5.21-2 的 `OP_max`
+> 摊还论证已经证明过 `WARD_MERGE` 事件数在病态输入下最坏是 O(T)——O(T)
+> 个事件、每个最坏 O(T) 个成员，总量是 O(T²)：Stage 0 的 dump 规格
+> （`experiments.md` §6）目标是 32k token/prompt，用 Python `frozenset[int]`
+> （每个元素算上对象头和哈希表槽位约 50~80 字节）估算这个乘积能到数十
+> GB，会直接把 Stage 0 拖死——这不是危言耸听的边界情形，是 `OP_max`
+> 论证里已经证明过的同一个最坏情况在这里的另一次出现，必须给出有界方案，
+> 不能假设"实践中不会这么糟"。
+>
+> **修法：把精确 `frozenset` 换成固定宽度的 MinHash（bottom-k）草图**，
+> 只服务它唯一的下游消费者——`experiments.md` S0.8 要的是 Jaccard
+> 相似度这一个标量，不是集合本身，而 Jaccard 允许有界误差的估计（这一项
+> 是诊断信号，不是决策门，决策门只挂在 3b，见 `experiments.md` §6）。
+> MinHash 的关键性质是**集合并运算下精确合成，不是"近似的近似"**：
+> `sketch(A ∪ B) = elementwise_min(sketch(A), sketch(B))` 对任意有限宽度
+> `k` 都精确成立；唯一的误差来自用有限宽度估计 Jaccard 本身，标准误差
+> 上界 `0.5/√k`（在真实 Jaccard=0.5 处最大，`k=128` 时 ≈4.4%）。这让它可以
+> 直接嵌进现有的增量式更新逻辑：每个身份的存储从"正比于它当前成员数"变成
+> 恒定的 `k` 个 `uint64`，总内存 O(事件数 × k)，与 `T` 完全无关——不是把
+> 常数因子改小，是把渐近复杂度本身改掉。代价：`keep_sketch_before`/
+> `free_sketch_before` 不再能重建出精确成员列表，只能估计 Jaccard；若某次
+> 调试确实需要某个具体事件的精确成员，用 `scan_op_log`/`resolve_final_slots`
+> 重放到该事件的 `trigger_token_idx` 为止即可精确重建（多付一次 O(T) 重扫，
+> 但只在真的需要时才付，不是默认路径）。精确的**成员数**（不是成员本身）
+> 代价是 O(1)，单独维护一个计数器即可，不需要靠草图估计。`k`（草图宽度）
+> 是 S0.8 专用的调试/分析参数，不属于核心算法（不进 §5.13 buffer 表、不
+> 影响 forward/backward），但和它产出的 Jaccard 数字一样，必须写进 eval
+> metadata——同一纪律见 §5.21-4 的 `s_h` 标定值。
 
 ```python
+WARD_EVENT_SKETCH_K = 128   # MinHash 草图宽度；S0.8 专用调试参数，见上方更正框，
+                              # 标准误差上界 0.5/sqrt(128) ≈ 4.4%（Jaccard=0.5 处最大）
+MINHASH_SEEDS = make_minhash_seeds(WARD_EVENT_SKETCH_K)   # 固定种子，整个 Stage 0
+                              # dump 全程复用同一份——不同事件的草图必须用同一族哈希
+                              # 函数才可比，具体哈希族选取不是这里的重点，只要求
+                              # k 个互相独立、均匀分布在 uint64 上即可
+EMPTY_SKETCH = np.full(WARD_EVENT_SKETCH_K, np.iinfo(np.uint64).max, dtype=np.uint64)
+                              # 空集的草图：全体取 min 的幺元，任何真实 token 的
+                              # 哈希值都比它小，第一次插入即正确覆盖
+
+
+def minhash_of_token(token_idx: int, seeds=MINHASH_SEEDS) -> "np.ndarray[K]":
+    """单个 token 的 MinHash 草图（k 个独立哈希值）。当作原子原语处理，
+    和文档别处把 apply_rope/compact() 当作既有正确原语是同一个态度——
+    具体哈希函数实现不是这里要规定的内容。"""
+    ...
+
+
 class WardEvent(NamedTuple):
-    trigger_token_idx: int              # 见下方"触发 token 的定义"
+    trigger_token_idx: int | None       # 见下方"触发 token 的定义"。只有仍在
+                                          # scan_op_log_for_ward_events 内部
+                                          # 传递、尚未被下一条 NEW_CLUSTER 消费
+                                          # 的 pending 事件才可能是 None——顺序
+                                          # 契约（§5.4 第 2 条）保证任何被真正
+                                          # append 进函数**返回的** ward_events
+                                          # 列表的 WardEvent，这个字段恒为 int，
+                                          # 因为 append 只发生在
+                                          # `pending._replace(trigger_token_idx=...)`
+                                          # 之后，从不直接 append 带 None 的
+                                          # pending 本身（见下方实现）
     keep_identity: tuple[int, int]      # 合并后保留的 (slot, epoch)
     free_identity: tuple[int, int]      # 被合并、释放的 (slot, epoch)
-    keep_set_before: frozenset[int]     # 合并前 keep 持有的 token_idx 集合
-    free_set_before: frozenset[int]     # 合并前 free 持有的 token_idx 集合
+    keep_sketch_before: "np.ndarray[K]" # 合并前 keep 的 MinHash 草图（uint64[K]）
+    free_sketch_before: "np.ndarray[K]" # 合并前 free 的 MinHash 草图（uint64[K]）
+    keep_size_before: int               # 合并前 keep 的精确成员数（不经草图，
+                                          # 单独维护的计数器，无估计误差）
+    free_size_before: int               # 合并前 free 的精确成员数
+
+
+def estimate_jaccard(sketch_a, sketch_b) -> float:
+    """标准 MinHash Jaccard 估计量：两个草图里逐位相等的比例。无偏，标准
+    误差上界 0.5/sqrt(K)（K=WARD_EVENT_SKETCH_K，在真实 Jaccard=0.5 处
+    最大）。"""
+    return float(np.mean(sketch_a == sketch_b))
 
 
 def scan_op_log_for_ward_events(
     op_log,
     initial_epoch: dict[int, int] | None = None,
     initial_parent: dict[tuple[int, int], tuple[int, int]] | None = None,
-    initial_members: dict[tuple[int, int], set[int]] | None = None,
+    initial_sketches: dict[tuple[int, int], "np.ndarray[K]"] | None = None,
+    initial_sizes: dict[tuple[int, int], int] | None = None,
     initial_pending: "WardEvent | None" = None,
 ):
     """只读、离线，S0.8 专用，不是 forward/backward/S0.1 依赖的东西——和
     scan_op_log 是两份独立的扫描逻辑，只是复用同一套 (slot,epoch) 身份和
     union-find 记号，**不能**和 scan_op_log 混用同一份 epoch/parent 状态
-    跨函数传递（members/pending 是这个函数独有的状态，scan_op_log 从不
-    维护它们）。
+    跨函数传递（sketches/sizes/pending 是这个函数独有的状态，scan_op_log
+    从不维护它们）。
 
-    在 scan_op_log 的基础上额外维护一个反向索引 members：身份 -> 当前
-    实际持有的 token_idx 集合，随 NEW_CLUSTER/JOIN/NEW_SEGMENT 增量更新；
-    每遇到一次 WARD_MERGE，在真正执行合并之前，把 keep/free 双方**此刻**
-    的 members 集合各自快照进一条 WardEvent，再把两个集合合并（free 并入
-    keep），供后续继续扫描时使用。
+    在 scan_op_log 的基础上额外维护两个反向索引：sketches（身份 -> 当前
+    成员集合的 MinHash 草图）和 sizes（身份 -> 当前精确成员数），随
+    NEW_CLUSTER/JOIN/NEW_SEGMENT 增量更新；每遇到一次 WARD_MERGE，在真正
+    执行合并之前，把 keep/free 双方**此刻**的草图与成员数各自快照进一条
+    WardEvent（快照只是复制 K 个定长数值 + 两个整数，代价与真实成员数
+    无关），再把两者合并（free 并入 keep：草图取逐位 min，成员数相加，
+    见上方更正框"精确合成"），供后续继续扫描时使用。
 
     trigger_token_idx 按 §5.4"op_log 跨 Phase 的顺序契约"第 2 条（结构
     操作紧邻它服务的主操作）填上：任何 WARD_MERGE 后面紧跟的下一条 op
@@ -939,9 +1029,9 @@ def scan_op_log_for_ward_events(
     "完整日志，或任意切片"），切片边界完全可能恰好落在某个 WARD_MERGE
     和它服务的 NEW_CLUSTER 之间——如果 pending 只是局部变量，扫完这一段
     时这个尚未补上 trigger_token_idx 的 WardEvent 会随函数返回直接丢失，
-    且没有任何信号告诉调用方"漏了一个事件"。**修法**：pending 做成第五个
-    可选种子参数，返回值里也带上它，和 epoch/parent/members 走同一套
-    "调用方负责在段之间原样传递"的纪律。**这里没有一个类似
+    且没有任何信号告诉调用方"漏了一个事件"。**修法**：pending 做成第六个
+    可选种子参数，返回值里也带上它，和 epoch/parent/sketches/sizes 走同一
+    套"调用方负责在段之间原样传递"的纪律。**这里没有一个类似
     `resolve_final_slots` 的额外"finalize"步骤**——WardEvent 一旦被
     append 进 ward_events 就是最终结果，不会像 token_identity 那样被
     后续操作弄过期；调用方唯一要做的事是：**扫完你关心的最后一段之后，
@@ -952,7 +1042,8 @@ def scan_op_log_for_ward_events(
     这个函数自己能替调用方判断的事（它不知道这是不是"最后一段"）。"""
     epoch = dict(initial_epoch) if initial_epoch else {}
     parent = dict(initial_parent) if initial_parent else {}
-    members = {k: set(v) for k, v in (initial_members or {}).items()}
+    sketches = dict(initial_sketches) if initial_sketches else {}   # 身份 -> 草图
+    sizes = dict(initial_sizes) if initial_sizes else {}             # 身份 -> 精确成员数
     def find(v):
         while parent.get(v, v) != v:
             parent[v] = parent.get(parent[v], parent[v])
@@ -966,13 +1057,16 @@ def scan_op_log_for_ward_events(
         if op.type == NEW_CLUSTER:
             epoch[op.cluster] = epoch.get(op.cluster, -1) + 1
             ident = (op.cluster, epoch[op.cluster])
-            members[ident] = {op.token_idx}
+            sketches[ident] = minhash_of_token(op.token_idx)
+            sizes[ident] = 1
             if pending is not None:                      # 顺序契约保证：紧邻
                 ward_events.append(pending._replace(trigger_token_idx=op.token_idx))
                 pending = None
         elif op.type in (JOIN, NEW_SEGMENT):
             ident = (op.cluster, epoch.get(op.cluster, 0))
-            members.setdefault(ident, set()).add(op.token_idx)
+            sketches[ident] = np.minimum(sketches.get(ident, EMPTY_SKETCH),
+                                          minhash_of_token(op.token_idx))
+            sizes[ident] = sizes.get(ident, 0) + 1
         elif op.type == WARD_MERGE:
             assert pending is None    # 上一个 Ward 事件必须已被消费，见 docstring
             keep_v = find((op.keep_slot, epoch.get(op.keep_slot, 0)))
@@ -980,25 +1074,30 @@ def scan_op_log_for_ward_events(
             pending = WardEvent(
                 trigger_token_idx=None,   # 下一条 NEW_CLUSTER 补上
                 keep_identity=keep_v, free_identity=free_v,
-                keep_set_before=frozenset(members.get(keep_v, ())),
-                free_set_before=frozenset(members.get(free_v, ())),
+                keep_sketch_before=sketches.get(keep_v, EMPTY_SKETCH).copy(),  # O(K)
+                free_sketch_before=sketches.get(free_v, EMPTY_SKETCH).copy(),  # 拷贝，
+                keep_size_before=sizes.get(keep_v, 0),   # 与真实成员数无关
+                free_size_before=sizes.get(free_v, 0),
             )
-            members[keep_v] = members.get(keep_v, set()) | members.get(free_v, set())
-            members.pop(free_v, None)
+            sketches[keep_v] = np.minimum(sketches.get(keep_v, EMPTY_SKETCH),
+                                           sketches.get(free_v, EMPTY_SKETCH))
+            sizes[keep_v] = sizes.get(keep_v, 0) + sizes.get(free_v, 0)
+            sketches.pop(free_v, None)
+            sizes.pop(free_v, None)
             parent[free_v] = keep_v
 
-    return ward_events, epoch, parent, members, pending
+    return ward_events, epoch, parent, sketches, sizes, pending
 ```
 
 **典型用法（分段串联，末尾断言 `pending` 已被消费干净）**：
 
 ```python
 all_events = []
-epoch = parent = members = pending = None
+epoch = parent = sketches = sizes = pending = None
 for segment in op_log_segments:            # 任意边界的切片都可以，不要求
                                               # 和 flush 批边界对齐
-    events, epoch, parent, members, pending = scan_op_log_for_ward_events(
-        segment, epoch, parent, members, pending
+    events, epoch, parent, sketches, sizes, pending = scan_op_log_for_ward_events(
+        segment, epoch, parent, sketches, sizes, pending
     )
     all_events.extend(events)
 
@@ -1014,12 +1113,23 @@ assert pending is None   # 扫完全部段之后才检查；不为 None 说明�
 冷启动必须复用同一个 `allocate_new_cluster`"一节）——`WARD_MERGE` 服务的
 正是这同一个 orphan（组）的建簇请求，两者必然紧邻（顺序契约第 2 条），所以
 `trigger_token_idx` 就是紧随其后那条 `NEW_CLUSTER` 的 `token_idx`，上面的
-函数正是这么取的。**批量路径和严格串行参考在这一点上天然一致，不需要额外
-对齐规则**：两条路径处理的是同一份输入 token 流，"哪个 token 是这个 orphan
-组里到达顺序最早的那个"只依赖输入数据和各自的路由决策（谁被分进同一个
-orphan 组），不依赖任何实现细节——即使两条路径因为路由近似分出了不同的
-orphan 分组，各自的 `tok0` 依然是各自路径下良定义、可比较的量，`experiments.md`
-按这个 `trigger_token_idx` 对齐两条路径的 `WardEvent` 列表即可。
+函数正是这么取的。**但 `trigger_token_idx` 只是一个 path-local 的对齐键，
+"不受路由近似影响"这个说法过强，必须收回。** 它在单条路径内部良定义、不
+依赖任何实现细节，这一点确实成立："哪个 token 是这个 orphan 组里到达顺序
+最早的那个"只依赖这条路径自己的输入数据和路由决策，不需要另外发明"哪个
+位置算触发点"这类规则。但两条路径的路由决策本身可以不同：批量路径的
+Phase 1 用批前冻结的 centroid 快照做直接/orphan 判定，严格串行参考逐 token
+重算——若同一段输入因此在两条路径下分出了不同的 orphan 分组（比如某个
+token 在一条路径下因为快照尚未反映最新 centroid 而被判定为 orphan，在另
+一条路径下因为重算后的 centroid 已经足够近而被直接并入既有簇），"这个
+orphan 组里到达顺序最早的那个 token"这件事本身在两条路径下可以有不同的
+答案，即同一次语义上的合并事件在两条路径下产出不同的 `trigger_token_idx`。
+**这不是需要修补的 bug，是这个对齐机制必须承受、也已经承受了的正常情形**：
+`experiments.md` 按 `trigger_token_idx` 精确匹配两条路径的 `WardEvent`
+列表，值相同代表强对齐（两条路径连"谁是最早成员"都一致）；只在一条路径
+出现的 `trigger_token_idx` 不强行配对，计入 `ward_event_inserted`/
+`ward_event_deleted`——这正是为"两条路径在这一点分歧"准备的处理路径，不是
+一个理论上不会触发的兜底分支。
 
 **本地缓冲 vs 持久 `op_log`**：本节说的"本地 op 缓冲"是 Phase 1/2 处理**当前
 这一个 flush 批**期间用的临时张量，**不是**跨批持久存在的 `op_log`
@@ -1588,6 +1698,36 @@ Phase 1 之后、Phase 2 之前运行一次（向量化）；Phase 3b 内联在 
    > "遇到 `NEW_CLUSTER` 就清零 scratch"已经天然处理了槽位复用，不会
    > 把"旧 X"和复用同一物理槽的"新 X"混成一个身份。
 
+   > **更正（这一轮修的）：上面这套参考实现隐含假设了一个从空白开始的
+   > 单批场景，对"alive 但本批未被任何主操作命中的槽"没有定义该从哪里
+   > 起算，这个空白本身就是一类 bug 的来源，必须补上。** 真实的 forward
+   > 是很多个 flush 批连续处理同一条序列，第 `N` 批开始时，绝大多数已经
+   > `alive` 的簇既不是"这一批刚 `NEW_CLUSTER`"，也不是"这一批被
+   > `JOIN`/`NEW_SEGMENT` 命中"——它们只是在更早的批次里建立、此后一直
+   > 存在，这一批可能完全没有 token 路由到它们。这类槽的正确行为是
+   > **metadata 原样不变，等于进入本批之前的值**（该值一般不是 0——它是
+   > 这个簇迄今为止累积的真实内容），不是"0"，也不是"未定义"。上面的
+   > 参考实现描述本身没有错（`NEW_CLUSTER` 清零、`JOIN`/`NEW_SEGMENT` 走
+   > §5.5 公式），但它默认 scratch 状态从哪里起算从未交代——如果测试只
+   > 构造单个孤立批次、且隐式让 scratch 起点全局为空，这套参考实现就只能
+   > 覆盖"整条序列的第一批"，第二批及以后任何"alive 但本批未被命中"或
+   > "本批 `JOIN` 进一个更早批次建立的簇"的情形都测不到，而这恰恰是长
+   > 序列下最常见的情形，不是边界情形。
+   >
+   > **修法**：参考实现（以及和它对拍的生产路径调用）都必须接受一个
+   > 显式的 `initial_scratch: dict[int, Metadata]` 种子参数（`Metadata`
+   > 打包 `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`），代表
+   > "进入本批之前"的完整状态，由测试构造者显式提供（可以全零，代表冷
+   > 启动；也可以非零，代表"已经跑过若干批"）。参考实现里，任何主操作
+   > 引用的槽号若不在 `initial_scratch` 里、也没有在**这次调用看到的 op
+   > 序列内**先出现过一次 `NEW_CLUSTER`，是测试构造本身的 bug（引用了一个
+   > 既非新建、又未声明历史状态的槽），应该直接断言失败，不是需要静默
+   > 兜底的情形。**生产路径这一侧不需要任何对应改动**——它读写的
+   > `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment` 本来就是跨批
+   > 持久的 buffer（§5.13），Phase 3a/3b 天然只更新本批 op 引用到的槽，
+   > 未被引用的槽内容自动原样保留；这条更正纯粹是补全**参考实现和测试
+   > 构造方法**的规格，不涉及任何生产代码行为的改变。
+
    **比较口径必须按字段类型拆开，不能笼统要求"逐位一致"**：`n_total`/
    `p_hi_c`/`current_segment` 是纯整数字段（分组计数、gather、取 `max`，
    过程里不出现任何浮点运算），(a)(b) 两条路径必须**逐位精确相同**——
@@ -1606,22 +1746,30 @@ Phase 1 之后、Phase 2 之前运行一次（向量化）；Phase 3b 内联在 
    组合公式（`torch.testing.assert_close(actual, expected, rtol=1e-4,
    atol=1e-5)`，或等价的 `|a−b| ≤ atol + rtol·|b|`），**不能只给
    `rtol`**——纯相对误差在参考值 `b=0` 处除零/未定义，而 `n_eff`/
-   `centroid` 在**从未被这批任何 token 触碰过的槽**上恰好精确是 0（这些
-   槽的 `alive` 可能是 `False`，也可能是 `True` 但这批没有任何主操作
-   命中它，两种情况数值上都是白纸状态的 0）。`rtol=1e-4` 量级上远大于
-   fp32 单精度在 `flush_granularity≤128`、`⌈log₂128⌉=7` 轮扫描下能积累
-   的舍入误差，`atol=1e-5` 是给"两边都恰好是 0（或接近 0）"这类条目的
-   下限——两者组合后足够收紧到能抓住真正的逻辑 bug：双计数、遗漏贡献
-   这类问题造成的偏差通常是量级上的，不是最后几位的舍入噪声或一个趋近
-   于零的参考值造成的虚假告警。**dead/未被触碰的槽不需要从比较范围里
-   单独摘除**：用上面"绝对+相对"的组合公式比较整个 `(K_max, d)` buffer
-   即可——这类槽在 (a)(b) 两条路径下都是精确的 0（"K 未满/冷启动分支
-   `alive[slot_idx]` 进入 `allocate_new_cluster` 之前为什么必然是白纸"
-   一节已经论证过这个前提由 `reset_parameters()` 的显式 `zeros(...)`
-   保证），`|0−0| ≤ atol` 对任意 `atol>0` 恒成立，天然通过，不会产生
-   噪声也不需要额外逻辑把它们排除在断言之外；`n_total`/`p_hi_c`/
-   `current_segment` 继续要求逐位精确（这三个字段不存在浮点误差，
-   也就不存在"参考值为 0 时公式退化"这个问题）。
+   `centroid` 在**从未被分配过的死槽**上恰好精确是 0，原因不变
+   （`reset_parameters()` 的显式 `zeros(...)`）。**但"alive 且本批未被
+   任何主操作命中的槽也是 0"这个说法是错的，必须收回**——这类槽（上一批
+   甚至更早批次里建立、此后一直存活但这一批没有 token 路由到它）的正确
+   值是**进入本批之前的旧值**，一般不是 0；`atol` 保护的是"参考值恰好
+   是 0（或接近 0）"这类条目在纯相对误差公式下的除零/未定义，死槽是这类
+   条目里唯一能保证恰好是 0 的一类，alive-but-untouched 槽的参考值可以是
+   任意非零数，不属于这个理由覆盖的范围，但下面的组合公式对它们同样
+   成立。`rtol=1e-4` 量级上远大于 fp32 单精度在 `flush_granularity≤128`、
+   `⌈log₂128⌉=7` 轮扫描下能积累的舍入误差，两者组合后足够收紧到能抓住
+   真正的逻辑 bug：双计数、遗漏贡献这类问题造成的偏差通常是量级上的，
+   不是最后几位的舍入噪声或一个趋近于零的参考值造成的虚假告警。
+   **dead/未被触碰的槽不需要从比较范围里单独摘除，但理由不是"两边都是
+   0"，而是"两边都源自同一份 clone"**：只要 (a) 生产路径和 (b) 参考
+   实现都用上面更正框要求的 `initial_scratch` 种子做起点，一个未被本批
+   任何 op 触碰的槽在两条路径下的值**逐位等于同一个 `initial_scratch`
+   条目**——死槽的 `initial_scratch` 条目恰好是 0（由 `reset_parameters()`
+   保证），alive-but-untouched 槽的 `initial_scratch` 条目是那个簇的真实
+   历史值，不必是 0——两种情况下 (a)(b) 两侧都相等，用上面"绝对+相对"的
+   组合公式比较整个 `(K_max, d)` buffer 依然天然通过（值相等时
+   `|a−b|=0 ≤ atol` 对任意 `atol>0` 恒成立），不需要按"是不是被触碰过"
+   分情况摘除或另外处理；`n_total`/`p_hi_c`/`current_segment` 继续要求
+   逐位精确（这三个字段不存在浮点误差，不存在"参考值为 0 时公式退化"
+   这个问题，对 alive-but-untouched 槽的旧值同样逐位精确相等）。
 
    断言：整数字段逐位精确、`centroid`/`n_eff` 在上述容差内一致，且
    **新建簇（本批内 Ward 合并腾出槽位后建立的那些）的最终 `n_total`
@@ -1636,7 +1784,15 @@ Phase 1 之后、Phase 2 之前运行一次（向量化）；Phase 3b 内联在 
    的任何贡献——这两条合起来直接抓住"Ward 合并读到 stale metadata"这类 bug，
    如果时序修复回归，(i) 会因为漏掉一份贡献而偏小，(ii) 会因为被错误混入而
    偏大或偏离预期 centroid，两个方向都要测，只测一个方向可能被另一个方向的
-   巧合掩盖。**这条断言存在的意义是把"重放/回放需要什么"和"调试工具/S0.8
+   巧合掩盖。**这批合成数据还必须专门覆盖上面"参考实现隐含从空白开始"那节
+   的反例场景**：至少构造两个连续批次，第一批让某个簇 `X` 建立并累积真实、
+   非零的 `centroid`/`n_eff`/`n_total`，第二批完全不包含任何引用 `X` 的主
+   操作；断言 (iii) 处理完第二批之后，`X` 的全部五个字段在 (a)(b) 两条路径
+   下都精确等于（浮点字段：在同一组合容差内等于）它在第一批结束时的值，
+   一字不差——这条直接抓住"实现把 alive-but-untouched 的槽误当成需要清零/
+   重新初始化"这类 bug，只用单批次合成数据结构性地测不出它，因为单批次里
+   "这一批建立"和"更早批次建立、这一批只是恰好没被命中"这两类槽根本无法
+   区分。**这条断言存在的意义是把"重放/回放需要什么"和"调试工具/S0.8
    对拍想知道什么"彻底分开成两个独立契约**——前者只服务 backward 的梯度
    正确性，后者只服务分析工具，任何时候都不应该被混进同一个正确性等级里。
 

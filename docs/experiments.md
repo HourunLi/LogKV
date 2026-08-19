@@ -175,8 +175,12 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
   放大或抵消，两者都不直接等于最终读出误差）：
   1. **cluster assignment divergence（含 Ward 事件）**：用
      `algorithm-spec.md` §5.4 已经给出的 `scan_op_log`/`resolve_final_slots`
-     分别解析批量路径和严格串行参考路径的 `op_log`，得到每个 token 的最终
-     `(slot, epoch)` 身份。**不能直接比较裸槽号**——两条路径的簇建立顺序不
+     分别解析批量路径和严格串行参考路径的 `op_log`，得到每个 token 最终的
+     **物理槽号**（`resolve_final_slots` 返回 `dict[int, int]`，只保留
+     `find(v)` 的物理槽号分量，不带 `epoch`——`algorithm-spec.md` 该函数
+     定义处已证明这一步不丢信息：解析时刻同一槽号至多有一个身份仍是并查集
+     的根）。**不能直接比较裸槽号**——这里说的是跳过 `resolve_final_slots`、
+     直接比较 `op_log` 里原始 `op.cluster` 的做法：两条路径的簇建立顺序不
      保证一致，槽号可能整体错位但语义上完全等价。改用**成对共簇一致率**
      （pairwise co-assignment agreement，类似 Rand index 的构造）：概念上是
      对所有 token 对 `(i,j)`（`i≠j`，`i<j` 各算一次，分母是
@@ -226,17 +230,26 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
      - `trigger_token_idx` 就是**主键**，两条路径按它对齐各自的事件列表
        ——它精确定义为 `tok0`（触发这次建簇的 orphan 组里到达顺序最早的
        那个 token 的 `token_idx`，等价于紧随该 `WARD_MERGE` 之后那条
-       `NEW_CLUSTER` 携带的 `token_idx`），两条路径处理的是同一份输入
-       token 流，`tok0` 因此是不受路由近似影响、两条路径天然可比的锚点，
-       不需要另外定义"哪个位置算触发点"；
-     - 每个事件的"候选对"不用槽号表示，直接用 `WardEvent.keep_set_before`/
-       `free_set_before`（合并前 `keep`/`free` 两个簇各自包含的原始
-       token_idx 集合，`scan_op_log_for_ward_events` 已经在扫描时快照
-       好）——两条路径若在语义上做了同一次合并，这两个集合应该（近似）
-       相同，不依赖槽号或 `epoch` 怎么编号；
+       `NEW_CLUSTER` 携带的 `token_idx`）。**这是一个 path-local 的对齐键，
+       不是一个保证跨路径相等的量**——它在单条路径内部良定义、不依赖任何
+       实现细节，不需要另外定义"哪个位置算触发点"；但若两条路径因为批量
+       近似（Phase 1 冻结的 centroid 快照 vs 严格串行逐 token 重算）对同一
+       段输入分出了不同的 orphan 分组，两条路径各自的 `tok0` 可能不同，此时
+       按这个键会**匹配不上**（处理方式见下方 `ward_event_inserted`/
+       `deleted`），不能假设它必然跨路径相等；
+     - 每个事件的"候选对"不用槽号表示，直接用 `WardEvent.keep_sketch_before`/
+       `free_sketch_before`（合并前 `keep`/`free` 两个簇各自的 MinHash 草图，
+       不是精确 token 集合——`algorithm-spec.md` §5.4 同一节已经论证过存
+       精确 `frozenset` 有 O(T²) 的内存/时间风险，草图是替代它的有界表示，
+       `scan_op_log_for_ward_events` 已经在扫描时快照好），不依赖槽号或
+       `epoch` 怎么编号；
      - `trigger_token_idx`（即 `tok0`）在两条路径都出现的事件算作
-       **匹配**，对匹配上的事件报告 `keep`/`free` 两个 token 集合各自的
-       Jaccard 相似度（均值）；
+       **匹配**，对匹配上的事件用 `algorithm-spec.md` 同一节定义的
+       `estimate_jaccard(...)` 分别估计 `keep`/`free` 两侧的 Jaccard
+       相似度（均值）——这是一个**估计值**，标准误差上界 `0.5/√k`（默认
+       `k=128` 时 ≈4.4%），`k` 必须和这个数字一起写进 eval metadata；连带
+       报告 `keep_size_before`/`free_size_before`（精确整数，不经估计），
+       帮助判断一个偏低的 Jaccard 发生在大簇还是小簇上；
      - `trigger_token_idx` 只在其中一条路径出现的事件，**不要**强行配对
        或直接丢弃平均掉——分别计为 `ward_event_inserted`（只在批量路径）/
        `ward_event_deleted`（只在严格串行参考）单独报告。"事件根本没有
@@ -299,16 +312,40 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
        > 读出、累积相对 L2 误差需要的分子/分母，算完这一块就跟着
        > `q_roped` 一起丢弃——q 全程不落盘，只是在它本来就要被用一次算
        > `attn_mass_by_dist` 的那个循环里"顺路多用一次"。**为了保证
-       > 因果性，3b 只用序列尾部的 query block，且精确定义为哪一个：
-       > 机制 B 按 `chunks(q_roped, block_size)` 分块处理时产生的最后
-       > 一个 `query_block`**（此时两条路径的最终 cache 状态都已经
-       > 构造完毕，序列尾部的 query 因果地有权看到整个 cache）——不额外
-       > 引入新的"tail block 大小"配置项，直接复用机制 B 已经定义好的
-       > `block_size`，这是唯一同时满足"因果地看到完整最终 cache"和
-       > "不需要新参数"的选择。3b 是这一次性的最后一块给出的单个相对
-       > L2 误差数字，不对多个 block 取平均——不需要让 cache 构造和
-       > 机制 B 的循环逐块交错对齐，两个阶段谁先谁后不重要，只要 cache
-       > 构造在机制 B 处理到这最后一个 query block 之前完成。
+       > 因果性，3b 只用序列尾部的 query，且精确定义用多少个：一个
+       > 独立的 `tail_query_count` 参数**（默认借用 `flush_granularity`
+       > 的量级，但是一个独立字段，不随 `block_size` 变化），窗口定义
+       > 为"绝对位置落在 `[T − tail_query_count, T)` 的全部 query"（此时
+       > 两条路径的最终 cache 状态都已经构造完毕，序列尾部的 query 因果
+       > 地有权看到整个 cache）。
+       >
+       > **更正（这一轮修的）：上一版直接复用 `chunks(q_roped, block_size)`
+       > 产生的最后一个 `query_block` 划定这个窗口，理由是"不引入新
+       > 参数"——这个理由没有权衡代价，必须收回。** `block_size` 是机制 B
+       > 为控制内存/计算峰值设的分块粒度，和"3b 该用多少个尾部 query 来
+       > 估计误差"是两个不相关的问题：调 `block_size`（比如为了让 dump
+       > 脚本跑得更快、或适配不同显存）会顺带改变最后一块的 query 数量和
+       > 绝对位置集合，3b 的 L2 误差分子/分母的样本量因此跟着变，< 5%
+       > 这个判据可能因为一次纯粹的性能调参而改变结论——一个硬性决策门
+       > 不应该对一个和它要回答的问题无关的旋钮敏感，这比"多一个参数"的
+       > 代价更值得付。`tail_query_count` 和 `block_size` 各自独立、互不
+       > 派生。
+       >
+       > 机制 B 原有的按 `block_size` 分块的循环结构不变（它服务的是
+       > 内存/计算峰值控制，和 `attn_mass_by_dist` 的其它职责一样）；3b
+       > 的累积逻辑在这个既有循环内部新增一个与块边界无关的掩码：对每个
+       > `query_block`，取 `abs_idx = block_start + arange(len(query_block))`，
+       > `tail_mask = abs_idx >= T - tail_query_count`，只用 `tail_mask`
+       > 选中的子集累积 3b 的 L2 误差分子/分母——`tail_query_count` 大于
+       > `block_size` 时这个窗口会跨越不止一块，小于 `block_size` 时只
+       > 覆盖最后一块的一部分，两种情形这个掩码写法都正确处理，不需要
+       > 分支特判。3b 依然是这一次性的窗口给出的单个相对 L2 误差数字，
+       > 不按 block 取平均——不需要让 cache 构造和机制 B 的循环逐块交错
+       > 对齐，两个阶段谁先谁后不重要，只要 cache 构造在机制 B 处理到
+       > 这个尾部窗口涉及的最后一块之前完成。**`block_size` 和
+       > `tail_query_count` 必须一起写进 eval metadata**（与 §5.21-4
+       > `s_h` 标定值同一纪律）——引用这个 5% 数字时，两者缺一都不算
+       > 完整复现实验设置。
        >
        > **不选"额外持久化一份 q_roped（或它的抽样子集）供事后用"这条
        > 路**：那样会让 S0.8 依赖的输入和"Stage 0 只落盘
@@ -319,8 +356,14 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
 
   **决策门只挂在 3b 上**：注意力读出的相对 L2 误差应 < 5%（沿用原来的
   数字，但现在明确它挂在哪一项，且不再依赖 3a 那套需要精确 token 集合
-  匹配、覆盖率可能不到 100% 的 ladder 字段比较）。第 1、2、3a 项没有独立
-  的通过/失败阈值，是诊断输出——**但必须报告**，因为若 3b 超标，第 1/2/3a
+  匹配、覆盖率可能不到 100% 的 ladder 字段比较）。**这个 < 5% 的结论只
+  覆盖"尾部 query"这一种设定**——3b 按定义只用序列尾部窗口
+  （`tail_query_count`）内的 query，不覆盖 query 在中部/前置的情形；
+  下面 §7 消融表"query 位置"那一行是一个独立的、eval-time（Stage 2，
+  真实模型输出）测量，回答的是同一个问题在中部/前置 query 下什么样，
+  **不是 3b 的延伸，也不共享它的 5% 阈值**——3b 只代表尾部 query，不要
+  拿它的结论去承担中部/前置 query 的判断，两者的结论不要互相借用。第
+  1、2、3a 项没有独立的通过/失败阈值，是诊断输出——**但必须报告**，因为若 3b 超标，第 1/2/3a
   项决定了修法：如果是 cluster assignment 分歧主导（尤其 Ward 事件分歧），
   要收紧 Phase 1 的批量
   近似（比如缩小 flush 粒度）；如果主要是 segment/pad overhead 主导且
@@ -377,7 +420,7 @@ Stage 2 有信号后再投入。v3 没有需要 warmup 的新标量（v2 的 `κ
 | 旋钮 | 取值 | 回答的问题 |
 |---|---|---|
 | **`(g_max, ℓ_block)`** | 纯语义 → 完全分段 | **语义分组 vs 分段边界，谁贡献大？（S0.0 的 eval 版）** |
-| **query 位置** | prompt 尾部 / 中部 / 前置 | **区分本方案与 eviction 类方法的关键设定**（§9-A）——尾部 query 是 retrieval-head 类方法的最佳工况 |
+| **query 位置** | prompt 尾部 / 中部 / 前置 | **区分本方案与 eviction 类方法的关键设定**（§9-A）——尾部 query 是 retrieval-head 类方法的最佳工况。**这一行是独立的 eval-time 测量，不是 S0.8 3b 的延伸**——3b 只用固定的尾部 `tail_query_count` 窗口，其 <5% 决策门不覆盖、也不能借用来回答中部/前置 query 的表现，两者结论不互相代入 |
 | `K_max` | 1 / 4 / 16 / 64 | 语义分组本身值多少分？1 是现状锚点。**覆盖默认值时要连带重算 `L_alloc`**（§5.6）|
 | `K:B′` 分配 | 32×4 / 16×8 / 8×16 | 语义分辨率 vs 时序分辨率，总预算固定 |
 | `anchor_mode` | `lo_hi_mid` / `lo_hi` / `mid` / `z` | 锚点表示 vs v2 的 z 统计量 |
