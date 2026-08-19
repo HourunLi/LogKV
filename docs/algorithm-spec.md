@@ -883,6 +883,109 @@ final_slot = resolve_final_slots(all_identity, parent)   # 只在这里、扫完
 部分。S0.8 对拍、调试工具需要"token 最终去了哪"时调用它,forward/backward 的
 正确性路径永远不依赖它、也不会被它影响。
 
+#### S0.8 的 Ward 事件比较需要合并前的成员快照——`scan_op_log` 不提供，需要一个专用姊妹函数
+
+`experiments.md` §6 S0.8 决策门的 Ward 事件分歧统计要求对齐两条路径各自的
+`WARD_MERGE` 事件、比较"合并前 `keep`/`free` 两个簇各自包含的原始 token
+集合"，但上面 `scan_op_log` 的 `WARD_MERGE` 分支只做了
+`parent[find(free_v)] = find(keep_v)`——它从不维护"某个 `(slot,epoch)`
+身份此刻实际持有哪些 token"这个反向索引，扫到 `WARD_MERGE` 的那一刻吐不出
+`keep_set_before`/`free_set_before`。**不要改 `scan_op_log` 本身去做这件
+事**——它的返回值和调用方式已经被 `resolve_final_slots`、S0.1 的重放正确性
+测试等多处依赖，它足够简单可信的原因正是"只维护解析最终归属需要的最小
+状态"，把 S0.8 才需要的东西塞进去会破坏这一点。新增一个专供 S0.8 用的
+姊妹函数：
+
+```python
+class WardEvent(NamedTuple):
+    trigger_token_idx: int              # 见下方"触发 token 的定义"
+    keep_identity: tuple[int, int]      # 合并后保留的 (slot, epoch)
+    free_identity: tuple[int, int]      # 被合并、释放的 (slot, epoch)
+    keep_set_before: frozenset[int]     # 合并前 keep 持有的 token_idx 集合
+    free_set_before: frozenset[int]     # 合并前 free 持有的 token_idx 集合
+
+
+def scan_op_log_for_ward_events(
+    op_log,
+    initial_epoch: dict[int, int] | None = None,
+    initial_parent: dict[tuple[int, int], tuple[int, int]] | None = None,
+    initial_members: dict[tuple[int, int], set[int]] | None = None,
+):
+    """只读、离线，S0.8 专用，不是 forward/backward/S0.1 依赖的东西——和
+    scan_op_log 是两份独立的扫描逻辑，只是复用同一套 (slot,epoch) 身份和
+    union-find 记号，**不能**和 scan_op_log 混用同一份 epoch/parent 状态
+    跨函数传递（members 是这个函数独有的状态，scan_op_log 从不维护它）。
+
+    在 scan_op_log 的基础上额外维护一个反向索引 members：身份 -> 当前
+    实际持有的 token_idx 集合，随 NEW_CLUSTER/JOIN/NEW_SEGMENT 增量更新；
+    每遇到一次 WARD_MERGE，在真正执行合并之前，把 keep/free 双方**此刻**
+    的 members 集合各自快照进一条 WardEvent，再把两个集合合并（free 并入
+    keep），供后续继续扫描时使用。
+
+    trigger_token_idx 不需要额外状态去猜：按 §5.4"op_log 跨 Phase 的顺序
+    契约"第 2 条（结构操作紧邻它服务的主操作），任何 WARD_MERGE 后面紧跟
+    的下一条 op 必然是它服务的 NEW_CLUSTER——用一个 pending 指针记住"刚
+    追加、还没等到 trigger_token_idx 的 WardEvent"，下一次遇到
+    NEW_CLUSTER 时直接填上它的 token_idx，不需要向前看（lookahead）；
+    一个 orphan（组）的建簇请求最多触发一次 Ward 合并（腾出恰好一个槽），
+    所以 pending 在被下一条 NEW_CLUSTER 消费之前不会被第二次覆盖——这不是
+    需要容忍的情形，用 assert 钉死。
+
+    可以和 scan_op_log 一样分段串联调用（epoch/parent/members 都是可选
+    种子参数）。"""
+    epoch = dict(initial_epoch) if initial_epoch else {}
+    parent = dict(initial_parent) if initial_parent else {}
+    members = {k: set(v) for k, v in (initial_members or {}).items()}
+    def find(v):
+        while parent.get(v, v) != v:
+            parent[v] = parent.get(parent[v], parent[v])
+            v = parent[v]
+        return v
+
+    ward_events: list[WardEvent] = []
+    pending: WardEvent | None = None   # 刚 append、还缺 trigger_token_idx
+    for op in op_log:
+        if op.type == NEW_CLUSTER:
+            epoch[op.cluster] = epoch.get(op.cluster, -1) + 1
+            ident = (op.cluster, epoch[op.cluster])
+            members[ident] = {op.token_idx}
+            if pending is not None:                      # 顺序契约保证：紧邻
+                ward_events.append(pending._replace(trigger_token_idx=op.token_idx))
+                pending = None
+        elif op.type in (JOIN, NEW_SEGMENT):
+            ident = (op.cluster, epoch.get(op.cluster, 0))
+            members.setdefault(ident, set()).add(op.token_idx)
+        elif op.type == WARD_MERGE:
+            assert pending is None    # 上一个 Ward 事件必须已被消费，见 docstring
+            keep_v = find((op.keep_slot, epoch.get(op.keep_slot, 0)))
+            free_v = find((op.free_slot, epoch.get(op.free_slot, 0)))
+            pending = WardEvent(
+                trigger_token_idx=None,   # 下一条 NEW_CLUSTER 补上
+                keep_identity=keep_v, free_identity=free_v,
+                keep_set_before=frozenset(members.get(keep_v, ())),
+                free_set_before=frozenset(members.get(free_v, ())),
+            )
+            members[keep_v] = members.get(keep_v, set()) | members.get(free_v, set())
+            members.pop(free_v, None)
+            parent[free_v] = keep_v
+
+    return ward_events, epoch, parent, members
+```
+
+**"触发这次合并的 orphan 的绝对 token 位置"精确定义为 `tok0`——不是新
+概念，是 §5.4 Phase 2 早就命名过的量，不需要另外发明。** Phase 2 的合并
+过程里，"K 已满"分支腾出槽位后，`NEW_CLUSTER(slot_idx, 0, tok0)` 写的
+`tok0` 就是"这个 orphan（组）里到达顺序最早的那个 token"（见 §5.4"K 未满/
+冷启动必须复用同一个 `allocate_new_cluster`"一节）——`WARD_MERGE` 服务的
+正是这同一个 orphan（组）的建簇请求，两者必然紧邻（顺序契约第 2 条），所以
+`trigger_token_idx` 就是紧随其后那条 `NEW_CLUSTER` 的 `token_idx`，上面的
+函数正是这么取的。**批量路径和严格串行参考在这一点上天然一致，不需要额外
+对齐规则**：两条路径处理的是同一份输入 token 流，"哪个 token 是这个 orphan
+组里到达顺序最早的那个"只依赖输入数据和各自的路由决策（谁被分进同一个
+orphan 组），不依赖任何实现细节——即使两条路径因为路由近似分出了不同的
+orphan 分组，各自的 `tok0` 依然是各自路径下良定义、可比较的量，`experiments.md`
+按这个 `trigger_token_idx` 对齐两条路径的 `WardEvent` 列表即可。
+
 **本地缓冲 vs 持久 `op_log`**：本节说的"本地 op 缓冲"是 Phase 1/2 处理**当前
 这一个 flush 批**期间用的临时张量，**不是**跨批持久存在的 `op_log`
 （`(B,G,OP_max,4)`，见 §5.13）。批内 Phase 1（一次性向量化写入）和 Phase 2
@@ -1281,13 +1384,33 @@ n_eff_r = d[t]·n_eff_{r-1} + 1
 成员 t 自己的状态（scan 的叶子/base case）：
     A_t  = d[t]
     Bn_t = 1
-    S_t  = k_t
+    S_t  = k_t.float()   # 见下方 dtype 说明：显式转 fp32，不沿用 k_raw 的
+                           # activation dtype
 
 合并两段状态（"先" ⊕ "后"，把"后"接在"先"之后，标准仿射复合，结合律成立）：
     A   = A_后 · A_先
     Bn  = A_后 · Bn_先 + Bn_后
     S   = A_后 · S_先  + S_后
 ```
+
+> **`(A, Bn, S)` 全程必须是 fp32，`S_t` 的输入 `k_t` 必须显式转型，不能
+> 沿用 `k_raw` 的 activation dtype。** `k_raw` 在 dump（`experiments.md`
+> 的 dump 表）和生产路径里都以 fp16/bf16 存储/传递，但 §5.13 的
+> `centroid`/`n_eff` buffer 明确声明 fp32——如果实现者顺手让 `S_t = k_t`
+> 直接沿用 `k_t` 自己的低精度 dtype（这是最容易踩的坑：`S` 是逐元素对
+> `k` 做的运算，"跟着输入 dtype 走"是最不需要多想的默认写法），累加器
+> `S`/最终的 `centroid_new` 就会被低精度污染。这比一次性的 fp16 计算更
+> 危险：`centroid` 是**跨整条序列在线更新**的量（每个 flush 批都要把
+> 这批的贡献混合进去，一条 32k 序列有几百次这样的批次），每次都在 fp16
+> 精度上算再写回 fp32 buffer，量化噪声会跨批次反复注入、累积，不是
+> 单次可忽略的舍入——这也是为什么它需要在这里单独强调，而不是只在
+> §5.13 的 `w` dtype 警告（`log_kv_cache.py` 现有 `level_w` 沿用
+> activation dtype 那个坑）旁边顺带一提就够了，两处坑的后果都是"精度
+> 静默劣化"，但这里是**持续累积**的版本，更隐蔽。`A`/`Bn` 本身不直接
+> 参与和 `k`/`μ` 的运算（`Bn` 只是标量计数，`A` 只是 `γ`/`1` 的乘积），
+> 但既然要和 `S`/`centroid`/`n_eff` 做加乘，也一并声明成 fp32，不留
+> 隐式类型提升的歧义。最终写回 `centroid`/`n_eff` buffer 时两者 dtype
+> 已经一致，不需要额外转换。
 
 按 `c*[t]` 分组做一次**包含性（inclusive）前缀扫描**（分组/排序用的是和
 `nsg_incl` 完全相同的 `(c*[t], rank[t])`，只是归约算子换成上面的仿射
@@ -1393,11 +1516,13 @@ Phase 1 之后、Phase 2 之前运行一次（向量化）；Phase 3b 内联在 
    这个近似在"K 已满、批内密集触发新簇"这种极端情形下的一个特例，不应该单独
    拔高到"必须和严格串行版逐位相同"这个不属于它的正确性等级——那样会把
    "重放准不准"和"批量决策的近似质量"这两个不同维度的问题混成一个。
-3. **Phase 3a/3b 元数据更新的正确性（S0.1，逐位精确，与第 1 条完全独立的一条
-   断言，不要和"重放正确性"共用同一个测试）**：用同一批合成数据，分别用
+3. **Phase 3a/3b 元数据更新的正确性（S0.1，整数字段逐位精确、浮点字段
+   数值容差内一致——理由见下方，与第 1 条完全独立的一条断言，不要和
+   "重放正确性"共用同一个测试）**：用同一批合成数据，分别用
    (a) 生产路径（Phase 1 → Phase 3a → Phase 2-含内联 Phase 3b 完整跑一遍）
    得到的最终 `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`，和
-   (b) 一个独立的、逐条重放的参考实现，断言两者逐位一致。
+   (b) 一个独立的、逐条重放的参考实现，比较两者（比较口径见下方，不能
+   笼统要求全部字段逐位一致）。
 
    > **更正（这一轮修的）：参考实现只喂"主操作序列"是错的，必须喂完整 op
    > 序列（含 `WARD_MERGE`）。** 上一版让参考实现只吃"本批最终本地缓冲里
@@ -1425,13 +1550,36 @@ Phase 1 之后、Phase 2 之前运行一次（向量化）；Phase 3b 内联在 
    > "遇到 `NEW_CLUSTER` 就清零 scratch"已经天然处理了槽位复用，不会
    > 把"旧 X"和复用同一物理槽的"新 X"混成一个身份。
 
-   断言两者逐位一致，且**新建簇（本批内 Ward 合并腾出槽位后建立的那些）的
-   最终 `n_total` 精确等于它实际收到的 token 数，不多不少**——这条直接抓住
+   **比较口径必须按字段类型拆开，不能笼统要求"逐位一致"**：`n_total`/
+   `p_hi_c`/`current_segment` 是纯整数字段（分组计数、gather、取 `max`，
+   过程里不出现任何浮点运算），(a)(b) 两条路径必须**逐位精确相同**——
+   不同就是逻辑 bug，没有"数值噪声"这个借口。`centroid`/`n_eff` 是浮点
+   字段（fp32），(a) 走的是 §5.5 递推的一个**并行仿射扫描**（"Phase 3a
+   的具体做法"一节），(b) 走的是同一个递推的**朴素顺序执行**——两者数学
+   上算的是同一个量，但浮点加法/乘法不满足结合律，并行扫描重新组合运算
+   顺序之后，IEEE754 舍入误差可能在最后几位上和顺序执行不同，这不是
+   bug，是任何"并行 scan vs 顺序循环"的浮点比较都会遇到的标准情形（GPU
+   并行规约和 CPU 顺序求和即使数学等价也不逐位相同，是同一个原因）。
+   **要求 `centroid`/`n_eff` 逐位相同，等价于要求参考实现去复刻生产路径
+   完全相同的运算结合顺序**——真这么做的话，两个实现会变成同一段扫描
+   逻辑的两份拷贝，一份的 bug（比如某一轮掩码写错）会在另一份里被逐位
+   复现，参考实现"独立交叉验证"这件事就名存实亡，比不设容差更糟。
+   **决定**：`centroid`/`n_eff` 改用数值容差（相对误差，建议
+   `rtol=1e-4`——量级上远大于 fp32 单精度在 `flush_granularity≤128`、
+   `⌈log₂128⌉=7` 轮扫描下能积累的舍入误差，但足够收紧到能抓住真正的
+   逻辑 bug：双计数、遗漏贡献这类问题造成的偏差通常是量级上的，不是
+   最后几位的舍入噪声）；`n_total`/`p_hi_c`/`current_segment` 继续要求
+   逐位精确。
+
+   断言：整数字段逐位精确、`centroid`/`n_eff` 在上述容差内一致，且
+   **新建簇（本批内 Ward 合并腾出槽位后建立的那些）的最终 `n_total`
+   精确等于它实际收到的 token 数，不多不少**——这条直接抓住
    "Phase 2 初始化和 Phase 3 更新双计数"这类 bug：如果双计数复现，这里的
    `n_total` 会系统性偏大。**这批合成数据必须专门覆盖上面"未闭合的漏洞"那节
    的反例场景**（Phase 1 已经对某个既有簇写下主操作、Phase 2 随后的 Ward
    合并恰好选中这个簇作为 `free_slot`）：断言 (i) 被合并进 `keep_slot` 的
-   `n_total`/`μ` 精确包含了 Phase 1 那次主操作的贡献（不是批前快照）；
+   `n_total`（逐位精确）/`μ`（容差内）包含了 Phase 1 那次主操作的贡献
+   （不是批前快照）；
    (ii) 复用该槽位建立的新簇的 `n_total`/`μ` **不包含**已经被合并走的旧内容
    的任何贡献——这两条合起来直接抓住"Ward 合并读到 stale metadata"这类 bug，
    如果时序修复回归，(i) 会因为漏掉一份贡献而偏小，(ii) 会因为被错误混入而
