@@ -29,6 +29,16 @@ needle 的 token span（复用另一分支已有的 `log_kv_pin_diag.py` 定位�
 > 的"完全连续分段"）。它的职责是回答科学问题：**可负担的区间里是否包含了大部分
 > 价值**。
 
+> **一处范围明确的例外（这一轮补的）**：这个"1 次 GPU dump + 全部 CPU 分析"
+> 的两阶段划分对 S0.0–S0.7、以及 S0.8 的第 1/2/3a 项精确成立——它们只吃
+> `k_raw`/`v`/`pos`/`attn_mass_by_dist`，全部来自持久化的 dump 文件，可以在
+> GPU dump 完成、进程退出之后，随时用一个独立的纯 CPU 后处理脚本重新跑，
+> 想跑几次跑几次。**S0.8 的 3b 项不满足这个划分**——它的读出比较需要
+> `q_tail`（下方 S0.8 一节论证过它不落盘，用完即弃），必须在 GPU dump 那个
+> 进程内、mechanism B 算出 `q_tail` 之后（且尚未被丢弃）就地完成，不能推迟
+> 到一个独立的、只读取已落盘 dump 文件的后处理脚本里——具体的执行顺序要求
+> 见下方 S0.8 3b 一节"不选『额外持久化…』"之后的补充说明。
+
 #### Stage 0 dump 规格（这个脚本是本项目该写的第一段代码）
 
 Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生产代码之前**（§5.21-5）。
@@ -238,6 +248,53 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
      pair 总数，就是上面的 `agree_pairs`——这是 Rand Index 的标准写法
      （sklearn `rand_score` 用的就是这个恒等式，不是新推导），整个计算量
      是 `O(T + K_A·K_B)`，`T=32768` 时也是毫秒级。
+
+     **仅凭这个原始一致率（下称 raw agreement）还不够：`K_max` 不大时，
+     "两条路径都判不同簇"这一类 pair 会天然占绝大多数，把分数往 1 附近
+     推，掩盖真实分歧，必须并列报告经过校正的指标。** 具体量级：
+     `K_max` 在 32k 下默认是 15（§5.6），若两条路径各自把 token 大致
+     均分成 15 个簇，即便两条路径的聚类**完全独立、互不相关**，随机
+     情况下"两者都不同簇"这一类 pair 的比例期望约 `(1−1/15)²≈87.1%`，
+     "两者都同簇"约 `(1/15)²≈0.4%`，两者相加，raw agreement 在完全
+     无关的两个聚类之间也能到 **≈87.6%**——这个数字本身不能说明批量
+     近似和严格串行参考**真的**一致，只是说明"很多 pair 靠『两边都判
+     不同簇』这种容易凑巧对上的方式蒙对了"，`K_max` 越小这个基线越高、
+     越容易把真实分歧藏进去。**必须并列报告 Adjusted Rand Index
+     （ARI）**，用同一张列联表 `n_{ab}`/`a_i`/`b_j` 免费算出，不需要
+     额外遍历：
+
+     ```
+     sum_nab  = Σ_{ab} C(n_{ab},2)          # 已经在算 agree_pairs 时算过
+     sum_ai   = Σ_i C(a_i,2)                  # 同上
+     sum_bj   = Σ_j C(b_j,2)                  # 同上
+     expected = sum_ai * sum_bj / C(T,2)
+     max_idx  = (sum_ai + sum_bj) / 2
+     ARI = (sum_nab - expected) / (max_idx - expected)
+     ```
+
+     ARI 对"随机蒙对"做了归一化（两个独立随机聚类的期望 ARI 是 0，完全
+     一致是 1），不会像 raw agreement 那样被 `K_max` 偏小、"大多数 pair
+     天然不同簇"这类结构性因素撑高。**同时并列报告 same-cluster 口径的
+     precision/recall/F1**（只看"至少一条路径判同簇"这个子集，天然回避
+     "两边都判不同簇"这一类被小 `K_max` 放大的多数 pair，对 ARI 的结论
+     做交叉验证，且能看出分歧的具体方向）：
+
+     ```
+     precision = sum_nab / sum_ai   # 批量路径判同簇的 pair 里，严格串行
+                                       # 参考也判同簇的比例
+     recall    = sum_nab / sum_bj   # 严格串行参考判同簇的 pair 里，批量
+                                       # 路径也判同簇的比例
+     f1        = 2 * precision * recall / (precision + recall)
+     ```
+
+     raw agreement、ARI、`(precision, recall, f1)` 四组数字一起报告，
+     不用其中一个代替另一个——raw agreement 直觉最直接但容易被小
+     `K_max` 撑高，ARI 修正了这一点但数值本身不直观（可以为负），
+     precision/recall 能看出分歧具体偏向"批量路径过度合并"（precision
+     低，批量路径把本该分开的簇并到了一起）还是"批量路径过度拆分"
+     （recall 低，批量路径把本该同簇的 token 分开了），三者合起来看
+     比任何单一数字更不容易被误读，也更方便和 Ward 事件那一类专门诊断
+     "过度合并"的指标互相印证。
      **同时报告 Ward 事件本身的分歧，但"逐一比较候选对"必须先定义怎么对齐，
      不能只说"逐一比较"**——两条路径触发 Ward 合并的**次数**、**触发时刻**，
      乃至候选对本身用的槽号/`epoch`，都可能因为批量近似让某些 token 走了
@@ -464,43 +521,142 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > 机制 B 自己的 `scores`/`probs`/`attn_mass_by_dist` 全程只服务
        > 它自己原来的目的（§13.2 的距离-质量曲线），3b 拿到完整
        > `q_tail` 之后在循环**外面**独立做两次压缩侧读出、互相比较，和
-       > 机制 B 的 dense 计算结果没有任何关系：
+       > 机制 B 的 dense 计算结果没有任何关系。
+       >
+       > **更正（这一轮修的，P0/P1）：上一版这段伪代码本身还有三处会让
+       > 实现直接崩溃或悄悄算错的问题，光是接上 `causal_tail`、剔除
+       > dense 比较还不够。**
+       > ① **`log_kv_slot_attention` 调用传的是错误的位置参数。** 现有
+       > 签名（`algorithm-spec.md` §5.14"虚拟槽展开必须扣上
+       > `causal_tail`/`mask` API"一节）是
+       > `(q, slot_k, slot_v, slot_w, scale, mask=None, causal_tail=0,
+       > slot_valid=None, M_s=None, ...)`——`scale` 排在 `slot_w` 之后、
+       > `mask` 之前，`slot_valid`/`M_s` 是排在更后面的具名参数。上一版
+       > `log_kv_slot_attention(q_tail, *cache.get_attention_state(),
+       > causal_tail=...)` 把 `get_attention_state()` 返回的 5 元组
+       > `(slot_k,slot_v,slot_w,slot_valid,M_s)` 整个展开成位置参数，
+       > 第 4、5 个位置会把 `slot_valid` 误传成 `scale`、把 `M_s` 误传成
+       > `mask`——两者类型都不对（`scale` 该是 `float`，收到一个 bool
+       > 张量；`mask` 该是 `(T_q,S)` bool 或 `None`，收到一个 int 张量），
+       > 而真正的 `slot_valid`/`M_s` 关键字参数反而没被传上，各自取默认值
+       > `None`。②**`tail_mask`/`block_start` 全部按错了轴索引。**
+       > `q_roped` 是 `(nh,T,hs)`（"Stage 0 dump 规格"一节的维度约定：
+       > `B` 固定为 1，直接省略这一维），`chunks(...)` 按 T 轴（dim 1）
+       > 切块，但 `len(query_block)` 在 PyTorch 里对一个张量返回的是
+       > `.shape[0]`，也就是 `nh`（16）而不是这一块的 T 长度——
+       > `abs_idx`/`block_start` 全部算错；`query_block[tail_mask]`
+       > 同样是按 dim 0（`nh` 轴）索引，而 `tail_mask` 的长度是这一块的
+       > T 长度，两者对不上，多数情况下会直接因形状不匹配报错，不会
+       > 悄悄算错，但同样会阻塞实现。③**`q_tail` 缺 batch 维。**
+       > `torch.cat(q_tail_parts, dim=-2)` 拼出的是
+       > `(nh, tail_query_count, hs)`，但 `log_kv_slot_attention` 的 `q`
+       > 要求显式 `(B, nh, T_q, k_dim)`
+       > （`litgpt/log_kv_cache.py:1477-1481`）——dump 约定里 `q_roped`
+       > 不带 batch 维，从它切出的 `q_tail` 也不带，必须显式补回去。
+       > 三处一起修，`scale` 直接复用机制 B 循环里已经在用的同一个
+       > `scale`（不是新引入的量）：
        >
        > ```python
        > q_tail_parts = []
+       > block_start = 0
        > for query_block in chunks(q_roped, block_size):   # 机制 B 已经在跑
        >                                                      # 的循环，不
-       >                                                      # 新增一次遍历
+       >                                                      # 新增一次遍历；
+       >                                                      # query_block:
+       >                                                      # (nh, blk_len, hs)
        >     ...（attn_mass_by_dist 的既有累积，见"Stage 0 dump 规格"，原样不变）...
-       >     abs_idx = block_start + arange(len(query_block))
+       >     blk_len = query_block.shape[1]        # T 轴是 dim 1，不是 dim 0
+       >                                              # （dim 0 是 nh）——张量上
+       >                                              # 的 len() 返回 shape[0]，
+       >                                              # 这里必须显式取 shape[1]
+       >     abs_idx = block_start + arange(blk_len)
        >     tail_mask = abs_idx >= T - tail_query_count
        >     if tail_mask.any():
-       >         q_tail_parts.append(query_block[tail_mask])   # 可能跨不止
-       >                                                          # 一块，也
-       >                                                          # 可能只是
-       >                                                          # 某一块的
-       >                                                          # 一部分，
-       >                                                          # 两种情形
-       >                                                          # 都正确
-       >                                                          # 累积
-       >     block_start += len(query_block)
+       >         q_tail_parts.append(query_block[:, tail_mask, :])   # 按 T 轴
+       >                                                                # （dim 1）
+       >                                                                # 取子集，
+       >                                                                # 不是按
+       >                                                                # dim 0
+       >                                                                # （nh 轴）；
+       >                                                                # 可能跨
+       >                                                                # 不止一
+       >                                                                # 块，也可能
+       >                                                                # 只是某一
+       >                                                                # 块的一部
+       >                                                                # 分，两种
+       >                                                                # 情形都正
+       >                                                                # 确累积
+       >     block_start += blk_len
        >
-       > q_tail = torch.cat(q_tail_parts, dim=-2)   # 循环结束后才拼成完整的
-       >     # (nh, tail_query_count, hs)；3b 的两次 log_kv_slot_attention
-       >     # 调用在循环外面、只做一次，不逐块调用
+       > q_tail = torch.cat(q_tail_parts, dim=-2).unsqueeze(0)
+       >     # 先拼成 (nh, tail_query_count, hs)，再补一个 batch 维变成
+       >     # (1, nh, tail_query_count, hs)——log_kv_slot_attention 的 q
+       >     # 要求显式 (B, nh, T_q, k_dim)。3b 的两次 log_kv_slot_attention
+       >     # 调用在循环外面、只做一次，不逐块调用。
        > assert cache_batch.recent_count  >= tail_query_count   # 前提，两条
        > assert cache_serial.recent_count >= tail_query_count   # 路径各查一次
+       >
+       > # log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale, mask=None,
+       > # causal_tail=0, slot_valid=None, M_s=None, ...)——scale 是位置参数、
+       > # 排在 slot_w 之后，slot_valid/M_s 是具名关键字参数，不能靠展开
+       > # get_attention_state() 的返回值自动对齐，必须显式拆包、按名字传：
+       > slot_k, slot_v, slot_w, slot_valid, M_s = cache_batch.get_attention_state()
        > out_batch = log_kv_slot_attention(
-       >     q_tail, *cache_batch.get_attention_state(),   # (slot_k,slot_v,
-       >     causal_tail=tail_query_count,                   # slot_w,slot_valid,
-       > )                                                    # M_s) 原样传，不
-       > out_serial = log_kv_slot_attention(                  # 手工重建、不拼接
-       >     q_tail, *cache_serial.get_attention_state(),
+       >     q_tail, slot_k, slot_v, slot_w, scale,   # scale 复用机制 B 循环
+       >     causal_tail=tail_query_count,              # 里已经在用的同一个
+       >     slot_valid=slot_valid, M_s=M_s,             # scale，不是新的量
+       > )
+       > slot_k, slot_v, slot_w, slot_valid, M_s = cache_serial.get_attention_state()
+       > out_serial = log_kv_slot_attention(
+       >     q_tail, slot_k, slot_v, slot_w, scale,
        >     causal_tail=tail_query_count,
+       >     slot_valid=slot_valid, M_s=M_s,
        > )
        > error_3b = relative_l2(out_batch, out_serial)   # 3b 的分子/分母；
        >                                                    # 两次调用用的是
-       >                                                    # 同一个 q_tail
+       >                                                    # 同一个 q_tail；
+       >                                                    # relative_l2 的
+       >                                                    # 精确定义见下方
+       > ```
+       >
+       > **`relative_l2` 此前只是一个未定义的函数名，补上精确定义**——
+       > 分母取谁、要不要 fp32、`eps` 怎么取、按 head/layer 先平均还是
+       > 整体 Frobenius，四个问题都需要钉死，否则 <5% 这个硬性决策门
+       > 本身就没有良定义的算法：
+       >
+       > ```python
+       > def relative_l2(out_batch, out_serial, eps=1e-6):
+       >     """out_batch/out_serial: (B, nh, tail_query_count, v_dim)，两次
+       >     log_kv_slot_attention 调用的直接输出（activation dtype，如
+       >     fp16/bf16）。
+       >
+       >     误差必须在 fp32 里算，不能在原 dtype 上直接相减取范数——
+       >     tail_query_count·v_dim 量级的求和在 fp16 下自带可观的舍入
+       >     噪声，量级可能和我们想测量的信号（批量近似 vs 严格串行的
+       >     真实分歧）相当，混进去会让 <5% 的判定本身不可信。
+       >
+       >     分母固定取 ||out_serial||，不是对称范数、也不是取两者较大值
+       >     ——out_serial 是这次比较里的参考真值（严格串行参考），3b 问
+       >     的是"批量近似偏离参考多少"，不是"两者互相偏离多少"这种两个
+       >     地位对等的量，与 `torch.testing.assert_close(actual,
+       >     expected, ...)` 系比较固定以 expected 为参考的惯例一致。
+       >     `eps` 只防止 `out_serial` 本身接近全零时除零，不改变分子
+       >     分母的选择。
+       >
+       >     范数按 (tail_query_count, v_dim) 联合展平后取，返回形状
+       >     (B, nh)——每个 (batch, query head) 一个标量，不在函数内部
+       >     跨 head 或跨 layer 平均。这是刻意的：按 §2.5 的贯穿性要求，
+       >     Stage 0 的一切统计必须逐层×逐头分开报告，3b 的 <5% 决策门
+       >     同样逐 (layer, head) 判定，不允许几个语义头很好的分数把
+       >     某个头很差的分数平均掉——调用方对每一层单独调用本函数一次
+       >     （层是外层循环，不在这个函数内部），拿到的 (B, nh) 结果按
+       >     (layer, head) 网格汇总报告，不产出单独的整体聚合数字。
+       >     """
+       >     a = out_batch.float()
+       >     b = out_serial.float()
+       >     num = torch.linalg.norm((a - b).flatten(start_dim=-2), dim=-1)   # (B, nh)
+       >     den = torch.linalg.norm(b.flatten(start_dim=-2), dim=-1)          # (B, nh)
+       >     return num / den.clamp_min(eps)
        > ```
        >
        > 这也顺带回答了"dense readout（`out_dense=probs@v`、GQA 展开、
@@ -533,6 +689,28 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > 未经验证的假设；上面的做法全程只在内存里累积一个
        > `(nh, tail_query_count, hs)` 的小切片、用完即弃，不落盘，不
        > 引入这个假设。
+       >
+       > **这个决定的直接推论（这一轮补的）：3b 不能是一个独立于 GPU
+       > dump 的后处理脚本，必须内嵌在 dump 脚本本身里。** 上面"S0.8
+       > （含 3b）本来就不是纯 CPU 后处理"那段说 `cache_batch`/
+       > `cache_serial` 的构造只吃 `k_raw`/`v`/`pos`（不需要 GPU），这句
+       > 话容易被读成"构造 cache 这一步可以在任何时候、任何进程里做"
+       > ——但既然 `q_tail` 只在 mechanism B 的循环里短暂存活、用完即弃，
+       > 3b 最后那一步真实读出比较就只能在 `q_tail` 还没被丢弃时发生，
+       > 也就是**这条 prompt 的 mechanism B 循环跑完、进入下一条 prompt
+       > 或脚本退出之前**。具体顺序：dump 脚本处理某一层时，mechanism A
+       > 的 hook 先给出这一层完整的 `k_raw`/`v`（一次性可得的中间激活，
+       > 不需要等待），紧接着 mechanism B 逐块跑过 `q_roped`（累积
+       > `attn_mass_by_dist` 和 `q_tail`）；`q_tail` 一凑齐，脚本必须
+       > **立即**（还在同一次 dump 调用栈里）用刚拿到的 `k_raw`/`v`/
+       > `pos` 跑一遍 §5.4/§5.18 的 CPU 参考实现构造出
+       > `cache_batch`/`cache_serial`，再做上面两次
+       > `log_kv_slot_attention` 调用算出 `error_3b`，然后才能丢弃
+       > `q_tail`、移动到下一层/下一条 prompt。**S0.8 的其余部分（第
+       > 1/2/3a 项，以及不依赖 `q` 的 cache 构造本身）不受这条约束**
+       > ——它们不碰 q，可以在 dump 完全结束、进程退出之后，用另一个
+       > 独立的纯 CPU 脚本随时对着已经落盘的 `k_raw`/`v`/`pos` 重跑；
+       > "离线"这个词对它们是准确的，但不适用于 3b 最后这一步读出比较。
 
   **决策门只挂在 3b 上**：注意力读出的相对 L2 误差应 < 5%（沿用原来的
   数字，但现在明确它挂在哪一项，且不再依赖 3a 那套需要精确 token 集合
