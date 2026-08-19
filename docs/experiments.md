@@ -245,11 +245,25 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
        `epoch` 怎么编号；
      - `trigger_token_idx`（即 `tok0`）在两条路径都出现的事件算作
        **匹配**，对匹配上的事件用 `algorithm-spec.md` 同一节定义的
-       `estimate_jaccard(...)` 分别估计 `keep`/`free` 两侧的 Jaccard
-       相似度（均值）——这是一个**估计值**，标准误差上界 `0.5/√k`（默认
-       `k=128` 时 ≈4.4%），`k` 必须和这个数字一起写进 eval metadata；连带
-       报告 `keep_size_before`/`free_size_before`（精确整数，不经估计），
-       帮助判断一个偏低的 Jaccard 发生在大簇还是小簇上；
+       `best_orientation_jaccard(event_a, event_b)`（不是直接调
+       `estimate_jaccard` 分别比较 `keep`/`free`）估计两侧的 Jaccard
+       相似度——**`keep`/`free` 是物理保留槽/释放槽这个实现细节的产物，
+       不保证两条路径方向一致**：两条路径若合并的是同一对语义簇但选了
+       相反方向的 keep/free（一条把 C 当 keep、另一条把 X 当 keep），
+       直接按标签比较会把两个不同的簇错误地凑一起，产出虚假的低 Jaccard，
+       即便这次合并本身是强对齐（`trigger_token_idx` 相等）。
+       `best_orientation_jaccard` 把两种配对方向都试一遍、取总相似度更高
+       的一种，返回 `side_1_jaccard`/`side_2_jaccard`（不再叫
+       keep/free——它们只在这一次结果内部有意义，不是跨路径可比的固定
+       标签）和 `orientation_flipped`（是否选中了交换方向），三者都要
+       报告，不要只留相似度丢掉是否翻转——翻转本身也是一个诊断信号
+       （翻转频繁可能说明两条路径的 Ward 候选选择存在系统性差异）。这是
+       一个**估计值**，标准误差上界 `0.5/√k`（默认 `k=128` 时 ≈4.4%），
+       `k` 必须和这个数字一起写进 eval metadata；连带报告
+       `keep_size_before`/`free_size_before`（精确整数，不经估计，用来
+       判断一个偏低的 Jaccard 发生在大簇还是小簇上——size 本身不受
+       keep/free 方向影响，两条路径各自的 `(keep_size, free_size)` 无序对
+       仍可直接比较）；
      - `trigger_token_idx` 只在其中一条路径出现的事件，**不要**强行配对
        或直接丢弃平均掉——分别计为 `ward_event_inserted`（只在批量路径）/
        `ward_event_deleted`（只在严格串行参考）单独报告。"事件根本没有
@@ -303,46 +317,107 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
        > 无关，可以离线用 `algorithm-spec.md` §5.4/§5.18 那套 CPU 参考
        > 实现做（S0.1 已经在用同一类参考实现，不需要额外 GPU）。**3b
        > 真正要用到 q 的地方只有"拿这两份已经构造好的 cache 状态各做
-       > 一次 attention 读出"这一步，决定：这一步复用机制 B 已有的、
-       > 按 query block 处理、用完即弃的循环，不新增任何持久化。**
-       > 具体做法：cache 构造（不需要 q，见上）在同一次 dump 里先完成；
-       > 机制 B 本来就要为 `attn_mass_by_dist` 逐块算一次
-       > `q_roped @ k_expanded.mT`，3b 在**同一个循环、同一个
-       > `query_block`** 上，额外用两份已经就绪的 cache 状态各算一次
-       > 读出、累积相对 L2 误差需要的分子/分母，算完这一块就跟着
-       > `q_roped` 一起丢弃——q 全程不落盘，只是在它本来就要被用一次算
-       > `attn_mass_by_dist` 的那个循环里"顺路多用一次"。**为了保证
-       > 因果性，3b 只用序列尾部的 query，且精确定义用多少个：一个
-       > 独立的 `tail_query_count` 参数**（默认借用 `flush_granularity`
-       > 的量级，但是一个独立字段，不随 `block_size` 变化），窗口定义
-       > 为"绝对位置落在 `[T − tail_query_count, T)` 的全部 query"（此时
-       > 两条路径的最终 cache 状态都已经构造完毕，序列尾部的 query 因果
-       > 地有权看到整个 cache）。
+       > 一次 attention 读出"这一步。**
        >
-       > **更正（这一轮修的）：上一版直接复用 `chunks(q_roped, block_size)`
-       > 产生的最后一个 `query_block` 划定这个窗口，理由是"不引入新
-       > 参数"——这个理由没有权衡代价，必须收回。** `block_size` 是机制 B
-       > 为控制内存/计算峰值设的分块粒度，和"3b 该用多少个尾部 query 来
-       > 估计误差"是两个不相关的问题：调 `block_size`（比如为了让 dump
-       > 脚本跑得更快、或适配不同显存）会顺带改变最后一块的 query 数量和
-       > 绝对位置集合，3b 的 L2 误差分子/分母的样本量因此跟着变，< 5%
-       > 这个判据可能因为一次纯粹的性能调参而改变结论——一个硬性决策门
-       > 不应该对一个和它要回答的问题无关的旋钮敏感，这比"多一个参数"的
-       > 代价更值得付。`tail_query_count` 和 `block_size` 各自独立、互不
-       > 派生。
+       > **更正（这一轮修的，P0）：上一版"序列尾部的 query 因果地有权
+       > 看到整个 cache"这句话只对 `tail_query_count=1`（字面意义上的
+       > 最后一个位置）成立，`tail_query_count>1` 时是错的，设计必须
+       > 重做，不能只改措辞。** 反例：尾部窗口里任意一个非末尾位置
+       > `p ∈ [T−tail_query_count, T−1)`，真实自回归 serving 下它只该
+       > 看到"刚摄入 token p 那一刻"的 cache 状态；但"两条路径各自处理
+       > 完整条序列之后的最终 cache 状态"已经包含了 `p` 之后全部
+       > `T−1−p` 个 token 的压缩贡献——若某个 entry 的 `[p_lo, p_hi]`
+       > 横跨 `p`，拿这个最终状态给位置 `p` 的 query 做读出，就是在喂它
+       > 本不该看到的未来信息。这不是"多一点误差"：算出来的相对 L2
+       > 误差会同时包含"批量近似 vs 严格串行"的真实分歧**和**"读到了
+       > 不该读到的未来 token"两种效应叠加在一起，`<5%` 的结论会好看
+       > 但不可信。根因是 `algorithm-spec.md` §5.14"虚拟槽展开必须扣上
+       > `causal_tail`/`mask` API"一节里 pooled 区域"无条件可见"这条
+       > 既有语义的前提被违反了：那条语义只在"pooled 里的内容天生都比
+       > 当前 query 老"（真实 serving 下必然成立，因为 compaction 只
+       > 发生在 token 被挤出 recent window 之后）这个前提下才安全，3b
+       > 用同一份最终 cache 服务尾部窗口里**除最后一个 query 外的所有
+       > query**时，这个前提并不成立。
+       >
+       > **修法：不重新构造多份 cache 状态（代价太大），而是把
+       > `tail_query_count` 这批 query 当成 `log_kv_slot_attention`
+       > 现有 `causal_tail` 参数里那批"in-flight exact chunk"，直接
+       > 复用生产读出路径，让"pooled 区域无条件可见"这条假设的前提
+       > 重新成立。** `causal_tail` 现有语义（`algorithm-spec.md`
+       > §5.14）正是"最后 `causal_tail` 个 slot 是逐 token 对齐的
+       > in-flight 精确 chunk、彼此三角因果互相掩蔽；它之前的所有
+       > pooled slot 无条件可见"——字面上就是 3b 需要的东西，前提是
+       > pooled 区域里确实不含任何比这批 query 里最早那个位置更"新"的
+       > 内容。只要这个前提满足，`causal_tail` 不需要新写任何因果
+       > 逻辑：把整条序列的最终 cache 当 pooled 前缀，把
+       > `[T−tail_query_count, T)` 这些原始 token 自己的 `k_raw`/`v`
+       > 当 in-flight chunk，调用现成的 `log_kv_slot_attention(...,
+       > causal_tail=tail_query_count)`，它内部的三角掩码天然保证位置
+       > `p` 只能 attend 到 in-flight chunk 里 `≤p` 的部分。
+       >
+       > **前提必须显式校验，不能默认成立**：要求"最近一次 flush
+       > （compaction）边界必须在位置 `T−tail_query_count` 之前"，即
+       > 整个尾部窗口自始至终都还没被挤出 recent window、没有被任何一次
+       > flush 处理过。用两条路径各自 recent window 里"自上次 flush
+       > 以来已摄入的 token 数"（记为 `since_last_flush`——两条路径本来
+       > 就在维护这个量，flush 触发条件天然要用它）断言
+       > `since_last_flush ≥ tail_query_count`，**两条路径分别断言，
+       > 不能只查一条**（批量近似和严格串行参考的 flush 时机可能因为
+       > 路由近似而略有不同）。不满足就是配置错误，**硬失败**——换更小
+       > 的 `tail_query_count`，或另挑一条不是刚好卡在 flush 边界上的
+       > prompt，不做静默截断或自动缩小（同 §5.21-2"预分配 + 硬失败"
+       > 原则）。默认 `tail_query_count` 借用 `flush_granularity` 的
+       > 量级（≤128）、`recent_size` 默认 1024，正常情况下这条断言
+       > 天然满足，只有病态/边界配置才会触发。
+       >
+       > 具体做法（压缩侧，两条路径各跑一次）：
+       >
+       > ```python
+       > assert since_last_flush(cache) >= tail_query_count   # 前提，两条路径各查一次
+       > slot_k, slot_v, slot_w, slot_valid, M_s = cache.get_attention_state()  # pooled
+       >                                                        # 前缀，§5.14/§5.20-B
+       > k_tail_roped = apply_rope(k_raw[T-tail_query_count:T], pos[T-tail_query_count:T])
+       > v_tail       = v[T-tail_query_count:T]         # in-flight chunk，flatten 顺序
+       > q_tail       = q_roped[T-tail_query_count:T]   # 与 append_exact_tokens 一致：
+       >                                                  # pooled 在前、exact 在后
+       > out_compressed = log_kv_slot_attention(
+       >     q_tail, slot_k, slot_v, slot_w, scale,     # slot_w 原样传，**不要**在
+       >     causal_tail=tail_query_count,                # 调用前手工除以 M_s——mass
+       >     slot_valid=slot_valid, M_s=M_s,              # bias λ·log(w_s/M_s) 是函数
+       > )                                                 # 内部算的（§5.14/表 B），
+       >                                                    # M_s 和 slot_valid 一样只
+       >                                                    # 覆盖 pooled 前缀，exact
+       >                                                    # 尾部不需要调用方补 M_s
+       > ```
+       >
+       > 这不只是修正因果性，顺带也回答了"3b 的压缩侧读出要不要和生产
+       > 路径逐项对齐（GQA 折叠、`slot_valid`、`M_s`、`λ log(w/M)`、
+       > fp32 分数缓冲）"这个单独提过的问题——**直接调用生产函数
+       > `log_kv_slot_attention`/`get_attention_state()` 本身，而不是
+       > 照抄一份平行实现**，这些细节全部自动保持一致，不需要在这里
+       > 重新枚举、也不会因为文档和代码各自演化而漂移。
+       >
+       > **稠密侧（mechanism B 给出的 ground truth）不受这次更正
+       > 影响**：它的 `causal_mask(scores)` 这一步（"Stage 0 dump 规格"
+       > 机制 B 伪代码第 3 行）本来就是逐 query 位置精确因果的，从第
+       > 一版开始就没有这个 bug，只是此前压缩侧没有对齐它。稠密侧继续
+       > 走下面的 `block_size` 分块循环 + `tail_mask`，用来算 3b 的
+       > 分子/分母另一半。
        >
        > 机制 B 原有的按 `block_size` 分块的循环结构不变（它服务的是
        > 内存/计算峰值控制，和 `attn_mass_by_dist` 的其它职责一样）；3b
-       > 的累积逻辑在这个既有循环内部新增一个与块边界无关的掩码：对每个
-       > `query_block`，取 `abs_idx = block_start + arange(len(query_block))`，
+       > 稠密侧的累积逻辑在这个既有循环内部新增一个与块边界无关的
+       > 掩码：对每个 `query_block`，取
+       > `abs_idx = block_start + arange(len(query_block))`，
        > `tail_mask = abs_idx >= T - tail_query_count`，只用 `tail_mask`
        > 选中的子集累积 3b 的 L2 误差分子/分母——`tail_query_count` 大于
        > `block_size` 时这个窗口会跨越不止一块，小于 `block_size` 时只
        > 覆盖最后一块的一部分，两种情形这个掩码写法都正确处理，不需要
-       > 分支特判。3b 依然是这一次性的窗口给出的单个相对 L2 误差数字，
-       > 不按 block 取平均——不需要让 cache 构造和机制 B 的循环逐块交错
-       > 对齐，两个阶段谁先谁后不重要，只要 cache 构造在机制 B 处理到
-       > 这个尾部窗口涉及的最后一块之前完成。**`block_size` 和
+       > 分支特判。**压缩侧（上面新增的 `causal_tail` 调用）不参与这个
+       > 分块循环，是独立的一次调用**——`causal_tail == tail_query_count`
+       > 硬校验本来就要求整批 `tail_query_count` 个 query 一次性传入，
+       > 不能再按 `block_size` 二次切块。3b 依然是这一次性的窗口给出的
+       > 单个相对 L2 误差数字，不按 block 取平均。**`block_size` 和
        > `tail_query_count` 必须一起写进 eval metadata**（与 §5.21-4
        > `s_h` 标定值同一纪律）——引用这个 5% 数字时，两者缺一都不算
        > 完整复现实验设置。
@@ -351,8 +426,8 @@ prompt id、tokenizer、序列长度、needle 的 token span、层/头索引、�
        > 路**：那样会让 S0.8 依赖的输入和"Stage 0 只落盘
        > k/v/`attn_mass_by_dist` 直方图"这条既定原则产生一个例外，且
        > 抽样出来的 query 子集能不能代表真实 readout 误差是一个新的、
-       > 未经验证的假设；复用机制 B 现成的循环不引入这个假设，也不需要
-       > 改动上面的 dump 表。
+       > 未经验证的假设；上面的做法两侧都只切一个固定大小的尾部窗口，
+       > 不引入这个假设，也不需要改动上面的 dump 表。
 
   **决策门只挂在 3b 上**：注意力读出的相对 L2 误差应 < 5%（沿用原来的
   数字，但现在明确它挂在哪一项，且不再依赖 3a 那套需要精确 token 集合

@@ -469,6 +469,101 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第十八轮核实：修 S0.8 3b 的一处 P0（多 query 尾部窗口
+  破坏因果性，`<5%` 决策门测的是一个混入未来信息泄漏的误差）与五处
+  实现坑——Ward 事件 keep/free 方向不跨路径稳定、`scan_op_log_for_
+  ward_events` 没真正校验 WARD_MERGE 紧邻 NEW_CLUSTER、该函数的防御式
+  `.get(..., 默认值)` 会把缺失状态伪装成合法空事件、MinHash 规格写成
+  "bottom-k" 但伪代码是另一种不兼容的变体且哈希函数未钉死到可复现的
+  程度、3b 压缩侧读出缺一段生产等价伪代码。** 动机：用户对上一轮
+  （第十七轮）刚修完的 S0.8 3b/Ward 事件机制再核一遍，指出这次的 P0
+  比之前任何一轮都危险——"结论会好看但不可信"这类 bug 最难在事后发现。
+  逐条结论：
+  ① **P0：`tail_query_count > 1` 时"尾部 query 因果地有权看到整个
+  cache"这句话是错的，只对最后一个位置成立。** 上一轮引入
+  `tail_query_count` 是为了解决"5% 决策门绑定 block_size"这个问题，
+  但顺带默认了"尾部窗口里所有 query 都能看最终 cache"，没意识到这本身
+  就是新的因果性漏洞：窗口里除最后一个位置外，其余位置在真实 serving
+  下只该看到"刚摄入那个 token 时"的 cache，而"两条路径处理完整条序列
+  后的最终 cache"已经吸收了它们各自位置之后全部 token 的压缩贡献。算出
+  的 3b 误差会把"批量近似 vs 严格串行的真实分歧"和"读到了未来 token"
+  两种效应叠在一起，看起来达标但不能说明近似值得信任。**没有选择"退回
+  `tail_query_count=1`"或"逐 query 位置重新构造 cache"这两条路**——前者
+  放弃了多 query 平均带来的样本量、后者代价太大（重建 `tail_query_count`
+  份完整 cache 状态）。**修法**：`algorithm-spec.md` §5.14"虚拟槽展开
+  必须扣上 `causal_tail`/`mask` API"一节的 `causal_tail` 机制本来就是
+  "最后 `causal_tail` 个 slot 是逐 token 对齐的 in-flight 精确 chunk、
+  彼此三角因果互相掩蔽，之前的 pooled slot 无条件可见"——这正是 3b 需要
+  的东西，前提是 pooled 区域确实不含比这批 query 里最早位置更新的内容。
+  于是把 `[T−tail_query_count, T)` 这批原始 token 自己的 `k_raw`/`v`
+  当 in-flight chunk、直接调用生产函数 `log_kv_slot_attention(...,
+  causal_tail=tail_query_count)`，不新写任何因果逻辑。**前提必须显式
+  校验**：两条路径分别断言"自上次 flush 以来已摄入的 token 数
+  （`since_last_flush`）≥ `tail_query_count`"，不满足硬失败（换更小的
+  `tail_query_count`，不做静默截断），同 §5.21-2"预分配+硬失败"原则。
+  默认参数（`tail_query_count≤flush_granularity`、`recent_size=1024`）
+  下这条断言天然满足。稠密侧（mechanism B 的 ground truth）不受影响
+  ——它的 `causal_mask(scores)` 从第一版起就是逐 query 位置精确因果的，
+  继续走 `block_size` 分块循环 + `tail_mask`；压缩侧改成独立的一次
+  `causal_tail` 调用，不再纳入 `block_size` 分块。
+  ② **P1：Ward 事件的 `keep`/`free` 不是跨路径稳定的有序对。** "keep"/
+  "free" 是"哪个物理槽被保留/释放"这个实现细节的产物，两条路径即使
+  合并的是同一对语义簇，也可能选择相反的保留方向；直接按标签比较
+  `keep_A` vs `keep_B` 会把两个不同的簇错误地凑一起比较，产出虚假的
+  低 Jaccard，即便这次合并本身是强对齐（`trigger_token_idx` 相等）。
+  **修法**：新增 `best_orientation_jaccard`，两种配对方向（不交换/
+  交换）都试一遍，取总相似度更高的一种，返回 `side_1_jaccard`/
+  `side_2_jaccard`（不再叫 keep/free——它们不是跨路径可比的固定标签）
+  和 `orientation_flipped`（是否选中了交换方向，本身也是一个诊断信号，
+  单独报告不藏进相似度里）。`keep_size_before`/`free_size_before` 不
+  受影响，size 本身与方向无关，仍可直接比较。
+  ③ **P1：`scan_op_log_for_ward_events` 没真正钉死"WARD_MERGE 紧邻
+  NEW_CLUSTER"这条顺序契约。** docstring 这么写，但循环只在遇到
+  `NEW_CLUSTER` 时才检查并消费 `pending`，中间如果插了一条 `JOIN`/
+  `NEW_SEGMENT`/`PAD_INSERT`/`CARRY`，会被无声跳过，不产生任何信号——
+  契约实际上从未被真正校验，只是恰好在正确输入下表现得像成立。若这份
+  契约在别处被打破，函数会把 `trigger_token_idx` 错配给一个不相关的
+  `NEW_CLUSTER`，产出的 `WardEvent` 看起来完全合法，实际已经污染。
+  **修法**：循环体最前面新增 `if pending is not None: assert op.type
+  == NEW_CLUSTER`，违反顺序契约的那一刻现场报错。
+  ④ **P1：`.get(ident, EMPTY_SKETCH)`/`.get(ident, 0)` 把"缺失状态"
+  伪装成"合法的空集合"。** 引用一个从未见过的身份本该是调用方 bug
+  （忘了传 `initial_sketches`/`initial_sizes`，或 `op_log` 切片不
+  合法），但防御式默认值会让它产出一个 size=0 的"合法"事件，诊断数字
+  被悄悄污染却没有任何报错。**修法**：新增 `_require` helper，所有
+  `sketches`/`sizes` 读取改成严格查找；额外在构造 `WardEvent` 前断言
+  `keep_size_before>0 and free_size_before>0`（抓的是"身份已知但计数
+  被错误清零"这另一类失效模式，不能被 `_require` 顺带盖住）。
+  `EMPTY_SKETCH` 不再当默认值用，只保留它作为 min 幺元的数学定义。
+  ⑤ **P2：MinHash 规格名不副实，且哈希函数没钉死到可复现的程度。**
+  "MinHash（bottom-k）"这个名字对不上伪代码——bottom-k 是单个哈希函数
+  取全局最小的 k 个值（无序子集），估计量和合并规则都和"k 个独立哈希
+  函数各自取 min"（伪代码实际实现的、Broder 1997 的经典方案）不同，
+  写成 bottom-k 会诱导实现者去套错的估计公式。**修法**：改称"k-hashes
+  MinHash"。同时，`minhash_of_token` 此前当成像 `apply_rope` 一样的
+  "不用规定内部细节"的原语——但 `apply_rope` 是唯一确定的数学操作，
+  任何正确实现都逐位一致；"一个哈希函数"不是唯一确定的，两次 dump 用
+  不同哈希实现会让草图不可比而没有任何报错信号。改用具体钉死的
+  [SplitMix64](https://prng.di.unimi.it/splitmix64.c)（Vigna，Java
+  `SplittableRandom` 的种子扩展器），全部按 `uint64` 回绕语义（Python
+  端必须显式 `&0xFFFFFFFFFFFFFFFF` 或用 `numpy.uint64`，不能用裸
+  `int`），`k` 个子种子从单个 `master_seed` 迭代 SplitMix64 派生。
+  eval metadata 需要记录的从"只有 `k`"改成"`k` + `hash_algorithm`
+  版本号（`"splitmix64-v1"`）+ `master_seed`"，三者共同决定草图可
+  不可比。
+  ⑥ **P2：3b 压缩侧读出缺一段生产等价伪代码，容易被实现成 dense
+  `k_expanded` 那套路径。** 和①的修法是同一个改动顺带解决的——直接
+  调用生产函数 `log_kv_slot_attention`/`get_attention_state()` 本身
+  （而不是照抄一份平行实现），GQA 折叠、`slot_valid`、`M_s`、
+  `λ log(w/M)`、fp32 分数缓冲这些细节全部自动保持一致，不需要在 3b
+  这里重新枚举、也不会因为文档和代码各自演化而漂移。**顺带修正了
+  起草这段伪代码时自己引入的一个新错误**：第一版把 `slot_w` 手工除以
+  `M_s` 再传给 `log_kv_slot_attention`，但 `algorithm-spec.md` 表 B
+  "mass bias 改用 `λ·log(w_s/M_s)`"和 §5.14 明确这是函数内部算的
+  ——`M_s` 应该和 `slot_valid` 一样作为独立参数传入（只覆盖 pooled
+  前缀），不能由调用方预先做除法，否则会重复应用或应用到错误的地方；
+  已改成 `slot_w` 原样传、`M_s` 单独作为关键字参数传入。
+
 - **2026-08-19｜第十七轮核实：修 S0.1/S0.8 六处测试与实现规格的坑——
   alive-but-untouched 槽的元数据基线被错误写成 0、Ward 事件成员快照有
   O(T²) 内存/时间风险、S0.8 3b 的决策门隐式绑定了机制 B 的性能参数、

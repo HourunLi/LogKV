@@ -925,10 +925,24 @@ final_slot = resolve_final_slots(all_identity, parent)   # 只在这里、扫完
 > 论证里已经证明过的同一个最坏情况在这里的另一次出现，必须给出有界方案，
 > 不能假设"实践中不会这么糟"。
 >
-> **修法：把精确 `frozenset` 换成固定宽度的 MinHash（bottom-k）草图**，
-> 只服务它唯一的下游消费者——`experiments.md` S0.8 要的是 Jaccard
-> 相似度这一个标量，不是集合本身，而 Jaccard 允许有界误差的估计（这一项
-> 是诊断信号，不是决策门，决策门只挂在 3b，见 `experiments.md` §6）。
+> **修法：把精确 `frozenset` 换成固定宽度的 MinHash 草图**，只服务它
+> 唯一的下游消费者——`experiments.md` S0.8 要的是 Jaccard 相似度这一个
+> 标量，不是集合本身，而 Jaccard 允许有界误差的估计（这一项是诊断信号，
+> 不是决策门，决策门只挂在 3b，见 `experiments.md` §6）。
+>
+> **更正（这一轮修的）：叫它"MinHash（bottom-k）"是名不副实，必须纠正
+> 措辞，不能只是笔误放过。** "bottom-k" 特指**单个**哈希函数、取整个集合
+> 哈希值里最小的 `k` 个（一个无序的 k 元子集），它的 Jaccard 估计量和
+> 合并规则都是"取两边 `2k` 个候选值里最小的 `k` 个,再看有几个来自两边
+> 交集"，比这里写的实现更省样本但更复杂。**下面的伪代码实际实现的是
+> 经典的『`k` 个独立哈希函数各自取 min』方案**（Broder 1997 的原始
+> MinHash，有时也称 k-hashes MinHash）：`k` 个位置逐一独立，每个位置
+> 存一个标量最小值，合并是逐位 `elementwise_min`，Jaccard 估计量是"两个
+> 草图逐位相等的比例"——这是两种不同的、不能混用估计公式的实现，写成
+> "bottom-k" 会让实现者去查 bottom-k 的估计量/合并公式，套到这里就是错的。
+> 全文统一改称 **"k-hashes MinHash"** 或直接说"MinHash 草图"，不再用
+> "bottom-k"这个限定词。
+>
 > MinHash 的关键性质是**集合并运算下精确合成，不是"近似的近似"**：
 > `sketch(A ∪ B) = elementwise_min(sketch(A), sketch(B))` 对任意有限宽度
 > `k` 都精确成立；唯一的误差来自用有限宽度估计 Jaccard 本身，标准误差
@@ -942,26 +956,66 @@ final_slot = resolve_final_slots(all_identity, parent)   # 只在这里、扫完
 > 但只在真的需要时才付，不是默认路径）。精确的**成员数**（不是成员本身）
 > 代价是 O(1)，单独维护一个计数器即可，不需要靠草图估计。`k`（草图宽度）
 > 是 S0.8 专用的调试/分析参数，不属于核心算法（不进 §5.13 buffer 表、不
-> 影响 forward/backward），但和它产出的 Jaccard 数字一样，必须写进 eval
-> metadata——同一纪律见 §5.21-4 的 `s_h` 标定值。
+> 影响 forward/backward）。
+>
+> **更正（这一轮修的）：光写 `k` 不够复现，`minhash_of_token` 不能当成
+> 像 `apply_rope` 那样"不用规定内部细节"的原语——`apply_rope` 是唯一
+> 确定的数学操作，任何正确实现都逐位一致；但"一个哈希函数"不是唯一
+> 确定的，不同实现（Python `hash()`、不同 PRNG、不同 murmur/xx 变体）
+> 给出完全不同的输出，两次 Stage 0 dump 如果用了不同的哈希实现，草图
+> 之间就不可比、连带 Jaccard 数字失去意义，而这条错误没有任何报错信号，
+> 只会安静地污染诊断数字。必须钉死到"任何人照此实现都逐位复现"的程度。**
+> 采用 [SplitMix64](https://prng.di.unimi.it/splitmix64.c)（Vigna 提出，
+> Java `SplittableRandom` 的种子扩展器，公开、简单、无歧义的标准 64 位
+> 混合函数）：全部算术按 `uint64` 回绕语义（mod `2**64`）执行，Python
+> 实现必须显式 `& 0xFFFFFFFFFFFFFFFF` 或使用 `numpy.uint64`/
+> `numpy.uint64` 数组，**不能用裸 Python `int`**（无溢出，静默不复现
+> C/numpy 版本的回绕结果）。
 
 ```python
+MASK64 = 0xFFFFFFFFFFFFFFFF
+
+def _splitmix64_next(state: "uint64") -> "tuple[uint64, uint64]":
+    """标准 SplitMix64 一步：返回 (推进后的 state, 本步输出)。全部按 uint64
+    回绕语义。"""
+    state = (state + 0x9E3779B97F4A7C15) & MASK64
+    z = state
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+    z = z ^ (z >> 31)
+    return state, z
+
 WARD_EVENT_SKETCH_K = 128   # MinHash 草图宽度；S0.8 专用调试参数，见上方更正框，
                               # 标准误差上界 0.5/sqrt(128) ≈ 4.4%（Jaccard=0.5 处最大）
+WARD_EVENT_HASH_ALGO = "splitmix64-v1"   # 必须和 k、master_seed 一起写进 eval
+                                           # metadata——三者共同决定草图可不可比
+WARD_EVENT_MASTER_SEED = 0   # 唯一的自由参数；k 个子种子从它确定性推导
+
+def make_minhash_seeds(k: int, master_seed=WARD_EVENT_MASTER_SEED) -> "list[uint64]":
+    """从单个 master_seed 迭代 SplitMix64 k 次，派生 k 个互相独立的子种子——
+    这是 SplitMix64 的标准用法（同一算法既用来出草图哈希、也用来扩展自己的
+    种子），不需要另外维护一份种子列表。"""
+    state, seeds = master_seed, []
+    for _ in range(k):
+        state, seed_i = _splitmix64_next(state)
+        seeds.append(seed_i)
+    return seeds
+
 MINHASH_SEEDS = make_minhash_seeds(WARD_EVENT_SKETCH_K)   # 固定种子，整个 Stage 0
                               # dump 全程复用同一份——不同事件的草图必须用同一族哈希
-                              # 函数才可比，具体哈希族选取不是这里的重点，只要求
-                              # k 个互相独立、均匀分布在 uint64 上即可
-EMPTY_SKETCH = np.full(WARD_EVENT_SKETCH_K, np.iinfo(np.uint64).max, dtype=np.uint64)
+                              # 函数才可比
+EMPTY_SKETCH = np.full(WARD_EVENT_SKETCH_K, MASK64, dtype=np.uint64)
                               # 空集的草图：全体取 min 的幺元，任何真实 token 的
-                              # 哈希值都比它小，第一次插入即正确覆盖
-
+                              # 哈希值都比它小，第一次插入即正确覆盖。**不再用作
+                              # "身份缺失时的默认值"**——见下方 strict 校验一节，
+                              # 这个语义已被证明是错的
 
 def minhash_of_token(token_idx: int, seeds=MINHASH_SEEDS) -> "np.ndarray[K]":
-    """单个 token 的 MinHash 草图（k 个独立哈希值）。当作原子原语处理，
-    和文档别处把 apply_rope/compact() 当作既有正确原语是同一个态度——
-    具体哈希函数实现不是这里要规定的内容。"""
-    ...
+    """单个 token 的 MinHash 草图：k 个独立哈希值，h_i(token_idx) =
+    splitmix64_next(seeds[i] ^ token_idx)[1]——把第 i 个子种子和 token_idx
+    异或后过一轮 SplitMix64。"""
+    return np.array([_splitmix64_next(s ^ np.uint64(token_idx))[1] for s in seeds],
+                     dtype=np.uint64)
 
 
 class WardEvent(NamedTuple):
@@ -990,6 +1044,31 @@ def estimate_jaccard(sketch_a, sketch_b) -> float:
     误差上界 0.5/sqrt(K)（K=WARD_EVENT_SKETCH_K，在真实 Jaccard=0.5 处
     最大）。"""
     return float(np.mean(sketch_a == sketch_b))
+
+
+def best_orientation_jaccard(event_a: WardEvent, event_b: WardEvent):
+    """两个已经按 trigger_token_idx 匹配上的 WardEvent，给出方向无关的相似度。
+
+    `keep`/`free` 是"物理保留槽/释放槽"这个实现细节的产物——`ward_merge_only`
+    合并 (C, X) 时哪一个当 keep、哪一个当 free 由代价矩阵/槽位选择逻辑决定，
+    不是语义上稳定的有序对。若两条路径（批量近似、严格串行参考）合并的是
+    同一对语义簇，但各自选择了相反方向的 keep/free（批量路径把 C 当 keep、
+    严格串行把 X 当 keep），直接按标签比较
+    `estimate_jaccard(event_a.keep_sketch_before, event_b.keep_sketch_before)`
+    会把两个不同的簇错误地凑在一起比较，产出一个虚假的低 Jaccard——事件本身
+    明明是同一次合并的强对齐（trigger_token_idx 相等），却被误判成"两侧都差"。
+
+    修法：把两种配对方向都试一遍，取总相似度更高的一种；`keep`/`free` 不再是
+    两个跨路径可比的固定标签，只作为"同一次结果内部" side_1/side_2 的
+    区分——orientation 是否发生翻转单独报告，不藏进相似度数字里。
+    """
+    fwd = (estimate_jaccard(event_a.keep_sketch_before, event_b.keep_sketch_before),
+           estimate_jaccard(event_a.free_sketch_before, event_b.free_sketch_before))
+    swapped = (estimate_jaccard(event_a.keep_sketch_before, event_b.free_sketch_before),
+               estimate_jaccard(event_a.free_sketch_before, event_b.keep_sketch_before))
+    if sum(fwd) >= sum(swapped):
+        return dict(side_1_jaccard=fwd[0], side_2_jaccard=fwd[1], orientation_flipped=False)
+    return dict(side_1_jaccard=swapped[0], side_2_jaccard=swapped[1], orientation_flipped=True)
 
 
 def scan_op_log_for_ward_events(
@@ -1050,10 +1129,25 @@ def scan_op_log_for_ward_events(
             v = parent[v]
         return v
 
+    def _require(store: dict, ident, what: str):
+        """严格查找,替代此前的 `.get(ident, EMPTY_SKETCH)`/`.get(ident, 0)`
+        防御式默认值——更正见下方 blockquote。缺失就地报错,不垫一个"看起来
+        合法"的空草图/0 计数。"""
+        if ident not in store:
+            raise AssertionError(
+                f"scan_op_log_for_ward_events: 引用了未知的簇身份 {ident}"
+                f"（缺失于 {what}）——多半是 initial_sketches/initial_sizes 没有"
+                f"正确传递，或 op_log 切片边界不合法")
+        return store[ident]
+
     ward_events: list[WardEvent] = []
     pending = initial_pending   # 刚 append、还缺 trigger_token_idx；可能是
                                   # 上一段传进来的，也可能在本段内产生
     for op in op_log:
+        if pending is not None:   # 见下方更正框：顺序契约必须在这里现场校验
+            assert op.type == NEW_CLUSTER, (
+                f"scan_op_log_for_ward_events: 顺序契约违反——WARD_MERGE 之后"
+                f"必须紧跟它服务的 NEW_CLUSTER，但遇到了 {op.type}")
         if op.type == NEW_CLUSTER:
             epoch[op.cluster] = epoch.get(op.cluster, -1) + 1
             ident = (op.cluster, epoch[op.cluster])
@@ -1064,30 +1158,59 @@ def scan_op_log_for_ward_events(
                 pending = None
         elif op.type in (JOIN, NEW_SEGMENT):
             ident = (op.cluster, epoch.get(op.cluster, 0))
-            sketches[ident] = np.minimum(sketches.get(ident, EMPTY_SKETCH),
+            sketches[ident] = np.minimum(_require(sketches, ident, "sketches"),
                                           minhash_of_token(op.token_idx))
-            sizes[ident] = sizes.get(ident, 0) + 1
+            sizes[ident] = _require(sizes, ident, "sizes") + 1
         elif op.type == WARD_MERGE:
             assert pending is None    # 上一个 Ward 事件必须已被消费，见 docstring
             keep_v = find((op.keep_slot, epoch.get(op.keep_slot, 0)))
             free_v = find((op.free_slot, epoch.get(op.free_slot, 0)))
+            keep_size, free_size = _require(sizes, keep_v, "sizes"), _require(sizes, free_v, "sizes")
+            assert keep_size > 0 and free_size > 0, (
+                "scan_op_log_for_ward_events: keep/free 的精确成员数不能是 0"
+                "——size 只会在 NEW_CLUSTER 时置 1、此后单调不减，精确为 0 只"
+                "可能是状态维护本身有 bug，不是合法输入")
             pending = WardEvent(
                 trigger_token_idx=None,   # 下一条 NEW_CLUSTER 补上
                 keep_identity=keep_v, free_identity=free_v,
-                keep_sketch_before=sketches.get(keep_v, EMPTY_SKETCH).copy(),  # O(K)
-                free_sketch_before=sketches.get(free_v, EMPTY_SKETCH).copy(),  # 拷贝，
-                keep_size_before=sizes.get(keep_v, 0),   # 与真实成员数无关
-                free_size_before=sizes.get(free_v, 0),
+                keep_sketch_before=_require(sketches, keep_v, "sketches").copy(),  # O(K) 拷贝，
+                free_sketch_before=_require(sketches, free_v, "sketches").copy(),  # 与真实成员数无关
+                keep_size_before=keep_size,
+                free_size_before=free_size,
             )
-            sketches[keep_v] = np.minimum(sketches.get(keep_v, EMPTY_SKETCH),
-                                           sketches.get(free_v, EMPTY_SKETCH))
-            sizes[keep_v] = sizes.get(keep_v, 0) + sizes.get(free_v, 0)
+            sketches[keep_v] = np.minimum(sketches[keep_v], sketches[free_v])
+            sizes[keep_v] = keep_size + free_size
             sketches.pop(free_v, None)
             sizes.pop(free_v, None)
             parent[free_v] = keep_v
 
     return ward_events, epoch, parent, sketches, sizes, pending
 ```
+
+> **更正（这一轮修的）：两处此前会静默吞掉 bug，必须改成硬失败。**
+> ① **`pending`/`NEW_CLUSTER` 的紧邻关系此前只是"等到了就消费"，从不校验
+> "等到的是不是它"。** 原循环只在 `op.type == NEW_CLUSTER` 分支内部检查
+> `pending is not None`，中间如果插了一条 `JOIN`/`NEW_SEGMENT`/
+> `PAD_INSERT`/`CARRY`，会被直接跳过、不产生任何信号——docstring 声称的
+> "紧邻"契约实际上从未被真正校验过，只是恰好在正确输入下表现得像是成立。
+> 一旦这份契约在别处被打破（比如 op_log 顺序被后续改动不小心破坏），这个
+> 函数会把 `trigger_token_idx` 错配给一个不相关的 `NEW_CLUSTER`，产出的
+> WardEvent 看起来完全合法，实际已经污染。**修法**：循环体最前面新增
+> `if pending is not None: assert op.type == NEW_CLUSTER`——只要上一步
+> 产生了 pending，本步不是 `NEW_CLUSTER` 就立刻现场报错，不再有"跳过几条
+> op 之后才补上"这条从未被授权过的路径。
+> ② **`.get(ident, EMPTY_SKETCH)`/`.get(ident, 0)` 把"缺失状态"伪装成
+> "合法的空集合"。** 引用一个从未被这次调用（含种子）见过的身份，本该是
+> 调用方的 bug（忘了传 `initial_sketches`/`initial_sizes`，或者 `op_log`
+> 切片不合法）——但防御式默认值会让它看起来像一次真实存在、只是恰好是
+> 空集的合并/加入，产出 size=0 的"合法"WardEvent，诊断数字被悄悄污染而
+> 没有任何报错。**修法**：新增 `_require` helper，所有读取 `sketches`/
+> `sizes` 的地方一律换成严格查找；额外在构造 `WardEvent` 前断言
+> `keep_size_before > 0 and free_size_before > 0`——一个已知身份的 size
+> 精确为 0 是另一类不该发生的状态维护 bug，值得单独一条断言而不是被
+> `_require` 顺带盖住（`_require` 抓的是"身份完全未知"，这一条抓的是
+> "身份已知但计数被错误清零"，两种失效模式不同）。`EMPTY_SKETCH` 不再
+> 用作缺省值，只保留它"min 幺元"这个数学定义本身。
 
 **典型用法（分段串联，末尾断言 `pending` 已被消费干净）**：
 
