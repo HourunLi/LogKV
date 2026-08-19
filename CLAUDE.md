@@ -469,6 +469,64 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第十九轮核实：修 3b 压缩侧读出伪代码里两个自己引入的
+  P0——忘了把尾部 exact token 真正拼进 slot 张量导致 `causal_tail` 遮错
+  对象、且和 `get_attention_state()` 已经包含 recent window 这件事撞在
+  一起变成双计——外加把 `since_last_flush` 这个凭空发明的状态量换成
+  真实存在的 `recent_count`，`M_s` 正式列入 `log_kv_slot_attention`
+  签名，`tail_query_count` 的默认值口径钉死，以及给 Ward orientation
+  选择补上噪声容限。** 动机：用户这次重新拉取远端最新
+  `origin/semanticLogKV`（确认代码目录里 `semantic`/`log_kv_semantic`
+  仍零匹配，审的是规格文本本身）核对上一轮（第十八轮）刚落地的 3b
+  修法，发现"因果性方向对了，但落到伪代码这层还有两个具体实现坑没堵上"
+  ——这类"方向正确、执行细节仍然错"的 bug 最容易被上一轮的"看起来已经
+  修好了"掩盖。逐条结论：
+  ① **P0：3b 压缩侧伪代码只算出了 `k_tail_roped`/`v_tail`，从未真的把
+  它们拼进传给 `log_kv_slot_attention` 的 `slot_k`/`slot_v`，`causal_
+  tail` 因此遮住的是 `get_attention_state()` 原始返回值里排在最后的
+  那几个槽，不是真正的尾部 token。** `causal_tail` 的既有语义（§5.14）
+  是"调用方传入的张量最后 `causal_tail` 个位置就是 in-flight chunk"，
+  它不负责拼接，只负责在调用方已经拼好的张量上加三角掩码——上一轮的
+  伪代码只做了后半件事，没做前半件事。
+  ② **P0：`get_attention_state()` 是否已经包含 recent window，上一轮
+  的注释（"# pooled 前缀"）说错了，叠上①就会双计。** 核对
+  `litgpt/log_kv_cache.py:1246-1336` 的现有实现确认：这个函数的返回值
+  本来就是"压缩 levels（老到新）+ recent window（原始顺序，`w=1`
+  精确槽）"拼接后的完整状态，recent window 已经在里面，不是只有 pooled
+  部分。若真按上一轮的写法再手工拼一份 `k_tail_roped`/`v_tail` 上去，
+  尾部 `tail_query_count` 个 token 会在最终 attend 到的集合里出现两次。
+  **两个坑合起来看，正确修法反而比上一版更简单**：只要
+  `recent_count ≥ tail_query_count`（见③）这个前提成立，尾部窗口本来
+  就是 recent window 末尾的那部分，`get_attention_state()` 原样返回的
+  `slot_k`/`slot_v` 最后 `tail_query_count` 个位置恰好已经是它们——不
+  需要任何手工重建或拼接，直接把原始返回值传给 `causal_tail=tail_
+  query_count` 即可；之前的压缩 levels 和 recent window 里更早的部分
+  保持无条件可见对它们同样正确（位置严格早于尾部窗口里任意一个
+  query），不需要区分"是压缩 level 还是较早的 recent token"。
+  ③ **P1：`since_last_flush` 不是 cache 实际维护的状态，且定义上比
+  真正需要的条件更严格，会把合法样本误判成硬失败。** cache 唯一持久
+  维护的滑窗状态是 `recent_count`（核对同一处代码确认是真实字段），
+  真正需要的前提是"尾部窗口此刻是否完整位于 recent window 内"，精确
+  写作 `recent_count ≥ tail_query_count`，不是"距上次 flush 多少步"。
+  ④ **P1：`M_s` 在 3b 调用里被传了，但 `log_kv_slot_attention` 正式
+  签名列表里没有它。** 补进签名，shape/作用域和 `slot_valid` 完全对齐
+  （`(B,G,S_pooled)`，只覆盖压缩 levels 前缀）——exact 后缀（recent
+  window + causal_tail 覆盖的 in-flight chunk）每一槽都是单个真实
+  token，隐式 `w=1,M=1`，`log(1/1)=0`，函数内部按此处理，不需要调用方
+  为这段额外构造 `M_s`。
+  ⑤ **P2：`tail_query_count` 说"默认借用 `flush_granularity` 的量级"，
+  但没说清是不是运行时直接读 `flush_granularity`。** 钉死为"取
+  `flush_granularity` 的数值做初始化，但保存成独立字段"——改
+  `flush_granularity` 不会连带改变已经跑过的实验用的
+  `tail_query_count`，复现实验只需要记录 `tail_query_count` 本身。
+  ⑥ **P2：`best_orientation_jaccard` 直接比较两种方向的总分，没考虑到
+  单个 Jaccard 估计本身有 ≈0.5/√k 的标准误差，总分接近时 `orientation_
+  flipped` 可能只是抽样噪声。** 新增 `orientation_margin`（两种方向
+  总分之差）和 `orientation_ambiguous`（margin 小于约 `2/√k` 时为真，
+  四个独立估计项方差可加推出的阈值）；`ambiguous=True` 时不该把
+  `orientation_flipped` 当可信信号去归因，`side_1/2_jaccard` 仍是当前
+  最优的点估计，不受这条标记影响。
+
 - **2026-08-19｜第十八轮核实：修 S0.8 3b 的一处 P0（多 query 尾部窗口
   破坏因果性，`<5%` 决策门测的是一个混入未来信息泄漏的误差）与五处
   实现坑——Ward 事件 keep/free 方向不跨路径稳定、`scan_op_log_for_

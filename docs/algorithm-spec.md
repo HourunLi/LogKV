@@ -1061,14 +1061,36 @@ def best_orientation_jaccard(event_a: WardEvent, event_b: WardEvent):
     修法：把两种配对方向都试一遍，取总相似度更高的一种；`keep`/`free` 不再是
     两个跨路径可比的固定标签，只作为"同一次结果内部" side_1/side_2 的
     区分——orientation 是否发生翻转单独报告，不藏进相似度数字里。
+
+    **更正（这一轮修的）：单选"总相似度更高的一种"没有考虑到每个 Jaccard
+    本身就是一个标准误差 ≈0.5/√k 的估计值。** 两种方向的总分很接近时，
+    `orientation_flipped` 报告的可能只是抽样噪声，不是两条路径的 Ward
+    候选选择真的存在系统性差异——如果不加区分地把这个标志当成可信信号去
+    归因（比如"orientation 翻转频繁，说明两条路径的合并方向选择不一致"），
+    会把噪声误读成结论。**修法**：新增 `orientation_margin`（两种方向总分
+    之差的绝对值）和 `orientation_ambiguous`（margin 小于一个基于 `k` 的
+    噪声阈值时为真）。阈值推导：单个 `estimate_jaccard` 的标准误差上界是
+    `0.5/√k`；`margin` 是两个"各由两个独立 Jaccard 估计求和"的量之差，
+    四个估计项近似独立，方差可加，`margin` 的标准误差因此约为
+    `sqrt(4)·(0.5/√k) = 1/√k`——取约两倍标准误差作为阈值，
+    `orientation_ambiguous = margin < 2/√k`（`k=128` 时 ≈17.7%）。
+    `ambiguous=True` 时 `orientation_flipped` 这个二元判断本身不可信，
+    不该被用来做进一步归因；`side_1_jaccard`/`side_2_jaccard`（仍然取
+    总分更高的那一种配对）依然是当前最优的点估计，不受这条标记影响——
+    ambiguous 标记的是"方向"这个判断不可信，不是"相似度数值"不可信。
     """
     fwd = (estimate_jaccard(event_a.keep_sketch_before, event_b.keep_sketch_before),
            estimate_jaccard(event_a.free_sketch_before, event_b.free_sketch_before))
     swapped = (estimate_jaccard(event_a.keep_sketch_before, event_b.free_sketch_before),
                estimate_jaccard(event_a.free_sketch_before, event_b.keep_sketch_before))
-    if sum(fwd) >= sum(swapped):
-        return dict(side_1_jaccard=fwd[0], side_2_jaccard=fwd[1], orientation_flipped=False)
-    return dict(side_1_jaccard=swapped[0], side_2_jaccard=swapped[1], orientation_flipped=True)
+    fwd_sum, swapped_sum = sum(fwd), sum(swapped)
+    margin = abs(fwd_sum - swapped_sum)
+    ambiguous = margin < 2.0 / np.sqrt(WARD_EVENT_SKETCH_K)   # 见上方推导
+    flipped = swapped_sum > fwd_sum
+    side_1, side_2 = swapped if flipped else fwd
+    return dict(side_1_jaccard=side_1, side_2_jaccard=side_2,
+                orientation_flipped=flipped, orientation_margin=margin,
+                orientation_ambiguous=ambiguous)
 
 
 def scan_op_log_for_ward_events(
@@ -2877,6 +2899,17 @@ flatten 成一维），**不覆盖、也不需要覆盖 exact 尾部**。
 
 **新增第三个、与另外两个正交的掩码参数**：
 
+> **更正（这一轮修的）：`M_s` 之前只在表 B/mass bias 公式里提过，从没
+> 正式列进这个签名，容易被当成"只是内部实现细节，不需要调用方传"。**
+> `M_s` 和 `slot_valid` 是同一批新增参数，**shape 与作用域也完全对齐
+> `slot_valid` 的既有约定**：`(B, G, S_pooled)`，只覆盖压缩 levels 那段
+> 前缀（`dedup_anchors` 产出、经同一次 flatten 展开到 `S_pooled`），不
+> 覆盖 exact 后缀（recent window + `causal_tail` 覆盖的 in-flight
+> chunk）——因为 exact 后缀的每一槽都是单个真实 token，天然 `w=1,
+> M=1`，`log(w_s/M_s) = log(1/1) = 0`，和现有（未引入语义簇之前）对
+> exact 槽的 mass bias 行为完全一致，不需要调用方为这段额外构造
+> `M_s`，函数内部对 `S_pooled` 之外的位置隐式按 `M_s≡1` 处理。
+
 ```python
 def log_kv_slot_attention(
     q, slot_k, slot_v, slot_w, scale,
@@ -2886,6 +2919,9 @@ def log_kv_slot_attention(
                            # 可以和 causal_tail 同时使用，也可以和 mask 同时使用
                            # ——它和另外两者不是同一个轴（entry 级有效性 vs
                            # query-time 因果可见性），不存在互斥关系
+    M_s=None,              # 新增：(B, G, S_pooled) int，和 slot_valid 同轴、
+                           # 同作用域（只覆盖 pooled 前缀）；mass bias 内部改用
+                           # λ·log(w_s/M_s)，S_pooled 之外隐式 M_s≡1
     ...
 ):
 ```
