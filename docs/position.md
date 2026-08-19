@@ -434,8 +434,16 @@ count = (-level_count[cluster, 0]) mod 2^ℓ_block
 保留合法 RoPE 坐标，只学习每个 anchor 的额外 logit bias：
 
 ```
-score_{s,a} = q · R(p_a)k_s + λ log(w_s) + b_a(entry_stats)
+score_{s,a} = q · R(p_a)k_s + λ log(w_s / M_s) + b_a(entry_stats)
 ```
+
+**`/M_s` 不能丢**——P5.2 已经证明这不是调参项，是正确性修正：一个 entry
+展开成 `M_s` 个 anchor 时若每个都用 `log(w_s)`，softmax 里的总质量会被
+静默放大约 `M_s` 倍。`b_a(entry_stats)` 是在这个已经修正过的 mass bias
+之上**额外**学到的一项 logit 偏置，不是用来替代 `/M_s` 的——两者共存，
+`b_a` 学的是"这个 anchor 除了计数质量之外还应该多一点/少一点可信度"，
+不应该、也学不出"除以 `M_s`"这件事本身（`b_a` 只吃 `entry_stats`，不
+知道其它 anchor 的存在，没有信息量去推导一个跨 anchor 的归一化项）。
 
 这最安全，因为 key 仍在模型熟悉的 RoPE 坐标上。
 

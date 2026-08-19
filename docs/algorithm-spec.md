@@ -910,11 +910,13 @@ def scan_op_log_for_ward_events(
     initial_epoch: dict[int, int] | None = None,
     initial_parent: dict[tuple[int, int], tuple[int, int]] | None = None,
     initial_members: dict[tuple[int, int], set[int]] | None = None,
+    initial_pending: "WardEvent | None" = None,
 ):
     """只读、离线，S0.8 专用，不是 forward/backward/S0.1 依赖的东西——和
     scan_op_log 是两份独立的扫描逻辑，只是复用同一套 (slot,epoch) 身份和
     union-find 记号，**不能**和 scan_op_log 混用同一份 epoch/parent 状态
-    跨函数传递（members 是这个函数独有的状态，scan_op_log 从不维护它）。
+    跨函数传递（members/pending 是这个函数独有的状态，scan_op_log 从不
+    维护它们）。
 
     在 scan_op_log 的基础上额外维护一个反向索引 members：身份 -> 当前
     实际持有的 token_idx 集合，随 NEW_CLUSTER/JOIN/NEW_SEGMENT 增量更新；
@@ -922,17 +924,32 @@ def scan_op_log_for_ward_events(
     的 members 集合各自快照进一条 WardEvent，再把两个集合合并（free 并入
     keep），供后续继续扫描时使用。
 
-    trigger_token_idx 不需要额外状态去猜：按 §5.4"op_log 跨 Phase 的顺序
-    契约"第 2 条（结构操作紧邻它服务的主操作），任何 WARD_MERGE 后面紧跟
-    的下一条 op 必然是它服务的 NEW_CLUSTER——用一个 pending 指针记住"刚
-    追加、还没等到 trigger_token_idx 的 WardEvent"，下一次遇到
-    NEW_CLUSTER 时直接填上它的 token_idx，不需要向前看（lookahead）；
-    一个 orphan（组）的建簇请求最多触发一次 Ward 合并（腾出恰好一个槽），
-    所以 pending 在被下一条 NEW_CLUSTER 消费之前不会被第二次覆盖——这不是
-    需要容忍的情形，用 assert 钉死。
+    trigger_token_idx 按 §5.4"op_log 跨 Phase 的顺序契约"第 2 条（结构
+    操作紧邻它服务的主操作）填上：任何 WARD_MERGE 后面紧跟的下一条 op
+    必然是它服务的 NEW_CLUSTER，用一个 pending 指针记住"刚追加、还没等到
+    trigger_token_idx 的 WardEvent"，下一次遇到 NEW_CLUSTER 时直接填上它
+    的 token_idx，不需要向前看（lookahead）；一个 orphan（组）的建簇请求
+    最多触发一次 Ward 合并（腾出恰好一个槽），所以 pending 在被下一条
+    NEW_CLUSTER 消费之前不会被第二次覆盖——这不是需要容忍的情形，用
+    assert 钉死。
 
-    可以和 scan_op_log 一样分段串联调用（epoch/parent/members 都是可选
-    种子参数）。"""
+    **可以和 scan_op_log 一样分段串联调用，但 pending 必须显式作为
+    种子参数/返回值传递，不能像上一版那样是函数内部的局部变量。** 如果
+    调用方按任意边界切片 `op_log`（`scan_op_log` 的 docstring 明确允许
+    "完整日志，或任意切片"），切片边界完全可能恰好落在某个 WARD_MERGE
+    和它服务的 NEW_CLUSTER 之间——如果 pending 只是局部变量，扫完这一段
+    时这个尚未补上 trigger_token_idx 的 WardEvent 会随函数返回直接丢失，
+    且没有任何信号告诉调用方"漏了一个事件"。**修法**：pending 做成第五个
+    可选种子参数，返回值里也带上它，和 epoch/parent/members 走同一套
+    "调用方负责在段之间原样传递"的纪律。**这里没有一个类似
+    `resolve_final_slots` 的额外"finalize"步骤**——WardEvent 一旦被
+    append 进 ward_events 就是最终结果，不会像 token_identity 那样被
+    后续操作弄过期；调用方唯一要做的事是：**扫完你关心的最后一段之后，
+    显式断言最终返回的 `pending is None`**——`WARD_MERGE` 后面按顺序
+    契约必然紧跟它的 `NEW_CLUSTER`，一份扫到底的完整日志不可能以一个
+    悬空的 `WARD_MERGE` 收尾，这条断言失败只可能是调用方自己的切片/拼接
+    逻辑有 bug（漏了一段、段的顺序错了），不是这个函数的正常行为，也不是
+    这个函数自己能替调用方判断的事（它不知道这是不是"最后一段"）。"""
     epoch = dict(initial_epoch) if initial_epoch else {}
     parent = dict(initial_parent) if initial_parent else {}
     members = {k: set(v) for k, v in (initial_members or {}).items()}
@@ -943,7 +960,8 @@ def scan_op_log_for_ward_events(
         return v
 
     ward_events: list[WardEvent] = []
-    pending: WardEvent | None = None   # 刚 append、还缺 trigger_token_idx
+    pending = initial_pending   # 刚 append、还缺 trigger_token_idx；可能是
+                                  # 上一段传进来的，也可能在本段内产生
     for op in op_log:
         if op.type == NEW_CLUSTER:
             epoch[op.cluster] = epoch.get(op.cluster, -1) + 1
@@ -969,7 +987,24 @@ def scan_op_log_for_ward_events(
             members.pop(free_v, None)
             parent[free_v] = keep_v
 
-    return ward_events, epoch, parent, members
+    return ward_events, epoch, parent, members, pending
+```
+
+**典型用法（分段串联，末尾断言 `pending` 已被消费干净）**：
+
+```python
+all_events = []
+epoch = parent = members = pending = None
+for segment in op_log_segments:            # 任意边界的切片都可以，不要求
+                                              # 和 flush 批边界对齐
+    events, epoch, parent, members, pending = scan_op_log_for_ward_events(
+        segment, epoch, parent, members, pending
+    )
+    all_events.extend(events)
+
+assert pending is None   # 扫完全部段之后才检查；不为 None 说明切片/拼接
+                           # 逻辑本身有 bug（漏段、段序错），不是这个函数
+                           # 的正常行为，见上方 docstring
 ```
 
 **"触发这次合并的 orphan 的绝对 token 位置"精确定义为 `tok0`——不是新
@@ -1464,9 +1499,12 @@ centroid_new[c] = (A_{last[c]} · n_eff_old[c] · centroid_old[c] + S_{last[c]})
 
 **正确性验证复用已有的测试，不需要新增一条**：§5.4"必须补的单测"第 3 条
 （Phase 3a/3b 元数据更新的正确性）已经要求生产路径的向量化结果和一个逐
-token 串行、按 §5.5 未向量化原始递推逐步执行的朴素参考实现逐位对拍——上面
-给出的三个平凡归约和这条仿射扫描，就是"生产路径"这一侧具体做的事，这条
-既有的对拍天然覆盖它们对不对，不需要单独再定义一套断言。
+token 串行、按 §5.5 未向量化原始递推逐步执行的朴素参考实现对拍——**按
+该条给出的比较口径**（整数字段 `n_total`/`p_hi_c`/`current_segment` 逐位
+精确，浮点字段 `centroid`/`n_eff` 数值容差内一致，不是笼统的"逐位"，理由
+和具体容差见该条），上面给出的三个平凡归约和这条仿射扫描，就是"生产路径"
+这一侧具体做的事，这条既有的对拍天然覆盖它们对不对，不需要单独再定义
+一套断言。
 
 **Phase 3b 的具体做法**：Phase 2 每处理完一个 orphan（组）的一条主操作
 （`NEW_CLUSTER`/`JOIN`/`NEW_SEGMENT`）、把它 append 进本地缓冲之后，立即用
@@ -1564,12 +1602,26 @@ Phase 1 之后、Phase 2 之前运行一次（向量化）；Phase 3b 内联在 
    完全相同的运算结合顺序**——真这么做的话，两个实现会变成同一段扫描
    逻辑的两份拷贝，一份的 bug（比如某一轮掩码写错）会在另一份里被逐位
    复现，参考实现"独立交叉验证"这件事就名存实亡，比不设容差更糟。
-   **决定**：`centroid`/`n_eff` 改用数值容差（相对误差，建议
-   `rtol=1e-4`——量级上远大于 fp32 单精度在 `flush_granularity≤128`、
-   `⌈log₂128⌉=7` 轮扫描下能积累的舍入误差，但足够收紧到能抓住真正的
-   逻辑 bug：双计数、遗漏贡献这类问题造成的偏差通常是量级上的，不是
-   最后几位的舍入噪声）；`n_total`/`p_hi_c`/`current_segment` 继续要求
-   逐位精确。
+   **决定**：`centroid`/`n_eff` 改用数值容差，且必须是"绝对+相对"的
+   组合公式（`torch.testing.assert_close(actual, expected, rtol=1e-4,
+   atol=1e-5)`，或等价的 `|a−b| ≤ atol + rtol·|b|`），**不能只给
+   `rtol`**——纯相对误差在参考值 `b=0` 处除零/未定义，而 `n_eff`/
+   `centroid` 在**从未被这批任何 token 触碰过的槽**上恰好精确是 0（这些
+   槽的 `alive` 可能是 `False`，也可能是 `True` 但这批没有任何主操作
+   命中它，两种情况数值上都是白纸状态的 0）。`rtol=1e-4` 量级上远大于
+   fp32 单精度在 `flush_granularity≤128`、`⌈log₂128⌉=7` 轮扫描下能积累
+   的舍入误差，`atol=1e-5` 是给"两边都恰好是 0（或接近 0）"这类条目的
+   下限——两者组合后足够收紧到能抓住真正的逻辑 bug：双计数、遗漏贡献
+   这类问题造成的偏差通常是量级上的，不是最后几位的舍入噪声或一个趋近
+   于零的参考值造成的虚假告警。**dead/未被触碰的槽不需要从比较范围里
+   单独摘除**：用上面"绝对+相对"的组合公式比较整个 `(K_max, d)` buffer
+   即可——这类槽在 (a)(b) 两条路径下都是精确的 0（"K 未满/冷启动分支
+   `alive[slot_idx]` 进入 `allocate_new_cluster` 之前为什么必然是白纸"
+   一节已经论证过这个前提由 `reset_parameters()` 的显式 `zeros(...)`
+   保证），`|0−0| ≤ atol` 对任意 `atol>0` 恒成立，天然通过，不会产生
+   噪声也不需要额外逻辑把它们排除在断言之外；`n_total`/`p_hi_c`/
+   `current_segment` 继续要求逐位精确（这三个字段不存在浮点误差，
+   也就不存在"参考值为 0 时公式退化"这个问题）。
 
    断言：整数字段逐位精确、`centroid`/`n_eff` 在上述容差内一致，且
    **新建簇（本批内 Ward 合并腾出槽位后建立的那些）的最终 `n_total`
