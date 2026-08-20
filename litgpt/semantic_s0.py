@@ -131,7 +131,12 @@ class Stage0DumpRecorder:
         self.layers = {int(x) for x in layers}
         self.key_scale = key_scale
         self.value_scale = value_scale
-        self.save_dtype = np.float32 if save_dtype == "float32" else np.float16
+        if save_dtype == "float32":
+            self.save_dtype = np.float32
+        elif save_dtype == "float16":
+            self.save_dtype = np.float16
+        else:
+            raise ValueError(f"save_dtype must be 'float32' or 'float16', got {save_dtype!r}")
         self.compressed = bool(compressed)
         self.records: list[dict[str, Any]] = []
 
@@ -173,6 +178,39 @@ class RouteResult:
     cluster_sizes: list[int]
 
 
+def route_position_single_ladder(token_count: int) -> RouteResult:
+    """Reference 'existing (vanilla) LogKV' router for the S0.4 baseline.
+
+    docs/experiments.md's S0.4 decision gate compares semantic-cluster intra-
+    entry variance against "现有位置槽内方差" (the existing position-bucketed
+    LogKV's intra-slot variance) -- a comparison route_dpmeans_segments alone
+    cannot produce, since even its most degenerate sweep cell (g_max=inf) is
+    still a *semantic* DP-means router, not a pure arrival-order one. This
+    router does no clustering at all: every token lands in cluster 0, segment
+    0, in arrival order. Feeding the result through simulate_segment_ladders/
+    _append_entry therefore reduces to exactly the same binary-carry
+    construction LogStructuredKVCache._add_compact_entry/_binary_carry uses
+    (see _append_entry's docstring), giving an apples-to-apples same-B' budget
+    baseline for the S0.4 comparison.
+    """
+    token_count = int(token_count)
+    if token_count == 0:
+        return RouteResult(
+            cluster_ids=np.zeros(0, dtype=np.int32),
+            segment_ids=np.zeros(0, dtype=np.int32),
+            cluster_count=0,
+            segment_count=0,
+            cluster_sizes=[],
+        )
+    return RouteResult(
+        cluster_ids=np.zeros(token_count, dtype=np.int32),
+        segment_ids=np.zeros(token_count, dtype=np.int32),
+        cluster_count=1,
+        segment_count=1,
+        cluster_sizes=[token_count],
+    )
+
+
 def route_dpmeans_segments(
     k_raw: np.ndarray,
     *,
@@ -191,6 +229,23 @@ def route_dpmeans_segments(
     k = np.asarray(k_raw, dtype=np.float32)
     if k.ndim != 2:
         raise ValueError(f"k_raw must have shape (T,D), got {k_raw.shape}")
+    lambda_new = float(lambda_new)
+    if not (math.isfinite(lambda_new) and lambda_new > 0.0):
+        raise ValueError(
+            f"lambda_new must be finite and > 0, got {lambda_new} -- a non-positive threshold "
+            f"forces (almost) every token into its own cluster (d2 >= 0 > lambda_new is true for "
+            f"virtually every comparison) without ever raising an error, silently producing a "
+            f"degenerate all-singleton routing instead of a meaningful sweep cell."
+        )
+    g_max = float(g_max)
+    if not (g_max == math.inf or (math.isfinite(g_max) and g_max >= 0.0)):
+        raise ValueError(
+            f"g_max must be finite and >= 0, or +inf, got {g_max} -- note -inf is deliberately "
+            f"rejected too (math.isinf(-inf) is True, so a naive isinf check would let it slip "
+            f"through): a negative/-inf g_max forces (almost) every same-cluster arrival to open a "
+            f"new segment (p - p_hi[c] >= 1 > g_max is true for virtually every comparison) without "
+            f"ever raising an error, silently producing pathologically frequent segment breaks."
+        )
     if not 0.0 <= float(gamma) <= 1.0:
         raise ValueError(f"gamma must be in [0,1], got {gamma}")
     t_total, dim = k.shape

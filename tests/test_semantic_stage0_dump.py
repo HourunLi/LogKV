@@ -16,6 +16,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 _assert_layers_are_recordable = _MODULE._assert_layers_are_recordable
 _assert_checkpoint_loaded_cleanly = _MODULE._assert_checkpoint_loaded_cleanly
+_assert_needle_span_present = _MODULE._assert_needle_span_present
 
 
 class _FakeLoadResult(NamedTuple):
@@ -94,3 +95,26 @@ def test_mismatch_proceeds_only_when_explicitly_allowed(capsys: pytest.CaptureFi
     result = _FakeLoadResult(["a"], ["b"])
     _assert_checkpoint_loaded_cleanly(result, allow_mismatch=True)
     assert "WARNING" in capsys.readouterr().out
+
+
+def test_require_needle_span_is_a_noop_when_disabled() -> None:
+    # Default behavior: a sample with no surviving needle span (or none found
+    # at all) must not raise unless --require_needle_span was passed.
+    _assert_needle_span_present("sample_0", [], require=False)
+    _assert_needle_span_present("sample_0", [{"survived_left_truncation": False}], require=False)
+
+
+def test_require_needle_span_raises_when_no_span_found() -> None:
+    with pytest.raises(RuntimeError, match="no needle span survived"):
+        _assert_needle_span_present("sample_0", [], require=True)
+
+
+def test_require_needle_span_raises_when_every_span_was_truncated_away() -> None:
+    spans = [{"survived_left_truncation": False}, {"survived_left_truncation": False}]
+    with pytest.raises(RuntimeError, match="no needle span survived"):
+        _assert_needle_span_present("sample_0", spans, require=True)
+
+
+def test_require_needle_span_passes_when_a_span_survives() -> None:
+    spans = [{"survived_left_truncation": False}, {"survived_left_truncation": True}]
+    _assert_needle_span_present("sample_0", spans, require=True)
