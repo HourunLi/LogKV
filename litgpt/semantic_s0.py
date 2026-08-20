@@ -178,20 +178,33 @@ class RouteResult:
     cluster_sizes: list[int]
 
 
-def route_position_single_ladder(token_count: int) -> RouteResult:
-    """Reference 'existing (vanilla) LogKV' router for the S0.4 baseline.
+def route_single_cluster_bprime_ladder(token_count: int) -> RouteResult:
+    """Single-cluster, same-B' position-order control -- NOT a vanilla-LogKV baseline.
 
-    docs/experiments.md's S0.4 decision gate compares semantic-cluster intra-
-    entry variance against "现有位置槽内方差" (the existing position-bucketed
-    LogKV's intra-slot variance) -- a comparison route_dpmeans_segments alone
-    cannot produce, since even its most degenerate sweep cell (g_max=inf) is
-    still a *semantic* DP-means router, not a pure arrival-order one. This
-    router does no clustering at all: every token lands in cluster 0, segment
-    0, in arrival order. Feeding the result through simulate_segment_ladders/
-    _append_entry therefore reduces to exactly the same binary-carry
-    construction LogStructuredKVCache._add_compact_entry/_binary_carry uses
-    (see _append_entry's docstring), giving an apples-to-apples same-B' budget
-    baseline for the S0.4 comparison.
+    Every token lands in cluster 0, segment 0, in arrival order (no semantic
+    clustering at all), so feeding this through simulate_segment_ladders/
+    _append_entry isolates what semantic clustering itself contributes when
+    the B' ladder budget and mechanics are held fixed to whatever the sweep is
+    already using for its semantic cells. That is a real, useful control --
+    but it must not be read as "the existing/vanilla LogKV" reference:
+
+    1. It runs at the sweep's ``b_prime`` (default 8), not the deployed
+       vanilla config's ``log_kv_B`` (512, exp/qwen1.7b-32k/base.yaml).
+    2. It has no recent-window carve-out at all (every token, including the
+       most recent ones, goes through compaction), unlike vanilla's
+       ``recent_size`` (1024) tokens that stay exact and are never compacted.
+    3. Level 0 here holds single raw tokens (w=1) per slot -- the *new*
+       semantic-cluster design's ladder convention (CLAUDE.md S2.1: "ladder
+       的 level 0 存单 token（w=1），不是现有方案的'2 token 合并'"). Vanilla's
+       real level 0 (log_kv_cache.py's ``_flush_pairs``) pre-merges 2 raw
+       tokens into one w=2 entry before it ever reaches the shared
+       binary-carry mechanism -- a different base granularity, not just a
+       different B'/recent_size.
+
+    For the actual vanilla-LogKV S0.4 reference point, use
+    ``vanilla_logkv_entries()`` instead, which reproduces all three of the
+    above faithfully (validated against the real LogStructuredKVCache, see
+    tests/test_semantic_s0.py).
     """
     token_count = int(token_count)
     if token_count == 0:
@@ -209,6 +222,96 @@ def route_position_single_ladder(token_count: int) -> RouteResult:
         segment_count=1,
         cluster_sizes=[token_count],
     )
+
+
+def vanilla_logkv_entries(token_count: int, *, b: int, recent_size: int) -> tuple[list[OfflineEntry], dict[str, Any]]:
+    """Faithful, position-only reconstruction of the *real* vanilla LogKV's compressed entries.
+
+    This is the actual S0.4 "现有位置槽内方差" reference point -- unlike
+    ``route_single_cluster_bprime_ladder`` (a single-cluster control built
+    from the *new* semantic-cluster ladder's mechanics), this reproduces two
+    structural properties specific to the deployed ``LogStructuredKVCache``
+    (``log_kv_cache.py``), both load-bearing for getting a comparable number:
+
+    1. **Recent window.** The last ``recent_size`` tokens are never compacted
+       at all -- ``add_recent()`` keeps them exact in a sliding window and
+       only flushes older tokens into the ladder on overflow. When
+       ``token_count <= recent_size``, nothing is compacted.
+
+       Parity subtlety: ``_flush_pairs()`` always flushes a *complete* number
+       of pairs, rounding the raw overflow up to the next even count
+       (log_kv_cache.py:1186, ``flush_len = 2 * ((overflow + 1) // 2)``). So
+       when ``token_count - recent_size`` is odd, one extra token beyond the
+       strict minimum gets compacted and the final recent window ends up
+       holding ``recent_size - 1`` tokens, not a full ``recent_size``. This
+       holds regardless of how the input is chunked into ``add_recent()``
+       calls (verified empirically, not just reasoned about -- see the test).
+
+    2. **Level-0 granularity.** Vanilla pre-merges 2 raw tokens into one
+       ``w=2`` entry (log_kv_cache.py's ``_flush_pairs``, lines ~990-1018)
+       *before* that entry ever reaches the shared binary-carry mechanism --
+       unlike the new semantic design (and ``route_single_cluster_bprime_
+       ladder``), whose level 0 holds single raw tokens (``w=1``). So the
+       oldest-first compactable tokens here are paired up (0,1), (2,3), ...
+       *before* being handed to ``_append_entry``, not one at a time.
+
+    The binary-carry promotion itself (``_append_entry``) is untouched and
+    reused as-is: it is a generic "insert one entry, cascade-merge on carry"
+    primitive that does not care whether what it is handed is a single token
+    or a pre-paired block, and it already matches ``LogStructuredKVCache.
+    _add_compact_entry``/``_binary_carry`` exactly (see ``_append_entry``'s
+    docstring). Only what gets fed to it, and the recent-window exclusion
+    before that, differ between vanilla and the semantic design.
+
+    ``b`` corresponds to ``LogStructuredKVCache``'s ``B`` constructor
+    argument / the ``--log_kv_B`` CLI flag (512 in the deployed
+    exp/qwen1.7b-32k/base.yaml config) -- named lowercase here, not ``B``,
+    per glossary.md's note that bare ``B`` is overloaded across this
+    codebase (batch size in tensor-shape comments vs. this per-level entry
+    budget). ``recent_size`` corresponds to ``--log_kv_recent_size`` (1024
+    in that same config).
+
+    Validated end-to-end (per-level occupancy *and* per-slot weight/mean, not
+    just aggregate counts) against a real ``LogStructuredKVCache`` fed
+    through ``add_recent()`` at several chunk sizes -- see
+    tests/test_semantic_s0.py's ``test_vanilla_logkv_entries_matches_real_
+    cache*`` tests.
+    """
+    token_count = int(token_count)
+    if token_count < 0:
+        raise ValueError(f"token_count must be non-negative, got {token_count}")
+    b = int(b)
+    if b <= 0 or b % 2 != 0:
+        raise ValueError(f"b must be a positive even integer, got {b}")
+    recent_size = int(recent_size)
+    if recent_size < 2:
+        raise ValueError(f"recent_size must be >= 2, got {recent_size} (matches LogStructuredKVCache's own bound)")
+
+    if token_count <= recent_size:
+        compactable = 0
+    else:
+        overflow = token_count - recent_size
+        compactable = overflow + (overflow % 2)  # round up to an even count -- see docstring's parity note
+    recent_count = token_count - compactable
+
+    levels: list[list[OfflineEntry]] = [[]]
+    for pair_start in range(0, compactable, 2):
+        _append_entry(levels, OfflineEntry(members=[pair_start, pair_start + 1]), b)
+
+    entries: list[OfflineEntry] = []
+    level_counts: dict[int, int] = {}
+    for level, level_entries in enumerate(levels):
+        level_counts[level] = len(level_entries)
+        entries.extend(level_entries)
+
+    meta = {
+        "entry_count": len(entries),
+        "pad_entry_count": 0,  # vanilla is a single flat ladder -- no segment boundaries to pad
+        "compactable_token_count": compactable,
+        "recent_count": recent_count,
+        "level_counts": {str(k): int(v) for k, v in sorted(level_counts.items())},
+    }
+    return entries, meta
 
 
 def route_dpmeans_segments(

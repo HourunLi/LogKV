@@ -394,6 +394,13 @@ def main() -> None:
         if used_len <= 0:
             raise ValueError(f"empty prompt after tokenization for sample {sample_id}")
 
+        # Computed and checked before the recorder/forward pass (not after):
+        # a sample failing this check should not cost a long-context forward
+        # pass, and must not leave a half-written .npz for this sample behind
+        # in output_dir.
+        needle_spans = _span_payload(tokenizer, prompt, sample, offset, used_len)
+        _assert_needle_span_present(sample_id, needle_spans, require=args.require_needle_span)
+
         recorder = Stage0DumpRecorder(
             output_dir=output_dir,
             sample_index=sample_index,
@@ -423,9 +430,6 @@ def main() -> None:
                 f"forward pass itself skipped some layers -- do not silently write a manifest "
                 f"with missing layers, investigate first."
             )
-
-        needle_spans = _span_payload(tokenizer, prompt, sample, offset, used_len)
-        _assert_needle_span_present(sample_id, needle_spans, require=args.require_needle_span)
 
         sample_payload: dict[str, Any] = {
             "sample_index": sample_index,
