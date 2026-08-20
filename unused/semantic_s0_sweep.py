@@ -176,6 +176,10 @@ def main() -> None:
     base_dir = manifest_base_dir(args.dump)
     g_values = parse_g_max_list(args.g_max)
     l_values = parse_int_list(args.l_block)
+    if not g_values:
+        raise ValueError(f"--g_max {args.g_max!r} parsed to an empty list -- pass at least one value")
+    if not l_values:
+        raise ValueError(f"--l_block {args.l_block!r} parsed to an empty list -- pass at least one value")
     layer_filter = _wanted(args.layers)
     group_filter = _wanted(args.groups)
 

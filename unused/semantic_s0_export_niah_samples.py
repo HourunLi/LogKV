@@ -13,6 +13,13 @@ just writes the resulting docs to disk instead of scoring them, so the same
 RULER cache / offline patch already required for this project's real NIAH
 evals is required here too.
 
+Requires lm-eval>=0.4.9 (pyproject.toml's floor): ``TaskManager.__init__``
+only gained its ``metadata`` kwarg in that release (absent through 0.4.2-0.4.8,
+confirmed against upstream source) -- the same constraint ``eval.py`` already
+has via its own unconditional ``simple_evaluate(..., metadata=metadata, ...)``
+call, which internally builds ``TaskManager(metadata=metadata)`` the same way
+this script does directly.
+
 Example:
     python unused/semantic_s0_export_niah_samples.py \
       --tokenizer_dir ckpt/qwen1.7b-32k-warmup \
