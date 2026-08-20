@@ -101,8 +101,19 @@ Qwen3-1.7B（本项目的目标模型）的 `rope_interleave` 默认 `False`，�
 
 ### 5.2 分簇：度量与阈值
 
-**用原始（未归一化）pre-RoPE key 上的平方欧氏距离，不用 cosine。** 理由不是习惯，
-而是这一个量同时是三件事：
+**用 qk-norm 之后、RoPE 之前的 key 上的平方欧氏距离，不做 cosine/L2 归一化。**
+理由不是习惯，而是这一个量同时是三件事：
+
+> **更正（这一轮修的）：上一版"原始（未归一化）pre-RoPE key"这个措辞会被读成
+> "qkv 投影的原始输出，qk-norm 之前"，与 §5.21-1 的定案直接矛盾。** "未归一化"
+> 这里唯一想表达的是"不做 cosine 需要的 L2/单位范数归一化"（呼应"不用 cosine"），
+> 不是"跳过 qk-norm"；但"原始"和"未归一化"连用，读者很自然会把它理解成"没有
+> 经过任何处理的 key"——而 qk-norm 本身就是一种归一化，"未归一化"这个词精确地
+> 诱导了这个误读。§5.21-1 已经用一整节钉死"pre-RoPE k 精确地说是 qk-norm 之后、
+> apply_rope 之前，不是 qkv 投影的原始输出，取错位置会让簇的度量落在未归一化的
+> 空间里、`s_h` 标定直接失效"——本节和 §5.21-1 描述的是同一个量，只是这里的
+> 措辞不小心写成了 §5.21-1 明确警告过的那个错误读法。改成"qk-norm 之后、RoPE
+> 之前"，不再用"原始（未归一化）"这个会引发歧义的说法。
 
 - 槽内池化误差对分数的影响是 `q·(k_i − k̄)`，所以**控制误差的量就是欧氏距离**；
 - DP-means 的分配准则 `‖k − μ_c‖² > λ_new`；
@@ -2828,7 +2839,7 @@ rank-1 统计 `σu/σ2/γa/γb/γ`（约 3d，activation dtype，fp16/bf16 均�
 
 | buffer | shape | dtype | 用途 |
 |---|---|---|---|
-| `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**，只记 token 归属不足以重建结构，完整语义/顺序/重放算法见 §5.21-2。**生命周期和本表其它 buffer 不同，且分配只发生在训练路径**：不是 `reset_parameters()` 原地 `zero_()` 复用的持久 buffer，而是只在 `LogKVStreamTrainingAttention.forward()`（训练）内部，每次调用开头重新绑定成全新分配的张量；`LogStructuredKVCache.forward()`（推理/生成路径）调用共享路由逻辑时传 `record_op_log=False`，完全不分配、不写入这两个字段——gating 规则、以及"448MB 只是单个 in-flight forward 的代价，梯度累积/pipeline 会按并发数相乘"，见 §5.21-2 新增的两节 |
+| `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**，只记 token 归属不足以重建结构，完整语义/顺序/重放算法见 §5.21-2。**生命周期和本表其它 buffer 不同，且分配只发生在训练路径**：不是 `reset_parameters()` 原地 `zero_()` 复用的持久 buffer，而是只在 `LogKVStreamTrainingAttention.forward()`（训练）内部，每次调用开头重新绑定成全新分配的张量；`CausalSelfAttention._log_kv_training_forward()`（推理/生成路径的真实入口，**不是** `LogStructuredKVCache.forward()`——后者恒定 `raise RuntimeError`，见 §5.21 的更正框）调用共享路由逻辑时传 `record_op_log=False`，完全不分配、不写入这两个字段——gating 规则、以及"448MB 只是单个 in-flight forward 的代价，梯度累积/pipeline 会按并发数相乘"，见 §5.21-2 新增的两节 |
 | `op_log_len` | `(B,G)` | int32 | `op_log` 当前**有效**行数——`op_log[b,g,:op_log_len[b,g],:]` 才是已写入的合法内容，之后的行是未写入/未定义，**任何遍历 `op_log` 的代码（重放、`scan_op_log`、S0.8 对拍）都必须先按这个长度截断，不能扫整个 `(OP_max,4)`**，见 §5.21-2 的更正框 |
 
 容量与内存：`OP_max = 4·T_max`，这不是经验估计，是有推导的硬上界，见 §5.21-2。
@@ -3399,10 +3410,13 @@ eval，就是在没有类似 3b 这样的批量 vs 严格串行验证的情况�
 ### 5.18 实现顺序（每一步都有可验证的中间态）
 
 0. **Stage 0 的 dump 脚本**（规格见 experiments.md）——它是所有 Stage 0 结论的输入，
-   排在生产代码之前（§5.21-5）。
-1. **`log_kv_position.py` + 单测**（纯 CPU，不依赖任何 dump）。
+   排在生产代码之前（§5.21-5）。S0.0–S0.7 和 S0.8 的第 1/2/3a 项只需要这一步。
+1. **`log_kv_position.py` + 单测**（纯 CPU，不依赖任何 dump）。**S0.8 3b 的前置项**。
 2. **CPU 参考实现的路由**（朴素串行版，慢但正确）——它同时是 S0.8 的对照基准，
-   不要跳过。
+   不要跳过。**连同 `log_kv_slot_attention()`/`get_attention_state()` 按
+   §5.14/§5.20-B 扩展出 `CacheAttentionState`/`slot_valid`/`M_s`（纯加法式改动，
+   受 §5.19-1 的默认关闭字节等价闸门保护），是 S0.8 3b 唯一需要在第 0 步之外
+   补的前置代码**，见 §5.21-5 的更正框；3b 之外的 S0.0–S0.7 不依赖这一步。
 3. **`K_max=1` 单簇路径**：验证退化到"单条位置序 ladder"，与现有实现数值对齐
    （注意 §12 的容差问题）。
 4. **多簇路由 + 向量化**（§5.4 三阶段），拿第 2 步的参考实现测分歧率。
@@ -4056,12 +4070,29 @@ forward 完整、最终的状态），把它们和 `q`/`k_raw`/`k_roped`/`v` 一
 CLAUDE.md §4 的第三笔账明确写着"serving/推理路径不做反向传播，**不分配、不
 持有**这块内存"，但本节和 §5.13 的 buffer 表只说"每次 `forward()` 开头重新
 绑定成全新分配的张量"——没有说这个 `forward()` 指的是哪一个。
-`LogStructuredKVCache` 有两个独立的调用入口（`log_kv_cache.py:1217` 的
-`forward()`，推理/生成路径用；`log_kv_cache.py:1838` 起的
-`LogKVStreamTrainingAttention.forward()`，训练路径用，是一个自定义
-`torch.autograd.Function`），如果不显式说清楚是哪一个，实现者完全可能把
-"每次 forward() 都重新绑定"读成"两个入口都要"，推理/生成路径因此会白白背上
-448MB/28 层的分配——这不是理论风险，是这句话字面上就能这样读。
+
+> **更正（这一轮修的）：真正的推理/生成入口不是 `LogStructuredKVCache.forward()`，
+> 是 `CausalSelfAttention._log_kv_training_forward()`。** 核对 `log_kv_cache.py:1217`
+> 确认 `LogStructuredKVCache.forward()` 从一开始就是显式禁用的 stub——`nn.Module`
+> 的 `forward()` 被覆写成直接 `raise RuntimeError(...)`，docstring 讲得很明确：
+> "直接调用 cache 无法正确实现 LogKV，因为 attention 必须先纳入当前 token 再提交
+> 它们"，本方案的 semantic-cluster 设计不改变这条限制、也没有理由重新启用它。
+> 上一版把它当成推理路径的调用入口，会让实现者去一个恒定 `raise` 的方法上挂
+> `record_op_log` 分支，字面照做直接不可执行。
+
+训练/推理两条路径各有一个真正的调用入口：训练路径是 `LogKVStreamTrainingAttention.
+forward()`（`log_kv_cache.py:1838` 起，自定义 `torch.autograd.Function`，由
+`CausalSelfAttention._log_kv_train_lowmem_forward()` 调用）；推理/生成路径是
+`CausalSelfAttention._log_kv_training_forward()`（`model.py:1095`，由
+`CausalSelfAttention.forward()` 在 `input_pos is not None` 且 `isinstance(self.
+kv_cache, LogStructuredKVCache)` 时以 `reset_cache=False, defer_last_single=True`
+调用，`model.py:833-838`）——这是 `CausalSelfAttention` 自己的方法，不是
+`LogStructuredKVCache` 的方法，内部只调用 `cache.get_attention_state()`/
+`cache.add_recent()` 等 cache 方法，从不经过 `cache.forward()`。两个入口都不叫
+`forward()` 意味着"哪个 forward() 该分配 op_log"这个问题本身问错了对象；如果不
+显式说清楚是这两个函数中的哪一个，实现者完全可能把"每次 forward() 都重新绑定"
+读成"两条路径共用的某个 forward() 都要"，推理/生成路径因此会白白背上 448MB/28
+层的分配——这不是理论风险，是这句话字面上就能这样读。
 
 **决定：`op_log`/`op_log_len` 的分配（`torch.zeros(...)` 重新绑定）和写入
 （Phase 1/3a/2-含内联 3b 的 op 追加）只发生在 `LogKVStreamTrainingAttention.
@@ -4103,9 +4134,10 @@ ladder 物理写入全部失去输入，路由机制在推理路径上直接失�
 `LogKVStreamTrainingAttention.forward()` 调用时传 `record_op_log=True`，且
 只有在这个分支里才会执行"`op_log`/`op_log_len` 重新绑定成全新张量"（forward
 一开始，处理第一个 flush 批之前）和"批末把本地缓冲提交进持久 `op_log`"这
-两步。`LogStructuredKVCache.forward()`（推理/生成，`litgpt/generate/base.py`、
-`speculative_decoding.py` 等用的入口）调用同一个共享函数时传
-`record_op_log=False`——跨批持久的 `op_log`/`op_log_len` 这两个属性在推理
+两步。`CausalSelfAttention._log_kv_training_forward()`（推理/生成，
+`litgpt/generate/base.py`、`speculative_decoding.py` 等触发的 `GPT.forward()`
+沿 `input_pos is not None` 分支最终调用到这里，见上方"更正"框）调用同一个
+共享函数时传 `record_op_log=False`——跨批持久的 `op_log`/`op_log_len` 这两个属性在推理
 路径上应该**从未被访问、从未分配**，不只是"分配了但不用"，因为哪怕只是每次
 forward 都重新 `torch.zeros(...)` 一次 448MB 又立即丢弃，也是纯浪费的分配器
 压力，且容易让人误以为这块内存"反正都要分配"从而不再警惕。**但这条 gating
@@ -4120,8 +4152,9 @@ Phase 1/2/3 的路由决策、metadata 更新、ladder 写入本身，以及驱�
 路由代码，所以"routing 这一步是否在 `torch.is_grad_enabled()` 下"这个信号
 在两条路径上是一样的，不能用它区分。真正的区分点是"这次 forward 之后会不会
 有一个对应的 `backward()` 调用需要重放 `op_log`"，这个信息只有调用方（是走
-`LogKVStreamTrainingAttention` 还是直接走 `LogStructuredKVCache.forward()`）
-知道，必须显式传下去，不能从张量的 `requires_grad`/全局 autograd 模式反推。
+`LogKVStreamTrainingAttention.forward()` 还是走 `CausalSelfAttention.
+_log_kv_training_forward()`）知道，必须显式传下去，不能从张量的
+`requires_grad`/全局 autograd 模式反推。
 
 #### "448MB" 只是每个 in-flight forward 的代价，不是训练期的固定开销——梯度累积/pipeline 会让它按并发数相乘
 
@@ -4250,3 +4283,40 @@ checkpoint/config 走。**标定常量必须写进 eval 的 metadata 字段**—
 规格见 [`experiments.md`](experiments.md) 的"Stage 0 dump 规格"一节。它本来就是
 Stage 0 全部结论的输入，却一直只有一句"dump 每层每头 pre-RoPE k/v"，没有可执行细节。
 **这个脚本应当是本项目写的第一段代码**，排在 §5.18 的第 1 步之前。
+
+> **更正（这一轮修的）："第一段代码"这句话覆盖的是 S0.0–S0.7 和 S0.8 的第
+> 1/2/3a 项，不覆盖 S0.8 的 3b 项——3b 有它自己独立的、更晚的前置依赖，
+> 之前没有显式说清楚，字面读会和 §5.18 的步骤顺序打架。** S0.8 3b（attention
+> 读出的相对 L2 误差，§6 的硬性决策门）需要 `cache_batch`/`cache_serial` 这两个
+> 由 §5.4/§5.18 第 2 步"CPU 参考实现的路由"构造出来的 cache 状态，还需要
+> `log_kv_slot_attention()`/`get_attention_state()` 已经按 §5.14/§5.20-B
+> 扩展出 `CacheAttentionState`/`slot_valid`/`M_s`（3b 的设计明确要求"直接、
+> 原样传递生产函数的返回值，不做手工重建或平行实现"，理由是避免测试代码和
+> 生产代码分叉——这条原则本身没有问题，但它意味着这两块代码必须先存在）。
+> 按 §5.18 的步骤编号，这是"第 1 步（`log_kv_position.py`）+ 第 2 步（CPU
+> 参考路由）+ `log_kv_slot_attention`/`get_attention_state()` 的接口扩展"，
+> 晚于第 0 步（dump 脚本本身），字面上和"dump 脚本排在任何生产代码之前"
+> 冲突。
+>
+> **这不是需要靠改期望解决的矛盾，是"生产代码"这个词在两处指代的范围不同，
+> 需要把边界画清楚。** CLAUDE.md §0 用 Stage 0 的结果决定"是否继续 Stage 1
+> （生产代码）"，真正被这道门挡住、需要先看到信号才值得投入的，是 §5.18
+> 第 3–6 步——多簇路由的向量化实现、段对齐填充、`op_log` 训练路径重放，
+> 这些是本方案唯一的、有实际工程量和回退风险的核心投入。3b 依赖的两块东西
+> 性质不同：
+> 1. **§5.18 第 2 步的 CPU 参考实现**在自己的定义里就是"朴素串行版，慢但
+>    正确"——它存在的唯一目的是当分歧率测试的对照基准（S0.8 本来就需要它，
+>    这条依赖从第一版起就写在第 2 步的说明里，不是这一轮新加的），不是要
+>    部署的代码，写它不构成"要不要投入 Stage 1"这个决策的组成部分。
+> 2. **`log_kv_slot_attention`/`get_attention_state()` 的接口扩展**
+>    （`CacheAttentionState`、`slot_valid`、`M_s`）是纯加法式改动——新增
+>    可选参数/返回字段，不改变现有调用不传这些参数时的行为，且受 §5.19-1
+>    "默认关闭必须逐字节等价"这条 CI 闸门保护。它是本节唯一真正触及
+>    `litgpt/log_kv_cache.py` 生产文件的一步，但改动量和风险与第 3–6 步的
+>    多簇路由实现不是一个量级——更准确的说法是，**它本身就是 Stage 0 决策
+>    门（3b）能够可信的前提**，所以把它划进"S0.8 需要先落地的最小基础设施"
+>    比划进"等 Stage 0 结果出来再做的 Stage 1 投入"更准确。
+>
+> `log_kv_position.py`（第 1 步）已经在 CLAUDE.md §0 的"下一步"清单里被列为
+> 独立于 Stage 0 决策门之外的待办项，这里是同一个先例的延伸，不是新开的口子。
+> 需要补写进实现顺序的具体位置见下方 §5.18 的对应说明。
