@@ -1,0 +1,340 @@
+#!/usr/bin/env python
+"""Run the SemanticLogKV S0.0 `(g_max, l_block)` CPU sweep on a Stage-0 dump.
+
+Example:
+    python unused/semantic_s0_sweep.py \
+      --dump stage0_dump \
+      --output stage0_dump/s0_sweep.json \
+      --g_max inf,8192,4096,2048,1024,256 \
+      --l_block 0,1,2,3
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import math
+from pathlib import Path
+import sys
+from typing import Any
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+_S0_PATH = REPO_ROOT / "litgpt" / "semantic_s0.py"
+_S0_SPEC = importlib.util.spec_from_file_location("semantic_s0_local", _S0_PATH)
+if _S0_SPEC is None or _S0_SPEC.loader is None:
+    raise RuntimeError(f"could not load {_S0_PATH}")
+_S0 = importlib.util.module_from_spec(_S0_SPEC)
+sys.modules[_S0_SPEC.name] = _S0
+_S0_SPEC.loader.exec_module(_S0)
+
+SweepAccumulator = _S0.SweepAccumulator
+format_g_max = _S0.format_g_max
+load_manifest = _S0.load_manifest
+manifest_base_dir = _S0.manifest_base_dir
+parse_g_max_list = _S0.parse_g_max_list
+parse_int_list = _S0.parse_int_list
+route_dpmeans_segments = _S0.route_dpmeans_segments
+simulate_segment_ladders = _S0.simulate_segment_ladders
+summarize_entries = _S0.summarize_entries
+
+
+def _wanted(values: str | None) -> set[int] | None:
+    return None if values is None else set(parse_int_list(values))
+
+
+def _fallback_scale(x: np.ndarray) -> float:
+    xx = np.asarray(x, dtype=np.float32)
+    mean = xx.mean(axis=0, keepdims=True)
+    return float(np.square(xx - mean, dtype=np.float32).sum(axis=1).mean(dtype=np.float64))
+
+
+def _manifest_scale(
+    manifest: dict[str, Any],
+    field: str,
+    layer: int,
+    group: int,
+    x: np.ndarray,
+    *,
+    allow_fallback: bool,
+) -> tuple[float, str]:
+    """Returns ``(scale, source)``, ``source`` one of ``"calibrated"``/``"fallback_local"``.
+
+    ``field`` is ``"key_scale"`` or ``"value_scale"`` -- the two are calibrated
+    independently (key-space and value-space vectors have no reason to share a
+    norm scale) and must not be cross-substituted. The calibrated value is the
+    whole-calibration-set global ``E||x-xbar||^2`` the dump script wrote into
+    ``manifest[field]`` (``algorithm-spec.md`` S5.2: thresholds/normalizers
+    must be relative to this, not an online/per-sample estimate -- "S0.2 扫
+    出来的 K_eff 曲线在层间完全没有可比性" otherwise). A missing/corrupted
+    calibration entry hard-fails by default rather than silently substituting
+    this one sample's own local variance, which is a materially noisier,
+    non-comparable-across-layers quantity; pass ``allow_fallback=True`` to opt
+    into that substitution instead. ``manifest[field]`` missing entirely
+    (dumps written before value-scale calibration existed) is treated the
+    same as a missing per-layer entry, not a hard crash on the outer lookup.
+    """
+    reason: str | None = None
+    value: float | None = None
+    try:
+        value = float(manifest[field][str(layer)]["s_h"][group])
+    except Exception as exc:
+        reason = f"manifest[{field!r}][{str(layer)!r}]['s_h'][{group}] missing or malformed: {exc!r}"
+    else:
+        if not (math.isfinite(value) and value > 0):
+            reason = f"manifest[{field!r}][{str(layer)!r}]['s_h'][{group}] = {value!r} is not a finite positive scale"
+            value = None
+
+    if value is not None:
+        return value, "calibrated"
+
+    if not allow_fallback:
+        raise ValueError(
+            f"{reason}. layer={layer} group={group} has no usable calibrated {field} from the "
+            f"dump manifest. Pass --allow_fallback_sh to substitute this one prompt's own "
+            f"local variance instead (noisier, and not comparable across layers/prompts -- see "
+            f"algorithm-spec.md S5.2)."
+        )
+    return max(_fallback_scale(x), 1e-12), "fallback_local"
+
+
+def _manifest_sh(
+    manifest: dict[str, Any], layer: int, group: int, k: np.ndarray, *, allow_fallback: bool
+) -> tuple[float, str]:
+    return _manifest_scale(manifest, "key_scale", layer, group, k, allow_fallback=allow_fallback)
+
+
+def _manifest_vh(
+    manifest: dict[str, Any], layer: int, group: int, v: np.ndarray, *, allow_fallback: bool
+) -> tuple[float, str]:
+    return _manifest_scale(manifest, "value_scale", layer, group, v, allow_fallback=allow_fallback)
+
+
+def _effective_g_max(g_max: float, l_block: int) -> float:
+    """The g_max routing should actually use for one (g_max, l_block) sweep cell.
+
+    algorithm-spec.md S5.3 defines the pure-semantic reference point as
+    eta=0 AND (g_max=inf OR l_block=0). eta=0 is structural (route_dpmeans_
+    segments has no eta parameter at all), but l_block=0 alone does not make
+    routing behave like g_max=inf: with a finite g_max, gamma-decay still
+    fires on every segment break, shifting centroid trajectories -- and
+    therefore cluster_ids -- away from what pure (g_max=inf) DP-means would
+    produce. Verified empirically (see tests): with identical data and eta=0,
+    g_max=inf gives 2 clusters ([0,0,1]) while g_max=0 gives 1 ([0,0,0]).
+    So the l_block=0 column must route with g_max=inf regardless of which
+    g_max is nominally being swept, or it silently isn't the pure-semantic
+    endpoint the sweep's whole point is to compare against.
+    """
+    return math.inf if int(l_block) == 0 else g_max
+
+
+def _iter_records(
+    manifest: dict[str, Any],
+    *,
+    layer_filter: set[int] | None,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    out: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for sample in manifest.get("samples", []):
+        for record in sample.get("layers", []):
+            layer = int(record["layer"])
+            if layer_filter is not None and layer not in layer_filter:
+                continue
+            out.append((sample, record))
+    return out
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dump", required=True, help="Dump directory or manifest.json")
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--g_max", default="inf,8192,4096,2048,1024,256")
+    parser.add_argument("--l_block", default="0,1,2,3")
+    parser.add_argument("--lambda_rel", type=float, default=1.0)
+    parser.add_argument("--seg_forget", type=float, default=0.5)
+    parser.add_argument("--b_prime", type=int, default=8)
+    parser.add_argument("--layers", help="Optional comma-separated layer filter")
+    parser.add_argument("--groups", help="Optional comma-separated KV-group filter")
+    parser.add_argument("--skip_value_var", action="store_true")
+    parser.add_argument(
+        "--allow_fallback_sh",
+        action="store_true",
+        help="If a (layer, group) has no usable calibrated s_h (key scale) or vh (value scale, "
+        "only looked up when --skip_value_var is not set) in the dump manifest, substitute "
+        "this one prompt's own local variance instead of hard-failing. algorithm-spec.md S5.2 "
+        "requires the calibrated, whole-calibration-set scale for cross-layer comparability -- "
+        "only use this to unblock a smoke test on a corrupted/partial manifest (e.g. one written "
+        "before value-scale calibration existed), not for a real S0.0 run.",
+    )
+    args = parser.parse_args()
+
+    manifest = load_manifest(args.dump)
+    base_dir = manifest_base_dir(args.dump)
+    g_values = parse_g_max_list(args.g_max)
+    l_values = parse_int_list(args.l_block)
+    layer_filter = _wanted(args.layers)
+    group_filter = _wanted(args.groups)
+
+    by_layer_group: dict[tuple[str, int, int, int], SweepAccumulator] = {}
+    overall: dict[tuple[str, int], SweepAccumulator] = {}
+    records = _iter_records(manifest, layer_filter=layer_filter)
+    if not records:
+        raise ValueError("No layer records matched the requested filters")
+
+    processed_pairs = 0
+    groups_seen: set[int] = set()
+    for record_i, (sample, record) in enumerate(records, start=1):
+        layer = int(record["layer"])
+        path = base_dir / record["path"]
+        payload = np.load(path)
+        k_raw = payload["k_raw"]
+        v = None if args.skip_value_var else payload["v"]
+        groups = range(k_raw.shape[0])
+        groups_seen.update(groups)
+        if group_filter is not None:
+            groups = [g for g in groups if g in group_filter]
+
+        for group in groups:
+            processed_pairs += 1
+            k_group = np.asarray(k_raw[group], dtype=np.float32)
+            v_group = None if v is None else np.asarray(v[group], dtype=np.float32)
+            sh, sh_source = _manifest_sh(
+                manifest, layer, int(group), k_group, allow_fallback=args.allow_fallback_sh
+            )
+            lambda_new = float(args.lambda_rel) * sh
+            # Only look up a value-space scale when value variance is actually
+            # being computed at all (--skip_value_var means v_group is None).
+            vh, vh_source = (
+                _manifest_vh(manifest, layer, int(group), v_group, allow_fallback=args.allow_fallback_sh)
+                if v_group is not None
+                else (None, None)
+            )
+            # route only depends on (lambda_new, effective_g_max, gamma) -- see
+            # _effective_g_max -- so cache by effective_g_max: otherwise the
+            # g_max=inf route would get recomputed once per swept g_max value
+            # purely because every l_block=0 cell collapses to the same one.
+            route_cache: dict[float, Any] = {}
+            for g_max in g_values:
+                g_label = format_g_max(g_max)
+                for l_block in l_values:
+                    effective_g_max = _effective_g_max(g_max, int(l_block))
+                    route = route_cache.get(effective_g_max)
+                    if route is None:
+                        route = route_dpmeans_segments(
+                            k_group,
+                            lambda_new=lambda_new,
+                            g_max=effective_g_max,
+                            gamma=args.seg_forget,
+                        )
+                        route_cache[effective_g_max] = route
+                    entries, ladder_meta = simulate_segment_ladders(
+                        route,
+                        b_prime=args.b_prime,
+                        l_block=int(l_block),
+                    )
+                    summary = summarize_entries(k_group, v_group, entries)
+                    key = (g_label, int(l_block), layer, int(group))
+                    by_layer_group.setdefault(key, SweepAccumulator()).add(
+                        route=route,
+                        ladder_meta=ladder_meta,
+                        summary=summary,
+                        sh=sh,
+                        sh_source=sh_source,
+                        vh=vh,
+                        vh_source=vh_source,
+                    )
+                    overall.setdefault((g_label, int(l_block)), SweepAccumulator()).add(
+                        route=route,
+                        ladder_meta=ladder_meta,
+                        summary=summary,
+                        sh=sh,
+                        sh_source=sh_source,
+                        vh=vh,
+                        vh_source=vh_source,
+                    )
+        print(
+            f"[s0-sweep] {record_i}/{len(records)} sample={sample.get('sample_id')} "
+            f"layer={layer} path={record['path']}",
+            flush=True,
+        )
+
+    if processed_pairs == 0:
+        # _iter_records already ruled out an empty --layers filter; getting here
+        # means every (layer, group) pair the layer filter left standing was then
+        # excluded by --groups, so overall_by_config/by_layer_group would
+        # otherwise be silently written out empty with exit code 0.
+        raise ValueError(
+            f"--groups {sorted(group_filter) if group_filter is not None else group_filter} matched none "
+            f"of the KV groups actually present in the dump ({sorted(groups_seen)}); "
+            f"0 (layer, group) pairs were processed."
+        )
+
+    by_lg_rows = []
+    for (g_label, l_block, layer, group), acc in sorted(
+        by_layer_group.items(), key=lambda item: (item[0][0], item[0][1], item[0][2], item[0][3])
+    ):
+        row = {
+            "g_max": g_label,
+            "l_block": l_block,
+            "layer": layer,
+            "group": group,
+        }
+        row.update(acc.finalize())
+        by_lg_rows.append(row)
+
+    overall_rows = []
+    for (g_label, l_block), acc in sorted(overall.items(), key=lambda item: (item[0][0], item[0][1])):
+        row = {"g_max": g_label, "l_block": l_block}
+        row.update(acc.finalize())
+        overall_rows.append(row)
+
+    result = {
+        "version": 1,
+        "kind": "semantic_logkv_s0_0_sweep",
+        "source_manifest": str(Path(args.dump)),
+        "config": {
+            "lambda_rel": args.lambda_rel,
+            "seg_forget": args.seg_forget,
+            "b_prime": args.b_prime,
+            "g_max": [format_g_max(x) for x in g_values],
+            "l_block": l_values,
+            "layers": None if layer_filter is None else sorted(layer_filter),
+            "groups": None if group_filter is None else sorted(group_filter),
+            "skip_value_var": bool(args.skip_value_var),
+            "routing_eta": 0.0,
+            "routing_mode": "strict_serial_dpmeans_unclipped",
+            "l_block_zero_forces_g_max_inf": True,
+        },
+        "overall_by_config_caveat": (
+            "CLAUDE.md S2.5 / experiments.md require Stage 0 statistics to be reported "
+            "per layer x KV-group, because key-vector scale (s_h) and value-vector scale "
+            "(vh) can each differ by orders of magnitude across layers/groups "
+            "(algorithm-spec.md S5.2). overall_by_config's token_weighted_key_var/value_var "
+            "sum absolute SSE across every swept layer/group and can therefore be "
+            "dominated by a single high-magnitude one, hiding the trend in all the "
+            "others -- do not use them alone to make the S0.0 call. Use "
+            "token_weighted_key_var_relative (normalized by each contributor's own "
+            "calibrated s_h) / token_weighted_value_var_relative (normalized by each "
+            "contributor's own calibrated vh, NOT s_h -- key and value scales are "
+            "independent) for a scale-comparable cross-layer summary, or inspect "
+            "by_layer_group directly. token_weighted_value_var/_relative and "
+            "value_var_available/vh_source can be None/empty if any contributing sample "
+            "had no value data (--skip_value_var) or no usable calibrated vh -- see "
+            "SweepAccumulator's docstring."
+        ),
+        "overall_by_config": overall_rows,
+        "by_layer_group": by_lg_rows,
+    }
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    print(f"[s0-sweep] wrote {args.output}")
+
+
+if __name__ == "__main__":
+    main()
