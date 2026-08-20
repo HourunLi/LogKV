@@ -40,6 +40,7 @@ manifest_base_dir = _S0.manifest_base_dir
 parse_g_max_list = _S0.parse_g_max_list
 parse_int_list = _S0.parse_int_list
 route_dpmeans_segments = _S0.route_dpmeans_segments
+route_position_single_ladder = _S0.route_position_single_ladder
 simulate_segment_ladders = _S0.simulate_segment_ladders
 summarize_entries = _S0.summarize_entries
 
@@ -180,11 +181,33 @@ def main() -> None:
         raise ValueError(f"--g_max {args.g_max!r} parsed to an empty list -- pass at least one value")
     if not l_values:
         raise ValueError(f"--l_block {args.l_block!r} parsed to an empty list -- pass at least one value")
+    # Fail fast on degenerate sweep parameters instead of silently producing a
+    # complete-looking but meaningless result (route_dpmeans_segments enforces
+    # the same bounds on lambda_new/g_max, but only once routing actually
+    # starts -- after loading the dump; checking here catches it before any
+    # of that work happens). -inf is deliberately rejected alongside negative
+    # finite values: math.isinf(-inf) is True, so it would otherwise slip
+    # through a naive "isinf or >= 0" check.
+    if not (math.isfinite(args.lambda_rel) and args.lambda_rel > 0.0):
+        raise ValueError(f"--lambda_rel must be finite and > 0, got {args.lambda_rel}")
+    if not (math.isfinite(args.seg_forget) and 0.0 <= args.seg_forget <= 1.0):
+        raise ValueError(f"--seg_forget must be in [0, 1], got {args.seg_forget}")
+    bad_g_max = [g for g in g_values if not (g == math.inf or (math.isfinite(g) and g >= 0.0))]
+    if bad_g_max:
+        raise ValueError(f"--g_max values must be finite >= 0, or inf, got {bad_g_max}")
     layer_filter = _wanted(args.layers)
     group_filter = _wanted(args.groups)
 
     by_layer_group: dict[tuple[str, int, int, int], SweepAccumulator] = {}
     overall: dict[tuple[str, int], SweepAccumulator] = {}
+    # S0.4 needs semantic-cluster intra-entry variance compared against the
+    # *existing* position-bucketed LogKV's intra-slot variance -- a reference
+    # point route_dpmeans_segments cannot produce (even g_max=inf is still
+    # semantic DP-means, not arrival-order routing). Keyed by (layer, group)
+    # only: route_position_single_ladder does no clustering, so it does not
+    # vary with (g_max, l_block) and is computed once per group, not per
+    # sweep cell.
+    position_baseline: dict[tuple[int, int], SweepAccumulator] = {}
     records = _iter_records(manifest, layer_filter=layer_filter)
     if not records:
         raise ValueError("No layer records matched the requested filters")
@@ -217,6 +240,27 @@ def main() -> None:
                 if v_group is not None
                 else (None, None)
             )
+
+            # S0.4 baseline: same B'-budget ladder construction, but with no
+            # semantic clustering at all (single cluster, arrival order) --
+            # see position_baseline's docstring comment above.
+            position_route = route_position_single_ladder(k_group.shape[0])
+            position_entries, position_ladder_meta = simulate_segment_ladders(
+                position_route,
+                b_prime=args.b_prime,
+                l_block=0,
+            )
+            position_summary = summarize_entries(k_group, v_group, position_entries)
+            position_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
+                route=position_route,
+                ladder_meta=position_ladder_meta,
+                summary=position_summary,
+                sh=sh,
+                sh_source=sh_source,
+                vh=vh,
+                vh_source=vh_source,
+            )
+
             # route only depends on (lambda_new, effective_g_max, gamma) -- see
             # _effective_g_max -- so cache by effective_g_max: otherwise the
             # g_max=inf route would get recomputed once per swept g_max value
@@ -296,6 +340,12 @@ def main() -> None:
         row.update(acc.finalize())
         overall_rows.append(row)
 
+    position_baseline_rows = []
+    for (layer, group), acc in sorted(position_baseline.items(), key=lambda item: (item[0][0], item[0][1])):
+        row = {"layer": layer, "group": group}
+        row.update(acc.finalize())
+        position_baseline_rows.append(row)
+
     result = {
         "version": 1,
         "kind": "semantic_logkv_s0_0_sweep",
@@ -332,6 +382,17 @@ def main() -> None:
         ),
         "overall_by_config": overall_rows,
         "by_layer_group": by_lg_rows,
+        "position_baseline_note": (
+            "The 'existing position-bucketed LogKV' reference docs/experiments.md's S0.4 "
+            "decision gate compares against ('key variance should be significantly lower "
+            "than the existing position slot'). Built with route_position_single_ladder: "
+            "every token in one sequential cluster/segment (no semantic clustering, no "
+            "g_max/l_block segmentation), run through the same simulate_segment_ladders "
+            "b_prime binary-carry construction as the semantic sweep cells, so it is "
+            "directly comparable at the same B' budget. Independent of (g_max, l_block) -- "
+            "reported once per (layer, group), not swept."
+        ),
+        "position_baseline_by_layer_group": position_baseline_rows,
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

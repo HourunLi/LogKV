@@ -555,6 +555,79 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-20｜第二十九轮：给 S0.0 sweep/dump 工具链补上四处代码评审发现的
+  缺口——S0.4 缺"现有位置槽"baseline、`route_dpmeans_segments`/CLI 缺
+  `lambda_new`/`g_max` 的正负值校验、dump 对空/被截断的 needle span 只记录
+  不拦截、`Stage0DumpRecorder` 直接实例化时 `save_dtype` 拼错会静默退化到
+  fp16。** 动机：一次独立代码评审对照 `litgpt/semantic_s0.py`/`unused/
+  semantic_s0_sweep.py`/`unused/semantic_stage0_dump.py`（第二十六、二十七轮
+  落地的 S0.0 工具链）逐条核实，找出四处 P2/P3 级缺口，均属于"能跑但会静默
+  产出误导性结果"一类，不是设计层面的问题。逐条结论：
+  ① **S0.4 决策口径（`docs/experiments.md` "簇内 key 方差与 value 方差 /
+  现有位置槽内方差"、"key 方差应显著低于现有位置槽"）需要一个"现有位置槽"
+  baseline，但 sweep 脚本只产出 DP-means 语义路由的结果——即使扫到
+  `g_max=inf` 这个最"退化"的端点，走的仍是语义 DP-means 路由，不是纯按到达
+  顺序的位置分桶。** 新增 `route_position_single_ladder()`
+  （`litgpt/semantic_s0.py`，紧邻 `RouteResult`）：不做任何聚类，全部 token
+  进 cluster 0/segment 0，按到达顺序喂给 `simulate_segment_ladders`/
+  `_append_entry`，根据 `_append_entry` 自己的 docstring（已验证与
+  `LogStructuredKVCache._add_compact_entry`/`_binary_carry` 逐位一致），这就
+  精确复现了现有位置分桶 LogKV 的槽结构，是同一 `B′` 预算下的对照。sweep 脚本
+  在每个 `(layer, group)` 只算一次（不随 `(g_max, l_block)` 扫描重复计算，
+  因为这个 baseline 结构上不依赖两者），累积进新的
+  `position_baseline_by_layer_group` 字段。用合成数据做了端到端验证：两个
+  紧凑 blob 按到达顺序交替排列时（对位置分桶最不利、语义聚类应完全不受影响
+  的构造），语义路由的 `token_weighted_key_var` 比 baseline 低了 4 个数量级
+  （0.0036 vs 80.06），确认两者不是在算同一件事。
+  ② **`route_dpmeans_segments` 只校验了 `gamma`，`lambda_new`/`g_max` 传负数
+  会静默产出退化结果而不报错**（负 `lambda_new` 让 `d2≥0>lambda_new` 对几乎
+  每个 token 成立从而每个 token 自成一簇；负 `g_max` 让 `p−p_hi[c]≥1>g_max`
+  对几乎每次同簇到达都成立从而几乎每次都开新段），结果 JSON look 起来完全
+  正常。在 `route_dpmeans_segments` 内补了校验：`lambda_new` 必须有限且
+  `>0`；`g_max` 必须是 `+inf` 或有限且 `≥0`。**修正了用户给出的校验公式里
+  一个会让检查本身失效的 bug**：提议的 `math.isinf(g_max) or (finite and
+  g_max>=0)` 会把 `g_max=-inf` 也判成合法——`math.isinf(-inf)` 同样是
+  `True`，这条检查唯一要拦的两种输入（负有限数、`-inf`）里的后一种会被自己
+  放过去。改成显式要求 `g_max == math.inf`（排除 `-inf`）。同时在
+  `unused/semantic_s0_sweep.py` 的 `main()` 里补了 CLI 层面的对应校验
+  （`--lambda_rel`、`--seg_forget`、`--g_max` 列表逐项），在 `args =
+  parser.parse_args()` 之后立刻做，比等到 sweep 循环里第一次调用
+  `route_dpmeans_segments` 更早失败（省掉一次 npz 加载）；`--seg_forget` 的
+  校验与 `route_dpmeans_segments` 内部已有的 `gamma` 校验重复，但两处入口
+  独立失败是这两个脚本里"宁可拒绝、不可静默"的既有风格（参见空列表校验、
+  `--max_samples`/`--max_seq_length` 等）。用已有测试
+  （`test_semantic_s0.py:117-119`、`test_semantic_s0_sweep.py` 多处）确认
+  `g_max=0`/`g_max=inf` 这两个合法边界值没有被新校验误伤。
+  ③ **dump 脚本对"needle 没找到"或"needle 被左截断挤出窗口"只把
+  `survived_left_truncation` 记进 `needle_spans`，从不拦截**，manifest 看
+  起来和正常样本完全一样。新增 `_assert_needle_span_present()`（独立可测
+  函数，风格对齐已有的 `_assert_layers_are_recordable`/
+  `_assert_checkpoint_loaded_cleanly`，而不是像最初建议那样直接把 `raise`
+  写在 `main()` 里）+ `--require_needle_span` opt-in CLI 开关（默认关闭，
+  因为不是所有 dump 都是 NIAH 形态的、"没有 needle"对非 NIAH 样本是合法
+  状态）；开关状态一并写进 `manifest["dump"]["require_needle_span"]`，供
+  下游知道这批 manifest 是否已经保证过 needle 存活。
+  ④ **`Stage0DumpRecorder.__init__` 原来是 `np.float32 if save_dtype ==
+  "float32" else np.float16`**——CLI 有 `choices` 兜底，但直接实例化（如
+  测试或未来脚本）时拼错字符串（如 `"fp32"`）会静默落进 `else` 分支变成
+  `float16`，与该类 docstring 反复强调的"`save_dtype` 必须和标定 `s_h`/
+  `vh` 时的精度一致，否则阈值边界会被 fp16 舍入噪声翻转簇归属"直接冲突。
+  改成显式三分支，非法值 `raise ValueError`。
+  **验证**：与此前多轮"本地没有 torch/numpy/pytest，只能做静态核对"不同，
+  这次环境装上了 numpy/pytest/torch/lightning（`pip install -e .`）后，
+  `pytest tests/test_semantic_s0.py tests/test_semantic_s0_sweep.py
+  tests/test_semantic_stage0_dump.py` **实际跑通**，39 个测试全部通过
+  （含本轮新增的 14 个：`route_position_single_ladder` 的 3 个、
+  `route_dpmeans_segments` 新校验的 3 个、`Stage0DumpRecorder.save_dtype`
+  的 2 个、`_assert_needle_span_present` 的 4 个，另加 g_max 边界值回归
+  2 个）；另外用合成 `.npz`+manifest 跑了两遍端到端 `unused/
+  semantic_s0_sweep.py`（见①），确认新增的 `position_baseline_by_layer_
+  group` 字段在真实 CLI 路径上产出合理数值,不只是单元测试里的行为。
+  `ruff check`/`ruff format --check` 核对过，本轮改动没有引入新的 lint
+  问题（跑出的几条 import-顺序/行宽提示经 `git stash` 核对后确认是改动前
+  就存在的、且都在本轮未触碰的代码行上，与 pre-commit 固定的 ruff 版本
+  `v0.15.9` 和这次临时装的 `0.16.3` 之间的版本差异有关，不属于本轮范围）。
+
 - **2026-08-20｜第二十八轮：把两处仍会被读成"S0.8 要等 Stage 1 才能跑"的措辞
   同步到已经拆开的口径——`cache_batch` 指的是 §5.4 Phase 1/2/3 的朴素 CPU 参考
   实现，不是 §5.18 第 4 步的向量化生产实现；`CLAUDE.md` §0 顶部的"这两块"也
