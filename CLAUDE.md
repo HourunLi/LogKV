@@ -10,8 +10,10 @@
 
 ## 文档地图
 
-内容按章节拆到四个文件，**全局章节编号连续**，所以 `§5.19`、`§11-A`、`§2.3` 这类
-交叉引用在任何一个文件里都指向同一处。
+内容按章节拆到五个文件。前四个共享**全局章节编号连续**，所以 `§5.19`、`§11-A`、
+`§2.3` 这类交叉引用在任何一个文件里都指向同一处；`docs/position.md` 是独立的专题
+手册，用自己的 `§P` 前缀编号（如 `§P5.2`、`§P8.4`），不占用全局编号空间，交叉引用
+时按算法规格里指向它的具体小节（§5.10、§5.11、§5.14、§5.21）定位。
 
 | 文件 | 章节 | 内容 |
 |---|---|---|
@@ -19,11 +21,13 @@
 | [`docs/algorithm-spec.md`](docs/algorithm-spec.md) | §5 | 算法规格与实现方案：记号、分簇、簇内压缩、buffer 清单、文件级改动、实现顺序、**tips 与易错点**、**复用边界**、**开工前必须定死的五个决定** |
 | [`docs/experiments.md`](docs/experiments.md) | §6–§7 | 实验协议（Stage 0–3，含决策门）、消融表 |
 | [`docs/risks-and-open-questions.md`](docs/risks-and-open-questions.md) | §8、§11–§13 | 风险与对策、**技术难点清单**、未决问题、压缩机制的剩余空间 |
+| [`docs/position.md`](docs/position.md) | §P（独立编号）| **Position/RoPE 专题手册**：entry 如何携带位置信息的动机、当前方案（pre-RoPE 内容均值 + 锚点展开）、实现接口、验证计划、外部研究脉络；算法落地细节仍以 `algorithm-spec.md` §5.10/§5.11/§5.14/§5.21 为准，本文件负责解释为什么这样设计 |
 | [`docs/glossary.md`](docs/glossary.md) | —（速查） | **术语表**：结构层次、维度记号、参数、废弃记号、代码符号、外部概念 |
 
 **先读顺序**：想知道"为什么这么设计"读本文件 §2；想动手实现读
-`algorithm-spec.md` 的 §5.19/§5.20 加 `risks-and-open-questions.md` 的 §11；
-想知道"值不值得做"读 `experiments.md` 的 Stage 0 决策门；**看不懂某个词或符号就查
+`algorithm-spec.md` 的 §5.19/§5.20 加 `risks-and-open-questions.md` 的 §11，
+位置表示相关的实现注意事项另见 `position.md`；想知道"值不值得做"读
+`experiments.md` 的 Stage 0 决策门；**看不懂某个词或符号就查
 `glossary.md`**（尤其 `B` 在代码里有两个含义这个坑）。
 
 ## 0. 现状速览（2026-08-14）
@@ -74,8 +78,16 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
    另一端退化成"连续性约束语义分段"，扫它等于直接回答"收益来自语义分组本身，还是
    仅仅来自更好的分段边界"。纯 CPU 可测，**排在所有事情之前**。
 2. Stage 0 其余离线证伪实验（§7）——一次 dump + CPU 分析，决定方案值不值得往下做。
+   **S0.8 的 3b 项是这一步内部的例外**：它额外需要 `litgpt/log_kv_position.py`
+   （下一项）、§5.4/§5.18 第 2 步的 CPU 参考路由、以及
+   `log_kv_slot_attention()`/`get_attention_state()` 按 §5.14/§5.20-B 扩展出的
+   `CacheAttentionState`/`slot_valid`/`M_s` 先落地——这三块是让 3b 这个决策门本身
+   可信的最小基础设施（CPU 参考路由是测试脚手架、扩展是受字节等价 CI 闸门保护的
+   纯加法式改动），不属于第 4 项要等 Stage 0 结果才投入的生产实现，完整论证见
+   `algorithm-spec.md` §5.21-5 的更正框。
 3. `litgpt/log_kv_position.py` 纯函数 + 单测（§5.14），CPU 可测，不依赖 dump 结果。
-4. 视 Stage 0 结果决定是否继续 Stage 1（生产代码）。**动手前先读 `algorithm-spec.md`
+4. 视 Stage 0 结果决定是否继续 Stage 1（生产代码，指 §5.18 第 3–6 步：多簇路由的
+   向量化实现、段对齐填充、`op_log` 训练路径重放）。**动手前先读 `algorithm-spec.md`
    的 §5.21（开工前必须定死的五个决定）、§5.19/§5.20，以及 `risks-and-open-questions.md`
    的 §11。**
 
@@ -352,7 +364,9 @@ memory-matched 对比**——`op_log` 是给 backward 重放用的操作日志�
 serving/推理路径不做反向传播，**不分配、不持有这块内存**；这不是"推理时反正
 用不上所以顺便不管"的隐式结果，是共享的路由/flush 逻辑显式接收一个
 `record_op_log` 开关，只有训练专用的 `LogKVStreamTrainingAttention.forward()`
-传 `True`，推理用的 `LogStructuredKVCache.forward()` 传 `False`，见
+传 `True`，推理用的 `CausalSelfAttention._log_kv_training_forward()` 传
+`False`——**不是** `LogStructuredKVCache.forward()`，那个方法从一开始就
+恒定 `raise RuntimeError`，从不被调用（`log_kv_cache.py:1217`），见
 `algorithm-spec.md` §5.21-2 新增的"`op_log` 只能在训练路径分配"一节。上面
 两笔账比较的是"cache 里究竟存了多少 entry"和"读出时瞬时展开多大"，两者都是
 serving 也会付的代价，`op_log` 不是。
@@ -468,6 +482,76 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-20｜第二十四轮核实（文档 vs 现有代码库对照）：修正推理入口的错误
+  指代，钉死 S0.8 3b 相对"dump 脚本是第一段代码"的真实前置依赖，去掉 §5.2
+  距离度量措辞里会诱导错误实现的"原始"字样，把 `docs/position.md` 补进文档
+  地图，外加清理两处 markdown 空白格式问题。** 动机：一次独立审查直接对照
+  当前 `litgpt/` 代码库（而不是只读文档互相印证）复核规格文本，找出四处
+  文档描述与实际代码/既有排期矛盾的地方。逐条结论：
+  ① **P1：`op_log` 门控段落把推理路径的调用入口写成
+  `LogStructuredKVCache.forward()`，但核对 `litgpt/log_kv_cache.py:1217`
+  确认这个方法从一开始就是显式禁用的 stub——直接 `raise RuntimeError`，
+  docstring 讲得很明确（"direct cache calls cannot implement LogKV
+  correctly"），且没有理由在语义簇设计下被重新启用。** 真实的推理/生成
+  入口是 `CausalSelfAttention._log_kv_training_forward()`
+  （`model.py:1095`，由 `CausalSelfAttention.forward()` 在
+  `input_pos is not None` 且 cache 是 `LogStructuredKVCache` 时以
+  `reset_cache=False, defer_last_single=True` 调用，`model.py:833-838`，
+  注释明确写着"Inference uses the same streaming chunker for prefill and
+  decode"）——这是 `CausalSelfAttention` 自己的方法，不是
+  `LogStructuredKVCache` 的方法，只是内部调用 `cache.get_attention_
+  state()`/`cache.add_recent()`，从不经过 `cache.forward()`。**修法**：
+  `algorithm-spec.md` §5.21-2 的四处提及（buffer 表、两段"决定"文字、
+  `record_op_log` 判断依据段落）与 `CLAUDE.md` §4 第三笔账，全部把
+  "`LogStructuredKVCache.forward()`（推理/生成路径）"改成
+  "`CausalSelfAttention._log_kv_training_forward()`"，并在 §5.21-2 开头
+  补一条"更正"框明确指出 `LogStructuredKVCache.forward()` 是禁用 stub、
+  从不被调用，避免下次又被当成入口引用。
+  ② **P1：`experiments.md`/`algorithm-spec.md` 反复强调"Stage 0 的 dump
+  脚本排在任何生产代码之前，是本项目该写的第一段代码"，但 S0.8 3b 的既有
+  设计明确要求"直接、原样传递生产函数 `get_attention_state()` 的返回值给
+  `log_kv_slot_attention`，不做手工重建或平行实现"，需要 §5.4/§5.18 第 2
+  步的 CPU 参考路由与 `log_kv_slot_attention()`/`get_attention_state()`
+  按 §5.14/§5.20-B 扩展出的 `CacheAttentionState`/`slot_valid`/`M_s`——
+  这两块按 §5.18 的步骤编号排在第 0 步（dump 脚本）之后，字面上直接
+  冲突。** 这不是需要靠改期望解决的矛盾，是"生产代码"这个词在两处指代的
+  范围不同：真正被"先看 Stage 0 结果再决定要不要投入"这道门挡住的，是
+  §5.18 第 3–6 步——多簇路由的向量化实现、段对齐填充、`op_log` 训练路径
+  重放，这是本方案唯一有实际工程量和回退风险的核心投入。3b 依赖的两块
+  东西性质不同：CPU 参考路由自己的定义就是"朴素串行版，慢但正确"的测试
+  脚手架（S0.1 已经在用同一类参考实现，这条依赖不是这一轮新加的）；
+  `log_kv_slot_attention`/`get_attention_state()` 的扩展是纯加法式改动
+  （新增可选参数/返回字段，不改变现有调用的行为，受 §5.19-1"默认关闭
+  必须逐字节等价"CI 闸门保护），改动量和风险与第 3–6 步的多簇路由实现
+  不是一个量级，更准确的定位是"S0.8 3b 这个决策门本身可信的前提"而不是
+  "等 Stage 0 结果出来才投入的 Stage 1 生产实现"——和 `log_kv_position.py`
+  被列为独立于 Stage 0 决策门之外的待办项是同一个先例。**修法**：
+  `algorithm-spec.md` §5.21-5 新增更正框钉死这条边界并给出完整论证，
+  §5.18 的步骤列表在第 0/1/2 步分别标注"S0.0–S0.7 和 S0.8 第 1/2/3a 项
+  只需要第 0 步""S0.8 3b 的前置项"；`experiments.md`"Stage 0 dump 规格"
+  一节和 `CLAUDE.md` §0"下一步"清单的对应条目同步加注；`glossary.md`
+  的 Stage 0 词条补上这条例外的指针。
+  ③ **P2：§5.2 距离度量那句"用原始（未归一化）pre-RoPE key 上的平方欧氏
+  距离"里的"原始"和"未归一化"连用，会被读成"qkv 投影的原始输出、
+  qk-norm 之前"——而 §5.21-1 用一整节钉死"pre-RoPE k 精确地说是 qk-norm
+  之后、apply_rope 之前，不是 qkv 投影的原始输出，取错位置会让簇的度量
+  落在未归一化空间、`s_h` 标定直接失效"，两处描述的是同一个量，但 §5.2
+  的措辞正是 §5.21-1 明确警告过的错误读法。** "未归一化"本来只想表达
+  "不做 cosine 需要的 L2/单位范数归一化"（呼应"不用 cosine"），不是
+  "跳过 qk-norm"。**修法**：改成"用 qk-norm 之后、RoPE 之前的 key 上的
+  平方欧氏距离，不做 cosine/L2 归一化"，不再用"原始（未归一化）"这个
+  会引发歧义的说法，并补一条"更正"框说明改动理由。
+  ④ **P3：`CLAUDE.md` 的"文档地图"仍说内容拆到"四个文件"，表里没有
+  `docs/position.md`——但 position.md 早在第七轮就已新增，一直没有被
+  补进地图，容易让实现者漏读 position 相关的实现注意事项。** **修法**：
+  地图表新增一行，说明 `position.md` 用独立的 `§P` 前缀编号（不占用
+  CLAUDE.md/algorithm-spec.md/experiments.md/risks-and-open-questions.md
+  共享的全局章节编号），"先读顺序"一节补上指向它的一句话。
+  顺带清理了 `docs/experiments.md:74` 的行尾空格和
+  `docs/experiments.md`/`docs/risks-and-open-questions.md` 文件末尾多出
+  的空行——`git diff --check origin/logKV...HEAD` 能直接复现，纯格式
+  问题，与设计内容无关。
 
 - **2026-08-19｜第二十三轮核实：给 `scan_op_log_for_ward_events` 补上
   "K 未满分支的 NEW_CLUSTER 必须落在从未 alive 过的槽上"这最后一类校验，
