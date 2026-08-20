@@ -44,7 +44,8 @@ route_dpmeans_segments = _S0.route_dpmeans_segments
 route_single_cluster_bprime_ladder = _S0.route_single_cluster_bprime_ladder
 simulate_segment_ladders = _S0.simulate_segment_ladders
 summarize_entries = _S0.summarize_entries
-vanilla_logkv_entries = _S0.vanilla_logkv_entries
+vanilla_logkv_compressed_entries = _S0.vanilla_logkv_compressed_entries
+vanilla_logkv_full_cache_entries = _S0.vanilla_logkv_full_cache_entries
 
 
 def _wanted(values: str | None) -> set[int] | None:
@@ -164,20 +165,24 @@ def main() -> None:
         "--vanilla_B",
         type=int,
         default=512,
-        help="B for the vanilla_logkv_baseline reference point (vanilla_logkv_entries) -- "
+        help="B for the vanilla_logkv_compressed/full_cache_baseline reference points -- "
         "matches LogStructuredKVCache's --log_kv_B / self.B, default 512 to match the deployed "
         "exp/qwen1.7b-32k/base.yaml config. NOT the same knob as --b_prime, which only controls "
-        "the semantic sweep cells and single_cluster_bprime_baseline.",
+        "the semantic sweep cells and single_cluster_bprime_baseline. Unlike --b_prime, this "
+        "does not need to be even -- the real LogStructuredKVCache places no such constraint on "
+        "B (verified empirically, see vanilla_logkv_compressed_entries's docstring); --b_prime's "
+        "evenness requirement is for a semantic-design-specific reason (PAD_INSERT alignment) "
+        "that does not apply here.",
     )
     parser.add_argument(
         "--vanilla_recent_size",
         type=int,
         default=1024,
-        help="recent_size for the vanilla_logkv_baseline reference point -- matches "
+        help="recent_size for the vanilla_logkv_compressed/full_cache_baseline reference points -- matches "
         "LogStructuredKVCache's --log_kv_recent_size, default 1024 to match the deployed "
         "exp/qwen1.7b-32k/base.yaml config. The semantic sweep and single_cluster_bprime_baseline "
         "have no recent-window concept at all (every token goes through compaction), so this only "
-        "affects vanilla_logkv_baseline.",
+        "affects the two vanilla_logkv_*_baseline outputs.",
     )
     parser.add_argument("--layers", help="Optional comma-separated layer filter")
     parser.add_argument("--groups", help="Optional comma-separated KV-group filter")
@@ -216,8 +221,8 @@ def main() -> None:
     bad_g_max = [g for g in g_values if not (g == math.inf or (math.isfinite(g) and g >= 0.0))]
     if bad_g_max:
         raise ValueError(f"--g_max values must be finite >= 0, or inf, got {bad_g_max}")
-    if args.vanilla_B <= 0 or args.vanilla_B % 2 != 0:
-        raise ValueError(f"--vanilla_B must be a positive even integer, got {args.vanilla_B}")
+    if args.vanilla_B <= 0:
+        raise ValueError(f"--vanilla_B must be a positive integer, got {args.vanilla_B}")
     if args.vanilla_recent_size < 2:
         raise ValueError(f"--vanilla_recent_size must be >= 2, got {args.vanilla_recent_size}")
     layer_filter = _wanted(args.layers)
@@ -226,11 +231,12 @@ def main() -> None:
     by_layer_group: dict[tuple[str, int, int, int], SweepAccumulator] = {}
     overall: dict[tuple[str, int], SweepAccumulator] = {}
     # S0.4 needs semantic-cluster intra-entry variance compared against the
-    # existing position-bucketed LogKV's intra-slot variance -- two different
-    # reference points for that, neither producible by route_dpmeans_segments
-    # (even g_max=inf is still semantic DP-means, not arrival-order routing).
-    # Both keyed by (layer, group) only, since neither varies with
-    # (g_max, l_block): computed once per group, not per sweep cell.
+    # existing position-bucketed LogKV's intra-slot variance -- three
+    # different reference points for that, none producible by
+    # route_dpmeans_segments (even g_max=inf is still semantic DP-means, not
+    # arrival-order routing). All keyed by (layer, group) only, since none
+    # vary with (g_max, l_block): computed once per group, not per sweep
+    # cell.
     #
     # single_cluster_bprime_baseline: same B'-budget ladder mechanics as the
     # semantic sweep cells, but with no clustering at all -- isolates what
@@ -239,11 +245,17 @@ def main() -> None:
     # route_single_cluster_bprime_ladder's docstring for the three respects
     # in which it differs).
     #
-    # vanilla_logkv_baseline: the actual existing/deployed LogKV -- real
-    # log_kv_B / log_kv_recent_size, real recent-window carve-out, real
-    # w=2 level-0 pairing (see vanilla_logkv_entries's docstring).
+    # vanilla_logkv_compressed_prefix_baseline / vanilla_logkv_full_cache_
+    # baseline: the actual existing/deployed LogKV -- real log_kv_B /
+    # log_kv_recent_size, real recent-window carve-out, real w=2 level-0
+    # pairing (see vanilla_logkv_compressed_entries's docstring). The two
+    # differ in whether the exact recent-window tokens are folded in --
+    # compressed_prefix (no) is the primary S0.4 metric, full_cache (yes) is
+    # a secondary sanity check -- see vanilla_logkv_full_cache_entries's
+    # docstring for why.
     single_cluster_bprime_baseline: dict[tuple[int, int], SweepAccumulator] = {}
-    vanilla_logkv_baseline: dict[tuple[int, int], SweepAccumulator] = {}
+    vanilla_logkv_compressed_prefix_baseline: dict[tuple[int, int], SweepAccumulator] = {}
+    vanilla_logkv_full_cache_baseline: dict[tuple[int, int], SweepAccumulator] = {}
     records = _iter_records(manifest, layer_filter=layer_filter)
     if not records:
         raise ValueError("No layer records matched the requested filters")
@@ -297,14 +309,16 @@ def main() -> None:
                 vh_source=vh_source,
             )
 
-            # S0.4 baseline 2/2: the actual existing/deployed vanilla LogKV --
-            # see vanilla_logkv_baseline's docstring comment above.
-            # vanilla_logkv_entries has no cluster/segment concept (it is a
-            # single flat ladder with a real recent-window carve-out), so
-            # there is no meaningful RouteResult for it; this placeholder
-            # only exists to satisfy SweepAccumulator.add()'s interface, and
-            # is why cluster_count_mean/segment_count_mean read 1.0/1.0 for
-            # every row of this baseline (correctly -- vanilla has neither).
+            # S0.4 baselines 2-3/3: the actual existing/deployed vanilla LogKV
+            # -- see the two vanilla_logkv_*_baseline dicts' docstring comment
+            # above. Neither vanilla_logkv_compressed_entries nor
+            # vanilla_logkv_full_cache_entries has a cluster/segment concept
+            # (both are a single flat ladder with a real recent-window
+            # carve-out), so there is no meaningful RouteResult for either;
+            # this placeholder only exists to satisfy SweepAccumulator.add()'s
+            # interface, and is why cluster_count_mean/segment_count_mean
+            # read 1.0/1.0 for every row of both baselines (correctly --
+            # vanilla has neither).
             vanilla_route = RouteResult(
                 cluster_ids=np.zeros(0, dtype=np.int32),
                 segment_ids=np.zeros(0, dtype=np.int32),
@@ -312,14 +326,28 @@ def main() -> None:
                 segment_count=1,
                 cluster_sizes=[k_group.shape[0]],
             )
-            vanilla_entries, vanilla_ladder_meta = vanilla_logkv_entries(
+            vanilla_compressed_entries, vanilla_compressed_meta = vanilla_logkv_compressed_entries(
                 k_group.shape[0], b=args.vanilla_B, recent_size=args.vanilla_recent_size,
             )
-            vanilla_summary = summarize_entries(k_group, v_group, vanilla_entries)
-            vanilla_logkv_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
+            vanilla_compressed_summary = summarize_entries(k_group, v_group, vanilla_compressed_entries)
+            vanilla_logkv_compressed_prefix_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
                 route=vanilla_route,
-                ladder_meta=vanilla_ladder_meta,
-                summary=vanilla_summary,
+                ladder_meta=vanilla_compressed_meta,
+                summary=vanilla_compressed_summary,
+                sh=sh,
+                sh_source=sh_source,
+                vh=vh,
+                vh_source=vh_source,
+            )
+
+            vanilla_full_entries, vanilla_full_meta = vanilla_logkv_full_cache_entries(
+                k_group.shape[0], b=args.vanilla_B, recent_size=args.vanilla_recent_size,
+            )
+            vanilla_full_summary = summarize_entries(k_group, v_group, vanilla_full_entries)
+            vanilla_logkv_full_cache_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
+                route=vanilla_route,
+                ladder_meta=vanilla_full_meta,
+                summary=vanilla_full_summary,
                 sh=sh,
                 sh_source=sh_source,
                 vh=vh,
@@ -413,11 +441,21 @@ def main() -> None:
         row.update(acc.finalize())
         single_cluster_bprime_baseline_rows.append(row)
 
-    vanilla_logkv_baseline_rows = []
-    for (layer, group), acc in sorted(vanilla_logkv_baseline.items(), key=lambda item: (item[0][0], item[0][1])):
+    vanilla_logkv_compressed_prefix_baseline_rows = []
+    for (layer, group), acc in sorted(
+        vanilla_logkv_compressed_prefix_baseline.items(), key=lambda item: (item[0][0], item[0][1])
+    ):
         row = {"layer": layer, "group": group}
         row.update(acc.finalize())
-        vanilla_logkv_baseline_rows.append(row)
+        vanilla_logkv_compressed_prefix_baseline_rows.append(row)
+
+    vanilla_logkv_full_cache_baseline_rows = []
+    for (layer, group), acc in sorted(
+        vanilla_logkv_full_cache_baseline.items(), key=lambda item: (item[0][0], item[0][1])
+    ):
+        row = {"layer": layer, "group": group}
+        row.update(acc.finalize())
+        vanilla_logkv_full_cache_baseline_rows.append(row)
 
     result = {
         "version": 1,
@@ -458,34 +496,57 @@ def main() -> None:
         "overall_by_config": overall_rows,
         "by_layer_group": by_lg_rows,
         "single_cluster_bprime_baseline_note": (
-            "NOT the vanilla/existing-LogKV reference -- see vanilla_logkv_baseline_note for "
-            "that. This is a same-B' single-cluster position-order CONTROL: every token in one "
-            "sequential cluster/segment (no semantic clustering, no g_max/l_block segmentation), "
-            "run through the same simulate_segment_ladders b_prime binary-carry construction as "
-            "the semantic sweep cells (route_single_cluster_bprime_ladder), so it answers 'how "
-            "much does semantic grouping itself help, holding the ladder budget/mechanics fixed "
-            "to what the semantic sweep is already using' -- a real, separate question from S0.4's "
-            "'how does this compare to the currently deployed LogKV'. Independent of "
-            "(g_max, l_block) -- reported once per (layer, group), not swept."
+            "NOT the vanilla/existing-LogKV reference -- see the two vanilla_logkv_*_baseline_"
+            "note fields for that. This is a same-B' single-cluster position-order CONTROL: "
+            "every token in one sequential cluster/segment (no semantic clustering, no "
+            "g_max/l_block segmentation), run through the same simulate_segment_ladders b_prime "
+            "binary-carry construction as the semantic sweep cells (route_single_cluster_bprime_"
+            "ladder), so it answers 'how much does semantic grouping itself help, holding the "
+            "ladder budget/mechanics fixed to what the semantic sweep is already using' -- a "
+            "real, separate question from S0.4's 'how does this compare to the currently "
+            "deployed LogKV'. Independent of (g_max, l_block) -- reported once per "
+            "(layer, group), not swept."
         ),
         "single_cluster_bprime_baseline_by_layer_group": single_cluster_bprime_baseline_rows,
-        "vanilla_logkv_baseline_note": (
-            "The actual 'existing position-bucketed LogKV' reference docs/experiments.md's S0.4 "
-            "decision gate compares against ('key variance should be significantly lower than "
-            "the existing position slot'). Built with vanilla_logkv_entries at --vanilla_B/"
-            "--vanilla_recent_size (defaults 512/1024, matching the deployed "
-            "exp/qwen1.7b-32k/base.yaml config): a real recent-window carve-out (the last "
-            "vanilla_recent_size tokens are never compacted, exactly like LogStructuredKVCache."
-            "add_recent()) and real vanilla level-0 pairing (2 raw tokens pre-merged into one "
-            "w=2 entry, exactly like log_kv_cache.py's _flush_pairs()) before the shared "
-            "binary-carry ladder. Validated end-to-end against a real LogStructuredKVCache -- "
-            "see vanilla_logkv_entries's docstring and tests/test_semantic_s0.py. "
+        "vanilla_logkv_compressed_prefix_baseline_note": (
+            "PRIMARY S0.4 reference: docs/experiments.md's decision gate ('key variance should "
+            "be significantly lower than the existing position slot') should be judged against "
+            "this one, not vanilla_logkv_full_cache_baseline -- see the latter's note for why. "
+            "Built with vanilla_logkv_compressed_entries at --vanilla_B/--vanilla_recent_size "
+            "(defaults 512/1024, matching the deployed exp/qwen1.7b-32k/base.yaml config): a "
+            "real recent-window carve-out (the last vanilla_recent_size tokens are never "
+            "compacted, exactly like LogStructuredKVCache.add_recent()) and real vanilla "
+            "level-0 pairing (2 raw tokens pre-merged into one w=2 entry, exactly like "
+            "log_kv_cache.py's _flush_pairs()) before the shared binary-carry ladder. Only "
+            "covers the compacted prefix (compactable_token_count of token_count) -- the exact "
+            "recent-window tokens are NOT represented here at all, not even as zero-variance "
+            "entries, so real_token_count/entry_count read 0 whenever token_count <= "
+            "vanilla_recent_size (correctly: nothing has been compressed yet, not 'zero "
+            "variance'). Validated end-to-end against a real LogStructuredKVCache -- see "
+            "vanilla_logkv_compressed_entries's docstring and tests/test_semantic_s0.py. "
             "cluster_count_mean/segment_count_mean read 1.0/1.0 for every row: vanilla has no "
             "cluster/segment concept, those fields are a SweepAccumulator interface placeholder, "
             "not a measurement. Independent of (g_max, l_block) -- reported once per "
             "(layer, group), not swept."
         ),
-        "vanilla_logkv_baseline_by_layer_group": vanilla_logkv_baseline_rows,
+        "vanilla_logkv_compressed_prefix_baseline_by_layer_group": vanilla_logkv_compressed_prefix_baseline_rows,
+        "vanilla_logkv_full_cache_baseline_note": (
+            "SECONDARY sanity check, not the primary S0.4 metric -- prefer "
+            "vanilla_logkv_compressed_prefix_baseline for the actual decision gate. This is "
+            "vanilla_logkv_compressed_prefix_baseline's compressed entries PLUS the "
+            "vanilla_recent_size exact recent-window tokens, each added back as its own "
+            "trivial width-1, zero-variance entry (vanilla_logkv_full_cache_entries), so every "
+            "position in the prompt is covered by exactly one entry -- useful for confirming "
+            "total token coverage, or as an end-to-end 'whole attention state' reference. Not "
+            "the primary metric because those ~vanilla_recent_size structurally-zero-variance "
+            "slots dilute the token-weighted variance average, more so the smaller token_count "
+            "is relative to vanilla_recent_size -- this measures something closer to 'how much "
+            "of the whole context is well-represented' than 'how good is compression itself'. "
+            "Same cluster_count_mean/segment_count_mean placeholder caveat as the compressed-"
+            "prefix baseline above. Independent of (g_max, l_block) -- reported once per "
+            "(layer, group), not swept."
+        ),
+        "vanilla_logkv_full_cache_baseline_by_layer_group": vanilla_logkv_full_cache_baseline_rows,
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
