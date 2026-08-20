@@ -1,0 +1,925 @@
+#!/usr/bin/env python
+"""Summarize ``unused/semantic_s0_sweep.py`` JSON output.
+
+The sweep JSON is intentionally machine-readable and can be awkward to inspect
+directly. This script turns it into a compact report:
+
+  * top ``(g_max, l_block)`` configs by scale-comparable key/value variance;
+  * per-layer/group ratios against the real vanilla LogKV compressed-prefix
+    baseline;
+  * span/entry-count tradeoff signals for S0.5;
+  * optional layer-wise winners and CSV/JSON summary exports.
+
+Examples:
+    python unused/semantic_s0_analyze.py stage0_dump/s0_sweep.json
+    python unused/semantic_s0_analyze.py './stage0_dump/*s0_sweep*.json' --layers 23-26 --top 20
+    python unused/semantic_s0_analyze.py stage0_dump/s0_sweep.json --csv stage0_dump/s0_summary.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import gzip
+import json
+import math
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Callable
+
+
+PRIMARY_KEY_METRIC = "token_weighted_key_var_relative"
+PRIMARY_VALUE_METRIC = "token_weighted_value_var_relative"
+SPAN_P99_METRIC = "entry_span_global_quantiles.p99"
+ENTRY_COUNT_METRIC = "entry_count_mean"
+
+BASELINE_KEYS = {
+    "vanilla": (
+        "vanilla_logkv_compressed_prefix_baseline_by_layer_group",
+        "vanilla_logkv_baseline_by_layer_group",
+    ),
+    "vanilla_full": ("vanilla_logkv_full_cache_baseline_by_layer_group",),
+    "single_cluster": (
+        "single_cluster_bprime_baseline_by_layer_group",
+        # One older intermediate version used this name before the baseline was
+        # renamed to clarify that it is not the deployed vanilla LogKV.
+        "position_baseline_by_layer_group",
+    ),
+    "position": ("position_baseline_by_layer_group",),
+}
+
+
+def _load_json(path_or_glob: str) -> tuple[Path, dict[str, Any]]:
+    pattern = str(Path(path_or_glob).expanduser())
+    matches = sorted(glob.glob(pattern))
+    path = Path(matches[-1] if matches else pattern)
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8") as f:
+        return path, json.load(f)
+
+
+def _parse_int_spec(spec: str | None) -> set[int] | None:
+    if spec is None:
+        return None
+    values: set[int] = set()
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            left, right = chunk.split("-", 1)
+            start, end = int(left), int(right)
+            if end < start:
+                start, end = end, start
+            values.update(range(start, end + 1))
+        else:
+            values.add(int(chunk))
+    return values
+
+
+def _format_layers(layers: set[int] | None) -> str:
+    if layers is None:
+        return "all"
+    if not layers:
+        return "none"
+    ordered = sorted(layers)
+    ranges: list[str] = []
+    start = prev = ordered[0]
+    for value in ordered[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = value
+    ranges.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(ranges)
+
+
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    value_f = float(value)
+    return value_f if math.isfinite(value_f) else None
+
+
+def _metric(row: dict[str, Any] | None, dotted_key: str) -> float | None:
+    if row is None:
+        return None
+    if dotted_key in row:
+        return _finite_float(row.get(dotted_key))
+    current: Any = row
+    for part in dotted_key.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return _finite_float(current)
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _quantile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    pos = min(max(float(q), 0.0), 1.0) * (len(ordered) - 1)
+    left = int(math.floor(pos))
+    right = int(math.ceil(pos))
+    if left == right:
+        return ordered[left]
+    frac = pos - left
+    return ordered[left] * (1.0 - frac) + ordered[right] * frac
+
+
+def _ratio(value: float | None, baseline: float | None) -> float | None:
+    if value is None or baseline is None or baseline <= 0:
+        return None
+    return value / baseline
+
+
+def _config_key(row: dict[str, Any], *, collapse_l0: bool) -> tuple[str, int]:
+    l_block = int(row["l_block"])
+    g_max = str(row["g_max"])
+    if collapse_l0 and l_block == 0:
+        # semantic_s0_sweep.py routes every l_block=0 cell with effective
+        # g_max=inf, so the nominal finite-g rows are duplicate pure-semantic
+        # endpoints. Collapsing keeps the report from being dominated by the
+        # same row repeated once per swept g_max.
+        g_max = "inf"
+    return g_max, l_block
+
+
+def _config_lg_key(row: dict[str, Any], *, collapse_l0: bool) -> tuple[str, int, int, int]:
+    g_max, l_block = _config_key(row, collapse_l0=collapse_l0)
+    return g_max, l_block, int(row["layer"]), int(row["group"])
+
+
+def _row_in_scope(row: dict[str, Any], layers: set[int] | None, groups: set[int] | None) -> bool:
+    if layers is not None and int(row.get("layer", -1)) not in layers:
+        return False
+    return not (groups is not None and int(row.get("group", -1)) not in groups)
+
+
+def _dedupe_config_rows(
+    rows: list[dict[str, Any]], *, collapse_l0: bool
+) -> tuple[list[dict[str, Any]], int]:
+    out: dict[tuple[str, int], dict[str, Any]] = {}
+    duplicates = 0
+    for row in rows:
+        key = _config_key(row, collapse_l0=collapse_l0)
+        if key in out:
+            duplicates += 1
+            continue
+        normalized = dict(row)
+        normalized["g_max"], normalized["l_block"] = key
+        out[key] = normalized
+    return list(out.values()), duplicates
+
+
+def _dedupe_config_layer_group_rows(
+    rows: list[dict[str, Any]], *, collapse_l0: bool
+) -> tuple[list[dict[str, Any]], int]:
+    out: dict[tuple[str, int, int, int], dict[str, Any]] = {}
+    duplicates = 0
+    for row in rows:
+        key = _config_lg_key(row, collapse_l0=collapse_l0)
+        if key in out:
+            duplicates += 1
+            continue
+        normalized = dict(row)
+        normalized["g_max"], normalized["l_block"], normalized["layer"], normalized["group"] = key
+        out[key] = normalized
+    return list(out.values()), duplicates
+
+
+def _baseline_layer_group_map(
+    rows: list[dict[str, Any]], *, layers: set[int] | None, groups: set[int] | None
+) -> dict[tuple[int, int], dict[str, Any]]:
+    out: dict[tuple[int, int], dict[str, Any]] = {}
+    for row in rows:
+        if not _row_in_scope(row, layers, groups):
+            continue
+        key = int(row["layer"]), int(row["group"])
+        out.setdefault(key, row)
+    return out
+
+
+def _resolve_baseline(payload: dict[str, Any], name: str) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+    if name == "none":
+        return None, None, []
+    candidates: list[str]
+    if name == "auto":
+        candidates = [
+            *BASELINE_KEYS["vanilla"],
+            *BASELINE_KEYS["position"],
+            *BASELINE_KEYS["single_cluster"],
+        ]
+    else:
+        candidates = list(BASELINE_KEYS[name])
+    for key in candidates:
+        rows = payload.get(key)
+        if isinstance(rows, list) and rows:
+            return name, key, rows
+    return name, None, []
+
+
+def _aggregate_config_rows(
+    rows: list[dict[str, Any]],
+    *,
+    key_metric: str,
+    value_metric: str,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[_config_key(row, collapse_l0=False)].append(row)
+
+    metrics = [
+        key_metric,
+        value_metric,
+        "cluster_count_mean",
+        "segment_count_mean",
+        "entry_count_mean",
+        "nonpad_entry_count_mean",
+        "pad_entry_count_mean",
+        "entry_width_global_quantiles.p90",
+        "entry_width_global_quantiles.p99",
+        "entry_width_global_max",
+        "entry_span_global_quantiles.p90",
+        "entry_span_global_quantiles.p99",
+        "entry_span_global_max",
+    ]
+    out: list[dict[str, Any]] = []
+    for (g_max, l_block), group_rows in sorted(grouped.items(), key=lambda item: (item[0][1], item[0][0])):
+        row: dict[str, Any] = {
+            "g_max": g_max,
+            "l_block": l_block,
+            "layer_group_count": len(group_rows),
+            "source": "by_layer_group_mean",
+        }
+        for metric in metrics:
+            values = [_metric(group_row, metric) for group_row in group_rows]
+            clean_values = [value for value in values if value is not None]
+            row[metric] = _mean(clean_values)
+        out.append(row)
+    return out
+
+
+def _config_summary_rows(
+    payload: dict[str, Any],
+    *,
+    layers: set[int] | None,
+    groups: set[int] | None,
+    collapse_l0: bool,
+    key_metric: str,
+    value_metric: str,
+) -> tuple[list[dict[str, Any]], str, int]:
+    if layers is None and groups is None:
+        rows, duplicates = _dedupe_config_rows(
+            payload.get("overall_by_config", []),
+            collapse_l0=collapse_l0,
+        )
+        return rows, "overall_by_config", duplicates
+
+    by_lg_rows, duplicates = _dedupe_config_layer_group_rows(
+        payload.get("by_layer_group", []),
+        collapse_l0=collapse_l0,
+    )
+    scoped = [row for row in by_lg_rows if _row_in_scope(row, layers, groups)]
+    rows = _aggregate_config_rows(scoped, key_metric=key_metric, value_metric=value_metric)
+    return rows, "by_layer_group_mean", duplicates
+
+
+def _ratio_summary(
+    rows: list[dict[str, Any]],
+    baseline_by_lg: dict[tuple[int, int], dict[str, Any]],
+    metric: str,
+) -> dict[str, Any]:
+    ratios: list[float] = []
+    for row in rows:
+        baseline = baseline_by_lg.get((int(row["layer"]), int(row["group"])))
+        ratio = _ratio(_metric(row, metric), _metric(baseline, metric))
+        if ratio is not None:
+            ratios.append(ratio)
+    return {
+        "valid": len(ratios),
+        "wins": sum(1 for value in ratios if value < 1.0),
+        "mean": _mean(ratios),
+        "median": _median(ratios),
+        "p90": _quantile(ratios, 0.90),
+        "max": max(ratios) if ratios else None,
+    }
+
+
+def _score_from_ratios(row: dict[str, Any]) -> float | None:
+    key_ratio = _metric(row, "key_ratio_median")
+    value_ratio = _metric(row, "value_ratio_median")
+    if key_ratio is None:
+        return None
+    if value_ratio is None:
+        return key_ratio
+    return math.sqrt(max(key_ratio, 0.0) * max(value_ratio, 0.0))
+
+
+def _compare_to_baseline(
+    by_layer_group_rows: list[dict[str, Any]],
+    baseline_rows: list[dict[str, Any]],
+    *,
+    layers: set[int] | None,
+    groups: set[int] | None,
+    collapse_l0: bool,
+    key_metric: str,
+    value_metric: str,
+) -> tuple[list[dict[str, Any]], int]:
+    deduped_rows, duplicates = _dedupe_config_layer_group_rows(by_layer_group_rows, collapse_l0=collapse_l0)
+    baseline_by_lg = _baseline_layer_group_map(baseline_rows, layers=layers, groups=groups)
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in deduped_rows:
+        if _row_in_scope(row, layers, groups) and (int(row["layer"]), int(row["group"])) in baseline_by_lg:
+            grouped[_config_key(row, collapse_l0=False)].append(row)
+
+    out: list[dict[str, Any]] = []
+    for (g_max, l_block), rows in grouped.items():
+        key_stats = _ratio_summary(rows, baseline_by_lg, key_metric)
+        value_stats = _ratio_summary(rows, baseline_by_lg, value_metric)
+        span_stats = _ratio_summary(rows, baseline_by_lg, SPAN_P99_METRIC)
+        entry_stats = _ratio_summary(rows, baseline_by_lg, ENTRY_COUNT_METRIC)
+        row = {
+            "g_max": g_max,
+            "l_block": l_block,
+            "layer_group_count": len(rows),
+            "key_ratio_median": key_stats["median"],
+            "key_ratio_mean": key_stats["mean"],
+            "key_ratio_p90": key_stats["p90"],
+            "key_ratio_max": key_stats["max"],
+            "key_wins": key_stats["wins"],
+            "key_valid": key_stats["valid"],
+            "value_ratio_median": value_stats["median"],
+            "value_ratio_mean": value_stats["mean"],
+            "value_ratio_p90": value_stats["p90"],
+            "value_ratio_max": value_stats["max"],
+            "value_wins": value_stats["wins"],
+            "value_valid": value_stats["valid"],
+            "span_p99_ratio_median": span_stats["median"],
+            "span_p99_ratio_p90": span_stats["p90"],
+            "span_p99_wins": span_stats["wins"],
+            "span_p99_valid": span_stats["valid"],
+            "entry_count_ratio_median": entry_stats["median"],
+            "entry_count_ratio_p90": entry_stats["p90"],
+            "entry_count_valid": entry_stats["valid"],
+        }
+        row["score"] = _score_from_ratios(row)
+        out.append(row)
+    return out, duplicates
+
+
+def _best_by_l_block(rows: list[dict[str, Any]], *, fallback_metric: str = PRIMARY_KEY_METRIC) -> list[dict[str, Any]]:
+    best: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        score = _metric(row, "score")
+        if score is None:
+            score = _metric(row, fallback_metric)
+        if score is None:
+            continue
+        l_block = int(row["l_block"])
+        old = best.get(l_block)
+        if old is None:
+            old_score = None
+        else:
+            old_score = _metric(old, "score")
+            if old_score is None:
+                old_score = _metric(old, fallback_metric)
+        if old is None or old_score is None or score < old_score:
+            best[l_block] = row
+    return [best[key] for key in sorted(best)]
+
+
+def _best_by_layer(
+    by_layer_group_rows: list[dict[str, Any]],
+    baseline_rows: list[dict[str, Any]],
+    *,
+    layers: set[int] | None,
+    groups: set[int] | None,
+    collapse_l0: bool,
+    key_metric: str,
+    value_metric: str,
+) -> list[dict[str, Any]]:
+    deduped_rows, _duplicates = _dedupe_config_layer_group_rows(by_layer_group_rows, collapse_l0=collapse_l0)
+    baseline_by_lg = _baseline_layer_group_map(baseline_rows, layers=layers, groups=groups)
+    grouped: dict[tuple[int, str, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in deduped_rows:
+        if not _row_in_scope(row, layers, groups):
+            continue
+        layer_group = int(row["layer"]), int(row["group"])
+        if layer_group not in baseline_by_lg:
+            continue
+        g_max, l_block = _config_key(row, collapse_l0=False)
+        grouped[(int(row["layer"]), g_max, l_block)].append(row)
+
+    candidates: list[dict[str, Any]] = []
+    for (layer, g_max, l_block), rows in grouped.items():
+        base_for_layer = {key: value for key, value in baseline_by_lg.items() if key[0] == layer}
+        key_stats = _ratio_summary(rows, base_for_layer, key_metric)
+        value_stats = _ratio_summary(rows, base_for_layer, value_metric)
+        row = {
+            "layer": layer,
+            "g_max": g_max,
+            "l_block": l_block,
+            "group_count": len(rows),
+            "key_ratio_median": key_stats["median"],
+            "value_ratio_median": value_stats["median"],
+            "key_wins": key_stats["wins"],
+            "key_valid": key_stats["valid"],
+        }
+        row["score"] = _score_from_ratios(row)
+        candidates.append(row)
+
+    by_layer: dict[int, dict[str, Any]] = {}
+    for row in candidates:
+        score = _metric(row, "score")
+        if score is None:
+            continue
+        old = by_layer.get(int(row["layer"]))
+        old_score = None if old is None else _metric(old, "score")
+        if old is None or old_score is None or score < old_score:
+            by_layer[int(row["layer"])] = row
+    return [by_layer[layer] for layer in sorted(by_layer)]
+
+
+def _parse_config_selector(text: str) -> tuple[str, int]:
+    for sep in (":", ",", "/"):
+        if sep in text:
+            g_max, l_block = text.split(sep, 1)
+            return g_max.strip(), int(l_block.strip())
+    raise ValueError(f"config selector must look like 'g_max:l_block', got {text!r}")
+
+
+def _worst_layer_groups(
+    by_layer_group_rows: list[dict[str, Any]],
+    baseline_rows: list[dict[str, Any]],
+    *,
+    config: tuple[str, int],
+    layers: set[int] | None,
+    groups: set[int] | None,
+    collapse_l0: bool,
+    key_metric: str,
+    value_metric: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    deduped_rows, _duplicates = _dedupe_config_layer_group_rows(by_layer_group_rows, collapse_l0=collapse_l0)
+    baseline_by_lg = _baseline_layer_group_map(baseline_rows, layers=layers, groups=groups)
+    records: list[dict[str, Any]] = []
+    for row in deduped_rows:
+        if _config_key(row, collapse_l0=False) != config or not _row_in_scope(row, layers, groups):
+            continue
+        baseline = baseline_by_lg.get((int(row["layer"]), int(row["group"])))
+        if baseline is None:
+            continue
+        records.append(
+            {
+                "layer": int(row["layer"]),
+                "group": int(row["group"]),
+                "key_ratio": _ratio(_metric(row, key_metric), _metric(baseline, key_metric)),
+                "value_ratio": _ratio(_metric(row, value_metric), _metric(baseline, value_metric)),
+                "span_p99_ratio": _ratio(_metric(row, SPAN_P99_METRIC), _metric(baseline, SPAN_P99_METRIC)),
+                "entry_count_ratio": _ratio(_metric(row, ENTRY_COUNT_METRIC), _metric(baseline, ENTRY_COUNT_METRIC)),
+                "key_rel": _metric(row, key_metric),
+                "value_rel": _metric(row, value_metric),
+            }
+        )
+
+    def sort_key(record: dict[str, Any]) -> tuple[float, int, int]:
+        key_ratio = record.get("key_ratio")
+        return (float("-inf") if key_ratio is None else float(key_ratio), int(record["layer"]), int(record["group"]))
+
+    return sorted(records, key=sort_key, reverse=True)[: max(int(limit), 0)]
+
+
+def build_analysis(
+    payload: dict[str, Any],
+    *,
+    layers: set[int] | None = None,
+    groups: set[int] | None = None,
+    baseline: str = "auto",
+    collapse_l0: bool = True,
+    key_metric: str = PRIMARY_KEY_METRIC,
+    value_metric: str = PRIMARY_VALUE_METRIC,
+) -> dict[str, Any]:
+    config_rows, config_source, config_duplicates = _config_summary_rows(
+        payload,
+        layers=layers,
+        groups=groups,
+        collapse_l0=collapse_l0,
+        key_metric=key_metric,
+        value_metric=value_metric,
+    )
+    ranked_configs = sorted(
+        config_rows,
+        key=lambda row: (
+            math.inf if _metric(row, key_metric) is None else float(_metric(row, key_metric)),
+            math.inf if _metric(row, value_metric) is None else float(_metric(row, value_metric)),
+        ),
+    )
+
+    baseline_name, baseline_key, baseline_rows = _resolve_baseline(payload, baseline)
+    comparison: list[dict[str, Any]] = []
+    comparison_duplicates = 0
+    best_layers: list[dict[str, Any]] = []
+    if baseline_rows:
+        comparison, comparison_duplicates = _compare_to_baseline(
+            payload.get("by_layer_group", []),
+            baseline_rows,
+            layers=layers,
+            groups=groups,
+            collapse_l0=collapse_l0,
+            key_metric=key_metric,
+            value_metric=value_metric,
+        )
+        comparison = sorted(
+            comparison,
+            key=lambda row: (
+                math.inf if _metric(row, "score") is None else float(_metric(row, "score")),
+                math.inf if _metric(row, "key_ratio_median") is None else float(_metric(row, "key_ratio_median")),
+            ),
+        )
+        best_layers = _best_by_layer(
+            payload.get("by_layer_group", []),
+            baseline_rows,
+            layers=layers,
+            groups=groups,
+            collapse_l0=collapse_l0,
+            key_metric=key_metric,
+            value_metric=value_metric,
+        )
+
+    warnings: list[str] = []
+    if not ranked_configs:
+        warnings.append("no config rows found for the selected scope")
+    if baseline != "none" and not baseline_rows:
+        warnings.append(f"baseline {baseline!r} was requested but no matching baseline rows were found")
+    if config_duplicates:
+        warnings.append(f"collapsed {config_duplicates} duplicate l_block=0 config rows")
+    if comparison_duplicates and config_source != "overall_by_config":
+        # Avoid repeating the same warning in the common no-filter case.
+        warnings.append(f"collapsed {comparison_duplicates} duplicate l_block=0 by_layer_group rows")
+
+    return {
+        "kind": payload.get("kind"),
+        "version": payload.get("version"),
+        "config": payload.get("config", {}),
+        "scope": {
+            "layers": None if layers is None else sorted(layers),
+            "groups": None if groups is None else sorted(groups),
+            "collapse_l0": collapse_l0,
+        },
+        "config_source": config_source,
+        "baseline": {"requested": baseline_name, "field": baseline_key, "row_count": len(baseline_rows)},
+        "warnings": warnings,
+        "config_rankings": ranked_configs,
+        "baseline_comparison": comparison,
+        "best_by_l_block": _best_by_l_block(comparison if comparison else ranked_configs, fallback_metric=key_metric),
+        "best_by_layer": best_layers,
+    }
+
+
+def _fmt_num(value: Any, digits: int = 4) -> str:
+    number = _finite_float(value)
+    if number is None:
+        return "n/a"
+    if number == 0:
+        return "0"
+    if abs(number) < 1e-3 or abs(number) >= 1e5:
+        return f"{number:.3e}"
+    return f"{number:.{digits}g}"
+
+
+def _fmt_ratio(value: Any) -> str:
+    number = _finite_float(value)
+    return "n/a" if number is None else f"{number:.3g}x"
+
+
+def _fmt_int(value: Any) -> str:
+    number = _finite_float(value)
+    if number is None:
+        return "n/a"
+    return str(int(number))
+
+
+def _fmt_win(row: dict[str, Any], prefix: str) -> str:
+    wins = row.get(f"{prefix}_wins")
+    valid = row.get(f"{prefix}_valid")
+    if not isinstance(wins, int) or not isinstance(valid, int) or valid <= 0:
+        return "n/a"
+    return f"{wins}/{valid}"
+
+
+def _fmt_config(row: dict[str, Any]) -> str:
+    return f"{row.get('g_max')}:{row.get('l_block')}"
+
+
+def _table(
+    rows: list[dict[str, Any]],
+    columns: list[tuple[str, str | Callable[[dict[str, Any]], Any], Callable[[Any], str]]],
+    *,
+    limit: int | None = None,
+) -> str:
+    clipped = rows if limit is None else rows[:limit]
+    if not clipped:
+        return "n/a"
+    rendered: list[list[str]] = []
+    for row in clipped:
+        rendered_row: list[str] = []
+        for _header, getter, formatter in columns:
+            value = getter(row) if callable(getter) else _metric(row, getter)
+            if value is None and isinstance(getter, str) and "." not in getter:
+                value = row.get(getter)
+            rendered_row.append(formatter(value))
+        rendered.append(rendered_row)
+    headers = [header for header, _getter, _formatter in columns]
+    widths = [
+        max(len(headers[i]), *(len(rendered_row[i]) for rendered_row in rendered))
+        for i in range(len(headers))
+    ]
+    lines = ["  ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))]
+    lines.append("  ".join("-" * width for width in widths))
+    for rendered_row in rendered:
+        lines.append("  ".join(rendered_row[i].ljust(widths[i]) for i in range(len(widths))))
+    return "\n".join(lines)
+
+
+def _ranked(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(row, rank=i) for i, row in enumerate(rows, start=1)]
+
+
+def _print_report(
+    path: Path,
+    analysis: dict[str, Any],
+    *,
+    top: int,
+    by_layer: bool,
+    worst_rows: list[dict[str, Any]],
+    inspected_config: tuple[str, int] | None,
+    key_metric: str,
+    value_metric: str,
+) -> None:
+    config = analysis.get("config", {})
+    baseline = analysis.get("baseline", {})
+    print("== Semantic S0 sweep summary ==")
+    print(f"file: {path}")
+    print(f"kind/version: {analysis.get('kind')}/{analysis.get('version')}")
+    print(
+        "scope: "
+        f"layers={_format_layers(None if analysis['scope']['layers'] is None else set(analysis['scope']['layers']))} "
+        f"groups={_format_layers(None if analysis['scope']['groups'] is None else set(analysis['scope']['groups']))} "
+        f"source={analysis.get('config_source')}"
+    )
+    print(
+        "sweep: "
+        f"g_max={config.get('g_max')} l_block={config.get('l_block')} "
+        f"lambda_rel={config.get('lambda_rel')} b_prime={config.get('b_prime')}"
+    )
+    if baseline.get("field"):
+        print(f"baseline: {baseline.get('field')} ({baseline.get('row_count')} rows)")
+    else:
+        print("baseline: none")
+    for warning in analysis.get("warnings", []):
+        print(f"warning: {warning}")
+
+    print(f"\n== Top configs by {key_metric} ==")
+    print(
+        _table(
+            _ranked(analysis.get("config_rankings", [])),
+            [
+                ("#", "rank", _fmt_int),
+                ("cfg", _fmt_config, str),
+                ("key_rel", key_metric, _fmt_num),
+                ("value_rel", value_metric, _fmt_num),
+                ("entries", "entry_count_mean", _fmt_num),
+                ("pad", "pad_entry_count_mean", _fmt_num),
+                ("clusters", "cluster_count_mean", _fmt_num),
+                ("segments", "segment_count_mean", _fmt_num),
+                ("span_p99", SPAN_P99_METRIC, _fmt_num),
+                ("span_max", "entry_span_global_max", _fmt_num),
+            ],
+            limit=top,
+        )
+    )
+
+    comparison = analysis.get("baseline_comparison", [])
+    if comparison:
+        print("\n== Ratios vs baseline, lower is better ==")
+        print(
+            _table(
+                _ranked(comparison),
+                [
+                    ("#", "rank", _fmt_int),
+                    ("cfg", _fmt_config, str),
+                    ("score", "score", _fmt_ratio),
+                    ("key_med", "key_ratio_median", _fmt_ratio),
+                    ("key_p90", "key_ratio_p90", _fmt_ratio),
+                    ("key_win", lambda row: _fmt_win(row, "key"), str),
+                    ("val_med", "value_ratio_median", _fmt_ratio),
+                    ("val_win", lambda row: _fmt_win(row, "value"), str),
+                    ("span_p99", "span_p99_ratio_median", _fmt_ratio),
+                    ("entries", "entry_count_ratio_median", _fmt_ratio),
+                    ("n", "layer_group_count", _fmt_int),
+                ],
+                limit=top,
+            )
+        )
+
+        print("\n== Best config per l_block ==")
+        print(
+            _table(
+                _ranked(analysis.get("best_by_l_block", [])),
+                [
+                    ("#", "rank", _fmt_int),
+                    ("cfg", _fmt_config, str),
+                    ("score", "score", _fmt_ratio),
+                    ("key_med", "key_ratio_median", _fmt_ratio),
+                    ("val_med", "value_ratio_median", _fmt_ratio),
+                    ("span_p99", "span_p99_ratio_median", _fmt_ratio),
+                    ("entries", "entry_count_ratio_median", _fmt_ratio),
+                ],
+            )
+        )
+
+    if by_layer and analysis.get("best_by_layer"):
+        print("\n== Best config per layer ==")
+        print(
+            _table(
+                analysis["best_by_layer"],
+                [
+                    ("layer", "layer", _fmt_int),
+                    ("cfg", _fmt_config, str),
+                    ("score", "score", _fmt_ratio),
+                    ("key_med", "key_ratio_median", _fmt_ratio),
+                    ("key_win", lambda row: _fmt_win(row, "key"), str),
+                    ("val_med", "value_ratio_median", _fmt_ratio),
+                    ("groups", "group_count", _fmt_int),
+                ],
+            )
+        )
+
+    if worst_rows and inspected_config is not None:
+        print(f"\n== Worst layer/groups for {inspected_config[0]}:{inspected_config[1]} by key ratio ==")
+        print(
+            _table(
+                worst_rows,
+                [
+                    ("layer", "layer", _fmt_int),
+                    ("group", "group", _fmt_int),
+                    ("key_ratio", "key_ratio", _fmt_ratio),
+                    ("value_ratio", "value_ratio", _fmt_ratio),
+                    ("span_p99", "span_p99_ratio", _fmt_ratio),
+                    ("entries", "entry_count_ratio", _fmt_ratio),
+                    ("key_rel", "key_rel", _fmt_num),
+                    ("value_rel", "value_rel", _fmt_num),
+                ],
+            )
+        )
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "g_max",
+        "l_block",
+        "score",
+        "key_ratio_median",
+        "key_ratio_mean",
+        "key_ratio_p90",
+        "key_ratio_max",
+        "key_wins",
+        "key_valid",
+        "value_ratio_median",
+        "value_ratio_mean",
+        "value_ratio_p90",
+        "value_ratio_max",
+        "value_wins",
+        "value_valid",
+        "span_p99_ratio_median",
+        "span_p99_ratio_p90",
+        "entry_count_ratio_median",
+        "entry_count_ratio_p90",
+        "layer_group_count",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name) for name in fieldnames})
+
+
+def _write_summary_json(path: Path, analysis: dict[str, Any], *, top: int) -> None:
+    compact = dict(analysis)
+    compact["config_rankings"] = compact.get("config_rankings", [])[:top]
+    compact["baseline_comparison"] = compact.get("baseline_comparison", [])[:top]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(compact, f, indent=2, ensure_ascii=False)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("sweep_json", help="Path or glob for semantic_s0_sweep.py output JSON; .gz is supported")
+    parser.add_argument("--top", type=int, default=12, help="Rows to print in each ranked table")
+    parser.add_argument("--layers", help="Optional layer filter, e.g. '23-26' or '0,7,14'")
+    parser.add_argument("--groups", help="Optional KV-group filter, e.g. '0-3'")
+    parser.add_argument(
+        "--baseline",
+        choices=("auto", "none", "vanilla", "vanilla_full", "single_cluster", "position"),
+        default="auto",
+        help="Baseline for ratios. auto prefers the real vanilla compressed-prefix baseline.",
+    )
+    parser.add_argument(
+        "--keep_duplicate_l0",
+        action="store_true",
+        help="Do not collapse l_block=0 rows whose effective g_max is always inf.",
+    )
+    parser.add_argument("--key_metric", default=PRIMARY_KEY_METRIC)
+    parser.add_argument("--value_metric", default=PRIMARY_VALUE_METRIC)
+    parser.add_argument("--by_layer", action="store_true", help="Also print the best config per layer")
+    parser.add_argument(
+        "--inspect_config",
+        help="Config to drill into for worst layer/groups, formatted as 'g_max:l_block'. Defaults to best ratio row.",
+    )
+    parser.add_argument("--worst", type=int, default=8, help="Worst layer/groups to print for --inspect_config")
+    parser.add_argument("--csv", type=Path, help="Write the compact baseline-ratio table to CSV")
+    parser.add_argument("--summary_json", type=Path, help="Write a compact top-N JSON summary")
+    args = parser.parse_args()
+
+    layers = _parse_int_spec(args.layers)
+    groups = _parse_int_spec(args.groups)
+    path, payload = _load_json(args.sweep_json)
+    analysis = build_analysis(
+        payload,
+        layers=layers,
+        groups=groups,
+        baseline=args.baseline,
+        collapse_l0=not args.keep_duplicate_l0,
+        key_metric=args.key_metric,
+        value_metric=args.value_metric,
+    )
+
+    comparison = analysis.get("baseline_comparison", [])
+    baseline_field = analysis.get("baseline", {}).get("field")
+    inspected_config: tuple[str, int] | None = None
+    worst_rows: list[dict[str, Any]] = []
+    if baseline_field and args.worst > 0:
+        if args.inspect_config:
+            inspected_config = _parse_config_selector(args.inspect_config)
+            if not args.keep_duplicate_l0 and inspected_config[1] == 0:
+                inspected_config = ("inf", 0)
+        elif comparison:
+            best = comparison[0]
+            inspected_config = str(best["g_max"]), int(best["l_block"])
+        if inspected_config is not None:
+            worst_rows = _worst_layer_groups(
+                payload.get("by_layer_group", []),
+                payload.get(baseline_field, []),
+                config=inspected_config,
+                layers=layers,
+                groups=groups,
+                collapse_l0=not args.keep_duplicate_l0,
+                key_metric=args.key_metric,
+                value_metric=args.value_metric,
+                limit=args.worst,
+            )
+
+    _print_report(
+        path,
+        analysis,
+        top=max(args.top, 1),
+        by_layer=args.by_layer,
+        worst_rows=worst_rows,
+        inspected_config=inspected_config,
+        key_metric=args.key_metric,
+        value_metric=args.value_metric,
+    )
+
+    if args.csv:
+        if not comparison:
+            raise SystemExit("--csv needs a baseline comparison; pass --baseline other than 'none'")
+        _write_csv(args.csv, comparison)
+        print(f"\nwrote CSV: {args.csv}")
+    if args.summary_json:
+        _write_summary_json(args.summary_json, analysis, top=max(args.top, 1))
+        print(f"wrote compact JSON: {args.summary_json}")
+
+
+if __name__ == "__main__":
+    main()
