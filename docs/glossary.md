@@ -129,8 +129,10 @@ cache（每 layer 一个）
 | `importance_pooling` | 已验证为负结果的邻近方案（niah 0.0827→0.0787）。**建议保持关闭**；语义簇开关打开时与 `pin` 一起被构造时硬性禁止组合（§5.1），共存数学尚未推导 |
 
 **新增的 buffer**（§5.13）：`centroid`、`n_eff`、`n_total`、`p_hi_c`、
-`current_segment`、`alive`、`level_count`、`pad_mask`、`op_log`、
-`op_log_len`、`s_h`。
+`current_segment`、`level0_phase`、`alive`、`level_count`、`pad_mask`、
+`op_log`、`op_log_len`、`s_h`。`level0_phase` 是 `PAD_INSERT` 对齐唯一依据
+的独立相位计数器，不能用 `level_count[cluster,0] mod 2^ℓ_block` 代替
+（§5.11 的更正框：`carry_into_level` 精确定义后两者不再等价）。
 
 ## T8. 外部概念
 

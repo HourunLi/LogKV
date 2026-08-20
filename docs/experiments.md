@@ -785,7 +785,16 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > # pre-RoPE 的 k_raw，用标准 apply_rope 在各自绝对位置上现算，和
        > # materialize_anchor_keys 给单点 entry 物化 key 是同一个原语。同样按
        > # dim 1（T 轴）取尾部子集，不是 dim 0：
-       > k_tail_roped = apply_rope(k_raw[:, cutoff:T, :], cos_cache[cutoff:T], sin_cache[cutoff:T])
+       > # 更正（这一轮修的，P3）：apply_rope 要求 cos/sin 恰好是三维
+       > # （见 litgpt/model.py:2081 的显式 `if cos.dim() != 3: raise
+       > # ValueError`），但 cos_cache[cutoff:T]/sin_cache[cutoff:T] 是从
+       > # 按位置索引的 cache 里切出来的，形状是 (tail, hs)，只有 2 维，
+       > # 直接传会立即报错，不是静默算错。k_raw[:, cutoff:T, :] 本身已经
+       > # 是 (G, tail, hs) 3 维（dim 0=G 权当 apply_rope 签名里的"B"，
+       > # 与本节其它地方把 k_raw/v 当 (G,T,hs) 处理一致），补一个前导
+       > # 维度让 cos/sin 变成 (1, tail, hs) 即可，dims_diff=0，直接靠
+       > # 前导维 1 对 G 做标准 broadcasting，不需要额外 reshape：
+       > k_tail_roped = apply_rope(k_raw[:, cutoff:T, :], cos_cache[None, cutoff:T, :], sin_cache[None, cutoff:T, :])
        > v_tail = v[:, cutoff:T, :]
        >
        > # log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale, mask=None,
