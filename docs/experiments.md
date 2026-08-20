@@ -43,6 +43,18 @@ needle 的 token span（复用另一分支已有的 `log_kv_pin_diag.py` 定位�
 
 Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生产代码之前**（§5.21-5）。
 
+> **这句话的范围（这一轮补的）：覆盖 S0.0–S0.7 和 S0.8 的第 1/2/3a 项，不覆盖
+> S0.8 的 3b 项。** 3b 需要 §5.4/§5.18 第 2 步的 CPU 参考路由实现，以及
+> `log_kv_slot_attention()`/`get_attention_state()` 按 §5.14/§5.20-B 扩展出的
+> `CacheAttentionState`/`slot_valid`/`M_s`——这两块在 `algorithm-spec.md` §5.18
+> 的编号里排在 dump 脚本（第 0 步）之后，字面上和"第一段代码"冲突。这不是需要
+> 靠改期望解决的问题：真正被"先看 Stage 0 结果再决定要不要投入"这道门挡住的是
+> 多簇路由的向量化实现、段对齐填充、`op_log` 训练路径重放（§5.18 第 3–6 步）；
+> CPU 参考路由本来就是"慢但正确"的测试脚手架、不是要部署的代码，
+> `log_kv_slot_attention`/`get_attention_state()` 的扩展是受字节等价 CI 闸门
+> 保护的纯加法式改动——两者都是让 3b 这个决策门本身可信所必需的最小基础设施，
+> 应当在 3b 之前先落地，完整论证见 `algorithm-spec.md` §5.21-5 的更正框。
+
 **两套机制，不是一个 hook——`attn_mass_by_dist` 在原来那个 hook 点算不出来。**
 原设计把它写成"在 hook 里就地累加"，但真实注意力质量需要**已经做完 RoPE 的 q、k
 和真实的 attention score**，而 `norm_q`/`norm_k` 之后、`apply_rope` 之前这个点还
@@ -71,7 +83,7 @@ Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生�
    `q_roped`/`k_roped` 的唯一原因，不是通用结论；换一个 partial-rotary 模型，
    dump 脚本必须同时落盘尾部通道并在这一步拼接。
 2. **GQA 展开**：`model.py:857-860` 在算分数前把 `k`（`(B, n_query_groups, T, hs)`，
-   这里 `n_query_groups=G=8`）按 `q_per_kv = n_head/n_query_groups = 2` 
+   这里 `n_query_groups=G=8`）按 `q_per_kv = n_head/n_query_groups = 2`
    `repeat_interleave` 到 `(B, nh_q, T, hs)`（`nh_q=16`），即每个 KV group 被
    **2 个相邻 query head 共享**。dump 出来的 `k_roped` 是 `(G, T, hs)`，必须先做
    同样的 `repeat_interleave(q_per_kv, dim=0)` 展开到 `(nh, T, hs)` 再和
@@ -904,4 +916,3 @@ Ward 会把 needle 漏斗进同一个簇，分数下降到底是聚类不行还�
 指标沿用现有四项（ACC/LongBench/LongBench_e/niah@32768），**另加 multi-needle**——
 单 needle 一旦从 0.08 提上去就会迅速失去区分度。v3 的锚点表示对 multi-needle 应有
 额外优势（多个 needle 各自成簇、各自保留精确位置）。
-

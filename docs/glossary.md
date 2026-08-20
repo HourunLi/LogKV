@@ -156,7 +156,7 @@ cache（每 layer 一个）
 
 | 记号 | 含义 |
 |---|---|
-| **Stage 0** | 离线证伪：一次 GPU dump + 全部 CPU 分析。**在写任何生产代码之前** |
+| **Stage 0** | 离线证伪：一次 GPU dump + 全部 CPU 分析。**在写任何生产代码之前**（S0.8 3b 例外，它需要 CPU 参考路由与 `log_kv_slot_attention`/`get_attention_state()` 的接口扩展先落地，见 `algorithm-spec.md` §5.21-5） |
 | **Stage 1 / 2 / 3** | 实现 / eval-time 探测 / CPT |
 | **S0.0** | 扫 `(g_max, ℓ_block)`——**最高优先级**，回答"收益来自语义分组还是分段边界" |
 | S0.1–S0.8 | 单测 / `K_eff` 曲线 / needle 隔离率 / 簇内 key+value 方差 / 跨度分布 / 锚点膨胀 `E[M]` / supersession 比例 / 批量化近似的分歧率 |
