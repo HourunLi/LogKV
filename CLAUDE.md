@@ -469,6 +469,101 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第二十三轮核实：给 `scan_op_log_for_ward_events` 补上
+  "K 未满分支的 NEW_CLUSTER 必须落在从未 alive 过的槽上"这最后一类校验，
+  明确姊妹函数 `scan_op_log`（S0.8 主指标用的解析器）必须先过它做前置
+  校验；推翻自相矛盾的"`S_pooled=0` 时是空张量"说法，钉死 `S_pooled`
+  恒为固定矩形宽度；补全签名里漏掉的 `lam`，3b 调用里显式传
+  `log_kv_lambda`；把 3b 的 CPU dtype 策略从"信任 fp16/bf16 CPU 支持"
+  改成显式 `.float()`；给二阶 Σ/Γ 路径补上"Stage 1 默认关闭"的显式决定；
+  列出 `CacheAttentionState` 的完整调用点迁移清单；调整 Stage 0 标题
+  措辞；顺带修掉起草过程中自己引入的两处 markdown 加粗嵌套渲染 bug。**
+  动机：用户对第二十二轮的修复再做一轮复核，指出接口级硬约束仍有缺口、
+  两处文字自相矛盾、以及一处此前完全没考虑过的 CPU 数值后端风险。逐条
+  结论：
+  ① **P1：`scan_op_log_for_ward_events` 的 `NEW_CLUSTER` 分支只在"紧邻
+  pending 的 WARD_MERGE"这条路径上校验过（上一轮的③），"没有 pending
+  时凭空冒出一个 NEW_CLUSTER"（K 未满/冷启动分支）完全没有校验。** 按
+  §5.6 的 K 未满/K 已满两分支表，没有 pending 的 NEW_CLUSTER 写入的槽
+  必须是"从未 alive 过"（`epoch` 恒为 -1），否则说明 K 未满分支的空位
+  判定选中了一个其实已经在用的槽，两个逻辑簇会静默共享同一个物理槽。
+  **修法**：`pending is None` 分支下追加
+  `assert epoch.get(op.cluster,-1) == -1`，列为"更正"框第⑤条。
+  ② **P1：S0.8 cluster assignment divergence（主指标）用的是
+  `scan_op_log`/`resolve_final_slots`，不是加固过的
+  `scan_op_log_for_ward_events`——非法 `op_log`（`NEW_CLUSTER` 写入非
+  空槽、`JOIN`/`NEW_SEGMENT` 指向非 alive/root、`WARD_MERGE` self/stale/
+  non-root）会被 `scan_op_log` 静默解析成"看起来合法"的最终槽号，
+  co-assignment/ARI/precision/recall 在错误输入上算出干净但没有意义的
+  数字。** `scan_op_log` 本身刻意保持"足够简单、容易独立确信正确"
+  （不新增校验），**决定**：`experiments.md` S0.8 第①项显式要求先对同一段
+  `op_log` 跑一遍 `scan_op_log_for_ward_events`（哪怕丢弃它的
+  `WardEvent`/sketch 输出，只借用它现在已有的五类合法性断言）作为前置
+  校验，通过后才调用 `scan_op_log`/`resolve_final_slots`；这一步和 S0.8
+  第①项本来就要算的"Ward 事件"分歧可以共享同一次调用，不需要多跑一遍。
+  ③ **P0：`S_pooled=0` 时是空张量的说法和 §5.13"读出不需要 gather"一节
+  的固定矩形预分配设计直接矛盾。** §5.13 明确 entry 躺在固定位置，
+  `get_attention_state()` 只需 `reshape` 成 `(B,G,K_max·L_alloc·B′,·)`
+  ——`S_pooled` 是只由 `K_max/L_alloc/B′` 决定的编译期常量，不随"是否
+  已经 flush 过"变化；序列刚开始时 `S_pooled` 依然是满值，只是每个槽都
+  `w=0`、`slot_valid` 在整个宽度上恒为 `False`，不是张量收缩到宽度 0。
+  **顺带补一条必须写进单测的推论**：pooled 区域整体无效时那一段分数
+  整体是 `-inf`，但因为 exact 后缀不受 `slot_valid` 约束、query 至少能
+  看到自己的 in-flight chunk，每行分数向量恒有至少一个有限值，softmax
+  不会因此产出 NaN——这条不变量此前从未显式验证过。
+  ④ **P1：新签名漏了 `lam`，3b 的调用也没有显式传它。** 真实签名是
+  `q, slot_k, slot_v, slot_w, scale, mask=None, lam=1.0, causal_tail=0,
+  ...`，`lam` 是现有参数、排在 `mask`/`causal_tail` 之间，上一轮的签名
+  片段只列了"不变"的 `mask`/`causal_tail`，中间漏了 `lam`，容易读成
+  "被移除了"。§7 消融表把 `λ∈{0,1}` 列为独立扫描轴，`λ=0` 时 mass bias
+  整项不加（`if lam != 0.0:` 门控），若 3b 悄悄用默认值 `1.0`，扫 `λ=0`
+  时 3b 比较的就不是这次实验实际配置的读出行为。**修法**：签名补全
+  `lam=1.0`；3b 的两次 `log_kv_slot_attention` 调用显式传
+  `lam=log_kv_lambda`（本次实验实际配置的值）。
+  ⑤ **P2：3b 的 CPU dtype 策略"信任 fp16/bf16 在 CPU 上能跑"是乐观假设，
+  不是安全默认值。** fp16 在 CPU 后端的 matmul/softmax 支持历来不完整
+  （常见"not implemented for 'Half'"报错，或退化成极慢路径），bf16 支持
+  更好但也不是全版本全算子覆盖。**修法**：`q_tail`/`state_batch.slot_k`/
+  `slot_v`/`slot_w`（以及 serial 侧对应张量）在传入 `log_kv_slot_
+  attention` 前统一 `.float()`——fp32 在 CPU 上全算子通用支持，且和
+  `relative_l2` 自己已经对输出做 `.float()` 是同一个精神，不会让比较
+  失真。
+  ⑥ **P1：3b 只覆盖 rank-1 Σ/Γ 的旋转数学，从未验证批量近似路由下 Σ/Γ
+  聚合状态本身（`compact()`/`_binary_carry()` 的 Chan-merge 累积值）是否
+  也和严格串行参考一致，但 §7 消融表已经把"现有构造"列为可以在 Stage 2
+  跑的一档。** 3b 证明的"路由分歧 <5%"不能自动推出"Σ/Γ 聚合分歧也
+  <5%"，这是未经验证的推论。**决定**：Stage 1 语义簇初次实现默认锁定
+  `second_order_scale=0`（对应消融表"关"这一档），和 v1 不碰训练目标是
+  同一类范围决定；要跑"现有构造"/"delta-rule 构造"两档，必须先有一个
+  类似 3b、针对 `with_stats=True` 路径的独立验证（可以叫 3c，这一轮不
+  展开设计——3b 已经足够复杂，Σ/Γ 尚未启用时提前定死 3c 的细节容易锁死一个
+  不合适的设计），消融表"rank-1 Σ/Γ"一行同步标注这条限制。
+  ⑦ **P2：`CacheAttentionState` 落地需要机械改动的调用点，上一轮只在
+  概念层面提过，没有列出具体位置，§5.20-B 的改动对照表里那一行还是"多
+  返回一个有效位掩码与每 entry 的 `M_s`"这个旧措辞。** 核对代码库确认
+  完整调用点：`get_attention_state()`/`append_exact_tokens()` 自身定义
+  （`log_kv_cache.py:1246/1435`）、`log_kv_chunk_attention()`
+  （`:1738/1754`）、`model.py` 三处独立流式调用（`:1209/1219`、
+  `1284/1338`、`1397/1409`）、`log_kv_diag.py:624`、以及
+  `tests/test_log_kv_cache.py`/`test_log_kv_diag.py`（分别约 22、3 处
+  直接调用，`grep -c` 实测）。改动对照表行更新为指向 `CacheAttentionState`
+  本身，并新增一张完整清单。
+  ⑧ **P2：Stage 0 标题仍是"1 次 GPU dump + 全部 CPU 分析"，虽然下方已经
+  补了 3b 例外的说明，但快速读者可能只扫标题。** 标题改为"1 次 GPU
+  dump + 主体 CPU 分析，S0.8 3b 例外——须在 dump 进程内完成"。
+  **自查发现并修正了本轮起草过程中自己引入的两处 markdown 渲染 bug**：
+  `**A**B**C**` 这种写法里 `**` 是交替 toggle、不是嵌套加粗（CLAUDE.md
+  变更记录第十八轮已经踩过一次同一个坑），这一轮在"`S_pooled` 恒为
+  固定宽度"和"3b 只保证 Σ/Γ 旋转数学正确"两段里各自不小心又写出了这个
+  模式（比如 `在**整个** S_pooled` 会让"整个"两个字本身不加粗、反而让
+  它前后的大段文字被错误加粗），写完之后逐段计数 `**` 出现次数、人工
+  核对配对关系时发现，已经改成单层加粗或去掉多余的内层强调。
+  用户重申代码仍处于纯规格阶段——独立重新扫了
+  `litgpt/`、`tests/` 里的 `SemanticLogKV`/`log_kv_semantic_clusters`/
+  `CacheAttentionState`/`scan_op_log_for_ward_events`/`dedup_anchors`/
+  `WARD_EVENT_SKETCH_K` 等关键词，确认零匹配，与 CLAUDE.md §0 已有声明
+  一致，不需要改动，仅在此确认。
+
 - **2026-08-19｜第二十二轮核实：给 Ward scanner 补上"原始操作数在 `find()`
   之前必须已经是当前根"这一硬约束，把 `slot_valid`/`M_s` 从"调用方按需
   传"改成"语义模式下由 cache 自动无条件产出"，把 `get_attention_state()`

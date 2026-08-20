@@ -20,7 +20,7 @@
 
 > **贯穿性硬要求（§2.5）**：Stage 0 的所有统计**必须逐层 × 逐头分开报告**。
 
-### Stage 0 — 离线可证伪（1 次 GPU dump + 全部 CPU 分析）
+### Stage 0 — 离线可证伪（1 次 GPU dump + 主体 CPU 分析，S0.8 3b 例外——须在 dump 进程内完成）
 
 只需要一次前向：对几条 32k 的 NIAH prompt dump 每层每头的 **pre-RoPE k / v** 与
 needle 的 token span（复用另一分支已有的 `log_kv_pin_diag.py` 定位逻辑）。
@@ -203,7 +203,29 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
 - **S0.8**：分歧率不是一个单一标量，必须拆成三项分别报告，理由是它们诊断的是
   不同层级的问题、且互相之间不是线性关系（cluster 分歧可能被 segment/pad 开销
   放大或抵消，两者都不直接等于最终读出误差）：
-  1. **cluster assignment divergence（含 Ward 事件）**：用
+  1. **cluster assignment divergence（含 Ward 事件）**：
+
+     > **前置校验（这一轮补的），必须先做**：`scan_op_log` 自己不做任何
+     > 合法性检查（`algorithm-spec.md` §5.4"不改 `scan_op_log` 本身"一节
+     > 明确这是刻意的设计，换取"足够简单、容易独立确信正确"），`NEW_
+     > CLUSTER` 是否写进真正的空槽、`JOIN`/`NEW_SEGMENT` 是否指向 alive/
+     > root 身份、`WARD_MERGE` 是否 self-merge 或引用 stale/non-root 操作
+     > 数，这些全部不检查——一份非法的 `op_log` 会被解析成一组"看起来合法"
+     > 的最终槽号，co-assignment/ARI/precision/recall 会在错误的输入上
+     > 算出干净但没有意义的数字，且没有任何报错信号提示这一点。**在对
+     > `cache_batch`/`cache_serial` 各自的 `op_log` 调用
+     > `scan_op_log`/`resolve_final_slots` 之前，必须先对同一段 `op_log`
+     > 各跑一遍 `scan_op_log_for_ward_events`（`algorithm-spec.md` §5.4，
+     > 现在已经补齐了五类合法性断言：紧邻关系、缺失身份、self-merge、
+     > stale/non-root 操作数、K 未满分支选中已占用槽），只要它跑完不
+     > 抛异常就说明这段 `op_log` 满足全部已知的合法性约束**——它的
+     > `WardEvent`/sketch/size 输出在这一步不需要用（第②小项"Ward 事件"
+     > 已经在别处独立消费它们），只是借用它的断言做一次前置校验，通过后
+     > 再放心调用 `scan_op_log`/`resolve_final_slots`。这个前置校验和下面
+     > "Ward 事件"那一小项的计算**可以共享同一次 `scan_op_log_for_ward_
+     > events` 调用**，不需要为了校验单独再跑一遍。
+
+     用
      `algorithm-spec.md` §5.4 已经给出的 `scan_op_log`/`resolve_final_slots`
      分别解析批量路径和严格串行参考路径的 `op_log`，得到每个 token 最终的
      **物理槽号**（`resolve_final_slots` 返回 `dict[int, int]`，只保留
@@ -622,7 +644,7 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        >     # (1, nh, tail_query_count, hs)——log_kv_slot_attention 的 q
        >     # 要求显式 (B, nh, T_q, k_dim)。3b 的两次 log_kv_slot_attention
        >     # 调用在循环外面、只做一次，不逐块调用。
-       > q_tail = q_tail.cpu()
+       > q_tail = q_tail.cpu().float()
        >     # q_tail 来自本轮 GPU 前向的 q_roped，是 CUDA 张量；cache_batch/
        >     # cache_serial 是 algorithm-spec.md §5.4/§5.18 的纯 CPU 参考实现
        >     # 构造出来的，get_attention_state() 返回的是 CPU 张量。两者不搬到
@@ -633,35 +655,52 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        >     # 这么大，搬一次的代价可以忽略；反过来搬 cache 状态需要额外维护
        >     # 一条"参考实现也能在 GPU 上跑"的路径，而参考实现的全部存在意义
        >     # 就是"足够简单、容易独立确信正确"，不值得为这里的比较步骤破例。
-       >     # dtype 不受这次 .cpu() 影响（不改变 dtype，仍是 q_roped 的原始
-       >     # activation dtype，如 fp16/bf16）；只要 cache_batch/cache_serial
-       >     # 的 k̄_raw/v̄ 按 §5.13 buffer 表的既有约定同样存 activation dtype
-       >     # （不是参考实现为了自己数值稳定改用 fp64 之类），两侧就天然一致，
-       >     # 不需要在这里额外做一次类型转换。
+       >     #
+       >     # 更正（这一轮修的）：上一版说 dtype 不受 .cpu() 影响、留在 q_roped
+       >     # 原始的 fp16/bf16——这在 CPU 上是乐观假设，不是安全默认值。fp16 在
+       >     # CPU 后端的 matmul/softmax 支持历来不完整（不同 PyTorch 版本下常见
+       >     # "not implemented for 'Half'" 这类报错，或者能跑但退化成极慢的逐
+       >     # 元素路径），bf16 支持更好但也不是所有算子、所有版本都覆盖，3b 不
+       >     # 应该依赖"这台机器的 PyTorch/CPU 后端恰好支持"这个未经检查的前提。
+       >     # 改为显式 .float()（fp32）——fp32 在 CPU 上是全算子通用支持，不
+       >     # 存在这一类阻塞风险。这不会让比较失真：3b 测的是"批量近似路由 vs
+       >     # 严格串行参考"的分歧，跟这一步用什么精度算无关，用比生产更高的
+       >     # 精度做这次比较只会让读出的数值噪声更小，不会掩盖真实分歧，
+       >     # 和 relative_l2 自己已经对 out_batch/out_serial 做 .float() 是
+       >     # 同一个精神。cache_batch/cache_serial 的 k̄_raw/v̄/w 同样要转
+       >     # fp32 才能和 fp32 的 q_tail 相乘，不能指望参考实现"恰好"存的就是
+       >     # 这个 dtype。
        > assert cache_batch.recent_count  >= tail_query_count   # 前提，两条
        > assert cache_serial.recent_count >= tail_query_count   # 路径各查一次
        >
        > # log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale, mask=None,
-       > # causal_tail=0, slot_valid=None, M_s=None, ...)——scale 是位置参数、
-       > # 排在 slot_w 之后，slot_valid/M_s 是具名关键字参数。get_attention_
-       > # state() 返回类型是 algorithm-spec.md §5.14"slot_valid/M_s 在语义
-       > # 模式下不是可选项"一节新增的 CacheAttentionState（具名结构，不是裸
-       > # 位置元组），按字段名取值，不再有"第几个位置对应哪个参数"这个问题；
-       > # with_stats 显式传 False——3b 只验证批量近似路由/compaction 与严格
-       > # 串行参考的一阶读出是否一致，不覆盖 Σ/Γ 二阶修正（后者已经由
-       > # algorithm-spec.md 同一节"Σ/Γ 锚点物化"的独立单测覆盖，理由见那节）：
+       > # lam=1.0, causal_tail=0, slot_valid=None, M_s=None, ...)——scale 是
+       > # 位置参数、排在 slot_w 之后，slot_valid/M_s 是具名关键字参数。
+       > # get_attention_state() 返回类型是 algorithm-spec.md §5.14"slot_
+       > # valid/M_s 在语义模式下不是可选项"一节新增的 CacheAttentionState
+       > # （具名结构，不是裸位置元组），按字段名取值，不再有"第几个位置对应
+       > # 哪个参数"这个问题；with_stats 显式传 False——3b 只验证批量近似
+       > # 路由/compaction 与严格串行参考的一阶读出是否一致，不覆盖 Σ/Γ 二阶
+       > # 修正（后者已经由 algorithm-spec.md 同一节"Σ/Γ 锚点物化"的独立单测
+       > # 覆盖，理由见那节）；lam 显式传 log_kv_lambda（本次实验实际配置的
+       > # mass bias 系数，不能让它默认落到 1.0）——§7 消融表把 λ∈{0,1} 列为
+       > # 一个独立扫描轴，λ=0 时 mass bias 整项不加（log_kv_cache.py:1625
+       > # 的 `if lam != 0.0:` 门控），若 3b 悄悄固定用默认值 1.0，扫 λ=0 时
+       > # 3b 比较的就不是这次实验实际配置的读出行为：
        > state_batch = cache_batch.get_attention_state(with_stats=False)
        > out_batch = log_kv_slot_attention(
-       >     q_tail, state_batch.slot_k, state_batch.slot_v, state_batch.slot_w,
-       >     scale,                                       # scale 复用机制 B
-       >     causal_tail=tail_query_count,                  # 循环里已经在用
-       >     slot_valid=state_batch.slot_valid,             # 的同一个 scale，
-       >     M_s=state_batch.M_s,                            # 不是新的量
+       >     q_tail, state_batch.slot_k.float(), state_batch.slot_v.float(),
+       >     state_batch.slot_w.float(), scale,        # scale 复用机制 B 循环
+       >     lam=log_kv_lambda,                          # 里已经在用的同一个
+       >     causal_tail=tail_query_count,                # scale；lam 是本次
+       >     slot_valid=state_batch.slot_valid,           # 实验实际配置的值，
+       >     M_s=state_batch.M_s,                          # 不留给默认值 1.0
        > )
        > state_serial = cache_serial.get_attention_state(with_stats=False)
        > out_serial = log_kv_slot_attention(
-       >     q_tail, state_serial.slot_k, state_serial.slot_v, state_serial.slot_w,
-       >     scale,
+       >     q_tail, state_serial.slot_k.float(), state_serial.slot_v.float(),
+       >     state_serial.slot_w.float(), scale,
+       >     lam=log_kv_lambda,
        >     causal_tail=tail_query_count,
        >     slot_valid=state_serial.slot_valid,
        >     M_s=state_serial.M_s,
@@ -855,7 +894,7 @@ Stage 2 有信号后再投入。v3 没有需要 warmup 的新标量（v2 的 `κ
 | `λ_rel` | 0.5 – 2.0 | needle 隔离与簇纯度的平衡点 |
 | `λ`（mass bias）| 0 / 1 | 大簇的计数质量补偿是否仍然正确 |
 | `γ`（遗忘因子）| 0 / 0.5 / 1 | centroid 门控更新值不值 |
-| rank-1 Σ/Γ | 关 / 现有构造 / delta-rule 构造 | 第三档取决于 S0.7 |
+| rank-1 Σ/Γ | 关 / 现有构造 / delta-rule 构造 | 第三档取决于 S0.7；**"现有构造"/"delta-rule 构造"两档在 Stage 2 还不能跑**——`algorithm-spec.md` §5.14"S0.8 3b 明确只走 with_stats=False"一节：3b 只验证过路由/compaction 的一阶分歧，从没验证过批量近似路由下 Σ/Γ 聚合状态本身是否也和严格串行参考一致，Stage 1 因此把 `second_order_scale` 默认锁在 0（即这一行的"关"），要跑另外两档必须先有类似 3b 的独立验证（那节称为 3c，未展开设计） |
 | vanilla memory-matched | B 调大到同 entry 数 | **排除"只是多用了内存"** |
 
 **multi-needle 行必须同时报告 `K_max` 的绑定频率**（§5.6）：needle 数逼近 `K_max` 时
