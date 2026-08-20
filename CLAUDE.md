@@ -286,10 +286,22 @@ sum_wp = A.sum_wp + B.sum_wp          # 整数加法：精确、可结合
 > 产生 `p_mid ≠ p_lo`，而那是罕见事件。
 >
 > **代价要诚实记一笔**：这个 bug 的副作用恰好压低了 `M`。修好之后 `p_mid` 通常
-> 严格落在 `(p_lo, p_hi)` 内，`M` 从 2 变成 3，**直接顶到 §4 那张表里"最坏
-> E[M]=3 ⇒ 4984 槽 ⇒ 超过 vanilla 的 3584"那一行**。所以 S0.6 从"验证性测量"
-> 升格为**真正的决策门**：若实测 `E[M]` 逼近 3，退路是砍掉第三锚点只留
-> `(p_lo, p_hi)`——反正按修复前的实现它本来就等于 `p_lo`，砍掉相对**现状**零损失。
+> 严格落在 `(p_lo, p_hi)` 内，`M` 从 2 变成 3，把 §4 表里"逻辑有效锚点"这一档的
+> 参考值从 ~2 推到 ~3。
+>
+> **更正：`S0.6` 的角色不是"预测 v1 会不会超过 vanilla"，那件事和 `E[M]` 实测值
+> 无关，是确定会发生的。** §4 已经更正过：v1（固定宽度、无 gather）读出时的
+> 物理槽池恒为 `entry × 3 = 4984`，不随 `E[M]` 变化——`E[M]` 逼近 3 还是停在
+> 1.5，v1 付出的 matmul 宽度和峰值内存都是同一个数字，`4984 > vanilla 3584`
+> 是**当前设计的确定结果**，不是"如果 E[M] 不好会发生"的风险。**S0.6 真正
+> 衡量的是"值不值得为 v1 之后的优化投入 gather/packed 实现"**：`E[M]` 越接近
+> 1.5，gather 能省下的空间越大（把 4984 降到接近 3004，重新回到 vanilla 之下）；
+> `E[M]` 越接近 3，说明大多数 entry 本来就需要三个不同的锚点（去重很少生效），
+> gather 的收益也就越小。**"砍掉第三锚点只留 `(p_lo, p_hi)`" 不是 S0.6 测出
+> "E[M] 逼近 3"之后才该考虑的退路，而是独立于 `E[M]` 的另一种设计选择**（把
+> 固定宽度从 3 降到 2，`1024+1320×2=3664`——仍然超过 vanilla 的 3584，只是差距
+> 更小），两者是解决同一问题的不同思路，不是"E[M] 差就退到 2 锚点、E[M] 好就
+> 保持 3 锚点"这种因果关系。
 
 ### 2.3 打分接入：复用现有 kernel + 一处必须做的 mass bias 修正
 
@@ -453,11 +465,25 @@ RoPE）这些改动是设计里不可选的（§2.1、§5.6 的 `K_max=1` 讨论
 | 口径 | vanilla | SemanticLogKV @32k | 用途 |
 |---|---:|---:|---|
 | **持久 cache 内存**（entry 数）| 3584 | **2344** = 1024 + 15×8×11 | memory-matched 公平性对比 |
-| 读出时槽池（entry × M，瞬时）| 3584 | ~3004（E[M]=1.5）| 计算量/峰值内存 |
-| 同上，最坏 E[M]=3 | 3584 | 4984 ✗ | **S0.6 的决策门** |
+| **读出时物理槽池**（entry × 3，固定宽度）| 3584 | **4984** | **计算量/峰值内存**——v1 的真实代价 |
+| 逻辑有效锚点（entry × E[M]，去重后）| — | ~3004（E[M]=1.5）/ 最坏 4984（E[M]=3）| 仅供参考，**不是** v1 的算力预算，见下方说明 |
 
-**锚点展开的 `M` 只影响读出时的瞬时槽池，不影响持久 cache 内存**——每 entry 存的是
-3 个整数，不是 3 份键值。
+**锚点展开的 `M` 只影响持久 cache 内存以外的账，但对"读出时物理槽池"这一行不生效
+——这一行是 v1 的真实计算量/峰值内存代价，恒为 entry 数的 3 倍，不随 E[M] 变化。**
+`dedup_anchors` 返回的是**固定形状** `(..., S, 3)`（§5.14），`S_pooled =
+K_max·L_alloc·B′·3` 是只由 `K_max/L_alloc/B′` 决定的编译期常量（`algorithm-spec.md`
+§5.14"`S_pooled` 因此是一个只由...决定的编译期常量"一节）——无效/重复的锚点靠
+`slot_valid` **掩码**而非收缩张量宽度来剔除，`mask_fill` 不会让 matmul/score
+张量本身变窄。所以 v1（无 gather，"读出不需要 gather"是 §5.13 的既有设计原则）
+无论 `E[M]` 实测是 1.5 还是逼近 3，**物理上付出的 matmul 宽度和峰值内存都恒为
+`1024 + 1320×3 = 4984`**，"~3004（E[M]=1.5）"从未是 v1 会真正付出的代价，只是
+"如果未来引入 gather/packed 实现、只物化真正去重后的锚点"这个假设性优化能省下
+多少的参考数字——`E[M]` 因此从"计算量决策门"降级为"值不值得投入 gather/packed
+实现（或改用更省锚点数的 `lo_hi`-only 表示，§8 消融）"这个**未来**优化决策的
+输入，S0.6 的角色相应从"预测 v1 峰值内存落在哪个区间"改为"衡量这项未来优化的
+潜在收益有多大"——v1 本身的内存/算力预算不受 `E[M]` 实测值影响，恒定 4984。
+每 entry 持久存的仍然是 3 个整数（`p_lo/p_mid/p_hi`），不是 3 份键值——这一点
+不受本次更正影响，持久 cache 内存那一行的账目不变。
 
 **第三笔账，此前漏记：训练期 `op_log` 重放元数据，约 448MiB×`B`/28 层@32k
 （`B` 是真实训练 batch size；下面"448MB"这个数字统一按本文档惯用的
@@ -594,6 +620,115 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-20｜第三十三轮：S0.8 3b 的 tail-cache 改用 cutoff + `append_exact_
+  tokens` 精确复现真实 streaming attention 状态；计算/峰值内存表拆开"逻辑
+  有效锚点"与"物理槽池宽度"两个口径，v1 超基线（4984>3584）从"S0.6 测出来
+  才知道"改为"确定发生"；新增 `saturating_top_carry` 顶层饱和累加原语的
+  完整可执行状态转移；semantic clusters 构造校验补上训练期 pin 注入参数；
+  `log_kv_slot_attention` 补上"query 行全部候选被掩码"的显式运行时检查；
+  activation checkpointing 首轮跳过 `op_log` 分配的说法降级为需要调用方
+  显式信号，不再暗示 v1 能靠 `is_grad_enabled()` 自动判断。**
+  动机：用户对照文档与实际代码逐条核实，给出四处 P1、两处 P2 级发现。
+  逐条结论：
+  ① **P1：S0.8 3b 的 tail-cache 时点此前用"完整 prompt 处理完之后的 final
+  cache"冒充"真实 streaming attention 该看到的 pre-tail 状态"，两者不
+  等价。** final cache 已经把 tail chunk commit 进 recent window、并顺带把
+  一批更早的 recent token 挤进了 pooled hierarchy——这批 token 在真实
+  streaming 下、tail chunk 到达那一刻本该仍是 recent 里的精确表示，final
+  cache 里却已经被压缩，表示粒度不同，即使内容本身不丢（上一轮已修的
+  "dense ground truth"问题是另一件事）。**修法**：`docs/experiments.md`
+  的 3b 定义改为显式 `cutoff = T − tail_query_count`，两条 CPU 参考实现
+  （`cache_batch`/`cache_serial`）只处理到 `cutoff` 为止；`k_raw[cutoff:T]`
+  单独 `apply_rope` 得到 `k_tail_roped`、连同 `v[cutoff:T]` 通过生产函数
+  `append_exact_tokens` 拼成 in-flight chunk，再调用
+  `log_kv_slot_attention(..., causal_tail=tail_query_count)`——这正是真实
+  streaming 每个 chunk 到达时实际执行的模式，不是另一套平行逻辑。原有的
+  `recent_count ≥ tail_query_count` 前置断言随之替换为更宽松、也更准确的
+  `T > tail_query_count`。
+  ② **P1：计算量/峰值内存表用 `E[M]=1.5` 算出的 ~3004，但 `dedup_anchors`
+  按 §5.13/§5.14 的既定设计固定返回 `(...,S,3)`，`S_pooled=K_max·L_alloc·
+  B′·3` 是编译期常量，v1 没有 gather，mask 掉无效锚点不会让 matmul/score
+  张量变窄。** `E[M]` 衡量的是"去重后逻辑上有多少锚点是真正不同的"，和
+  "v1 这次 forward 实际要付出的物理槽池宽度"是两个不同的量，前者此前被
+  错误地当成了后者的代理。**修法**：CLAUDE.md §4、`docs/experiments.md`
+  的 S0.6 表格行与决策门段落，统一拆成"持久 cache 内存"（不变，2344）、
+  "读出时物理槽池，固定宽度"（v1 的真实代价，4984，**确定**超过 vanilla
+  的 3584，不是 S0.6 测出来才知道）、"逻辑有效锚点"（仅供参考，衡量未来
+  gather/packed 实现的优化空间上限，不是 v1 的算力预算）三档。连带更新
+  `docs/risks-and-open-questions.md` §8 风险表"锚点展开撑爆读出槽池"一行
+  ——"对策"列从"S0.6 先测；缓解见 §4"改为"确定发生，无缓解；S0.6 只衡量
+  未来优化空间"，与上面两处保持一致。
+  ③ **P1：`L_alloc` 顶层"饱和累加器"只有一句原则性描述（"`w` 允许超过名义
+  `2^L`，继续吸收进位"），没有可执行的状态转移，且和现有代码的真实行为
+  （`log_kv_cache.py:944-950` 顶层溢出直接 `RuntimeError`）不一致。** 上一版
+  "不需要新机制，`compact` 本来就不要求两侧等宽"这句话没错，但回答的不是
+  真正缺的东西——缺的是**围绕** `compact()` **的控制流**："什么时候调用、
+  结果写回哪里、`level_count` 怎么更新、pad/锚点/ΣΓ 怎么处理、replay 要不要
+  跟着改"，这些此前完全没有定义，`§5.19-2` 也只是把它标记为"最集中的风险
+  点"而未给出定义。**修法**：先证明"抵达顶层的进位块宽度恒为 `B′`，永不
+  需要 zero-pad"这条支撑简化的不变量（由普通层间进位的"同层等宽"性质加
+  `compact` 输出宽度恒为输入宽度的性质归纳得到），再给出
+  `saturating_top_carry(cluster, incoming_block)` 的完整状态转移伪代码：
+  顶层从未占用时原样写入（不调用 `compact`）；已占用时（此时恒有
+  `level_count=B′`）与既有内容做一次标准 `compact`、结果原地写回同一层、
+  不再向上传播、`level_count` 钉死在 `B′`。全部字段（`w`/`p_lo`/`p_hi`/
+  `sum_wp`/rank-1 ΣΓ/pad 规则）复用普通层间进位的既有 `compact` 调用，没有
+  新公式。**replay 不需要新的 `op_log` 条目类型**——和普通二进制进位一样，
+  这个事件完全由"重放到这一步时顶层是否已经是 `B′`"这一状态本身决定；
+  forward 路由和 replay 必须调用同一个实现（不允许平行重写），与
+  `ward_merge_only`/`PAD_INSERT` 扫描已经确立的"forward/replay 共享
+  primitive"纪律一致。新增单测要求：构造单簇极端不均衡序列，强制顶层
+  饱和合并 2~3 次，forward 与 replay 产出的顶层 entry 做完整字段元组对拍，
+  并断言 `level_count[top]` 全程只在 `{0, B′}` 间跳变。
+  ④ **P2：semantic clusters 构造校验只挡了 `pin_size>0`（eval-time pin），
+  没挡训练期的 `log_kv_pin_train_max`/`log_kv_pin_train_prob`。** 核实
+  后确认这两个参数确实经 `model.py:1020` 一带传进
+  `LogKVStreamTrainingAttention.apply(...)`，最终由
+  `_sample_training_pin_positions`（`log_kv_cache.py:1780-1808`）调用
+  `cache.set_pinned(...)`；但由于该函数内部本来就有
+  `pin_train_max = min(int(pin_train_max), cache.pin_size)` 这一步 clamp，
+  一旦 `pin_size` 已被现有校验钉死为 0，这条训练注入路径就已经被下游早退
+  分支挡死——**不是当前会触发的活跃正确性 bug，而是"因为另一处代码的下游
+  行为副作用而碰巧安全"**，下游 clamp 逻辑一旦被重构就可能在毫无警觉的
+  情况下失守。**修法**：构造时校验补上 `pin_train_max > 0`/
+  `pin_train_prob > 0.0` 两个条件，把"没有 pin 共存语义"这条契约做成不
+  依赖任何下游实现细节的自证不变量（fail loud, not silent），定性为纵深
+  防御而非活跃 bug 修复。
+  ⑤ **P2：`log_kv_slot_attention` 是通用函数，测试/诊断代码可能直接拿
+  cache 的 `slot_valid` 调它、不额外拼 in-flight chunk（`causal_tail=0`）
+  也不传显式 `mask`——若 `slot_valid` 恰好整段为 `False`（如刚构造的空
+  cache），会产出整行 `-inf` 的 score、softmax 出 NaN。** 现有代码
+  （`log_kv_cache.py:1553`）只特判了 `S==0` 这一种"cache 为空"的表现
+  形式，没覆盖"`S>0` 但被掩码全部遮住、又没有 exact 后缀兜底"这第二种
+  同样会导致空结果的情形。**修法**：函数内部在全部 `masked_fill_` 之后、
+  `softmax` 之前，新增 `effective_valid = (score > -inf)` 归约检查，逐
+  `(B,head,T_q)` 行断言至少一个有效候选，不满足直接 `raise ValueError`，
+  不允许 NaN 静默流入下游；`S==0` 的早退路径保留，两者覆盖"cache 为空"
+  这同一根因下的两种不同表现，不冲突。
+  ⑥ **P3：activation checkpointing"首轮跳过 `op_log` 分配"的说法暗示 v1
+  能自动检测，但没交代信号从哪来。** 直觉候选信号 `torch.is_grad_enabled()`
+  乍看能区分"checkpoint throwaway 首轮"（外层显式 `no_grad()`）和"recompute
+  轮/正常训练 forward"（外层梯度开启）——但 `LogKVStreamTrainingAttention.
+  forward()` 是 `torch.autograd.Function` 的 `forward()` 方法，PyTorch 的
+  `Function.apply()` 机制本身就会在整个 `forward()` 执行期间统一禁用梯度
+  追踪，`log_kv_cache.py:1879` 那处显式 `torch.no_grad()` 只是让这一点在
+  代码里变得可见，不是额外施加的限制——所以 `is_grad_enabled()` 在
+  `forward()` 内部任意位置查询恒为 `False`，三种调用场景在函数内部结构性
+  地不可区分，不是"查询位置不对"这么简单。**修法**：把这项优化降级为
+  "需要调用方（checkpoint 包装层）显式传入新信号才能做的未来工作"，v1 不
+  承诺、也不实现自动检测；`record_op_log` 继续由调用方在 `.apply(...)`
+  之前决定好并传入，不影响本节"448MB×B"这个峰值数字本身的正确性，只影响
+  能不能省掉一次可回收的 throwaway 分配。
+  **验证**：`pytest tests/test_semantic_s0.py tests/test_semantic_s0_analyze.py
+  tests/test_semantic_s0_sweep.py tests/test_semantic_stage0_dump.py
+  tests/test_log_kv_cache.py` 全部跑通，219 个测试通过，与本轮之前的基线
+  一致（本轮改动全部是文档，不涉及任何代码/测试文件）；改动覆盖的四个文件
+  （CLAUDE.md、`docs/algorithm-spec.md`、`docs/experiments.md`、
+  `docs/risks-and-open-questions.md`）逐个核对 `**` 出现次数均为偶数，并对
+  本轮新增的三处"更正（这一轮修的）"框逐一定位其开合标记的确切字符位置，
+  确认闭合于预期的引导句末尾，未触发本文档历史上出现过的"`**A**B**C**`"
+  级联加粗渲染 bug。
 
 - **2026-08-20｜第三十二轮：mass bias 公式改正，`−log(M)` 不受 `λ` 门控；
   修正两处 novelty 判据里与 `c*` 定义矛盾的 `min_c`/"到所有既有簇都远"
