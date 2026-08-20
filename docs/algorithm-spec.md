@@ -61,10 +61,15 @@ CLI』逻辑"那条），不进 `eval.sh`/`majob.sh` 核心列表，走 `DIAG_AR
 `pin_size>0`，在构造时硬失败，不是静默忽略**：
 
 ```python
-if log_kv_semantic_clusters and (importance_pooling or pin_size > 0):
+if log_kv_semantic_clusters and (
+    importance_pooling
+    or pin_size > 0
+    or pin_train_max > 0
+    or pin_train_prob > 0.0
+):
     raise ValueError(
-        "semantic clusters 与 importance_pooling/pin 尚未定义共存语义，"
-        "构造时二选一"
+        "semantic clusters 与 importance_pooling/pin（含训练期 pin 注入）"
+        "尚未定义共存语义，构造时二选一"
     )
 ```
 
@@ -75,6 +80,24 @@ DP-means 分配阈值、mass bias `λ·log(w) − log(M)` 全部依赖的那个"
 两套机制不是不能共存，是共存的数学还没推导——**pin 系列本身也是另一条独立技术
 路线（CLAUDE.md 顶部已声明），在没有专门推导之前默认禁止组合，比默认允许后产出
 无法解释的分数更安全。**
+
+> **更正（这一轮修的，P2）：上一版的校验只挡了 `pin_size>0`（eval-time pin），
+> 训练期还有一条独立注入路径没堵。** `log_kv_pin_train_max`/`log_kv_pin_train_prob`
+> 这两个训练专属参数会经 `model.py` 传进
+> `LogKVStreamTrainingAttention.apply(...)`（`model.py:1020` 一带），最终由
+> `_sample_training_pin_positions`（`log_kv_cache.py:1780-1808`）调用
+> `cache.set_pinned(...)` 往 cache 里写入训练期的 exact-duplicate pin token——
+> 这条路径不经过、也不检查 `pin_size` 之外的任何字段。**核实结论：由于
+> `_sample_training_pin_positions` 内部本来就会做
+> `pin_train_max = min(int(pin_train_max), cache.pin_size)`，一旦上面的构造时
+> 校验把 `pin_size` 钉死为 0，这条训练注入路径就已经被下游 `cache.pin_size<=0`
+> 的早退分支挡死，不是一个当前会触发的正确性 bug。** 但这属于"因为另一处代码
+> 的下游行为副作用而碰巧安全"，不是"因为这里的接口契约本身禁止它"——下游
+> clamp 逻辑未来如果被重构（比如允许 `pin_train_max` 独立于 `pin_size` 生效），
+> 这条防线会在没有任何警觉的情况下消失，训练期开始静默混入语义簇设计从未定义
+> 过共存语义的 exact-duplicate pin。补齐这两个字段是纵深防御（fail loud, not
+> silent）而非修复活跃 bug——把"没有 pin 共存语义"这条构造时契约做成不依赖
+> 任何下游实现细节的自证不变量。
 
 **同样，`log_kv_semantic_clusters=True` 必须拒绝 `rope_interleave=True`**：
 
@@ -2874,9 +2897,72 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 报错，而是**让最顶层变成饱和累加器**——顶层 entry 的 `w` 允许超过名义的 `2^L`，
 继续吸收进位。这个降级方向正确：一个吞掉整篇文档的簇，本来就该被压得最狠。
 
-实现上不需要新机制——`compact(k1,v1,w1, k2,v2,w2)` 本来就是按 `w` 加权、
-**不要求两侧等宽**，所以宽度超标在数学上现成支持。要改的只是 `_counts[ell]` 那套
-"同层等宽"的簿记假设（**和对齐填充要改的是同一处，见 §5.19-2**）。
+> **更正（这一轮修的，P1）：上一版只说"不需要新机制，`compact` 本来就不要求两侧
+> 等宽"，这句话本身没错，但回答的不是真正的问题。** `compact()` 这个纯函数确实不
+> 挑宽度，缺的是**围绕它的控制流**——"什么时候调它、结果写回哪里、`level_count`
+> 怎么更新、pad/锚点/ΣΓ 怎么处理、op_log replay 要不要跟着改"，这些此前完全没有
+> 定义。现有生产代码（`log_kv_cache.py:944-950` 的 `_binary_carry`）对顶层溢出的
+> 处理是直接 `raise RuntimeError`——"顶层变成饱和累加器"这句话从未在任何地方落成
+> 可执行的状态转移，`§5.19-2` 也只是把它列为"最集中的风险点"，同样没给出定义。
+> 补的不是新的合并数学，是新的顶层专属控制流原语，见下方 `saturating_top_carry`。
+>
+> **先证明一条支撑简化的不变量：抵达顶层的进位块宽度恒为 `B′`，永不需要
+> zero-pad。** 普通层级（`ell < L_alloc-1`）的进位循环本身就维持"同层等宽"——
+> `_binary_carry` 每一层只在"已占用"时才调用 `compact(既有, 新到)`，而既有内容
+> 和新到内容在这条不变量下宽度恒等于 `B′`（这正是 §5.19-2 点名要保护的假设，只是
+> 此前没人把它写成显式命题）；`compact(A,B)`（`|A|=|B|=B′`）的输出宽度也恒为
+> `B′`（CLAUDE.md §14 第三十轮变更记录已经验证过这条"拼成 `2B′` 再按
+> `(2i,2i+1)` 配对"的性质）。归纳可得：只要 `B′` 本身在整个级联里保持不变（生产
+> 路径确实如此），任何一次进位——无论是普通层间进位，还是即将定义的顶层饱和
+> 合并——收到的输入宽度和产出的输出宽度都精确是 `B′`。**唯一的例外是序列末尾未
+> 冲满的残留（§5.21 的 decode pending），那是另一个独立机制，从不会把非 `B′`
+> 宽的块交给顶层。**
+>
+> **`saturating_top_carry` 的完整状态转移**（`top = L_alloc − 1`，`level_count`
+> 简写为 `lc`）：
+>
+> ```
+> def saturating_top_carry(cluster, incoming_block):        # incoming_block 宽度恒为 B′（上证）
+>     if lc[cluster, top] == 0:
+>         # 顶层此前从未被占用：直接原样写入，不调用 compact，不消耗任何进位预算
+>         write_level(cluster, top, incoming_block)
+>         lc[cluster, top] = B′
+>     else:
+>         # 顶层已占用（由下面的不变量，此时恒有 lc[cluster, top] == B′）：
+>         # 与既有内容做一次标准 compact，合并结果原地写回同一层，不再向上传播
+>         existing_block = read_level(cluster, top)          # 宽度 B′
+>         merged = compact(existing_block, incoming_block)   # 宽度恒为 B′，w 逐 entry 相加
+>         write_level(cluster, top, merged)
+>         lc[cluster, top] = B′                               # 不变量维持：顶层占用后恒为 B′
+> ```
+>
+> `compact` 调用带的参数与普通层间进位完全一致——`k̄_raw/v̄/w/p_lo/p_hi/sum_wp`
+> 走既有的加权合并公式，rank-1 `σu/σ2/γa/γb/γ`（若启用）走既有的 Chan-merge 分支，
+> pad 槽（`w=0`）走既有的"全字段显式清零"规则（§5.19-3）——**没有任何字段走新
+> 公式**，新增的只是"合并结果写回同一层、`level_count` 钉死在 `B′`、不再产生
+> 更高层"这条控制流决定。`lc[cluster, top]` 因此只有两个可能取值：`0`
+> （从未占用）或 `B′`（占用后恒定），不会像普通层那样在 `0` 和 `B′` 之间反复
+> 切换——这条不变量本身就是"顶层饱和累加器"这个说法的精确含义。
+>
+> **replay 不需要新的 `op_log` 条目类型。** 和普通二进制进位一样（`CARRY` 是
+> debug-only、非权威，见 §5.21-2），顶层饱和合并事件完全由"重放到这一步时
+> `lc[cluster, top]` 是否已经是 `B′`"这个状态本身决定，不依赖任何额外记录——
+> replay 只需要让自己模拟的进位状态机在触达顶层时也执行上面同一段
+> `saturating_top_carry`，而不是像 vanilla 那样在顶层溢出时报错。**要求**：forward
+> 路由和 op_log replay 必须调用同一个 `saturating_top_carry` 实现（不允许各自
+> 平行重写一份），与 `ward_merge_only`（§5.6）、`PAD_INSERT` 扫描（§5.11）等已经
+> 确立的"forward/replay 共享同一 primitive"纪律一致。
+>
+> **必须补的单测**：构造一个内容极端不均衡的单簇合成序列（远超 `L_alloc·B′`
+> 个成员全部路由进同一个簇，强制顶层至少饱和合并 2~3 次），对 forward 产出的
+> 顶层 entry 和 op_log replay 产出的顶层 entry 做**完整字段元组**逐位/容差对拍
+> （`k̄_raw/v̄/w/p_lo/p_hi/sum_wp` 逐位，rank-1 统计容差内，参照 §5.4"必须补的
+> 单测"已经确立的比较口径），并显式断言 `lc[cluster, top]` 全程只在
+> `{0, B′}` 两个值之间跳变、从未越界。
+
+实现上不需要新的合并数学——`compact(k1,v1,w1, k2,v2,w2)` 本来就是按 `w` 加权，
+数值公式与普通层间进位完全相同。要改的是 `_counts[ell]` 那套"同层等宽"的簿记
+假设（**和对齐填充要改的是同一处，见 §5.19-2**）以及上面新增的顶层专属控制流。
 
 ### 5.13 数据结构（buffer 清单）
 
@@ -3267,6 +3353,35 @@ in-flight exact chunk（需要 `causal_tail`）的合成场景，断言两种掩
 respects 逐 token 因果关系，且这条路径下的输出与"手工构造等价的 `(T_q,S)`
 `mask`（同时编码两种约束）"数值一致，验证"两个正交掩码分别加"和"揉成一个
 掩码"是同一件事，只是前者更便宜。
+
+> **更正（这一轮修的，P2）：上面"pooled 区域整体无效不会导致整行 `-inf`"这条
+> 不变量（§5.14"更正：上一版『`S_pooled=0` 时是空张量』……"框）依赖的前提是
+> "调用方一定走 `log_kv_chunk_attention`/`LogKVStreamTrainingAttention.
+> forward()`，因此一定带着非空 exact 后缀"——但 `log_kv_slot_attention` 是
+> 通用函数，测试/诊断代码完全可能直接用 cache 的 `get_attention_state()` 输出
+> 调它，且不额外拼 in-flight chunk（`causal_tail=0`）、也不传显式 `mask`。这种
+> 调用方式下，若 `slot_valid` 恰好整段为 `False`（比如刚构造的空 cache），
+> `S_pooled>0` 但每一列都被遮住，`score` 整行是 `-inf`，softmax 产出 NaN——
+> 现有代码（`log_kv_cache.py:1553`）只特判了 `S==0` 这一种"cache 为空"的
+> 表现形式（此时函数在真正调用注意力数学之前就直接返回全零），完全没有覆盖
+> "`S>0` 但被 `slot_valid` 全部遮住、且没有 exact 后缀兜底"这第二种同样会
+> 产生空结果的情形，两者都是"这次读出看不到任何东西"，理应有一致的处理，现在
+> 只处理了其中一种。**
+>
+> **修法**：`log_kv_slot_attention` 在做完全部 `masked_fill_`（`slot_valid` +
+> `causal_tail`/`mask`）之后、`softmax` 之前，显式构造
+> `effective_valid = (score > -inf)`（等价于把三种掩码来源——`slot_valid`、
+> `causal_tail` 的三角自掩码、调用方显式 `mask`——按前面已经确立的"结合律
+> 成立、顺序不影响结果"揉到一起看最终结果），按 `(B, head, T_q)` 归约，断言
+> `effective_valid.any(dim=-1)` 逐行为真；若某一行整行为 `False`，直接
+> `raise ValueError("log_kv_slot_attention: query row 有效候选为空，无法定义
+> softmax——检查 slot_valid/causal_tail/mask 组合是否遗漏了 exact 后缀")`，
+> 不允许 NaN 静默流入下游。**`S==0` 的早退路径不变，仍然保留**——它是"整个
+> cache 都不存在"这种更早、更明确的场景的显式快捷方式（连 `score` 张量都不
+> 构造），不与这条新检查冲突，两者覆盖的是"cache 为空"这同一个根因下的两种
+> 不同表现（`S==0` 是结构性为空，这条新检查是"结构上非空但被掩码全部遮住"）。
+> 这条断言只在函数入口路径新增一次 `any()` 归约，相对 `masked_fill_`/`softmax`
+> 本身的开销可忽略，值得作为默认行为而非 debug-only 选项。
 
 #### `slot_valid`/`M_s` 在语义模式下不是可选项；`get_attention_state()` 的返回结构需要重新设计
 
@@ -4453,12 +4568,37 @@ size，这个乘数始终在，与是否发生梯度累积无关），梯度累�
 backward 时再在有梯度的模式下重新跑一次 forward（重建图）紧接着执行这段的
 backward"。所以 checkpointing **不会**把 in-flight 数推高（每个 checkpoint
 段落任意时刻最多一个"有效"`ctx`），但会让 `op_log` 的分配次数变成两倍（一次
-no_grad 的 throwaway 分配、一次 recompute 的真实分配）——按上面"`op_log`
-只在 `LogKVStreamTrainingAttention.forward()` 里分配"这条已经成立，checkpoint
-的 no_grad 首轮是否还需要真的分配 448MB、还是可以跳过，取决于 checkpoint
-内部是否也传了 `record_op_log`（它应该传 `False`——首轮的目的只是拿输出值，
-根本不会有人对它调用 `backward()`）；这是一个可以在实现阶段做的效率优化，
-不是本节这笔账的正确性问题，这里只记录下来避免遗漏。
+no_grad 的 throwaway 分配、一次 recompute 的真实分配）。
+
+> **更正（这一轮修的，P3）：上一版说"首轮是否可以跳过分配取决于 checkpoint
+> 内部是否传了 `record_op_log=False`"，暗示这能在 v1 里自动做到，但没有交代
+> 这个信号从哪来——重新核实后发现它**不能**靠函数内部自己判断。** 直觉的
+> 候选信号是 `torch.is_grad_enabled()`：checkpoint 的 throwaway 首轮确实是在
+> 外层显式 `no_grad()` 下调用的，recompute 轮和正常训练 forward 都是在梯度
+> 开启的环境下调用的，看起来足以区分"throwaway"和"其余两种"。**但
+> `LogKVStreamTrainingAttention.forward()` 是一个 `torch.autograd.Function`
+> 的 `forward()` 方法，而 PyTorch 的 `Function.apply()` 机制会在整个
+> `forward()` 执行期间统一禁用梯度追踪（这是自定义 Function 协议本身的行为，
+> 不是这份代码自己加的）——`log_kv_cache.py` 里那处显式 `torch.no_grad()`
+> 包裹（约 1879 行）只是让这一点在代码里变得可见/显式，不是这份代码额外
+> 施加的限制。** 也就是说，`torch.is_grad_enabled()` 在 `forward()` 内部
+> 任意位置查询，恒为 `False`——不论外层调用方此刻实际处于 `no_grad()`
+> （checkpoint 首轮）、`enable_grad()`（checkpoint recompute 轮）、还是
+> 普通训练 forward 的默认梯度开启状态，`forward()` 内部看到的都是同一个值，
+> **这个信号在 `forward()` 内部结构性地不可观察，不是"忘了在正确的位置查询"
+> 这么简单**。
+>
+> **修法**：把"checkpoint 首轮跳过 `op_log` 分配"降级为一项**需要调用方显式
+> 传入新信号才能做的未来优化**，v1 不承诺、也不实现自动检测。具体来说，
+> `record_op_log` 必须继续由**调用方**（`CausalSelfAttention`/训练脚本，而非
+> `LogKVStreamTrainingAttention.forward()` 自己）在调用 `.apply(...)` 之前
+> 决定好并传入——如果未来要支持"checkpoint 首轮不分配"，需要 checkpoint
+> 包装层（`torch.utils.checkpoint` 的调用点）自己知道"这次调用是不是 throwaway
+> 首轮"（它天然知道，因为是它自己在决定要不要包一层 `no_grad()`），把这个
+> 判断结果作为一个新的显式参数向下传递，而不是指望被调函数凭 PyTorch 的
+> 内部梯度状态自己猜出来。这不是本节这笔账的正确性问题（不影响"448MB×B"这个
+> 峰值数字本身，只影响能不能省掉一次可回收的 throwaway 分配），这里记录下来
+> 是为了避免"v1 应该能自动做到"这个过强的印象被当成既定行为去依赖。
 
 **结论，写进操作性规则**：默认训练循环（forward 后立即 backward，不论
 `optimizer.step()` 是否被梯度累积推迟）下，"448MB×`B`"（`B` 是真实训练
