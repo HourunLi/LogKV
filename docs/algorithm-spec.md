@@ -259,8 +259,10 @@ Phase 1（并行，覆盖绝大多数 token）:
 
 Phase 3a（紧接 Phase 1 之后、Phase 2 开始前，向量化，**不是**批末）:
     用 Phase 1 刚产出的主操作，批量更新它们各自目标簇的
-    centroid/n_eff/n_total/p_hi_c/current_segment（§5.5）——见下方"Phase 3
-    拆成 3a/3b"一节，这一步必须在这里执行，不能推迟到 Phase 2 之后
+    centroid/n_eff/n_total/p_hi_c/current_segment（§5.5）以及
+    level0_phase（§5.11，PAD_INSERT 对齐用的独立相位计数器，同样在这一步
+    写，不能漏）——见下方"Phase 3 拆成 3a/3b"一节，这一步必须在这里执行，
+    不能推迟到 Phase 2 之后
 
 Phase 2（串行，只处理 orphan）:
     s*[t] > λ_new 的 token 需要开新簇，它们之间还可能互相成簇
@@ -583,20 +585,50 @@ count[t]     = (-prev_mod[t]) mod 2^ℓ_block         # 只有 new_seg[t]=True �
                                                        PAD_INSERT op（沿用既有
                                                        "count=0 不产生 op"规则）
 
-phase_after[t] = (prev_mod[t] + 1) mod 2^ℓ_block    # Phase 3a 的写回值：对每个
-                                                       t 都成立（每个 direct
-                                                       token 贡献恰好 1 次真实
-                                                       level-0 插入）；Phase 3a
-                                                       按簇分组取 rank 最大的
-                                                       t，把它的 phase_after[t]
-                                                       写回持久 level0_phase[
-                                                       c*[t]]（segmented"取组内
-                                                       最后一个"归约，和 p_hi_c/
-                                                       current_segment 已用的
-                                                       归约同一原语族，见 §5.11
-                                                       "三个写入点"）
+phase_after[t] = 1 % 2^ℓ_block                       如果 new_seg[t]=True
+                                                       （count[t] 个 PAD 已经
+                                                       把相位打到 0，t 自己
+                                                       落地后精确是 1；不能
+                                                       写成 (prev_mod[t]+1)
+                                                       mod 2^ℓ_block——那是
+                                                       "没插 PAD"分支的公式，
+                                                       见下方"更正"框的反例）
+               = (prev_mod[t] + 1) mod 2^ℓ_block     否则（new_seg[t]=False，
+                                                       没有插入 PAD，相位在
+                                                       prev_mod[t] 基础上单纯
+                                                       +1）
+                 # Phase 3a 的写回值：两个分支合起来对每个 t 都成立（每个
+                 # direct token 贡献恰好 1 次真实 level-0 插入）；Phase 3a
+                 # 按簇分组取 rank 最大的 t，把它的 phase_after[t] 写回持久
+                 # level0_phase[c*[t]]（segmented"取组内最后一个"归约，和
+                 # p_hi_c/current_segment 已用的归约同一原语族，见 §5.11
+                 # "三个写入点"）
 ```
 
+> **更正（这一轮修的，P1）：`phase_after[t]` 不能对 `new_seg[t]=True` 的
+> token 也套用 `(prev_mod[t]+1) mod 2^ℓ_block` 这条公式，会算出比正确值
+> 大的相位，且这个错误不会自行暴露。** 具体反例：`prev_mod[t]=2`，
+> `2^ℓ_block=4`（`ℓ_block=2`），`new_seg[t]=True`。正确过程是：先插
+> `count[t]=(-2) mod 4=2` 个 PAD 把相位从 2 推到 0（`2→3→0`），再落地 `t`
+> 自己这个真实 entry，相位变成 1——`phase_after[t]` 应该是 `1`。但如果不分
+> 支、无条件套用 `(prev_mod[t]+1) mod 2^ℓ_block`，算出的是 `(2+1) mod
+> 4=3`，比正确值多了 2。这不是舍入误差，是把"没插 PAD 时相位单纯 +1"这条
+> 公式错误地套用到了"插了 PAD、相位已经被拉回 0"的分支上——两个分支共享
+> 同一个 `prev_mod[t]` 输入，但 `new_seg[t]=True` 时 `prev_mod[t]` 的唯一
+> 作用是决定要插多少个 PAD（`count[t]`），它本身的数值此后不再参与
+> `phase_after[t]` 的计算，因为 PAD 已经把相位"清零"到 0、t 落地后固定
+> 变成 1，和 `prev_mod[t]` 具体是 2 还是 3 无关。**修法**：`phase_after[t]`
+> 拆成两个分支——`new_seg[t]=True` 时恒为 `1 % 2^ℓ_block`（对 `ℓ_block=0`
+> 这个纯语义/关闭端点，`2^ℓ_block=1`，`1 % 1=0`，与"该配置下 `level0_
+> phase` 恒为 0、`count` 恒为 0"这一事实一致，不需要单独特判）；
+> `new_seg[t]=False`（`JOIN`，没有插入 PAD）时才是 `(prev_mod[t]+1) mod
+> 2^ℓ_block`。**这个坑不止出现在这一处**：下面"三个写入点"第 1、2 条
+> （Phase 3a/3b 的写回描述）和上面"必须有 CPU 参考实现"段落里描述的朴素
+> 参考实现，此前都无条件写着"`+1 mod 2^ℓ_block`"或等价表述，同一个错误在
+> 三处被复述了三遍，必须一并改正——否则向量化实现和它要对拍的朴素参考
+> 实现会用同一个错误公式，对拍单测会在两边一致地算错的情况下"通过"，
+> 完全测不出这个 bug。
+>
 > **这个 "-1" 不是可以省略的细节，是这条公式唯一容易做错的地方，必须显式钉死
 > 并给出推导。** 从头验证：设一批内某簇的子序列按组内下标排好，`M_r` 表示
 > 处理完第 `r` 个成员之后（即将处理第 `r+1` 个成员之前）的 mod 计数器值，
@@ -630,12 +662,17 @@ S0.1，见下方"更正"框）**：和 §5.21-2 对批量
 ladder 写入的要求同一个模式——写一个逐 token 串行的朴素参考实现（对每个**到达
 的 direct token**，先过滤掉 orphan，再读当前 `current_segment`/
 `level0_phase[cluster]`（不是 `level_count[cluster,0]`，见 §5.11 的更正框），
-立即决定 `segment`/`count`，立即"执行"更新（含 `level0_phase` 自身的
-`+1 mod 2^ℓ_block` 递推），供下一个 token 读到最新值），断言它和上面向量化
+立即决定 `segment`/`count`，立即"执行"更新（含 `level0_phase` 自身的更新——
+若这个 token 触发新段（`new_seg=True`），重置为 `1 % 2^ℓ_block`；否则
+`+1 mod 2^ℓ_block`，**不能无条件写成后者**，见上方"更正（这一轮修的，P1）"
+的反例），供下一个 token 读到最新值），断言它和上面向量化
 公式在任意合成批次（含同簇多次开新段、
 含多个不同簇交错到达、**含 direct 和 orphan 交替出现**）上逐位一致。这条测试
 没通过之前，"segment id / PAD_INSERT count 的批量化是对的"这个论证是未经验证
-的假设。
+的假设。**这条参考实现描述此前和向量化公式犯了同一个错**（无条件 `+1 mod
+2^ℓ_block`）——如果只改公式不改这里，对拍单测会拿两份同样错误的实现互相
+比较，"逐位一致"会在两边一致地算错的情况下通过，完全测不出问题，这处必须
+和公式本身同步改正，不是可以延后的次要描述。
 
 > **更正（这一轮补的）：本节及下文多处"S0.1"标签用错了对象，统一改名为
 > "实现单测"。** 这里，以及下面 §5.4/§5.6/§5.11/§5.21-2 附近另外几处"必须
@@ -908,9 +945,10 @@ def scan_op_log(
     而不是裸 slot——见上方更正框，槽位复用后的新身份不能被误认成被合并走的
     旧身份。
 
-    前提（函数不做任何隐式校验，调用方必须自己保证）：
+    前提：
     1. `op_log` 参数必须是**有效前缀**（按 §5.13 的 `op_log_len` 截断，不是
-       整个静态 `(OP_max, 4)` buffer）。
+       整个静态 `(OP_max, 4)` buffer）——这一条函数不做校验，调用方必须
+       自己保证。
     2. 主操作必须携带真实的 `token_idx`（arg2，§5.21-2 这一轮的更正——旧格式
        `arg2` 恒为 `-1` 的日志不能喂给这个函数，`token_identity` 直接用
        `op.token_idx` 做 key，不再用递增计数器去猜"这条 op 对应哪个 token"，
@@ -918,7 +956,9 @@ def scan_op_log(
     3. 若这是从冷启动（所有槽从未 `alive` 过）开始的完整日志：
        `initial_epoch`/`initial_parent` 留默认 `None`。若这只是一段切片：
        必须传入这一段开始之前的 `epoch`/`parent` 状态——用上一段调用的
-       返回值直接传进来即可串联。
+       返回值直接传进来即可串联。**这一条函数会主动校验**：`JOIN`/
+       `NEW_SEGMENT`/`WARD_MERGE` 引用一个在 `epoch`（含种子）里从未出现
+       过的槽，直接 `raise`，不会静默当成 `epoch=0` 处理——见下方更正框。
 
     返回三元组：(本段的 token_identity：token_idx -> 记录时的版本化身份；
     本段结束时的 epoch 状态；本段结束时的 parent 状态)。后两者原样传给下一段
@@ -940,15 +980,58 @@ def scan_op_log(
                                                                   # 每次复用再 +1
             token_identity[op.token_idx] = (op.cluster, epoch[op.cluster])
         elif op.type in (JOIN, NEW_SEGMENT):
-            token_identity[op.token_idx] = (op.cluster, epoch.get(op.cluster, 0))
+            if op.cluster not in epoch:   # 见下方更正框，不能静默按 epoch=0 处理
+                raise AssertionError(
+                    f"scan_op_log: {op.type} 引用了未知的簇 {op.cluster}——"
+                    f"这个槽在本次调用可见范围内（含 initial_epoch 种子）从未"
+                    f"被 NEW_CLUSTER 建立过，多半是切片时忘了传 initial_epoch"
+                    f"（见前提 3），或 op_log 切片/拼接顺序本身有 bug")
+            token_identity[op.token_idx] = (op.cluster, epoch[op.cluster])
         elif op.type == WARD_MERGE:
-            keep_v = (op.keep_slot, epoch.get(op.keep_slot, 0))
-            free_v = (op.free_slot, epoch.get(op.free_slot, 0))
+            if op.keep_slot not in epoch or op.free_slot not in epoch:
+                raise AssertionError(
+                    f"scan_op_log: WARD_MERGE 引用了未知的槽（keep_slot="
+                    f"{op.keep_slot}, free_slot={op.free_slot}）——同上，"
+                    f"不能静默按 epoch=0 处理")
+            keep_v = (op.keep_slot, epoch[op.keep_slot])
+            free_v = (op.free_slot, epoch[op.free_slot])
             parent[find(free_v)] = find(keep_v)   # 只 union 当前这一代，不碰 epoch 本身
 
     return token_identity, epoch, parent
+```
 
+> **更正（这一轮修的，P2）：`JOIN`/`NEW_SEGMENT`/`WARD_MERGE` 此前用
+> `epoch.get(..., 0)` 默认值，会把"引用了一个未知槽"静默处理成"这个槽
+> 恰好在 epoch 0"，而不是报错。** 这正是前提 3 花了一整段专门警告的那个
+> 场景（切片时忘了传 `initial_epoch`，或 `op_log` 拼接顺序本身有 bug）
+> ——docstring 把责任全部推给调用方（"函数不做任何隐式校验"），但函数
+> 自己不维护任何能顺带暴露这类错误的状态，`.get(...,0)` 因此是这个函数
+> 里唯一、且完全没有防线的一环：一旦调用方违反前提 3，产出的
+> `token_identity`/`parent` 不会报错，只会安静地错，且没有任何下游信号
+> 能揪出来（`resolve_final_slots` 只是照单全收地做 `find()`）。这和
+> 姊妹函数 `scan_op_log_for_ward_events` 早两轮就已经改正过的问题
+> （`.get(ident, EMPTY_SKETCH)`/`.get(ident, 0)`，见上方"更正（这一轮
+> 修的）②"）是同一类反模式，但这个函数当时没有跟着一起改——**不是因为
+> 这里的风险更小，是因为这个函数本来就更简单、没有 `sketches`/`sizes`
+> 这类会顺带兜底的额外状态，问题反而更容易被放过**。**修法**：不引入
+> `scan_op_log_for_ward_events` 那一整套 `_require`/`sketches`/`sizes`/
+> `pending` 机制（这个函数刻意保持"只维护 `epoch`/`parent`，足够简单以便
+> 独立确信正确"，见 round 20 的既有取舍），只做最小的对称改动——
+> `JOIN`/`NEW_SEGMENT` 引用的 `op.cluster`、`WARD_MERGE` 引用的
+> `op.keep_slot`/`op.free_slot`，凡是不在当前 `epoch` 字典（含调用方传入
+> 的种子）里的，直接 `raise`，不再用 `.get(...,0)` 垫一个可能是假的默认
+> 值。`NEW_CLUSTER` 不受影响——它的 `epoch.get(op.cluster,-1)+1` 本来就是
+> 在**建立**一个新身份，不是**引用**一个应该已经存在的身份，"槽此前没见
+> 过"对 `NEW_CLUSTER` 而言是完全合法的输入（冷启动、或 K 未满分支选中一
+> 个从未用过的槽），不能同样加上"必须已存在"的校验。
 
+**必须补的单测**：构造一个不传 `initial_epoch` 就对一段中间切片（不是从
+冷启动开始）调用 `scan_op_log` 的场景，`op_log` 第一条就是 `JOIN`（引用一个
+在这段切片里从未 `NEW_CLUSTER` 过的槽），断言函数 `raise`；再构造一个正确
+传了 `initial_epoch`（把该槽标记为已存在）的对照场景，断言同一条 `op_log`
+能正常返回，不受影响——覆盖"漏传种子会被抓、传对了不会被误伤"两个方向。
+
+```python
 def resolve_final_slots(
     token_identity: dict[int, tuple[int, int]],
     parent: dict[tuple[int, int], tuple[int, int]],
@@ -1564,8 +1647,8 @@ Phase 2 处理每个 orphan（或一小簇互相接近的 orphan，由批内 min
        —— 这一步开始就是 allocate_new_cluster(slot_idx, group) 这个共享原语
        的内容（见本小节末尾"K 未满/冷启动复用同一个原语"一段），**只**初始化
        结构性状态：alive[slot_idx]=true，
-          centroid/n_eff/n_total/p_hi_c/current_segment 全部清零（"白纸"状态，
-          不沿用旧簇残留值）。
+          centroid/n_eff/n_total/p_hi_c/current_segment/level0_phase 全部
+          清零（"白纸"状态，不沿用旧簇残留值）。
           **数值元数据不在这里赋值**——统一交给 Phase 3b（内联，见下方
           "Phase 3 拆成 3a/3b"一节）从这个 orphan（组）的主操作重新构造，
           避免和 Phase 2 这一步的初始化重复计入同一批 token
@@ -1665,7 +1748,8 @@ allocate_new_cluster(slot_idx, group)   # 上面第 4 步开始的全部内容�
 为什么必然是"白纸"，还有一个隐含前提必须显式点出**：Ward 分支的"白纸"是
 `ward_merge_only`/第 4 步显式 `zero_()` 出来的，`K` 未满分支的"白纸"则依赖
 "一个从未被 `alive` 过的槽，它的 `centroid`/`n_eff`/`n_total`/`p_hi_c`/
-`current_segment` 本来就是全零"——**这个前提不是自动成立的，必须由
+`current_segment`/`level0_phase` 本来就是全零"——**这个前提不是自动成立的，
+必须由
 `reset_parameters()` 在整个 cache 生命周期开始时显式 `torch.zeros(...)`
 （或等价的显式清零）保证，不能依赖 `torch.empty` 之类不保证清零的分配**，
 否则一个"从未使用过"的槽可能带着未初始化的垃圾内存，`allocate_new_cluster`
@@ -1727,7 +1811,8 @@ orphan）本身也完全不受影响——它们只往本地缓冲**追加**，�
 看起来还小"的簇上的常规偏好）。
 
 如果 Phase 3（`centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment` 的 §5.5
-在线更新）严格等到 Phase 1 **和** Phase 2 全部跑完才统一运行，`ward_merge_only
+在线更新，以及 `level0_phase` 的 §5.11 相位更新）严格等到 Phase 1 **和**
+Phase 2 全部跑完才统一运行，`ward_merge_only
 (C, X)` 执行的那一刻，X 的 metadata 仍然是**批前**的快照——`tok0` 加入 X 这件
 事只体现在 op_log 和（已经按前面"Phase 1 整体"原则物理写好的）X 的 ladder 里，
 还没有体现在 X 的 `n_total`/`μ`/`p_hi_c` 上。于是：
@@ -1763,7 +1848,8 @@ Phase——Ward 合并看到的 ladder 是对的，看到的 metadata 却是错�
 - **Phase 3a**（向量化，紧跟 Phase 1 完成之后、Phase 2 开始之前）：只处理
   Phase 1 产出的主操作（direct token 的 `JOIN`/`NEW_SEGMENT`——direct token
   不会产生 `NEW_CLUSTER`，那是 orphan 专属），用 §5.5 的公式批量更新它们各自
-  目标簇的 `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`。这正是
+  目标簇的 `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`，以及用
+  §5.11 的规则批量更新 `level0_phase`。这正是
   前面"这个技巧的适用范围不止这里"那个指针指向的向量化任务——但含
   `NEW_SEGMENT` 触发的 `γ` 衰减重启时，`n_eff`/`centroid` 需要的是一个
   仿射变换复合的并行扫描，**不是**和 segment id/pad count 同构的
@@ -1824,7 +1910,9 @@ stale 值），不是近似精度问题（近似应该多准），两者正交�
 **Phase 3a 的具体做法**：Phase 1 结束、Phase 2 开始之前，对本地缓冲里刚刚由
 Phase 1 写入的主操作（只有 `JOIN`/`NEW_SEGMENT`），逐簇更新
 `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment`（`current_segment`
-只在遇到 `NEW_SEGMENT` 时被那条 op 的 `segment` 字段覆写，`JOIN` 不改它）。
+只在遇到 `NEW_SEGMENT` 时被那条 op 的 `segment` 字段覆写，`JOIN` 不改它），
+以及 `level0_phase`（按 §5.11 的规则：`NEW_SEGMENT` 重置为 `1 % 2^ℓ_block`，
+`JOIN` 是 `+1 mod 2^ℓ_block`）。
 **这里同样要用 `op.token_idx` 去取这条 op 对应的 `k_raw`，不能假设"本地
 缓冲里的第几条 op 就对应本批第几个 token"**——原因和 backward 重放的
 `token_ptr` 问题完全一样（§5.4"op_log 跨 Phase 的顺序契约"一节）。
@@ -2878,7 +2966,22 @@ Gram 矩阵本就是秩 1 且只有一个非零对角元，幂迭代在这个退
 | 2 | 3 | 300 | 23% |
 | 3 | 7 | 700 | **53%，不可接受** |
 
-**所以 `ℓ_block` 实际只能取 1 或 2**，这不是拍脑袋，是指数增长逼出来的。
+**所以在需要真正的段边界保护时，`ℓ_block` 只能取 1 或 2**，这不是拍脑袋，是
+指数增长逼出来的——上面这张表从 1 开始列，不是漏了 0：`ℓ_block=0` 时
+`2^ℓ_block=1`，每边界浪费 `2^ℓ_block−1=0` 个槽位，代价恒为零，没有必要（也
+没有意义）出现在一张讨论"代价多大"的表里。
+
+> **`ℓ_block=0` 不是被排除在合法取值之外，是这张代价表天然不适用的零成本
+> 端点，三处表述必须统一。** §5.3 把 `ℓ_block=0` 定义为"纯语义聚类"这条
+> 消融端点本身的一部分（`g_max=∞` 或 `ℓ_block=0` 两者之一即可关闭段边界
+> 保护），§5.21-2 生产路径构造时硬校验的合法范围也是 `ℓ_block ∈ {0,1,2}`
+> （包含 0）——上面若读成"`ℓ_block` 实际只能取 1 或 2"（不含 0），会和这
+> 两处直接矛盾。准确的表述是：**`ℓ_block=0` 是合法的"关闭段边界保护"档
+> （零代价、零保护，等价于 §5.11 开头"从不直接插到 level≥1"这条原则退化
+> 成"从不需要对齐、`PAD_INSERT` 恒不产生"），是消融/关闭档；`ℓ_block∈
+> {1,2}` 是"确实需要非退化段边界保护"时唯一负担得起的两档；`ℓ_block≥3`
+> 无论是否需要保护都不可接受（53% 起步）**。生产路径的三值校验
+> `{0,1,2}` 因此是精确的、不需要改动，需要改的只是这句结论性文字的措辞。
 
 #### `PAD_INSERT(cluster, level, count)` 的字段定死
 
@@ -2986,19 +3089,30 @@ entry 覆盖一个跨度，"插一个空的高层 entry"意味着什么本身就
 > **三个写入点**（和 `current_segment`/`p_hi_c` 同一模式，见 §5.4"Phase 1
 > 缺持久 segment 状态"一节）：
 > 1. **Phase 3a**（紧跟 Phase 1，向量化，直接复用那里已经算出的
->    `prev_mod[t]`）：`phase_after[t] = (prev_mod[t] + 1) mod 2^ℓ_block`
->    对本批每个 direct token 都成立（每个 direct token 恰好贡献 1 次真实
->    level-0 插入）；对每个本批出现过的簇，取该簇分组内 `rank` 最大（即
->    到达顺序最晚）的 `t`，把它的 `phase_after[t]` 写回持久
->    `level0_phase[c*[t]]`——标准 segmented"取组内最后一个"归约，和
->    `p_hi_c`/`current_segment` 已经在用的归约是同一个原语族（§5.4）。
->    本批未出现的簇，`level0_phase` 保持不变。
+>    `prev_mod[t]`/`new_seg[t]`）：`phase_after[t] = 1 % 2^ℓ_block`（若
+>    `new_seg[t]=True`）或 `(prev_mod[t] + 1) mod 2^ℓ_block`（若
+>    `new_seg[t]=False`）——**不能对两种情形统一套用后一条公式**，见上方
+>    "更正（这一轮修的，P1）"的反例。两个分支合起来对本批每个 direct
+>    token 都成立（每个 direct token 恰好贡献 1 次真实 level-0 插入）；
+>    对每个本批出现过的簇，取该簇分组内 `rank` 最大（即到达顺序最晚）的
+>    `t`，把它的 `phase_after[t]` 写回持久 `level0_phase[c*[t]]`——标准
+>    segmented"取组内最后一个"归约，和 `p_hi_c`/`current_segment` 已经
+>    在用的归约是同一个原语族（§5.4）。本批未出现的簇，`level0_phase`
+>    保持不变。
 > 2. **Phase 3b**（内联，逐 orphan 处理）：每处理完一个 orphan 的主操作
 >    （落到新建簇或本批内 Phase 2 自己形成的簇），对该簇的 `level0_phase`
->    做同一条 `+1 mod 2^ℓ_block` 更新；新建簇初始 `level0_phase=0`（和
->    `n_eff`/`n_total`/`p_hi_c`/`centroid` 一样，`allocate_new_cluster`
->    清零的字段列表里加上它），首个成员不需要 `PAD_INSERT`（没有历史可
->    对齐），落地后变成 1。
+>    按**同一条**规则更新——**`NEW_CLUSTER`/`NEW_SEGMENT` 重置为
+>    `1 % 2^ℓ_block`，只有 `JOIN` 才是 `+1 mod 2^ℓ_block`**，和 Phase 3a
+>    是同一条规则，不是各自独立的两条：Phase 2 内部同一 orphan 组的后续
+>    成员一样可能因为 `local_p_hi` 判据触发 `NEW_SEGMENT`（见上面"Phase 2
+>    处理每个 orphan"一段），这条更新规则必须覆盖这个情形，不能只处理
+>    `NEW_CLUSTER` 这一个特例——上一版"做同一条 `+1 mod 2^ℓ_block` 更新"
+>    这句话本身就是需要被改正的那个 bug 的另一处复述。新建簇初始
+>    `level0_phase=0`（和 `n_eff`/`n_total`/`p_hi_c`/`centroid` 一样，
+>    `allocate_new_cluster` 清零的字段列表里加上它），首个成员
+>    （`NEW_CLUSTER`）不需要 `PAD_INSERT`（没有历史可对齐，`level0_phase`
+>    本来就是 0），落地后按上面的重置规则变成 `1 % 2^ℓ_block`——和后续
+>    `NEW_SEGMENT` 用的是同一条公式，不是单独的初始化特例。
 > 3. **`ward_merge_only`**（§5.6）：合并两个既有簇时，`level0_phase` 无法
 >    有意义地"合并"（`a`/`b` 是两条独立的相位历史，不像 `p_hi_c` 取
 >    `max` 那样有自然的合并语义）——合并后直接按重建完毕的
@@ -3134,7 +3248,13 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 >
 > ```python
 > def carry_into_level(cluster, level, incoming_block):
->     """把 incoming_block（时间序，1..2B′个）并入 level 现有内容。
+>     """把 incoming_block（时间序，1..3B′个——不只是普通进位场景下的 1，
+>     Ward 合并级联到足够深的层时，非顶层同样会收到 native_ℓ(≤2B′)+
+>     ejected_from_below(饱和后=B′) = 3B′，证明见下方"更正（第三次）②"；
+>     该证明虽然是在推导顶层 incoming 上界时给出的，但它依赖的递推
+>     E(ℓ)=⌈(B′+E(ℓ-1))/2⌉ 对任意非顶层同样成立，B′=8 的例子里从第 4 层
+>     起 E 已经饱和到 B′，此后任何一层（不只是顶层）收到的 incoming 都是
+>     2B′+B′=3B′）并入 level 现有内容。
 >     返回本层放不下、需要继续向上进位的部分（可能为空）。level 必须 < top；
 >     顶层用下面独立的 saturating_top_carry，因为顶层没有『继续向上』这回事。
 >     不递归——由调用方（下面的 append_to_ladder / §5.6 的 ward 合并循环）
@@ -3316,7 +3436,13 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 >    `B′=8`、`L_alloc≥5`，两个源簇在每一层都恰好各有 `B′` 个 entry，逐层
 >    级联足够多层后 `ejected` 应精确稳定在 `B′`，断言顶层最终收到的
 >    `incoming` 长度确实达到 `3B′=24` 且 `saturating_top_carry`/
->    `carry_into_level` 都能正确处理，不因 shape/越界假设报错）。
+>    `carry_into_level` 都能正确处理，不因 shape/越界假设报错）。**同一组
+>    构造还要显式断言至少一个非顶层（例如上面 `E(3)=B′` 之后的某一层
+>    ℓ=4）在这次合并中传给 `carry_into_level` 的 `incoming_block` 长度
+>    也达到 `3B′`——不能只测顶层：这条 `carry_into_level` 本身也会在足够
+>    深的非顶层收到 `3B′` 宽输入，是上面"更正（第三次）②"证明的直接推论，
+>    但此前只有顶层被显式断言过，`carry_into_level` 的 docstring 因此曾经
+>    长期停留在过时的 `1..2B′` 表述而没有被这条测试揪出来。
 >  4. **`ward_merge_only` 不重复计入 `keep_slot` 的合并前内容**（见下方
 >    §5.6 的更正框）：构造 `keep_slot` 自己在某一层已有非空内容的合并场景
 >    （不是"keep_slot 该层为空、只有 free_slot 有内容"这种平凡情形——那种
