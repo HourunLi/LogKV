@@ -75,7 +75,7 @@ cache（每 layer 一个）
 
 | 符号 | 参数名 | 含义 |
 |---|---|---|
-| `λ` | `log_kv_lambda` | **mass bias 系数**，`+λ·log(w/M)`。沿用现有语义 |
+| `λ` | `log_kv_lambda` | **mass bias 系数**，只控制 `+λ·log(w)` 这一半；`−log(M)` 不受 `λ` 门控，无条件生效（§2.3）。沿用现有语义 |
 | `λ_new` | — | 开新簇的距离阈值 = `λ_rel · s_h` |
 | `λ_rel` | `log_kv_cluster_lambda_rel` | 上面那个的相对系数。**全方案最敏感的超参** |
 | `s_h` | — | 每 (layer, **KV group**，不是 query head——聚类只在 k 空间做，一个 KV group 只有一份 k) 的 key 尺度估计 `E‖k−k̄‖²`，`k̄` 是整个标定集上的全局均值。**v1 用离线标定**（§5.21-4），标定值须写进 eval metadata；在线估计降级为消融 |
@@ -122,7 +122,7 @@ cache（每 layer 一个）
 | `_append_level0()` | 往 level 0 追加 entry，满 `B′` 个就触发进位 |
 | `_flush_pairs()` | 批量版的窗口 flush。**它存在的唯一理由就是消除逐对串行**——语义路由会把这个串行请回来（§11-B）|
 | `_pair_rank1_stats()` | 算两个槽合并时新增的协方差，rank-1 化 |
-| `log_kv_slot_attention()` | 槽级 attention。**这一行描述的是现有代码**：`score = scale·(q·k) + ½scale²σ²(q·σu)² + λ·log w`，`read = v̄ + scale·γ(q·γa)·γb`。语义簇版本把 `log w` 换成 **`log(w/M)`**，见 §2.3/§5.15，**写单测时不要抄这一行的公式** |
+| `log_kv_slot_attention()` | 槽级 attention。**这一行描述的是现有代码**：`score = scale·(q·k) + ½scale²σ²(q·σu)² + λ·log w`，`read = v̄ + scale·γ(q·γa)·γb`。语义簇版本把 mass bias 换成 **`λ·log(w) − log(M)`**（`−log(M)` 不受 `λ` 门控），见 §2.3/§5.15，**写单测时不要抄这一行的公式** |
 | `LogKVStreamTrainingAttention` | 训练用的自定义 autograd。**forward 不建图，backward 重置 cache 并重放整条流**——语义路由打破了它的确定性前提（§11-A）|
 | `second_order` / `second_order_scale` | 是否构建 Σ/Γ / 它们的运行时缩放（CPT 期间 warmup 爬坡）|
 | `causal_tail` | 在途 chunk 的因果掩码，省掉一个全尺寸 mask |
