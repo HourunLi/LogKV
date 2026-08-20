@@ -234,6 +234,32 @@ def _assert_checkpoint_loaded_cleanly(load_result: Any, *, allow_mismatch: bool)
     print(f"[stage0-dump] WARNING (--allow_checkpoint_key_mismatch set): {message}", flush=True)
 
 
+def _assert_needle_span_present(sample_id: str, needle_spans: list[dict[str, Any]], *, require: bool) -> None:
+    """Fail fast when ``--require_needle_span`` is set and no needle span
+    survived tokenization/truncation for this sample.
+
+    Without this, a sample whose needle was never found by ``find_needle_
+    spans`` (empty ``needle_spans``) or whose only span got pushed outside the
+    left-truncation window (every span's ``survived_left_truncation`` is
+    False) still writes a normal-looking manifest entry. S0.0 does not care --
+    it never reads ``needle_spans`` -- but a later S0.3 (needle isolation
+    rate) that consumes this manifest directly would silently mix such
+    samples into its statistics instead of excluding or flagging them. This
+    check is opt-in (``require=False`` is a no-op) because not every dump is
+    NIAH-shaped; only pass ``--require_needle_span`` for samples that are
+    supposed to contain a findable needle.
+    """
+    if not require:
+        return
+    if not any(span.get("survived_left_truncation") for span in needle_spans):
+        raise RuntimeError(
+            f"sample {sample_id}: no needle span survived tokenization/truncation "
+            f"(needle_spans={needle_spans!r}). Pass without --require_needle_span if this "
+            f"sample is expected to have no needle, or investigate why the needle text was "
+            f"not found by find_needle_spans / fell entirely outside the left-truncation window."
+        )
+
+
 def _span_payload(tokenizer: Tokenizer, prompt: str, sample: dict[str, Any], offset: int, used_len: int) -> list[dict]:
     spans = find_needle_spans(tokenizer, prompt, doc=sample)
     out = []
@@ -271,6 +297,15 @@ def main() -> None:
         "not for a real S0.0/S0.2/S0.3 run.",
     )
     parser.add_argument("--compressed", action="store_true")
+    parser.add_argument(
+        "--require_needle_span",
+        action="store_true",
+        help="Hard-fail a sample if no needle span survives tokenization/left-truncation "
+        "(find_needle_spans found nothing, or every span it found fell outside the used "
+        "token window), instead of silently recording it as if it were a normal sample. "
+        "Only set this for dumps where every sample is expected to contain a findable "
+        "needle (e.g. NIAH); leave it off for mixed/non-NIAH samples.",
+    )
     parser.add_argument("--max_seq_length", type=int)
     parser.add_argument("--config_overrides", help="JSON dict merged into model_config.yaml")
     parser.add_argument("--store_prompt", action="store_true")
@@ -389,6 +424,9 @@ def main() -> None:
                 f"with missing layers, investigate first."
             )
 
+        needle_spans = _span_payload(tokenizer, prompt, sample, offset, used_len)
+        _assert_needle_span_present(sample_id, needle_spans, require=args.require_needle_span)
+
         sample_payload: dict[str, Any] = {
             "sample_index": sample_index,
             "sample_id": sample_id,
@@ -397,7 +435,7 @@ def main() -> None:
             "original_token_count": original_len,
             "used_token_count": used_len,
             "prompt_token_offset": offset,
-            "needle_spans": _span_payload(tokenizer, prompt, sample, offset, used_len),
+            "needle_spans": needle_spans,
             "layers": sorted(recorder.records, key=lambda r: r["layer"]),
         }
         if args.store_prompt:
@@ -422,6 +460,7 @@ def main() -> None:
             "layers": sorted(layers),
             "save_dtype": args.save_dtype,
             "compressed": bool(args.compressed),
+            "require_needle_span": bool(args.require_needle_span),
             "hook": "CausalSelfAttention: post norm_q/norm_k, pre apply_rope",
             # Machine-readable marker for downstream tooling: this manifest only
             # ever has mechanism-A fields (k_raw/v/s_h/vh/needle spans). A future
