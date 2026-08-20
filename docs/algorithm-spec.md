@@ -481,7 +481,7 @@ segment id（下一次开新段时用 `current_segment + 1`），进 §5.13 的�
 用同一份批前冻结的 `p_hi_c` 独立判断每个 token，这个判断本身已经是接受下来的
 近似（上面"这是一个近似"那段）；但**分配 segment id 和计算 `PAD_INSERT` 的
 `count` 不能重复这个近似**——如果本批里 token A、B（同簇，A 更早到达）都被判定
-为"开新段"，若两者都直接读批前持久的 `current_segment`/`level_count[cluster,0]`
+为"开新段"，若两者都直接读批前持久的 `current_segment`/`level0_phase[cluster]`
 计算，会给出完全相同的 `segment id` 和 `PAD_INSERT count`，而正确结果应该是 B
 在 A 已经开的那个新段之后再开一段、B 的 padding 也应该把 A 插入的 pad 和 A 自己
 的 entry 算进去。这本质上和 Phase 2 orphan 组内后续成员的问题是**同一类 bug**，
@@ -571,19 +571,37 @@ steps_since[t] = rank[t] - last_new_rank_before[t] - 1   # 注意这个 "-1"，
 
 base_mod[t]  = 1                                   如果 last_new_rank_before[t] ≠ -1
                                                      （本批内 c*[t] 之前已经开过新段）
-             = level_count[c*[t], 0] mod 2^ℓ_block  否则（本批这个簇还没开过新段，
-                                                     用批前持久值）
+             = level0_phase[c*[t]]                  否则（本批这个簇还没开过新段，
+                                                     用批前持久的相位计数器——不是
+                                                     level_count[cluster,0] mod
+                                                     2^ℓ_block，见 §5.11 的更正框：
+                                                     后者在 §5.12 精确定义 carry_
+                                                     into_level 之后已不再等价）
 prev_mod[t]  = (base_mod[t] + steps_since[t]) mod 2^ℓ_block
 count[t]     = (-prev_mod[t]) mod 2^ℓ_block         # 只有 new_seg[t]=True 且
                                                        count[t] > 0 才产生
                                                        PAD_INSERT op（沿用既有
                                                        "count=0 不产生 op"规则）
+
+phase_after[t] = (prev_mod[t] + 1) mod 2^ℓ_block    # Phase 3a 的写回值：对每个
+                                                       t 都成立（每个 direct
+                                                       token 贡献恰好 1 次真实
+                                                       level-0 插入）；Phase 3a
+                                                       按簇分组取 rank 最大的
+                                                       t，把它的 phase_after[t]
+                                                       写回持久 level0_phase[
+                                                       c*[t]]（segmented"取组内
+                                                       最后一个"归约，和 p_hi_c/
+                                                       current_segment 已用的
+                                                       归约同一原语族，见 §5.11
+                                                       "三个写入点"）
 ```
 
 > **这个 "-1" 不是可以省略的细节，是这条公式唯一容易做错的地方，必须显式钉死
 > 并给出推导。** 从头验证：设一批内某簇的子序列按组内下标排好，`M_r` 表示
 > 处理完第 `r` 个成员之后（即将处理第 `r+1` 个成员之前）的 mod 计数器值，
-> `M_0 = level_count[cluster,0] mod 2^ℓ_block`（批前持久值）。递推关系是
+> `M_0 = level0_phase[cluster]`（批前持久值，见 §5.11 更正框——不是
+> `level_count[cluster,0] mod 2^ℓ_block`）。递推关系是
 > `M_{r+1} = 1`（若第 `r` 个成员 `new_seg=True`）或 `(M_r+1) mod 2^ℓ_block`
 > （否则）——这就是"每次新段事件后计数器精确回到 1"这条化简的直接展开。
 > 设 `r'` 是严格小于 `r` 的、最近一次 `new_seg=True` 的组内下标：从
@@ -611,8 +629,10 @@ count[t]     = (-prev_mod[t]) mod 2^ℓ_block         # 只有 new_seg[t]=True �
 S0.1，见下方"更正"框）**：和 §5.21-2 对批量
 ladder 写入的要求同一个模式——写一个逐 token 串行的朴素参考实现（对每个**到达
 的 direct token**，先过滤掉 orphan，再读当前 `current_segment`/
-`level_count[cluster,0]`，立即决定 `segment`/`count`，立即"执行"更新，供下一个
-token 读到最新值），断言它和上面向量化公式在任意合成批次（含同簇多次开新段、
+`level0_phase[cluster]`（不是 `level_count[cluster,0]`，见 §5.11 的更正框），
+立即决定 `segment`/`count`，立即"执行"更新（含 `level0_phase` 自身的
+`+1 mod 2^ℓ_block` 递推），供下一个 token 读到最新值），断言它和上面向量化
+公式在任意合成批次（含同簇多次开新段、
 含多个不同簇交错到达、**含 direct 和 orphan 交替出现**）上逐位一致。这条测试
 没通过之前，"segment id / PAD_INSERT count 的批量化是对的"这个论证是未经验证
 的假设。
@@ -2181,10 +2201,15 @@ Phase 1 之后、Phase 2 之前运行一次（向量化）；Phase 3b 内联在 
 >   分开维护——后者继续喂 centroid 混合，前者只喂 Ward 代价）。
 >
 > **`n_total` 还有一处不能兼任**：§5.11 的 `PAD_INSERT` 对齐计算也不能用
-> `n_total_c`（会在第一次填充后算错，反例见 §5.11 那条更正框），但那处的修法
-> **不是**再拆一个新计数器，而是直接复用已经在维护的 `level_count[cluster,0]`
-> ——细节见 §5.11，这里只提醒"`n_total` 不能哪里都塞"这个教训又出现了一次，
-> 不代表设计里计数器数量还会继续增长。
+> `n_total_c`（会在第一次填充后算错，反例见 §5.11 那条更正框）——这里只提醒
+> "`n_total` 不能哪里都塞"这个教训出现过不止一次。**更正（这一轮修的）：
+> 下一句"不是再拆一个新计数器，而是直接复用 `level_count[cluster,0]`...
+> 不代表设计里计数器数量还会继续增长"已经不成立，删掉。** `carry_into_level`
+> 精确定义之后（§5.12），`level_count[cluster,0]` 本身在饱和之后会在
+> `B′-1`/`B′` 之间振荡，不再单调覆盖 `mod 2^ℓ_block` 的每个剩余类，也不能
+> 兼任 `PAD_INSERT` 对齐这件事——§5.11 现在确实新增了一个独立计数器
+> `level0_phase`，计数器数量这次真的增长了一个，具体定义与理由见 §5.11
+> 的更正框。
 
 ### 5.6 分簇：新簇的形成条件、`K_max` 的定尺与自适应
 
@@ -2464,11 +2489,25 @@ op_log，见下方更正）：
    成对 compact"这条独立规则，理由见 §5.12 那条更正框——旧规则在"其余"数量
    为奇数或不是 B′ 的整数倍时没有良定义的行为，§5.12 的折叠循环没有这个问题，
    两处共用同一份实现，不需要分别证明两遍）：
+   a_snapshot, b_snapshot = snapshot_ladder(keep_slot), snapshot_ladder(free_slot)
+                                                    # §5.12 更正框④：native_ℓ 下面会
+                                                       # 显式包含 a（keep_slot）自己的
+                                                       # 原有内容，所以必须先把两条 ladder
+                                                       # 各自的内容拍下来，再清空 keep_slot，
+                                                       # 否则 carry_into_level 内部的
+                                                       # read_level(keep_slot, ℓ) 会重新
+                                                       # 读到 a 未清空的原内容，和 native_ℓ
+                                                       # 里已经包含的 a 内容重复计入
+   clear_ladder(keep_slot)                          # 所有 level 清空、level_count 归零，
+                                                       # 之后 read_level(keep_slot, ·) 在
+                                                       # 本次重建过程中恒定返回空，直到
+                                                       # 下面的循环把新内容写回去为止
    ejected = []                                    # 上一层级联下来、待并入这一层的内容，
                                                        # 初始为空（level 0 没有下面一层）
    for ℓ in 0 .. top:
-       native_ℓ = 把 a、b 第 ℓ 层各自原有的 entry 按到达顺序归并（这一层
-                   各自本来就有的内容，和本次合并级联无关的部分，≤ 2B′ 个）
+       native_ℓ = 把 a_snapshot、b_snapshot 第 ℓ 层各自原有的 entry 按到达
+                   顺序归并（这一层各自本来就有的内容，和本次合并级联无关
+                   的部分，来自清空前的快照、不是清空后的实时状态，≤ 2B′ 个）
        incoming = native_ℓ + ejected                 # native 更早（这一层原有内容），
                                                          # ejected 更晚（上一层级联下来
                                                          # 的，必然产生于比 native_ℓ 更
@@ -2478,12 +2517,34 @@ op_log，见下方更正）：
            saturating_top_carry(keep_slot, incoming)     # §5.12，折叠后原地保留，循环结束
        else:
            ejected = carry_into_level(keep_slot, ℓ, incoming)   # 返回值供下一轮循环使用；
-                                                                    # keep_slot 这一层此时还
-                                                                    # 是空的（整条 ladder 正在
-                                                                    # 被重建，不是原地修改），
+                                                                    # keep_slot 这一层此时确实
+                                                                    # 是空的（上面已显式
+                                                                    # clear_ladder，不是靠
+                                                                    # "整条 ladder 正在被重建"
+                                                                    # 这句话本身来保证），
                                                                     # 函数内部 read_level 读到空
+   level0_phase[keep_slot] = level_count[keep_slot, 0] mod 2^ℓ_block  # §5.11 更正框：
+                                                       # 段对齐本来就允许被 Ward 合并打断
+                                                       # （已有共识），重建完毕后用真实
+                                                       # resident 状态重新起算，不需要、
+                                                       # 也无法有意义地"合并"a/b 两段
+                                                       # 独立的历史相位
    释放另一个槽位（alive=false）
 ```
+
+> **更正（这一轮修的，P1）：上一版没有 `snapshot_ladder`/`clear_ladder` 这
+> 两步，`native_ℓ` 的注释写"把 a、b 第 ℓ 层各自原有的 entry...归并"，隐含
+> a 就是 keep_slot；而循环里 `carry_into_level(keep_slot, ℓ, incoming)`
+> 内部会 `read_level(keep_slot, ℓ)`。若不先清空，这次 `read_level` 读到的
+> 正是 keep_slot（=a）尚未清空的原内容——同一份内容因此被计入两次：一次
+> 通过 `native_ℓ`（显式包含 a 的原内容），一次通过 `carry_into_level`
+> 内部隐式的 `read_level`。旧版本第 2480-2484 行的注释（"keep_slot 这一层
+> 此时还是空的...函数内部 read_level 读到空"）只是**断言**了这个前提，
+> 从未在可执行的伪代码里真正建立它——这正是本次修正要补上的缺口：显式
+> `snapshot_ladder`（清空前，为 `native_ℓ` 保留数据来源）+ `clear_ladder`
+> （让循环内部的 `read_level` 确实读到空，不再依赖一句从未被执行的注释）。
+> **必须补的单测见 §5.12"必须补的单测"第 4 条**（用非平凡场景——keep_slot
+> 自己该层本来就非空——验证总权重不翻倍）。
 
 调用方在拿到 `ward_merge_only` 的返回后自行 `append WARD_MERGE(keep_slot,
 free_slot, -1)`（**合并方向必须记**，§5.21-2）——日志写入不属于这个 primitive。
@@ -2542,18 +2603,28 @@ Ward 代价的尺寸加权恰好与"entry 会不会被迫合并"同向，所以 
 容易在某条分支漏掉"这种需要人工守纪律的地方；上一版这里警告的"总数 ≤ B′ 直接
 放入"这个分支尤其容易漏更新 `level_count`，现在这个分支已经不存在于 Ward 合并
 自己的代码里（它在共享原语内部，原语本身对"要不要真正折叠"的两个分支都无条件
-更新 `level_count`），这类疏漏在结构上不再可能发生。这条不变量依然是上面
-"§5.11 的 `PAD_INSERT` 直接读 `level_count[cluster,0]`"这个设计能够成立的
-**前提**——只是现在"如何保证它成立"从"依赖 Ward 合并这段代码写对"变成了
-"依赖 §5.12 的共享原语写对，Ward 合并只需要正确调用它"。
+更新 `level_count`），这类疏漏在结构上不再可能发生。**更正（这一轮修的）：
+这条不变量"是上面『§5.11 的 PAD_INSERT 直接读 level_count[cluster,0]』这个
+设计能够成立的前提"这句话已经不成立**——§5.11 的更正框已经把 `PAD_INSERT`
+的 `count` 公式改成读独立的 `level0_phase`，不再直接读 `level_count`。但
+`level_count[keep_slot, 0]` 的正确性依然是必要前提，只是因果链换了一环：
+`ward_merge_only` 合并结束时会把 `level0_phase[keep_slot]` 重置为
+`level_count[keep_slot, 0] mod 2^ℓ_block`（§5.11"三个写入点"第 3 点），
+所以 `level_count` 算错会通过这次重置**间接**污染 `level0_phase`，进而污染
+下一次 `PAD_INSERT` 的 `count`——路径变长了一步，但"`level_count` 必须
+精确正确"这个要求本身没有变化。
 
 **必须补的单测**（和 §5.11 的对齐单测同一档次，实现单测，不是 S0.1）：构造一个合成的 Ward
 合并场景（两个簇各自有已知的 ladder 状态，含至少一层触发折叠、至少一层
 `总数 ≤ B′` 直接放入、**至少一层"总数−B′"是奇数**——这一轮新增，专门覆盖
 §5.12"Ward 合并注入非 `B′` 宽进位"那条更正框的场景，用具体数字如 `B′=8`、
 两源簇该层各 8 个和 5 个 entry），合并后：（a）断言 `level_count` 在**每一层**都等于用
-`pad_mask`/`w>0` 独立统计出的真实占用数——不能只测 level 0；（b）在合并后的
-簇上模拟一次后续的 `PAD_INSERT`（用刚更新的 `level_count[cluster,0]` 算
+`pad_mask`/`w>0` 独立统计出的真实占用数——不能只测 level 0；（b）断言
+`level0_phase[keep_slot]` 精确等于合并后 `level_count[keep_slot, 0] mod
+2^ℓ_block`（验证 §5.11"三个写入点"第 3 点的重置规则被正确执行——这一步
+**替换**了旧版本"用刚更新的 `level_count[cluster,0]` 算 `count`"这个说法，
+因为 `count` 现在由 `level0_phase` 算，不是直接由 `level_count` 算）；（c）
+在合并后的簇上模拟一次后续的 `PAD_INSERT`（用刚重置的 `level0_phase` 算
 `count`），断言按这个 `count` 填充之后，下一次段边界前的 level 0 逻辑流长度
 确实对齐到 `2^ℓ_block` 的倍数——即，不仅测"计数器数值对不对"，还要测"用这个
 计数器算出来的对齐填充确实达到了对齐的效果"，这才是这条不变量真正要保证的
@@ -2601,10 +2672,30 @@ CPU 参考实现（§5.18 第 2 步）和生产路径必须共享这条 `K_max==
 ### 5.7 簇内压缩：ladder 结构
 
 ```
-level 0:  B′ 个 entry，每个 w = 1        ← 单 token，不是现在的 2-token 合并
-level ℓ:  B′ 个 entry，每个 w = 2^ℓ
+level 0:        B′ 个 entry，每个 w = 1        ← 单 token，不是现在的 2-token 合并
+level ℓ (< top): B′ 个 entry，每个 w = 2^ℓ
 level ℓ 满（B′ 个）时，成对合并进位到 ℓ+1
+level top（顶层）：例外，见下方
 ```
+
+> **更正（这一轮修的，P2）："每个 w = 2^ℓ" 这条不变量只对非顶层成立，顶层
+> 是例外，原表述没有区分两者。** §5.12 明确顶层是"饱和累加器"，`w` 允许
+> 超过名义的 `2^top`——用 `carry_into_level` 的 `ejected.append`（不放回
+> `combined`，产物直接离开这一层，交给上一层处理）可以证明非顶层的
+> "每个 entry 恰好权重 `2^ℓ`"确实保持：进入某个非顶层 ℓ 的 `incoming`
+> 全部是权重恰为 `2^ℓ` 的 entry（归纳：level 0 的原始 entry 权重恒为 1
+> `=2^0`；`carry_into_level` 只合并同一层内的两个权重相同的 entry，产出
+> 权重翻倍、恰为 `2^(ℓ+1)` 的 entry，作为下一层的 incoming），且这一层
+> 自己的 `combined` 不会被之前已折叠出去的 `ejected` 污染（`ejected` 已经
+> 离开这一层）——所以非顶层"每个 entry 权重恰为 `2^ℓ`"确实是不变量。但
+> 顶层用的是 `saturating_top_carry`，折叠结果**留在原地**继续参与后续
+> 折叠（§5.12"更正第三次"①），权重会持续累积、不再是干净的 `2^top`——
+> 稳定形态是"1 个不断增长的最老 summary entry（权重可以远超 `2^top`）+
+> 至多 `B′-1` 个仍保持权重 `2^top` 的较新 entry"。读取/展开锚点
+> （`dedup_anchors` 等）依赖的是 entry 自带的 `w`/`p_lo`/`p_hi`/`sum_wp`
+> 字段本身，不依赖"权重恰为 `2^level`"这条假设，所以这个例外不影响正确性
+> ——只是这里的文字表述之前没有把它显式排除，容易让读者以为顶层也满足
+> 干净的 `2^ℓ` 规律。
 
 因为路由发生在 flush 时、按到达顺序，**簇内成员序列就是位置序列**，所以 Fenwick
 合并的天然是位置相邻的成员。
@@ -2794,8 +2885,8 @@ Gram 矩阵本就是秩 1 且只有一个非零对角元，幂迭代在这个退
 **`level` 恒为 0，`count` 有闭式公式，两者都不是运行时才决定的自由量**：
 
 ```
-count = (-level_count[cluster, 0]) mod 2^ℓ_block   # 读现有 buffer，不需要新计数器；见下方更正框
-level = 0                                            # 恒定，v1 不支持在别的层直接插 pad
+count = (-level0_phase[cluster]) mod 2^ℓ_block   # 读独立的相位计数器，不是 level_count；见下方更正框
+level = 0                                          # 恒定，v1 不支持在别的层直接插 pad
 ```
 
 **为什么 `level` 恒为 0**：填充遵循"和普通 entry 同一条纪律"（本节开头已经定的
@@ -2850,13 +2941,83 @@ entry 覆盖一个跨度，"插一个空的高层 entry"意味着什么本身就
 > `n_total_c` 保持不变、继续只数真实 token——它是 Ward 代价（§5.6）和 §5.8
 > 空间界要的量，这两处算的是"这个簇的真实内容有多少"，混入 pad 计数会让 Ward
 > 代价虚高（簇看起来比实际更"大"）、让 §5.8 的 `L_c = ⌈log₂(n_total_c/B′+1)⌉`
-> 层数估计虚高——这条边界依然成立，只是不需要为它另开一个计数器来对齐 pad，
-> 复用 `level_count` 就够。
+> 层数估计虚高——这条边界依然成立，与本节讨论的计数器选择无关。
+
+> **更正（这一轮修的，P1，推翻上面这条框的核心结论——"复用 `level_count`
+> 就够"不成立）：`level_count[cluster,0] mod 2^ℓ_block` 在 §5.12 把
+> `carry_into_level` 精确定义之后，不再等于"该簇从建立以来的累积逻辑插入数
+> mod 2^ℓ_block"，上面这条框的等价性证明是基于一个后来被替换掉的进位模型。**
+>
+> 上面框里的证明依赖一句话："每次 level 0 满 `B′` 个触发进位时，`B′ ≡ 0
+> (mod 2^ℓ_block)`，进位不改变这个余数"——这句话隐含的进位模型是"level 满
+> `B′` 个后一次性把整层清空/重置"（一次进位让 resident count 干净地回到某个
+> 固定基准，例如 0 或 1，之后重新从头计数）。但 §5.12 后来把普通逐 token
+> 进位精确定义成了不同的行为：**level 满 `B′` 个后，每次溢出只合并"当前
+> 最老的两个"、留下 `B′-1` 个 + 新到的 1 个，之后 resident count 在
+> `B′-1` 和 `B′` 之间永久振荡，不会再回到比 `B′-1` 更低的值**。用
+> `B′=8, ℓ_block=2`（`2^ℓ_block=4`）代入直接验证：累积插入数从 9 开始，
+> `resident_count` 序列是 `7,8,7,8,7,8,...`，`mod 4` 序列是
+> `3,0,3,0,3,0,...`——只能取 2 个值，而累积插入数 `mod 4` 应该依次取遍
+> `1,2,3,0,1,2,3,0,...` 全部 4 个剩余类。两者从第 9 次插入起就不再相等
+> （`9 mod 4=1` 但 `resident=7`，`7 mod 4=3`），且不只是"暂时分叉"——往后
+> 每隔一次插入就错一次（`10,13,14,17,18,...` 对应的次数上不相等，`11,12,
+> 15,16,...` 上碰巧相等，没有规律可用）。这不是边界条件疏漏，是"resident
+> count 只在两个值之间振荡"这个新进位模型结构性地无法承载"mod K 计数器
+> 应该遍历全部 K 个剩余类"这个需求——**和上面框里修正 `n_total_c` 时的
+> 根因是同一类问题（拿一个语义不匹配的计数器去驱动对齐计算），但这次连
+> "换成 `level_count`"这个此前的修法本身也失效了，因为 `level_count`
+> 赖以正确的进位模型已经被 §5.12 换掉**。
+>
+> **修法：引入一个真正独立、只为这一件事存在的持久计数器
+> `level0_phase: (B,G,K_max) int32`**，取值范围 `[0, 2^ℓ_block)`，语义是
+> "该簇 level 0 逻辑插入流（真实 token + pad，混合计数）的当前相位"，
+> 更新规则只有一条、不依赖任何其它状态：**每次有 1 个 entry（不论真实
+> token 还是 pad）被插入该簇的 level 0，`level0_phase[cluster] ←
+> (level0_phase[cluster] + 1) mod 2^ℓ_block`**——这条规则不依赖 resident
+> count 如何振荡、不依赖 `B′` 和 `2^ℓ_block` 的整除关系，只是老老实实地
+> 数"到目前为止插入了几个"，按定义天然正确。`count = (-level0_phase[
+> cluster]) mod 2^ℓ_block` 补齐 `count` 个 pad 后，`level0_phase` 变成 0；
+> 该新段的第一个真实 token 落地后变成 1；此后每个真实 token +1，直到下
+> 一次新段事件。**这个修法的直接推论：上面"前提要显式校验：`B′` 必须是
+> `2^ℓ_block` 的倍数"这条要求随之作废**——`level0_phase` 的正确性不依赖
+> `B′`/`2^ℓ_block` 的任何关系，§5.21-2 里为这条前提写的 `B′ %
+> (2**ℓ_block) == 0` 运行时校验应当删除，见下方"实现要求"。
+>
+> **三个写入点**（和 `current_segment`/`p_hi_c` 同一模式，见 §5.4"Phase 1
+> 缺持久 segment 状态"一节）：
+> 1. **Phase 3a**（紧跟 Phase 1，向量化，直接复用那里已经算出的
+>    `prev_mod[t]`）：`phase_after[t] = (prev_mod[t] + 1) mod 2^ℓ_block`
+>    对本批每个 direct token 都成立（每个 direct token 恰好贡献 1 次真实
+>    level-0 插入）；对每个本批出现过的簇，取该簇分组内 `rank` 最大（即
+>    到达顺序最晚）的 `t`，把它的 `phase_after[t]` 写回持久
+>    `level0_phase[c*[t]]`——标准 segmented"取组内最后一个"归约，和
+>    `p_hi_c`/`current_segment` 已经在用的归约是同一个原语族（§5.4）。
+>    本批未出现的簇，`level0_phase` 保持不变。
+> 2. **Phase 3b**（内联，逐 orphan 处理）：每处理完一个 orphan 的主操作
+>    （落到新建簇或本批内 Phase 2 自己形成的簇），对该簇的 `level0_phase`
+>    做同一条 `+1 mod 2^ℓ_block` 更新；新建簇初始 `level0_phase=0`（和
+>    `n_eff`/`n_total`/`p_hi_c`/`centroid` 一样，`allocate_new_cluster`
+>    清零的字段列表里加上它），首个成员不需要 `PAD_INSERT`（没有历史可
+>    对齐），落地后变成 1。
+> 3. **`ward_merge_only`**（§5.6）：合并两个既有簇时，`level0_phase` 无法
+>    有意义地"合并"（`a`/`b` 是两条独立的相位历史，不像 `p_hi_c` 取
+>    `max` 那样有自然的合并语义）——合并后直接按重建完毕的
+>    `level_count[keep_slot,0] mod 2^ℓ_block` 重新起算（见 §5.6 步骤 2
+>    新增的一行）。**这不会引入新的正确性问题**：§5.6 早就明确"合并后
+>    两簇的 segment 对齐被破坏，这是可接受的（罕见、预算逼出来的事件）"
+>    ——`level0_phase` 在合并这一刻"重新起算、放弃历史对齐"与这条既有
+>    容忍完全一致，只是把同一容忍显式延伸到相位计数器上，不是新开的口子。
+>
+> **实现要求**：§5.13 buffer 表新增 `level0_phase` 一行（与 `current_segment`
+> 同一档，`(B,G,K_max) int32`）；§5.21-2 删除"`B′` 必须是 `2^ℓ_block` 的
+> 倍数"这条运行时校验（不再是正确性前提），保留 `ℓ_block ∈ {0,1,2}` 校验
+> （理由不变——指数代价和 `OP_max` 聚合假设，与本次修正无关）；`glossary.md`
+> 的"新增 buffer"清单加入 `level0_phase`。
 
 代入前面的表可以直接验证一致性：`ℓ_block=2` 时 `count ∈ {0,1,2,3}`，最坏 `count=3`，
 正好等于"每边界浪费 ≤ `2^ℓ_block−1` = 3"这行——**这条公式和上面代价表用的是同一个
-量，不是巧合，是同一个约束的两种写法**。`count=0` 的情况（`level_count[cluster,0]`
-本来就已经对齐）意味着这次不需要填充，此时不应该产生 `PAD_INSERT` op（省一个
+量，不是巧合，是同一个约束的两种写法**。`count=0` 的情况（`level0_phase[cluster]`
+本来就已经是 0）意味着这次不需要填充，此时不应该产生 `PAD_INSERT` op（省一个
 `OP_max` 名额）。
 
 #### 更深一层：阻断不创造预算，它只是换了合并哪一对
@@ -2995,30 +3156,99 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 >
 > def saturating_top_carry(cluster, incoming_block):
 >     """顶层专用：折叠结果原地并入，不产生需要继续进位的余量。
->     incoming_block 时间序，1..2B′ 个——下界来自普通逐 token 进位（恒为 1，
->     见上面这一轮新增的推导），上界来自 §5.6 Ward 合并在 L_alloc=1（顶层
->     即 level 0）这个退化配置下可能直接注入两个源簇某层的全部原生内容
->     （最多 2B′），两种来源共用同一个函数，不需要调用方先判断走哪条路。"""
+>     incoming_block 时间序，1..3B′ 个——下界来自普通逐 token 进位（恒为 1，
+>     见上面这一轮新增的推导），上界见下方"更正（第三次）"，不是 2B′。"""
 >     existing = read_level(cluster, top)
 >     combined = list(existing) + list(incoming_block)
 >     while len(combined) > B′:
 >         merged = merge(combined[0], combined[1])
->         combined = combined[2:] + [merged]                  # 折叠结果放回队尾，不是放回
->                                                                 # 队首——如果放队首，下一轮的
->                                                                 # combined[0]/[1] 会立刻又把它
->                                                                 # 连下一个原始 entry 一起折进
->                                                                 # 去，变成链式合并（1 个 entry
->                                                                 # 吸收 3 个、4 个……原始成员），
->                                                                 # 不再是"每两个配对"，破坏
->                                                                 # §5.7 承诺的分辨率梯度
+>         combined = [merged] + combined[2:]                   # 折叠结果放回队首，不是放回
+>                                                                 # 队尾——见下方"更正（第三次）"，
+>                                                                 # 放队尾会让较新的原始 entry
+>                                                                 # 排到较老 summary 前面，破坏
+>                                                                 # 时间序；放队首则合并结果
+>                                                                 # （代表目前为止最老的内容）
+>                                                                 # 继续留在最老的位置，下一轮
+>                                                                 # 自然地把它和次老的一项接着
+>                                                                 # 折叠——链式合并在顶层是
+>                                                                 # 正确、被期待的行为，不是
+>                                                                 # 要避免的缺陷，见下方说明
 >     write_level(cluster, top, combined)                      # <= B′，全部原始内容都还在
 >     level_count[cluster, top] = len(combined)                 # （直接保留或已折叠），没有
 >                                                                  # 任何一条被丢弃
 > ```
 >
-> **循环保证终止**：每轮迭代 `combined` 长度严格减少（`carry_into_level`
-> 每轮 -2，`saturating_top_carry` 每轮 -1），下界是 `B′`，起始上界 `2B′`，
-> 所以两个循环都在**至多 `B′` 轮**内结束，不存在死循环风险。
+> **更正（这一轮修的，P1，第三次——修的是第二次自己引入的两个新 bug，不是
+> 推翻第二次的核心结论）：`saturating_top_carry` 把折叠结果放回队尾会破坏
+> 时间序，且这个函数被喂到的 `incoming_block` 实际上界不是 `2B′` 而是
+> `3B′`。两处分开说明。**
+>
+> **① 队尾 vs 队首。** 用 `B′=8`、13 个原始 raw item（时间序 1..13，`existing`
+> 为空）代入原队尾版本手算：第一轮 merge(1,2)=M12，`combined = [3..13] +
+> [M12]`；重复 5 轮后收敛到 `[11,12,13, M12,M34,M56,M78,M910]`——**较新的
+> 原始 item（11,12,13）排在数组最前面，而覆盖最老内容的 M12 反而被挤到中间
+> 靠后**，直接违反 §5.7"簇内成员序列就是位置序列"这条贯穿全文、被反复引用
+> 的不变量。更严重的是这个错误会**复合**：若这层随后又收到新的 incoming
+> （如 `[14,15]`），下一次调用会从"当前数组"的 `combined[0],combined[1]`
+> （此时是 13、M12）开始折叠，产出一个 `p_lo=1,p_hi=13,w=3` 的 entry——
+> 它的跨度声称覆盖 item 1 到 13 的全部范围，但实际只包含其中 3 个原始
+> item（1、2、13），3-12 之间的内容分散在数组别处，读出锚点 `p_mid`
+> 因此可能落在一个这个 entry 根本没有真实内容的位置。**修法：折叠结果放回
+> 队首而非队尾**（`combined = [merged] + combined[2:]`）。用同样的 13 项
+> 输入验证：`[merged] + combined[2:]` 每轮都把新产出的 summary 放回最老
+> 的位置，5 轮后收敛到 `[M123456(覆盖1-6,w=6), 7,8,9,10,11,12,13]`——
+> **前后 entry 之间 `p_hi < 下一个 p_lo` 恒成立，跨度连续、不重叠、不
+> 交错，且后续无论追加多少批新 incoming，这个性质都保持**（已用两轮
+> 合成数据验证，第二轮追加 `[14,15]` 后仍收敛到
+> `[M12345678(1-8,w=8),9,...,15]`，同样连续无重叠）。
+>
+> **这个修法同时纠正了第二次修法里一个更深层的设计误判，而不只是修一个
+> 局部 bug**：第二次的队尾注释把"避免链式合并"当成目标，理由抄自
+> `carry_into_level`（非顶层）——但那条理由对顶层不成立。§5.12 开头就明确
+> 说"顶层 entry 的 `w` 允许超过名义的 `2^L`，继续吸收进位"，这句话字面
+> 意思就是顶层的合并**应该**链式发生（否则任何一次干净的 2 对 1 合并产出
+> 的权重恰好是 `2^top`，不会"超过名义"）。队首版本的实际行为——数组稳定
+> 收敛成"恰好 1 个不断增长的最老 summary entry + 至多 `B′-1` 个仍未合并的
+> 较新原始 entry"——正是"饱和累加器"这个名字字面描述的行为，比队尾版本
+> （试图避免链式，结果既没避免成功、又破坏了时间序）更贴合 §5.12 本来的
+> 设计意图。`carry_into_level`（非顶层）不受这条影响、维持原状——它的
+> `ejected.append(merged)`（不放回 `combined`）从一开始就不存在"队首/
+> 队尾"的选择，折叠产物直接进独立的 `ejected` 列表，且已验证该列表本身
+> 天然保持时间序（见下面第②点的推导过程，非顶层每层仍然维持"每个 entry
+> 权重恰为 `2^ℓ`"这条不变量，§5.7 的表述对非顶层依然成立，只有顶层例外，
+> 见 §5.7 的更正框）。
+>
+> **② `incoming_block` 的真实上界是 `3B′`，不是 `2B′`。** 第二次修法的
+> 注释写"上界来自 Ward 合并...最多 `2B′`"，只算了 `native_ℓ`（两个源簇
+> 各自在该层原有内容，各 `≤B′`，合计 `≤2B′`）这一项，漏了 `incoming =
+> native_ℓ + ejected`（§5.6 步骤 2）里的第二项——上一层级联下来的
+> `ejected`。对 `carry_into_level` 反复代入递推 `E(ℓ) = ⌈(B′+E(ℓ-1))/2⌉`
+> （`E(-1)=0`，`native_ℓ` 按最坏 `2B′` 代入）验证：`B′=8` 时
+> `E(0)=4,E(1)=6,E(2)=7,E(3)=8`，**从第 4 层起精确稳定在 `E=B′=8`，不是
+> 渐近逼近**（整数上取整的缘故，收敛速度比连续情形快）——而 `L_alloc`
+> 在 32k 参考配置下是 11，远超过 4 层，所以 `ejected` 递归级联到顶层时
+> **确定**已经饱和到 `B′`，顶层 `incoming = native_top(≤2B′) + ejected
+> (=B′) = 3B′`，不是 `2B′`。**这条修正同时解释了①的双计数 bug 为什么
+> 更危险**：`ward_merge_only` 若不清空 `keep_slot`（见下面 §5.6 的更正框），
+> `existing` 还会在 `3B′` 之上再叠加最多 `B′`，实际峰值能到 `4B′`，超出
+> 矩形 buffer 单层容量 `B′` 的假设更多。
+>
+> **这条修正只影响 `saturating_top_carry` 的迭代轮数上界，不影响
+> `carry_into_level` 的既有结论**：`carry_into_level` 每轮 `-2`，
+> `n≤3B′` 时迭代数 `=⌈(3B′-B′)/2⌉=B′`，和"至多 `B′` 轮"这个已经写出的
+> 结论**恰好依然成立**（`⌈2B′/2⌉=B′` 不受"起始上界从 `2B′` 改成 `3B′`"
+> 影响，纯属该轮式子里 `/2` 吸收了这个差异，不是巧合的凑数，是
+> `carry_into_level` 本来就比 `saturating_top_carry` 多一倍的收缩速度）。
+> `saturating_top_carry` 每轮只 `-1`，`n≤3B′` 时迭代数
+> `=3B′-B′=2B′`，**不是 `B′`**——下面的"循环保证终止"改写成分别陈述
+> 两个函数的准确轮数，不再共用一个数字。
+>
+> **循环保证终止**：每轮迭代 `combined` 长度严格减少，下界是 `B′`。
+> `carry_into_level`（每轮 `-2`）在 `n≤3B′` 时**至多 `B′` 轮**内结束；
+> `saturating_top_carry`（每轮 `-1`）在 `n≤3B′` 时**至多 `2B′` 轮**内结束。
+> 两者都是有限、和输入无关的静态上界（只依赖 `B′`，不依赖数据），不存在死循环
+> 风险，`saturating_top_carry` 只是常数上比 `carry_into_level` 松一倍，不影响
+> 它是静态可预算这一结论本身。
 >
 > **普通逐 token append 现在写成对 `carry_into_level` 的驱动循环**（取代
 > 上一版从未给出、只在别处被引用的 `append_to_ladder` 内部实现）：
@@ -3067,17 +3297,36 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 >    未经任何折叠的原始 token（因为循环从未触发）。
 >  2. **顶层持续饱和**：在场景 1 基础上继续注入远超 `L_alloc·B′` 个 token，
 >    强制顶层反复折叠，断言折叠之后 `level_count[cluster,top]` 恒为 `B′`
->    （从"第一次达到 `B′`"那一刻起再也不变），且折叠是**两两配对**而非链式
->    （构造能区分两者的合成数据，比如断言任意一个顶层 entry 的 `w` 都不超过
->    `2×(触发这次折叠时刻的最大既有 entry 权重)`——链式合并会让个别 entry 的
->    `w` 远超这个界）。
->  3. **Ward 合并注入奇数/非 `B′` 宽的进位**：构造两个源簇，在同一层的
->    entry 数之和减去 `B′` 后是奇数（如 `B′=8`，源簇分别 8 个、5 个），验证
->    合并后目标簇该层 `level_count` 与用 `pad_mask`/`w>0` 独立统计出的真实
->    占用数一致，且级联到顶层时（如果确实级联到顶层）`saturating_top_carry`
->    正确处理非 `B′` 宽的输入，不因 shape 不匹配报错。
+>    （从"第一次达到 `B′`"那一刻起再也不变）。**更正（这一轮修的）：不再
+>    断言"两两配对而非链式"——上面"更正（第三次）①"已经说明顶层链式合并
+>    是正确、被期待的行为，旧断言测的是错误的性质，删掉。改为断言真正
+>    重要的三条不变量**：(a) **span 连续不重叠**——数组里任意相邻两个
+>    entry 满足 `combined[i].p_hi < combined[i+1].p_lo`；(b) **时间序**
+>    ——`combined` 里每个 entry 的 `p_lo`（进而 `p_hi`）严格左小右大，
+>    不出现"较新内容排在较老 summary 前面"这类倒置；(c) **总权重守恒**
+>    ——`Σ w`（顶层全部 entry）+ recent window 的精确 token 数，逐时刻
+>    精确等于这个簇迄今收到的真实 token 总数，折叠只改变分辨率、不丢弃
+>    任何内容。用类似 Python 参考实现直接跑一遍多轮注入（含跨越多次
+>    `saturating_top_carry` 调用）验证这三条，而不是构造单个反例。
+>  3. **Ward 合并注入奇数/非 `B′` 宽的进位，且级联到顶层触达 `3B′` 上界**：
+>    构造两个源簇，在同一层的 entry 数之和减去 `B′` 后是奇数（如 `B′=8`，
+>    源簇分别 8 个、5 个），验证合并后目标簇该层 `level_count` 与用
+>    `pad_mask`/`w>0` 独立统计出的真实占用数一致；**另需一组独立的构造
+>    专门触达上面"更正（第三次）②"证明的 `incoming≤3B′` 上界本身**（例如
+>    `B′=8`、`L_alloc≥5`，两个源簇在每一层都恰好各有 `B′` 个 entry，逐层
+>    级联足够多层后 `ejected` 应精确稳定在 `B′`，断言顶层最终收到的
+>    `incoming` 长度确实达到 `3B′=24` 且 `saturating_top_carry`/
+>    `carry_into_level` 都能正确处理，不因 shape/越界假设报错）。
+>  4. **`ward_merge_only` 不重复计入 `keep_slot` 的合并前内容**（见下方
+>    §5.6 的更正框）：构造 `keep_slot` 自己在某一层已有非空内容的合并场景
+>    （不是"keep_slot 该层为空、只有 free_slot 有内容"这种平凡情形——那种
+>    情形即使有 bug 也不会被测出来），合并后断言：(a) 该层总权重
+>    `Σw` 精确等于 `a` 该层原有权重 `+` `b` 该层原有权重（不多不少，双计数
+>    会让它变成 `a+a+b` 或类似的错误值）；(b) 用参考实现（不复用生产
+>    `ward_merge_only`，独立按"snapshot→clear→用 snapshot 重建"手写一遍）
+>    做逐 entry 对拍。
 >
->  三类场景都要求：forward 路由与 op_log replay 产出的对应层 entry 做
+>  四类场景都要求：forward 路由与 op_log replay 产出的对应层 entry 做
 >  **完整字段元组**逐位/容差对拍（`k̄_raw/v̄/w/p_lo/p_hi/sum_wp` 逐位，rank-1
 >  统计容差内，参照 §5.4"必须补的单测"已经确立的比较口径）。
 
@@ -3098,7 +3347,8 @@ L_alloc = ⌈log₂( N / (K_max · B′) + 1 )⌉ + δ        # δ = 2~3 安全�
 |---|---|---|---|
 | `centroid` | `(B,G,K_max,d)` | fp32 | 语义身份，路由用 |
 | `n_eff` | `(B,G,K_max)` | **fp32** | centroid 混合权重。**必须浮点**——`γ` 衰减会产生非整数。**只喂 §5.5 的 centroid 更新，不进 Ward 代价**（§5.5/§5.6 的更正框）|
-| `n_total` | `(B,G,K_max)` | int32 | 簇的真实物理规模（**只数真实 token，不含 pad**），单调不减、从不衰减。**Ward 代价（§5.6）和 §5.8 的空间界都用这个**。`§5.11` 的 `PAD_INSERT` 对齐**不用这个**，直接读 `level_count[cluster,0]`，见 §5.11 的更正框 |
+| `n_total` | `(B,G,K_max)` | int32 | 簇的真实物理规模（**只数真实 token，不含 pad**），单调不减、从不衰减。**Ward 代价（§5.6）和 §5.8 的空间界都用这个**。`§5.11` 的 `PAD_INSERT` 对齐**不用这个**，也不用 `level_count[cluster,0]`（两者都在 §5.11 的更正框里被证明不适用），改用独立的 `level0_phase` |
+| `level0_phase` | `(B,G,K_max)` | int32 | 该簇 level 0 逻辑插入流（真实 token + pad 混合计数）的当前相位，取值 `[0, 2^ℓ_block)`。每次 level 0 收到 1 个 entry（真实或 pad）`+1 mod 2^ℓ_block`。**`PAD_INSERT` 的 `count` 唯一依据**（§5.11），不能用 `level_count[cluster,0]`——`carry_into_level`（§5.12）精确定义后 resident count 会在 `B′-1`/`B′` 间振荡，不再遍历全部剩余类。写入点：Phase 3a/3b 逐簇更新（同 `current_segment`），`ward_merge_only` 合并时重置为 `level_count[keep_slot,0] mod 2^ℓ_block`（历史相位随段对齐一起被合并打断，是既有容忍，不是新问题）|
 | `p_hi_c` | `(B,G,K_max)` | int32 | 该簇最近一次收到成员的位置（join cost + segment 判定）|
 | `current_segment` | `(B,G,K_max)` | int32 | 该簇当前最新的 segment id，下一次开新段用 `current_segment+1`（见 §5.4"Phase 1 缺持久 segment 状态"一节）。**写入点和 `p_hi_c` 同一档**：Phase 3a（紧跟 Phase 1，向量化）/3b（内联进 Phase 2）逐簇更新，不是批末统一写入，见 §5.4"Phase 3 拆成 3a/3b"一节；`ward_merge_only` 合并时取 `max` |
 | `alive` | `(B,G,K_max)` | bool | 槽位占用。**每个头实际用几个簇可以不同**，`K_max` 只是共享上界 |
@@ -4419,15 +4669,18 @@ if log_kv_seg_block_level not in (0, 1, 2):
         f"{{0,1,2}}——OP_max 的 PAD_INSERT 聚合假设、§5.11 的槽位预算表都只在这个"
         f"范围内成立，更大的值只能用于 Stage 0 离线扫描"
     )
-if log_kv_cluster_entries % (2 ** log_kv_seg_block_level) != 0:
-    raise ValueError(
-        f"log_kv_cluster_entries (B'={log_kv_cluster_entries}) 必须是 "
-        f"2**log_kv_seg_block_level ({2 ** log_kv_seg_block_level}) 的倍数——"
-        f"§5.11 的 PAD_INSERT 对齐公式直接读 level_count[cluster,0] 而不维护独立的"
-        f"累积计数器，这个等价关系的前提就是 B' 整除 2**ℓ_block，默认组合"
-        f"（B'=8, ℓ_block∈{{0,1,2}}）天然满足，覆盖 B' 时必须一并检查"
-    )
 ```
+
+> **更正（这一轮修的，P1）：上面这条 `B' % (2**ℓ_block) == 0` 校验已删除，
+> 不再是正确性前提。** 它原本存在的理由是"§5.11 的 `PAD_INSERT` 对齐公式
+> 直接读 `level_count[cluster,0]`，这个等价关系依赖 `B'` 整除
+> `2**ℓ_block`"——但 §5.11 的更正框已经证明这个等价关系本身不成立
+> （`carry_into_level` 精确定义后，`level_count` 会在 `B′-1`/`B′` 间
+> 振荡，无论 `B'` 是否整除 `2**ℓ_block` 都一样），`PAD_INSERT` 因此改用
+> 独立计数器 `level0_phase`（每次插入 `+1 mod 2^ℓ_block`，定义上不依赖
+> `B'`/`2^ℓ_block` 的任何数论关系）。覆盖 `B'` 时不再需要这条校验，`ℓ_block
+> ∈ {0,1,2}` 校验保留（理由不变：指数代价与 `OP_max` 聚合假设，与 `B'`
+> 无关）。
 
 **Stage 0 的 S0.0 豁免于这条校验**：S0.0 扫 `(g_max, ℓ_block)`（§7）是在 dump 出来
 的 `k_raw` 上做纯 CPU/NumPy 模拟，复现簇/段边界的计数逻辑，**完全不经过 `op_log`
