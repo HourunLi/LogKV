@@ -99,7 +99,19 @@ class RunningKeyScale:
 
 
 class Stage0DumpRecorder:
-    """Duck-typed recorder attached to selected attention layers during dump."""
+    """Duck-typed recorder attached to selected attention layers during dump.
+
+    ``save_dtype`` defaults to ``"float32"``: ``key_scale``/``value_scale``
+    (``RunningKeyScale``, above) always accumulate ``s_h``/``vh`` in fp32 from
+    the pre-quantization tensor, before ``record_pre_rope`` ever casts to
+    ``save_dtype`` for storage. Saving at ``float16`` would make routing (which
+    reads the saved, quantized k/v back off disk) diverge from the scale the
+    threshold ``lambda_new = lambda_rel * s_h`` was calibrated against -- fp16
+    rounding noise near the threshold boundary can flip a cluster assignment
+    that the fp32-calibrated threshold never saw. ``float16`` is still
+    supported for callers that explicitly accept that risk (e.g. a quick
+    smoke test where storage size matters more than exact routing).
+    """
 
     def __init__(
         self,
@@ -110,7 +122,7 @@ class Stage0DumpRecorder:
         layers: set[int],
         key_scale: RunningKeyScale,
         value_scale: RunningKeyScale,
-        save_dtype: str = "float16",
+        save_dtype: str = "float32",
         compressed: bool = False,
     ) -> None:
         self.output_dir = Path(output_dir)

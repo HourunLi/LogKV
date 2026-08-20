@@ -58,28 +58,63 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 **v3.1 的核心转变**：时序打断不再 fork 出新的**簇**，而是在同一个簇下开一个新的
 **segment**。簇只负责语义身份（一个 centroid，用于路由），segment 负责存储局部性。
 
-**当前阶段：设计与算法规格已完成（§5），代码尚未开始写。**
+**当前阶段：设计与算法规格已完成（§5），Stage 0 的 S0.0 级 k/v dump + sweep
+工具链已落地，Stage 1（生产实现）尚未开始。**
 
 > **务必读清楚这句话字面的意思，不要被下面大段的伪代码/公式/`raise
-> ValueError(...)` 片段误导。** `litgpt/`、`tests/` 里不存在
-> `log_kv_semantic_clusters`、`op_log`、`current_segment` 等任何本文档描述
-> 的字段或分支——可以用 `grep -rn log_kv_semantic_clusters litgpt/ tests/`
+> ValueError(...)` 片段误导，也不要把"Stage 0 有代码了"误读成"设计已经在
+> 生产路径里落地"。** `litgpt/log_kv_cache.py`（现有位置分桶实现）与
+> `litgpt/model.py` 的流式路径**不存在** `log_kv_semantic_clusters`、
+> `op_log`、`current_segment` 等任何本文档描述的字段或分支——可以用
+> `grep -rn log_kv_semantic_clusters litgpt/log_kv_cache.py litgpt/model.py`
 > 自行验证，应该零匹配。`LogKVStreamTrainingAttention` 这个类名确实在
 > `litgpt/log_kv_cache.py`/`litgpt/model.py` 里存在，但那是它在语义簇设计
 > 之前、位置分桶时代就有的版本，本文档在它之上设计的改动尚未落地。变更记录
 > （§14）里反复出现的"更正""这一轮修的""P0/P1"，改的都是**这份规格文本
 > 自身的逻辑漏洞**——两处描述互相矛盾、一条公式在某个边界条件下算错、一个
-> 反例说明某条规则不成立——不是已经在跑的代码里发现的 bug。**连 Stage 0
-> 的 dump 脚本（§5.21-5，本项目该写的第一行代码）都还没有写**，Stage 1
-> （生产实现）完全没有开始。
+> 反例说明某条规则不成立——不是已经在跑的代码里发现的 bug。
+>
+> **已经写好的是 Stage 0 dump 规格里 mechanism A（k/v）那一半，且只覆盖
+> S0.0 这一档，不是完整的 Stage 0 dump 脚本。** `litgpt/semantic_s0.py`
+> （可复用的纯函数：DP-means 路由、ladder 模拟、entry 统计，均带单测
+> `tests/test_semantic_s0.py`）+ `unused/semantic_stage0_dump.py`（k/v dump
+> CLI，`tests/test_semantic_stage0_dump.py`）+ `unused/semantic_s0_sweep.py`
+> （`(g_max, ℓ_block)` sweep CLI，`tests/test_semantic_s0_sweep.py`）+
+> `unused/semantic_s0_export_niah_samples.py`（NIAH 样本导出）+
+> `litgpt/model.py` 里一个 7 行的 duck-typed 钩子（`_semantic_s0_recorder`，
+> 挂在 `CausalSelfAttention.forward` 的 `norm_q`/`norm_k` 之后、
+> `apply_rope` 之前）——这一套工具链实现的是 `experiments.md`"两套机制"
+> 一节里的**机制 A**，够跑 S0.0/S0.1/S0.3–S0.7（以及 S0.2/S0.8 里只依赖
+> k/v 的子项），**不包含机制 B**（post-RoPE q、`attn_mass_by_dist`）、也
+> 不包含 S0.8 3b 需要的 manifest 字段（`tail_query_count`、MinHash 三元组）
+> ——这两块，以及 S0.8 3b 本身、`litgpt/log_kv_position.py`、CPU 参考路由、
+> `CacheAttentionState` 扩展、全部 Stage 1 生产实现，都还没有开始写。
+> 详见 `unused/semantic_stage0_dump.py` 模块 docstring 里的显式 scope 声明。
 
 **下一步（按优先级）**：
 1. **S0.0（§7）：扫 `(g_max, ℓ_block)`。** 全课题最根本的实验——一端是纯语义聚类，
    另一端退化成"连续性约束语义分段"，扫它等于直接回答"收益来自语义分组本身，还是
-   仅仅来自更好的分段边界"。纯 CPU 可测，**排在所有事情之前**。
+   仅仅来自更好的分段边界"。纯 CPU 可测，**排在所有事情之前**。**工具链已落地**
+   （`litgpt/semantic_s0.py` + `unused/semantic_stage0_dump.py` +
+   `unused/semantic_s0_sweep.py`，见 §0 开头的说明）——剩下的是拿真实 checkpoint
+   实际跑一次并读结果，不是再写代码。
 2. Stage 0 其余离线证伪实验（§7）——一次 dump + CPU 分析，决定方案值不值得往下做。
-   **S0.8 的 3b 项是这一步内部的例外**：它额外需要 `litgpt/log_kv_position.py`
-   （下一项）、§5.4/§5.18 第 2 步的 CPU 参考路由、以及
+   **第 1 项同一套 k/v 工具链目前直接覆盖到的是 S0.4（`token_weighted_key_var`/
+   `token_weighted_value_var`，已在 `SweepAccumulator` 里）、S0.5（`entry_span_*`，
+   同上）、以及 S0.2 口径①（unclipped 纯 DP-means K_eff，`route_dpmeans_segments`
+   传 `g_max=inf` 即可，因为它结构上没有 `η` 参数、`g_max=inf` 又天然关掉
+   `γ`；但目前只覆盖单一长度，"n 从 1k 到 32k 扫一条曲线"这一步还没有配套的
+   驱动脚本）**。**S0.1（`log_kv_position.py` 的纯 CPU 单测）、S0.3（needle
+   隔离率，需要把 needle span 和已有的 entry 归属交叉统计，逻辑还没写）、
+   S0.6（锚点去重 `E[M]`，需要 `p_lo/p_hi/p_mid`/去重逻辑，`semantic_s0.py`
+   完全没有）、S0.7（supersession 判定）、S0.2 口径②（生产三路路由，需要
+   `η`，`route_dpmeans_segments` 结构上不支持）都还没有实现**。**S0.8 全部
+   三项都还没法跑，不只是 3b**——它比较的是"批量近似路由 vs 严格串行参考"，
+   `semantic_s0.py` 的 `route_dpmeans_segments` 只是**严格串行**那一侧的参考
+   实现，§5.4 的批量近似路由（Phase 1/2/3 向量化、冻结 centroid）完全没有
+   对应代码，缺了另一侧就无法算任何分歧率。3b 额外还需要 `litgpt/log_kv_
+   position.py`（下一项）、§5.4/§5.18 第 2 步的 CPU 参考路由（严格串行路由
+   已有雏形，但还没接上 anchor/ladder 的完整 attention 读出比较）、以及
    `log_kv_slot_attention()`/`get_attention_state()` 按 §5.14/§5.20-B 扩展出的
    `CacheAttentionState`/`slot_valid`/`M_s` 先落地——这三块是让 3b 这个决策门本身
    可信的最小基础设施（CPU 参考路由是测试脚手架；`CacheAttentionState` 的扩展
@@ -96,7 +131,8 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
    的 §11。**
 
 > **实际的第 0 步是 Stage 0 的 dump 脚本**（规格见 `experiments.md`）——它是上面第 1、2
-> 项全部结论的输入，应当是本项目写的第一段代码。
+> 项全部结论的输入，是本项目写的第一段代码。**这一步（mechanism A / k/v 部分）
+> 已经写完**（见 §0 开头的说明），机制 B 和 S0.8 3b 需要的字段仍未落地。
 
 ## 1. 背景：为什么从位置分桶转向语义分簇
 
@@ -494,6 +530,79 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-20｜第二十六轮：Stage 0 的 S0.0 级 k/v dump + sweep 工具链已经落地
+  （`litgpt/semantic_s0.py`、`unused/semantic_stage0_dump.py`、`unused/
+  semantic_s0_sweep.py`、`unused/semantic_s0_export_niah_samples.py`，各带
+  单测），入口文档"代码尚未开始写"的措辞随之过时，本轮修正范围声明；同时把
+  dump 的 `--save_dtype` 默认值从 `float16` 改成 `float32`，消除 `s_h`/`vh`
+  标定精度与实际路由输入精度不一致的风险；清理两处遗留的 EOF 空行。** 动机：
+  用户对照最新代码库核实，指出入口文档的"未实现"声明已经和 `semanticLogKV`
+  分支上新落地的代码脱节，另加一处默认 dtype 组合会让阈值附近的簇分配翻转的
+  风险，以及两处 `git diff --check` 报出的格式问题。逐条结论：
+  ① **P1：CLAUDE.md §0、`algorithm-spec.md` 顶部仍说"代码尚未开始写""连
+  Stage 0 的 dump 脚本都还没有写"，但 `semanticLogKV` 分支已经新增了一整套
+  Stage 0 S0.0 工具链。** 核对代码库确认新增了 `litgpt/semantic_s0.py`
+  （DP-means 路由、ladder 模拟、entry 统计等纯函数，`tests/test_semantic_
+  s0.py`）、`unused/semantic_stage0_dump.py`（k/v dump CLI，`tests/
+  test_semantic_stage0_dump.py`）、`unused/semantic_s0_sweep.py`（`(g_max,
+  ℓ_block)` sweep CLI，`tests/test_semantic_s0_sweep.py`）、`unused/
+  semantic_s0_export_niah_samples.py`（NIAH 样本导出）、以及 `litgpt/
+  model.py` 里一个 7 行的 duck-typed 钩子（`_semantic_s0_recorder`）。**但
+  这套工具链只实现了 Stage 0 dump 规格的机制 A（k/v），不触碰
+  `litgpt/log_kv_cache.py`，不引入 `log_kv_semantic_clusters`/`op_log` 等
+  任何生产字段**——"本节描述的生产实现 100% 是设计规格"这句话本身仍然成立，
+  过时的只是"连 Stage 0 dump 脚本都没有"这个具体举例。**修法**：CLAUDE.md
+  §0 重写现状声明与"下一步"清单，精确列出已覆盖（S0.0 全部；S0.4/S0.5 的
+  方差与跨度统计；S0.2 口径①的 unclipped K_eff，因为 `route_dpmeans_
+  segments` 结构上没有 `η` 参数、传 `g_max=inf` 天然关掉 `γ`）与未覆盖
+  （S0.1/S0.3/S0.6/S0.7、S0.2 口径②、**S0.8 全部三项**——不只 3b，因为
+  `semantic_s0.py` 的路由只是严格串行参考那一侧，§5.4 的批量近似路由完全
+  没有对应代码，缺一侧就无法算任何分歧率）；`algorithm-spec.md` 顶部同步
+  加更正框，精确到"机制 A 已写，机制 B 和生产实现未写"。**没有夸大覆盖
+  范围**：核对 `litgpt/semantic_s0.py` 确认它不含任何 `p_mid`/锚点去重/
+  supersession 逻辑，S0.6/S0.7 不能被现有代码回答。
+  ② **P1/P2：`unused/semantic_stage0_dump.py` 的模块 docstring 只说"Dump
+  pre-RoPE k/v tensors for SemanticLogKV Stage-0 analyses"，读起来像完整
+  Stage 0 dump 脚本，但 manifest（`_manifest`/`main()` 里构造的那部分）只有
+  `key_scale`/`value_scale`/`samples`（k/v 路径、needle span、基础信息），
+  没有机制 B 的 `attn_mass_by_dist`，也没有 `experiments.md`"落盘格式"一节
+  钉死的 `tail_query_count`、MinHash 三元组（`hash_algorithm`/`k`/
+  `master_seed`）。** **决定不去实现机制 B**（需要先有 CPU 参考路由和
+  `CacheAttentionState`/`log_kv_slot_attention` 扩展，属于更大的 Stage 1
+  相邻投入，超出这一轮"文档-实现一致性"的范围）——**改用审查建议的第一个
+  选项：把脚本明确标注为 S0.0/机制 A 专用**。`semantic_s0.py` 的模块
+  docstring 本来就已经写"S0.0 sweep"，问题主要在 `semantic_stage0_dump.py`
+  这一侧：补了一段显式 scope 声明（"implements mechanism A only ...
+  sufficient for S0.0-S0.7 ... does not implement mechanism B ... not yet
+  implemented anywhere in this repo"），并在 CLAUDE.md/algorithm-spec.md
+  的说明里同步指向这段声明，不做代码层面的更大改动。
+  ③ **P2：dump 默认 `--dtype bf16` + `--save_dtype float16`，但 `s_h`/`vh`
+  标定用的是落盘前的 fp32 值，实际路由读的却是落盘后的 fp16 值，阈值附近
+  可能翻转 cluster assignment。** 核对确认：`Stage0DumpRecorder.record_
+  pre_rope`（`litgpt/semantic_s0.py`）里 `key_scale.update(layer, k_f32)`/
+  `value_scale.update(layer, v_f32)` 在类型转换成 `save_dtype` **之前**执行，
+  即标定永远吃 fp32；而 `unused/semantic_s0_sweep.py` 的 `_manifest_sh`/
+  `route_dpmeans_segments` 读的是 `.npz` 里已经量化过的数组。fp16 的量化
+  噪声在 `d2 = ‖centroid − x‖²` 逼近 `λ_new` 的边界上，完全可能让本该分进
+  同一簇/不同簇的 token 翻转——这不是理论风险，是标定值和被标定对象来自
+  两个不同精度的数据源这一结构性错配。**修法**：`--save_dtype` 默认值从
+  `float16` 改成 `float32`（`unused/semantic_stage0_dump.py` 的 CLI 定义、
+  `litgpt/semantic_s0.py` 的 `Stage0DumpRecorder.__init__` 签名默认值都要
+  改，后者是防御性的，避免有调用方绕过 CLI 直接实例化这个类时踩同一个坑），
+  `float16` 仍保留为显式选项（接受这个风险换存储体积的场景），CLI
+  help/类 docstring 都加了这个精度错配的说明。**没有选择"按落盘后的数组
+  重算 manifest scale"这条路**——那样标定值会依赖落盘精度这个实现细节，
+  且需要在 dump 脚本里多一次转换/重算，默认改 fp32 更直接、也是唯一让
+  "标定依据"和"实际路由输入"天然对齐的做法，不引入新的复杂度。检查确认
+  两处默认值都没有被现有测试依赖（`tests/test_semantic_s0.py`/`tests/
+  test_semantic_stage0_dump.py` 都不涉及 `save_dtype`），改动安全。
+  ④ **P3：`git diff --check origin/logKV...HEAD` 报两处"new blank line at
+  EOF"**（`tests/test_semantic_s0.py:364`、`unused/semantic_stage0_
+  dump.py:380`）。**修法**：去掉两个文件末尾多出的空行，纯格式问题。
+  用户同时确认 `python -m py_compile` 对新增脚本全部通过；本地临时环境
+  没有 `torch`/`numpy`/`pytest`，无法跑 `pytest`，这一轮同样只做静态核对
+  （`py_compile` + 逐行读代码），没有条件补跑测试套件。
 
 - **2026-08-20｜第二十五轮核实：推翻"`CacheAttentionState` 是纯加法式改动"这句话，
   统一 `K_max=1` 的定位为单簇消融参考点（不是数值锚点），把"逐层×逐头"这条贯穿性
