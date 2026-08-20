@@ -2,16 +2,19 @@ import math
 
 import numpy as np
 import pytest
+import torch
 
+from litgpt.log_kv_cache import LogStructuredKVCache
 from litgpt.semantic_s0 import (
     RouteResult,
     RunningKeyScale,
     Stage0DumpRecorder,
     SweepAccumulator,
     route_dpmeans_segments,
-    route_position_single_ladder,
+    route_single_cluster_bprime_ladder,
     simulate_segment_ladders,
     summarize_entries,
+    vanilla_logkv_entries,
 )
 
 
@@ -73,12 +76,14 @@ def test_route_dpmeans_accepts_boundary_g_max_values() -> None:
     route_dpmeans_segments(k, lambda_new=1.0, g_max=math.inf, gamma=0.5)
 
 
-def test_route_position_single_ladder_is_one_sequential_cluster() -> None:
-    # The S0.4 baseline router: no clustering at all, every token in arrival
-    # order under cluster 0 / segment 0 -- matches vanilla position-bucketed
-    # LogKV, unlike even route_dpmeans_segments(g_max=inf) which is still
-    # semantic DP-means.
-    route = route_position_single_ladder(5)
+def test_route_single_cluster_bprime_ladder_is_one_sequential_cluster() -> None:
+    # A single-cluster, same-B' position-order CONTROL for isolating what
+    # semantic clustering contributes -- NOT the vanilla/existing LogKV
+    # reference (that is vanilla_logkv_entries, tested below): this has no
+    # recent-window carve-out and inserts single raw tokens (w=1) at level 0,
+    # matching the *new* semantic-cluster ladder's mechanics, not vanilla's
+    # real w=2 pairing. See route_single_cluster_bprime_ladder's docstring.
+    route = route_single_cluster_bprime_ladder(5)
     assert route.cluster_ids.tolist() == [0, 0, 0, 0, 0]
     assert route.segment_ids.tolist() == [0, 0, 0, 0, 0]
     assert route.cluster_count == 1
@@ -86,8 +91,8 @@ def test_route_position_single_ladder_is_one_sequential_cluster() -> None:
     assert route.cluster_sizes == [5]
 
 
-def test_route_position_single_ladder_empty_input() -> None:
-    route = route_position_single_ladder(0)
+def test_route_single_cluster_bprime_ladder_empty_input() -> None:
+    route = route_single_cluster_bprime_ladder(0)
     assert route.cluster_ids.tolist() == []
     assert route.segment_ids.tolist() == []
     assert route.cluster_count == 0
@@ -95,7 +100,7 @@ def test_route_position_single_ladder_empty_input() -> None:
     assert route.cluster_sizes == []
 
 
-def test_route_position_single_ladder_matches_binary_carry_reference() -> None:
+def test_route_single_cluster_bprime_ladder_matches_binary_carry_reference() -> None:
     # Feeding the single-cluster route through simulate_segment_ladders must
     # reduce to exactly the same b_prime binary-carry construction as the
     # dedicated LogStructuredKVCache-equivalence test below (see
@@ -103,9 +108,122 @@ def test_route_position_single_ladder_matches_binary_carry_reference() -> None:
     # exactly b_prime members land as b_prime still-unmerged, single-member
     # entries relocated to level 1, not merged pairs.
     b_prime = 4
-    route = route_position_single_ladder(b_prime)
+    route = route_single_cluster_bprime_ladder(b_prime)
     entries, _ = simulate_segment_ladders(route, b_prime=b_prime, l_block=0)
     assert sorted(e.members for e in entries) == [[0], [1], [2], [3]]
+
+
+def test_vanilla_logkv_entries_no_compaction_below_recent_size() -> None:
+    entries, meta = vanilla_logkv_entries(3, b=4, recent_size=4)
+    assert entries == []
+    assert meta["recent_count"] == 3
+    assert meta["compactable_token_count"] == 0
+
+
+def test_vanilla_logkv_entries_even_overflow_pairs_oldest_first() -> None:
+    # T=12, recent_size=4 -> overflow=8 (even): tokens 0..7 compacted as 4
+    # consecutive pairs, tokens 8..11 stay exact in the recent window.
+    entries, meta = vanilla_logkv_entries(12, b=4, recent_size=4)
+    assert meta["recent_count"] == 4
+    assert meta["compactable_token_count"] == 8
+    assert sorted(e.members for e in entries) == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert all(len(e.members) == 2 for e in entries)  # vanilla's real w=2 level-0 granularity
+
+
+def test_vanilla_logkv_entries_odd_overflow_compacts_one_extra_token() -> None:
+    # T=13, recent_size=4 -> raw overflow=9 (odd). log_kv_cache.py's
+    # _flush_pairs always flushes a complete number of pairs, rounding UP --
+    # so one extra token (10 total, not 9) gets compacted and the final
+    # recent window ends up holding recent_size-1=3 tokens, not a full 4.
+    entries, meta = vanilla_logkv_entries(13, b=4, recent_size=4)
+    assert meta["recent_count"] == 3
+    assert meta["compactable_token_count"] == 10
+    assert sorted(e.members for e in entries) == [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
+
+
+def test_vanilla_logkv_entries_rejects_invalid_parameters() -> None:
+    with pytest.raises(ValueError, match="token_count"):
+        vanilla_logkv_entries(-1, b=4, recent_size=4)
+    with pytest.raises(ValueError, match="b must be"):
+        vanilla_logkv_entries(10, b=3, recent_size=4)
+    with pytest.raises(ValueError, match="b must be"):
+        vanilla_logkv_entries(10, b=0, recent_size=4)
+    with pytest.raises(ValueError, match="recent_size"):
+        vanilla_logkv_entries(10, b=4, recent_size=1)
+
+
+def _run_real_cache_add_recent(
+    token_count: int, b: int, recent_size: int, chunk_size: int
+) -> LogStructuredKVCache:
+    """Feed 0..token_count-1 (as 1-D keys equal to their own position) through
+    the real LogStructuredKVCache via add_recent(), in chunks of chunk_size.
+    k[i] = float(i) makes every merged mean independently checkable: the true
+    weighted mean over any set of member positions is just their arithmetic
+    mean, and compact()'s weighted-mean merge is documented to reproduce
+    exactly that regardless of merge hierarchy (log_kv_cache.py:685-691).
+    """
+    k_shape = (1, 1, max(token_count, 8), 1)
+    v_shape = (1, 1, max(token_count, 8), 1)
+    cache = LogStructuredKVCache(k_shape, v_shape, B=b, recent_size=recent_size, device=torch.device("cpu"), dtype=torch.float32)
+    k = torch.arange(token_count, dtype=torch.float32).view(1, 1, token_count, 1)
+    v = k.clone()
+    offset = 0
+    while offset < token_count:
+        take = min(chunk_size, recent_size, token_count - offset)
+        cache.add_recent(k[:, :, offset : offset + take, :], v[:, :, offset : offset + take, :])
+        offset += take
+    return cache
+
+
+@pytest.mark.parametrize(
+    ("token_count", "b", "recent_size"),
+    [
+        (12, 4, 4),   # even overflow
+        (13, 4, 4),   # odd overflow (the parity edge case)
+        (21, 4, 6),   # odd overflow, different recent_size
+        (37, 8, 5),   # larger B, odd overflow
+        (100, 8, 17), # a level-1+ carry actually fires
+        (4, 4, 4),    # T == recent_size exactly: nothing compacted
+        (3, 4, 4),    # T < recent_size: nothing compacted
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [1, 3, None])  # None -> recent_size (largest legal single add_recent() call)
+def test_vanilla_logkv_entries_matches_real_cache(token_count: int, b: int, recent_size: int, chunk_size: int | None) -> None:
+    # Validates vanilla_logkv_entries' combinatorial derivation (recent-window
+    # carve-out incl. odd-overflow parity, and w=2 level-0 pre-pairing)
+    # against the actual LogStructuredKVCache -- not just the shared carry
+    # primitive (_append_entry), which test_b_prime_members_relocate_
+    # unmerged_before_second_batch_merges already covers independently.
+    # Checked per-level *and* per-slot (weight and mean, not just aggregate
+    # counts), across several add_recent() chunkings, since the real cache's
+    # docstring claims (and this confirms) the final state is chunk-invariant.
+    resolved_chunk_size = recent_size if chunk_size is None else chunk_size
+    cache = _run_real_cache_add_recent(token_count, b, recent_size, resolved_chunk_size)
+    entries, meta = vanilla_logkv_entries(token_count, b=b, recent_size=recent_size)
+
+    assert cache.recent_count == meta["recent_count"]
+
+    # vanilla_logkv_entries returns a flat list; re-slice it back into
+    # per-level groups using meta["level_counts"], which records entries in
+    # the same level-by-level order they were appended in (entry width alone
+    # cannot recover level assignment once carries land at different depths).
+    levels: list[list] = []
+    cursor = 0
+    for level in sorted(int(lvl_str) for lvl_str in meta["level_counts"]):
+        count = meta["level_counts"][str(level)]
+        levels.append(entries[cursor : cursor + count])
+        cursor += count
+
+    for level, level_entries in enumerate(levels):
+        real_count = int(cache.level_count[level].item())
+        assert real_count == len(level_entries), f"level {level}: count mismatch"
+        real_w = getattr(cache, f"level_w_{level}")[0, 0, :real_count]
+        real_k = getattr(cache, f"level_k_{level}")[0, 0, :real_count, 0]
+        for slot_i, entry in enumerate(level_entries):
+            assert real_w[slot_i].item() == pytest.approx(len(entry.members))
+            assert real_k[slot_i].item() == pytest.approx(float(np.mean(entry.members)), abs=1e-4)
+    for level in range(len(levels), cache.max_levels):
+        assert int(cache.level_count[level].item()) == 0, f"unexpected occupied level {level}"
 
 
 def test_b_prime_members_relocate_unmerged_before_second_batch_merges() -> None:
