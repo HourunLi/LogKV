@@ -469,6 +469,89 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-19｜第二十二轮核实：给 Ward scanner 补上"原始操作数在 `find()`
+  之前必须已经是当前根"这一硬约束，把 `slot_valid`/`M_s` 从"调用方按需
+  传"改成"语义模式下由 cache 自动无条件产出"，把 `get_attention_state()`
+  从裸位置元组改成具名的 `CacheAttentionState`，明确 S0.8 3b 只验证一阶
+  路径、不覆盖 Σ/Γ 二阶修正，给 3b 补上 CPU/GPU 设备与 dtype 编排、多
+  prompt 聚合口径，并给 ARI/precision/recall 补上零分母边界的显式定义。**
+  动机：用户对第二十一轮的修复再做一轮复核，指出七处问题——集中在"接口级
+  硬契约还没钉死"这一类：调用签名/张量维度的直接阻塞性 bug 已经在上一轮
+  堵上，这一轮剩下的是"函数会跑，但边界条件/隐含假设没有写清楚"这一层。
+  逐条结论：
+  ① **P1：Ward scanner 的 `WARD_MERGE` 分支对 `op.keep_slot`/`op.free_slot`
+  拼出的原始身份直接做 `find()`，从未校验这两个原始 tuple 在 `find()` 之前
+  本身就该是当前根。** 若上游有 bug 让一个已经被更早一次合并吸收掉的 stale
+  身份又被错误地当成新一次合并的操作数写进日志，`find()` 会静默把它解析到
+  正确的祖先身份，日志层面的错误被并查集结构"自动修好"，永远不会被发现——
+  这和第二十一轮修的③（校验 `NEW_CLUSTER` 是否复用了刚释放的槽）是同一类
+  "不假设 op_log 一定合法"的立场，但抓的是不同的输入：③ 抓"合并之后新簇
+  建错了槽"，这一条抓"合并本身的操作数就已经引用了一个不该存在的身份"。
+  **修法**：`find()` 之前先构造 `raw_keep`/`raw_free`，断言
+  `raw_keep == find(raw_keep)` 与 `raw_free == find(raw_free)`，通过后
+  直接把 `keep_v`/`free_v` 赋值为这两个原始 tuple（不需要再调用一次
+  `find()`），列进"更正"框的第④条。
+  ② **P0：`slot_valid`/`M_s` 写成 `=None` 默认值，只回答了"传了之后形状
+  怎么用"，没回答"语义模式下能不能不传"。** 若调用方漏传，函数不报错，
+  只会静默按"没有无效槽"处理——`λ≠0` 时会让有效 entry 内部的重复锚点
+  （去重前 `M∈{1,2,3}`）被当成独立证据把 softmax 质量放大 `M` 倍；
+  `λ=0` 时（`log_kv_slot_attention` 自带的消融旋钮）更严重，`if lam !=
+  0.0` 门控让 mass bias 整项都不加，连"纯 pad/dead entry 靠 `log(0)=-inf`
+  被动压掉"这条安全网也没有了，`slot_valid` 是唯一挡住无效槽（含 anchor=0
+  哨兵位置）获得非零 attention 的机制。**修法**：不再是调用方按需申请的
+  可选项，`slot_valid`/`M_s` 由 `get_attention_state()` 依据 cache 自身的
+  构造模式（`log_kv_semantic_clusters=True`）自动、无条件产出；`S_pooled=0`
+  时是空张量而不是 `None`，legacy 模式下恒为 `None`（合法稳定值，不是占位
+  符）。
+  ③ **P1：`get_attention_state()` 现有实现按 `with_stats` 布尔值返回裸
+  3-元组或 8-元组，语义模式叠加 `slot_valid`/`M_s` 后理论上会衍生出 4 种
+  不同长度/顺序的返回值，"语义×有 stats"这一档此前完全没人定义过顺序，
+  而这份规格通篇都在抓"位置参数摆错顺序"这一类 bug（S0.8 3b 的调用签名
+  错误就是活生生的例子）。** **修法**：不再扩展位置元组，新增
+  `CacheAttentionState`（`NamedTuple`，10 个字段，不适用的字段取
+  `None`），`get_attention_state()` 在任何模式下都返回这一个类型，调用方
+  一律按字段名取值（`state.slot_k`），"第几个位置对应哪个参数"这整个 bug
+  类别在语法层面消失。`with_stats` 作为性能旋钮保留。
+  ④ **P2：S0.8 3b 用 5 个字段调用 `log_kv_slot_attention`，但算法规格里
+  rank-1 Σ/Γ 的读出修正依然存在，`with_stats=True` 时 3b 该怎么处理没有
+  定义，"`relative_l2 < 5%`"到底在验什么因此含糊。** **决定**：3b 固定
+  `get_attention_state(with_stats=False)`，只验证批量近似路由/compaction
+  与严格串行参考的一阶读出是否一致；Σ/Γ 的正确性已经由独立的、纯 CPU 的
+  嵌套精确性/坐标系回归单测覆盖，不需要 3b 重复验证，也避免把"路由分歧"
+  和"二阶修正近似误差"两个独立误差源混进同一个数字。若日后需要验证两者
+  组合起来是否也一致，那是新起一项独立实验，不是往 3b 加参数。
+  ⑤ **P1：3b 的 `q_tail` 来自 GPU 前向的 `q_roped`，`cache_batch`/
+  `cache_serial` 来自纯 CPU 参考实现，两者不搬到同一设备直接相乘会立即
+  报 device mismatch——上一轮完全没提这件事。** **修法**：`q_tail` 在两次
+  `log_kv_slot_attention` 调用前显式 `.cpu()`（选择挪 `q_tail` 而不是把
+  参考实现搬上 GPU，因为前者张量小、代价可忽略，后者会给"足够简单以便
+  独立确信正确"的参考实现增加一条新路径）；dtype 上 `.cpu()` 不改变
+  dtype，只要参考实现的 `k̄_raw`/`v̄` 按 §5.13 buffer 表的既有约定同样存
+  activation dtype，两侧天然一致，不需要额外转换。
+  ⑥ **P2：`relative_l2` 已定义为不跨 head/layer 平均，返回 `(B,nh)`，但
+  Stage 0 dump 的是"几条"NIAH prompt，完整结果其实是 `(prompt,layer,head)`
+  三维网格，没定义这个网格怎么收敛成一个"过/不过"的判断。** **决定**：
+  硬性决策门挂在 `max`——`max` over `(prompt,layer,head)` 的 `error_3b`
+  必须 <5%，任意一个 prompt 任意一层任意一个头超标就算 3b 失败而不是
+  warning，理由和"不跨 head/layer 平均"同源（§2.5 贯穿性要求：均值/`p95`
+  会把头/层特定的失效稀释掉）；同时报告完整网格的均值、`p95`、以及取到
+  `max` 的那个 `(prompt,layer,head)` 身份，帮助归因，不是只留一个数字。
+  ⑦ **P2：新增的 ARI/precision/recall 公式都有零分母边界**（`max_idx==
+  expected`、`sum_ai==0`、`sum_bj==0`），32k 正常路由几乎不会撞见，但
+  S0.1 风格的小合成单测（全 singleton、全同簇）会撞见。**修法**：实测
+  验证 `sklearn.metrics.adjusted_rand_score` 在这类退化输入上返回 `1.0`
+  （不是凭印象转述），本规格对 ARI 采用相同约定；precision/recall 各自
+  在对应分母为 0 时定义为未定义（`NaN` + 显式 flag），两者都定义且都
+  精确为 0 时 `f1:=0`（标准调和平均约定，不是另一处 0/0）。
+  **顺带修正了本轮起草过程中自己引入的两处引用错误**：把"3b 调用签名
+  错误"错误地指向了不存在关联的"§5.8"（`experiments.md` 的 S0.8 编号和
+  `algorithm-spec.md` 的 §5.8 章节号恰好数字相同、含义完全无关，容易
+  手滑连到一起——已改成明确写 `experiments.md` S0.8 3b，不用 §5.8 这个
+  容易引发混淆的记号）；把 `CacheAttentionState` 的定义位置错误地标成
+  §5.15（实际是 §5.14 内的一个新增小节，紧邻"虚拟槽展开必须扣上
+  causal_tail/mask API"）——两处都在 algorithm-spec.md 和 experiments.md
+  之间交叉引用时发现并改正。
+
 - **2026-08-19｜第二十一轮核实：修掉 S0.8 3b 伪代码的调用签名/张量
   维度两处会直接阻塞实现的 bug，补上 `dedup_anchors` 输出到
   `log_kv_slot_attention` 输入之间缺失的 per-entry→per-virtual-slot
