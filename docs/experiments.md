@@ -18,12 +18,18 @@
 省下来的是**训练**（不需要梯度、不需要反复迭代）和**落盘量**（分桶直方图而不是
 完整 attention 矩阵），不是"几乎不花 GPU"这种程度的省。
 
-> **贯穿性硬要求（§2.5）**：Stage 0 的所有统计**必须逐层 × 逐头分开报告**。
+> **贯穿性硬要求（§2.5）**：Stage 0 的所有统计**必须逐层分开报告，且按统计量本身
+> 的粒度选对下一级维度，不是统一"逐头"**——`k`/`v`/聚类/路由相关的统计按
+> **(layer, KV group)**（聚类按 `(B, G)` 独立进行，一个 KV group 只有一份 `k`）；
+> 依赖 `q` 的注意力质量统计（`attn_mass_by_dist`、S0.8 3b 的 `error_3b`）按
+> **(layer, query head)**（`q` 是 per-query-head 的，见下方 S0.8 3b 一节）。
 
 ### Stage 0 — 离线可证伪（1 次 GPU dump + 主体 CPU 分析，S0.8 3b 例外——须在 dump 进程内完成）
 
-只需要一次前向：对几条 32k 的 NIAH prompt dump 每层每头的 **pre-RoPE k / v** 与
-needle 的 token span（复用另一分支已有的 `log_kv_pin_diag.py` 定位逻辑）。
+只需要一次前向：对几条 32k 的 NIAH prompt dump 每层每 KV group 的 **pre-RoPE k / v**
+（`(B, G, T, hs)`，不是每 query head 一份——GQA 下同一 KV group 被 `q_per_kv` 个
+query head 共享）与 needle 的 token span（复用另一分支已有的 `log_kv_pin_diag.py`
+定位逻辑）。
 
 > **S0.0 是离线模拟，可以探索生产实现负担不起的配置**（例如 `ℓ_block = L_alloc`
 > 的"完全连续分段"）。它的职责是回答科学问题：**可负担的区间里是否包含了大部分
@@ -50,10 +56,15 @@ Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生�
 > 的编号里排在 dump 脚本（第 0 步）之后，字面上和"第一段代码"冲突。这不是需要
 > 靠改期望解决的问题：真正被"先看 Stage 0 结果再决定要不要投入"这道门挡住的是
 > 多簇路由的向量化实现、段对齐填充、`op_log` 训练路径重放（§5.18 第 3–6 步）；
-> CPU 参考路由本来就是"慢但正确"的测试脚手架、不是要部署的代码，
-> `log_kv_slot_attention`/`get_attention_state()` 的扩展是受字节等价 CI 闸门
-> 保护的纯加法式改动——两者都是让 3b 这个决策门本身可信所必需的最小基础设施，
-> 应当在 3b 之前先落地，完整论证见 `algorithm-spec.md` §5.21-5 的更正框。
+> CPU 参考路由本来就是"慢但正确"的测试脚手架、不是要部署的代码；
+> `log_kv_slot_attention`/`get_attention_state()` 的扩展**不是纯加法式改动
+> ——是一次 breaking 的返回类型迁移**（`get_attention_state()` 在任何模式下
+> 都改返回恒定 10 字段的 `CacheAttentionState`，现有位置解包调用会直接
+> `ValueError`，需要原子迁移全部约 30 处调用点，字节等价 CI 闸门管的是数值
+> 不是接口形状，管不到这里，完整论证见 `algorithm-spec.md` §5.18 第 2 步的
+> 更正框）——但迁移动作本身机械、不涉及新算法。两者都是让 3b 这个决策门本身
+> 可信所必需的最小基础设施，应当在 3b 之前先落地，完整论证见
+> `algorithm-spec.md` §5.21-5 的更正框。
 
 **两套机制，不是一个 hook——`attn_mass_by_dist` 在原来那个 hook 点算不出来。**
 原设计把它写成"在 hook 里就地累加"，但真实注意力质量需要**已经做完 RoPE 的 q、k
@@ -751,8 +762,9 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        >     范数按 (tail_query_count, v_dim) 联合展平后取，返回形状
        >     (B, nh)——每个 (batch, query head) 一个标量，不在函数内部
        >     跨 head 或跨 layer 平均。这是刻意的：按 §2.5 的贯穿性要求，
-       >     Stage 0 的一切统计必须逐层×逐头分开报告，3b 的 <5% 决策门
-       >     同样逐 (layer, head) 判定，不允许几个语义头很好的分数把
+       >     `error_3b` 依赖 `q`，属于"逐 (layer, query head)"这一档
+       >     （不是聚类/路由统计的 (layer, KV group) 档），3b 的 <5%
+       >     决策门同样逐 (layer, query head) 判定，不允许几个语义头很好的分数把
        >     某个头很差的分数平均掉——调用方对每一层单独调用本函数一次
        >     （层是外层循环，不在这个函数内部），拿到的 (B, nh) 结果按
        >     (layer, head) 网格汇总报告，不产出单独的整体聚合数字。
@@ -900,7 +912,7 @@ Stage 2 有信号后再投入。v3 没有需要 warmup 的新标量（v2 的 `κ
 |---|---|---|
 | **`(g_max, ℓ_block)`** | 纯语义 → 完全分段 | **语义分组 vs 分段边界，谁贡献大？（S0.0 的 eval 版）** |
 | **query 位置** | prompt 尾部 / 中部 / 前置 | **区分本方案与 eviction 类方法的关键设定**（§9-A）——尾部 query 是 retrieval-head 类方法的最佳工况。**这一行是独立的 eval-time 测量，不是 S0.8 3b 的延伸**——3b 只用固定的尾部 `tail_query_count` 窗口，其 <5% 决策门不覆盖、也不能借用来回答中部/前置 query 的表现，两者结论不互相代入 |
-| `K_max` | 1 / 4 / 16 / 64 | 语义分组本身值多少分？1 是现状锚点。**覆盖默认值时要连带重算 `L_alloc`**（§5.6）|
+| `K_max` | 1 / 4 / 16 / 64 | 语义分组本身值多少分？**`K_max=1` 是单簇消融参考点，不是现有 LogKV 的数值锚点**——即使实现完全正确也不预期复现现有 LogKV 的 0.1716/0.0827（`algorithm-spec.md` §5.18"K_max=1 是退化边界"一节），正确性检验走 `anchor_mode=z` 的 CPU 单测，不在这张表里。**覆盖默认值时要连带重算 `L_alloc`**（§5.6）|
 | `K:B′` 分配 | 32×4 / 16×8 / 8×16 | 语义分辨率 vs 时序分辨率，总预算固定 |
 | `anchor_mode` | `lo_hi_mid` / `lo_hi` / `mid` / `z` | 锚点表示 vs v2 的 z 统计量 |
 | `λ_rel` | 0.5 – 2.0 | needle 隔离与簇纯度的平衡点 |

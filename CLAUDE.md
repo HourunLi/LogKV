@@ -82,9 +82,13 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
    （下一项）、§5.4/§5.18 第 2 步的 CPU 参考路由、以及
    `log_kv_slot_attention()`/`get_attention_state()` 按 §5.14/§5.20-B 扩展出的
    `CacheAttentionState`/`slot_valid`/`M_s` 先落地——这三块是让 3b 这个决策门本身
-   可信的最小基础设施（CPU 参考路由是测试脚手架、扩展是受字节等价 CI 闸门保护的
-   纯加法式改动），不属于第 4 项要等 Stage 0 结果才投入的生产实现，完整论证见
-   `algorithm-spec.md` §5.21-5 的更正框。
+   可信的最小基础设施（CPU 参考路由是测试脚手架；`CacheAttentionState` 的扩展
+   **不是纯加法式改动，是一次 breaking 的返回类型迁移**——`get_attention_
+   state()` 在任何模式下都改返回恒定 10 字段的 `CacheAttentionState`，现有约
+   30 处位置解包调用点必须原子迁移，否则直接 `ValueError`；字节等价 CI 闸门管
+   数值不管接口形状，管不到这里），不属于第 4 项要等 Stage 0 结果才投入的生产
+   实现——两者的共同点是改动机械、不涉及新算法，不是"不改变调用方代码"，完整
+   论证见 `algorithm-spec.md` §5.18 第 2 步与 §5.21-5 的更正框。
 3. `litgpt/log_kv_position.py` 纯函数 + 单测（§5.14），CPU 可测，不依赖 dump 结果。
 4. 视 Stage 0 结果决定是否继续 Stage 1（生产代码，指 §5.18 第 3–6 步：多簇路由的
    向量化实现、段对齐填充、`op_log` 训练路径重放）。**动手前先读 `algorithm-spec.md`
@@ -299,9 +303,17 @@ softmax 选择性读出保留、改动局限在 `_pair_rank1_stats`/`compact` �
 连续，segment 规则自动变成 no-op，不造成伤害。所以这不是 bug，而是意味着
 **整套方案的价值在不同头、不同层之间差异会很大**。
 
-**操作后果（硬性要求）**：Stage 0 的所有统计**必须逐层 × 逐头分开报告**。"平均看起来
-还行"可能是少数中层语义头很好、多数头完全无效的叠加，而这两种情况对应完全不同的
-下一步。
+**操作后果（硬性要求）**：Stage 0 的所有统计**必须逐层分开报告，且在下一级粒度上
+按统计量本身的性质二选一**——"平均看起来还行"可能是少数中层语义头很好、多数头
+完全无效的叠加，而这两种情况对应完全不同的下一步。**粒度不是统一的"逐头"**：
+`k`/`v`/聚类/路由相关的统计（`K_eff`、槽内方差、锚点跨度、cluster assignment 分歧
+等）按 **(layer, KV group)** 报告——聚类只在 k 空间做、按 `(B, G)` 独立进行
+（§5.2 的口径统一更正框、§5.17），一个 KV group 只有一份 `k`，GQA 下共享它的
+`q_per_kv` 个 query head 天生看到相同的簇结构，逐 query head 拆开只会制造虚假的
+细粒度；而**依赖 `q` 的注意力质量统计**（`attn_mass_by_dist`、S0.8 3b 的
+`error_3b`）按 **(layer, query head)** 报告——`q` 是 per-query-head 的，共享同一
+KV group 的两个 query head 完全可能因为各自的 `q` 不同而产出不同的注意力模式，
+折叠成 KV group 粒度会把这种差异平均掉。
 
 ## 3. 为什么能解决捞针
 
@@ -482,6 +494,56 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-20｜第二十五轮核实：推翻"`CacheAttentionState` 是纯加法式改动"这句话，
+  统一 `K_max=1` 的定位为单簇消融参考点（不是数值锚点），把"逐层×逐头"这条贯穿性
+  统计要求拆成 (layer, KV group) 和 (layer, query head) 两档。** 动机：上一轮
+  （第二十四轮）修完四处问题后，用户又对照代码库做了一轮独立复核，指出上一轮自己
+  在 §5.21-5 里写的"S0.8 3b 前置代码是纯加法式改动"这个判断本身站不住脚，另加两处
+  长期存在的一致性问题。逐条结论：
+  ① **P1：`CacheAttentionState` 被上一轮描述成"纯加法式改动"，但核对代码库确认
+  这实际是一次 breaking 的 API 迁移。** §5.14 定案"`get_attention_state(with_
+  stats=False)` 在**任何模式**下都返回同一个恒定 10 字段的 `CacheAttentionState`"
+  ——但现有 `litgpt/log_kv_cache.py:1738` 的
+  `slot_k, slot_v, slot_w = cache.get_attention_state(with_stats=False)` 是
+  3-变量位置解包，`litgpt/model.py:1200`、`tests/test_log_kv_cache.py:1096` 是
+  8-变量位置解包，一旦返回值变成 10-元组，`NamedTuple` 的位置解包要求变量数与
+  字段数**完全相等**，两类调用会直接 `ValueError: too many values to unpack`
+  ——且**不分 legacy/语义模式**，因为这个返回类型改动对两条路径都生效，不受
+  `log_kv_semantic_clusters` 开关裹住。上一版说"受 §5.19-1 默认关闭字节等价 CI
+  闸门保护"是范畴错误：那条闸门管的是开关关闭时**数值**是否不变，管不到**函数
+  签名/返回元组长度**变了导致调用方在 Python 层面直接报错这类问题。同一处还有
+  一句更早的错误："legacy 测试不强制改写"——同样不成立，legacy 调用一样会炸。
+  **修法**：`algorithm-spec.md` §5.20-B 调用点迁移清单最后一行删掉"legacy 测试
+  不强制改写"，改为钉死"全部约 30 处调用点（生产代码 6 处 + 测试约 25 处）必须
+  在同一次改动里原子迁移，没有例外、没有过渡期"；§5.18 第 2 步、§5.21-5 更正框、
+  `experiments.md`"Stage 0 dump 规格"一节、`CLAUDE.md` §0 的对应措辞全部同步
+  改成"breaking 但机械的迁移"，不再说"纯加法/不改变调用行为"——**保留的结论
+  是"这次迁移不改变本节'是否要投入 Stage 1'这个决策的判断"，理由从"不改变
+  调用方代码"改成"迁移动作本身机械、不涉及新算法决策"**，这条结论本身没有
+  垮，垮的只是错误的论据。
+  ② **P2：`K_max=1` 的定位在两处仍有残留的自相矛盾表述。** `algorithm-spec.md`
+  §5.18 第 3 步说"与现有实现数值对齐（注意 §12 的容差问题）"，但紧跟着的
+  blockquote（以及 §12-E 已经定案的结论）明确"即使实现完全正确也不会复现旧
+  数字""不要设容差"；`experiments.md` 消融表的 `K_max` 行还写着"1 是现状锚点"，
+  与 §7 表格里 Config A 那行"不预期复现 0.1716/0.0827"、`glossary.md`/
+  `risks-and-open-questions.md` 已经统一的口径矛盾。**修法**：§5.18 第 3 步改成
+  "不要求、也不预期与现有 LogKV 数值对齐，当消融参考点看待，正确性检验是
+  `anchor_mode=z` 的 CPU 单测"；消融表的 `K_max` 行改成"`K_max=1` 是单簇消融
+  参考点，不是现有 LogKV 的数值锚点"。`glossary.md`/§7 Config A 行/§12-E 本来
+  就是对的，不需要改，这次只是把最后两处滞后的表述拉齐。
+  ③ **P3：`§2.5` 的"逐层×逐头"这条贯穿性统计要求，粒度本身就有歧义，且和
+  S0.8 3b 的实际返回粒度对不上。** §5.2 早就把聚类相关统计的物理粒度钉死成
+  KV group（`(n_layer, G)`，不是 `(n_layer, nh)`），但 `CLAUDE.md` §2.5、
+  `experiments.md` 的"贯穿性硬要求"、`risks-and-open-questions.md` 的风险表和
+  §I 仍泛称"逐头"；而 S0.8 3b 的 `error_3b` 明确返回 `(B, nh)`——是 query head
+  粒度，因为它依赖 `q`，GQA 下共享同一 KV group 的 query head 可以有不同的
+  `q`、因而有不同的注意力模式。**修法**：把"逐层×逐头"统一拆成两档并在四处
+  落地——`k`/`v`/聚类/路由相关统计按 (layer, KV group)；依赖 `q` 的注意力质量
+  统计（`attn_mass_by_dist`、`error_3b`）按 (layer, query head)。改动位置：
+  `CLAUDE.md` §2.5 的"操作后果"段落、`experiments.md` 的"贯穿性硬要求"引言与
+  dump 规格里"每层每头"改成"每层每 KV group"、S0.8 3b 定义 `relative_l2` 那段
+  引用贯穿性要求的措辞、`risks-and-open-questions.md` 的风险表第一行与 §I。
 
 - **2026-08-20｜第二十四轮核实（文档 vs 现有代码库对照）：修正推理入口的错误
   指代，钉死 S0.8 3b 相对"dump 脚本是第一段代码"的真实前置依赖，去掉 §5.2
