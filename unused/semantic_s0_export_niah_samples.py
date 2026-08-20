@@ -103,14 +103,20 @@ def main() -> None:
         default=8,
         help="Keep at most this many docs per task. RULER always generates "
         "500 per length internally regardless of this flag -- it only "
-        "controls how many of those get written out.",
+        "controls how many of those get written out. Must be >= 1.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Subsampling seed when limit_per_task < generated count")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    if not tasks:
+        raise ValueError(f"--tasks must name at least one task, got {args.tasks!r}")
     max_seq_lengths = parse_int_list(args.max_seq_lengths)
+    if not max_seq_lengths:
+        raise ValueError(f"--max_seq_lengths must list at least one length, got {args.max_seq_lengths!r}")
+    if args.limit_per_task is not None and args.limit_per_task < 1:
+        raise ValueError(f"--limit_per_task must be >= 1 (or omitted), got {args.limit_per_task}")
 
     metadata = {"pretrained": args.tokenizer_dir, "max_seq_lengths": max_seq_lengths}
     task_manager = TaskManager(metadata=metadata)
@@ -137,6 +143,11 @@ def main() -> None:
                 written += 1
             print(f"[export] {task_name}: wrote {len(docs)}/{len(all_docs)} generated docs", flush=True)
 
+    if written == 0:
+        raise RuntimeError(
+            f"wrote 0 samples to {args.output} -- every task in {tasks} produced an empty eval_docs set; "
+            "downstream dump would silently see no samples, refusing to write an unusable JSONL"
+        )
     print(f"[export] wrote {written} total samples to {args.output}")
 
 
