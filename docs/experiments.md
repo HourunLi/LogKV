@@ -668,9 +668,12 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > ① **`log_kv_slot_attention` 调用传的是错误的位置参数。** 现有
        > 签名（`algorithm-spec.md` §5.14"虚拟槽展开必须扣上
        > `causal_tail`/`mask` API"一节）是
-       > `(q, slot_k, slot_v, slot_w, scale, mask=None, causal_tail=0,
+       > `(q, slot_k, slot_v, slot_w, scale, mask=None, lam=1.0, causal_tail=0,
        > slot_valid=None, M_s=None, ...)`——`scale` 排在 `slot_w` 之后、
-       > `mask` 之前，`slot_valid`/`M_s` 是排在更后面的具名参数。上一版
+       > `mask` 之前，`lam` 排在 `mask`/`causal_tail` 之间（**这一轮补的**：
+       > 上一版这里的签名片段漏抄了 `lam`，容易让人以为它被移除了——它一直
+       > 都在，下面的调用也一直显式传它，只是这个片段本身抄漏了），
+       > `slot_valid`/`M_s` 是排在更后面的具名参数。上一版
        > `log_kv_slot_attention(q_tail, *cache.get_attention_state(),
        > causal_tail=...)` 把 `get_attention_state()` 返回的 5 元组
        > `(slot_k,slot_v,slot_w,slot_valid,M_s)` 整个展开成位置参数，
@@ -766,14 +769,24 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > # cache，和 S0.8 第 1/2/3a 项用的 cache_batch/cache_serial 是不同实例
        > # ——用同一套 §5.3/§5.4 CPU 参考实现构造，只是喂给它们的输入截短到
        > # [0, cutoff)，不是完整的 [0, T)：
-       > cache_batch_prefix  = build_cache_batch(k_raw[:cutoff], v[:cutoff], pos[:cutoff])
-       > cache_serial_prefix = build_cache_serial(k_raw[:cutoff], v[:cutoff], pos[:cutoff])
+       > #
+       > # 更正（这一轮修的，P1）：上一版写的 k_raw[:cutoff]/v[:cutoff] 按的是
+       > # dim 0 切片，但"dump 什么"表（本节前面）已经钉死 k_raw/v 的落盘形状是
+       > # (G, T, hs)——dim 0 是 KV group（默认 G=8），dim 1 才是时间轴 T。
+       > # k_raw[:cutoff] 字面上会切掉除前 cutoff 个 KV group 之外的一切（当
+       > # cutoff 是几千的 token 数量级、G 只有 8 时，这个切片要么整个越界、
+       > # 要么静默切出一个形状对不上下游的怪张量），不是按时间戳截断。pos 是
+       > # 例外：它是纯位置索引，形状 (T,)，没有 G 这一维，pos[:cutoff] 原来就是
+       > # 对的，不用改。改成显式按 dim 1 取子集：
+       > cache_batch_prefix  = build_cache_batch(k_raw[:, :cutoff, :], v[:, :cutoff, :], pos[:cutoff])
+       > cache_serial_prefix = build_cache_serial(k_raw[:, :cutoff, :], v[:, :cutoff, :], pos[:cutoff])
        >
        > # 尾部 [cutoff, T) 作为 in-flight 精确槽，必须是 post-RoPE——dump 只有
        > # pre-RoPE 的 k_raw，用标准 apply_rope 在各自绝对位置上现算，和
-       > # materialize_anchor_keys 给单点 entry 物化 key 是同一个原语：
-       > k_tail_roped = apply_rope(k_raw[cutoff:T], cos_cache[cutoff:T], sin_cache[cutoff:T])
-       > v_tail = v[cutoff:T]
+       > # materialize_anchor_keys 给单点 entry 物化 key 是同一个原语。同样按
+       > # dim 1（T 轴）取尾部子集，不是 dim 0：
+       > k_tail_roped = apply_rope(k_raw[:, cutoff:T, :], cos_cache[cutoff:T], sin_cache[cutoff:T])
+       > v_tail = v[:, cutoff:T, :]
        >
        > # log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale, mask=None,
        > # lam=1.0, causal_tail=0, slot_valid=None, M_s=None, ...)——scale 是
@@ -789,32 +802,47 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > # 一个独立扫描轴，λ=0 时 mass bias 整项不加（log_kv_cache.py:1625
        > # 的 `if lam != 0.0:` 门控），若 3b 悄悄固定用默认值 1.0，扫 λ=0 时
        > # 3b 比较的就不是这次实验实际配置的读出行为：
-       > state_batch = cache_batch_prefix.get_attention_state(with_stats=False)
-       > k_all_b, v_all_b, w_all_b = append_exact_tokens(
-       >     state_batch.slot_k.float(), state_batch.slot_v.float(), state_batch.slot_w.float(),
-       >     k_tail_roped.float(), v_tail.float(),
-       > )   # 尾部拼在 prefix 的 pooled+recent 之后；slot_valid/M_s 只覆盖
-       >     # prefix 自己的 pooled 前缀宽度，不需要为拼接的尾部额外扩展
-       >     # （函数内部对 S_pooled 之外的位置隐式按 slot_valid=True/M_s=1 处理，
-       >     # 和 exact 后缀天然 w=1 是同一条既有约定）
+       > # 更正（这一轮修的，P2）：上一版把 append_exact_tokens 当成"收三个裸
+       > # 张量、吐三个裸张量"的老式函数调用——但 algorithm-spec.md §5.14
+       > # （CacheAttentionState 定义那一节）已经钉死它的新契约是"收一个
+       > # CacheAttentionState、吐一个 CacheAttentionState"，输入输出都要迁移，
+       > # 不是只迁移 get_attention_state() 一个函数。改成按新契约调用：先用
+       > # NamedTuple 的 _replace() 只转 dtype（slot_valid/M_s 等其余字段原样
+       > # 透传，_replace 不碰未指定的字段），再整个 state 传给
+       > # append_exact_tokens，返回值也是一个完整 CacheAttentionState，直接
+       > # 按字段名取给 log_kv_slot_attention，不再有裸位置元组：
+       > state_batch_f32 = state_batch._replace(
+       >     slot_k=state_batch.slot_k.float(),
+       >     slot_v=state_batch.slot_v.float(),
+       >     slot_w=state_batch.slot_w.float(),
+       > )
+       > state_batch_full = append_exact_tokens(state_batch_f32, k_tail_roped.float(), v_tail.float())
+       >     # 尾部拼在 prefix 的 pooled+recent 之后；state_batch_full.slot_valid/
+       >     # M_s 原样透传自 state_batch_f32，只覆盖 pooled 前缀宽度，不需要为
+       >     # 拼接的尾部额外扩展（log_kv_slot_attention 对 S_pooled 之外的位置
+       >     # 隐式按 slot_valid=True/M_s=1 处理，和 exact 后缀天然 w=1 是同一条
+       >     # 既有约定）
        > out_batch = log_kv_slot_attention(
-       >     q_tail, k_all_b, v_all_b, w_all_b, scale,   # scale 复用机制 B 循环
-       >     lam=log_kv_lambda,                            # 里已经在用的同一个
-       >     causal_tail=tail_query_count,                  # scale；lam 是本次
-       >     slot_valid=state_batch.slot_valid,             # 实验实际配置的值，
-       >     M_s=state_batch.M_s,                            # 不留给默认值 1.0
+       >     q_tail, state_batch_full.slot_k, state_batch_full.slot_v,   # scale 复用机制 B
+       >     state_batch_full.slot_w, scale,                                # 循环里已经在用
+       >     lam=log_kv_lambda,                                             # 的同一个 scale；
+       >     causal_tail=tail_query_count,                                  # lam 是本次实验
+       >     slot_valid=state_batch_full.slot_valid,                        # 实际配置的值，
+       >     M_s=state_batch_full.M_s,                                       # 不留给默认值 1.0
        > )
        > state_serial = cache_serial_prefix.get_attention_state(with_stats=False)
-       > k_all_s, v_all_s, w_all_s = append_exact_tokens(
-       >     state_serial.slot_k.float(), state_serial.slot_v.float(), state_serial.slot_w.float(),
-       >     k_tail_roped.float(), v_tail.float(),
+       > state_serial_f32 = state_serial._replace(
+       >     slot_k=state_serial.slot_k.float(),
+       >     slot_v=state_serial.slot_v.float(),
+       >     slot_w=state_serial.slot_w.float(),
        > )
+       > state_serial_full = append_exact_tokens(state_serial_f32, k_tail_roped.float(), v_tail.float())
        > out_serial = log_kv_slot_attention(
-       >     q_tail, k_all_s, v_all_s, w_all_s, scale,
+       >     q_tail, state_serial_full.slot_k, state_serial_full.slot_v, state_serial_full.slot_w, scale,
        >     lam=log_kv_lambda,
        >     causal_tail=tail_query_count,
-       >     slot_valid=state_serial.slot_valid,
-       >     M_s=state_serial.M_s,
+       >     slot_valid=state_serial_full.slot_valid,
+       >     M_s=state_serial_full.M_s,
        > )
        > error_3b = relative_l2(out_batch, out_serial)   # 3b 的分子/分母；
        >                                                    # 两次调用用的是
