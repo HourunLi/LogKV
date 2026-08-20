@@ -1191,8 +1191,21 @@ def scan_op_log_for_ward_events(
             sizes[ident] = _require(sizes, ident, "sizes") + 1
         elif op.type == WARD_MERGE:
             assert pending is None    # 上一个 Ward 事件必须已被消费，见 docstring
-            keep_v = find((op.keep_slot, epoch.get(op.keep_slot, 0)))
-            free_v = find((op.free_slot, epoch.get(op.free_slot, 0)))
+            raw_keep = (op.keep_slot, epoch.get(op.keep_slot, 0))
+            raw_free = (op.free_slot, epoch.get(op.free_slot, 0))
+            assert raw_keep == find(raw_keep), (
+                f"scan_op_log_for_ward_events: WARD_MERGE 引用的 keep_slot "
+                f"{op.keep_slot}（scanner 当前记录的 epoch={raw_keep[1]}）不是"
+                f"当前根——这个身份已经在更早的一次合并里被吸收掉了，op_log 里"
+                f"这条 WARD_MERGE 引用了一个 stale/non-root 的身份；若放任 "
+                f"find() 把它悄悄改判成祖先身份，等于让并查集『自动修正』一个"
+                f"本该报错的上游日志错误，必须在这里就地失败，不能被吸收掉")
+            assert raw_free == find(raw_free), (
+                f"scan_op_log_for_ward_events: WARD_MERGE 引用的 free_slot "
+                f"{op.free_slot}（scanner 当前记录的 epoch={raw_free[1]}）不是"
+                f"当前根——同上，stale/non-root 身份必须报错，不能被 find() "
+                f"静默吸收")
+            keep_v, free_v = raw_keep, raw_free
             assert keep_v != free_v, (
                 f"scan_op_log_for_ward_events: self-merge，keep_v == free_v == "
                 f"{keep_v}——生产路由的代价矩阵会 mask 对角线（§5.6）排除这种"
@@ -1222,7 +1235,7 @@ def scan_op_log_for_ward_events(
     return ward_events, epoch, parent, sketches, sizes, pending
 ```
 
-> **更正（这一轮修的）：三处此前会静默吞掉 bug，必须改成硬失败。**
+> **更正（这一轮修的）：四处此前会静默吞掉 bug，必须改成硬失败。**
 > ① **`pending`/`NEW_CLUSTER` 的紧邻关系此前只是"等到了就消费"，从不校验
 > "等到的是不是它"。** 原循环只在 `op.type == NEW_CLUSTER` 分支内部检查
 > `pending is not None`，中间如果插了一条 `JOIN`/`NEW_SEGMENT`/
@@ -1264,6 +1277,26 @@ def scan_op_log_for_ward_events(
 > 这个函数存在的意义就是"不假设 op_log 一定合法"（本节其它断言的一贯
 > 立场），槽号复用是这条设计里少数几个跨结构操作/主操作的强不变量，
 > 值得和类型检查放在同一处、同等严格地校验。
+> ④ **`WARD_MERGE` 分支构造 `keep_v`/`free_v` 时直接对
+> `(op.keep_slot, epoch.get(op.keep_slot,0))`/`(op.free_slot,
+> epoch.get(op.free_slot,0))` 做 `find()`，从未校验这两个"原始操作数"在
+> `find()` 之前本身就该是当前根。** 这两个原始 tuple——不是 `find()` 之后
+> 的结果——理论上必须恒等于自己的根：`op.keep_slot`/`op.free_slot` 是生产
+> 路由的 Ward 代价矩阵从"当前 alive 槽位"里选出来的（§5.6），而
+> `epoch.get(...)` 取的正是 scanner 自己维护的、该槽当前存活身份对应的
+> epoch，两者拼起来在 op_log 合法的前提下必然是一个从未被 union 过的根。
+> 但这只是"op_log 合法"这个假设下才成立的推论，而这个函数存在的全部意义
+> 正是不假设 op_log 合法（③ 的立场）——如果上游有 bug 让某个已经被更早一次
+> `WARD_MERGE` 吸收掉的 stale 身份又被错误地当成新一次合并的操作数写进日志，
+> 直接 `find()` 会**静默把它解析到正确的祖先身份**，日志层面的错误被并查集
+> 结构"自动修好"，不会报错，也就永远不会被发现。**修法**：`find()` 之前先
+> 分别构造 `raw_keep`/`raw_free`，断言 `raw_keep == find(raw_keep)` 与
+> `raw_free == find(raw_free)`——这就是"是否为当前根"的判据（`find` 对根
+> 恒等，对非根一定会走到别处），断言通过后再把 `keep_v`/`free_v` 直接赋值
+> 为 `raw_keep`/`raw_free`（此时已经证明两者相等，不需要再调用一次
+> `find()`）。这条检查独立于③——③ 抓的是"合并之后新簇建在了错误的槽上"，
+> ④ 抓的是"合并本身的输入操作数就已经引用了一个不该存在的身份"，两种输入
+> 都会在功能上"看起来能跑"，只有分别加断言才能都拦住。
 
 **典型用法（分段串联，末尾断言 `pending` 已被消费干净）**：
 
@@ -3052,6 +3085,80 @@ respects 逐 token 因果关系，且这条路径下的输出与"手工构造等
 `mask`（同时编码两种约束）"数值一致，验证"两个正交掩码分别加"和"揉成一个
 掩码"是同一件事，只是前者更便宜。
 
+#### `slot_valid`/`M_s` 在语义模式下不是可选项；`get_attention_state()` 的返回结构需要重新设计
+
+**上面的签名把 `slot_valid`/`M_s` 写成 `=None` 默认值，这只回答了"传了之后
+形状/掩码怎么用"，没有回答"什么时候必须传"。这不是无关紧要的措辞缺口：如果
+调用方在语义模式下漏传（`slot_valid=None`），函数不会报错，只会静默按"没有
+无效槽"处理。** 后果比听起来更糟，且和 `λ` 是否为 0 强相关：
+
+- **`λ≠0` 时**，靠 `w=0` entry 的 `log(w/M)=log(0)=-inf` 能顺带压掉**纯 pad/
+  dead entry**（因为它们的 `w` 本身就是 0），但压不掉**有效 entry 内部的重复
+  锚点**（`p_lo==p_mid` 等，§5.14 `dedup_anchors` docstring）——这类槽的 `w>0`
+  （和它没被去重的兄弟槽共享同一个 `w`），`log(w/M)` 不为 `-inf`。漏传
+  `slot_valid` 会让这些重复锚点被当成**独立的额外证据**，把该 entry 的
+  softmax 质量按 `M` 倍放大（`M∈{1,2,3}`），而不是均摊——`M_s` 存在的意义
+  正是防止这个放大，`slot_valid` 缺失时它形同虚设。
+- **`λ=0` 时**（`log_kv_slot_attention` 文档里明确列出的消融旋钮，"built-in
+  ∝1/w long-range forgetting curve"）更严重：mass bias 这一项**根本不会被
+  加**（现有代码 `if lam != 0.0:` 门控，`log_kv_cache.py:1625-1628`），连
+  "纯 pad/dead entry 靠 `log(0)=-inf` 被动压掉"这条安全网也不存在了。此时
+  `slot_valid` 是**唯一**挡住无效槽（含锚点=0 的哨兵位置）获得非零 attention
+  的机制，缺了它不是"退化成稍差的近似"，是"pad/dead entry 的垃圾内容混进
+  softmax"。
+
+**修法：`slot_valid`/`M_s` 在语义模式下由 `get_attention_state()` 自动、无条件
+产出，不是调用方按需申请的可选项。** 判断依据是 cache 自身的构造模式
+（`log_kv_semantic_clusters=True`），不是某个新增的调用参数——是否需要
+`slot_valid`/`M_s` 完全由 cache 是不是语义簇模式决定，调用方没有"要不要"的
+选择权，也就不存在"忘了传"这种调用方过失（只要 `get_attention_state()` 自己
+写对）。`S_pooled=0`（尚无 pooled 内容，例如序列还没触发过一次 flush）时
+`slot_valid`/`M_s` 是空张量（`shape[-1]=0`），不是 `None`——`log_kv_slot_
+attention` 内部按"`S_pooled` 的宽度"而非"是否为 `None`"决定要不要应用这层
+掩码，空张量下这层 `masked_fill_` 天然是 no-op，不需要特判。**位置分桶
+（legacy）模式永远不产出 `slot_valid`/`M_s`**（值恒为 `None`）——它从不做
+锚点展开，没有"重复/无效虚拟槽"这个概念，`None` 在这条路径上是合法的稳定值，
+不是"忘了实现"的占位符。
+
+**这个决定顺带暴露了一个更大的接口问题，必须一并解决**：`get_attention_
+state()` 现有实现（`log_kv_cache.py:1246-1369`）按 `with_stats` 布尔值返回
+**裸 3-元组或 8-元组**，位置对应关系全靠调用方记住。语义模式再叠加
+`slot_valid`/`M_s`，理论上会衍生出 **4 种不同长度/顺序的返回值**（legacy×
+无 stats=3、legacy×有 stats=8、语义×无 stats=5、语义×有 stats=10，且"语义×
+有 stats"这一档此前完全没人定义过顺序），而这份规格通篇反复在抓的正是"位置
+参数摆错顺序"这一类 bug（`experiments.md` S0.8 3b 一节的调用签名错误就是活
+生生的例子）
+——继续用裸位置元组只会不断制造同一类风险。**不再扩展位置元组，改用一个
+具名结构**：
+
+```python
+class CacheAttentionState(NamedTuple):
+    slot_k: torch.Tensor
+    slot_v: torch.Tensor
+    slot_w: torch.Tensor
+    # 语义模式恒为张量（S_pooled 可以是 0 但不是 None）；legacy 模式恒为 None：
+    slot_valid: torch.Tensor | None = None
+    M_s: torch.Tensor | None = None
+    # with_stats=True 时是张量；with_stats=False 时恒为 None，不区分 legacy/语义：
+    slot_sigma_u: torch.Tensor | None = None
+    slot_sigma2: torch.Tensor | None = None
+    slot_gamma_a: torch.Tensor | None = None
+    slot_gamma_b: torch.Tensor | None = None
+    slot_gamma: torch.Tensor | None = None
+```
+
+`get_attention_state(with_stats=False)` 在任何模式下都返回同一个类型
+`CacheAttentionState`，只是不适用的字段取 `None`——调用方一律按**字段名**
+取值（`state.slot_k`、`state.slot_valid`），不再按位置解包，这一类改动本身
+就让"第 4 个位置传成第 5 个参数"这整个 bug 类别在语法层面消失，不需要调用方
+自觉小心。`with_stats` 参数保留（性能旋钮，`second_order_scale==0` 的调用
+方仍可以传 `False` 跳过 5 个 rank-1 张量的 gather/cat），不因为这次改动被
+取消。`log_kv_slot_attention` 自身的参数列表不变（仍是关键字参数，不接收
+这个结构体本身），调用方从 `state` 上取字段后按现有方式逐个传入。
+
+§5.15"`get_attention_state()` 额外返回有效位掩码与每 entry 的 `M_s`"一节
+（原文只有一句话）改为指向本节这个具体结构。
+
 **为什么 Σ/Γ 也要按锚点转，不能只转 `k_raw`。** §5.10/§5.20-B 说"Σ/Γ 的统计空间
 post-RoPE → pre-RoPE，数学不变，只是喂进去的张量换了"——这句话覆盖了**累积**这一步
 （Chan merge 在 pre-RoPE 空间做，正确），但没覆盖**读出**这一步。现有打分/读出公式
@@ -3087,6 +3194,27 @@ entry 展开出 `M` 个虚拟槽时，`sigma_u`/`gamma_a` 也各自展开出 `M`
   用旋转后的 `sigma_u_eff` 算"和"用未旋转的 `sigma_u` 直接点乘 `q`"两者**不相等**
   （只要该 entry 的锚点不在原点）——这条测的是"没有人漏转"，而不是"转得准不准"，
   是防回归最便宜的一条。
+
+**S0.8 3b（`experiments.md`"S0.8"一节）明确只走 `with_stats=False` 的一阶路径，
+不覆盖这里的 Σ/Γ 二阶修正。** 3b 要验证的是"批量近似路由/compaction 与严格
+串行参考构造出的 cache，attention 读出是否一致"——这个问题只关心**槽的成员
+划分和位置表示**（哪些 token 进了哪个槽、entry 的 `p_lo/p_hi/sum_wp`），和
+Σ/Γ 的旋转数学是两件正交的事：Σ/Γ 的正确性已经由本节这两条单测独立覆盖
+（嵌套精确性、坐标系回归，纯 CPU、不需要批量/串行两条路径对拍）。若 3b 也
+把 `with_stats=True`、`slot_sigma_u/sigma2/gamma_*` 一并纳入比较，一是要
+在 §5.14"`dedup_anchors`/`materialize_anchor_keys` 的输出到
+`log_kv_slot_attention` 输入之间还缺一步展开"那节的基础上再定义五个 rank-1 字段
+各自的展开/mask/`CacheAttentionState` 字段顺序（`materialize_anchor_
+directions` 对 `sigma_u`/`gamma_a` 同样要展开成 3 个虚拟槽、同样要被
+`slot_valid` 遮蔽——`gamma_b`/`sigma2`/`gamma` 不经过旋转但仍需要按同一个
+`slot_valid` 广播/遮蔽，和 `slot_w`/`M_s` 是同一类"entry 级、不随锚点变化"
+的量），二是会让 `error_3b` 超标时无法区分"是路由分歧导致的，还是二阶修正
+本身的近似误差导致的"——把两个独立误差源混进同一个数字，违背了 3b 存在的
+本意（诊断路由/compaction 层面的分歧）。**决定：3b 固定
+`get_attention_state(with_stats=False)`，第一次实现时不需要考虑
+`slot_sigma_u`/`slot_gamma_*` 的展开顺序；如果日后需要验证"批量近似路由 +
+二阶修正"组合起来是否也保持一致，那是一个独立的、需要新起一项的实验，不是
+往 3b 里加参数。**
 - **嵌套精确性**：单 token entry（`p_lo=p_hi=p_mid`）→ M=1，输出与 `model.apply_rope`
   在该位置上逐位一致。
 - **合并的结合律**：任意二叉合并顺序**逐位一致**——`sum_wp` 是整数加法，这条应当
@@ -3140,7 +3268,9 @@ entry 展开出 `M` 个虚拟槽时，`sigma_u`/`gamma_a` 也各自展开出 `M`
   pre-RoPE 内容空间统计（§5.10）；`_counts[ell]` 的"同层等宽"假设要放开（§5.19-2）。
 - 路由 `_route()`：按 §5.2–§5.6 实现，`@torch.no_grad()`，与 cache 更新同路径。
   **必须同时把路由决策写进 `op_log` 供 backward 重放**（§11-A、§5.21-2，硬性要求）。
-- `get_attention_state()` 额外返回有效位掩码与每 entry 的 `M_s`；
+- `get_attention_state()` 返回类型改为 `CacheAttentionState`（具名结构，见上方
+  "`slot_valid`/`M_s` 在语义模式下不是可选项"一节），不再是裸位置元组；语义模式下
+  无条件（不受调用方控制）额外产出 `slot_valid`/`M_s` 两个字段；
   `log_kv_slot_attention` 增加可选槽有效性掩码参数（fp32 分数上填 `-inf`），与现有
   `causal_tail` 正交；**mass bias 改用 `λ·log(w_s / M_s)`**。
 
