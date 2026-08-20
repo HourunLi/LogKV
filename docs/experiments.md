@@ -287,6 +287,35 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
      f1        = 2 * precision * recall / (precision + recall)
      ```
 
+     **上面三个公式都有零分母边界，32k 下正常路由几乎不会撞见，但 S0.1
+     风格的小合成单测（极端场景：全 singleton、两条路径都退化成单个大簇）
+     会撞见，必须显式定义，不能让 NaN 悄悄混进报告——这正是本文档一贯在
+     防的那类问题，不能因为"实践中大概率不会发生"就在这里放过去**：
+     - **ARI 的 `max_idx - expected == 0`**：只在 `sum_ai == sum_bj`
+       且两者都取到各自可能的两个极值之一时发生——精确对应"两条路径的
+       聚类形状退化成完全相同的极端结构"（都是全 singleton，或都是单个
+       大簇纳入全部 token）。经验证 `sklearn.metrics.adjusted_rand_
+       score` 在这类输入上返回 `1.0`（用 `all_singleton`/`all_same_
+       cluster` 等场景实测确认，不是凭印象转述）——两条路径退化成同一种
+       最简单结构，判"完全一致"符合直觉，不是需要回避的边界，本规格
+       采用相同约定：**`max_idx == expected` 时 `ARI := 1.0`**。
+     - **precision 的 `sum_ai == 0`**：批量路径把每个 token 都分进了
+       独立的单点簇，"批量路径判同簇的 pair"这个集合本身是空集，此时
+       `sum_nab` 也必然是 0（`sum_nab ≤ sum_ai` 恒成立），precision 是
+       真正的 0/0，没有自然的数值可填——**定义为未定义（报告
+       `NaN`，标记 `precision_undefined=True`）**，不强行给一个会被
+       误读成"精确"的数字。
+     - **recall 的 `sum_bj == 0`**：对称情形（严格串行参考退化成全
+       singleton），**同样定义为未定义（`NaN`，
+       `recall_undefined=True`）**，独立于 precision 是否也未定义
+       （两条路径可能只有一条退化）。
+     - **f1**：`precision`/`recall` 任一未定义则 `f1` 未定义
+       （`NaN`）；两者都定义且都精确为 0（`sum_ai>0` 且
+       `sum_bj>0` 但两条路径没有任何共同的同簇 pair）时
+       `f1 := 0`（标准调和平均"两个已定义的 0 调和平均仍是 0"的约定，
+       不是另一个 0/0——`f1` 公式本身只有在 `precision+recall==0` 时
+       才有除零风险，而这恰好就是这个分支覆盖的情形）。
+
      raw agreement、ARI、`(precision, recall, f1)` 四组数字一起报告，
      不用其中一个代替另一个——raw agreement 直觉最直接但容易被小
      `K_max` 撑高，ARI 修正了这一点但数值本身不直观（可以为负），
@@ -593,24 +622,49 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        >     # (1, nh, tail_query_count, hs)——log_kv_slot_attention 的 q
        >     # 要求显式 (B, nh, T_q, k_dim)。3b 的两次 log_kv_slot_attention
        >     # 调用在循环外面、只做一次，不逐块调用。
+       > q_tail = q_tail.cpu()
+       >     # q_tail 来自本轮 GPU 前向的 q_roped，是 CUDA 张量；cache_batch/
+       >     # cache_serial 是 algorithm-spec.md §5.4/§5.18 的纯 CPU 参考实现
+       >     # 构造出来的，get_attention_state() 返回的是 CPU 张量。两者不搬到
+       >     # 同一设备就直接相乘，log_kv_slot_attention 内部的矩阵乘法会立即
+       >     # 报 device mismatch——这不是可以事后再补的细节，是这段代码能不能
+       >     # 跑起来的前提。选择把 q_tail 挪到 CPU（而不是把 cache_batch/
+       >     # cache_serial 挪到 GPU）：q_tail 只有 (1, nh, tail_query_count, hs)
+       >     # 这么大，搬一次的代价可以忽略；反过来搬 cache 状态需要额外维护
+       >     # 一条"参考实现也能在 GPU 上跑"的路径，而参考实现的全部存在意义
+       >     # 就是"足够简单、容易独立确信正确"，不值得为这里的比较步骤破例。
+       >     # dtype 不受这次 .cpu() 影响（不改变 dtype，仍是 q_roped 的原始
+       >     # activation dtype，如 fp16/bf16）；只要 cache_batch/cache_serial
+       >     # 的 k̄_raw/v̄ 按 §5.13 buffer 表的既有约定同样存 activation dtype
+       >     # （不是参考实现为了自己数值稳定改用 fp64 之类），两侧就天然一致，
+       >     # 不需要在这里额外做一次类型转换。
        > assert cache_batch.recent_count  >= tail_query_count   # 前提，两条
        > assert cache_serial.recent_count >= tail_query_count   # 路径各查一次
        >
        > # log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale, mask=None,
        > # causal_tail=0, slot_valid=None, M_s=None, ...)——scale 是位置参数、
-       > # 排在 slot_w 之后，slot_valid/M_s 是具名关键字参数，不能靠展开
-       > # get_attention_state() 的返回值自动对齐，必须显式拆包、按名字传：
-       > slot_k, slot_v, slot_w, slot_valid, M_s = cache_batch.get_attention_state()
+       > # 排在 slot_w 之后，slot_valid/M_s 是具名关键字参数。get_attention_
+       > # state() 返回类型是 algorithm-spec.md §5.14"slot_valid/M_s 在语义
+       > # 模式下不是可选项"一节新增的 CacheAttentionState（具名结构，不是裸
+       > # 位置元组），按字段名取值，不再有"第几个位置对应哪个参数"这个问题；
+       > # with_stats 显式传 False——3b 只验证批量近似路由/compaction 与严格
+       > # 串行参考的一阶读出是否一致，不覆盖 Σ/Γ 二阶修正（后者已经由
+       > # algorithm-spec.md 同一节"Σ/Γ 锚点物化"的独立单测覆盖，理由见那节）：
+       > state_batch = cache_batch.get_attention_state(with_stats=False)
        > out_batch = log_kv_slot_attention(
-       >     q_tail, slot_k, slot_v, slot_w, scale,   # scale 复用机制 B 循环
-       >     causal_tail=tail_query_count,              # 里已经在用的同一个
-       >     slot_valid=slot_valid, M_s=M_s,             # scale，不是新的量
+       >     q_tail, state_batch.slot_k, state_batch.slot_v, state_batch.slot_w,
+       >     scale,                                       # scale 复用机制 B
+       >     causal_tail=tail_query_count,                  # 循环里已经在用
+       >     slot_valid=state_batch.slot_valid,             # 的同一个 scale，
+       >     M_s=state_batch.M_s,                            # 不是新的量
        > )
-       > slot_k, slot_v, slot_w, slot_valid, M_s = cache_serial.get_attention_state()
+       > state_serial = cache_serial.get_attention_state(with_stats=False)
        > out_serial = log_kv_slot_attention(
-       >     q_tail, slot_k, slot_v, slot_w, scale,
+       >     q_tail, state_serial.slot_k, state_serial.slot_v, state_serial.slot_w,
+       >     scale,
        >     causal_tail=tail_query_count,
-       >     slot_valid=slot_valid, M_s=M_s,
+       >     slot_valid=state_serial.slot_valid,
+       >     M_s=state_serial.M_s,
        > )
        > error_3b = relative_l2(out_batch, out_serial)   # 3b 的分子/分母；
        >                                                    # 两次调用用的是
@@ -720,7 +774,23 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   下面 §7 消融表"query 位置"那一行是一个独立的、eval-time（Stage 2，
   真实模型输出）测量，回答的是同一个问题在中部/前置 query 下什么样，
   **不是 3b 的延伸，也不共享它的 5% 阈值**——3b 只代表尾部 query，不要
-  拿它的结论去承担中部/前置 query 的判断，两者的结论不要互相借用。第
+  拿它的结论去承担中部/前置 query 的判断，两者的结论不要互相借用。
+
+  **多 prompt 聚合口径（此前未定义）**：`relative_l2` 对每条 prompt 各自的
+  每一层给出一个 `(B, nh)` 网格，不跨 head/layer 平均（见 `relative_l2` 的
+  docstring）；Stage 0 dump 的是"几条 32k NIAH prompt"（复数），所以完整的
+  `error_3b` 结果是一个 `(prompt, layer, head)` 三维网格，此前没有说清楚这
+  个网格怎么收敛成一个"过/不过"的判断。**决定：硬性决策门挂在
+  `max` 上——`max` over `(prompt, layer, head)` 的 `error_3b` 必须
+  < 5%，任意一个 prompt 的任意一层任意一个头超标就算 S0.8 在 3b 这一项
+  失败，不是 warning。** 理由和"不跨 head/layer 平均"同源（§2.5 的贯穿性
+  要求）：均值/`p95` 这类统计量会把"某个头系统性有问题"稀释进一堆好头里，
+  而 3b 存在的意义正是暴露这类头/层特定的失效，取 `max` 是唯一不会把问题
+  平均掉的选择。**但只报一个 `max` 数字不够诊断**：同时报告完整网格的
+  均值、`p95`、以及取到 `max` 的那个 `(prompt, layer, head)` 三元组本身
+  （方便直接定位是哪条 prompt、哪一层、哪个头出的问题，不需要事后再翻
+  整个网格去找）——`max` 决定过没过，分布统计和最差点身份帮助归因"差在
+  哪"，两者都要报，不能只留一个。第
   1、2、3a 项没有独立的通过/失败阈值，是诊断输出——**但必须报告**，因为若 3b 超标，第 1/2/3a
   项决定了修法：如果是 cluster assignment 分歧主导（尤其 Ward 事件分歧），
   要收紧 Phase 1 的批量
