@@ -361,4 +361,3 @@ def test_value_var_relative_unavailable_without_vh() -> None:
     assert result["token_weighted_value_var"] == pytest.approx(5.0)
     assert result["token_weighted_value_var_relative"] is None
     assert result["vh_source"] == []
-

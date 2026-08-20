@@ -9,13 +9,24 @@
 > **动手写代码之前先读 §5.19（实现 tips 与易错点）和 §5.20（复用边界），
 > 以及 risks 文档的 §11（技术难点清单）。**
 >
-> **本文件目前 100% 是设计规格，不是已实现代码——`litgpt/`、`tests/` 里不存在
-> 下面参数表、buffer 清单、`op_log` 等任何字段或分支（`LogKVStreamTrainingAttention`
-> 这个类名确实存在，但那是它在语义簇设计之前、位置分桶时代就有的版本，见
-> CLAUDE.md §0"当前阶段"）。文中大量"更正""这一轮修的"字样，改的都是**规格
-> 文本自身的逻辑漏洞**，不是已运行代码的 bug——不要把这些当成"代码已经在跑，
-> 只是在修 bug"的证据。连 Stage 0 的 dump 脚本（§5.21-5，本项目该写的第一段
-> 代码）都还没有写。**
+> **本文件描述的生产实现目前 100% 是设计规格，不是已实现代码——`litgpt/
+> log_kv_cache.py`（现有位置分桶实现）与 `litgpt/model.py` 的流式路径里
+> 不存在下面参数表、buffer 清单、`op_log` 等任何字段或分支
+> （`LogKVStreamTrainingAttention` 这个类名确实存在，但那是它在语义簇设计
+> 之前、位置分桶时代就有的版本，见 CLAUDE.md §0"当前阶段"）。文中大量
+> "更正""这一轮修的"字样，改的都是**规格文本自身的逻辑漏洞**，不是已运行
+> 代码的 bug——不要把这些当成"代码已经在跑，只是在修 bug"的证据。**
+>
+> **更正（这一轮修的）：Stage 0 的 dump 脚本已经写了一部分，上一句"都还没有
+> 写"过时了，必须精确区分范围。** `litgpt/semantic_s0.py` + `unused/
+> semantic_stage0_dump.py` + `unused/semantic_s0_sweep.py`（各带单测）实现了
+> Stage 0 dump 规格里的**机制 A**（k/v，服务 S0.0/S0.4/S0.5/S0.2 口径①，详见
+> CLAUDE.md §0 开头的说明），但**机制 B**（post-RoPE q、`attn_mass_by_dist`）、
+> S0.8 3b 需要的 manifest 字段（`tail_query_count`、MinHash 三元组）、以及
+> 本节描述的生产实现（`log_kv_semantic_clusters`、多簇路由、`op_log` 等）
+> **都还没有
+> 写**——"生产代码 100% 是设计规格"这句话本身仍然成立，只是"连 Stage 0 dump
+> 脚本都没有"这个具体例子不再成立，不能再用它当佐证。
 
 ## 5. 算法规格与实现方案
 

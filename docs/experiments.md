@@ -49,6 +49,13 @@ query head 共享）与 needle 的 token span（复用另一分支已有的 `log
 
 Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生产代码之前**（§5.21-5）。
 
+> **这份规格的机制 A（k/v）部分已经实现**：`litgpt/semantic_s0.py` +
+> `unused/semantic_stage0_dump.py` + `unused/semantic_s0_sweep.py`（各带单测，
+> 详见 `CLAUDE.md` §0 开头的说明）。**机制 B（下方）以及本节"落盘格式"要求
+> 的 `tail_query_count`/MinHash 三元组等字段仍未实现**——现有脚本的 manifest
+> 只有 k/v、`s_h`/`vh`、基础样本信息，不满足下面完整 schema，不要把它当成
+> 已经覆盖了整份 Stage 0 dump 规格。
+
 > **这句话的范围（这一轮补的）：覆盖 S0.0–S0.7 和 S0.8 的第 1/2/3a 项，不覆盖
 > S0.8 的 3b 项。** 3b 需要 §5.4/§5.18 第 2 步的 CPU 参考路由实现，以及
 > `log_kv_slot_attention()`/`get_attention_state()` 按 §5.14/§5.20-B 扩展出的
