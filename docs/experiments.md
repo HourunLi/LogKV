@@ -846,8 +846,8 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > 向它要东西"这条边界。压缩侧两次调用**直接、原样传递生产函数
        > `get_attention_state()` 的返回值给 `log_kv_slot_attention`，不
        > 做任何手工重建或平行实现**（GQA 折叠、`slot_valid`、`M_s`、
-       > `λ log(w/M)`、fp32 分数缓冲这些细节因此全部自动保持一致，不
-       > 需要在这里重新枚举）。
+       > `λ·log(w) − log(M)`（`−log(M)` 不受 `λ` 门控，§2.3）、fp32
+       > 分数缓冲这些细节因此全部自动保持一致，不需要在这里重新枚举）。
        >
        > `tail_query_count > block_size` 时 `q_tail` 会跨越不止一块——
        > 上面"先逐块累积、循环结束后统一 `cat`"的写法对这种情形和
@@ -978,7 +978,7 @@ Stage 2 有信号后再投入。v3 没有需要 warmup 的新标量（v2 的 `κ
 | `K:B′` 分配 | 32×4 / 16×8 / 8×16 | 语义分辨率 vs 时序分辨率，总预算固定 |
 | `anchor_mode` | `lo_hi_mid` / `lo_hi` / `mid` / `z` | 锚点表示 vs v2 的 z 统计量 |
 | `λ_rel` | 0.5 – 2.0 | needle 隔离与簇纯度的平衡点 |
-| `λ`（mass bias）| 0 / 1 | 大簇的计数质量补偿是否仍然正确 |
+| `λ`（mass bias）| 0 / 1 | 原始 vanilla `log(w)` 那部分计数质量补偿开/关，值不值——`−log(M)` 这个锚点展开候选数校正项不受这个开关影响，两档下都无条件生效（§2.3），扫这一行不会像旧公式那样连带改变 anchor-count 校正的行为 |
 | `γ`（遗忘因子）| 0 / 0.5 / 1 | centroid 门控更新值不值 |
 | rank-1 Σ/Γ | 关 / 现有构造 / delta-rule 构造 | 第三档取决于 S0.7；**"现有构造"/"delta-rule 构造"两档在 Stage 2 还不能跑**——`algorithm-spec.md` §5.14"S0.8 3b 明确只走 with_stats=False"一节：3b 只验证过路由/compaction 的一阶分歧，从没验证过批量近似路由下 Σ/Γ 聚合状态本身是否也和严格串行参考一致，Stage 1 因此把 `second_order_scale` 默认锁在 0（即这一行的"关"），要跑另外两档必须先有类似 3b 的独立验证（那节称为 3c，未展开设计） |
 | vanilla memory-matched | B 调大到同 entry 数 | **排除"只是多用了内存"** |
