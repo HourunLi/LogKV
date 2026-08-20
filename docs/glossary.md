@@ -156,10 +156,12 @@ cache（每 layer 一个）
 
 | 记号 | 含义 |
 |---|---|
-| **Stage 0** | 离线证伪：一次 GPU dump + 全部 CPU 分析。**在写任何生产代码之前**（S0.8 3b 例外，它需要 CPU 参考路由与 `log_kv_slot_attention`/`get_attention_state()` 的接口扩展先落地，见 `algorithm-spec.md` §5.21-5） |
+| **Stage 0** | 离线证伪：一次 GPU dump + 全部 CPU 分析。**在写任何生产代码之前**——但 S0.8 全部子项（不只 3b）都还需要 `cache_serial`/`cache_batch` 这两份朴素 CPU 参考实现（§5.3 严格串行、§5.4 批量近似算法各自的非向量化实现，**不是** §5.18 第 4 步的生产向量化实现，两者是不同的制品）先落地；3b 在此之上额外还需要 `log_kv_slot_attention`/`get_attention_state()` 的 `CacheAttentionState` 接口扩展，见 `algorithm-spec.md` §5.18 第 2 步与 §5.21-5 |
 | **Stage 1 / 2 / 3** | 实现 / eval-time 探测 / CPT |
 | **S0.0** | 扫 `(g_max, ℓ_block)`——**最高优先级**，回答"收益来自语义分组还是分段边界" |
 | S0.1–S0.8 | 单测 / `K_eff` 曲线 / needle 隔离率 / 簇内 key+value 方差 / 跨度分布 / 锚点膨胀 `E[M]` / supersession 比例 / 批量化近似的分歧率 |
+| **S0.1**（精确定义） | 只指 `log_kv_position.py`/§5.14 的纯 CPU 单测（mass bias 计数守恒、`w=0` 恒等元等）。**不包括**下面的"实现单测"，即使两者都不需要 dump |
+| **实现单测** | `algorithm-spec.md` 里散落的一类正确性单测（重放正确性、Phase 3a/3b 元数据更新、Ward 合并 `level_count` 不变量、padding 槽字段对拍等），验证 §5.3/§5.4/§5.6/§5.11/§5.21-2 这些**实现本身**对不对。之前借用过 S0.1 标签（因为同样纯 CPU、不需要 dump），已统一改名——它们依赖各自测的那块路由/重放机制先写出来，不依赖 `log_kv_position.py`，前置条件和真正的 S0.1 不同，不能混用 |
 | **Config A/B/C** | Stage 2 的三档，**全部是 eval-time 消融参考点，不设通过/失败容差**（正确性检验在 Stage 0/1 的纯 CPU 单测，不在这里）：`K_max=1` 参考基线（不预期复现旧数字）/ 纯语义（`η=0, g_max=∞`）/ 主实验 |
 | **D1 自检** | 另一分支的诊断实验，测出 width≥8 时 rank-1 失真明显 |
 | **memory-matched** | 把 vanilla 的 `B` 调大到同 entry 数再比，**排除"只是多用了内存"** |
