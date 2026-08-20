@@ -621,6 +621,119 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-20｜第三十六轮：修第三十五轮自己引入/遗留的一处 P1（`phase_after`
+  对 `NEW_SEGMENT` 分支套错公式，在三处独立描述里重复了三遍）、一处 P1 跨文档
+  传播缺口（`position.md`/`glossary.md` 仍停在被推翻的 `level_count` 公式）、
+  六处"新簇初始化/Phase 3 写入清单"漏了 `level0_phase`、`carry_into_level`
+  docstring 留着过时的 `1..2B′` 上界、`ℓ_block` 合法取值在三处自相矛盾、
+  `scan_op_log` 对未知槽引用静默按 `epoch=0` 处理。** 动机：一次独立代码评审
+  （对照当前文档给出 file:line 级证据）指出六处问题，两处 P1、三处 P2、一处
+  P2/P3。逐条结论：
+  ① **P1，本轮最重要的一处：`phase_after[t] = (prev_mod[t] + 1) mod
+  2^ℓ_block` 这条公式对 `new_seg[t]=True`（该 token 触发新段、前面刚插过
+  PAD）的情形是错的，且这个错误在文档里被独立复述了三遍。** 用具体反例验证：
+  `prev_mod[t]=2`，`2^ℓ_block=4`。正确过程是先插 `count[t]=(-2) mod 4=2`
+  个 PAD 把相位从 2 推到 0（`2→3→0`），t 自己落地后相位变成 1；但公式无
+  条件套用 `(prev_mod[t]+1) mod 2^ℓ_block` 会算出 `(2+1) mod 4=3`，比正确值
+  多 2。根因是"没插 PAD 时相位单纯 +1"这条公式（`JOIN` 分支）被错误地也套用
+  到了"插了 PAD、相位已经被拉回 0"的分支（`NEW_SEGMENT`/`NEW_CLUSTER`）上
+  ——讽刺的是，紧接着这条公式之后、为 `steps_since` 的 "-1" 做完整推导的那段
+  证明，本身已经正确写出了分叉的递推 `M_{r+1}=1（若 new_seg=True）或
+  (M_r+1) mod 2^ℓ_block（否则）`，公式却没有照这个已经证明对的递推来写，是
+  一处"证明是对的、抄成公式时抄错"的典型 bug。**修法**：`phase_after[t]`
+  拆成两个分支——`new_seg[t]=True` 时恒为 `1 % 2^ℓ_block`（`ℓ_block=0` 时
+  退化成 0，与该配置下 `level0_phase`/`count` 恒为 0 一致，不需要单独
+  特判）；`new_seg[t]=False` 时才是 `(prev_mod[t]+1) mod 2^ℓ_block`。**同一
+  个错误分别复述在三个地方，必须一并改**：Phase 1 的公式定义本身、"三个
+  写入点"里 Phase 3a（直接复述同一条错公式）和 Phase 3b（"做同一条 `+1 mod
+  2^ℓ_block` 更新"，同一个错误的另一种措辞，且遗漏了 Phase 2 内部同一
+  orphan 组后续成员一样可能触发 `NEW_SEGMENT` 这一情形）、以及"必须有 CPU
+  参考实现"段落对朴素串行参考实现的描述（同样无条件写"`+1 mod
+  2^ℓ_block` 递推"）。**这一条尤其致命**：如果只改向量化公式、不改参考
+  实现的描述，对拍单测会拿两份同样错误的实现互相比较，"逐位一致"会在两边
+  一致算错的情况下"通过"，完全测不出问题——三处必须同步改正，不是可以
+  分批处理的独立问题。
+  ② **P1：`docs/position.md`、`docs/glossary.md` 都还停留在被第三十五轮推翻
+  的 `level_count[cluster,0]` 公式上，从未跟进 `level0_phase` 这次修正。**
+  `position.md` P7.1 的代码块和讲解仍然是"直接复用 `level_count[cluster,0]`
+  不需要新计数器"这条已经被证明有反例（`carry_into_level` 精确定义后
+  `level_count` 只在 `B′-1`/`B′` 间振荡，不再遍历全部剩余类）的旧结论；
+  `glossary.md` 更明显——`n_total` 词条的尾注仍写"那处直接复用
+  `level_count[cluster,0]`"，但仅隔 60 行的"新增的 buffer"清单已经是正确
+  的 `level0_phase` 描述，同一份文件内部自相矛盾。两处都已按
+  `algorithm-spec.md` §5.11 的权威定义改正：`count = (-level0_phase[
+  cluster]) mod 2^ℓ_block`，并补充说明新旧两条公式为什么不再等价。
+  ③ **P1/P2：至少六处"这是一个新簇/Phase 3(a) 要初始化或更新哪些字段"的
+  枚举列表漏了 `level0_phase`**——`allocate_new_cluster` 的清零列表、
+  `K` 未满/冷启动分支"白纸"前提、Phase 3 总览、Phase 3a 两处独立描述、
+  "如果 Phase 3 严格等到批末才运行"那段反例说明，全部只列了
+  `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment` 五个字段，但
+  `level0_phase` 正是同一轮（第三十五轮）新增、且明确要求"新建簇初始
+  `level0_phase=0`……`allocate_new_cluster` 清零的字段列表里加上它"的
+  字段——要求本身写在文档里，却没有传播到它引用的那些列表本身。六处全部
+  补上 `level0_phase`（各自标注它归属 §5.11 而非 §5.5，避免被误读成
+  `n_eff`/`centroid` 那一类在线均值更新字段）。**未改动的三处**（"重放
+  正确性断言范围外"列表、"生产路径 vs 独立参考实现对拍"列表、`Metadata`
+  struct 打包字段）**留白是刻意的**：`level0_phase` 已经有 §5.11 自己独立
+  的 CPU 参考实现和对拍单测（本轮①已修正），把它并进这个专门服务
+  `centroid`/`n_eff` 一类字段的另一个测试的 `Metadata` 结构，需要同步改
+  这个测试自己的参考实现伪代码，超出"修一处过时枚举"的范围，不属于本轮。
+  ④ **P2：`carry_into_level` 的 docstring 仍写"incoming_block（时间序，
+  1..2B′个）"，与后文"更正（第三次）②"证明的"Ward 合并级联到足够深的层
+  时，非顶层同样会收到 `3B′`"直接矛盾——同一个函数的前置条件在 100 行内
+  自相矛盾。** 核实证明本身：递推 `E(ℓ)=⌈(B′+E(ℓ-1))/2⌉` 在 `B′=8` 时从
+  `E(3)=8=B′` 起饱和，此后任何一层（不只是顶层）收到的 `incoming =
+  native_ℓ(≤2B′) + ejected_from_below(=B′) = 3B′`，`carry_into_level` 的
+  真实上界因此是 `3B′`，`2B′` 只是"只算了 Ward 合并两源簇原生内容、漏了
+  上一层级联下来的 `ejected`"这个更早版本的证明留下的过时数字。**修法**：
+  docstring 改为 `1..3B′` 并给出简短理由；同时给 §5.12"必须补的单测"第 3
+  条追加一句要求——同一组构造需要显式断言至少一个**非顶层**在这次合并中
+  收到的 `incoming_block` 长度也达到 `3B′`，不能只测顶层（此前的测试只
+  显式断言了顶层，这正是 docstring 长期没被这条测试揪出来的原因）。
+  ⑤ **P2：`ℓ_block` 的合法取值在三处互相矛盾**——§5.3 把 `ℓ_block=0` 定义
+  为"纯语义聚类"消融端点的一部分，§5.21-2 生产路径硬校验的合法范围是
+  `{0,1,2}`（含 0），但 §5.11"代价是指数的"一节结论句写的是"`ℓ_block`
+  实际只能取 1 或 2"，字面读成排除 0，与前两处直接冲突；`glossary.md` 的
+  `ℓ_block` 词条把"指数增长，只能取 1~2"和"硬校验 `ℓ_block ∈ {0,1,2}`"
+  两句紧挨着写，同一个矛盾在这里更加显眼。**厘清**：`ℓ_block=0` 时
+  `2^ℓ_block=1`，每边界浪费 `2^0-1=0`，代价恒为零——§5.11 那张代价表从 1
+  开始列，不是漏了 0，是 0 在"讨论代价多大"的表里天然没有意义（零成本，
+  没什么好讨论的）。**准确的表述是三档而非二选一**：`ℓ_block=0` 是合法
+  的"关闭段边界保护"消融/关闭档（零代价零保护）；`ℓ_block∈{1,2}` 是"确实
+  需要非退化保护"时唯一负担得起的两档；`ℓ_block≥3` 一律不可接受。生产
+  路径的三值校验 `{0,1,2}` 本身是精确的、不需要改动，需要改的只是 §5.11
+  结论句和 `glossary.md` 词条的措辞。
+  ⑥ **P2/P3：`scan_op_log` 对 `JOIN`/`NEW_SEGMENT`/`WARD_MERGE` 引用的槽
+  用 `epoch.get(..., 0)`，缺失时静默当作"epoch 恰好是 0"，而不是报错。**
+  这正是它自己 docstring 前提 3 专门警告过的场景（切片调用忘了传
+  `initial_epoch`，或 `op_log` 拼接顺序本身有 bug）——docstring 把责任全部
+  推给调用方，但函数自己不维护任何能顺带暴露这类错误的状态。这和姊妹函数
+  `scan_op_log_for_ward_events` 在更早一轮（第二十轮）已经改正过的
+  `.get(ident, EMPTY_SKETCH)`/`.get(ident, 0)` 反模式是同一类问题，但
+  `scan_op_log` 当时没有跟着一起改——不是风险更小，是这个函数本来就更简单
+  （没有 `sketches`/`sizes` 之类会顺带兜底暴露错误的额外状态），问题反而
+  更容易被放过。**修法**：不引入 `scan_op_log_for_ward_events` 那一整套
+  `_require`/`sketches`/`sizes`/`pending` 机制（这个函数刻意保持"只维护
+  `epoch`/`parent`，足够简单以便独立确信正确"的既有取舍不变），只做最小
+  的对称改动——`JOIN`/`NEW_SEGMENT`/`WARD_MERGE` 引用的槽不在当前 `epoch`
+  字典（含调用方传入的种子）里就直接 `raise`，不再用 `.get(...,0)` 垫一个
+  可能是假的默认值；`NEW_CLUSTER` 不受影响，因为它是在**建立**新身份而非
+  **引用**已有身份，"槽此前没见过"对它而言是合法输入。新增单测要求：
+  不传 `initial_epoch` 就对中间切片调用、`op_log` 第一条引用未知槽，
+  断言 `raise`；正确传种子的对照场景断言不受影响。
+  **验证**：`grep -rn "log_kv_semantic_clusters\|level0_phase\|
+  saturating_top_carry\|carry_into_level" litgpt/ tests/` 零匹配，确认
+  本轮改动（`docs/algorithm-spec.md`/`docs/position.md`/`docs/glossary.md`）
+  全部是文档，不涉及任何代码/测试文件，与历轮基线一致；本地临时环境没有
+  torch/numpy（`ModuleNotFoundError`），延续既往轮次的处理方式，未安装
+  完整依赖跑测试套件，改为对每处核心结论手工代入验证（①的反例直接代入两条
+  公式对比数值、④的递推 `E(ℓ)` 手工迭代到饱和值）而非仅凭推导；`**` 计数
+  （`grep -o '\*\*' | wc -l`）核对三个改动文件均为偶数
+  （algorithm-spec.md 2134、position.md 50、glossary.md 208），且逐一确认
+  本轮新引入的 `2**ℓ_block` 类字符串（若有）均在反引号内、非 markdown 加粗
+  ——实际核查确认本轮未新增任何此类字符串，全部沿用已有的 `2^ℓ_block`
+  记号，不受历史上"级联加粗渲染 bug"这一类问题影响。
+
 - **2026-08-20｜第三十五轮：修第三十四轮自己引入的四处 P1——`PAD_INSERT`
   相位计数不能再用 `level_count[cluster,0]`（`carry_into_level` 精确定义后
   两者不再等价，新增独立计数器 `level0_phase`）；`saturating_top_carry` 把

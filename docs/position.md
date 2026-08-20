@@ -350,8 +350,8 @@ segment 不直接出现在 attention 中；它通过影响 ladder 的合并边�
 `ℓ_block` 表示 segment 边界保护到第几层：
 
 ```
-保护到第 ℓ 层 => 新 segment 开始前，把 level 0 当前占用数对齐到 2^ℓ 的倍数
-count = (-level_count[cluster, 0]) mod 2^ℓ_block
+保护到第 ℓ 层 => 新 segment 开始前，把 level 0 逻辑插入流的相位对齐到 2^ℓ 的倍数
+count = (-level0_phase[cluster]) mod 2^ℓ_block
 ```
 
 `count` 个 `w=0` pad 只插入 level 0，然后靠普通 binary carry 自然上升。
@@ -359,12 +359,23 @@ count = (-level_count[cluster, 0]) mod 2^ℓ_block
 > **不能用 `n_total_c`（该簇累计的真实 token 数）算这个余数**——`n_total_c` 只数
 > 真实 token，不含已经插入过的 pad，而这里要对齐的是 level 0 上"真实 token + pad
 > 混合而成的插入流"，两者从第一次填充起就会分叉（具体反例见
-> [`algorithm-spec.md`](algorithm-spec.md) §5.11 的更正框）。正确的量是
-> `level_count[cluster, 0]`——该簇 level 0 **当前**的真实占用数，本来就是
-> `_binary_carry` 要维护的既有状态，不需要新增计数器：只要 `B′` 是 `2^ℓ_block`
-> 的倍数（默认配置天然满足），"当前占用数 mod `2^ℓ_block`"和"累积逻辑插入数 mod
-> `2^ℓ_block`"全程相等，且这个量在 Ward 合并之后自动保持正确（合并过程本就会
-> 重写 `level_count`）。这里只复述结论，`algorithm-spec.md` 才是权威定义，两处
+> [`algorithm-spec.md`](algorithm-spec.md) §5.11 的更正框）。
+>
+> **也不能用 `level_count[cluster, 0]`（该簇 level 0 当前的真实占用数）**——
+> 早期版本这样做过，在"level 满 `B′` 个后一次性清空/重置"这个进位模型下是对
+> 的；但 `algorithm-spec.md` §5.12 把逐 token 进位精确定义成"每次溢出只合并
+> 最老的两个、留下 `B′-1` 个 + 新到的 1 个"之后，`level_count` 只在 `B′-1`/
+> `B′` 两个值之间永久振荡，不再遍历 `mod 2^ℓ_block` 的全部剩余类，这条等价
+> 关系随之失效（具体反例同样见 `algorithm-spec.md` §5.11 的更正框）。
+>
+> **正确的量是独立的持久相位计数器 `level0_phase[cluster]`**——不依赖
+> `level_count` 如何振荡、不依赖 `B′` 与 `2^ℓ_block` 的整除关系，只是老实地
+> 数"该簇 level 0 逻辑插入流（真实 token + pad 混合计数）目前的相位"：每插入
+> 1 个 entry（不论真实还是 pad）就 `+1 mod 2^ℓ_block`；新段事件（`NEW_
+> CLUSTER`/`NEW_SEGMENT`）落地后重置为 `1 % 2^ℓ_block`，不是"先 pad 归零、
+> 再套用逐 token 的 `+1` 公式"——这两条规则共享同一个 `prev_mod`/`count`
+> 输入但不是同一条公式，混用会在 pad 之后把相位算大（`algorithm-spec.md`
+> §5.11 有具体反例）。这里只复述结论，`algorithm-spec.md` 才是权威定义，两处
 > 一旦不一致，以那边为准。
 
 ### P7.2 保护不是永久隔离
