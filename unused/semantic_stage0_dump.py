@@ -285,6 +285,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.max_samples is not None and args.max_samples < 1:
+        raise ValueError(
+            f"--max_samples must be >= 1 (or omitted), got {args.max_samples} -- a negative value "
+            f"silently drops samples off the end via Python's negative-slice semantics "
+            f"(`samples[:max_samples]`) instead of limiting the count, which is never the intent here"
+        )
+    if args.max_seq_length is not None and args.max_seq_length < 1:
+        raise ValueError(
+            f"--max_seq_length must be >= 1 (or omitted), got {args.max_seq_length} -- "
+            f"`min(args.max_seq_length, model.max_seq_length)` would set model.max_seq_length "
+            f"itself to this non-positive value and break downstream slicing"
+        )
+
     checkpoint_dir = Path(args.checkpoint_dir).expanduser()
     output_dir = args.output_dir.expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
