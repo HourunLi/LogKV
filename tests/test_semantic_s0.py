@@ -1,11 +1,15 @@
+import math
+
 import numpy as np
 import pytest
 
 from litgpt.semantic_s0 import (
     RouteResult,
     RunningKeyScale,
+    Stage0DumpRecorder,
     SweepAccumulator,
     route_dpmeans_segments,
+    route_position_single_ladder,
     simulate_segment_ladders,
     summarize_entries,
 )
@@ -30,6 +34,78 @@ def test_g_max_opens_new_segment_without_new_cluster() -> None:
     assert route.segment_count == 3
     assert route.cluster_ids.tolist() == [0, 1, 0]
     assert route.segment_ids.tolist() == [0, 0, 1]
+
+
+def test_route_dpmeans_rejects_nonpositive_lambda_new() -> None:
+    # A non-positive threshold forces (almost) every token into its own
+    # singleton cluster (d2 >= 0 > lambda_new holds for virtually every
+    # comparison) without ever raising -- a silently degenerate sweep cell
+    # rather than a meaningful one.
+    k = np.asarray([[0.0], [0.1], [0.2]], dtype=np.float32)
+    with pytest.raises(ValueError, match="lambda_new"):
+        route_dpmeans_segments(k, lambda_new=-1.0, g_max=float("inf"), gamma=0.5)
+    with pytest.raises(ValueError, match="lambda_new"):
+        route_dpmeans_segments(k, lambda_new=0.0, g_max=float("inf"), gamma=0.5)
+    with pytest.raises(ValueError, match="lambda_new"):
+        route_dpmeans_segments(k, lambda_new=float("nan"), g_max=float("inf"), gamma=0.5)
+
+
+def test_route_dpmeans_rejects_negative_g_max() -> None:
+    # A negative (or -inf) g_max forces (almost) every same-cluster arrival to
+    # open a new segment (p - p_hi[c] >= 1 > g_max holds for virtually every
+    # comparison) without ever raising -- pathologically frequent segment
+    # breaks that still look like a normal, valid sweep result.
+    k = np.asarray([[0.0], [0.1], [0.2]], dtype=np.float32)
+    with pytest.raises(ValueError, match="g_max"):
+        route_dpmeans_segments(k, lambda_new=1.0, g_max=-1.0, gamma=0.5)
+    with pytest.raises(ValueError, match="g_max"):
+        # math.isinf(-inf) is True, so a naive "isinf or >= 0" check would let
+        # this slip through -- must be rejected explicitly.
+        route_dpmeans_segments(k, lambda_new=1.0, g_max=-math.inf, gamma=0.5)
+
+
+def test_route_dpmeans_accepts_boundary_g_max_values() -> None:
+    # g_max=0 and g_max=+inf are legitimate degenerate endpoints (used
+    # elsewhere in this file/the S0.0 sweep itself) and must not be rejected
+    # by the new validation.
+    k = np.asarray([[0.0], [0.1]], dtype=np.float32)
+    route_dpmeans_segments(k, lambda_new=1.0, g_max=0.0, gamma=0.5)
+    route_dpmeans_segments(k, lambda_new=1.0, g_max=math.inf, gamma=0.5)
+
+
+def test_route_position_single_ladder_is_one_sequential_cluster() -> None:
+    # The S0.4 baseline router: no clustering at all, every token in arrival
+    # order under cluster 0 / segment 0 -- matches vanilla position-bucketed
+    # LogKV, unlike even route_dpmeans_segments(g_max=inf) which is still
+    # semantic DP-means.
+    route = route_position_single_ladder(5)
+    assert route.cluster_ids.tolist() == [0, 0, 0, 0, 0]
+    assert route.segment_ids.tolist() == [0, 0, 0, 0, 0]
+    assert route.cluster_count == 1
+    assert route.segment_count == 1
+    assert route.cluster_sizes == [5]
+
+
+def test_route_position_single_ladder_empty_input() -> None:
+    route = route_position_single_ladder(0)
+    assert route.cluster_ids.tolist() == []
+    assert route.segment_ids.tolist() == []
+    assert route.cluster_count == 0
+    assert route.segment_count == 0
+    assert route.cluster_sizes == []
+
+
+def test_route_position_single_ladder_matches_binary_carry_reference() -> None:
+    # Feeding the single-cluster route through simulate_segment_ladders must
+    # reduce to exactly the same b_prime binary-carry construction as the
+    # dedicated LogStructuredKVCache-equivalence test below (see
+    # test_b_prime_members_relocate_unmerged_before_second_batch_merges):
+    # exactly b_prime members land as b_prime still-unmerged, single-member
+    # entries relocated to level 1, not merged pairs.
+    b_prime = 4
+    route = route_position_single_ladder(b_prime)
+    entries, _ = simulate_segment_ladders(route, b_prime=b_prime, l_block=0)
+    assert sorted(e.members for e in entries) == [[0], [1], [2], [3]]
 
 
 def test_b_prime_members_relocate_unmerged_before_second_batch_merges() -> None:
@@ -361,3 +437,30 @@ def test_value_var_relative_unavailable_without_vh() -> None:
     assert result["token_weighted_value_var"] == pytest.approx(5.0)
     assert result["token_weighted_value_var_relative"] is None
     assert result["vh_source"] == []
+
+
+def _make_recorder(save_dtype: str) -> Stage0DumpRecorder:
+    return Stage0DumpRecorder(
+        output_dir=".",
+        sample_index=0,
+        sample_id="s0",
+        layers={0},
+        key_scale=RunningKeyScale(),
+        value_scale=RunningKeyScale(),
+        save_dtype=save_dtype,
+    )
+
+
+def test_stage0_dump_recorder_accepts_float32_and_float16() -> None:
+    assert _make_recorder("float32").save_dtype is np.float32
+    assert _make_recorder("float16").save_dtype is np.float16
+
+
+def test_stage0_dump_recorder_rejects_invalid_save_dtype() -> None:
+    # A typo like "fp32" used to silently fall through to float16 (the `else`
+    # branch of a two-way ternary) instead of raising -- routing would then
+    # quietly use a lower-precision k/v than the caller intended, without any
+    # error to signal it. Direct instantiation (bypassing the CLI's `choices`
+    # guard) must still catch this.
+    with pytest.raises(ValueError, match="save_dtype"):
+        _make_recorder("fp32")
