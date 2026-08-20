@@ -53,8 +53,9 @@
 | `λ` | `log_kv_lambda`（现有）| `1.0` | **mass bias 系数**，沿用现有语义 |
 
 沿用项目惯例：`demo.py`/`eval.py` 走 `run_cli()` 签名自省与 `_o()`，**YAML 新字段
-默认必须写 `null`**（否则会被同名 CLI 参数静默覆盖，见 §12），不进 `eval.sh`/
-`majob.sh` 核心列表，走 `DIAG_ARGS` opt-in。
+默认必须写 `null`**（否则这个非 `null` 默认值会静默覆盖同名 CLI 参数，方向是 YAML
+赢过 CLI，不是反过来——见 CLAUDE.md §10"工程习惯"里"`_o()` 的『YAML 非 null 覆盖
+CLI』逻辑"那条），不进 `eval.sh`/`majob.sh` 核心列表，走 `DIAG_ARGS` opt-in。
 
 **`log_kv_semantic_clusters=True` 必须拒绝 `importance_pooling=True` 与
 `pin_size>0`，在构造时硬失败，不是静默忽略**：
@@ -69,7 +70,8 @@ if log_kv_semantic_clusters and (importance_pooling or pin_size > 0):
 
 理由：`compact()` 现有的 `imp1`/`imp2` 路径（`log_kv_cache.py:238-246`、
 `695-706`）会让槽内加权均值偏离纯 `w`-计数均值，改变的正是 Ward 合并代价、
-DP-means 分配阈值、mass bias `log(w/M)` 全部依赖的那个"`w` 就是真实权重"的前提。
+DP-means 分配阈值、mass bias `λ·log(w) − log(M)` 全部依赖的那个"`w` 就是真实
+权重"的前提。
 两套机制不是不能共存，是共存的数学还没推导——**pin 系列本身也是另一条独立技术
 路线（CLAUDE.md 顶部已声明），在没有专门推导之前默认禁止组合，比默认允许后产出
 无法解释的分数更安全。**
@@ -355,8 +357,29 @@ token，`arg2` 保留原有语义（`count`/`resulting_count`/`-1`），不受�
   的槽——复用之后是一个新的 `epoch`，逻辑上同样是全新身份，和被合并走的旧
   身份不是同一个簇（`scan_op_log`/`resolve_final_slots` 那节已经用
   `(slot,epoch)` 讲过这一点）。orphan **永远不会** JOIN 一个 Phase 1 本批也
-  在写的既有簇——按定义，orphan 到所有既有簇（含被 Phase 1 命中的那些）的语义距离都
-  `> λ_new`，否则它就不是 orphan。
+  在写的既有簇——但理由是**结构性的，不是语义距离保证**（下面这条更正框）。
+
+  > **更正（曾经写错）："orphan 到所有既有簇的语义距离都 `> λ_new`"这句话不成立，
+  > 且和 §5.3/上面"更正"框刚确立的 `c*` 定义直接矛盾。** orphan 的定义是
+  > `s*[τ] = S[τ, c*[τ]] > λ_new`——只约束 token 到它自己的统一代价赢家 `c*`
+  > 的语义距离，不约束到其它任何簇的语义距离。`η>0` 时完全可能存在另一个既有簇
+  > `c'`，`S[τ,c'] ≤ λ_new`（语义上其实很近）但因为 `c'` 太久没被访问、
+  > `φ(p_τ−p_hi_{c'})` 的时序惩罚项够大，导致 `D[τ,c'] > D[τ,c*]`——`c'` 在
+  > argmin 里输给了语义更远、但更"新鲜"的 `c*`。这种情形下 τ 依然满足
+  > `s*[τ]>λ_new`（因为 `S[τ,c*]>λ_new`），**是** orphan，但它离 `c'` 并不远。
+  > "orphan 到所有既有簇都远"这个说法在这类输入上是假的。
+  >
+  > **真正让"Phase 2 不会给既有簇产生主操作"成立的，是一个纯结构性事实，
+  > 和语义距离无关**：Phase 2 的工作范围本来就只有"在这批 orphan 内部跑一个小
+  > DP-means"（§5.4 Phase 2 伪代码），它从未尝试把某个 orphan 重新并入任何一个
+  > 既有簇（哪怕语义上很近的 `c'`）——novelty 判定在 Phase 1 已经用 `c*` 做过
+  > 一次，Phase 2 拿到的 orphan 集合是"Phase 1 判定不该并入既有簇"的 token，
+  > 它的职责只是把这些 token 彼此分组／各自建新簇，不会回头质疑或复用 Phase 1
+  > 的既有簇决策。所以结论（orphan 的主操作不会落在 Phase 1 本批touch过的槽上）
+  > 依然成立，只是论据要改成"Phase 2 的算法范围里根本没有『重新考虑加入既有簇』
+  > 这一步"，不是"orphan 在语义上真的离所有既有簇都远"。**实现/断言层面的教训**：
+  > 不要写类似 `assert all(semantic_dist(orphan, c) > λ_new for c in existing_clusters)`
+  > 这样的校验——它在上面这类合法、非 bug 的输入上会失败。
 - Ward 合并本身（`ward_merge_only` 步骤 1）只**读写 `keep_slot` 的聚合元数据**
   （μ/n_eff/n_total/p_hi/current_segment 的合并），**不会给 `keep_slot` 产生
   新的主操作**——orphan 自己的主操作全部落在 `free_slot`（腾出来的槽）上，不
@@ -1444,9 +1467,10 @@ orphan 组里到达顺序最早的那个 token"这件事本身在两条路径下
 > 表里其它张量前两维都是 `(B,G)` 的约定一致，本地缓冲的完整形状是
 > `(B,G,local_op_cap,4)`，不是全局或整层共享一份：`512×4×4B ≈ 8KB` 只是
 > 单个 `(b,g)` 切片的大小，`B=1,G=8`（本文档惯用的展示口径，和持久
-> `op_log` 的"(1,8,4·32768,4) int32 ≈16MB/层"算法一致）下一层是
+> `op_log` 的"(1,8,4·32768,4) int32 ≈16MB/层"算法一致——两个数字都按
+> `B=1` 给出，真实训练要一起乘上真实 `B`，比值本身不受 `B` 影响）下一层是
 > `8KB×8≈64KB`，28 层约 **1.8MB**。仍然远小于持久 `op_log` 的
-> `OP_max=4·T_max`（32k 下约 448MB），两条路径都构建它的开销可以忽略
+> `OP_max=4·T_max`（32k 下约 448MB，同样是 `B=1` 口径），两条路径都构建它的开销可以忽略
 > 不计，不会重新引入那笔训练专属的内存账目——但这笔小账本身要按
 > `(B,G,层数)` 完整展开才是"约 1.8MB"，不能只留单个 `(b,g)` 切片的
 > "约 8KB"，否则又会重演之前"一笔小账被误读成全局账"的错误。
@@ -2143,7 +2167,13 @@ Phase 1 之后、Phase 2 之前运行一次（向量化）；Phase 3b 内联在 
 
 #### 新簇形成的条件
 
-唯一的语义条件：`min_c ‖k_x − μ_c‖² > λ_new`。加上三条结构性路径：
+唯一的语义条件：`‖k_x − μ_{c*}‖² > λ_new`，其中 `c* = argmin_c d_c` 是 §5.3
+统一代价（语义距离 + 时序 tie-break）的 argmin 赢家——**不是** `min_c ‖k_x−μ_c‖²`
+（纯语义最近簇）。两者在 `η>0` 时可以不是同一个簇（§5.4"更正（曾经写错）"一节
+已经用反例证明过：时序 tie-break 可能让语义更近但更久未访问的簇输给语义更远
+但更新近的簇），novelty 判据必须用 `c*` 自己的语义距离，不能用全体簇的最小
+语义距离——早期版本这里就是错误地写成 `min_c`，与 §5.3/§5.4 的权威定义不一致，
+这里改正。加上三条结构性路径：
 
 | 路径 | 说明 |
 |---|---|
@@ -2541,12 +2571,28 @@ Every merged slot covers a contiguous span."——配对是**时间序上相邻*
 个 entry（这里的 `n_total_c` 就是 §5.5/§5.6 定义的**未衰减**簇物理规模，不是
 `n_eff`——两者在这条空间论证里必须是同一个量，否则界不成立）：
 
+> **更正（曾经写错）：下面这行求和式此前直接丢了 `L_c` 定义里的 `⌈⌉` 和 `+1`，
+> 数学上不严谨，且在 `n_total_c < B′`（任何小于 `B′` 个成员的簇，例如 needle
+> 单点簇）时会产出负数，不能拿来当 entry 数的上界。** `Σ_c B′·log₂(n_total_c/B′)`
+> 每一项都比它对应的真实 `B′·L_c` 小（`log₂(x) < ⌈log₂(x+1)⌉` 对任意 `x≥0`
+> 成立），所以原写法给出的其实是一个**下界**，不是上界，"≤ O(K·B′·log n)"
+> 这个不等式虽然对这个被弱化的量成立，却没有证明真正关心的
+> `Σ_c B′·L_c`（真实占用的 entry 数）也满足同一个界——需要把 `⌈⌉` 和 `+1`
+> 显式带回去，重新推导。
+
 ```
-Σ_c B′·log₂(n_total_c/B′)  ≤  K·B′·log₂( n / (K·B′) )  =  O( K·B′·log n )
+Σ_c entries_c = B′ · Σ_c L_c = B′ · Σ_c ⌈log₂(n_total_c/B′ + 1)⌉
+             ≤ B′ · Σ_c ( log₂(n_total_c/B′ + 1) + 1 )         # ⌈x⌉ ≤ x + 1
+             = B′·K + B′ · Σ_c log₂(n_total_c/B′ + 1)
+             ≤ B′·K + B′·K · log₂( n/(K·B′) + 1 )              # log(x+1) 仍是凹函数，
+                                                                  # Jensen：均衡分布时求和最大
+             = O( K·B′·log n )                                  # B′·K 是低阶项，不改变量级
 ```
 
-不等号来自 log 的**凹性**：给定总 token 数，簇均衡分布时求和最大。所以
-**最坏情况是簇均衡**，一个簇吃掉全部反而更省——这个界是安全的。
+不等号来自 `log(x+1)` 的**凹性**（仿射平移不改变凹性）：给定总 token 数，簇均衡
+分布时求和最大。所以**最坏情况是簇均衡**，一个簇吃掉全部反而更省——`+1`/`⌈⌉`
+各自贡献一个 `O(K·B′)` 的低阶加项，不改变 `O(K·B′·log n)` 这个阶，这个界依然
+安全，只是推导过程要把它们显式带上，不能像原写法那样直接省略。
 
 ### 5.9 簇内压缩：小簇是无损的（needle 论证的承重点）
 
@@ -2805,6 +2851,19 @@ E_max(n, K) = K · B′ · ⌈log₂( n / (K·B′) + 1 )⌉
 （对照极端不均衡：一个簇吃掉全部 32k、其余 14 个各 1 个 token，总 entry 数只有约
 110——远小于均衡时的 1080，再次验证均衡才是最坏。）
 
+> **`E_max` 是分析用的理论量，不是显存预算数字——两者角色不同，不要互换。**
+> `E_max=1080`（32k）算的是"`L_alloc` 恰好卡在均衡界、不留安全余量"时的
+> live-occupancy 上界，纯粹用来**推导下面 `L_alloc` 该定多深**；它本身从
+> 未被当作矩形 buffer 的实际容量使用。真正分配的 buffer 深度是下面的
+> `L_alloc`（均衡界 **+ 安全余量 `δ`**），§5.13 用它算出的 **1320**
+> （`K=15,B′=8,L_alloc=11`）才是矩形张量 `(B,G,K_max,L_alloc,B′,·)` 的
+> 真实容量，也是 CLAUDE.md §4 显存预算表（`2344 = 1024 + 1320`）、
+> `risks-and-open-questions.md` 等处全文统一使用的数字——固定矩形 buffer
+> 一旦分配，占用的就是这个容量本身，与运行时实际 live occupancy（可能
+> 更接近 `E_max` 甚至更小）无关。`E_max` 和 `1320` 因此从不相等
+> （`1080 < 1320`，差值正是 `δ` 贡献的安全余量），这是**预期行为**，不是
+> 两处数字打架。
+
 **所以 ladder 深度按均衡界定尺**：
 
 ```
@@ -2852,7 +2911,7 @@ rank-1 统计 `σu/σ2/γa/γb/γ`（约 3d，activation dtype，fp16/bf16 均�
 > `w` **不能沿用现有 `level_w` 那样跟着 activation dtype 建 buffer**（现有
 > `log_kv_cache.py:346-349` 是 `torch.zeros(..., dtype=dtype)`）。fp16 整数精确
 > 表示上限是 2048、溢出上限 65504，而 1M 上下文下一个高冗余大簇的 `w` 可以到几十
-> 万，必须显式声明 `w` 的 buffer 为 fp32 或 int32，`log(w/M)` 之前再转 fp32——这条
+> 万，必须显式声明 `w` 的 buffer 为 fp32 或 int32，`log(w)` 之前再转 fp32——这条
 > 在 §5.20-B 的改动对照表里也有，这里是实现者最先会看到的地方，直接标出来，不要
 > 让人照抄旁边 `k̄_raw`/`v̄` 的 dtype 建错。
 
@@ -2867,12 +2926,17 @@ rank-1 统计 `σu/σ2/γa/γb/γ`（约 3d，activation dtype，fp16/bf16 均�
 
 | buffer | shape | dtype | 用途 |
 |---|---|---|---|
-| `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**，只记 token 归属不足以重建结构，完整语义/顺序/重放算法见 §5.21-2。**生命周期和本表其它 buffer 不同，且分配只发生在训练路径**：不是 `reset_parameters()` 原地 `zero_()` 复用的持久 buffer，而是只在 `LogKVStreamTrainingAttention.forward()`（训练）内部，每次调用开头重新绑定成全新分配的张量；`CausalSelfAttention._log_kv_training_forward()`（推理/生成路径的真实入口，**不是** `LogStructuredKVCache.forward()`——后者恒定 `raise RuntimeError`，见 §5.21 的更正框）调用共享路由逻辑时传 `record_op_log=False`，完全不分配、不写入这两个字段——gating 规则、以及"448MB 只是单个 in-flight forward 的代价，梯度累积/pipeline 会按并发数相乘"，见 §5.21-2 新增的两节 |
+| `op_log` | `(B,G,OP_max,4)` | int32 | **操作日志，不是 token→cluster 映射**，只记 token 归属不足以重建结构，完整语义/顺序/重放算法见 §5.21-2。**生命周期和本表其它 buffer 不同，且分配只发生在训练路径**：不是 `reset_parameters()` 原地 `zero_()` 复用的持久 buffer，而是只在 `LogKVStreamTrainingAttention.forward()`（训练）内部，每次调用开头重新绑定成全新分配的张量；`CausalSelfAttention._log_kv_training_forward()`（推理/生成路径的真实入口，**不是** `LogStructuredKVCache.forward()`——后者恒定 `raise RuntimeError`，见 §5.21 的更正框）调用共享路由逻辑时传 `record_op_log=False`，完全不分配、不写入这两个字段——gating 规则、以及"448MB（`B=1` 展示口径，真实要乘上 batch size `B`）只是单个 in-flight forward 的代价，梯度累积/pipeline 会按并发数相乘"，见 §5.21-2 新增的两节 |
 | `op_log_len` | `(B,G)` | int32 | `op_log` 当前**有效**行数——`op_log[b,g,:op_log_len[b,g],:]` 才是已写入的合法内容，之后的行是未写入/未定义，**任何遍历 `op_log` 的代码（重放、`scan_op_log`、S0.8 对拍）都必须先按这个长度截断，不能扫整个 `(OP_max,4)`**，见 §5.21-2 的更正框 |
 
 容量与内存：`OP_max = 4·T_max`，这不是经验估计，是有推导的硬上界，见 §5.21-2。
-32k 下 `(1,8,4·32768,4)` int32 ≈ 16MB/层，28 层共 **约 448MB**——是 §5.21-2 那份
-正确性升级的代价，不是可选项。`op_log_len` 本身 `(B,G)` int32，相对 448MB 可
+32k 下单个 batch 元素 `(1,8,4·32768,4)` int32 ≈ 16MB/层，28 层共 **约
+448MB**——这是 **`B=1` 展示口径**下的数字（buffer 真实 shape 是
+`(B,G,OP_max,4)`，`B` 是这次 forward 真实的 batch size，不是恒为 1），
+真实训练显存要再乘上 `B`：**约 448MB × `B`**。是 §5.21-2 那份正确性升级
+的代价，不是可选项（`B` 这个乘数和 §5.21-2"梯度累积/pipeline 并行"那节
+讨论的"in-flight forward 数"乘数是两个独立因子，要分别核算再相乘，见
+那一节新增的说明）。`op_log_len` 本身 `(B,G)` int32，相对 448MB×B 可
 忽略不计，不需要单独进内存账目。
 
 **per-head 尺度估计**（§5.2）：**形状是 `(n_layer, G)`，不是 `(B, G)`**——`s_h`
@@ -2961,9 +3025,10 @@ def dedup_anchors(lo, hi, mid, w):
         anchors:    (..., S, 3) int64   —— 固定 3 槽，顺序恒为 [lo, mid, hi]
         slot_valid: (..., S, 3) bool    —— 这个虚拟槽是否参与 attention
         M:          (..., S)    int64   —— slot_valid.sum(-1).clamp_min(1)，**返回前
-                                            已经 clamp**，调用方用 log(w / M) 而不是
-                                            log(w) 做 mass bias（§2.3），不需要、也
-                                            不应该自己再 clamp 一次
+                                            已经 clamp**，调用方用它算 mass bias 里
+                                            无条件生效的 `-log(M)` 项（与
+                                            `λ·log(w)` 分开相加，见 §2.3），不需要、
+                                            也不应该自己再 clamp 一次
 
     计算顺序固定为下面两步，**顺序不能换**——先处理"entry 本身是否有效"，
     再在有效 entry 内部做去重，因为无效 entry 的 lo/hi 本身就是哨兵值，
@@ -2993,26 +3058,47 @@ def dedup_anchors(lo, hi, mid, w):
 
 **为什么 `M_s` 现在是 per-entry 张量而不是标量**：早期的伪代码签名 `(unique_anchors,
 M)` 没说清楚 `M` 的形状，读起来容易以为是一个全局标量或者某种变长列表长度。矩形化
-之后 `M` 就是普通的 `(..., S)` int 张量，`log(w_s / M_s)` 是逐元素运算，和现有
+之后 `M` 就是普通的 `(..., S)` int 张量，`-log(M_s)` 是逐元素运算，和现有
 `log_kv_slot_attention` 的其它逐槽张量运算完全同构，不需要特殊处理。
 
 **为什么 `M` 必须在 `dedup_anchors` 内部就 `clamp_min(1)`，不能留给调用方**：无效
 entry（`w=0`）三个槽的 `slot_valid` 全部是 `False`，`slot_valid.sum(-1)` 对这类
-entry 算出 `M=0`。如果不 clamp，调用方算 `w/M` 就是 `0/0`——**这个 NaN 和 `w`
-本身是否等于 0 无关，是除法本身的 0/0，`log_kv_slot_attention` 现有的
-"`slot_w >= 1 by construction`"这条不变量（`log_kv_cache.py:1626`）到语义簇路径
-上不再成立，必须显式补回来**。补法完全类比 `mid_anchor` 已经在用的
+entry 算出 `M=0`。如果不 clamp，调用方算 `-log(M)` 就是 `-log(0) = +inf`——**一个
+比旧公式的 `0/0`（NaN）更隐蔽的失效模式**：它不会立刻触发 NaN 报警，而是让无效
+entry 的 mass bias 变成 `+inf`，在 softmax 里把垃圾内容的权重推向无穷大，比"分数
+是 NaN 导致整行输出污染"更难被察觉。补法完全类比 `mid_anchor` 已经在用的
 `ww = w.clamp_min(1)`（§5.14）：`M.clamp_min(1)` 之后，无效 entry 的
-`w/M = 0/1 = 0`，`log(0) = -inf`（IEEE754 良定义，不是 NaN），`λ·(-inf)` 在
-`λ≠0` 的分支里是良定义的 `-inf`（不是 `0·(-inf)` 那种会产出 NaN 的模式——现有
-代码用 `if lam != 0.0:` 门控防的正是那一种，这里从一开始就没有落入那个模式）。
-`score.add_(-inf)` 让该槽分数变成 `-inf`，随后现有的 `masked_fill_(~mask, -inf)`
-再把它显式盖成 `-inf` 一次——**两者顺序不需要改变，`log_kv_slot_attention` 现有
-的"先加 bias、后 mask"这个顺序原封不动地对语义簇路径安全**，`M.clamp_min(1)`
-这一处补丁就足够，不需要像"先构造 mask、再算 bias"那样重排整个计算顺序。这也是
-为什么这个 clamp 被放进 `dedup_anchors` 内部而不是留给每个调用方各自记得写一遍：
-`M` 的唯一合法用途就是做这个除法，把安全性钉在产出 `M` 的地方，调用方就不可能
-漏掉。
+`-log(M) = -log(1) = 0`——注意这只是让 `-log(M)` 这一项本身不再是 `+inf`，**不
+等于无效 entry 因此被自动压制**（`-log(1)=0` 是一个"中性"值，不是 `-inf`，见下方
+"`slot_valid`/`M_s` 在语义模式下不是可选项"一节——挡住无效槽的机制从来不是
+`-log(M)`，是 `slot_valid` 掩码本身，这条在新旧公式下都成立）。
+
+**拆分 `λ·log(w)` 与 `-log(M)` 之后，两项各自的 NaN 风险必须分开处理，不能像旧公式
+那样合成一次 `log()` 调用就完事**：旧公式 `λ·log(w/M)` 只有一次 `log`，`λ=0` 时
+现有代码用 `if lam != 0.0:` 整体跳过这一项，天然避开了 `0·log(0)=0·(-inf)=NaN`
+这个坑。新公式里 `λ·log(w)` 和 `-log(M)`是两次独立的运算，**`λ·log(w)` 依旧必须
+保留 `if lam != 0.0:` 门控**（`w=0` 时 `log(w)=-inf`，`λ=0` 时若不跳过直接算
+`0·(-inf)` 会产出 NaN，和旧公式的坑完全同源）；**`-log(M)` 则必须在这个门控之外
+无条件计算**（这正是本次修正的核心，见 §2.3）——`M` 经过 `clamp_min(1)` 后恒
+`≥1`，`log(M)` 恒有限（`M∈{1,2,3}`），不存在 `0·(-inf)` 的风险，不需要、也不应该
+被同一个 `if lam != 0.0:` 保护。伪代码：
+
+```python
+bias = -torch.log(M.clamp_min(1))          # 无条件，M 恒 >= 1，log(M) 恒有限
+if lam != 0.0:
+    bias = bias + lam * torch.log(w.clamp_min(1))   # 只在 lam != 0 时才碰 log(w)，
+                                                       # 避开 w=0 时 0 * (-inf) = NaN
+score = score + bias
+score = score.masked_fill(~slot_valid, -float("inf"))
+```
+
+`w.clamp_min(1)` 这一步同样是防御性的（`w=0` 的 entry 本该被 `slot_valid` 挡住，
+不该走到这里贡献任何 softmax 质量，但 `log(w)` 本身作为一个逐元素运算不能因为
+"理论上会被 mask 掉"就允许对 `w=0` 求值——IEEE754 的 `log(0)=-inf` 是良定义值，
+真正的风险只在于让它参与乘法，`clamp_min(1)` 只是把这个已经在别处（`slot_valid`）
+被处理过的情形，再挡一层，双重保险，不是必需但廉价）。这也是为什么 `M` 的 clamp
+被放进 `dedup_anchors` 内部而不是留给每个调用方各自记得写一遍：`M` 的唯一合法
+用途就是喂 `-log(M)`，把安全性钉在产出 `M` 的地方，调用方就不可能漏掉。
 
 #### `dedup_anchors`/`materialize_anchor_keys` 的输出到 `log_kv_slot_attention` 输入之间还缺一步展开
 
@@ -3059,13 +3145,13 @@ M_s        = M_3.reshape(*M_3.shape[:-2], S_pooled)
 
 `M_s`/`slot_w` 里每个 entry 的 3 个虚拟槽拿到的是**同一个**标量（entry 级的
 `M`/`w`，不随锚点变化）——这是故意的，不是偷懒广播出来的近似。mass bias
-公式 `λ·log(w_s/M_s)`（§2.3）里的 `w_s`/`M_s` 描述的是"这个 entry 整体代表
-了多少原始 token、这些原始 token 被这个 entry 展开成了几个虚拟槽"，两个量
+公式 `λ·log(w_s) − log(M_s)`（§2.3）里的 `w_s`/`M_s` 描述的是"这个 entry 整体
+代表了多少原始 token、这些原始 token 被这个 entry 展开成了几个虚拟槽"，两个量
 的定义域都是 entry 而不是虚拟槽；3 个虚拟槽只是同一个 entry 在 3 个不同
 位置上的只读投影，`w`/`M` 的份额怎么在它们之间分摊，交给 softmax 按各自的
 `score` 竞争，不需要（事实上也不应该）把 `w`/`M` 人为拆成三份、分别赋给三个
-虚拟槽——拆分反而是错的：`log(w/M)` 会在虚拟槽维度上被重复稀释，而且已经
-展开出来的 3 个虚拟槽本来就不是三个各自独立的 1/3 个 entry，它们共享同一份
+虚拟槽——拆分反而是错的：`λ·log(w) − log(M)` 会在虚拟槽维度上被重复稀释，而且
+已经展开出来的 3 个虚拟槽本来就不是三个各自独立的 1/3 个 entry，它们共享同一份
 底层内容，区别只在旋转它们的锚点位置不同。
 
 #### 虚拟槽展开必须扣上 `log_kv_slot_attention` 现有的 `causal_tail`/`mask` API
@@ -3101,7 +3187,7 @@ flatten 成一维），**不覆盖、也不需要覆盖 exact 尾部**。
 > 前缀（`dedup_anchors` 产出、经同一次 flatten 展开到 `S_pooled`），不
 > 覆盖 exact 后缀（recent window + `causal_tail` 覆盖的 in-flight
 > chunk）——因为 exact 后缀的每一槽都是单个真实 token，天然 `w=1,
-> M=1`，`log(w_s/M_s) = log(1/1) = 0`，和现有（未引入语义簇之前）对
+> M=1`，`λ·log(1) − log(1) = 0`，和现有（未引入语义簇之前）对
 > exact 槽的 mass bias 行为完全一致，不需要调用方为这段额外构造
 > `M_s`，函数内部对 `S_pooled` 之外的位置隐式按 `M_s≡1` 处理。
 >
@@ -3111,17 +3197,22 @@ flatten 成一维），**不覆盖、也不需要覆盖 exact 尾部**。
 > `lam`（mass bias 系数，即 `log_kv_lambda`，见 §5.1 参数表）排在 `mask`
 > 和 `causal_tail` 之间，是**现有**参数，不是这次改动新增或移动的。上一版
 > 只列出"不变"的 `mask`/`causal_tail` 和"新增"的 `slot_valid`/`M_s`，中间
-> 漏了 `lam`，容易被读成"这个参数被顺带移除或换位置了"。`lam` 本身**不受
-> 这次改动影响**——`λ·log(w_s/M_s)` 公式里的 `λ` 就是这个 `lam`，语义
-> 簇路径只改了这个公式除以什么（`w_s/M_s` 而不是 `w_s`），没有改 `lam`
-> 本身的传参方式，补全签名只是让这一点在这里也看得见。
+> 漏了 `lam`，容易被读成"这个参数被顺带移除或换位置了"。`lam` 本身的**传参
+> 方式**不受这次改动影响（还是那个现有形参，位置不变）；但 §2.3 的更正框
+> 修正了它的**门控范围**——`log_kv_slot_attention` 现有的 `if lam != 0.0:`
+> 只应该继续包住 `λ·log(w_s)` 这一半，`−log(M_s)` 必须搬到这个门控**之外**
+> 无条件计算，不能像"公式整体从 `log(w_s)` 换成 `log(w_s/M_s)`"这种理解那样，
+> 让 `lam=0` 时把 `M_s` 的贡献也一并跳过——那样会退回本节修正之前的旧行为
+> （`λ=0` 时 `M` 的膨胀完全不受控制），是这次改动要修的问题本身，不是可以
+> 保留的旧语义。
 
 ```python
 def log_kv_slot_attention(
     q, slot_k, slot_v, slot_w, scale,
     mask=None,             # 不变：(T_q, S) bool，仍与 causal_tail 互斥
     lam=1.0,                # 不变：mass bias 系数（log_kv_lambda），排在
-                             # mask 和 causal_tail 之间，这次改动没有移动它
+                             # mask 和 causal_tail 之间，这次改动没有移动它，
+                             # 但门控范围收窄了，见下面 M_s 的注释
     causal_tail=0,          # 不变：仍要求 causal_tail == T_q
     slot_valid=None,      # 新增：(B, G, S_pooled) bool，只盖 pooled 前缀，
                            # 可以和 causal_tail 同时使用，也可以和 mask 同时使用
@@ -3129,7 +3220,9 @@ def log_kv_slot_attention(
                            # query-time 因果可见性），不存在互斥关系
     M_s=None,              # 新增：(B, G, S_pooled) int，和 slot_valid 同轴、
                            # 同作用域（只覆盖 pooled 前缀）；mass bias 内部改用
-                           # λ·log(w_s/M_s)，S_pooled 之外隐式 M_s≡1
+                           # λ·log(w_s) − log(M_s)，且 −log(M_s) 无条件生效，
+                           # 不受 if lam != 0.0 门控（§2.3），S_pooled 之外
+                           # 隐式 M_s≡1
     ...
 ):
 ```
@@ -3182,20 +3275,27 @@ respects 逐 token 因果关系，且这条路径下的输出与"手工构造等
 调用方在语义模式下漏传（`slot_valid=None`），函数不会报错，只会静默按"没有
 无效槽"处理。** 后果比听起来更糟，且和 `λ` 是否为 0 强相关：
 
-- **`λ≠0` 时**，靠 `w=0` entry 的 `log(w/M)=log(0)=-inf` 能顺带压掉**纯 pad/
-  dead entry**（因为它们的 `w` 本身就是 0），但压不掉**有效 entry 内部的重复
-  锚点**（`p_lo==p_mid` 等，§5.14 `dedup_anchors` docstring）——这类槽的 `w>0`
-  （和它没被去重的兄弟槽共享同一个 `w`），`log(w/M)` 不为 `-inf`。漏传
-  `slot_valid` 会让这些重复锚点被当成**独立的额外证据**，把该 entry 的
-  softmax 质量按 `M` 倍放大（`M∈{1,2,3}`），而不是均摊——`M_s` 存在的意义
-  正是防止这个放大，`slot_valid` 缺失时它形同虚设。
+- **对重复锚点（`p_lo==p_mid` 等，§5.14 `dedup_anchors` docstring）的放大
+  问题，本次公式修正（§2.3，`λ·log(w) − log(M)` 取代 `λ·log(w/M)`）之后，
+  在任意 `λ` 下都成立，不再需要分 `λ≠0`/`λ=0` 两种情形讨论**：这类槽的
+  `w>0`（和它没被去重的兄弟槽共享同一个 `w`），`−log(M)` 本身不为 `-inf`，
+  也不因为 `λ` 取何值而改变（`−log(M)` 不受 `λ` 门控）。漏传 `slot_valid`
+  会让这些重复锚点被当成**独立的额外证据**参与 softmax 求和，把该 entry 的
+  质量按"实际参与求和的槽数 / `M`"这个比例放大——`M_s` 只保证"每个参与求和
+  的槽各自该分摊多少"这个**除数**是对的，它无法替代"不该参与求和的槽根本
+  不该出现在分母对应的求和里"这件事，那是 `slot_valid` 的职责，两者不是
+  同一层面的机制，`M_s` 缺不了 `slot_valid` 的配合。
 - **`λ=0` 时**（`log_kv_slot_attention` 文档里明确列出的消融旋钮，"built-in
-  ∝1/w long-range forgetting curve"）更严重：mass bias 这一项**根本不会被
-  加**（现有代码 `if lam != 0.0:` 门控，`log_kv_cache.py:1625-1628`），连
-  "纯 pad/dead entry 靠 `log(0)=-inf` 被动压掉"这条安全网也不存在了。此时
-  `slot_valid` 是**唯一**挡住无效槽（含锚点=0 的哨兵位置）获得非零 attention
-  的机制，缺了它不是"退化成稍差的近似"，是"pad/dead entry 的垃圾内容混进
-  softmax"。
+  ∝1/w long-range forgetting curve"），`λ·log(w)` 这一半按 §2.3 的更正框
+  仍然被 `if lam != 0.0:` 跳过，但 `−log(M)` 依然无条件计算——问题是
+  `−log(M)` **对区分"死/pad entry"和"正常 entry"完全没有帮助**：dead
+  entry（`w=0`）的 `M` 同样被 `clamp_min(1)` 成 `1`，`−log(1)=0`，和一个
+  正常、未被去重放大的单锚点 entry 拿到的 bias 完全相同（都是中性的 `0`，
+  不是 `-inf`）——`−log(M)` 是"对齐候选膨胀"的机制，不是"识别哪些槽是垃圾"
+  的机制，把两者混为一谈是本次公式改动之前就存在、改动之后依然存在的一个
+  误区。**`λ=0` 时唯一挡住无效槽（含锚点=0 的哨兵位置、含纯 pad/dead entry）
+  获得非零 attention 的机制，无论新旧公式都只有 `slot_valid`**，缺了它不是
+  "退化成稍差的近似"，是"pad/dead entry 的垃圾内容混进 softmax"。
 
 **修法：`slot_valid`/`M_s` 在语义模式下由 `get_attention_state()` 自动、无条件
 产出，不是调用方按需申请的可选项。** 判断依据是 cache 自身的构造模式
@@ -3375,14 +3475,30 @@ eval，就是在没有类似 3b 这样的批量 vs 严格串行验证的情况�
 >   进而改变 mass bias。**所以这里必须是整数算术，不是"用整数比较快"的问题。**
 > - 平局取上（偏向 `p_hi`）是个约定：entry 内更晚的成员更"新鲜"。`2·sum_wp` 在
 >   int64 下最大约 `2×10¹²`，不会溢出。
-- **mass bias 的计数守恒**（§2.3 那个 bug 的回归测试，**必须有**）。注意断言要写对，
+- **mass bias 的计数守恒**（§2.3 那个 bug 的回归测试，**必须有**）。
+
+  > **更正（曾经写错）：上一版把这条不变量写成"`Σ_a (w/M)^λ = M·(w/M)^λ`，
+  > 在 `λ=1` 时精确等于 `w`"，只在 `λ=1` 时才是真正意义上的守恒**（`λ≠1`
+  > 时差一个 `M^(1-λ)` 的因子，`λ=0` 时这个因子直接退化成 `M` 本身——一个
+  > 展开成 3 个锚点的 entry 会白拿 3 倍质量）。这正是 §2.3 记录的那个真实
+  > bug：旧公式 `λ·log(w/M)` 只有在 `λ=1` 时才让展开成 `M` 个虚拟槽这件
+  > 存储细节对最终质量没有影响，`λ` 一旦不是 1（尤其 `λ=0` 消融档，
+  > `experiments.md` §7 计划扫）`M` 就会重新泄漏进结果。§2.3 已经把公式改成
+  > `λ·log(w) − log(M)`，`−log(M)` 挪到 `λ` 门控之外无条件生效，下面的不变量
+  > 相应变得更强、更简单：
+
   下面两条是不同强度的命题：
-  - **可以断言（精确，不依赖 score）**：M 个虚拟槽的计数因子之和等于单槽的，即
-    `Σ_a (w/M)^λ = M·(w/M)^λ`，在 `λ=1` 时精确等于 `w`。**这才是 `/M` 强制的不变量**，
-    去掉 `/M` 会得到 `M·w`，正好被这条抓住。
-  - **只在等 logit 下成立**：M 槽的 softmax 总质量 `= (w/M)^λ · Σ_a exp(s_a)` 等于
-    单槽的 `w^λ·exp(s)`，**需要所有 `s_a` 相等且 `λ=1`**（`λ≠1` 时还差一个
-    `M^(1-λ)`）。测这条必须先把 M 个锚点强制取同一位置（或旁路 RoPE）使 logit 相等。
+  - **可以断言（精确，不依赖 score，对任意 `λ` 都成立，不再限定 `λ=1`）**：
+    `Σ_a exp(λ·log(w) − log(M)) = M · w^λ/M = w^λ`——`M` 个虚拟槽的计数因子
+    之和精确等于单槽（`M=1`）本该贡献的 `w^λ`，与 `M` 无关，对**任意** `λ`
+    精确成立。**这才是 `−log(M)` 强制的不变量**，用旧公式（`λ·log(w/M)`，
+    等价于把 `−log(M)` 也乘上 `λ`）测这条会在 `λ≠1` 时失败，是这条测试
+    本身能抓住"`−log(M)` 有没有被错误地挂在 `λ` 门控里"这个 bug 的地方。
+  - **只在等 logit 下成立**：M 槽的 softmax 总质量 `= w^λ · Σ_a exp(s_a)`
+    等于单槽的 `w^λ·exp(s)`，**需要所有 `s_a` 相等**——这条和 `λ` 取值无关
+    （新公式下 `−log(M)` 已经不再依赖 `λ`），但仍然需要所有锚点的点积项 `s_a`
+    相等才能让 softmax 总质量本身恒等，测这条必须先把 M 个锚点强制取同一
+    位置（或旁路 RoPE）使 logit 相等。
 
   > **不要断言一般情况下的 softmax 质量恒等。** 不同锚点的 `k_eff_a` 不同 ⇒ `s_a`
   > 不同 ⇒ 总质量本来就会变——**这正是锚点展开的目的**（位置敏感的检索靠它实现），
@@ -3411,7 +3527,8 @@ eval，就是在没有类似 3b 这样的批量 vs 严格串行验证的情况�
   "`slot_valid`/`M_s` 在语义模式下不是可选项"一节），不再是裸位置元组；语义模式下
   无条件（不受调用方控制）额外产出 `slot_valid`/`M_s` 两个字段；
   `log_kv_slot_attention` 增加可选槽有效性掩码参数（fp32 分数上填 `-inf`），与现有
-  `causal_tail` 正交；**mass bias 改用 `λ·log(w_s / M_s)`**。
+  `causal_tail` 正交；**mass bias 改用 `λ·log(w_s) − log(M_s)`，`−log(M_s)`
+  不受 `λ` 门控（§2.3）**。
 
 ### 5.16 `litgpt/model.py`
 
@@ -3598,7 +3715,7 @@ eval，就是在没有类似 3b 这样的批量 vs 严格串行验证的情况�
 |---|---|
 | `compact()` 的加权均值 | 按 `w` 加权、不要求两侧等宽；且已核实配对是**时间序相邻**的（§5.7）|
 | Chan-style 二阶矩合并 + rank-1 截断 | 纯代数，与内容语义无关。`_pair_rank1_stats`、`_dominant_eigvec_small`、`_rank1_psd_from_factors`、`_rank1_cross_from_factors` 全部原样 |
-| `log_kv_slot_attention` 的打分/读出结构 | 公式骨架 `score = 点积 + 二阶项 + λ·log(质量因子)`、`read = v̄ + scale·γ(q·γa)·γb` 不变；**但质量因子从 `w` 变成 `w/M`，这个改动记在下表 B，不要以为这行说的是「连质量因子也不变」** |
+| `log_kv_slot_attention` 的打分/读出结构 | 公式骨架 `score = 点积 + 二阶项 + mass bias`、`read = v̄ + scale·γ(q·γa)·γb` 不变；**但 mass bias 从单纯的 `λ·log(w)` 变成 `λ·log(w) − log(M)`（`−log(M)` 项不受 `λ` 门控），这个改动记在下表 B，不要以为这行说的是「连 mass bias 也不变」** |
 | GQA 的 rf 折叠、fp32 分数缓冲、`causal_tail` | 与压缩机制正交 |
 | `LogKVStreamTrainingAttention` 的流式重放**框架** | 骨架、内存论证、per-block 梯度正确性论证全部不变（但重放的**依据**要换，见 C）|
 
@@ -3620,11 +3737,11 @@ eval，就是在没有类似 3b 这样的批量 vs 严格串行验证的情况�
 | Σ/Γ 的统计空间 | post-RoPE → pre-RoPE。**累积数学不变**，只是喂进去的张量换了；**但读出侧必须新增一步**——`sigma_u`/`gamma_a` 现在是 pre-RoPE 方向，不能直接和 post-RoPE 的 `q` 点积，要走 §5.14 的 `materialize_anchor_directions`，和 `k_raw→k_eff` 对称展开成 `M` 份（§5.14 那段"为什么 Σ/Γ 也要转"）|
 | `compact()` 签名 | 多带 `(p_lo, p_hi, sum_wp)` 走 `merge_anchors`，一行 |
 | `n_c` | 拆成 `n_eff`（centroid 混合，`γ` 衰减）和 `n_total`（Ward 代价 + §5.8 空间界，单调不减）——原来单个 `n_c` 两处混用会让 Ward 误判长历史簇是"小簇"（§5.5/§5.6 的更正框）|
-| mass bias | `λ·log(w)` → `λ·log(w/M)`（§2.3，必须做的正确性修正）|
+| mass bias | `λ·log(w)` → `λ·log(w) − log(M)`，`−log(M)` 不受 `λ` 门控（§2.3，必须做的正确性修正）|
 | `get_attention_state()` 返回类型 | **这一轮更正**：不是"多返回一个字段"这么简单——返回类型从裸位置元组改成 §5.14"slot_valid/M_s 在语义模式下不是可选项"一节新增的 `CacheAttentionState`（具名结构），语义模式下无条件带上 `slot_valid`（entry 级有效位掩码去重后展开到 per-virtual-slot）与 `M_s`（同样是 per-virtual-slot，不是"每 entry 一个"字面意义上的粒度，值在同一 entry 的 3 个虚拟槽间相同，见 §5.14"per-entry→per-virtual-slot 展开"一节） |
 | `get_attention_state()`/`append_exact_tokens()` 的调用点 | **不只是这两个函数自己的定义要改，所有消费它们返回值的调用点都要跟着从位置解包换成按字段取值**，见下面单独一行的完整清单 |
 | cache 入口 | 收 pre-RoPE k + 绝对位置，而不是 post-RoPE k |
-| `level_w`/entry `w` 的 dtype | 不能继承 activation dtype（现有 `log_kv_cache.py:346-349` 是 `torch.zeros(..., dtype=dtype)`，跟着 fp16/bf16 走）。fp16 整数精确表示上限是 2048、溢出上限 65504；1M 上下文下一个高冗余大簇的 `w` 可以到几十万，**必须 fp32 或 int32**，`log(w/M)` 之前再转 fp32 |
+| `level_w`/entry `w` 的 dtype | 不能继承 activation dtype（现有 `log_kv_cache.py:346-349` 是 `torch.zeros(..., dtype=dtype)`，跟着 fp16/bf16 走）。fp16 整数精确表示上限是 2048、溢出上限 65504；1M 上下文下一个高冗余大簇的 `w` 可以到几十万，**必须 fp32 或 int32**，`log(w)` 之前再转 fp32 |
 
 **`get_attention_state()`/`append_exact_tokens()` 调用点迁移清单（这一轮补的，
 `CacheAttentionState` 落地时必须机械过一遍，不是自然会跟着改）**——核对当前
@@ -4054,7 +4171,10 @@ WARD_MERGE + 1 PAD_INSERT + CARRY 余量"的小常数，**`c = 4` 足够**。这
 那样，**溢出直接硬失败**（`raise RuntimeError`），不做动态扩容、不做静默截断——
 矩形预分配 + 硬失败是这个项目一贯的选择（§5.17），`OP_max` 没有理由是例外。
 
-32k 下 `(1,8,4·32768,4)` int32 ≈ 16MB/层，28 层约 **448MB**——比早期估的
+32k 下单个 batch 元素 `(1,8,4·32768,4)` int32 ≈ 16MB/层，28 层约
+**448MB**（**`B=1` 展示口径**，真实 batch size `B>1` 时要再乘上
+`B`——见下面"『448MB』只是每个 in-flight forward 的代价"一节，`B` 和
+"同一时刻并存的 in-flight forward 数"是两个独立乘数）——比早期估的
 224MB 贵一倍，但那 224MB 本来就是经验值，不是这次算出的真实上界。这是正确性的价格，
 不是可选项。
 
@@ -4260,16 +4380,26 @@ Phase 1/2/3 的路由决策、metadata 更新、ladder 写入本身，以及驱�
 _log_kv_training_forward()`）知道，必须显式传下去，不能从张量的
 `requires_grad`/全局 autograd 模式反推。
 
-#### "448MB" 只是每个 in-flight forward 的代价，不是训练期的固定开销——梯度累积/pipeline 会让它按并发数相乘
+#### "448MB" 只是每个 in-flight forward、`B=1` 口径下的代价，不是训练期的固定开销——batch size 与梯度累积/pipeline 是两个独立的相乘因子
 
-上面"训练峰值显存"这条更正框把峰值钉死在"单份 448MB"，但那个推导隐含一个
-前提：**同一时刻最多只有一个 `ctx` 持有 `op_log` 快照在等待它的
-`backward()`**。这个前提对"每次 forward 后立即调用对应的 backward"这种训练
-循环成立，但不是任何训练循环都满足它——`ctx.save_for_backward` 是 PyTorch
-autograd 的标准机制，只要**下一次 forward() 在这次 forward 对应的
-`backward()` 跑完之前发生**，两个 `ctx`（连同它们各自的 448MB `op_log`）就
-会同时存活，训练峰值显存因此是**448MB × 同一时刻并存的 in-flight forward
-数**，不是一个固定常数。这条必须显式写清楚，否则"约 448MB"这句话会被不加
+上面"训练峰值显存"这条更正框把峰值钉死在"单份 448MB"，但那个推导隐含**两个**
+未被显式核算的乘数，都必须补上，不能漏任何一个：
+
+1. **`B=1` 展示口径**。`op_log` 的真实 shape 是 `(B,G,OP_max,4)`（§5.13），
+   "448MB"这个数字是按 `B=1` 算出来的（`(1,8,4·32768,4)` int32），真实训练
+   跑的 batch size 是多少，这笔账就要先乘上多少——这一步和下面第 2 点无关，
+   是单次 forward 自己张量形状的一部分，不受"是否发生梯度累积/pipeline"影响。
+2. **同一时刻最多只有一个 `ctx` 持有 `op_log` 快照在等待它的 `backward()`**
+   这个前提。这个前提对"每次 forward 后立即调用对应的 backward"这种训练
+   循环成立，但不是任何训练循环都满足它——`ctx.save_for_backward` 是 PyTorch
+   autograd 的标准机制，只要**下一次 forward() 在这次 forward 对应的
+   `backward()` 跑完之前发生**，两个 `ctx`（连同它们各自的 `op_log`）就
+   会同时存活，这一步贡献的是**"同一时刻并存的 in-flight forward 数"**这个
+   乘数。
+
+训练峰值显存因此是 **448MB × `B`（真实 batch size）× 同一时刻并存的
+in-flight forward 数**，是三个独立因子的乘积，不是一个固定常数，也不能只
+补其中一个就当作完整核算。这条必须显式写清楚，否则"约 448MB"这句话会被不加
 限定地当成训练期的总开销来做预算——这正是上面"训练期梯度累积场景下，同一个
 cache 对象可能在这次 forward 的 `backward()` 被调用之前，就被下一次
 `forward()` 调用并 reset 过"这句话已经承认、但没有展开算清楚代价的地方。
@@ -4293,25 +4423,28 @@ if not is_accumulating:
 `fabric.backward()`（进而每个自定义 `Function` 的 `backward()`）依然逐次
 立即执行**，被推迟的只有 `optimizer.step()`。所以在这条训练循环下，任意
 时刻最多只有一个 microbatch 的 forward 已完成、backward 未完成，`op_log`
-峰值就是本节算出的单份 448MB，梯度累积的步数
-（`gradient_accumulation_iters`）不参与这个乘法。
+峰值就是本节算出的单份 448MB×`B`（`B` 是每个 microbatch 自己的 batch
+size，这个乘数始终在，与是否发生梯度累积无关），梯度累积的步数
+（`gradient_accumulation_iters`）不参与"in-flight forward 数"这第二个乘法。
 
-**但这是这个仓库当前训练脚本的性质，不是设计本身的保证——以下两类模式会按
-并发的 in-flight forward 数把 448MB 相乘，必须显式排除或显式预算，不能假设
-"训练期就是 448MB"对它们也成立**：
+**但"in-flight forward 数恒为 1"是这个仓库当前训练脚本的性质，不是设计
+本身的保证——以下两类模式会在 `448MB×B` 之上再按并发的 in-flight forward
+数相乘，必须显式排除或显式预算，不能假设"训练期就是 448MB×B"对它们也
+成立**：
 
 1. **累积 loss、只在最后调一次 `backward()`**（例如
    `losses = [model(x_i) for x_i in microbatches]; sum(losses).backward()`）
    ——所有 microbatch 的 forward 都先跑完、`ctx` 全部存活，直到最后那一次
    `backward()` 才会按拓扑逆序依次释放。峰值是
-   `microbatch 数 × 448MB`。这个仓库当前不用这个模式（见上面 `pretrain.py`
-   的分析），但如果未来任何训练脚本（包括 `litgpt/finetune/*.py` 或外部
-   使用方）改成这种写法，必须重新核算这笔账，不能沿用"448MB"。
+   `microbatch 数 × 448MB × B`。这个仓库当前不用这个模式（见上面
+   `pretrain.py` 的分析），但如果未来任何训练脚本（包括
+   `litgpt/finetune/*.py` 或外部使用方）改成这种写法，必须重新核算这笔账，
+   不能沿用"448MB×B"。
 2. **pipeline 并行的 microbatch 调度**（GPipe 式，故意让多个 microbatch 的
    forward 领先于它们各自的 backward，以填满流水线气泡）——这是这种调度
-   方式存在的意义本身，peak 是 `pipeline depth × 448MB`。本仓库 `extensions/`
-   下的 thunder/xla 扩展如果引入这类调度，必须把这一条计入训练显存预算，
-   `op_log` 不会因为"训练本来就该省显存"而自动免于这个乘法。
+   方式存在的意义本身，peak 是 `pipeline depth × 448MB × B`。本仓库
+   `extensions/` 下的 thunder/xla 扩展如果引入这类调度，必须把这一条计入
+   训练显存预算，`op_log` 不会因为"训练本来就该省显存"而自动免于这个乘法。
 
 **activation checkpointing（`torch.utils.checkpoint`）不属于上面两类，但有
 一个值得记录的低优先级浪费**：checkpoint 的标准实现是"先在 `no_grad()` 下跑
@@ -4328,9 +4461,11 @@ no_grad 的 throwaway 分配、一次 recompute 的真实分配）——按上�
 不是本节这笔账的正确性问题，这里只记录下来避免遗漏。
 
 **结论，写进操作性规则**：默认训练循环（forward 后立即 backward，不论
-`optimizer.step()` 是否被梯度累积推迟）下，"448MB"是准确的峰值数字；一旦
-训练脚本改成"累积 loss 再统一 backward"或引入 pipeline 并行，必须显式按
-"同一时刻 in-flight 的 forward 数 × 448MB"重新核算，不能沿用这个数字。
+`optimizer.step()` 是否被梯度累积推迟）下，"448MB×`B`"（`B` 是真实训练
+batch size，这一步的乘法始终要做，不依赖训练循环的具体形态）是准确的
+峰值数字；一旦训练脚本改成"累积 loss 再统一 backward"或引入 pipeline
+并行，还必须在此基础上显式按"同一时刻 in-flight 的 forward 数 ×
+448MB×B"重新核算，不能只沿用"448MB"或"448MB×B"这两个都不完整的数字。
 
 **`op_log`（完整 `(B,G,OP_max,4)`）和 `op_log_len`（`(B,G)`）一起进 `ctx`，
 不做切片**：虽然不同 `(b,g)` 的有效长度不同，但保存前按最长有效长度裁剪成
