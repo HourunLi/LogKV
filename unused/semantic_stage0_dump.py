@@ -1,6 +1,17 @@
 #!/usr/bin/env python
 """Dump pre-RoPE k/v tensors for SemanticLogKV Stage-0 analyses.
 
+Scope: this implements *mechanism A only* (the cheap post-norm_q/norm_k,
+pre-apply_rope hook -- see docs/experiments.md's "两套机制" section). It is
+sufficient for S0.0-S0.7 (and S0.2's/S0.8's k/v-only sub-items), all of which
+only ever touch k/v, never q. It does **not** implement mechanism B
+(post-RoPE q, ``attn_mass_by_dist``) or the manifest fields that mechanism
+depends on (``tail_query_count``, the MinHash triple ``hash_algorithm``/``k``/
+``master_seed``) -- those are required for S0.8's 3b sub-item and for
+`CLAUDE.md` S13.2's attention-quality-by-distance curve, and are not yet
+implemented anywhere in this repo. Do not read this script's existence as
+"Stage 0 dump is done"; it covers the k/v-only slice of Stage 0.
+
 Example:
     python unused/semantic_stage0_dump.py \
       --checkpoint_dir ckpt/qwen1.7b-32k-warmup \
@@ -232,7 +243,19 @@ def main() -> None:
     parser.add_argument("--max_samples", type=int)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default="bf16")
-    parser.add_argument("--save_dtype", choices=("float16", "float32"), default="float16")
+    parser.add_argument(
+        "--save_dtype",
+        choices=("float16", "float32"),
+        default="float32",
+        help="Defaults to float32 so downstream sweeps (unused/semantic_s0_sweep.py) route on "
+        "the same precision the manifest's calibrated s_h/vh were computed from -- s_h/vh are "
+        "always accumulated in fp32 from the pre-quantization tensor (litgpt/semantic_s0.py's "
+        "RunningKeyScale.update()), so saving k/v at float16 lets DP-means routing distances "
+        "near the lambda_new threshold pick up fp16 rounding noise that the threshold itself "
+        "never saw, which can flip a cluster assignment right at the boundary. Pass float16 "
+        "only for a quick smoke test where exact routing near the threshold does not matter; "
+        "not for a real S0.0/S0.2/S0.3 run.",
+    )
     parser.add_argument("--compressed", action="store_true")
     parser.add_argument("--max_seq_length", type=int)
     parser.add_argument("--config_overrides", help="JSON dict merged into model_config.yaml")
@@ -377,4 +400,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
