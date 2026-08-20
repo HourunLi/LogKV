@@ -56,6 +56,19 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 
 **当前阶段：设计与算法规格已完成（§5），代码尚未开始写。**
 
+> **务必读清楚这句话字面的意思，不要被下面大段的伪代码/公式/`raise
+> ValueError(...)` 片段误导。** `litgpt/`、`tests/` 里不存在
+> `log_kv_semantic_clusters`、`op_log`、`current_segment` 等任何本文档描述
+> 的字段或分支——可以用 `grep -rn log_kv_semantic_clusters litgpt/ tests/`
+> 自行验证，应该零匹配。`LogKVStreamTrainingAttention` 这个类名确实在
+> `litgpt/log_kv_cache.py`/`litgpt/model.py` 里存在，但那是它在语义簇设计
+> 之前、位置分桶时代就有的版本，本文档在它之上设计的改动尚未落地。变更记录
+> （§14）里反复出现的"更正""这一轮修的""P0/P1"，改的都是**这份规格文本
+> 自身的逻辑漏洞**——两处描述互相矛盾、一条公式在某个边界条件下算错、一个
+> 反例说明某条规则不成立——不是已经在跑的代码里发现的 bug。**连 Stage 0
+> 的 dump 脚本（§5.21-5，本项目该写的第一行代码）都还没有写**，Stage 1
+> （生产实现）完全没有开始。
+
 **下一步（按优先级）**：
 1. **S0.0（§7）：扫 `(g_max, ℓ_block)`。** 全课题最根本的实验——一端是纯语义聚类，
    另一端退化成"连续性约束语义分段"，扫它等于直接回答"收益来自语义分组本身，还是
@@ -332,14 +345,40 @@ RoPE）这些改动是设计里不可选的（§2.1、§5.6 的 `K_max=1` 讨论
 **锚点展开的 `M` 只影响读出时的瞬时槽池，不影响持久 cache 内存**——每 entry 存的是
 3 个整数，不是 3 份键值。
 
-**第三笔账，此前漏记：训练期 `op_log` 重放元数据，约 448MB/28 层@32k
-（`algorithm-spec.md` §5.21-2 的推导）。这笔账只属于训练侧，不属于上面两笔里的
-任何一笔，也不进 memory-matched 对比**——`op_log` 是给 backward 重放用的操作日志
-（§11-A），serving/推理路径不做反向传播，**不分配、不持有这块内存**；上面两笔账
-比较的是"cache 里究竟存了多少 entry"和"读出时瞬时展开多大"，两者都是 serving 也
-会付的代价，`op_log` 不是。训练时这笔额外的 448MB 是真实成本，但它和"压缩率""
-memory-matched 公平性"这两个 serving 侧的论证是两件独立的事——放进同一张表比较
-会把训练开销和推理内存预算混为一谈，所以单独列出，不进上面那张表。
+**第三笔账，此前漏记：训练期 `op_log` 重放元数据，约 448MB/28 层@32k，**且是
+每个尚未执行 `backward()` 的 in-flight forward 各付一份**（`algorithm-spec.md`
+§5.21-2 的推导）。这笔账只属于训练侧，不属于上面两笔里的任何一笔，也不进
+memory-matched 对比**——`op_log` 是给 backward 重放用的操作日志（§11-A），
+serving/推理路径不做反向传播，**不分配、不持有这块内存**；这不是"推理时反正
+用不上所以顺便不管"的隐式结果，是共享的路由/flush 逻辑显式接收一个
+`record_op_log` 开关，只有训练专用的 `LogKVStreamTrainingAttention.forward()`
+传 `True`，推理用的 `LogStructuredKVCache.forward()` 传 `False`，见
+`algorithm-spec.md` §5.21-2 新增的"`op_log` 只能在训练路径分配"一节。上面
+两笔账比较的是"cache 里究竟存了多少 entry"和"读出时瞬时展开多大"，两者都是
+serving 也会付的代价，`op_log` 不是。
+
+**"448MB" 不是训练期的固定开销，是每个 in-flight forward 的单价**：只要
+下一次 `forward()` 在这次 forward 对应的 `backward()` 跑完之前发生，两份
+448MB 就会同时存活，训练峰值因此是 `448MB × 同一时刻并存的 in-flight
+forward 数`。本仓库 `litgpt/pretrain.py` 的梯度累积循环每个 microbatch 都
+立即调用 `fabric.backward()`（只有 `optimizer.step()` 被推迟），所以在这条
+训练循环下 in-flight 数恒为 1，"448MB"就是准确的峰值；但"累积 loss、只在
+最后统一调一次 `backward()`"或 pipeline 并行的 microbatch 调度会让这个数字
+按并发 forward 数相乘，完整分析、以及哪些模式安全/哪些需要重新核算，见
+`algorithm-spec.md` §5.21-2 新增的"『448MB』只是每个 in-flight forward 的
+代价"一节——训练时这笔额外的显存是真实成本，但它和"压缩率""memory-matched
+公平性"这两个 serving 侧的论证是两件独立的事——放进同一张表比较会把训练
+开销和推理内存预算混为一谈，所以单独列出，不进上面那张表。
+
+> **这笔账中途差点被算错一次，教训值得留着**：为了让 `op_log` 安全地活过
+> `backward()`（不被下一次 `forward()` 的 reset 清空），中间一版实现是
+> `ctx.save_for_backward(cache.op_log.detach().clone(), ...)`——这个 `clone`
+> 让训练峰值一度变成 448+448=896MB，因为 cache 自己的持久 448MB 和 ctx 里的
+> 克隆同时存在。**最终方案不是克隆，是让 `op_log`/`op_log_len` 不再走"持久
+> buffer + `reset_parameters()` 原地清零复用"这条路**——它们改成每次
+> `forward()` 开头重新绑定成全新分配的张量，直接存进 `ctx`，不需要克隆，
+> 训练峰值因此回到单份 448MB，就是本节这笔账的数字，不是 896MB。完整推导见
+> `algorithm-spec.md` §5.21-2"训练峰值显存"更正框。
 
 **关于"期望 O(log n)、最坏 O(N)"这个契约**：作为**论文的空间复杂度主张**它成立，
 而且比"期望"更强——CRP 簇数是独立 Bernoulli 之和，Chernoff 给出多项式小的尾概率，
@@ -429,6 +468,1332 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-19｜第二十三轮核实：给 `scan_op_log_for_ward_events` 补上
+  "K 未满分支的 NEW_CLUSTER 必须落在从未 alive 过的槽上"这最后一类校验，
+  明确姊妹函数 `scan_op_log`（S0.8 主指标用的解析器）必须先过它做前置
+  校验；推翻自相矛盾的"`S_pooled=0` 时是空张量"说法，钉死 `S_pooled`
+  恒为固定矩形宽度；补全签名里漏掉的 `lam`，3b 调用里显式传
+  `log_kv_lambda`；把 3b 的 CPU dtype 策略从"信任 fp16/bf16 CPU 支持"
+  改成显式 `.float()`；给二阶 Σ/Γ 路径补上"Stage 1 默认关闭"的显式决定；
+  列出 `CacheAttentionState` 的完整调用点迁移清单；调整 Stage 0 标题
+  措辞；顺带修掉起草过程中自己引入的两处 markdown 加粗嵌套渲染 bug。**
+  动机：用户对第二十二轮的修复再做一轮复核，指出接口级硬约束仍有缺口、
+  两处文字自相矛盾、以及一处此前完全没考虑过的 CPU 数值后端风险。逐条
+  结论：
+  ① **P1：`scan_op_log_for_ward_events` 的 `NEW_CLUSTER` 分支只在"紧邻
+  pending 的 WARD_MERGE"这条路径上校验过（上一轮的③），"没有 pending
+  时凭空冒出一个 NEW_CLUSTER"（K 未满/冷启动分支）完全没有校验。** 按
+  §5.6 的 K 未满/K 已满两分支表，没有 pending 的 NEW_CLUSTER 写入的槽
+  必须是"从未 alive 过"（`epoch` 恒为 -1），否则说明 K 未满分支的空位
+  判定选中了一个其实已经在用的槽，两个逻辑簇会静默共享同一个物理槽。
+  **修法**：`pending is None` 分支下追加
+  `assert epoch.get(op.cluster,-1) == -1`，列为"更正"框第⑤条。
+  ② **P1：S0.8 cluster assignment divergence（主指标）用的是
+  `scan_op_log`/`resolve_final_slots`，不是加固过的
+  `scan_op_log_for_ward_events`——非法 `op_log`（`NEW_CLUSTER` 写入非
+  空槽、`JOIN`/`NEW_SEGMENT` 指向非 alive/root、`WARD_MERGE` self/stale/
+  non-root）会被 `scan_op_log` 静默解析成"看起来合法"的最终槽号，
+  co-assignment/ARI/precision/recall 在错误输入上算出干净但没有意义的
+  数字。** `scan_op_log` 本身刻意保持"足够简单、容易独立确信正确"
+  （不新增校验），**决定**：`experiments.md` S0.8 第①项显式要求先对同一段
+  `op_log` 跑一遍 `scan_op_log_for_ward_events`（哪怕丢弃它的
+  `WardEvent`/sketch 输出，只借用它现在已有的五类合法性断言）作为前置
+  校验，通过后才调用 `scan_op_log`/`resolve_final_slots`；这一步和 S0.8
+  第①项本来就要算的"Ward 事件"分歧可以共享同一次调用，不需要多跑一遍。
+  ③ **P0：`S_pooled=0` 时是空张量的说法和 §5.13"读出不需要 gather"一节
+  的固定矩形预分配设计直接矛盾。** §5.13 明确 entry 躺在固定位置，
+  `get_attention_state()` 只需 `reshape` 成 `(B,G,K_max·L_alloc·B′,·)`
+  ——`S_pooled` 是只由 `K_max/L_alloc/B′` 决定的编译期常量，不随"是否
+  已经 flush 过"变化；序列刚开始时 `S_pooled` 依然是满值，只是每个槽都
+  `w=0`、`slot_valid` 在整个宽度上恒为 `False`，不是张量收缩到宽度 0。
+  **顺带补一条必须写进单测的推论**：pooled 区域整体无效时那一段分数
+  整体是 `-inf`，但因为 exact 后缀不受 `slot_valid` 约束、query 至少能
+  看到自己的 in-flight chunk，每行分数向量恒有至少一个有限值，softmax
+  不会因此产出 NaN——这条不变量此前从未显式验证过。
+  ④ **P1：新签名漏了 `lam`，3b 的调用也没有显式传它。** 真实签名是
+  `q, slot_k, slot_v, slot_w, scale, mask=None, lam=1.0, causal_tail=0,
+  ...`，`lam` 是现有参数、排在 `mask`/`causal_tail` 之间，上一轮的签名
+  片段只列了"不变"的 `mask`/`causal_tail`，中间漏了 `lam`，容易读成
+  "被移除了"。§7 消融表把 `λ∈{0,1}` 列为独立扫描轴，`λ=0` 时 mass bias
+  整项不加（`if lam != 0.0:` 门控），若 3b 悄悄用默认值 `1.0`，扫 `λ=0`
+  时 3b 比较的就不是这次实验实际配置的读出行为。**修法**：签名补全
+  `lam=1.0`；3b 的两次 `log_kv_slot_attention` 调用显式传
+  `lam=log_kv_lambda`（本次实验实际配置的值）。
+  ⑤ **P2：3b 的 CPU dtype 策略"信任 fp16/bf16 在 CPU 上能跑"是乐观假设，
+  不是安全默认值。** fp16 在 CPU 后端的 matmul/softmax 支持历来不完整
+  （常见"not implemented for 'Half'"报错，或退化成极慢路径），bf16 支持
+  更好但也不是全版本全算子覆盖。**修法**：`q_tail`/`state_batch.slot_k`/
+  `slot_v`/`slot_w`（以及 serial 侧对应张量）在传入 `log_kv_slot_
+  attention` 前统一 `.float()`——fp32 在 CPU 上全算子通用支持，且和
+  `relative_l2` 自己已经对输出做 `.float()` 是同一个精神，不会让比较
+  失真。
+  ⑥ **P1：3b 只覆盖 rank-1 Σ/Γ 的旋转数学，从未验证批量近似路由下 Σ/Γ
+  聚合状态本身（`compact()`/`_binary_carry()` 的 Chan-merge 累积值）是否
+  也和严格串行参考一致，但 §7 消融表已经把"现有构造"列为可以在 Stage 2
+  跑的一档。** 3b 证明的"路由分歧 <5%"不能自动推出"Σ/Γ 聚合分歧也
+  <5%"，这是未经验证的推论。**决定**：Stage 1 语义簇初次实现默认锁定
+  `second_order_scale=0`（对应消融表"关"这一档），和 v1 不碰训练目标是
+  同一类范围决定；要跑"现有构造"/"delta-rule 构造"两档，必须先有一个
+  类似 3b、针对 `with_stats=True` 路径的独立验证（可以叫 3c，这一轮不
+  展开设计——3b 已经足够复杂，Σ/Γ 尚未启用时提前定死 3c 的细节容易锁死一个
+  不合适的设计），消融表"rank-1 Σ/Γ"一行同步标注这条限制。
+  ⑦ **P2：`CacheAttentionState` 落地需要机械改动的调用点，上一轮只在
+  概念层面提过，没有列出具体位置，§5.20-B 的改动对照表里那一行还是"多
+  返回一个有效位掩码与每 entry 的 `M_s`"这个旧措辞。** 核对代码库确认
+  完整调用点：`get_attention_state()`/`append_exact_tokens()` 自身定义
+  （`log_kv_cache.py:1246/1435`）、`log_kv_chunk_attention()`
+  （`:1738/1754`）、`model.py` 三处独立流式调用（`:1209/1219`、
+  `1284/1338`、`1397/1409`）、`log_kv_diag.py:624`、以及
+  `tests/test_log_kv_cache.py`/`test_log_kv_diag.py`（分别约 22、3 处
+  直接调用，`grep -c` 实测）。改动对照表行更新为指向 `CacheAttentionState`
+  本身，并新增一张完整清单。
+  ⑧ **P2：Stage 0 标题仍是"1 次 GPU dump + 全部 CPU 分析"，虽然下方已经
+  补了 3b 例外的说明，但快速读者可能只扫标题。** 标题改为"1 次 GPU
+  dump + 主体 CPU 分析，S0.8 3b 例外——须在 dump 进程内完成"。
+  **自查发现并修正了本轮起草过程中自己引入的两处 markdown 渲染 bug**：
+  `**A**B**C**` 这种写法里 `**` 是交替 toggle、不是嵌套加粗（CLAUDE.md
+  变更记录第十八轮已经踩过一次同一个坑），这一轮在"`S_pooled` 恒为
+  固定宽度"和"3b 只保证 Σ/Γ 旋转数学正确"两段里各自不小心又写出了这个
+  模式（比如 `在**整个** S_pooled` 会让"整个"两个字本身不加粗、反而让
+  它前后的大段文字被错误加粗），写完之后逐段计数 `**` 出现次数、人工
+  核对配对关系时发现，已经改成单层加粗或去掉多余的内层强调。
+  用户重申代码仍处于纯规格阶段——独立重新扫了
+  `litgpt/`、`tests/` 里的 `SemanticLogKV`/`log_kv_semantic_clusters`/
+  `CacheAttentionState`/`scan_op_log_for_ward_events`/`dedup_anchors`/
+  `WARD_EVENT_SKETCH_K` 等关键词，确认零匹配，与 CLAUDE.md §0 已有声明
+  一致，不需要改动，仅在此确认。
+
+- **2026-08-19｜第二十二轮核实：给 Ward scanner 补上"原始操作数在 `find()`
+  之前必须已经是当前根"这一硬约束，把 `slot_valid`/`M_s` 从"调用方按需
+  传"改成"语义模式下由 cache 自动无条件产出"，把 `get_attention_state()`
+  从裸位置元组改成具名的 `CacheAttentionState`，明确 S0.8 3b 只验证一阶
+  路径、不覆盖 Σ/Γ 二阶修正，给 3b 补上 CPU/GPU 设备与 dtype 编排、多
+  prompt 聚合口径，并给 ARI/precision/recall 补上零分母边界的显式定义。**
+  动机：用户对第二十一轮的修复再做一轮复核，指出七处问题——集中在"接口级
+  硬契约还没钉死"这一类：调用签名/张量维度的直接阻塞性 bug 已经在上一轮
+  堵上，这一轮剩下的是"函数会跑，但边界条件/隐含假设没有写清楚"这一层。
+  逐条结论：
+  ① **P1：Ward scanner 的 `WARD_MERGE` 分支对 `op.keep_slot`/`op.free_slot`
+  拼出的原始身份直接做 `find()`，从未校验这两个原始 tuple 在 `find()` 之前
+  本身就该是当前根。** 若上游有 bug 让一个已经被更早一次合并吸收掉的 stale
+  身份又被错误地当成新一次合并的操作数写进日志，`find()` 会静默把它解析到
+  正确的祖先身份，日志层面的错误被并查集结构"自动修好"，永远不会被发现——
+  这和第二十一轮修的③（校验 `NEW_CLUSTER` 是否复用了刚释放的槽）是同一类
+  "不假设 op_log 一定合法"的立场，但抓的是不同的输入：③ 抓"合并之后新簇
+  建错了槽"，这一条抓"合并本身的操作数就已经引用了一个不该存在的身份"。
+  **修法**：`find()` 之前先构造 `raw_keep`/`raw_free`，断言
+  `raw_keep == find(raw_keep)` 与 `raw_free == find(raw_free)`，通过后
+  直接把 `keep_v`/`free_v` 赋值为这两个原始 tuple（不需要再调用一次
+  `find()`），列进"更正"框的第④条。
+  ② **P0：`slot_valid`/`M_s` 写成 `=None` 默认值，只回答了"传了之后形状
+  怎么用"，没回答"语义模式下能不能不传"。** 若调用方漏传，函数不报错，
+  只会静默按"没有无效槽"处理——`λ≠0` 时会让有效 entry 内部的重复锚点
+  （去重前 `M∈{1,2,3}`）被当成独立证据把 softmax 质量放大 `M` 倍；
+  `λ=0` 时（`log_kv_slot_attention` 自带的消融旋钮）更严重，`if lam !=
+  0.0` 门控让 mass bias 整项都不加，连"纯 pad/dead entry 靠 `log(0)=-inf`
+  被动压掉"这条安全网也没有了，`slot_valid` 是唯一挡住无效槽（含 anchor=0
+  哨兵位置）获得非零 attention 的机制。**修法**：不再是调用方按需申请的
+  可选项，`slot_valid`/`M_s` 由 `get_attention_state()` 依据 cache 自身的
+  构造模式（`log_kv_semantic_clusters=True`）自动、无条件产出；`S_pooled=0`
+  时是空张量而不是 `None`，legacy 模式下恒为 `None`（合法稳定值，不是占位
+  符）。
+  ③ **P1：`get_attention_state()` 现有实现按 `with_stats` 布尔值返回裸
+  3-元组或 8-元组，语义模式叠加 `slot_valid`/`M_s` 后理论上会衍生出 4 种
+  不同长度/顺序的返回值，"语义×有 stats"这一档此前完全没人定义过顺序，
+  而这份规格通篇都在抓"位置参数摆错顺序"这一类 bug（S0.8 3b 的调用签名
+  错误就是活生生的例子）。** **修法**：不再扩展位置元组，新增
+  `CacheAttentionState`（`NamedTuple`，10 个字段，不适用的字段取
+  `None`），`get_attention_state()` 在任何模式下都返回这一个类型，调用方
+  一律按字段名取值（`state.slot_k`），"第几个位置对应哪个参数"这整个 bug
+  类别在语法层面消失。`with_stats` 作为性能旋钮保留。
+  ④ **P2：S0.8 3b 用 5 个字段调用 `log_kv_slot_attention`，但算法规格里
+  rank-1 Σ/Γ 的读出修正依然存在，`with_stats=True` 时 3b 该怎么处理没有
+  定义，"`relative_l2 < 5%`"到底在验什么因此含糊。** **决定**：3b 固定
+  `get_attention_state(with_stats=False)`，只验证批量近似路由/compaction
+  与严格串行参考的一阶读出是否一致；Σ/Γ 的正确性已经由独立的、纯 CPU 的
+  嵌套精确性/坐标系回归单测覆盖，不需要 3b 重复验证，也避免把"路由分歧"
+  和"二阶修正近似误差"两个独立误差源混进同一个数字。若日后需要验证两者
+  组合起来是否也一致，那是新起一项独立实验，不是往 3b 加参数。
+  ⑤ **P1：3b 的 `q_tail` 来自 GPU 前向的 `q_roped`，`cache_batch`/
+  `cache_serial` 来自纯 CPU 参考实现，两者不搬到同一设备直接相乘会立即
+  报 device mismatch——上一轮完全没提这件事。** **修法**：`q_tail` 在两次
+  `log_kv_slot_attention` 调用前显式 `.cpu()`（选择挪 `q_tail` 而不是把
+  参考实现搬上 GPU，因为前者张量小、代价可忽略，后者会给"足够简单以便
+  独立确信正确"的参考实现增加一条新路径）；dtype 上 `.cpu()` 不改变
+  dtype，只要参考实现的 `k̄_raw`/`v̄` 按 §5.13 buffer 表的既有约定同样存
+  activation dtype，两侧天然一致，不需要额外转换。
+  ⑥ **P2：`relative_l2` 已定义为不跨 head/layer 平均，返回 `(B,nh)`，但
+  Stage 0 dump 的是"几条"NIAH prompt，完整结果其实是 `(prompt,layer,head)`
+  三维网格，没定义这个网格怎么收敛成一个"过/不过"的判断。** **决定**：
+  硬性决策门挂在 `max`——`max` over `(prompt,layer,head)` 的 `error_3b`
+  必须 <5%，任意一个 prompt 任意一层任意一个头超标就算 3b 失败而不是
+  warning，理由和"不跨 head/layer 平均"同源（§2.5 贯穿性要求：均值/`p95`
+  会把头/层特定的失效稀释掉）；同时报告完整网格的均值、`p95`、以及取到
+  `max` 的那个 `(prompt,layer,head)` 身份，帮助归因，不是只留一个数字。
+  ⑦ **P2：新增的 ARI/precision/recall 公式都有零分母边界**（`max_idx==
+  expected`、`sum_ai==0`、`sum_bj==0`），32k 正常路由几乎不会撞见，但
+  S0.1 风格的小合成单测（全 singleton、全同簇）会撞见。**修法**：实测
+  验证 `sklearn.metrics.adjusted_rand_score` 在这类退化输入上返回 `1.0`
+  （不是凭印象转述），本规格对 ARI 采用相同约定；precision/recall 各自
+  在对应分母为 0 时定义为未定义（`NaN` + 显式 flag），两者都定义且都
+  精确为 0 时 `f1:=0`（标准调和平均约定，不是另一处 0/0）。
+  **顺带修正了本轮起草过程中自己引入的两处引用错误**：把"3b 调用签名
+  错误"错误地指向了不存在关联的"§5.8"（`experiments.md` 的 S0.8 编号和
+  `algorithm-spec.md` 的 §5.8 章节号恰好数字相同、含义完全无关，容易
+  手滑连到一起——已改成明确写 `experiments.md` S0.8 3b，不用 §5.8 这个
+  容易引发混淆的记号）；把 `CacheAttentionState` 的定义位置错误地标成
+  §5.15（实际是 §5.14 内的一个新增小节，紧邻"虚拟槽展开必须扣上
+  causal_tail/mask API"）——两处都在 algorithm-spec.md 和 experiments.md
+  之间交叉引用时发现并改正。
+
+- **2026-08-19｜第二十一轮核实：修掉 S0.8 3b 伪代码的调用签名/张量
+  维度两处会直接阻塞实现的 bug，补上 `dedup_anchors` 输出到
+  `log_kv_slot_attention` 输入之间缺失的 per-entry→per-virtual-slot
+  广播契约，钉死此前一直是黑盒的 `relative_l2` 定义，给 Ward scanner
+  补上"新簇是否复用了刚释放的槽"这一校验，把 Stage 0"1 次 GPU dump +
+  全部 CPU 分析"的两阶段划分与 3b 的"`q_tail` 不落盘"显式对齐，并给
+  成对共簇一致率补上 ARI + same-cluster precision/recall/F1。** 动机：
+  用户对第二十轮的修复复核，指出上一轮清掉了"3b 混入 dense ground
+  truth"这个概念性 P0 之后，剩下的是更底层的可执行性问题——伪代码字面
+  拿去实现会直接报错或悄悄传错参数，这类"方向对了、细节仍然错"的 bug
+  同样危险。逐条结论：
+  ① **P0：3b 调用 `log_kv_slot_attention` 时把 `get_attention_state()`
+  的返回值整个展开成位置参数，与真实签名对不上。** 签名是 `(q, slot_k,
+  slot_v, slot_w, scale, mask=None, causal_tail=0, slot_valid=None,
+  M_s=None, ...)`——`scale` 是第 5 个位置参数，排在 `slot_w` 之后、
+  `mask` 之前；`slot_valid`/`M_s` 是更靠后的具名参数。上一版
+  `log_kv_slot_attention(q_tail, *cache.get_attention_state(),
+  causal_tail=...)` 把 5 元组 `(slot_k,slot_v,slot_w,slot_valid,M_s)`
+  展开后，第 4、5 个位置会把 `slot_valid` 误传成 `scale`、`M_s` 误传成
+  `mask`，两者类型都不对，真正的 `slot_valid`/`M_s` 反而没被传上。
+  **修法**：显式拆包 `slot_k, slot_v, slot_w, slot_valid, M_s =
+  cache.get_attention_state()`，`scale` 复用 mechanism B 循环里已有的
+  同一个 `scale`，`slot_valid`/`M_s` 按关键字传递（`experiments.md`
+  S0.8 3b 一节）。
+  ② **P0：`q_tail` 的组装伪代码按错了轴索引，且缺 batch 维。**
+  `q_roped` 是 `(nh,T,hs)`（dump 约定省略 batch 维），但
+  `len(query_block)` 在 PyTorch 张量上返回的是 `shape[0]`（即 `nh`）
+  而不是这一块的 T 长度，`abs_idx`/`block_start` 全部算错；
+  `query_block[tail_mask]` 同样按 dim 0（`nh` 轴）索引，和长度为 T 的
+  `tail_mask` 对不上，多数情况下会直接因形状不匹配报错。**修法**：
+  改用 `query_block.shape[1]` 取真实 T 长度，`query_block[:, tail_mask,
+  :]` 按 T 轴（dim 1）取子集；`q_tail` 拼出的
+  `(nh, tail_query_count, hs)` 还需 `.unsqueeze(0)` 补回
+  `log_kv_slot_attention` 要求的显式 `(B, nh, T_q, k_dim)`。
+  ③ **P1：`dedup_anchors` 的输出 `M`（per-entry，`(...,S)`）和
+  `log_kv_slot_attention` 需要的 `M_s`（per-virtual-slot，
+  `(B,G,S_pooled)`，`S_pooled=S·3`）之间，此前没有任何代码或文字把
+  这一步展开写清楚。** 补上 `algorithm-spec.md` §5.14 新增小节：`v̄`/
+  `w`/`M` 三者都是"entry 级、不随锚点变化"的量，各自
+  `unsqueeze(-1/-2).expand(...,3)` 广播到 3 个虚拟槽（每个虚拟槽拿到
+  同一个标量，不能拆分成三份分别赋值——那样会让 `log(w/M)` 在虚拟槽
+  维度上被重复稀释），再与 `slot_k`（来自 `materialize_anchor_keys`，
+  天然是 `(...,S,3,k_dim)`，每个虚拟槽因锚点不同而不同）、`slot_valid`
+  用同一次 flatten 合并 `(S,3)` 两维成 `S_pooled`，保证顺序对齐。
+  **自查发现并修正了草稿中的一处指标错误**：`S_pooled` 最初写成
+  `anchors.shape[-3]`，但 `anchors` 形状是 `(...,S,3)`，倒数第三维是
+  `S` 之前的那一维（通常是 `G`），不是 `S`——改用 `w.shape[-1]`（`w`
+  形状 `(...,S)`，末维无歧义就是 `S`），避免负索引数错。
+  ④ **P2：`relative_l2` 此前只是一个从未定义的函数名，直接用在硬性
+  决策门（<5%）上。** 补上精确定义：误差在 fp32 里算（避免 fp16 舍入
+  噪声和真实信号量级相当）；分母固定取 `‖out_serial‖`（严格串行参考
+  是这次比较的真值，不是对称范数）；`eps` 只防止分母接近零时除零；
+  范数按 `(tail_query_count, v_dim)` 联合展平后取，返回 `(B, nh)`，
+  不在函数内部跨 head/layer 平均——呼应 §2.5"贯穿性硬要求"，3b 的
+  <5% 决策门同样要逐 (layer, head) 判定，不能被好头平均掉坏头。
+  ⑤ **P1：Ward scanner 只校验"紧跟的是不是 `NEW_CLUSTER` 类型"，没
+  校验"这个 `NEW_CLUSTER` 用的是不是刚释放出来的那个槽"。** §5.4
+  Phase 2 步骤 4 的既有约定是 `slot_idx = free_slot`，若上游路由/日志
+  代码有 bug 让 `WARD_MERGE` 后紧跟的 `NEW_CLUSTER` 落在了别的槽上，
+  原有检查（只看 `op.type`）不会发现，`trigger_token_idx` 会被安到
+  一个不相关的 token 上，产出的 `WardEvent` 表面合法、实际张冠李戴。
+  补 `assert op.cluster == pending.free_identity[0]`，和类型检查放在
+  同一处、同等严格。
+  ⑥ **P1：Stage 0 顶层"1 次 GPU dump + 全部 CPU 分析"的两阶段划分，
+  与 3b"`q_tail` 不落盘、用完即弃"的既有决定没有显式对齐，独立的
+  后处理脚本理论上拿不到 q。** 补充：这个两阶段划分对 S0.0–S0.7 及
+  S0.8 的第 1/2/3a 项精确成立（只吃已落盘的 `k_raw`/`v`/`pos`/
+  `attn_mass_by_dist`，随时可用独立 CPU 脚本重跑）；**3b 是唯一的
+  例外**——它的读出比较必须在 GPU dump 那个进程内、`q_tail` 还没被
+  丢弃时就地完成（mechanism A 给出 `k_raw`/`v` 后，紧跟 mechanism B
+  凑齐 `q_tail`，立即在同一调用栈里跑 CPU 参考实现构造
+  `cache_batch`/`cache_serial` 并做读出比较，然后才能丢弃
+  `q_tail`），不能是一个独立于 dump 的后处理脚本。
+  ⑦ **P2：cluster assignment 的成对共簇一致率（Rand Index 风格）会被
+  "两条路径都判不同簇"这一类 pair 结构性撑高，掩盖真实分歧。**
+  用 `K_max=15`（32k 默认）代入独立随机模型算出：即便两条路径的聚类
+  完全独立无关，raw agreement 期望也能到 ≈87.6%（这正是 Rand Index
+  发明 Adjusted Rand Index 的原始动机）。补上 ARI（用同一张列联表
+  免费算出，不需要额外遍历）与 same-cluster 口径的
+  precision/recall/F1（能看出分歧偏向"过度合并"还是"过度拆分"），
+  四组数字一起报告，不用一个代替另一个。
+  ⑧ 用户重申代码仍处于纯规格阶段——独立重新扫了
+  `litgpt/`、`tests/`（124 个 `.py` 文件）里的
+  `SemanticLogKV`/`log_kv_semantic_clusters`/`slot_valid`/
+  `WARD_EVENT_SKETCH_K`/`scan_op_log_for_ward_events`/`dedup_anchors`
+  等关键词，确认零匹配，核实与 CLAUDE.md §0 已有声明一致，不需要
+  改动，仅在此确认。
+
+- **2026-08-19｜第二十轮核实：删掉第二轮起混进 3b 的一处 P0 自相
+  矛盾——"稠密侧 ground truth"从来不是 3b 的比较对象，3b 自始至终是
+  批量近似 cache 与严格串行参考 cache 互相比较——顺带把 `q_tail` 的
+  组装方式从"裸切片"改成跨 mechanism B 分块循环累积，补上 CPU 参考
+  实现必须真正维护 recent window（不能只做 op_log 重放）的要求，给
+  `slot_valid`/`M_s` 补上断言级的 shape 契约，给 Ward scanner 补上
+  self-merge 防御，并集中列全 Stage 0 manifest 的必需字段。** 动机：
+  用户这轮重新拉取 `origin/semanticLogKV` 复核前几轮的 3b/S0.8 修法，
+  指出最要命的一处是"3b 到底比较谁"这个定义本身自相矛盾——这类"两处
+  互相矛盾的表述都各自看起来合理"的 bug 比单处错误更危险，因为读者
+  可能只看到其中一处就信以为真。逐条结论：
+  ① **P0：3b 的定义存在两个互相矛盾的版本，根源是第二轮引入
+  `causal_tail` 修法时，把"3b 蹭 mechanism B 的循环拿 `q_roped`"和
+  "3b 拿 mechanism B 算出的 dense score/probs 当比较对象"这两件不
+  相关的事混成了一件。** 3b 从条目定义（本节最上面、S0.8 的条目
+  说明）起就只说"批量路径与严格串行参考给出的注意力输出的相对 L2
+  误差"——两个压缩 cache 互相比较，不涉及任何稠密 attention。但第
+  十八轮为了修因果性漏洞，在下面新增了"稠密侧（mechanism B 给出的
+  ground truth）...用来算 3b 的分子/分母另一半"，把 mechanism B 的
+  dense 计算错误地拉进了 3b 的比较对象里，与条目定义直接冲突，两处
+  同时挂在文档里、都读起来像是权威定义。**这处矛盾同时让"dense
+  readout（`out_dense=probs@v`、GQA 展开、dtype/softcap 口径）要不要
+  补全"这个问题看起来是真问题**——如果 3b 真的需要 dense 端参与比较，
+  mechanism B 现有伪代码（只算到 `probs`，从不算 `out_dense`）确实
+  不完整；但一旦确认 3b 从不吃 dense 读出结果，这个问题就不存在，
+  `attn_mass_by_dist` 需要的只是 `probs` 本身，mechanism B 对它自己
+  的目的一直是完整的。**修法**：删掉"稠密侧...另一半"那一整段设计
+  （不是改措辞），`q_tail` 只从 mechanism B 循环里"顺路"累积（省一次
+  重复算 RoPE 的开销），mechanism B 自己的 `scores`/`probs`/
+  `attn_mass_by_dist` 全程只服务它自己的目的（§13.2），3b 拿到完整
+  `q_tail` 后在循环**外面**独立对两个压缩 cache 各做一次
+  `log_kv_slot_attention` 读出、互相比较，和 mechanism B 的 dense
+  计算没有任何关系。
+  ② **P1（①的直接推论）：`tail_query_count > block_size` 时压缩侧
+  需要整批 `q_tail`，但上一版的伪代码是 `q_roped[T-tail_query_count:T]`
+  这样的裸切片，隐含假设 `q_roped` 整条可用——和"`q_roped` 分块用完
+  即弃、不整块落盘"这条既定原则矛盾。** 改成在 mechanism B 循环内部
+  按 `tail_mask` 逐块把命中的 query 追加进 `q_tail_parts`，循环结束后
+  一次性 `cat`——不要求 `tail_query_count ≤ block_size`，也不需要为
+  3b 单独引入 ring buffer；`block_size` 因此不影响 3b 的任何输出值
+  （`k_expanded` 从不按 `block_size` 切片，`softmax` 永远在完整 key
+  维度上做），只影响凑齐 `q_tail` 要跑几次循环，不需要和
+  `tail_query_count` 一起进复现实验的必需 metadata。
+  ③ **P1：`recent_count ≥ tail_query_count` 这条前提能否成立，取决于
+  CPU 参考实现是否真的维护了一个忠实的 recent window 缓冲，但文档
+  之前没有显式要求这一点。** 若某个批量近似/严格串行 CPU 实现图省事，
+  只保留压缩层级或者只靠 `op_log` 重放去重建 pooled 部分，
+  `recent_count` 就没有对应的真实状态可查，断言要么执行不了要么查到
+  假值，产出一个"看起来能跑但因果尾部已经错位"的 cache。补一条显式
+  要求：两条 CPU 参考实现都必须复刻"滑窗、按到达顺序追加、溢出时把
+  最老的 `flush_granularity` 个 token 推出去做压缩"这条既有语义（同
+  CLAUDE.md §10），S0.1 用到的同一套参考实现同样适用，不是 3b 专属的
+  新增负担。
+  ④ **P2：`slot_valid`/`M_s` 的 shape 约束只在 docstring 里散见几句，
+  没有断言级的钉死。** 补齐四条：`S_pooled≤S_total`；
+  `S_total−S_pooled≥causal_tail`（等号是 `recent_count==tail_query_
+  count` 的情形，大于号是 recent window 里还有比尾部窗口更早内容的
+  情形，两种都要处理）；`w=0⟹slot_valid=False` 是单向蕴含，不是
+  等价（有效 entry 内部去重掉的锚点槽同样 `slot_valid=False`，不能
+  被误读成"该 entry 无效"）；exact 后缀由调用方（`get_attention_
+  state()` 的构造本身）保证 `w` 恒为 1，函数不反过来校验这一点。
+  ⑤ **P2：Ward scanner 的 `WARD_MERGE` 分支没有防御 `keep_v==free_v`
+  的 self-merge。** 生产路由的代价矩阵会 mask 对角线排除这种情况
+  （§5.6），但 scanner 处理的是 op_log，不该假设日志一定合法——不挡
+  住的话会静默腐化状态：`sizes[keep_v]=keep_size+free_size` 把同一
+  身份的计数翻倍，紧接着 `sketches.pop(free_v)`/`sizes.pop(free_v)`
+  又把刚更新的条目整个删掉，自合并被静默转换成状态丢失。补
+  `assert keep_v != free_v`，在合并逻辑执行前现场报错。
+  ⑥ **P2：Stage 0 manifest 的字段列表分散在多处新增，没有集中维护，
+  容易漏记。** 把 `tail_query_count`（3b 必需）、MinHash 三元组
+  `hash_algorithm`/`k`/`master_seed`（Ward 事件 Jaccard 必需）和已有
+  的 `s_h` 标定值集中列进"落盘格式"一节的 manifest schema；同时明确
+  `block_size` **不**属于这份必需清单（见②的论证），避免过度收紧。
+  ⑦ 用户额外指出代码仍处于纯规格阶段（`litgpt/`、`tests/`、
+  `demo.py`、`eval.py`、`exp/` 扫描 `SemanticLogKV`/`M_s`/`slot_valid`/
+  `WARD_EVENT_SKETCH_K` 等关键词零匹配）——核实与 CLAUDE.md §0 已有
+  声明一致，不是新发现，不需要改动，仅在此确认。
+
+- **2026-08-19｜第十九轮核实：修 3b 压缩侧读出伪代码里两个自己引入的
+  P0——忘了把尾部 exact token 真正拼进 slot 张量导致 `causal_tail` 遮错
+  对象、且和 `get_attention_state()` 已经包含 recent window 这件事撞在
+  一起变成双计——外加把 `since_last_flush` 这个凭空发明的状态量换成
+  真实存在的 `recent_count`，`M_s` 正式列入 `log_kv_slot_attention`
+  签名，`tail_query_count` 的默认值口径钉死，以及给 Ward orientation
+  选择补上噪声容限。** 动机：用户这次重新拉取远端最新
+  `origin/semanticLogKV`（确认代码目录里 `semantic`/`log_kv_semantic`
+  仍零匹配，审的是规格文本本身）核对上一轮（第十八轮）刚落地的 3b
+  修法，发现"因果性方向对了，但落到伪代码这层还有两个具体实现坑没堵上"
+  ——这类"方向正确、执行细节仍然错"的 bug 最容易被上一轮的"看起来已经
+  修好了"掩盖。逐条结论：
+  ① **P0：3b 压缩侧伪代码只算出了 `k_tail_roped`/`v_tail`，从未真的把
+  它们拼进传给 `log_kv_slot_attention` 的 `slot_k`/`slot_v`，`causal_
+  tail` 因此遮住的是 `get_attention_state()` 原始返回值里排在最后的
+  那几个槽，不是真正的尾部 token。** `causal_tail` 的既有语义（§5.14）
+  是"调用方传入的张量最后 `causal_tail` 个位置就是 in-flight chunk"，
+  它不负责拼接，只负责在调用方已经拼好的张量上加三角掩码——上一轮的
+  伪代码只做了后半件事，没做前半件事。
+  ② **P0：`get_attention_state()` 是否已经包含 recent window，上一轮
+  的注释（"# pooled 前缀"）说错了，叠上①就会双计。** 核对
+  `litgpt/log_kv_cache.py:1246-1336` 的现有实现确认：这个函数的返回值
+  本来就是"压缩 levels（老到新）+ recent window（原始顺序，`w=1`
+  精确槽）"拼接后的完整状态，recent window 已经在里面，不是只有 pooled
+  部分。若真按上一轮的写法再手工拼一份 `k_tail_roped`/`v_tail` 上去，
+  尾部 `tail_query_count` 个 token 会在最终 attend 到的集合里出现两次。
+  **两个坑合起来看，正确修法反而比上一版更简单**：只要
+  `recent_count ≥ tail_query_count`（见③）这个前提成立，尾部窗口本来
+  就是 recent window 末尾的那部分，`get_attention_state()` 原样返回的
+  `slot_k`/`slot_v` 最后 `tail_query_count` 个位置恰好已经是它们——不
+  需要任何手工重建或拼接，直接把原始返回值传给 `causal_tail=tail_
+  query_count` 即可；之前的压缩 levels 和 recent window 里更早的部分
+  保持无条件可见对它们同样正确（位置严格早于尾部窗口里任意一个
+  query），不需要区分"是压缩 level 还是较早的 recent token"。
+  ③ **P1：`since_last_flush` 不是 cache 实际维护的状态，且定义上比
+  真正需要的条件更严格，会把合法样本误判成硬失败。** cache 唯一持久
+  维护的滑窗状态是 `recent_count`（核对同一处代码确认是真实字段），
+  真正需要的前提是"尾部窗口此刻是否完整位于 recent window 内"，精确
+  写作 `recent_count ≥ tail_query_count`，不是"距上次 flush 多少步"。
+  ④ **P1：`M_s` 在 3b 调用里被传了，但 `log_kv_slot_attention` 正式
+  签名列表里没有它。** 补进签名，shape/作用域和 `slot_valid` 完全对齐
+  （`(B,G,S_pooled)`，只覆盖压缩 levels 前缀）——exact 后缀（recent
+  window + causal_tail 覆盖的 in-flight chunk）每一槽都是单个真实
+  token，隐式 `w=1,M=1`，`log(1/1)=0`，函数内部按此处理，不需要调用方
+  为这段额外构造 `M_s`。
+  ⑤ **P2：`tail_query_count` 说"默认借用 `flush_granularity` 的量级"，
+  但没说清是不是运行时直接读 `flush_granularity`。** 钉死为"取
+  `flush_granularity` 的数值做初始化，但保存成独立字段"——改
+  `flush_granularity` 不会连带改变已经跑过的实验用的
+  `tail_query_count`，复现实验只需要记录 `tail_query_count` 本身。
+  ⑥ **P2：`best_orientation_jaccard` 直接比较两种方向的总分，没考虑到
+  单个 Jaccard 估计本身有 ≈0.5/√k 的标准误差，总分接近时 `orientation_
+  flipped` 可能只是抽样噪声。** 新增 `orientation_margin`（两种方向
+  总分之差）和 `orientation_ambiguous`（margin 小于约 `2/√k` 时为真，
+  四个独立估计项方差可加推出的阈值）；`ambiguous=True` 时不该把
+  `orientation_flipped` 当可信信号去归因，`side_1/2_jaccard` 仍是当前
+  最优的点估计，不受这条标记影响。
+
+- **2026-08-19｜第十八轮核实：修 S0.8 3b 的一处 P0（多 query 尾部窗口
+  破坏因果性，`<5%` 决策门测的是一个混入未来信息泄漏的误差）与五处
+  实现坑——Ward 事件 keep/free 方向不跨路径稳定、`scan_op_log_for_
+  ward_events` 没真正校验 WARD_MERGE 紧邻 NEW_CLUSTER、该函数的防御式
+  `.get(..., 默认值)` 会把缺失状态伪装成合法空事件、MinHash 规格写成
+  "bottom-k" 但伪代码是另一种不兼容的变体且哈希函数未钉死到可复现的
+  程度、3b 压缩侧读出缺一段生产等价伪代码。** 动机：用户对上一轮
+  （第十七轮）刚修完的 S0.8 3b/Ward 事件机制再核一遍，指出这次的 P0
+  比之前任何一轮都危险——"结论会好看但不可信"这类 bug 最难在事后发现。
+  逐条结论：
+  ① **P0：`tail_query_count > 1` 时"尾部 query 因果地有权看到整个
+  cache"这句话是错的，只对最后一个位置成立。** 上一轮引入
+  `tail_query_count` 是为了解决"5% 决策门绑定 block_size"这个问题，
+  但顺带默认了"尾部窗口里所有 query 都能看最终 cache"，没意识到这本身
+  就是新的因果性漏洞：窗口里除最后一个位置外，其余位置在真实 serving
+  下只该看到"刚摄入那个 token 时"的 cache，而"两条路径处理完整条序列
+  后的最终 cache"已经吸收了它们各自位置之后全部 token 的压缩贡献。算出
+  的 3b 误差会把"批量近似 vs 严格串行的真实分歧"和"读到了未来 token"
+  两种效应叠在一起，看起来达标但不能说明近似值得信任。**没有选择"退回
+  `tail_query_count=1`"或"逐 query 位置重新构造 cache"这两条路**——前者
+  放弃了多 query 平均带来的样本量、后者代价太大（重建 `tail_query_count`
+  份完整 cache 状态）。**修法**：`algorithm-spec.md` §5.14"虚拟槽展开
+  必须扣上 `causal_tail`/`mask` API"一节的 `causal_tail` 机制本来就是
+  "最后 `causal_tail` 个 slot 是逐 token 对齐的 in-flight 精确 chunk、
+  彼此三角因果互相掩蔽，之前的 pooled slot 无条件可见"——这正是 3b 需要
+  的东西，前提是 pooled 区域确实不含比这批 query 里最早位置更新的内容。
+  于是把 `[T−tail_query_count, T)` 这批原始 token 自己的 `k_raw`/`v`
+  当 in-flight chunk、直接调用生产函数 `log_kv_slot_attention(...,
+  causal_tail=tail_query_count)`，不新写任何因果逻辑。**前提必须显式
+  校验**：两条路径分别断言"自上次 flush 以来已摄入的 token 数
+  （`since_last_flush`）≥ `tail_query_count`"，不满足硬失败（换更小的
+  `tail_query_count`，不做静默截断），同 §5.21-2"预分配+硬失败"原则。
+  默认参数（`tail_query_count≤flush_granularity`、`recent_size=1024`）
+  下这条断言天然满足。稠密侧（mechanism B 的 ground truth）不受影响
+  ——它的 `causal_mask(scores)` 从第一版起就是逐 query 位置精确因果的，
+  继续走 `block_size` 分块循环 + `tail_mask`；压缩侧改成独立的一次
+  `causal_tail` 调用，不再纳入 `block_size` 分块。
+  ② **P1：Ward 事件的 `keep`/`free` 不是跨路径稳定的有序对。** "keep"/
+  "free" 是"哪个物理槽被保留/释放"这个实现细节的产物，两条路径即使
+  合并的是同一对语义簇，也可能选择相反的保留方向；直接按标签比较
+  `keep_A` vs `keep_B` 会把两个不同的簇错误地凑一起比较，产出虚假的
+  低 Jaccard，即便这次合并本身是强对齐（`trigger_token_idx` 相等）。
+  **修法**：新增 `best_orientation_jaccard`，两种配对方向（不交换/
+  交换）都试一遍，取总相似度更高的一种，返回 `side_1_jaccard`/
+  `side_2_jaccard`（不再叫 keep/free——它们不是跨路径可比的固定标签）
+  和 `orientation_flipped`（是否选中了交换方向，本身也是一个诊断信号，
+  单独报告不藏进相似度里）。`keep_size_before`/`free_size_before` 不
+  受影响，size 本身与方向无关，仍可直接比较。
+  ③ **P1：`scan_op_log_for_ward_events` 没真正钉死"WARD_MERGE 紧邻
+  NEW_CLUSTER"这条顺序契约。** docstring 这么写，但循环只在遇到
+  `NEW_CLUSTER` 时才检查并消费 `pending`，中间如果插了一条 `JOIN`/
+  `NEW_SEGMENT`/`PAD_INSERT`/`CARRY`，会被无声跳过，不产生任何信号——
+  契约实际上从未被真正校验，只是恰好在正确输入下表现得像成立。若这份
+  契约在别处被打破，函数会把 `trigger_token_idx` 错配给一个不相关的
+  `NEW_CLUSTER`，产出的 `WardEvent` 看起来完全合法，实际已经污染。
+  **修法**：循环体最前面新增 `if pending is not None: assert op.type
+  == NEW_CLUSTER`，违反顺序契约的那一刻现场报错。
+  ④ **P1：`.get(ident, EMPTY_SKETCH)`/`.get(ident, 0)` 把"缺失状态"
+  伪装成"合法的空集合"。** 引用一个从未见过的身份本该是调用方 bug
+  （忘了传 `initial_sketches`/`initial_sizes`，或 `op_log` 切片不
+  合法），但防御式默认值会让它产出一个 size=0 的"合法"事件，诊断数字
+  被悄悄污染却没有任何报错。**修法**：新增 `_require` helper，所有
+  `sketches`/`sizes` 读取改成严格查找；额外在构造 `WardEvent` 前断言
+  `keep_size_before>0 and free_size_before>0`（抓的是"身份已知但计数
+  被错误清零"这另一类失效模式，不能被 `_require` 顺带盖住）。
+  `EMPTY_SKETCH` 不再当默认值用，只保留它作为 min 幺元的数学定义。
+  ⑤ **P2：MinHash 规格名不副实，且哈希函数没钉死到可复现的程度。**
+  "MinHash（bottom-k）"这个名字对不上伪代码——bottom-k 是单个哈希函数
+  取全局最小的 k 个值（无序子集），估计量和合并规则都和"k 个独立哈希
+  函数各自取 min"（伪代码实际实现的、Broder 1997 的经典方案）不同，
+  写成 bottom-k 会诱导实现者去套错的估计公式。**修法**：改称"k-hashes
+  MinHash"。同时，`minhash_of_token` 此前当成像 `apply_rope` 一样的
+  "不用规定内部细节"的原语——但 `apply_rope` 是唯一确定的数学操作，
+  任何正确实现都逐位一致；"一个哈希函数"不是唯一确定的，两次 dump 用
+  不同哈希实现会让草图不可比而没有任何报错信号。改用具体钉死的
+  [SplitMix64](https://prng.di.unimi.it/splitmix64.c)（Vigna，Java
+  `SplittableRandom` 的种子扩展器），全部按 `uint64` 回绕语义（Python
+  端必须显式 `&0xFFFFFFFFFFFFFFFF` 或用 `numpy.uint64`，不能用裸
+  `int`），`k` 个子种子从单个 `master_seed` 迭代 SplitMix64 派生。
+  eval metadata 需要记录的从"只有 `k`"改成"`k` + `hash_algorithm`
+  版本号（`"splitmix64-v1"`）+ `master_seed`"，三者共同决定草图可
+  不可比。
+  ⑥ **P2：3b 压缩侧读出缺一段生产等价伪代码，容易被实现成 dense
+  `k_expanded` 那套路径。** 和①的修法是同一个改动顺带解决的——直接
+  调用生产函数 `log_kv_slot_attention`/`get_attention_state()` 本身
+  （而不是照抄一份平行实现），GQA 折叠、`slot_valid`、`M_s`、
+  `λ log(w/M)`、fp32 分数缓冲这些细节全部自动保持一致，不需要在 3b
+  这里重新枚举、也不会因为文档和代码各自演化而漂移。**顺带修正了
+  起草这段伪代码时自己引入的一个新错误**：第一版把 `slot_w` 手工除以
+  `M_s` 再传给 `log_kv_slot_attention`，但 `algorithm-spec.md` 表 B
+  "mass bias 改用 `λ·log(w_s/M_s)`"和 §5.14 明确这是函数内部算的
+  ——`M_s` 应该和 `slot_valid` 一样作为独立参数传入（只覆盖 pooled
+  前缀），不能由调用方预先做除法，否则会重复应用或应用到错误的地方；
+  已改成 `slot_w` 原样传、`M_s` 单独作为关键字参数传入。
+
+- **2026-08-19｜第十七轮核实：修 S0.1/S0.8 六处测试与实现规格的坑——
+  alive-but-untouched 槽的元数据基线被错误写成 0、Ward 事件成员快照有
+  O(T²) 内存/时间风险、S0.8 3b 的决策门隐式绑定了机制 B 的性能参数、
+  `tok0`"不受路由近似影响"的说法过强、`WardEvent.trigger_token_idx`
+  类型标注与 pending 用法矛盾、`resolve_final_slots` 的返回值口径表述
+  前后不一致。** 动机：用户逐条指出这六处都是"文字上看似定了，真去实现
+  测试/工具时会踩坑"的问题，集中在 `algorithm-spec.md` 的 S0.1（Phase
+  3a/3b 元数据正确性单测）、S0.8 Ward 事件比较两节，以及 `experiments.md`
+  对应的消费侧描述。逐条结论：
+  ① **P0：S0.1 元数据对拍测试的前提是错的。** 文档说
+  `centroid`/`n_eff` 在"从未被这批任何 token 触碰过的槽"上精确是 0，
+  且明确包含"`alive=True` 但本批没有主操作命中"这一类——不成立：一个
+  在更早批次建立、此后一直存活的簇，本批未被命中时该保留**进入本批之前
+  的旧值**（一般非零），不是白纸 0。根子在参考实现的描述上——它按物理
+  顺序重放"本批本地缓冲"这一件事本身没错，但从未交代 scratch 起点该
+  从哪里来；如果测试只构造孤立单批、隐式让 scratch 全局起点为空，这套
+  参考实现结构性地只能覆盖"整条序列的第一批"，长序列下最常见的"alive
+  但本批未被命中"或"本批 JOIN 进更早批次建立的簇"反而测不到。**修法**：
+  参考实现与生产路径对拍都必须接受一个显式 `initial_scratch` 种子（进入
+  本批之前的完整状态，可以全零代表冷启动，也可以非零代表"已经跑过若干
+  批"）；dead/未被触碰槽"不需要单独摘除"这条结论保留，但理由从"两边都是
+  0"改成"两边都源自同一份 `initial_scratch` clone"（对死槽恰好是 0，
+  对 alive-but-untouched 槽是真实旧值，两条路径下都相等）；新增第 (iii)
+  条必测场景：两个连续批次，第一批建立某簇并积累非零内容，第二批完全不
+  引用它，断言处理完第二批后该簇的五个字段精确/容差内等于第一批结束时
+  的值——单批次合成数据结构性地测不出这类 bug。
+  ② **P1：`WardEvent` 存完整 `frozenset[int]` 成员集合有 O(T²) 内存/
+  时间风险，规格没给有界方案。** `OP_max` 摊还论证已经证明过
+  `WARD_MERGE` 事件数最坏 O(T)，每个事件的 `keep`（往往是持续吸收新
+  成员的大簇）成员集合最坏也是 O(T)，32k 下用 Python `frozenset[int]`
+  估算能到数十 GB，会拖死 Stage 0。**修法**：把精确集合换成固定宽度
+  `k`（默认 128）的 MinHash（bottom-k）草图——MinHash 在集合并运算下
+  精确合成（`sketch(A∪B)=elementwise_min(...)`，不是近似的近似），
+  唯一误差来自用有限 `k` 估计 Jaccard 本身（标准误差上界 `0.5/√k`），
+  总内存 O(事件数×k)，与 `T` 无关。`WardEvent.keep_set_before`/
+  `free_set_before` 改名为 `keep_sketch_before`/`free_sketch_before`，
+  精确成员数单独用 O(1) 计数器维护（不经估计）；这一项在 S0.8 里本来就
+  是诊断信号而非决策门（决策门只挂 3b），能接受有界误差的估计。深挖某个
+  具体事件的精确成员仍然可行，用 `scan_op_log`/`resolve_final_slots`
+  重放到该事件为止即可，只是不再是默认路径。`k` 和它产出的 Jaccard 数字
+  必须一起写进 eval metadata。
+  ③ **P1：S0.8 3b 的硬性 5% 决策门绑定到机制 B 的 `block_size`，让一个
+  正确性阈值隐式依赖一个纯性能/分块参数。** 上一版直接用
+  `chunks(q_roped, block_size)` 的最后一块划定 3b 的尾部窗口，理由是
+  "不引入新参数"——但调 `block_size`（为了跑得更快或适配显存）会顺带
+  改变最后一块的 query 数量和位置集合，5% 判据可能因为纯粹的性能调参
+  改变结论，而 §7 消融表另有"query 位置：尾部/中部/前置"一行，两者一旦
+  混用会让 3b 的尾部专属结论被错误地当成对中部/前置也成立。**修法**：
+  拆出独立的 `tail_query_count` 参数（默认借用 `flush_granularity` 量级
+  但不派生自它，也不派生自 `block_size`），窗口按绝对位置
+  `[T−tail_query_count, T)` 定义，机制 B 原有分块循环不变，3b 的累积
+  只是在循环内加一个与块边界无关的掩码，可以跨块也可以只覆盖最后一块的
+  一部分。`block_size`/`tail_query_count` 必须一起写进 eval metadata；
+  §6 决策门段落与 §7 表格都补了交叉引用，明确 3b 的 <5% 结论只覆盖尾部
+  query，不能承担中部/前置的结论，也不被后者借用。
+  ④ **P1：`tok0`/`trigger_token_idx`"不受路由近似影响、两条路径天然
+  可比"的说法过强，且与同一份文档几行之后的让步自相矛盾。**
+  `algorithm-spec.md` 原文一边说"批量路径和严格串行参考在这一点上天然
+  一致"，一边紧接着承认"若两条路径路由近似分出不同 orphan 分组，各自
+  的 tok0 依然是各自路径下良定义的量"——后半句已经在说两者可能不同。
+  **修法**：改成准确的 path-local 契约——`trigger_token_idx` 在单条
+  路径内部良定义、不依赖实现细节；但两条路径的路由决策本身可以分歧
+  （Phase 1 冻结 centroid 快照 vs 严格串行逐 token 重算），导致同一次
+  语义合并在两条路径下产出不同的 `tok0`。这不是需要修补的 bug，是
+  `experiments.md` 已经准备好的处理路径——值相同代表强对齐，只在一条
+  路径出现就计入 `ward_event_inserted`/`ward_event_deleted`，不强行
+  配对。`algorithm-spec.md`、`experiments.md` 两处对应措辞同步改正。
+  ⑤ **P2：`WardEvent.trigger_token_idx` 标注成 `int`，但 pending 事件
+  创建时赋值 `None`，类型标注与实际用法矛盾。** 改成 `int | None`，并在
+  字段注释里钉死更强的不变量：只有仍在函数内部传递、未被下一条
+  `NEW_CLUSTER` 消费的 pending 事件才可能是 `None`——顺序契约保证任何
+  真正 append 进函数**返回的** `ward_events` 列表的 `WardEvent`，这个
+  字段恒为 `int`（append 只发生在 `pending._replace(trigger_token_idx=
+  ...)` 之后）。不拆成 `PendingWardEvent`/`WardEvent` 两个类型，保留
+  现有 `_replace` 惯用法，改动面更小。
+  ⑥ **P2：`resolve_final_slots` 的调用方描述说"得到每个 token 最终的
+  `(slot, epoch)` 身份"，但函数实际返回 `dict[int, int]`，只保留物理
+  槽号，丢弃 epoch。** 核实后确认这不是代码的 bug——在 `resolve_final_
+  slots` 被调用的那一刻（扫完全部关心的段之后），同一个物理槽号不可能
+  同时有两个不同 epoch 的身份还是并查集的根（任何复用槽号的
+  `NEW_CLUSTER` 必然紧邻在释放它的 `WARD_MERGE` 之后，旧 epoch 在新
+  epoch 出现前就已经不是根），所以只取 `find(v)[0]` 天然无损。**修法
+  是文本口径而非代码**：`algorithm-spec.md` 在函数定义处补上这条证明，
+  `experiments.md` 的调用方描述统一改成"最终物理槽号"，不再写
+  "`(slot, epoch)` 身份"，避免继续诱导实现者误用未解析的原始身份。
+
+- **2026-08-19｜第十六轮核实：修 `docs/position.md` §P8.4"弱学习：learned
+  anchor bias"公式漏掉的 `/M_s`，其余四点核对结论是"已在上一轮修过、还没
+  合并"。** 动机：用户对照远端仓库逐条复核，指出的前四点（co-assignment
+  标签、S0.8 3b 统计口径、`scan_op_log_for_ward_events` 的 `pending` 状态、
+  Phase 3a 残留的"逐位对拍"措辞+`atol`）和第十五轮已经修过的四处完全对应。
+  **核实结论：这四处在本分支（`claude/cool-fermi-vjbb7n`，含第十五轮的
+  commit）里都已经是修过的状态**——逐条对照当前文件内容确认：
+  `experiments.md` 的 co-assignment 标签已钉死"必须是 `resolve_final_
+  slots` 解析后的最终槽号"；S0.8 3b 已经是"整条序列处理完后的单次测量"
+  加精确定义的尾部 query block；`scan_op_log_for_ward_events` 已经有
+  `initial_pending` 参数和对应的返回值；Phase 3a 的"正确性验证复用已有的
+  测试"一段已经改成"按该条给出的比较口径"，容差公式也已经带 `atol`。
+  用户看到的旧状态是因为**上一轮（第十五轮）的 commit 还停留在未合并的
+  PR 上**，`semanticLogKV` 分支当时还是第十四轮的状态——不是回归，是
+  评审快照落后于分支。这四点本轮不再重复修改，只在这里记一笔核对结论，
+  留给下次合并后自然对齐。
+  **第五点是新问题，已修**：`docs/position.md` §P8.4"弱学习：learned
+  anchor bias"的公式写的是 `score_{s,a} = q·R(p_a)k_s + λ log(w_s) +
+  b_a(entry_stats)`——`log(w_s)` 漏了 `/M_s`，和同一份文件 §P5.2 刚证明
+  过的"这不是调参项、是正确性修正"直接矛盾：一个 entry 展开成 `M_s` 个
+  anchor 时若每个都用未除过 `M_s` 的 `log(w_s)`，softmax 总质量会被静默
+  放大约 `M_s` 倍，多 anchor 的 entry（大跨度 entry）会系统性占到不该有
+  的额外注意力质量。**修法**：改成 `λ log(w_s/M_s) + b_a(entry_stats)`，
+  并补一句说明 `b_a` 和 `/M_s` 是两件独立的事——`b_a` 是在已经修正过的
+  mass bias 之上**额外**学到的 logit 偏置，不能也不该被指望去替代
+  `/M_s` 这个归一化（`b_a` 只吃单个 entry 自己的 `entry_stats`，不知道
+  其它 anchor 的存在，没有信息量学出一个跨 anchor 的归一化项）。扫了一遍
+  `position.md` 其余 `log(w...)` 出现的地方，其它全部已经正确带 `/M`
+  （包括两处特意写错误形式 `log(w)`/`log(w_s)` 来举反例的地方，不是
+  同类 bug，不需要改）。
+
+- **2026-08-19｜第十五轮核实：把 pairwise co-assignment 的标签钉死为
+  `resolve_final_slots` 解析后的最终身份（不能用原始 `(slot,epoch)`）、
+  拍死 S0.8 3b 是"整条序列处理完后的单次测量"并精确定义尾部 query block、
+  把 `scan_op_log_for_ward_events` 的 `pending` 状态纳入可分段传递的
+  参数/返回值、清掉 Phase 3a 段落里残留的"逐位对拍"旧措辞、并给浮点容差
+  补上 `atol` 和 dead slot 的处理方式。** 动机：用户逐条核实上一轮的五处
+  修复，指出三处 P1、两处 P2——都是细节但都会让实现在具体数值/边界情形上
+  出错。逐条结论：
+  ① **P1：co-assignment 的标签说"`(slot,epoch)` 或 `resolve_final_slots`
+  给出的槽号都可以"，这句话会诱导实现者直接用原始 `(slot,epoch)`，
+  产出错误结果。** `scan_op_log` 返回的 `token_identity` 是"记录时"的
+  `(slot,epoch)`，Ward 合并发生在**之后**——同一个最终簇完全可能由多个
+  不同的记录时 `(slot,epoch)` 合并而成。直接拿未解析的 `(slot,epoch)`
+  当标签，会把语义上已经属于同一个最终簇的 token 错误拆成多个标签，
+  人为压低一致率，哪怕两条路径的最终聚类结构完全等价。**修法**：钉死
+  必须先经 `resolve_final_slots` 解析到最终身份才能用作标签，标签解析
+  后再怎么编号不影响结果，但解析这一步不能省。
+  ② **P1：S0.8 3b 的统计对象前后不一致**——3b 的主定义说"这批处理完之后
+  立即"做一次读出（读起来像逐 flush 批重复测量），但补充说明里又说
+  "只用序列尾部的 query block"（意味着只在整条序列处理完之后测一次）。
+  两者是不同的指标，5% 门槛挂在哪个上不可复现。**决定：3b 是针对整条
+  序列处理完毕后那个最终 cache 状态的单次测量**，不是逐批重复；同时把
+  "尾部 query block"精确定义为机制 B 按 `chunks(q_roped, block_size)`
+  分块处理时产生的**最后一个** `query_block`——不额外引入新的"tail block
+  大小"参数，直接复用机制 B 已有的 `block_size`，这是唯一同时满足"因果地
+  看到完整最终 cache"和"不需要新参数"的选择。同步修掉这处改动引入的一个
+  markdown 嵌套加粗渲染 bug（`**A**B**C**` 这种写法在 markdown 里不是
+  "整体加粗、中间再嵌套强调"，而是交替 toggle，会把想强调的词渲染成不
+  加粗、反而把周围文字加粗）。
+  ③ **P1：`scan_op_log_for_ward_events` 声称可以像 `scan_op_log` 一样
+  分段串联调用，但 `pending`（记录"刚追加、还没等到 trigger_token_idx
+  的 WardEvent"）是函数内部的局部变量，不是可传递的状态。** 如果调用方
+  按任意边界切片 `op_log`（`scan_op_log` 自己的 docstring 明确允许"任意
+  切片"），切片边界完全可能落在某个 `WARD_MERGE` 和它服务的 `NEW_CLUSTER`
+  之间——`pending` 若不能跨调用传递，这条事件会在函数返回时直接丢失，且
+  没有任何信号提示调用方。**修法**：把 `pending` 做成第五个可选种子
+  参数，返回值里也带上它，和 `epoch`/`parent`/`members` 走同一套"调用方
+  负责在段之间原样传递"的纪律；这里没有类似 `resolve_final_slots` 的
+  额外 finalize 步骤（`WardEvent` 一旦 append 就是最终结果，不会过期），
+  调用方唯一要做的是**扫完最后一段之后显式断言 `pending is None`**——
+  不为 `None` 说明切片/拼接逻辑本身有 bug（漏段、段序错），不是函数的
+  正常行为。补了对应的"典型用法"示例代码。
+  ④ **P2：Phase 3a"正确性验证复用已有的测试"一段仍写着"逐位对拍"**，
+  和后面已经拆开的"整数字段逐位精确、浮点字段容差内"比较口径不一致，
+  容易让读者以为这是两套不同的要求。改成显式指向"按 §5.4 第 3 条给出的
+  比较口径"，不再重复"逐位"这个可能过时的措辞。
+  ⑤ **P2：浮点容差只给了 `rtol=1e-4`，没有 `atol`，且没说 dead/未触碰的
+  槽算不算数。** 纯相对误差公式在参考值为 0 处除零/未定义，而 `n_eff`/
+  `centroid` 在从未被这批任何 token 触碰过的槽上恰好精确是 0（不论
+  `alive` 是否为 `True`）。**修法**：改用标准的"绝对+相对"组合公式
+  （`|a−b| ≤ atol + rtol·|b|`，比如 `torch.testing.assert_close(rtol=
+  1e-4, atol=1e-5)`），并明确 dead/未触碰的槽**不需要**从比较范围里
+  单独摘除——两边都精确是 0（由 `reset_parameters()` 的显式 `zeros(...)`
+  保证），`|0−0| ≤ atol` 对任意正 `atol` 恒成立，天然通过，不会产生噪声。
+
+- **2026-08-19｜第十四轮核实：给 S0.8 3b 的 query 来源补一个明确决定（复用
+  机制 B 的现场 query 循环，不落盘）、新增 `scan_op_log_for_ward_events`
+  给 Ward 事件比较提供合并前成员快照、把 Phase 3a/3b 元数据对拍的"逐位
+  一致"拆成整数字段精确/浮点字段容差、把成对共簇一致率从 O(T²) 全对枚举
+  改写成 O(T+K²) 的列联表算法、并钉死仿射 scan 的累加器必须是 fp32。**
+  动机：用户逐条核实上一轮的四处修复，指出四处 P1、一处 P2——都是"实验/
+  调试接口和数值测试口径"这类会让实现卡在"指标算不出来"或"正确代码过不了
+  逐位测试"的缺口，不是新的 P0。逐条结论：
+  ① **P1：S0.8 的 3b（attention 读出 L2 误差）需要 query，但 Stage 0 dump
+  规格明确 `q_roped` 不整块落盘（"分块用完即弃"）。** 两处独立写的规格互相
+  矛盾：3b 要"同一批 query 跑 attention"，dump 表却不给这批 query 留后路。
+  **决定：S0.8 本来就不是纯粹"对 Stage 0 静态 dump 事后做 CPU 分析"**——
+  它已经需要先用 `k_raw`/`v`/`pos`（不需要 q）跑两条路由/cache 构造路径
+  （批量近似 + 严格串行参考，可以离线 CPU 做，复用 S0.1 同款参考实现）；
+  3b 真正要 q 的地方只有"用这两份 cache 状态各做一次 readout"，这一步
+  **复用机制 B 已有的、按 query block 处理、用完即弃的循环**——在机制 B
+  本来就要为 `attn_mass_by_dist` 算一次 `q_roped @ k_expanded.mT` 的
+  同一个循环、同一个 block 上，额外用两份 cache 状态各算一次读出、累积
+  L2 误差的分子分母，算完这块就跟着 `q_roped` 一起丢弃，q 全程不落盘。
+  为保证因果性，3b 只用序列**尾部**的 query block（此时两条路径的最终
+  cache 都已构造完毕，尾部 query 因果地有权看到整个 cache）。**不选**
+  "额外持久化一份 q_roped 供事后用"——会给"Stage 0 只落盘 k/v/直方图"
+  开一个例外，且抽样 query 能不能代表真实误差是一个新的未验证假设。
+  `experiments.md` §6 的 dump 表 `q_roped` 行、S0.8 3b 定义处分别补上
+  这条决定和交叉引用。
+  ② **P1：Ward 事件 Jaccard 说"scan 到这一步即可得到合并前 token 集合"，
+  但 `scan_op_log` 的接口拿不到这个快照。** 核实后确认这不是文字表述
+  问题——`scan_op_log` 的 `WARD_MERGE` 分支只做 `parent[find(free_v)] =
+  find(keep_v)`，从不维护"某身份此刻实际持有哪些 token"这个反向索引，
+  结构性拿不出 `keep_set_before`/`free_set_before`。**不改 `scan_op_log`
+  本身**（它已被 `resolve_final_slots`、S0.1 依赖，足够简单可信正是因为
+  只维护最小状态）：新增专供 S0.8 用的姊妹函数 `scan_op_log_for_ward_events`
+  ——在 union-find 基础上额外维护 `members: 身份 -> token_idx 集合`，每遇
+  `WARD_MERGE` 就在合并生效前把 `keep`/`free` 双方当前的 members 集合
+  快照进一条 `WardEvent(trigger_token_idx, keep_identity, free_identity,
+  keep_set_before, free_set_before)`。`trigger_token_idx` 不需要额外
+  状态去猜——按已有的顺序契约（结构操作紧邻它服务的主操作），`WARD_MERGE`
+  后紧跟的下一条 op 必然是它服务的 `NEW_CLUSTER`，用一个 pending 指针
+  记住"刚追加、还没等到 trigger 的事件"，下一次遇到 `NEW_CLUSTER` 直接
+  补上，不需要向前看。同时把"触发这次合并的 orphan 的绝对 token 位置"
+  精确定义为 `tok0`（§5.4 Phase 2 早就命名过的量：orphan 组里到达顺序
+  最早的那个 token），不是新概念，两条路径对同一份输入天然能算出可比的
+  `tok0`。`experiments.md` §6 的 Ward 事件比较一节同步改成直接调用这个
+  新函数，不再重复描述"scan 到这一步"这种含糊做法。
+  ③ **P1：Phase 3a/3b metadata 要求"逐位一致"不现实，除非参考实现复刻
+  同一棵 scan。** Phase 3a 的生产路径用仿射 scan（并行组合律重排运算
+  顺序），S0.1 的参考实现用 §5.5 原始递推逐条顺序执行——两者数学上算的
+  是同一个量，但浮点加法/乘法不满足结合律，fp32 下最后几位完全可能不同，
+  这是任何"并行 scan vs 顺序循环"比较的标准情形，不是 bug。**决定**：
+  按字段类型拆开比较口径——`n_total`/`p_hi_c`/`current_segment`（纯
+  整数字段，过程不出现浮点运算）继续要求逐位精确；`centroid`/`n_eff`
+  （fp32）改用数值容差（建议 `rtol=1e-4`，远大于 `flush_granularity≤128`
+  下 `⌈log₂128⌉=7` 轮扫描能积累的舍入误差，但足够收紧到能抓真正的逻辑
+  bug）。**不选"参考实现也按同样的 Hillis-Steele 轮次跑"**——那样两个
+  实现会变成同一段扫描逻辑的两份拷贝，一份的 bug 会在另一份里被逐位
+  复现，参考实现"独立交叉验证"这件事名存实亡，比不设容差更糟。
+  ④ **P2：pairwise co-assignment 若按"所有 token 对"字面实现是 `O(T²)`**
+  ——32k 单层单头就是 `C(32768,2)≈5.4×10⁸` 对，乘上层数和 KV group 数会
+  直接拖垮 Stage 0。**修法**：写成标准的 contingency-table 算法——把两条
+  路径的最终身份映射成整数标签，建 `K_A×K_B` 列联表 `n_{ab}`（一次分组
+  统计，`O(T)`），用标准 Rand Index 恒等式
+  `agree_pairs = C(T,2) − Σ_i C(a_i,2) − Σ_j C(b_j,2) + 2·Σ_{ab} C(n_{ab},2)`
+  算一致 pair 数（`O(T+K_A·K_B)`，`sklearn.rand_score` 用的就是这个
+  恒等式，不是新推导），32k 下也是毫秒级；同时明确排除 self-pair、
+  分母用 `T(T-1)/2`。
+  ⑤ **P2：Phase 3a 仿射 scan 的 dtype 没有钉死**——`k_raw` 以 fp16/bf16
+  存储/传递，但 `centroid`/`n_eff` buffer 是 fp32，若实现者顺手让
+  `S_t = k_t` 沿用 `k_t` 自己的低精度 dtype（最容易踩的默认写法：逐元素
+  运算"跟着输入 dtype 走"），累加器会被低精度污染。**这比一次性 fp16
+  计算更危险**：`centroid` 是跨整条序列在线更新的量，每个 flush 批都要
+  混合一次，量化噪声会跨批次反复注入、累积，不是单次可忽略的舍入。
+  **决定**：`(A, Bn, S)` 全程 fp32，`S_t = k_t.float()` 显式转型，最终
+  写回 `centroid`/`n_eff` buffer 时两者 dtype 已经一致，不需要额外转换。
+
+- **2026-08-19｜第十三轮核实：把 Phase 3a 仿射 scan 的 `γ` 定义域从 `(0,1]`
+  改成 `[0,1]` 并说明 `γ=0` 时公式仍精确成立、把 S0.8 的 Ward 事件比较从
+  "逐一比较候选对"细化成可执行的对齐算法、把最终 cache/readout 差异拆成
+  "只在 token 集合完全相同的簇上比较字段"（诊断）和"attention 读出 L2
+  误差"（唯一决策门）两个子项、并把本地缓冲"约 8KB"的内存账目标注清楚是
+  per-(batch,KV group) 而不是整层。** 动机：用户对照已合并的 PR #19（HEAD
+  `e231662`）逐条核实上一轮的四处修复，指出三处 P1、一处 P2——都属于"公式
+  本身没错，但定义域/对齐算法/统计口径还留了缺口"。逐条结论：
+  ① **P1：Phase 3a 仿射 scan 写的 `d[t]∈(0,1]`、"`A` 只会变小不会为 0"，
+  和 §5.5 明确支持 `γ=0`（"归零"分支）矛盾。** 核实后确认这不是公式本身
+  的 bug——把 `γ=0` 代入仿射 scan 的合并公式（`A=A_后·A_先` 等）逐项验证，
+  在 `A=0` 处全部良定义：`n_eff_new`/`centroid_new` 精确退化成
+  `Bn_last`/`S_last/n_eff_new`，即"只看衰减之后的内容"，和 §5.5 的
+  "没有历史可混，直接替换"语义完全一致，不需要任何特判分支。**问题纯粹
+  出在文字表述**：三处写法（`d[t]∈(0,1]`、"`A`只会变小不会为0"、"`γ∈(0,1]`
+  时结果通常仍非零"）都隐含排除了 `γ=0`，容易诱使实现者写出
+  `assert A>0`、`log(A)`/`1/A` 之类只在 `γ>0` 时安全的"优化"，在 `γ=0`
+  处静默崩溃或算错。**修法**：定义域改成 `[0,1]`，三处都补充说明
+  `γ=0` 时 `A` 精确变成 `0` 是符合语义的正确结果，不是数值边界；同时
+  纠正了一处过度引申——`γ=0` 时单看 `n_eff` 确实退化成类似 `PAD_INSERT`
+  的固定重置，但 `centroid`（`μ`）不会，它依然需要真正累积段内成员的
+  内容而非只知道"过了几步"，所以"不能直接套用 steps_since"这条结论
+  对 `μ` 在任何 `γ` 下都成立，不能因为 `n_eff` 在 `γ=0` 这个特例上像
+  固定重置就反过来说"那就可以用 steps_since 了"。新增要求：
+  §5.4"必须补的单测"第 3 条的对拍数据必须覆盖 `γ=0` + 本批内同一簇连续
+  多次 `NEW_SEGMENT` 这个最容易让"`A` 恒为正"假设现形的场景。
+  ② **P1：S0.8 的 Ward 事件比较说"逐一比较候选对"，但没有给出可执行的
+  对齐算法。** 两条路径触发 Ward 合并的次数、触发时刻、候选对用的槽号/
+  `epoch` 都可能因为批量近似而不同（谁先把 `K_max` 填满这件事本身可能
+  发生在不同 token 上），"逐一比较"字面读容易被实现成按下标顺序两两
+  对齐，产出的差异其实是伪差异。**修法**：给出具体对齐算法——用触发
+  这次合并的 orphan 的**绝对 token 位置**（两条路径共有、不受路由近似
+  影响的锚点）做主键对齐两条路径的事件列表；候选对不用槽号表示，改用
+  合并前 `keep`/`free` 两个簇各自的**原始 token 绝对位置集合**表示
+  （`scan_op_log` 扫到那一步即可得到），触发位置对上的事件比较这两个
+  集合的 Jaccard 相似度；触发位置只在一条路径出现的事件不强行配对、
+  不平均掉，单独计为 `ward_event_inserted`/`ward_event_deleted`——"事件
+  没有对应物"和"配对上但决策不同"是两种不同的失效模式，混在一起会
+  互相掩盖。
+  ③ **P1：最终 cache/readout 差异的"对齐到同一组 token"缺具体算法，且
+  和第 1 项的成对一致率（只给标量，不给簇的一一映射）实际上对不上。**
+  聚类若发生真实分歧（不只是槽号错位），"这个槽对应那个槽"可能根本没有
+  良定义的答案（比如批量路径合并了两个簇、严格串行参考没合并，找不到
+  唯一对应的严格串行簇），此时逐字段比较 ladder 会产出没有意义的数字。
+  **修法：拆成 3a/3b 两个子项，决策门只挂在 3b。** 3a（诊断，不参与决策）
+  只在"两条路径的簇 token 集合完全相等"（不是重叠/相似）的子集上逐字段
+  比较，落不进这个精确匹配子集的 token 单独报告成 `unmatched_token_ratio`，
+  需要更细粒度诊断时可选用 Jaccard/匈牙利算法做软匹配但不进正式数字；
+  3b（决策依据，唯一硬性门槛，< 5%）直接比较两条路径最终 cache 状态给出
+  的 attention 读出相对 L2 误差——这一项不需要任何簇对齐，两条路径的簇
+  怎么编号、有没有一一对应完全不影响它是否良定义，是唯一在聚类真实分歧
+  时依然能给出干净数字的一项。`experiments.md` §6 的 S0.8 决策门措辞同步
+  从"第 3 项"改成"3b"。
+  ④ **P2：本地缓冲"约 8KB"的内存账漏了作用域，容易被读成整层或全局的
+  数字。** `local_op_cap=4×flush_granularity` 默认 512 行 int32，
+  `512×4×4B≈8KB` 说的是**单个 `(batch 元素, KV group)` 切片**的大小（和
+  §5.13 buffer 表"前两维都是 `(B,G)`"的约定一致，本地缓冲完整形状是
+  `(B,G,local_op_cap,4)`），不是整层、更不是整模型的数字。`B=1,G=8`
+  时一层约 `8KB×8≈64KB`，28 层约 **1.8MB**——仍然远小于持久 `op_log` 的
+  448MB，结论不变，但补上完整展开的数字，避免又把一笔小账错读成全局账。
+
+- **2026-08-19｜第十二轮核实：厘清 `record_op_log=False` 下本地 op 缓冲的
+  构建/持久化边界、把 Phase 2 的 orphan 判定钉死为"批内冻结、不随 Phase 3a
+  的 metadata 更新重判"、把 S0.1 的 Ward 场景参考实现从"只吃主操作"改成
+  "吃完整 op 序列"、并给出 Phase 3a 的 `n_eff`/`centroid` 向量化更新此前
+  缺失的仿射扫描推导。** 动机：用户对照 `algorithm-spec.md`（HEAD
+  `3aca2dc`）逐条核实，指出三处 P1、一处 P2——均属于"接口边界和实现公式
+  还没钉死"，不是大方向错误。逐条结论：
+  ① **P1：`record_op_log=False` 和"本地 op 缓冲"此前自相矛盾。** §5.4
+  通篇（Phase 1/2/3 的伪代码）假设本地缓冲无条件存在、由 Phase 3a/3b
+  消费去驱动 metadata 更新、Ward 合并候选选择、ladder 物理写入；但
+  §5.21 的 `record_op_log` 门控代码块把 `append_ops_to_local_buffer`
+  整体挂在 `if record_op_log` 之下，字面读会让推理路径的 Phase 3a 无 op
+  可读，路由机制直接失效。**决定：本地缓冲（含它驱动的全部路由、
+  metadata 更新、ladder 物理写入）在训练/推理两条路径上无条件构建和
+  消费，不受 `record_op_log` 影响；`record_op_log` 唯一门控的是这一批
+  处理完之后，要不要把已经写满的本地缓冲整体提交进跨批持久的
+  `op_log`（供 backward 重放）——这一步在推理路径上跳过，本地缓冲随即
+  被丢弃/被下一批复用，不留任何持久状态。** 本地缓冲自身很小
+  （`local_op_cap=4×flush_granularity`，默认 512 行 int32、约 8KB），
+  两条路径都构建它的开销可忽略，不会重新引入 448MB 那笔训练专属账目。
+  §5.4"本地缓冲 vs 持久 op_log"一节补一条更正框，§5.21 的门控伪代码从
+  "整体挂 if record_op_log"改成"路由/metadata/ladder 写入 unconditional，
+  只有『提交进持久 op_log』这一步挂 if record_op_log"。
+  ② **P1：Phase 3a 更新 metadata 后，Phase 2 是否重新判断 orphan 此前
+  未钉死。** Phase 1 用批前冻结的 centroid 算出 `c*[t]`/`s*[t]`，据此把
+  token 分成 direct/orphan；Phase 3a 随后更新 centroid；若 Phase 2 处理
+  orphan 时用更新后的 centroid 重新判断，可能让某个 orphan 相对新
+  centroid 已经 `≤λ_new`——但允许它转投一个本批 Phase 1 也在写的既有簇 X，
+  会把这条 `JOIN` 排到 X 在本地缓冲里全部 Phase 1 成员的物理顺序**之后**
+  （因为"Phase 1 整组先写、Phase 2 整组后写"），直接违反"同一逻辑簇的
+  主操作必须按真实到达顺序出现"这条契约，并击穿§5.4"为什么 Phase1 先于
+  Phase2 满足三条契约"那节证明依赖的前提。**决定：冻结。** `s*[t]`/
+  `c*[t]`/direct-orphan 划分只在 Phase 1 计算一次，Phase 3a 更新后的
+  metadata 只喂 Phase 2 的 Ward 代价计算和 Phase 3b 自己的在线更新，绝不
+  重新拿去判断某个 orphan 该不该转投现有簇——这是"Phase 1 冻结 centroid
+  是一个已知近似，S0.8 测"这条既有框架的直接延伸，不是新的近似类别。
+  §5.4 的 Phase 1/3a/2 伪代码块、"为什么满足三条契约"一节分别补一句
+  钉死这一点。
+  ③ **P1：S0.1 的 Ward 场景参考实现描述不完整，只喂"主操作序列"验证不了
+  它本该验证的东西。** 原文让参考实现"把本批最终本地缓冲里原样的主操作
+  序列喂给一个……逐簇顺序重算的参考实现"，但 `WARD_MERGE` 是结构操作、
+  不在"主操作"之列——参考实现看不到它，就既无法把被合并簇（`free_slot`）
+  批内收到的贡献并入 `keep_slot`（断言 (i) 需要），也无法在复用槽位建新
+  簇前清空旧内容（断言 (ii) 需要），而验证这两条正是这条测试存在的全部
+  意义。**修法**：参考实现改为按物理顺序走完整本地缓冲（主操作 +
+  `WARD_MERGE`，`PAD_INSERT`/`CARRY` 对 metadata 无影响可跳过），遇到
+  `WARD_MERGE(keep,free)` 时对自己的 scratch 状态套用和 `ward_merge_only`
+  步骤 1 完全相同的合并公式，再把 `free` 的 scratch 清零——不需要引入
+  `derive_final_cluster` 那套 `(slot,epoch)` 版本化身份，因为这是一次
+  真正按时间顺序执行的模拟（不是跳过时间顺序的离线并查集派生），"遇到
+  NEW_CLUSTER 就清零"天然处理了槽位复用。本质上是把 backward 重放循环
+  （§5.21-2）的 `append_to_ladder`/`ward_merge_only` 换成对 metadata 的
+  操作，同一个模式。
+  ④ **P2：Phase 3a 的 `n_eff`/`centroid` 向量化公式此前只说"复用
+  pad-count 的 segmented reset scan 技巧"，这个类比是错的，补上实际
+  推导。** `PAD_INSERT` 的重置落在一个固定值（mod 计数器精确回到 1），
+  "距离上一次重置几步"这个无状态相对量就够了；但 `n_eff` 的 `γ` 衰减是
+  把历史打折扣、不是清零（`n_eff_pre←γ·n_eff`），衰减后的值依然依赖
+  衰减前的完整历史，"steps_since"这类单层查询在这里不成立。**补上的
+  推导**：先识别出五个待更新字段里 `n_total`/`p_hi_c`/`current_segment`
+  其实是平凡的分组归约（不需要扫描，直接复用已有的 `rank`/`nsg_incl` 取
+  组内最后一个成员）；只有 `n_eff`/`centroid` 需要真正的扫描——把逐成员
+  递推看成仿射变换的复合（`x↦d[t]·x+常数项`，`d[t]=γ` 或 `1`），复合
+  满足结合律，可以用固定 `⌈log₂flush_granularity⌉` 轮的 Hillis-Steele
+  掩码扫描算出（三元组 `(A,Bn,S)` 及合并公式已给出），和 §5.21-3 的
+  `_binary_carry` 是同一类"结合律换并行"技巧，只是幺半群从二进制进位
+  换成仿射复合。**特别指出**：这个仿射复合不是现成库原语（不同于
+  `nsg_incl` 依赖的原生 segmented cumsum/max），需要手写扫描；也指出了
+  为什么不用负指数闭式解——病态批次会算出 `γ^{-128}` 量级的中间值，
+  逼近 fp32 溢出边界，扫描全程只做有界量的乘加，规避了这个风险。不需要
+  新增单测，§5.4 已有的 Phase 3a/3b 元数据对拍单测（③修完之后）天然
+  覆盖这条公式对不对。
+
+- **2026-08-19｜第十一轮核实：解决"Phase 3 批末运行"这个此前一直没被注意到的
+  P0——它和"Ward 合并不受限、op_log 永不改写"这两条上一轮才证明成立的设计
+  互相冲突；同时把训练期 `op_log` 显存账目精确到"per in-flight forward"、
+  把它的分配显式限定到训练路径、在入口文档补一条不容错过的"未实现"声明、
+  并把 S0.8 的分歧率从一个模糊标量拆成三条可执行指标。** 动机：用户对照最新
+  远端逐条核实，指出一处 P0、两处 P1、一处 P2、外加一条工作流建议。逐条结论：
+  ① **P0：Phase 3 若像此前写的那样"批末统一运行"，会和上一轮才证明成立的
+  两条设计互相冲突，导致 Ward 合并读到 stale metadata、token 内容被错误地
+  计入错误的簇。** 具体反例：Phase 1 把 direct token `tok0` 路由到既有簇 X、
+  写下 `JOIN(X, seg, tok0)`；Phase 2 处理某个 orphan 时 `K_max` 已满，Ward
+  代价矩阵选中 `(keep_slot=C, free_slot=X)`——X 恰好是本批刚被 Phase 1 触碰
+  过的簇（Ward 尺寸加权对"批内刚建立、暂时还小"的簇的偏好，上一轮已经用
+  几乎一样的场景证明过这不是边界情形）。若 Phase 3 严格等 Phase 1、Phase 2
+  都跑完才统一 walk 本批 ops、按裸 `op.cluster` 分组更新
+  `centroid`/`n_eff`/`n_total`/`p_hi_c`，`ward_merge_only(C,X)` 执行那一刻
+  X 的 metadata 仍是批前快照（不含 `tok0`），于是 `tok0` 对 X 的内容贡献在
+  合并这一步被丢弃；紧接着 X 被复用建立一个全新的簇，Phase 3 用裸槽号回头
+  处理 `JOIN(X,seg,tok0)` 时，又会把 `tok0` 错误地计入这个和它毫无关系的
+  新簇。**根因**：本节此前已经确立"Phase 1 整体（含 ladder 物理写入）必须
+  先于 Phase 2 完整跑完"这条原则，理由是 Ward 合并需要看到真实、最新的
+  ladder——但同一条逻辑对 metadata 同样成立，而"Phase 3 批末运行"这个设计
+  从未被拿去对照这条原则重新检查，是一个被漏掉的推论，不是一个新的独立
+  问题。**修法**：把"Phase 3"从"批末的第三个步骤"改成按内容来源拆开、各自
+  在能拆的最早时刻执行——**Phase 3a**（向量化，紧跟 Phase 1 完成之后、
+  Phase 2 开始之前）批量更新 Phase 1 产出的主操作对应的 metadata；**Phase
+  3b**（内联，逐 token）在 Phase 2 本就是串行的循环内部，每个 orphan 主操作
+  写入本地缓冲后立即更新它的 metadata，不再等批末。这样任何一次
+  `ward_merge_only` 执行时，它要读的两个槽的 metadata 都已经是本批目前
+  为止的真实值，"stale metadata"这类输入结构性不可能出现。这不是重新引入
+  上一轮刚推翻的"批内重定向"——`op_log` 依然纯追加、永不改写，改变的只是
+  "消费这些 op 去更新 metadata 的时机"，一个纯调度问题，不触及 op_log 顺序
+  契约本身。相应修正了：§5.4 的三阶段伪代码、"Phase 3 是唯一写入点"那段
+  论证里"Ward 总是先于 Phase 3"这句被证明是错的话、"Phase 3 的具体做法"
+  拆成 3a/3b 两段、"执行时机"的表述、`current_segment` buffer 的写入点
+  说明、`ward_merge_only` 步骤 1 里"和 Phase 3 不冲突"那句话补上它依赖的
+  调度前提、以及 S0.1 单测第 3 条补上必须覆盖这个反例场景（且要双向验证：
+  `keep_slot` 精确包含被合并簇的批内贡献、复用槽建立的新簇精确不包含）。
+  ② **P1：训练期 `op_log` 448MB 这个数字只对"任意时刻最多一个 in-flight
+  forward"成立，不是训练期的固定开销。** `ctx.save_for_backward` 只要
+  下一次 `forward()` 在这次 forward 对应的 `backward()` 跑完之前发生，两份
+  448MB 就会同时存活，峰值因此是`448MB × 同一时刻并存的 in-flight forward
+  数`。核对本仓库 `litgpt/pretrain.py:351-355` 后确认，梯度累积循环每个
+  microbatch 都立即调用 `fabric.backward()`（`no_backward_sync` 只跳过
+  DDP all-reduce，不推迟 backward 本身），只有 `optimizer.step()` 被推迟——
+  这条训练循环下 in-flight 数恒为 1，"448MB"是准确的。但"累积 loss、只在
+  最后统一调一次 `backward()`"（峰值 `microbatch 数 × 448MB`）和 pipeline
+  并行的 microbatch 调度（峰值 `pipeline depth × 448MB`）会让这个数字按
+  并发相乘，必须显式排除或预算，不能假设"训练期就是 448MB"对它们也成立；
+  activation checkpointing 不属于这两类（不推高 in-flight 数），但会让
+  `op_log` 多分配一次可被立即回收的 throwaway 448MB，是效率问题不是峰值
+  问题。`algorithm-spec.md` §5.21-2 新增专门一节写清楚这个换算规则和这三类
+  模式各自的结论，CLAUDE.md §4 的第三笔账同步更新措辞。
+  ③ **P1：推理是否分配 `op_log` 的规格不一致，必须把"不分配"从隐式默认行为
+  改成显式 gate。** CLAUDE.md 说 serving"不分配、不持有"，但 §5.13 的
+  buffer 表只说"每次 `forward()` 开头重新绑定"，没说是哪一个
+  `forward()`——`LogStructuredKVCache` 有两个独立入口（推理用的
+  `forward()`，训练用的 `LogKVStreamTrainingAttention.forward()`），字面
+  读容易让实现者把 448MB 的分配也带进推理路径。**修法**：两个入口共享的
+  路由/flush 逻辑显式接收 `record_op_log: bool`，训练侧传 `True`、推理侧传
+  `False`；不能靠 `torch.is_grad_enabled()` 判断，因为路由决策本身（DP-means
+  距离比较、`argmin`）在训练和推理下都恒定 `no_grad`（CLAUDE.md §10 死因
+  1），这个信号在两条路径上是一样的，真正的区分点（这次 forward 之后会不会
+  有对应的 backward）只有调用方知道，必须显式传。`algorithm-spec.md`
+  §5.21-2、§5.13 的 `op_log` 行、CLAUDE.md §4 三处同步补上这条 gate 的
+  说明。
+  ④ **P1（工作流问题，非规格漏洞）：入口文档没有一句话能让人在读到一半时
+  就确认"这一切都还没写成代码"。** 上一轮已经在 §0 写了"代码尚未开始写"，
+  但整篇文档充满可直接复制的 Python 伪代码、`raise ValueError(...)` 片段、
+  精确到字段名的 buffer 表，读者很容易在读了十几轮"这一轮修的""P0/P1"
+  之后，把"规格文本的逻辑漏洞被反复修正"误读成"代码在跑、bug 在修"。核对
+  `litgpt/`、`tests/` 确认零匹配 `log_kv_semantic_clusters`/`op_log`/
+  `current_segment` 等任何本设计的字段（`LogKVStreamTrainingAttention` 类名
+  确实存在，但那是语义簇设计之前、位置分桶时代的版本）。在 CLAUDE.md §0 和
+  `algorithm-spec.md` 顶部/§5.1 参数表前都补了不容错过的"未实现"声明，附
+  `grep` 自证命令，并明确"更正/这一轮修的"指的是规格文本自身的逻辑漏洞。
+  ⑤ **P2：S0.8"分歧率 < 5%"是一个未定义统计口径的单一标量，拆成三项**：
+  ①cluster assignment divergence（含 Ward 事件）——用已有的
+  `scan_op_log`/`resolve_final_slots` 解析出每个 token 的 `(slot,epoch)`
+  最终身份，因为槽号在两条路径下不保证对齐，改用成对共簇一致率
+  （pairwise co-assignment agreement）而不是直接比较槽号，Ward 事件的
+  合并候选对单独比较、不并进这个一致率里被平均掉；②segment/PAD
+  overhead——`segment_count_ratio`/`pad_entry_ratio`，预期方向确定
+  （`p_hi_c` 批内冻结只会让批量路径多开 segment，不会少开），报告"大多少"
+  而非"有没有偏差"；③最终 cache/readout 差异——两条路径的 ladder 在按
+  ①的身份对齐之后比较相对误差，或直接比较一次 attention 读出的相对 L2
+  误差，这是唯一直接回答"近似值不值得用"的一项，**决策门只挂在这一项**
+  （<5%）。①②是诊断信号，用于在③超标时决定修法：cluster assignment/Ward
+  事件分歧主导时收紧 Phase 1 近似（如缩小 flush 粒度）；segment/PAD
+  overhead 主导且①本身一致率高时按 §5.4"批量路由留下的一个未解决风险"
+  那节的方向，给 `p_hi_c` 加按簇分组的前缀扫描，而不是缩小 flush 粒度
+  （对这类分歧没有针对性，代价却是实打实的）；`γ` 更保守只在分歧确实由
+  centroid 冻结导致漂移过大时对症，不是对所有分歧类型都有效的旋钮。
+  `experiments.md` §6 的 S0.8 行与决策门、`algorithm-spec.md` §5.4 里
+  引用 S0.8 的地方同步更新。
+
+- **2026-08-14｜第十轮核实：解决"op_log 跨 Phase 顺序"这个此前一直没钉死的
+  根本问题——主操作改成显式携带 `token_idx`，不再靠隐式位置对应原始 token；
+  同时钉死 Ward 合并的物理执行顺序、拆开 `derive_final_cluster` 避免分段
+  结果过期、把 Phase 1 的向量化公式显式限定在 direct 子序列上、并把训练期
+  `op_log` 显存从"克隆导致翻倍"改成"重新分配、不翻倍"。** 动机：用户指出
+  两处 P0——本质都是"批量化路由（Phase 1 向量化 + Phase 2 串行）产生的
+  op_log，和 backward 重放/Phase 3 assumed 的东西不是同一个顺序"这一个更
+  根本问题的不同表现——外加三处 P1。这是目前为止改动面最大的一轮，因为
+  两处 P0 的修法（显式 `token_idx`）触及 op 格式、Phase 1/2 的全部伪代码、
+  重放循环、以及 `derive_final_cluster`。逐条结论：
+  ① **P0：`op_log` 的顺序契约自相矛盾**——§5.21-2 早就承认"op_log 的线性
+  顺序是逻辑顺序，不是 forward 真实物理顺序"，但 backward 重放的
+  `token_ptr` 是一个从 0 开始的隐式递增计数器，悄悄假设了"op_log 第 i 条
+  就对应原始第 i 个 token"。具体反例：批次 `[direct τ0, orphan τ1,
+  direct τ2]`，Phase 1（向量化）先写 `τ0`/`τ2` 的 op，Phase 2（串行）再写
+  `τ1` 的 op——本地缓冲顺序是 `[τ0, τ2, τ1]`，不是 `[τ0, τ1, τ2]`，
+  `token_ptr` 会把 `τ2` 的 `JOIN` 错误地喂上 `τ1` 的数据。**修法**：三类
+  主操作的 `arg2`（此前恒为 `-1`，未使用）改存显式 `token_idx`，重放/
+  `derive_final_cluster`/Phase 3 一律用 `op.token_idx` 索引原始
+  `(k_raw,v,pos)`，不再依赖隐式位置。同时把顺序契约精确改写为三条（同簇
+  内部按真实到达顺序、结构操作紧邻其主操作、跨簇顺序不重要），并证明
+  "Phase 1 全体先写、Phase 2 全体后写"满足这三条——关键前提是"同一个逻辑
+  簇的主操作在一个 flush 批内只可能整个来自 Phase 1 或整个来自 Phase 2，
+  不会两边都有"（orphan 的语义距离恒 `>λ_new`，不可能 JOIN 一个 Phase 1
+  也在写的既有簇；Ward 合并只改写 `keep_slot` 的聚合元数据，不产生新主
+  操作，不会把 Phase 2 的东西混进 `keep_slot` 的主操作序列）。
+  ② **P0：Ward 合并的物理执行顺序此前没有明确定义**——如果"Phase 1 只记
+  日志、物理写入推迟到批末"，Ward 合并看不到 Phase 1 已分配的 token；如果
+  "Phase 1 提前把全部 direct token 物理写入"，Ward 合并又会提前看到本该
+  更晚到达的内容——两种读法都会让 forward 真实发生的事和 op_log 记录的
+  顺序对不上。**修法**：钉死"Phase 1（路由决策 + 向量化物理写入）作为一个
+  原子步骤完整跑完，Phase 2（串行，含 Ward 合并）才开始"这一条实现契约，
+  不是"日志 vs 物理写入"的分界，是"Phase 1 整体 vs Phase 2 整体"的分界。
+  这个顺序和①确定的 op_log 物理顺序完全对应，所以"严格按 op_log 顺序
+  重放"自动等价于 forward 的真实执行，不需要另外证明。
+  ③ **P1：`derive_final_cluster` 分段串联会让早期 token 的 final slot
+  过期**——第 1 段扫完返回的 `final_slot` 一旦被调用方当作最终答案存起来，
+  第 2 段里如果发生 `WARD_MERGE` 继续合并第 1 段某个 token 所在的槽，那个
+  存起来的值就悄悄过期了，且没有任何机制通知调用方。**修法**：拆成
+  `scan_op_log`（只累积 `token_identity`/`epoch`/`parent`，从不解析"最终
+  归属"）和 `resolve_final_slots`（对累积下来的**全部** `token_identity`
+  统一解析一次，只应该在扫完全部你关心的段之后调用一次）两个函数——
+  中间任何一次 `scan_op_log` 的返回值都不包含"最终"这个概念，也就没有
+  "过期"的可能性。
+  ④ **P1：Phase 1 的向量化公式（segment id / PAD count / 本地缓冲索引
+  分配）没有排除 orphan**——公式按全批 `c*[t]` 分组，但 Phase 1 只该处理
+  `s*[t]≤λ_new` 的 direct token，orphan 的 `c*[t]` 是"离哪个既有簇最近"
+  而非"它真的会去哪"，混进分组会污染真实 direct token 所在簇的统计。
+  **修法**：显式定义 `direct[τ]=(s*[τ]≤λ_new)` 和压缩后的 `direct_idx`，
+  下面所有公式的下标 `t` 改指压缩后 direct 子序列（`t=0..m_direct-1`），
+  orphan 完全不出现在这些公式里，也不占本地缓冲的任何一行。
+  ⑤ **P1：训练期 `op_log` 显存少算了一份 clone**——上一轮修的
+  `.detach().clone()` 解决了别名 bug，但 cache 自己的持久 448MB 和 ctx 里
+  的克隆同时存在，训练峰值实际是 896MB，`CLAUDE.md` 的"约 448MB"因此过时
+  了。**没有选择接受翻倍**：重新审视后发现 `op_log`/`op_log_len` 是本表
+  唯一"必须活过 `reset_parameters()`"的 buffer（其它 buffer 的内容 backward
+  从不直接读，靠重放 `op_log` 重建，不需要活过自己所在的 forward() 调用）
+  ——这个独有的需求，本就不该套用其它 buffer"预分配一次、原地清零复用"
+  的模式。**修法**：`op_log`/`op_log_len` 改成每次 `forward()` 开头重新
+  绑定成全新分配的张量（不是原地 `zero_()`），直接存进 `ctx`，不需要
+  克隆——下一次 `reset_parameters()` 只会让属性名指向另一块全新存储，
+  完全不触碰 `ctx` 里这次调用留下的对象。训练峰值显存回到单份 448MB，
+  代价是分配频率变高，但 PyTorch 显存缓存分配器在稳态训练循环里能把这个
+  代价压得很低，远小于峰值翻倍的代价。
+
+- **2026-08-14｜第九轮核实：修掉 `ctx.save_for_backward` 存裸引用而非快照的
+  bug、Phase 1 reset-scan 的 off-by-one、变长本地缓冲的索引分配公式、`K`
+  未满/冷启动路径与 Ward 分支的初始化不一致，并澄清 `current_segment` 合并后
+  的语义边界与更新 `glossary.md` 的漂移。** 动机：用户逐条核实上一轮的四处
+  修复都已生效，同时指出一处 P0、四处 P1/P2 级的实现缺口。逐条结论：
+  ① **P0：`ctx.save_for_backward(cache.op_log, cache.op_log_len)` 存的是
+  裸引用，不是快照**——PyTorch 的 `save_for_backward` 不会自动 deep copy，
+  而本项目一贯用预分配 buffer + `reset_parameters()` 原地 `zero_()` 复用
+  （不是每次重新分配），下一次 `forward()` 的 reset 会直接清空 `ctx` 里
+  "存"的那个引用指向的底层数据——`backward()` 读到的可能已经是被清空的
+  `op_log`。虽然 PyTorch 的 saved-tensor 版本计数器可能会让这种误用在
+  `backward()` 访问时报错，但这不是能依赖的安全网。**修法**：
+  `ctx.save_for_backward` 时对 `cache.op_log`/`cache.op_log_len` 显式
+  `.detach().clone()`；`q`/`k_raw`/`k_roped`/`v` 不需要同样处理，因为它们
+  是每次 forward 新建的激活张量，不是会被 cache 对象在未来原地清零复用的
+  buffer，不存在这个别名风险。
+  ② **P1：Phase 1 的 PAD_INSERT reset-scan 有一处 off-by-one，且两个分支
+  会以同一个方向同时出错**——`steps_since` 如果直接算成"组内下标减最近一次
+  new_seg 的下标"（不减 1），对"已有上一次新段"和"本批还没开过新段"两个
+  分支都会多算 1 步，因为 `new_seg=True` 那个 token 自己那一步已经被"计数器
+  重置到 1"这条化简吸收掉了，不能再计入距离。补了从头展开递推
+  `M_r = 1 + (r-1-r')` 的完整推导，钉死统一公式
+  `steps_since[t] = rank[t] - last_new_rank_before[t] - 1`（哨兵 `-1`
+  代表"本批还没开过新段"，代入后两个分支自动给出正确结果，不需要分别记两条
+  公式），并强调这个 `-1` 是这条公式唯一容易做错、又不容易被单测覆盖到的
+  地方（需要专门测"本批第一次开新段"这个边界）。
+  ③ **P1：Phase 1 写入本地缓冲的变长展开缺一个索引分配公式**——`PAD_INSERT`
+  必须紧邻且先于它服务的 `NEW_SEGMENT`，但不同 token 展开出的 op 数量不同
+  （1 或 2 条），Phase 1 是向量化路径不能逐 token 决定行号。补了
+  `extra[t]=new_seg[t] and count[t]>0`、
+  `main_idx[t]=base+t+inclusive_prefix_sum(extra)[t]`、
+  `pad_idx[t]=main_idx[t]-1` 的完整公式，并用一个三 token 的例子验证了
+  "inclusive 前缀和"是必须的，用 exclusive 会导致两个 token 的 op 写进
+  同一行、互相覆盖。
+  ④ **P1：`K` 未满/冷启动的新簇初始化写得过于简略，容易和 Ward 分支的详细
+  步骤脱节**——Ward 分支的 `alive`/元数据清零、`NEW_CLUSTER` 写入、
+  `local_p_hi`/`local_segment` 初始化写得很细，但"K 未满"在 §5.6 的表里
+  只有"占用第一个 false 槽位"一句，容易让实现者以为这条路径不需要同样的
+  初始化。**修法**：把 Ward 分支步骤 4 开始的全部内容形式化为共享原语
+  `allocate_new_cluster(slot_idx, group)`，三条路径（冷启动/K 未满/K 已满）
+  只在"如何拿到一个空 `slot_idx`"这一步分叉，初始化逻辑完全共用；同时点出
+  一条隐含前提——"K 未满"分支依赖"一个从未 `alive` 过的槽本来就是全零"，
+  这必须由 `reset_parameters()` 的显式 `torch.zeros(...)` 保证，不能依赖
+  `torch.empty` 之类不保证清零的分配，否则 `n_eff_pre==0` 这条判据会在
+  垃圾值上失效。
+  ⑤ **P2：`current_segment=max(a,b)` 的语义边界需要精确重新表述**——原表述
+  "不会和调试/分析工具已经见过的旧 id 撞车"不准确：`max` 只保证合并后
+  `keep_slot` 未来新开的 segment id 大于 `a`/`b` 双方的历史最大值，不保证
+  `a`/`b` 各自独立计数（都从 0 开始）的历史 segment id 互不相同——但这天然
+  没关系，因为 `op_log` 里两段历史各自带着原本的 `cluster` 字段（没有被
+  重定向），本来就可以区分；真正需要小心的是"同一个物理槽先后被两个不同
+  逻辑簇使用"这种槽位复用场景，这正是 `derive_final_cluster` 的
+  `(slot, epoch)` 版本化身份已经解决过的问题，不是 segment 机制独有的新
+  坑。结论：需要跨这类边界分组的分析工具必须按 `(slot, epoch, segment)`
+  做 key，且跨 lineage 的时间先后顺序只能从 `op_log` 线性位置读，不能比较
+  两个独立 lineage 的 segment 数值大小。
+  ⑥ **P2：`glossary.md` 的"新增 buffer"列表漏了这两轮新加的
+  `current_segment`/`op_log_len`**——已同步补上。
+
+- **2026-08-14｜第八轮核实：补上 Phase 1 缺失的持久 segment 状态与批内向量化
+  segment-id/PAD_INSERT 计算、`op_log` 的有效长度规格与 backward ctx 生命周期
+  定案、`derive_final_cluster` 的切片安全性，并删掉一处从未有过定义、和已证明
+  不变量矛盾的 Ward 合并 fallback。** 动机：用户对照最新远端逐条核实上一轮的
+  四处修复都已生效，同时指出五处更底层的实现缺口——本质上都是"看起来定了，
+  细究会发现某个边界情形没人接住"。逐条结论：
+  ① **P0 级缺口：Phase 1 没有持久 `current_segment` 状态，且同批同簇多个
+  token 独立开新段时会互相踩踏**——`JOIN`/`NEW_SEGMENT` 都要写具体的
+  `segment` 整数，但 §5.13 只有 `p_hi_c`，从没有一个持久 buffer 记"这个簇
+  现在 segment id 是多少"；上一轮为 Phase 2 orphan 组加的 `local_p_hi`/
+  `local_segment` 只覆盖新建簇，覆盖不了 Phase 1 批量路由到既有簇的 token
+  （恰恰是每批处理量最大的路径）。同时，若批内同簇多个 token 都判定"该开
+  新段"，各自读批前持久值计算 `segment`/`PAD_INSERT count` 会给出重复或
+  过期的结果——这和 Phase 2 那个 bug 同构，只是发生在向量化路径上，不能退回
+  逐 token 串行去修。**修法**：新增持久 buffer `current_segment: (B,G,K_max)`
+  （Phase 3 唯一写入点，`ward_merge_only` 合并时取 `max`，和 `p_hi_new` 同一
+  模式）；批内 segment id 分配用一次 **segmented inclusive cumsum**
+  （`op.segment[t] = current_segment[c*[t]] + 组内到 t 为止 new_seg 的包含性
+  前缀和`，一个公式同时覆盖 JOIN 和 NEW_SEGMENT）；`PAD_INSERT` 的 count 用
+  一次 **segmented reset-scan**（关键化简：每次新段事件后，level-0 的 mod
+  计数器必然精确回到 `1 mod 2^ℓ_block`，与之前 pad 了多少无关，于是只需要
+  "距离本簇上一次开新段过了几步"这一个无状态量，不需要像 §5.21-3 的 carry
+  那样模拟计数器怎么折返）。两者都是标准向量化原语，不需要数据相关的有界
+  循环轮数，要求补 CPU 参考实现对拍单测。
+  ② **P1：`PAD_INSERT` 读 `level_count[cluster,0]` 的公式本身是对的（上一轮
+  已修），但没说清楚"批内多次触发时读的是哪个 level_count"**——这个疑问随①
+  一并解决：`level_count[c*[t],0] mod 2^ℓ_block` 只在"本批内这个簇还没开过
+  新段"时作为 `base_mod` 使用，一旦本批内发生过一次新段事件，后续同簇的
+  `count` 计算改用"距离那次事件几步"，不再依赖是否读到"批前"还是"批内更新
+  过"的 `level_count`——化简后这个问题不需要维护一份额外的"本地 level_count"
+  也能正确处理。
+  ③ **P1：`op_log` 缺有效长度规格，replay 伪代码 `for op in op_log` 会扫到
+  未写入的尾部行**——新增 `op_log_len: (B,G)`（§5.13）记录当前写到第几行，
+  一切遍历 `op_log` 的代码（重放、`derive_final_cluster`、S0.8 对拍）必须先
+  按它截断；本地缓冲同样需要 `local_op_len`，提交进持久 `op_log` 就是一次
+  定长拷贝 + 两个指针相加，不需要逐条判断。**顺带把 `op_log` 和
+  `reset_parameters()`/backward `ctx` 的生命周期从"两个选项都列出但没拍板"
+  改成定案**：`op_log`/`op_log_len` 在 `forward()` 处理完整条序列后，和
+  `q`/`k_raw`/`k_roped`/`v` 一起存进 `ctx`，`backward()` 只读这份快照，cache
+  对象自己的 `op_log`/`op_log_len` 该被下一次 `forward()` 的
+  `reset_parameters()` 清空就清空，不需要任何豁免逻辑——和已有 `v`/`k_raw`
+  的处理方式完全对称，不给 `op_log` 发明第二套生命周期规则。
+  ④ **P1：`derive_final_cluster` 只对"从冷启动开始的完整日志"安全，拿切片
+  调用会让上一轮刚修的槽位复用 bug 以另一种方式复活**——`epoch.get(slot,0)`
+  的默认值会把"切片开始前已经复用过的槽"重新当成第一次出现。**修法**：把
+  `epoch`/`parent` 做成可选种子参数（`initial_epoch`/`initial_parent`），
+  函数变成可以对同一条 `op_log` 分段串联调用的形式，返回值里带上本段结束时
+  的 `epoch`/`parent` 状态供下一段调用直接传入；`op_log` 参数本身也要求是
+  按 `op_log_len` 截断过的有效前缀，不是整个静态 buffer，和③统一。
+  ⑤ **P2：`K` 已满时"合并失败必须有 fallback：强制并入最近簇"这句话和文档
+  别处已经证明的不变量矛盾，必须删掉**——`K_max≥2` 时 Ward 候选池必然非空
+  （§5.6 已证明），这个 fallback 对应的前提根本不成立，硬留着只会制造一个
+  从未定义过语义（该写 JOIN 还是 NEW_SEGMENT？消费哪个 token？）的死代码分支。
+  **改法**：从"新簇形成条件"表里删掉这句话，替换成"这一步不会失败，不需要
+  fallback"的说明；实现层面该有的是一条 `assert alive[keep_slot] and
+  alive[free_slot] and keep_slot != free_slot`，断言失败说明前面状态维护
+  出了 bug，需要去修那个 bug，不是在这里兜底掩盖。连带清掉 `K_max=1` 分支
+  里一处指向这条 fallback、且用了脆弱行号引用（"第 192 行"）的交叉引用。
+
+- **2026-08-14｜第七轮核实：修掉离线派生工具的槽位复用 bug、`docs/position.md`
+  里 PAD_INSERT 公式的回归、Phase 3 元数据写入权限的过强表述，并补上 orphan
+  组内后续成员的局部时序状态。** 动机：用户对照最新远端 `semanticLogKV`
+  （HEAD `01ce49e`，已含 PR #17 合并结果和一个独立提交新增的 `docs/position.md`）
+  逐条核实上一轮的修复，指出一处 P0、三处需要立即澄清/修正的问题。逐条结论：
+  ① **`derive_final_cluster` 仍有严重漏洞：槽位复用会被 union-find 错误合并**
+  ——上一版直接对裸槽号做并查集，`WARD_MERGE(C,B)` 之后 `free_slot=B` 被后续
+  `NEW_CLUSTER(B)` 复用建立一个全新、无关的簇时，裸槽号并查集会把这个新簇的
+  token 也错误地路由到 C（具体反例：`token0` 进 B，`WARD_MERGE(C,B)`，`token1`
+  又 `NEW_CLUSTER(B)`，离线 derive 会把 `token1` 也推到 C）。**这是 §5.4 反例
+  在离线派生工具这一侧的镜像问题**——真正的执行路径（forward/replay）不会犯
+  这个错，因为它们按时间顺序执行，槽的"当前身份"由最后一次写入决定；但这个
+  离线函数跳过时间顺序、只扫 `WARD_MERGE` 边，裸槽号不足以区分"同一物理槽在
+  不同时期代表的不同簇"。**修法**：引入版本化身份 `(slot, epoch)`——每次
+  `NEW_CLUSTER(slot,...)`（首次建立或复用）都让该槽 `epoch` 前进一代，
+  `WARD_MERGE` 只 union 当前这一代的身份，不触碰 `epoch` 本身；`epoch` 只是这个
+  只读函数内部的临时簿记，不影响 forward/backward/replay 的任何状态。
+  ② **`docs/position.md` 的 `PAD_INSERT` 公式写回了已经被证伪的版本**——位置
+  手册的 P7.1 写着 `count = (-n_total_c) mod 2^ℓ_block`，这正是
+  `algorithm-spec.md` §5.11 更正框已经用反例否定过的公式（`n_total_c` 不含 pad，
+  第一次填充后就会和 level 0 真实插入流分叉）。已改成
+  `count = (-level_count[cluster,0]) mod 2^ℓ_block`，并加一段简短说明加指向
+  `algorithm-spec.md` 的权威引用，防止两份文档再次漂移。
+  ③ **"Phase 3 是簇级元数据唯一写入点"是过强表述，和 `ward_merge_only` 冲突**
+  ——`ward_merge_only` 步骤 1（合并簇级元数据）本来就会写
+  `μ_new`/`n_eff_new`/`n_total_new`/`p_hi_new`，这是必须存在的第二个写入来源，
+  不是需要消灭的冗余。**改成精确表述**：Phase 3 是本批"主操作 token 内容贡献"
+  唯一的写入点；Ward 合并是"结构性合并事件"的写入点，处理的是两个既有簇已
+  积累的历史值组合，不处理本批任何 token 的原始内容。两者写入范围不重叠
+  （`keep_slot` 的历史值 vs. 本批新内容增量），顺序上 Ward 合并总在 Phase 3
+  之前（发生在 Phase 2 内部），所以 Phase 3 读到的永远是"本批结构变动都已落地
+  之后"的起点，不存在竞争。
+  ④ **orphan 组内后续成员的 `JOIN`/`NEW_SEGMENT` 判据读的是刚被清零的
+  `p_hi_c`，时序判据会错**——Phase 2 第 4 步把新簇的 `p_hi_c` 清零备用，但
+  紧接着又说组内后续成员按"`slot_idx` 当前 `p_hi`"判断要不要开新段；若这个
+  "当前 p_hi"指全局 buffer，读到的就是刚清零的占位值 0，`p_t − 0` 对任何有
+  意义长度的文档都远超 `g_max`，组内除最早成员外全部被错误判成"时序打断"，
+  各自被迫开新 segment——而它们本来就是同一次 mini DP-means 判定为彼此接近、
+  到达时间上也大概率紧挨着的一组 token。**修法**：引入 Phase 2 私有的局部
+  状态 `local_p_hi[slot_idx]`/`local_segment[slot_idx]`（不是新持久 buffer，
+  不进 §4/§5.13 账目，Phase 3 也不需要读它——Phase 3 判断新段直接看 op 类型
+  本身），由第 4 步用最早成员的位置初始化，组内后续成员读写这个局部状态而
+  非全局 `p_hi_c`。同时说明这个 bug 为什么只出现在 Phase 2 的 orphan 组、
+  不出现在 Phase 1：Phase 1 的"批前冻结 `p_hi_c`"是一个已知、已在 S0.8 测的
+  近似（读到的始终是真实历史值，只是不够新），而 Phase 2 这里读到的是一个不
+  代表任何历史的占位哨兵，是正确性 bug 不是近似误差，两者不能混为一谈。
+  ⑤ **新簇的 segment 初始化一并定案**——`local_segment[slot_idx]` 从 0 开始
+  （与 `NEW_CLUSTER` 的 `arg1=0`"新簇第一段"约定一致），后续成员按
+  `p_t − local_p_hi[slot_idx] > g_max` 决定 `JOIN` 还是 `NEW_SEGMENT`（后者
+  照常触发 §5.11 的 `PAD_INSERT`），处理完毕后 `local_p_hi` 无条件推进到
+  `p_t`（不论是否开了新段）——这就是 `p_hi` 的既有定义"最近一次收到成员的
+  位置"，随④一并解决，不再是未定义行为。
+
+- **2026-08-14｜第六轮核实：推翻上一轮（第五轮）刚钉死的"批内重定向"机制本身
+  ——它会把可执行的 `op_log` 改坏，改用"op_log 只追加、永不改写 + 需要时按需
+  派生最终归属"。** 动机：用户指出上一轮把"可执行日志"和"最终归属索引"这两个
+  不同的东西合成了同一个可变 `op_log`，这才是重定向反复出问题的根源，一拆开，
+  重定向的风险自然消失。给出六条意见，两处 P0、三处 P1、一处 P2。逐条结论：
+  ① **P0：重定向会把"可执行 op_log"改坏，用具体反例证实**——本批内 orphan
+  组 1 先 `NEW_CLUSTER(B)`，orphan 组 2 因 `K_max` 满触发 Ward 合并，代价矩阵
+  在"全部 alive、非对角线槽"里选中 `(keep=C, free=B)` 完全可能发生、甚至是
+  大概率事件（B 刚建立、`n_total` 极小，Ward 尺寸加权代价对它天然最低，和
+  §5.6"multi-needle 被漏斗到同一簇"是同一种偏好，只是这次发生在同一批内）。
+  按上一轮的重定向规则，这会把 orphan 组 1 更早写下的 `NEW_CLUSTER(B,...)`
+  该写成 `arg0=C`，留在原时序位置，产生两个独立的致命错误：（a）重定向只碰
+  `arg0` 不碰 `arg1`，改写后的 `NEW_CLUSTER(C, 0, -1)` 仍带着"新簇第一段"的
+  `arg1=0`，把一个刚到达的 token 记成运行了很久的既有簇 C 的"segment 0"，
+  违反 segment 单调性；（b）`WARD_MERGE` 类型本身被排除在重定向目标之外，
+  所以 `WARD_MERGE(C, B, -1)` 原样留在序列里，但 B 的建立事件已经被重定向
+  改写走了——重放重建出的状态里槽 B 从未被 `alive` 过，`ward_merge_only(C, B)`
+  要么撞断言崩溃，要么悄悄用垃圾内容"合并"进 C。**这不是能靠加字段、加特判
+  堵住的漏洞**，只要 Ward 候选池不排除本批内新建的簇（而它必须不排除，否则
+  §5.6"`K_max≥2` 时永远有候选"这条不变量就不成立），这类结构性矛盾会反复
+  出现。**推翻重做**：完全不做重定向，`op_log`（本地缓冲和持久存储一样）
+  任何已追加条目永不改写——这不需要放弃任何已证明成立的性质，本节此前就已
+  论证过"结构操作和主操作共享同一条未经改写的时间线时，严格按 op_log 顺序
+  重放本身就足以正确重建 forward 的 cache 结构"，上一轮误把这条已成立的性质
+  当成"重放正确性还需要重定向来加强"，答案反了。
+  ② **P0：`ward_merge_only` 是否写日志自相矛盾，修法是把候选选择和日志写入
+  都移出这个 primitive**——§5.6 原定义"1-3+5 步"里的"5"是写 `WARD_MERGE`
+  日志，但 §5.4 的 Phase 2 在调用完 `ward_merge_only` 后又显式 append 一次
+  （双写），backward 重放调用它时注释却写着"只合并"（暗示不该写）。核实后
+  两处用法一致指向同一个正确定义：**`ward_merge_only` 只负责纯状态 mutation
+  （合并簇级元数据、合并两条 ladder、释放槽位，重编号为 1-2 步），Ward 代价
+  矩阵候选选择在它之前由调用方完成，`WARD_MERGE` 日志写入在它之后由调用方
+  完成**——重放时这个 primitive 只读日志决定的 `(keep_slot, free_slot)`，
+  从不重新计算 Δ，也从不写日志，天然不会有双写或"重放时产生副作用写"的问题。
+  ③ **P1：新簇元数据被 Phase 2 初始化和 Phase 3 更新双计数**——上一轮的 Phase 2
+  "新簇写进去"那一步同时给 centroid/`n_eff`/`n_total`/`p_hi_c` 按 orphan 内容
+  设初值，Phase 3 后又对整个本地缓冲统一更新一遍同一批 token，计入两次。**选
+  第一种修法**：Phase 2 腾出槽位后只置 `alive=true`、数值元数据全部清零（白纸
+  状态），Phase 3 是这些字段唯一的写入点，对 Phase 1 分配到的既有簇和 Phase 2
+  新建的簇一视同仁，从本批完整的 op 序列统一构造。新建簇的第一个成员不需要
+  特判——§5.5 公式里 `n_eff_pre==0 时 μ_c←k` 这条分支本就是为"冷启动或 γ=0
+  归零"设计的，天然接得住"刚建立的簇"这个情形。
+  ④ **P1：replay 正确性单测不该要求 centroid 逐位一致**——§5.21-2 明确"重放
+  完全不需要 centroid"，但上一轮的单测又要求 replay 产出的"ladder/centroid"
+  状态与批量前向逐位一致，自相矛盾。**拆成三条独立断言**：重放正确性（S0.1，
+  只覆盖 attention 需要的 ladder 张量、`level_count`/`alive`/`pad_mask`，
+  明确排除 centroid 类元数据）、批量近似质量（S0.8，允许分歧率）、Phase 3
+  元数据更新正确性（S0.1，与重放正确性完全独立的一条断言，专门抓"双计数"
+  这类 bug，断言新建簇的最终 `n_total` 精确等于它实际收到的 token 数）。
+  ⑤ **P1：`NEW_CLUSTER` 被列为重定向目标尤其危险**——它比 `JOIN`/`NEW_SEGMENT`
+  更严重，因为它的语义依赖目标槽在那一刻是 free 的，重定向后这个前提不再成立
+  （见①的反例 b）。随①的推翻一并解决：不存在"重定向目标"这个概念了，`op_log`
+  里没有任何字段会在写入后被后续操作改写，六类 op 一视同仁。
+  ⑥ **P2：本地缓冲容量 `4×flush_granularity` 对 debug `CARRY` 最坏 burst 缺
+  断言**——生产默认不写 `CARRY` 时这条余量足够，但 debug/对拍 build 打开
+  `CARRY` 后，§5.21-2 的 `OP_max` 推导是对整条序列的摊还论证（O(T/B′)），不
+  等于对单个 flush 批内的最坏 burst 也成立。补上：追加前必须显式检查是否会
+  超过 `local_op_cap`，超出则硬失败，不做动态扩容、不做静默截断——沿用项目
+  一贯的"矩形预分配 + 硬失败"原则，避免对拍场景里本地缓冲静默溢出/截断产出
+  一份看似完整、实则丢了尾部结构操作的日志。
+
+  **顺带新增的机制**：重定向想买的"`op_log` 对每个 token 的最终归属自
+  解释"这个真实需求，改用一个只读、离线的 `derive_final_cluster` 函数按需
+  从 `op_log` 派生（对 `WARD_MERGE` 序列做一次并查集），不新增任何持久
+  buffer、不改变 §4/§5.13 的内存账目，forward/backward 的正确性路径永远
+  不依赖它、也不会被它影响——S0.8 对拍、调试工具需要"token 最终去了哪"时
+  调用它就够了。
+
+  **总体教训**：上一轮把"可执行日志"（forward/backward 正确性依赖的东西）
+  和"最终归属索引"（调试/分析工具想要的东西）合成了同一个可变 `op_log`，
+  这个表示层混淆是本轮几乎所有问题的共同根源——一旦拆开成"不可变执行日志 +
+  按需只读派生"，重定向本身连同它带来的一整类边界 bug 就不再需要存在。
+
+- **2026-08-14｜第五轮核实：把批内重定向从"原则"钉成"可实现的规格"——区分
+  重定向该改哪些 op 字段、`WARD_MERGE` 何时落地、本地缓冲的真实容量、同一新簇
+  多个 orphan 的 op 序列、合并 primitive 拆分、Phase 3 该读哪份数据、单测该测
+  哪个性质，外加训练梯度文档里一处容易踩的表述。** 动机：用户对上一轮"批内
+  重定向"设计再做一遍逐条核实，指出两处 P0（会让实现者写出结构错误或语义模糊
+  的版本）、五处 P1、一处 P2。逐条结论：
+  ① **P0：重定向笼统写成"改 `op.cluster`"，但六类 op 字段异构**——`WARD_MERGE`
+  的 `arg0/arg1` 是 `keep_slot/free_slot`，是历史记录而非"簇身份"，重定向如果
+  也去改它就是在篡改已发生的合并事实。补一张类型表，明确重定向只碰
+  `NEW_CLUSTER`/`NEW_SEGMENT`/`JOIN`/`PAD_INSERT`/`CARRY` 这五类的 `arg0`，
+  `WARD_MERGE` 排除在外；改写用 `is_target_type & (arg0==free_slot)` 这样的
+  类型感知掩码，不是无条件的 `where`。
+  ② **P0：`WARD_MERGE` 该在本地缓冲的哪个位置落地，新伪代码没写**——补上：物理
+  合并（`ward_merge_only`）执行后立即 `append WARD_MERGE`，再做重定向，最后才
+  `append NEW_CLUSTER`——`WARD_MERGE` 落在"紧邻 `NEW_CLUSTER` 之前"这个既有
+  顺序要求里，且因为①的类型排除，它自己不会被同一次重定向误伤。
+  ③ **P1：本地缓冲容量按"batch token 数"分配是错的**——缓冲最终要装下会提交进
+  持久 `op_log` 的完整内容，必须像全局 `OP_max` 一样按"每 token 最坏 4 条 op"
+  分配：`local_op_cap = 4 × flush_granularity`，不是 `≤128`。
+  ④ **P1："多个 orphan 共享一个 `NEW_CLUSTER`"和"每 token 恰好一个主操作"直接
+  冲突**——mini DP-means 分进同一临时簇的 orphan 里，只有到达顺序最早的那个
+  产生 `NEW_CLUSTER`，其余对同一 `slot_idx` 产生 `JOIN`/`NEW_SEGMENT`，和"一个
+  已存在的簇收到新成员"是同一套逻辑。
+  ⑤ **P1：`merge_cluster_ladders` 到底是"只合并"还是"合并并写新簇"，两处伪
+  代码用法不一致**——把 §5.6 步骤 4（"释放槽位，新簇写进去"）拆成两句：
+  `ward_merge_only`（步骤 1-3+5，只合并、只释放）是一个 primitive，"新簇写
+  进去"是调用方（无论是单 orphan 场景还是批量 Phase 2）自己的职责，不属于这个
+  primitive；连带把 replay 伪代码里 `WARD_MERGE` 分支调用的函数名同步改过来。
+  ⑥ **P1：重定向会改变本批部分 token 的最终归属，但 Phase 3 该用哪份数据更新
+  centroid/`n_eff`/`n_total`/`p_hi_c` 没写清楚**——补硬规则：只能读"重定向执行
+  完毕、提交进持久 `op_log` 之前"的最终本地缓冲，不能读 Phase 1 原始输出，否则
+  会把 token 计入它最终并不属于的簇。
+  ⑦ **P1：把"批量近似 vs 严格串行路由"的分歧率测试和"批量前向 vs 重放"的逐位
+  一致性测试混成一条**——两者拆开：前者是 S0.8 已经在测的近似质量问题（Phase 1
+  冻结 centroid/`p_hi_c` 本来就承认是近似），不要求逐位一致；后者才是需要逐位
+  精确的正确性契约（"`op_log` 忠实记录了批量前向做了什么"），Ward 合并撞见
+  Phase 1 已分配槽位只是作为 S0.8 分歧率统计必须覆盖的一类特殊输入，不该单独
+  拔高成正确性要求。
+  ⑧ **P2：训练梯度那节说"`k_raw` 传进来 detach 与否都无所谓"容易被误读成
+  "可以在算 `k_roped` 之前把上游 qk-norm 输出整体 detach"**——补充区分：这句
+  话只针对"这个 Function 的 `k_raw` 输入参数本身"，`k_roped` 必须从未经任何
+  detach 的 qk-norm 输出算出，否则 `k_roped` 的梯度链会被一并切断——"`k_raw`
+  不产生梯度"完全由这个 Function 的 `backward()` 恒返回 `None` 保证，不需要、
+  也不应该在调用方源头做任何 detach。
 
 - **2026-08-14｜第四轮核实：推翻上一轮的"屏蔽+顺延"设计（会让 token 在
   attention 里凭空消失），改用批内向量化重定向；纠正训练梯度目标与现有
