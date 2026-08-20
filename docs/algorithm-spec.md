@@ -3414,11 +3414,35 @@ eval，就是在没有类似 3b 这样的批量 vs 严格串行验证的情况�
 1. **`log_kv_position.py` + 单测**（纯 CPU，不依赖任何 dump）。**S0.8 3b 的前置项**。
 2. **CPU 参考实现的路由**（朴素串行版，慢但正确）——它同时是 S0.8 的对照基准，
    不要跳过。**连同 `log_kv_slot_attention()`/`get_attention_state()` 按
-   §5.14/§5.20-B 扩展出 `CacheAttentionState`/`slot_valid`/`M_s`（纯加法式改动，
-   受 §5.19-1 的默认关闭字节等价闸门保护），是 S0.8 3b 唯一需要在第 0 步之外
-   补的前置代码**，见 §5.21-5 的更正框；3b 之外的 S0.0–S0.7 不依赖这一步。
-3. **`K_max=1` 单簇路径**：验证退化到"单条位置序 ladder"，与现有实现数值对齐
-   （注意 §12 的容差问题）。
+   §5.14/§5.20-B 扩展出 `CacheAttentionState`/`slot_valid`/`M_s`——这是一次
+   breaking 的 API 迁移（不是"纯加法式改动"，见下方"更正"框与 §5.20-B 调用点
+   迁移清单最后一行），需要在同一次改动里原子迁移全部约 30 处调用点（生产代码
+   6 处 + 测试约 25 处），但改动本身是机械的位置解包换字段访问、不涉及新算法，
+   是 S0.8 3b 唯一需要在第 0 步之外补的前置代码**，见 §5.21-5 的更正框；3b 之外
+   的 S0.0–S0.7 不依赖这一步。
+
+   > **更正（这一轮修的）：`CacheAttentionState` 不是"纯加法式改动"。** §5.14
+   > 定案"`get_attention_state(with_stats=False)` 在任何模式下都返回同一个
+   > 类型 `CacheAttentionState`"（恒定 10 个字段，不用的字段填 `None`）——这
+   > 意味着现有 `slot_k, slot_v, slot_w = c.get_attention_state(with_stats=
+   > False)` 这类 3-变量位置解包（`log_kv_cache.py:1738` 现状）、以及
+   > `with_stats=True` 的 8-变量解包（`model.py:1200`、
+   > `tests/test_log_kv_cache.py:1096` 现状），在返回类型改成 10-元组之后
+   > 会直接 `ValueError: too many values to unpack`——**不论 legacy 还是
+   > 语义模式，因为这个返回类型改动对两种模式都生效，不受 `log_kv_
+   > semantic_clusters` 开关裹住**。§5.19-1 的"默认关闭字节等价"CI 闸门管
+   > 的是**数值**在开关关闭时是否不变，管不到**函数签名/返回元组长度**变了
+   > 导致调用方在 Python 层面直接报错这类问题——上一版拿这条 CI 闸门当这次
+   > 改动的安全网是范畴错误，两件事正交。正确的定位是：这是一次**必须原子
+   > 完成的 breaking 迁移**（`get_attention_state()`/`append_exact_tokens()`
+   > 的定义与全部约 30 个调用点在同一个改动里一起改，见 §5.20-B 调用点迁移
+   > 清单最后一行），但迁移动作本身是机械的（位置解包 → 按字段名取值，纯
+   > 语法层面的重写，不涉及任何新算法决策），所以仍然是"是否要投入 Stage 1"
+   > 这道门不需要关心的小额、低风险前置工作，只是"低风险"不等于"不改变
+   > 调用方代码"，措辞必须精确。
+3. **`K_max=1` 单簇路径**：验证退化到"单条位置序 ladder"。**不要求、也不预期**
+   与现有 LogKV 数值对齐（下方"更正"框），当消融参考点看待；这一步真正的正确性
+   检验是 `anchor_mode=z` 的 CPU 单测（同一个更正框末尾）。
 4. **多簇路由 + 向量化**（§5.4 三阶段），拿第 2 步的参考实现测分歧率。
 5. **段对齐填充**（§5.11）+ `level_count` 簿记改造。
 6. **训练路径**：`op_log` 的保存与重放（§11-A、§5.21-2）。
@@ -3535,7 +3559,7 @@ sigma_u, ...] = ...`"换成"接住一个 `CacheAttentionState`，按字段名取
 | `litgpt/log_kv_cache.py:1738/1754`（`log_kv_chunk_attention()`）| 训练流式 attention 的共享构件，`second_order_scale==0.0`/`!=0.0` 两个分支各调用一次 `get_attention_state()` |
 | `litgpt/model.py:1209/1219`、`1284/1338`、`1397/1409` | **三处**独立的流式调用点，每处都是"`get_attention_state()` 接着 `append_exact_tokens()`"这个模式的一次独立重复，三处都要改，不能只改一处漏两处 |
 | `litgpt/log_kv_diag.py:624` | 诊断工具对 `append_exact_tokens()` 的调用，语义簇路径下诊断输出的字段也要跟着扩展，否则诊断工具会在语义模式下悄悄丢信息 |
-| `tests/test_log_kv_cache.py`、`tests/test_log_kv_diag.py` | 分别约 22、3 处直接调用（`grep -c` 实测）。legacy 路径的既有测试预期"返回 3-/8-元组"——`NamedTuple` 同时支持位置解包和按字段访问，legacy 测试不强制改写；但迁移时需要过一遍确认没有 testcase 隐式依赖"返回值就是一个裸 tuple、`len()` 恒为 3 或 8"这类现在会被打破的假设，语义模式的新测试则要显式覆盖 `state.slot_valid`/`state.M_s` |
+| `tests/test_log_kv_cache.py`、`tests/test_log_kv_diag.py` | 分别约 22、3 处直接调用（`grep -c` 实测）。**这一轮更正：上一版"legacy 测试不强制改写"是错的，必须删掉这句话**——`CacheAttentionState` 恒定 10 个字段（§5.14），`get_attention_state(with_stats=False)` 返回的是一个**完整的 10-元组**（不用的字段填 `None`，不是"3 个字段的元组"），`slot_k, slot_v, slot_w = c.get_attention_state(with_stats=False)` 这类 3-变量解包会直接 `ValueError: too many values to unpack`；`with_stats=True` 同理，8-变量解包对上 10-元组同样会炸。`NamedTuple` 支持位置解包，但前提是解包变量数与字段数**完全相等**，不是"随便解包几个都行"——这条前提在 legacy 测试里从不成立。**所有 22+3 处直接调用，不论 legacy 还是语义模式，都必须在同一次改动里迁移成按字段名取值，没有例外、没有过渡期**：这个返回类型改动对**任何模式**都生效（§5.14"`get_attention_state(with_stats=False)` 在任何模式下都返回同一个类型"），不是被 `log_kv_semantic_clusters` 开关裹住的语义模式专属改动，legacy 调用同样会在 Python 层面直接报错，不是"数值算错"这种能被 §5.19-1 字节等价 CI 捕捉的问题——那条 CI 门检查的是"开关关闭时数值是否不变"，管不到"函数签名/返回元组长度变了导致调用方 `ValueError`"这类问题，这两件事是正交的，不能把后者的责任推给前者。 |
 
 **二阶修正的精度应该变好，不是变差**：D1 自检里 width≥8 的失真，根因之一是 Σ 统计在
 post-RoPE 空间——槽内 token 位置不同，`R(p_j)k_j` 之间的差异里混着**位置相位方差**，
@@ -4309,13 +4333,24 @@ Stage 0 全部结论的输入，却一直只有一句"dump 每层每头 pre-RoPE
 >    这条依赖从第一版起就写在第 2 步的说明里，不是这一轮新加的），不是要
 >    部署的代码，写它不构成"要不要投入 Stage 1"这个决策的组成部分。
 > 2. **`log_kv_slot_attention`/`get_attention_state()` 的接口扩展**
->    （`CacheAttentionState`、`slot_valid`、`M_s`）是纯加法式改动——新增
->    可选参数/返回字段，不改变现有调用不传这些参数时的行为，且受 §5.19-1
->    "默认关闭必须逐字节等价"这条 CI 闸门保护。它是本节唯一真正触及
->    `litgpt/log_kv_cache.py` 生产文件的一步，但改动量和风险与第 3–6 步的
->    多簇路由实现不是一个量级——更准确的说法是，**它本身就是 Stage 0 决策
->    门（3b）能够可信的前提**，所以把它划进"S0.8 需要先落地的最小基础设施"
->    比划进"等 Stage 0 结果出来再做的 Stage 1 投入"更准确。
+>    （`CacheAttentionState`、`slot_valid`、`M_s`）——**更正（这一轮修的）：
+>    上一版说这是"纯加法式改动，不改变现有调用不传这些参数时的行为"，这句话
+>    不成立，必须删掉。** `get_attention_state()` 的返回类型对**任何模式**
+>    （包括 legacy）都改成恒定 10 字段的 `CacheAttentionState`（§5.14），
+>    现有位置解包调用（`slot_k, slot_v, slot_w = cache.get_attention_
+>    state(...)` 这类 3-/8-变量解包）在返回值变成 10-元组后会直接
+>    `ValueError: too many values to unpack`——是**breaking 迁移**，不是
+>    加法。真正成立的是：这次迁移**动作本身**是机械的（生产代码 6 处 +
+>    测试约 25 处，全部是"位置解包换成按字段取值"这一种模式，不涉及任何
+>    新算法决策，必须原子完成，见 §5.20-B 调用点迁移清单最后一行的更正
+>    框），且是本节唯一真正触及 `litgpt/log_kv_cache.py` 生产文件的一步，
+>    但改动量和风险与第 3–6 步的多簇路由实现不是一个量级——**它本身就是
+>    Stage 0 决策门（3b）能够可信的前提**，所以把它划进"S0.8 需要先落地
+>    的最小基础设施"比划进"等 Stage 0 结果出来再做的 Stage 1 投入"更准确。
+>    §5.19-1 的"默认关闭字节等价"CI 闸门与这次迁移无关——那条闸门管的是
+>    开关关闭时**数值**是否不变，管不到这里"函数返回元组长度变了、调用方
+>    直接 `ValueError`"这类 Python 层面的接口问题，不能拿来当这次迁移的
+>    安全网。
 >
 > `log_kv_position.py`（第 1 步）已经在 CLAUDE.md §0 的"下一步"清单里被列为
 > 独立于 Stage 0 决策门之外的待办项，这里是同一个先例的延伸，不是新开的口子。
