@@ -649,6 +649,44 @@ def test_sweep_accumulator_reports_genuinely_zero_coverage_not_absent() -> None:
     assert result["covered_token_fraction"] == pytest.approx(0.0)
 
 
+def test_sweep_accumulator_covered_token_fraction_denominator_excludes_uncovered_samples() -> None:
+    # SweepAccumulator.add()'s contract does not forbid mixing coverage-
+    # bearing ladder_meta (vanilla_logkv_compressed_entries's) with
+    # coverage-less ladder_meta (simulate_segment_ladders's, used by the
+    # semantic sweep cells) within one accumulator -- the sweep script
+    # happens not to do this today (each of its three accumulators is fed a
+    # single consistent ladder_meta shape throughout), but the class itself
+    # must not silently fold a coverage-less call's route.cluster_sizes into
+    # covered_token_fraction's denominator, or that call's tokens would drag
+    # the fraction toward 0 despite never having their coverage measured.
+    acc = SweepAccumulator()
+    # A large coverage-less contributor: if its 1000 source tokens leaked
+    # into the denominator, covered_token_fraction would be ~8/1012 (~0.008)
+    # instead of the correct 8/12.
+    acc.add(
+        route=_dummy_route(1000),
+        ladder_meta=_DUMMY_LADDER_META,
+        sh=1.0,
+        summary={"nonpad_entry_count": 1, "real_token_count": 1000, "key_sse": 0.0},
+    )
+    _, meta = vanilla_logkv_compressed_entries(12, b=4, recent_size=4)
+    # sanity, see test_vanilla_logkv_full_cache_entries_appends_recent_tokens_after_compressed
+    assert meta["coverage_token_count"] == 8
+    acc.add(
+        route=_dummy_route(12),
+        ladder_meta=meta,
+        sh=1.0,
+        summary={
+            "nonpad_entry_count": meta["entry_count"],
+            "real_token_count": meta["compactable_token_count"],
+            "key_sse": 0.0,
+        },
+    )
+    result = acc.finalize()
+
+    assert result["covered_token_fraction"] == pytest.approx(8 / 12)
+
+
 def test_value_var_reported_as_none_not_zero_when_any_sample_skipped_it() -> None:
     # --skip_value_var means summarize_entries never puts "value_sse" in summary
     # at all for that call. Reporting a fake 0.0 there reads as "value variance

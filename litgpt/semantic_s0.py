@@ -756,16 +756,19 @@ class SweepAccumulator:
     sweep cells and the single-cluster-b'-budget baseline) has none of them,
     since every token there always lands in some entry, so these fields are
     simply absent (not zero) from accumulators that never saw them.
-    ``covered_token_fraction`` is ``coverage_token_sum / total_source_tokens``
-    across every ``add()`` call that supplied ``coverage_token_count``, where
-    ``total_source_tokens`` comes from ``sum(route.cluster_sizes)`` (present
-    on every call regardless of whether ``ladder_meta`` carries coverage
-    fields). It should read close to 1.0 for ``vanilla_logkv_full_cache_
-    baseline`` (every token is represented, by construction) and well below
-    1.0 for ``vanilla_logkv_compressed_prefix_baseline`` whenever
-    ``token_count`` is not much larger than ``recent_size`` (the exact
-    recent window is not represented there at all -- see
-    ``vanilla_logkv_compressed_entries``'s docstring).
+    ``covered_token_fraction`` is ``coverage_token_sum /
+    coverage_source_token_sum``, where both are accumulated *only* from
+    ``add()`` calls that actually supplied ``coverage_token_count`` in
+    ``ladder_meta`` (``coverage_source_token_sum`` adds that call's
+    ``sum(route.cluster_sizes)``, not every call's -- a call whose
+    ``ladder_meta`` never carried coverage info contributes to neither sum,
+    so it cannot dilute the fraction). It should read close to 1.0 for
+    ``vanilla_logkv_full_cache_baseline`` (every token is represented, by
+    construction) and well below 1.0 for
+    ``vanilla_logkv_compressed_prefix_baseline`` whenever ``token_count`` is
+    not much larger than ``recent_size`` (the exact recent window is not
+    represented there at all -- see ``vanilla_logkv_compressed_entries``'s
+    docstring).
     """
 
     _META_MEAN_KEYS = (
@@ -798,7 +801,7 @@ class SweepAccumulator:
         self.value_var_relative_available: bool = True
         self.meta_sums: dict[str, float] = {k: 0.0 for k in self._META_MEAN_KEYS}
         self.meta_counts: dict[str, int] = {k: 0 for k in self._META_MEAN_KEYS}
-        self.total_source_tokens: float = 0.0
+        self.coverage_source_token_sum: float = 0.0
         self.coverage_token_sum: float = 0.0
 
     def add(
@@ -842,13 +845,25 @@ class SweepAccumulator:
         # entries/vanilla_logkv_full_cache_entries's ladder_meta -- see the
         # class docstring's _META_MEAN_KEYS paragraph for why absence here is
         # not treated as zero).
-        self.total_source_tokens += float(sum(route.cluster_sizes))
         for key in self._META_MEAN_KEYS:
             if key in ladder_meta:
                 self.meta_sums[key] += float(ladder_meta[key])
                 self.meta_counts[key] += 1
         if "coverage_token_count" in ladder_meta:
             self.coverage_token_sum += float(ladder_meta["coverage_token_count"])
+            # Denominator kept in lockstep with the numerator: only accumulate
+            # a call's source-token count here when that same call actually
+            # supplied coverage_token_count. The current sweep script never
+            # mixes coverage-bearing and coverage-less add() calls within one
+            # accumulator (each of the three baseline/sweep-cell accumulators
+            # is fed a single, consistent ladder_meta shape throughout), so
+            # this is presently equivalent to summing route.cluster_sizes
+            # unconditionally -- but SweepAccumulator's contract does not
+            # promise callers won't mix the two, and doing so with an
+            # unconditional denominator would silently fold in source tokens
+            # from samples whose coverage was never measured, understating
+            # covered_token_fraction.
+            self.coverage_source_token_sum += float(sum(route.cluster_sizes))
 
     def finalize(self) -> dict[str, Any]:
         denom = max(self.sample_groups, 1)
@@ -915,8 +930,8 @@ class SweepAccumulator:
         # been compacted yet, per vanilla_logkv_compressed_entries's
         # docstring) -- that 0.0 is a real, reportable measurement, not a
         # "not computed" sentinel, so it must not be suppressed here.
-        if self.meta_counts["coverage_token_count"] and self.total_source_tokens > 0:
-            out["covered_token_fraction"] = self.coverage_token_sum / self.total_source_tokens
+        if self.meta_counts["coverage_token_count"] and self.coverage_source_token_sum > 0:
+            out["covered_token_fraction"] = self.coverage_token_sum / self.coverage_source_token_sum
         return out
 
 
