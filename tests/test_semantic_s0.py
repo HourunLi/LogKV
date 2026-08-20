@@ -14,7 +14,8 @@ from litgpt.semantic_s0 import (
     route_single_cluster_bprime_ladder,
     simulate_segment_ladders,
     summarize_entries,
-    vanilla_logkv_entries,
+    vanilla_logkv_compressed_entries,
+    vanilla_logkv_full_cache_entries,
 )
 
 
@@ -79,10 +80,11 @@ def test_route_dpmeans_accepts_boundary_g_max_values() -> None:
 def test_route_single_cluster_bprime_ladder_is_one_sequential_cluster() -> None:
     # A single-cluster, same-B' position-order CONTROL for isolating what
     # semantic clustering contributes -- NOT the vanilla/existing LogKV
-    # reference (that is vanilla_logkv_entries, tested below): this has no
-    # recent-window carve-out and inserts single raw tokens (w=1) at level 0,
-    # matching the *new* semantic-cluster ladder's mechanics, not vanilla's
-    # real w=2 pairing. See route_single_cluster_bprime_ladder's docstring.
+    # reference (that is vanilla_logkv_compressed_entries/vanilla_logkv_
+    # full_cache_entries, tested below): this has no recent-window carve-out
+    # and inserts single raw tokens (w=1) at level 0, matching the *new*
+    # semantic-cluster ladder's mechanics, not vanilla's real w=2 pairing.
+    # See route_single_cluster_bprime_ladder's docstring.
     route = route_single_cluster_bprime_ladder(5)
     assert route.cluster_ids.tolist() == [0, 0, 0, 0, 0]
     assert route.segment_ids.tolist() == [0, 0, 0, 0, 0]
@@ -113,43 +115,90 @@ def test_route_single_cluster_bprime_ladder_matches_binary_carry_reference() -> 
     assert sorted(e.members for e in entries) == [[0], [1], [2], [3]]
 
 
-def test_vanilla_logkv_entries_no_compaction_below_recent_size() -> None:
-    entries, meta = vanilla_logkv_entries(3, b=4, recent_size=4)
+def test_vanilla_logkv_compressed_entries_no_compaction_below_recent_size() -> None:
+    entries, meta = vanilla_logkv_compressed_entries(3, b=4, recent_size=4)
     assert entries == []
     assert meta["recent_count"] == 3
     assert meta["compactable_token_count"] == 0
 
 
-def test_vanilla_logkv_entries_even_overflow_pairs_oldest_first() -> None:
+def test_vanilla_logkv_compressed_entries_even_overflow_pairs_oldest_first() -> None:
     # T=12, recent_size=4 -> overflow=8 (even): tokens 0..7 compacted as 4
     # consecutive pairs, tokens 8..11 stay exact in the recent window.
-    entries, meta = vanilla_logkv_entries(12, b=4, recent_size=4)
+    entries, meta = vanilla_logkv_compressed_entries(12, b=4, recent_size=4)
     assert meta["recent_count"] == 4
     assert meta["compactable_token_count"] == 8
     assert sorted(e.members for e in entries) == [[0, 1], [2, 3], [4, 5], [6, 7]]
     assert all(len(e.members) == 2 for e in entries)  # vanilla's real w=2 level-0 granularity
 
 
-def test_vanilla_logkv_entries_odd_overflow_compacts_one_extra_token() -> None:
+def test_vanilla_logkv_compressed_entries_odd_overflow_compacts_one_extra_token() -> None:
     # T=13, recent_size=4 -> raw overflow=9 (odd). log_kv_cache.py's
     # _flush_pairs always flushes a complete number of pairs, rounding UP --
     # so one extra token (10 total, not 9) gets compacted and the final
     # recent window ends up holding recent_size-1=3 tokens, not a full 4.
-    entries, meta = vanilla_logkv_entries(13, b=4, recent_size=4)
+    entries, meta = vanilla_logkv_compressed_entries(13, b=4, recent_size=4)
     assert meta["recent_count"] == 3
     assert meta["compactable_token_count"] == 10
     assert sorted(e.members for e in entries) == [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
 
 
-def test_vanilla_logkv_entries_rejects_invalid_parameters() -> None:
+def test_vanilla_logkv_compressed_entries_rejects_invalid_parameters() -> None:
     with pytest.raises(ValueError, match="token_count"):
-        vanilla_logkv_entries(-1, b=4, recent_size=4)
+        vanilla_logkv_compressed_entries(-1, b=4, recent_size=4)
     with pytest.raises(ValueError, match="b must be"):
-        vanilla_logkv_entries(10, b=3, recent_size=4)
+        vanilla_logkv_compressed_entries(10, b=0, recent_size=4)
     with pytest.raises(ValueError, match="b must be"):
-        vanilla_logkv_entries(10, b=0, recent_size=4)
+        vanilla_logkv_compressed_entries(10, b=-1, recent_size=4)
     with pytest.raises(ValueError, match="recent_size"):
-        vanilla_logkv_entries(10, b=4, recent_size=1)
+        vanilla_logkv_compressed_entries(10, b=4, recent_size=1)
+
+
+def test_vanilla_logkv_compressed_entries_accepts_odd_b() -> None:
+    # Unlike simulate_segment_ladders' b_prime, b here must only be positive
+    # -- the real LogStructuredKVCache constructor places no evenness
+    # requirement on B, and compact()'s pairwise merge never needed it either
+    # (it always pairs up a 2*b-length concatenated sequence, even regardless
+    # of whether b itself is). Odd b must not raise.
+    entries, meta = vanilla_logkv_compressed_entries(30, b=3, recent_size=4)
+    assert meta["compactable_token_count"] == 26
+    assert sum(len(e.members) for e in entries) == 26
+
+
+def test_vanilla_logkv_full_cache_entries_covers_every_token_below_recent_size() -> None:
+    # T=3 <= recent_size=4: compressed_entries alone reports 0 entries/0
+    # tokens (correct for "compressed slot variance", undefined so far -- see
+    # vanilla_logkv_compressed_entries's docstring), but the *full* attention
+    # state still has 3 real, w=1 exact slots. full_cache_entries must
+    # represent all of them, each as its own trivial width-1 entry.
+    entries, meta = vanilla_logkv_full_cache_entries(3, b=4, recent_size=4)
+    assert sorted(e.members for e in entries) == [[0], [1], [2]]
+    assert all(len(e.members) == 1 for e in entries)
+    assert meta["compressed_entry_count"] == 0
+    assert meta["recent_entry_count"] == 3
+    assert meta["entry_count"] == 3
+    assert meta["coverage_token_count"] == 3
+
+
+def test_vanilla_logkv_full_cache_entries_appends_recent_tokens_after_compressed() -> None:
+    # T=12, recent_size=4 -> compressed_entries covers [0,8) as 4 pairs (see
+    # test_vanilla_logkv_compressed_entries_even_overflow_pairs_oldest_first);
+    # full_cache_entries must add the remaining [8,12) back as individual
+    # width-1 entries, so every position in [0, 12) is covered exactly once.
+    compressed_entries, compressed_meta = vanilla_logkv_compressed_entries(12, b=4, recent_size=4)
+    entries, meta = vanilla_logkv_full_cache_entries(12, b=4, recent_size=4)
+
+    covered = sorted(pos for e in entries for pos in e.members)
+    assert covered == list(range(12))  # every token accounted for exactly once
+    assert meta["compressed_entry_count"] == len(compressed_entries) == 4
+    assert meta["recent_entry_count"] == 4
+    assert meta["entry_count"] == 8
+    assert meta["coverage_token_count"] == 12
+    # The width-1 recent entries contribute exactly 0 variance -- no special
+    # casing needed in summarize_entries, a single-member entry's mean is
+    # itself, so its SSE is definitionally 0.
+    summary = summarize_entries(np.arange(12, dtype=np.float32).reshape(-1, 1), None, entries)
+    assert summary["real_token_count"] == 12
 
 
 def _run_real_cache_add_recent(
@@ -188,8 +237,8 @@ def _run_real_cache_add_recent(
     ],
 )
 @pytest.mark.parametrize("chunk_size", [1, 3, None])  # None -> recent_size (largest legal single add_recent() call)
-def test_vanilla_logkv_entries_matches_real_cache(token_count: int, b: int, recent_size: int, chunk_size: int | None) -> None:
-    # Validates vanilla_logkv_entries' combinatorial derivation (recent-window
+def test_vanilla_logkv_compressed_entries_matches_real_cache(token_count: int, b: int, recent_size: int, chunk_size: int | None) -> None:
+    # Validates vanilla_logkv_compressed_entries' combinatorial derivation (recent-window
     # carve-out incl. odd-overflow parity, and w=2 level-0 pre-pairing)
     # against the actual LogStructuredKVCache -- not just the shared carry
     # primitive (_append_entry), which test_b_prime_members_relocate_
@@ -199,11 +248,11 @@ def test_vanilla_logkv_entries_matches_real_cache(token_count: int, b: int, rece
     # docstring claims (and this confirms) the final state is chunk-invariant.
     resolved_chunk_size = recent_size if chunk_size is None else chunk_size
     cache = _run_real_cache_add_recent(token_count, b, recent_size, resolved_chunk_size)
-    entries, meta = vanilla_logkv_entries(token_count, b=b, recent_size=recent_size)
+    entries, meta = vanilla_logkv_compressed_entries(token_count, b=b, recent_size=recent_size)
 
     assert cache.recent_count == meta["recent_count"]
 
-    # vanilla_logkv_entries returns a flat list; re-slice it back into
+    # vanilla_logkv_compressed_entries returns a flat list; re-slice it back into
     # per-level groups using meta["level_counts"], which records entries in
     # the same level-by-level order they were appended in (entry width alone
     # cannot recover level assignment once carries land at different depths).
