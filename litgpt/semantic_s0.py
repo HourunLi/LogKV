@@ -202,9 +202,11 @@ def route_single_cluster_bprime_ladder(token_count: int) -> RouteResult:
        different B'/recent_size.
 
     For the actual vanilla-LogKV S0.4 reference point, use
-    ``vanilla_logkv_entries()`` instead, which reproduces all three of the
-    above faithfully (validated against the real LogStructuredKVCache, see
-    tests/test_semantic_s0.py).
+    ``vanilla_logkv_compressed_entries()``/``vanilla_logkv_full_cache_
+    entries()`` instead, which reproduce all three of the above faithfully
+    (validated against the real LogStructuredKVCache, see
+    tests/test_semantic_s0.py) -- see the former's docstring for which of
+    the two to prefer for the S0.4 decision itself.
     """
     token_count = int(token_count)
     if token_count == 0:
@@ -224,10 +226,30 @@ def route_single_cluster_bprime_ladder(token_count: int) -> RouteResult:
     )
 
 
-def vanilla_logkv_entries(token_count: int, *, b: int, recent_size: int) -> tuple[list[OfflineEntry], dict[str, Any]]:
-    """Faithful, position-only reconstruction of the *real* vanilla LogKV's compressed entries.
+def vanilla_logkv_compressed_entries(
+    token_count: int, *, b: int, recent_size: int
+) -> tuple[list[OfflineEntry], dict[str, Any]]:
+    """Faithful, position-only reconstruction of the *real* vanilla LogKV's compressed-prefix entries.
 
-    This is the actual S0.4 "现有位置槽内方差" reference point -- unlike
+    Returns only the entries that have actually been flushed into the
+    compression ladder -- the last ``recent_size`` tokens (or fewer, see the
+    parity note below) that ``add_recent()`` keeps exact are *not* included
+    here at all, not even as trivial width-1 entries. That is deliberate, not
+    an oversight: this function answers "of the tokens vanilla has actually
+    compressed, how much variance sits in each compression slot", which is
+    the S0.4-relevant question when the goal is to judge slot quality without
+    diluting it by ~``recent_size`` structurally-zero-variance exact tokens
+    (see the S0.4 primary/secondary-metric discussion in
+    ``vanilla_logkv_full_cache_entries``'s docstring and ``docs/
+    experiments.md``). When ``token_count <= recent_size`` this returns an
+    empty list -- correctly: vanilla has compressed nothing yet, so
+    "compressed-slot variance" is undefined, not zero. Use
+    ``vanilla_logkv_full_cache_entries`` when you need every token in the
+    prompt accounted for (e.g. as a sanity check that total token coverage
+    matches ``token_count``).
+
+    This -- either this function or ``vanilla_logkv_full_cache_entries`` --
+    is the actual S0.4 "现有位置槽内方差" reference point -- unlike
     ``route_single_cluster_bprime_ladder`` (a single-cluster control built
     from the *new* semantic-cluster ladder's mechanics), this reproduces two
     structural properties specific to the deployed ``LogStructuredKVCache``
@@ -268,21 +290,30 @@ def vanilla_logkv_entries(token_count: int, *, b: int, recent_size: int) -> tupl
     exp/qwen1.7b-32k/base.yaml config) -- named lowercase here, not ``B``,
     per glossary.md's note that bare ``B`` is overloaded across this
     codebase (batch size in tensor-shape comments vs. this per-level entry
-    budget). ``recent_size`` corresponds to ``--log_kv_recent_size`` (1024
-    in that same config).
+    budget). Only required to be a positive integer, matching the real
+    ``LogStructuredKVCache`` constructor, which places no evenness
+    requirement on ``B`` -- unlike ``simulate_segment_ladders``'s
+    ``b_prime``, which *does* require an even value, but for an unrelated
+    reason specific to the semantic design (``PAD_INSERT`` alignment to
+    ``2**l_block`` segment boundaries, a concept vanilla has no equivalent
+    of). ``compact()``'s pairwise merge itself never needed evenness either:
+    it always pairs up a concatenated ``2*b``-length sequence, which is even
+    regardless of whether ``b`` itself is (verified against odd ``b`` in
+    tests/test_semantic_s0.py, not just reasoned about). ``recent_size``
+    corresponds to ``--log_kv_recent_size`` (1024 in that same config).
 
     Validated end-to-end (per-level occupancy *and* per-slot weight/mean, not
     just aggregate counts) against a real ``LogStructuredKVCache`` fed
-    through ``add_recent()`` at several chunk sizes -- see
-    tests/test_semantic_s0.py's ``test_vanilla_logkv_entries_matches_real_
-    cache*`` tests.
+    through ``add_recent()`` at several chunk sizes and both even/odd ``b``
+    -- see tests/test_semantic_s0.py's ``test_vanilla_logkv_compressed_
+    entries_matches_real_cache`` tests.
     """
     token_count = int(token_count)
     if token_count < 0:
         raise ValueError(f"token_count must be non-negative, got {token_count}")
     b = int(b)
-    if b <= 0 or b % 2 != 0:
-        raise ValueError(f"b must be a positive even integer, got {b}")
+    if b <= 0:
+        raise ValueError(f"b must be a positive integer, got {b}")
     recent_size = int(recent_size)
     if recent_size < 2:
         raise ValueError(f"recent_size must be >= 2, got {recent_size} (matches LogStructuredKVCache's own bound)")
@@ -309,9 +340,67 @@ def vanilla_logkv_entries(token_count: int, *, b: int, recent_size: int) -> tupl
         "pad_entry_count": 0,  # vanilla is a single flat ladder -- no segment boundaries to pad
         "compactable_token_count": compactable,
         "recent_count": recent_count,
+        "coverage_token_count": compactable,  # how many of token_count are represented by these entries
         "level_counts": {str(k): int(v) for k, v in sorted(level_counts.items())},
     }
     return entries, meta
+
+
+def vanilla_logkv_full_cache_entries(
+    token_count: int, *, b: int, recent_size: int
+) -> tuple[list[OfflineEntry], dict[str, Any]]:
+    """The full vanilla-LogKV attention state: compressed prefix + exact recent window.
+
+    ``vanilla_logkv_compressed_entries`` alone omits the ``recent_size``
+    tokens ``add_recent()`` keeps exact -- correct for asking "how much
+    variance sits inside each compression slot", but if read as "the entire
+    thing a query would attend to under deployed vanilla LogKV" it silently
+    undercounts: at ``token_count <= recent_size`` the compressed-only view
+    reports ``real_token_count=0``/variance 0 even though the real attention
+    state has ``token_count`` exact, ``w=1`` slots. This function appends
+    those recent tokens back in, each as its own trivial ``OfflineEntry``
+    (width 1, therefore exactly 0 internal variance -- ``summarize_entries``
+    needs no special-casing for this, a width-1 entry's SSE is definitionally
+    0), so every position in ``[0, token_count)`` is covered by exactly one
+    entry.
+
+    **Which of the two functions to use for the S0.4 decision gate**: prefer
+    ``vanilla_logkv_compressed_entries`` as the primary metric. The
+    ``recent_size`` (1024 by default) exact slots this function adds are
+    structurally zero-variance regardless of content, so folding them into a
+    token-weighted average dilutes the "is compression itself doing well"
+    signal -- more so the smaller ``token_count`` is relative to
+    ``recent_size``. Use this full-cache version as a secondary sanity check
+    (e.g. confirming total token coverage equals ``token_count``, or as an
+    end-to-end reference if what is actually needed is "the whole state a
+    query attends to"), and always report which one a given number came
+    from -- they answer different questions and are not interchangeable.
+
+    Meta adds ``compressed_entry_count``/``recent_entry_count`` (the latter
+    numerically equal to ``recent_count`` here, since every recent token
+    becomes exactly one width-1 entry, but conceptually distinct: one counts
+    tokens still held exact, the other counts ``OfflineEntry`` objects
+    created for them) on top of ``vanilla_logkv_compressed_entries``'s
+    fields; ``entry_count``/``coverage_token_count`` are overwritten to
+    reflect the full (compressed + recent) picture rather than the
+    compressed-only one.
+    """
+    entries, meta = vanilla_logkv_compressed_entries(token_count, b=b, recent_size=recent_size)
+    recent_start = meta["compactable_token_count"]
+    full_entries = list(entries)
+    for pos in range(recent_start, int(token_count)):
+        full_entries.append(OfflineEntry(members=[pos]))
+
+    full_meta = dict(meta)
+    full_meta.update(
+        {
+            "compressed_entry_count": len(entries),
+            "recent_entry_count": len(full_entries) - len(entries),
+            "entry_count": len(full_entries),
+            "coverage_token_count": int(token_count),
+        }
+    )
+    return full_entries, full_meta
 
 
 def route_dpmeans_segments(

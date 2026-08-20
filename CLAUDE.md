@@ -555,6 +555,66 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-20｜第三十一轮：`vanilla_logkv_entries()` 拆成两个口径——
+  `vanilla_logkv_compressed_entries()`（只算已压缩前缀,S0.4 主判定）+
+  `vanilla_logkv_full_cache_entries()`（补上 recent window 精确 token,
+  sanity check）；`--vanilla_B` 的偶数限制是抄错的,放宽为只要求正整数。**
+  动机：上一轮（第三十轮）刚把 baseline 改名改对,这一轮的审查指出两处更深的
+  问题——一处是"槽内方差算的是哪些 token"这个口径本身有歧义,另一处是校验条件
+  copy 错了源头。逐条结论：
+  ① **P2：`vanilla_logkv_entries()` 只返回已经 flush 进压缩 ladder 的 entry,
+  recent window 里的精确 token 完全不参与统计。** `T <= recent_size` 时
+  `real_token_count=0`、`entry_count=0`、方差读数是 0——如果这份 baseline 被
+  理解成"完整 deployed LogKV attention state 的槽内方差",这个 0 会被误读成
+  "方差极小",实际是"还没压缩任何东西,这个量根本没定义"。**这不是要不要修的
+  问题,是"回答的是哪个问题"从一开始就没写清楚**：S0.4 到底关心"被压缩的旧
+  token 在现有位置槽里方差多大"，还是"整个 attention state（含精确窗口）平均
+  下来方差多大"，是两个不同的量,混着报告会让读结果的人以为只有一个数字。
+  **修法**：函数改名为 `vanilla_logkv_compressed_entries()`（行为不变,只是
+  docstring 显式声明"只算压缩前缀,`T<=recent_size` 时返回空列表是正确的
+  『还没压缩』,不是『方差为零』"）,新增 `vanilla_logkv_full_cache_entries()`
+  ——复用前者的压缩 entry,再把 `[compactable_token_count, token_count)` 范围
+  内的 recent token 各自补一个 `OfflineEntry(members=[pos])`（宽度 1,`summarize_
+  entries` 不需要特判,单成员 entry 的 SSE 定义上就是 0）,新增 meta 字段
+  `compressed_entry_count`/`recent_entry_count`/`coverage_token_count`（后者
+  = 压缩前缀口径下等于 `compactable_token_count`,full-cache 口径下等于
+  `token_count`,两者用同一个字段名让"这份 baseline 覆盖了多少 token"可以
+  跨口径直接读)。sweep 脚本相应输出两个字段
+  （`vanilla_logkv_compressed_prefix_baseline_by_layer_group`/
+  `vanilla_logkv_full_cache_baseline_by_layer_group`）,各自的 note 都显式写明
+  **S0.4 决策门以 compressed-prefix 为主**——full-cache 版本会被
+  `vanilla_recent_size`（默认 1024）个结构性零方差的精确槽稀释,`token_count`
+  越接近 `recent_size` 稀释效应越明显,量的是"整个上下文覆盖得好不好"而不是
+  "压缩本身好不好",两者不能互相替代,只能一个当主判定、一个当 sanity check。
+  用合成数据端到端验证了稀释效应确实存在且方向正确：`T=3000,recent_size=
+  1024`（精确窗口占约 34%）时 compressed-prefix 的 `token_weighted_key_var
+  ≈100.0`,full-cache 版本 `≈65.9`——明显更低,且 `entry_count_mean` 精确等于
+  `988(压缩)+1024(精确)=2012`,验证了两个口径不是同一份计算的重复,且稀释
+  方向与文档描述一致；`T=500<recent_size=1024` 时 compressed-prefix 正确产出
+  0 个 entry,full-cache 正确产出 500 个宽度为 1 的 entry（方差仍是 0,但这次
+  是"500 个 token 全部精确保留、真实方差为零"，不是"没有数据"）。
+  ② **P3：`--vanilla_B` 被要求是正偶数,但真实 `LogStructuredKVCache` 构造器
+  对 `B` 没有这个限制。** 核对确认这个限制是从 `simulate_segment_ladders` 的
+  `b_prime` 校验原样搬过来的,但两者要求偶数的原因根本不同——`b_prime` 的偶数
+  要求是为了服务语义设计独有的 `PAD_INSERT` 对齐（填充到 `2^ℓ_block` 边界,
+  §5.11）,vanilla 没有 segment/padding 概念,不需要这个约束。深挖 `compact()`
+  的配对逻辑发现这个限制在数学上也站不住脚：它把两个 `b` 宽的 block 拼成
+  `2b` 长再按 `(2i,2i+1)` 配对,`2b` 恒为偶数,配对天然不依赖 `b` 本身的奇偶性
+  ——`_append_entry` 的进位逻辑同理（`combined=levels[level]+block` 长度恒为
+  `2*b_prime`）。**用与上一轮同样严格的方式验证**（`B∈{3,5,7}` 的奇数配置,
+  多种 `add_recent()` chunk size,逐层逐槽比较真实 cache 与推导结果，不只对
+  总数）,确认奇数 `B` 与真实 cache 完全吻合。**修法**：
+  `vanilla_logkv_compressed_entries`/`--vanilla_B` 的校验从"正偶数"放宽为
+  "正整数",docstring/help text 显式对比"为什么这里不需要偶数,`b_prime` 为
+  什么需要"，避免以后又被当成同一件事抄反。
+  **验证**：`pytest tests/test_semantic_s0.py tests/test_semantic_s0_sweep.py
+  tests/test_semantic_stage0_dump.py tests/test_log_kv_cache.py` 全部跑通,
+  206 个测试通过（新增 `vanilla_logkv_full_cache_entries` 的 2 个单测、
+  `vanilla_logkv_compressed_entries` 接受奇数 `b` 的 1 个单测,原先"`b=3`
+  应该报错"的用例改成"`b=-1` 应该报错"，净增 3）；`ruff check` 核对确认本轮
+  未引入新 lint 问题（3 条 import 顺序/`Iterable` 提示是本轮之前就有的,均不在
+  本轮触碰的代码行上)。
+
 - **2026-08-20｜第三十轮：`position_baseline` 从未真正是"现有 LogKV"——改名为
   `single_cluster_bprime_baseline`（诚实标注为"同 B′ 单簇位置序对照组"），另加
   一个真正忠实复现 vanilla LogKV 的 `vanilla_logkv_baseline`（`log_kv_B=512`/
