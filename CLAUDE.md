@@ -119,13 +119,24 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
    `η`，`route_dpmeans_segments` 结构上不支持）都还没有实现**。**S0.8 全部
    三项都还没法跑，不只是 3b**——它比较的是"批量近似路由 vs 严格串行参考"，
    `semantic_s0.py` 的 `route_dpmeans_segments` 只是**严格串行**那一侧的参考
-   实现，§5.4 的批量近似路由（Phase 1/2/3 向量化、冻结 centroid）完全没有
-   对应代码，缺了另一侧就无法算任何分歧率。3b 额外还需要 `litgpt/log_kv_
-   position.py`（下一项）、§5.4/§5.18 第 2 步的 CPU 参考路由（严格串行路由
-   已有雏形，但还没接上 anchor/ladder 的完整 attention 读出比较）、以及
+   实现（`cache_serial`），缺的另一侧是 `cache_batch`——**§5.4 Phase 1/2/3
+   批量近似算法的朴素 CPU 实现（伪代码逐字翻译成普通 Python 循环，不做任何
+   向量化），完全没有对应代码，缺了它就无法算任何分歧率**。
+
+   > **这里必须显式分清一件事，否则会把 S0.8 变成循环依赖：`cache_batch`
+   > 要的是 §5.4 算法的朴素 CPU 实现，不是第 4 项"生产代码"里"多簇路由的
+   > 向量化实现"那份东西——两者是不同的制品。** 如果不拆开，字面上会读成
+   > "S0.8（Stage 0 决策门）需要先有第 4 项（被这道决策门挡住的 Stage 1
+   > 投入）才能跑"，逻辑倒转。`cache_batch` 的朴素版和 `cache_serial` 一样
+   > 廉价、一样是测试脚手架，不构成"是否投入 Stage 1"这个决策的组成部分；
+   > 完整论证见 `algorithm-spec.md` §5.18 第 2 步的更正框。
+
+   3b 额外还需要 `litgpt/log_kv_position.py`（下一项）、`cache_serial`/
+   `cache_batch` 这两份朴素 CPU 参考实现接上 anchor/ladder 的完整 attention
+   读出比较（`cache_serial` 已有雏形）、以及
    `log_kv_slot_attention()`/`get_attention_state()` 按 §5.14/§5.20-B 扩展出的
-   `CacheAttentionState`/`slot_valid`/`M_s` 先落地——这三块是让 3b 这个决策门本身
-   可信的最小基础设施（CPU 参考路由是测试脚手架；`CacheAttentionState` 的扩展
+   `CacheAttentionState`/`slot_valid`/`M_s` 先落地——这几块是让 3b 这个决策门本身
+   可信的最小基础设施（两份 CPU 参考路由是测试脚手架；`CacheAttentionState` 的扩展
    **不是纯加法式改动，是一次 breaking 的返回类型迁移**——`get_attention_
    state()` 在任何模式下都改返回恒定 10 字段的 `CacheAttentionState`，现有约
    30 处位置解包调用点必须原子迁移，否则直接 `ValueError`；字节等价 CI 闸门管
