@@ -1177,6 +1177,18 @@ def scan_op_log_for_ward_events(
                 f"释放出来的槽立即交给这个 orphan 的新簇使用，这里违反了这条"
                 f"约定）")
         if op.type == NEW_CLUSTER:
+            if pending is None:   # 没有紧邻的 WARD_MERGE 腾位——见下方更正框⑤,
+                                    # 这条 NEW_CLUSTER 只能是 K 未满/冷启动分支
+                assert epoch.get(op.cluster, -1) == -1, (
+                    f"scan_op_log_for_ward_events: NEW_CLUSTER 写入的槽 "
+                    f"{op.cluster} 之前已经被用过（scanner 记录的当前 epoch="
+                    f"{epoch.get(op.cluster, -1)}），但这条 NEW_CLUSTER 前面"
+                    f"没有 pending 的 WARD_MERGE 为它腾位。按 §5.6 的 K 未满/"
+                    f"K 已满两分支表：K 未满/冷启动的 NEW_CLUSTER 只能落在"
+                    f"从未 alive 过的槽上（`epoch` 恒为 -1）；已经被用过的槽"
+                    f"要复用必须先经过 WARD_MERGE（会在这里留下 pending 记录）"
+                    f"——这条 op 两者都不满足，说明 K 未满分支选中了一个不该"
+                    f"选的、已经在用的槽")
             epoch[op.cluster] = epoch.get(op.cluster, -1) + 1
             ident = (op.cluster, epoch[op.cluster])
             sketches[ident] = minhash_of_token(op.token_idx)
@@ -1235,7 +1247,7 @@ def scan_op_log_for_ward_events(
     return ward_events, epoch, parent, sketches, sizes, pending
 ```
 
-> **更正（这一轮修的）：四处此前会静默吞掉 bug，必须改成硬失败。**
+> **更正（这一轮修的）：五处此前会静默吞掉 bug，必须改成硬失败。**
 > ① **`pending`/`NEW_CLUSTER` 的紧邻关系此前只是"等到了就消费"，从不校验
 > "等到的是不是它"。** 原循环只在 `op.type == NEW_CLUSTER` 分支内部检查
 > `pending is not None`，中间如果插了一条 `JOIN`/`NEW_SEGMENT`/
@@ -1297,6 +1309,32 @@ def scan_op_log_for_ward_events(
 > `find()`）。这条检查独立于③——③ 抓的是"合并之后新簇建在了错误的槽上"，
 > ④ 抓的是"合并本身的输入操作数就已经引用了一个不该存在的身份"，两种输入
 > 都会在功能上"看起来能跑"，只有分别加断言才能都拦住。
+> ⑤ **`NEW_CLUSTER` 分支只在"紧邻 pending 的 WARD_MERGE"这条路径上校验过
+> （③），"没有 pending 时凭空冒出一个 NEW_CLUSTER"这条路径完全没有校验。**
+> 按 §5.6 的 K 未满/K 已满两分支表：K 已满时复用一个槽必须先经过 Ward 合并
+> （会在这里留下 `pending`）；K 未满/冷启动时选的必须是"从未 `alive` 过"的
+> 槽（`(~alive).float().argmax(-1)`，第一个空位）。这意味着一条没有
+> `pending` 的 `NEW_CLUSTER`，它写入的槽在 scanner 的 `epoch` 记录里必须
+> 是"从未见过"（`epoch.get(op.cluster,-1) == -1`）——上游若有 bug 让 K 未满
+> 分支错误地选中了一个其实已经在用的槽（比如"空位"判定逻辑本身有 bug），
+> 这个函数此前不会发现，会直接把它当成一次合法的新增身份处理，静默地让
+> 两个不同的逻辑簇共享同一个物理槽而不触发任何冲突信号。**修法**：
+> `pending is None` 分支下追加 `assert epoch.get(op.cluster,-1) == -1`。
+> 和①②③④一样，这条检查独立捕捉一种③④都覆盖不到的输入：③④校验的是
+> "跟在 WARD_MERGE 后面的 NEW_CLUSTER 对不对"，这条校验的是"不跟在
+> WARD_MERGE 后面的 NEW_CLUSTER 对不对"，两类路径互斥、合起来才是
+> `NEW_CLUSTER` 的完整校验面。
+>
+> **这五处校验目前只加在 `scan_op_log_for_ward_events` 里，姊妹函数
+> `scan_op_log`（S0.8 cluster assignment divergence/co-assignment 用的
+> 主解析器，见 `experiments.md` S0.8 第①项）完全没有——这是刻意的，不是
+> 遗漏：`scan_op_log` 的存在理由就是"足够简单、足够小，容易独立确信正确"
+> （§5.4"不改 `scan_op_log` 本身"一节），继续往里堆断言会削弱这个理由。
+> 需要这五类校验时，调用方应该先对同一段 `op_log` 跑一遍
+> `scan_op_log_for_ward_events`（哪怕丢弃它的 `WardEvent`/sketch 输出，
+> 只要它的断言全部通过），把它当一次独立的合法性校验，再放心调用
+> `scan_op_log`/`resolve_final_slots` 去算真正要的东西——`experiments.md`
+> S0.8 一节已经据此更新为显式要求这个先后顺序。**
 
 **典型用法（分段串联，末尾断言 `pending` 已被消费干净）**：
 
@@ -3027,12 +3065,25 @@ flatten 成一维），**不覆盖、也不需要覆盖 exact 尾部**。
 > M=1`，`log(w_s/M_s) = log(1/1) = 0`，和现有（未引入语义簇之前）对
 > exact 槽的 mass bias 行为完全一致，不需要调用方为这段额外构造
 > `M_s`，函数内部对 `S_pooled` 之外的位置隐式按 `M_s≡1` 处理。
+>
+> **更正（这一轮修的）：上一版这个签名把 `lam` 整个漏掉了。** 真实现有签名
+> （`litgpt/log_kv_cache.py:1477-1497`）是 `q, slot_k, slot_v, slot_w,
+> scale, mask=None, lam=1.0, causal_tail=0, slot_sigma_u=None, ...`——
+> `lam`（mass bias 系数，即 `log_kv_lambda`，见 §5.1 参数表）排在 `mask`
+> 和 `causal_tail` 之间，是**现有**参数，不是这次改动新增或移动的。上一版
+> 只列出"不变"的 `mask`/`causal_tail` 和"新增"的 `slot_valid`/`M_s`，中间
+> 漏了 `lam`，容易被读成"这个参数被顺带移除或换位置了"。`lam` 本身**不受
+> 这次改动影响**——`λ·log(w_s/M_s)` 公式里的 `λ` 就是这个 `lam`，语义
+> 簇路径只改了这个公式除以什么（`w_s/M_s` 而不是 `w_s`），没有改 `lam`
+> 本身的传参方式，补全签名只是让这一点在这里也看得见。
 
 ```python
 def log_kv_slot_attention(
     q, slot_k, slot_v, slot_w, scale,
-    mask=None,           # 不变：(T_q, S) bool，仍与 causal_tail 互斥
-    causal_tail=0,        # 不变：仍要求 causal_tail == T_q
+    mask=None,             # 不变：(T_q, S) bool，仍与 causal_tail 互斥
+    lam=1.0,                # 不变：mass bias 系数（log_kv_lambda），排在
+                             # mask 和 causal_tail 之间，这次改动没有移动它
+    causal_tail=0,          # 不变：仍要求 causal_tail == T_q
     slot_valid=None,      # 新增：(B, G, S_pooled) bool，只盖 pooled 前缀，
                            # 可以和 causal_tail 同时使用，也可以和 mask 同时使用
                            # ——它和另外两者不是同一个轴（entry 级有效性 vs
@@ -3112,13 +3163,39 @@ respects 逐 token 因果关系，且这条路径下的输出与"手工构造等
 （`log_kv_semantic_clusters=True`），不是某个新增的调用参数——是否需要
 `slot_valid`/`M_s` 完全由 cache 是不是语义簇模式决定，调用方没有"要不要"的
 选择权，也就不存在"忘了传"这种调用方过失（只要 `get_attention_state()` 自己
-写对）。`S_pooled=0`（尚无 pooled 内容，例如序列还没触发过一次 flush）时
-`slot_valid`/`M_s` 是空张量（`shape[-1]=0`），不是 `None`——`log_kv_slot_
-attention` 内部按"`S_pooled` 的宽度"而非"是否为 `None`"决定要不要应用这层
-掩码，空张量下这层 `masked_fill_` 天然是 no-op，不需要特判。**位置分桶
-（legacy）模式永远不产出 `slot_valid`/`M_s`**（值恒为 `None`）——它从不做
-锚点展开，没有"重复/无效虚拟槽"这个概念，`None` 在这条路径上是合法的稳定值，
-不是"忘了实现"的占位符。
+写对）。
+
+> **更正（这一轮修的）：上一版"`S_pooled=0` 时是空张量"这句话和 §5.13"读出
+> 不需要 gather"一节的既有设计直接矛盾，必须收回。** §5.13 明确"entry 躺在
+> 固定位置，`get_attention_state()` 只要 `reshape` 成
+> `(B,G,K_max·L_alloc·B′,·)`"，§5.14"per-entry→per-virtual-slot 展开"一节
+> 据此把 `S_pooled` 定义为 `w.shape[-1]*3`，其中 `w` 就是这个 reshape 出来的
+> **固定宽度** `K_max·L_alloc·B′` 张量——这是"矩形预分配"这条贯穿全篇的架构
+> 决定的直接推论：entry 存储从不随实际占用量收缩或增长，`w=0` 的槽（从未写入
+> 过或已被 §5.11 显式 pad）和 `w>0` 的真实内容槽躺在同一个固定形状的张量里，
+> 靠 `w>0`/`slot_valid` 掩码区分，不靠改变张量宽度区分。**`S_pooled` 因此是
+> 一个只由 `K_max/L_alloc/B′` 决定的编译期常量，恒等于
+> `K_max·L_alloc·B′·3`，不随"是否已经 flush 过""pooled 里有多少真实内容"
+> 变化——序列刚开始、一次 flush 都还没发生时，`S_pooled` 依然是这个满值，
+> 只是这满值里的每一个槽此刻都 `w=0`，`slot_valid` 因此在整个 `S_pooled`
+> 宽度上恒为 `False`，不是张量本身缩成宽度 0。** 唯一让 `S_pooled` 变成 0 的
+> 情形是 `K_max=0` 或 `L_alloc=0` 或 `B′=0`（配置错误，不是运行时状态）。
+>
+> **这个更正带来一个必须显式处理的后果：pooled 区域整体无效时，`softmax`
+> 的这一段分数会整体是 `-inf`，调用方不能假设"总有几个 pooled 槽有效"。**
+> 但这不会导致某个 query 的整行分数全 `-inf`（那才是真正危险的、会让 softmax
+> 产出 NaN 的情形）——`causal_tail`/recent window 覆盖的 exact 后缀**不受
+> `slot_valid` 约束**（§5.14"新增第三个掩码参数"一节：`slot_valid` 只覆盖
+> pooled 前缀），且任何走过 `log_kv_chunk_attention`/`LogKVStreamTraining
+> Attention.forward()` 的 query 位置至少能因果地看到它自己所在的 in-flight
+> chunk，这部分从不被掩码，所以每一行分数向量恒有至少一个有限值，softmax
+> 恒良定义。这条不变量值得写进单测：构造一个"pooled 区域整体无效（序列刚
+> 开始）"的合成场景，断言 softmax 输出不含 NaN/Inf，且数值上等价于"pooled
+> 区域根本不存在，只对 exact 后缀做 attention"。
+
+**位置分桶（legacy）模式永远不产出 `slot_valid`/`M_s`**（值恒为 `None`）——
+它从不做锚点展开，没有"重复/无效虚拟槽"这个概念，`None` 在这条路径上是合法
+的稳定值，不是"忘了实现"的占位符。
 
 **这个决定顺带暴露了一个更大的接口问题，必须一并解决**：`get_attention_
 state()` 现有实现（`log_kv_cache.py:1246-1369`）按 `with_stats` 布尔值返回
@@ -3215,6 +3292,29 @@ directions` 对 `sigma_u`/`gamma_a` 同样要展开成 3 个虚拟槽、同样�
 `slot_sigma_u`/`slot_gamma_*` 的展开顺序；如果日后需要验证"批量近似路由 +
 二阶修正"组合起来是否也保持一致，那是一个独立的、需要新起一项的实验，不是
 往 3b 里加参数。**
+
+**这个范围决定留下一个必须显式接住的后果（这一轮补的）**：3b 只保证 rank-1
+Σ/Γ 旋转数学正确（本节两条单测），从没有任何测试覆盖过"批量近似路由/
+compaction 下，Σ/Γ 的聚合状态本身（`sigma_u`/`sigma2`/`gamma_a`/
+`gamma_b`/`gamma` 经 `compact()`/`_binary_carry()` 的 Chan-merge 累积出的
+值）是否也和严格串行参考一致"——Σ/Γ 的 Chan-merge 依赖的正是 3b 在测的
+那同一套路由/compaction 结构（哪些 token 被合并进哪个 entry），3b 已经
+证明的"路由分歧 <5%"不能自动推出"Σ/Γ 聚合分歧也 <5%"，这是一个未经
+验证的推论，不是已经覆盖的情形。§7 消融表"rank-1 Σ/Γ"一行把"关/现有
+构造/delta-rule 构造"列为独立扫描轴，"现有构造"这一档一旦在 Stage 2 跑
+eval，就是在没有类似 3b 这样的批量 vs 严格串行验证的情况下，把一条完全
+未经验证的数值路径喂进真实模型输出——不能假设它"大概率也没事"。
+
+**决定：Stage 1 的语义簇初次实现里，`second_order_scale` 默认固定为 0**
+（等价于 §7 消融表"rank-1 Σ/Γ"一行的"关"这一档），和 v1 不碰训练目标
+（CLAUDE.md §10 pin 系列死因清单、本文档"训练梯度"一节）是同一类范围
+决定——先把能验证的部分（一阶路由/compaction，3b 覆盖）钉实，再决定要不要
+扩大范围，而不是在没有验证手段的地方直接打开开关。**"现有构造"这一档要
+在 Stage 2 跑之前，必须先有一个类似 3b、专门针对 `with_stats=True` 路径
+的独立验证（可以叫 3c，但这里不展开定义它的具体做法——3b 现在已经足够复杂，
+提前把 3c 的细节也定死容易在 Σ/Γ 尚未启用时就锁死一个可能不合适的设计；
+真正要开这个口子时再照着 3b 的模式单独设计）**，在那之前"rank-1 Σ/Γ"这一行
+的消融只能停留在"关"这一档，"现有构造"/"delta-rule 构造"两档不能跑。
 - **嵌套精确性**：单 token entry（`p_lo=p_hi=p_mid`）→ M=1，输出与 `model.apply_rope`
   在该位置上逐位一致。
 - **合并的结合律**：任意二叉合并顺序**逐位一致**——`sum_wp` 是整数加法，这条应当
@@ -3404,9 +3504,24 @@ directions` 对 `sigma_u`/`gamma_a` 同样要展开成 3 个虚拟槽、同样�
 | `compact()` 签名 | 多带 `(p_lo, p_hi, sum_wp)` 走 `merge_anchors`，一行 |
 | `n_c` | 拆成 `n_eff`（centroid 混合，`γ` 衰减）和 `n_total`（Ward 代价 + §5.8 空间界，单调不减）——原来单个 `n_c` 两处混用会让 Ward 误判长历史簇是"小簇"（§5.5/§5.6 的更正框）|
 | mass bias | `λ·log(w)` → `λ·log(w/M)`（§2.3，必须做的正确性修正）|
-| `get_attention_state()` | 多返回一个有效位掩码与每 entry 的 `M_s` |
+| `get_attention_state()` 返回类型 | **这一轮更正**：不是"多返回一个字段"这么简单——返回类型从裸位置元组改成 §5.14"slot_valid/M_s 在语义模式下不是可选项"一节新增的 `CacheAttentionState`（具名结构），语义模式下无条件带上 `slot_valid`（entry 级有效位掩码去重后展开到 per-virtual-slot）与 `M_s`（同样是 per-virtual-slot，不是"每 entry 一个"字面意义上的粒度，值在同一 entry 的 3 个虚拟槽间相同，见 §5.14"per-entry→per-virtual-slot 展开"一节） |
+| `get_attention_state()`/`append_exact_tokens()` 的调用点 | **不只是这两个函数自己的定义要改，所有消费它们返回值的调用点都要跟着从位置解包换成按字段取值**，见下面单独一行的完整清单 |
 | cache 入口 | 收 pre-RoPE k + 绝对位置，而不是 post-RoPE k |
 | `level_w`/entry `w` 的 dtype | 不能继承 activation dtype（现有 `log_kv_cache.py:346-349` 是 `torch.zeros(..., dtype=dtype)`，跟着 fp16/bf16 走）。fp16 整数精确表示上限是 2048、溢出上限 65504；1M 上下文下一个高冗余大簇的 `w` 可以到几十万，**必须 fp32 或 int32**，`log(w/M)` 之前再转 fp32 |
+
+**`get_attention_state()`/`append_exact_tokens()` 调用点迁移清单（这一轮补的，
+`CacheAttentionState` 落地时必须机械过一遍，不是自然会跟着改）**——核对当前
+代码库确认的完整调用点列表，都要从"位置解包成 `slot_k, slot_v, slot_w[,
+sigma_u, ...] = ...`"换成"接住一个 `CacheAttentionState`，按字段名取值"：
+
+| 位置 | 现状 |
+|---|---|
+| `litgpt/log_kv_cache.py:1246` | `get_attention_state()` 自己的定义——返回类型改造的起点 |
+| `litgpt/log_kv_cache.py:1435`（`append_exact_tokens()`）| 消费 `get_attention_state()` 的输出、拼接 in-flight chunk，再产出下一层要用的元组——输入输出都要跟着换成 `CacheAttentionState` |
+| `litgpt/log_kv_cache.py:1738/1754`（`log_kv_chunk_attention()`）| 训练流式 attention 的共享构件，`second_order_scale==0.0`/`!=0.0` 两个分支各调用一次 `get_attention_state()` |
+| `litgpt/model.py:1209/1219`、`1284/1338`、`1397/1409` | **三处**独立的流式调用点，每处都是"`get_attention_state()` 接着 `append_exact_tokens()`"这个模式的一次独立重复，三处都要改，不能只改一处漏两处 |
+| `litgpt/log_kv_diag.py:624` | 诊断工具对 `append_exact_tokens()` 的调用，语义簇路径下诊断输出的字段也要跟着扩展，否则诊断工具会在语义模式下悄悄丢信息 |
+| `tests/test_log_kv_cache.py`、`tests/test_log_kv_diag.py` | 分别约 22、3 处直接调用（`grep -c` 实测）。legacy 路径的既有测试预期"返回 3-/8-元组"——`NamedTuple` 同时支持位置解包和按字段访问，legacy 测试不强制改写；但迁移时需要过一遍确认没有 testcase 隐式依赖"返回值就是一个裸 tuple、`len()` 恒为 3 或 8"这类现在会被打破的假设，语义模式的新测试则要显式覆盖 `state.slot_valid`/`state.M_s` |
 
 **二阶修正的精度应该变好，不是变差**：D1 自检里 width≥8 的失真，根因之一是 Σ 统计在
 post-RoPE 空间——槽内 token 位置不同，`R(p_j)k_j` 之间的差异里混着**位置相位方差**，
