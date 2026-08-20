@@ -2,15 +2,29 @@
 """Dump pre-RoPE k/v tensors for SemanticLogKV Stage-0 analyses.
 
 Scope: this implements *mechanism A only* (the cheap post-norm_q/norm_k,
-pre-apply_rope hook -- see docs/experiments.md's "两套机制" section). It is
-sufficient for S0.0-S0.7 (and S0.2's/S0.8's k/v-only sub-items), all of which
-only ever touch k/v, never q. It does **not** implement mechanism B
-(post-RoPE q, ``attn_mass_by_dist``) or the manifest fields that mechanism
+pre-apply_rope hook -- see docs/experiments.md's "两套机制" section), never
+mechanism B (post-RoPE q, ``attn_mass_by_dist``) or the manifest fields that
 depends on (``tail_query_count``, the MinHash triple ``hash_algorithm``/``k``/
 ``master_seed``) -- those are required for S0.8's 3b sub-item and for
 `CLAUDE.md` S13.2's attention-quality-by-distance curve, and are not yet
-implemented anywhere in this repo. Do not read this script's existence as
-"Stage 0 dump is done"; it covers the k/v-only slice of Stage 0.
+implemented anywhere in this repo.
+
+"This dump provides data mechanism A can supply" and "there is an analyzer
+that turns that data into a given S0.x number" are two different claims --
+do not conflate them. This dump's k/v is the only input S0.0/S0.3/S0.4/S0.5/
+S0.6/S0.7 and S0.2's calibration-① and S0.8's k/v-dependent sub-items ever
+need, but that is a statement about *what data those items depend on*, not
+about *what has an analyzer already*. As of this writing, `litgpt/
+semantic_s0.py`'s `SweepAccumulator`/`route_dpmeans_segments` only actually
+compute S0.0, S0.4, S0.5, and S0.2's calibration-①; S0.3 (needle isolation
+rate), S0.6 (anchor-dedup E[M]), and S0.7 (supersession) still need their own
+analysis code written on top of this dump's output, and S0.8 cannot run at
+all yet regardless of dump data (it needs the batch-approximate routing side
+of that comparison, which has no implementation anywhere). S0.1 does not use
+this dump at all -- it is a pure-CPU unit test of `log_kv_position.py` (not
+yet written). Do not read this script's existence as "Stage 0 dump is done";
+it covers the k/v-only slice of Stage 0, and only a subset of that slice has
+an analyzer to go with it.
 
 Example:
     python unused/semantic_stage0_dump.py \
@@ -275,6 +289,13 @@ def main() -> None:
     output_dir = args.output_dir.expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     layers = set(parse_int_list(args.layers))
+    if not layers:
+        raise ValueError(
+            f"--layers {args.layers!r} parsed to an empty set -- this would silently write a "
+            f"manifest with dump.layers=[] and every sample's layers=[] (the hook is armed for no "
+            f"block, so record_pre_rope never fires, and recorded_layers == layers == set() passes "
+            f"the mismatch check below vacuously), not an obviously-wrong empty output"
+        )
     overrides = json.loads(args.config_overrides) if args.config_overrides else None
 
     tokenizer_dir = _resolve_tokenizer_dir(checkpoint_dir, args.tokenizer_dir)
@@ -293,6 +314,13 @@ def main() -> None:
     _assert_layers_are_recordable(model, config, layers)
 
     samples = _load_samples(args.samples, args.prompt, args.max_samples)
+    if not samples:
+        raise ValueError(
+            f"0 samples to dump after loading {args.samples!r} and applying --max_samples="
+            f"{args.max_samples!r} -- this would silently write a manifest with samples=[] and exit "
+            f"0 instead of an obviously-wrong empty output. Pass --max_samples >= 1, or check "
+            f"--samples actually contains rows."
+        )
     key_scale = RunningKeyScale()
     # RunningKeyScale is a generic E||x-xbar||^2 accumulator (see its docstring) --
     # this second instance calibrates value-space scale, since normalizing value
@@ -382,6 +410,13 @@ def main() -> None:
             "save_dtype": args.save_dtype,
             "compressed": bool(args.compressed),
             "hook": "CausalSelfAttention: post norm_q/norm_k, pre apply_rope",
+            # Machine-readable marker for downstream tooling: this manifest only
+            # ever has mechanism-A fields (k_raw/v/s_h/vh/needle spans). A future
+            # mechanism-B (attn_mass_by_dist) or S0.8-3b dump/sweep script must
+            # check this before assuming tail_query_count/MinHash-triple fields
+            # exist here -- they never will, no matter how "kind" reads. Keep in
+            # sync with the module docstring's scope note if this ever changes.
+            "scope": "mechanism_a_kv_only",
         },
         "load_state_dict": {
             "missing_keys": len(load_result.missing_keys),
