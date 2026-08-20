@@ -223,11 +223,23 @@ def _resolve_baseline(payload: dict[str, Any], name: str) -> tuple[str | None, s
         return None, None, []
     candidates: list[str]
     if name == "auto":
-        candidates = [
-            *BASELINE_KEYS["vanilla"],
-            *BASELINE_KEYS["position"],
-            *BASELINE_KEYS["single_cluster"],
-        ]
+        # "auto" only ever resolves to a real vanilla-LogKV baseline field --
+        # never to single_cluster/position. Those are same-B'-budget /
+        # position-order CONTROLS (see route_single_cluster_bprime_ladder's
+        # and single_cluster_bprime_baseline's docstrings in
+        # litgpt/semantic_s0.py and unused/semantic_s0_sweep.py), not the
+        # deployed LogKV, and "position_baseline_by_layer_group" is the exact
+        # field name that used to *be* misread as "the vanilla baseline"
+        # before it was renamed (see BASELINE_KEYS["single_cluster"]'s
+        # backward-compat entry above). Silently falling back to it here
+        # would let a JSON sweep run without a real vanilla baseline still
+        # produce ratio numbers that read as "vs. deployed LogKV" under
+        # --baseline auto (the default). If no real vanilla field is present,
+        # _resolve_baseline returns no rows and build_analysis's caller emits
+        # a warning and skips the baseline comparison entirely -- callers who
+        # actually want the position/single_cluster control must ask for it
+        # explicitly via --baseline single_cluster / --baseline position.
+        candidates = list(BASELINE_KEYS["vanilla"])
     else:
         candidates = list(BASELINE_KEYS[name])
     for key in candidates:
