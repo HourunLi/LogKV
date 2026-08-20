@@ -84,10 +84,18 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 > `litgpt/model.py` 里一个 7 行的 duck-typed 钩子（`_semantic_s0_recorder`，
 > 挂在 `CausalSelfAttention.forward` 的 `norm_q`/`norm_k` 之后、
 > `apply_rope` 之前）——这一套工具链实现的是 `experiments.md`"两套机制"
-> 一节里的**机制 A**，够跑 S0.0/S0.1/S0.3–S0.7（以及 S0.2/S0.8 里只依赖
-> k/v 的子项），**不包含机制 B**（post-RoPE q、`attn_mass_by_dist`）、也
-> 不包含 S0.8 3b 需要的 manifest 字段（`tail_query_count`、MinHash 三元组）
-> ——这两块，以及 S0.8 3b 本身、`litgpt/log_kv_position.py`、CPU 参考路由、
+> 一节里的**机制 A**，**不包含机制 B**（post-RoPE q、`attn_mass_by_dist`）、
+> 也不包含 S0.8 3b 需要的 manifest 字段（`tail_query_count`、MinHash 三元组）。
+>
+> **"机制 A 够用"和"分析代码已经写好"是两件事，不要混为一谈**（下方"下一步"
+> 第 2 项有精确到每个 S0.x 的分解，这里只给结论）：**已经配了现成分析代码、
+> 能直接跑的只有 S0.0、S0.4、S0.5、S0.2 口径①**（`SweepAccumulator`/
+> `route_dpmeans_segments` 已经算出这些量）。**S0.3/S0.6/S0.7 虽然只需要
+> 机制 A 的 k/v 数据，但隔离率/锚点去重/supersession 这几个分析逻辑本身还
+> 没写**；**S0.1 和这份 dump 无关**——它是 `log_kv_position.py`（还没写）的
+> 纯 CPU 单测，`experiments.md` 的 S0.1 行本来就写着"不需要 dump"；**S0.8
+> 无论如何都跑不了**，缺的是批量近似路由（§5.4 Phase 1/2/3），不是数据。
+> 这两块，以及 S0.8 3b 本身、`litgpt/log_kv_position.py`、CPU 参考路由、
 > `CacheAttentionState` 扩展、全部 Stage 1 生产实现，都还没有开始写。
 > 详见 `unused/semantic_stage0_dump.py` 模块 docstring 里的显式 scope 声明。
 
@@ -530,6 +538,76 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-20｜第二十七轮：修掉"数据依赖"和"分析代码已实现"两个概念被混用导致的
+  自相矛盾，把 lm-eval 的版本下界从 `0.4.2` 拉到 `0.4.9`（核对上游源码确认
+  `metadata` 参数直到 0.4.9 才加进 `TaskManager`/`simple_evaluate`），把 dump
+  的 dtype 表同步成 fp32 默认值，给 manifest 加机器可读的 scope 字段，并给
+  sweep/dump 两个 CLI 补上空列表/零样本防呆。** 动机：用户继续对照代码库复核，
+  指出上一轮的措辞留下一处直接自相矛盾，外加一个此前完全没检查过的第三方库
+  版本兼容性问题、一处刚改完 dtype 默认值却没同步的文档表格、以及两处 CLI
+  防呆缺口。逐条结论：
+  ① **P1：CLAUDE.md §0 开头说"够跑 S0.0/S0.1/S0.3–S0.7"，几段之后的"下一步"
+  第 2 项又明确说"S0.1/S0.3/S0.6/S0.7...都还没有实现"，两处直接矛盾。**
+  根子是把两个不同的问题混成了一句话："这份 dump 提供的数据够不够"（S0.1/
+  S0.3/S0.6/S0.7 确实都只需要机制 A 的 k/v，这点没错）和"有没有分析代码把
+  这份数据变成 S0.x 那个数字"（只有 S0.0/S0.4/S0.5/S0.2 口径①有——
+  `SweepAccumulator`/`route_dpmeans_segments` 已经在算这几个；S0.3 的隔离率、
+  S0.6 的锚点去重 `E[M]`、S0.7 的 supersession 判定都还没写分析逻辑；S0.1 甚至
+  根本不需要 dump，是独立于这份工具链的 `log_kv_position.py` 纯 CPU 单测）。
+  **修法**：CLAUDE.md §0 的状态段落、`docs/experiments.md`"Stage 0 dump 规格"
+  一节、`unused/semantic_stage0_dump.py` 的模块 docstring 三处统一改成"数据
+  依赖 vs 分析代码"两句话分开说的表述，不再用一个"够跑 X/Y/Z"笼统带过。
+  ② **P2：`unused/semantic_s0_export_niah_samples.py` 直接调用
+  `TaskManager(metadata=metadata)`，但 `pyproject.toml` 允许的版本范围是
+  `lm-eval>=0.4.2,<0.4.9.1`。** 逐个核对上游 GitHub 标签源码（v0.4.2/v0.4.5/
+  v0.4.7/v0.4.8/v0.4.9）确认：`TaskManager.__init__` 和 `evaluator.
+  simple_evaluate()` 的 `metadata` 关键字参数**直到 0.4.9 才存在**，0.4.2–0.4.8
+  全部没有——而且这不只是这个新导出脚本的问题，`eval.py` 自己的
+  `evaluator.simple_evaluate(..., metadata=metadata, ...)`（`eval.py:1277`）
+  是无条件调用（不判断 `metadata is None`），在 0.4.2–0.4.8 上会对**任何**
+  benchmark 直接 `TypeError`，不止 NIAH。说明 `pyproject.toml` 的下界从一开始
+  就是虚的，实际能跑的只有 `0.4.9`（配合已有的 `<0.4.9.1` 上界，PyPI 上
+  0.4.8 与 0.4.9.1 之间只有 0.4.9 这一个版本）。**修法**：选审查给的第一个
+  选项——把下界改成 `lm-eval>=0.4.9,<0.4.9.1`，加注释说明原因和验证方式；
+  没有改成"改用兼容旧版的 per-task config 注入方式"，因为那需要在导出脚本
+  里重新发明一套 `eval.py` 都不支持的兼容路径，不如把下界改到位诚实。
+  ③ **P2：`docs/experiments.md` 的"dump 什么"表仍写 `k_raw`/`v` 是 fp16，
+  和上一轮刚把 `--save_dtype` 默认值改成 `float32` 的动机（避免标定 fp32、
+  路由读 fp16 的精度错配）直接冲突——文档层面又把这个刚修好的坑挖了回来。**
+  **修法**：表格改成 fp32（`float16` 标注为显式可选项），补一条"更正"框
+  说明原因，同步更新"层子集"一节的体积估算（`2B`→`4B`，5 层子集
+  700MB→1.4GB，全 28 层 3.8GB→7.5GB/条 prompt），保留"若显式传
+  `--save_dtype float16` 数字对半"的说明，不删掉这条路径。
+  ④ **P3：manifest 只有通用的 `kind: "semantic_logkv_stage0_dump"`，没有
+  机器可读的字段说明"这只是机制 A"，未来写机制 B/S0.8 工具的人可能直接
+  假设这份 manifest 已经有 `tail_query_count`/MinHash 三元组。** **修法**：
+  在 `manifest["dump"]` 里加 `"scope": "mechanism_a_kv_only"` 字段（没有
+  改 `kind` 本身——核对确认没有任何现有代码读取这个 `kind` 值做分支判断，
+  改字符串没有兼容性收益，反而不如新增一个专门字段直接、不影响任何现有
+  消费者）。
+  ⑤ **P3：`parse_int_list("")`/`parse_g_max_list("")` 都会静默返回空列表，
+  下游没有拦截。** 核对确认两处真实会静默产出空结果、退出码 0：
+  `unused/semantic_s0_sweep.py` 里 `--g_max ""` 或 `--l_block ""` 会让
+  `g_values`/`l_values` 为空，内层两层 `for` 循环体一次都不执行，但
+  `processed_pairs` 是在**进入**这层循环之前、按 `(layer, group)` 计数的，
+  跟 `g_max`/`l_block` 是否为空无关，所以既有的
+  `if processed_pairs == 0: raise` 兜底完全拦不住这种情况，`overall_by_
+  config`/`by_layer_group` 会双双写成空列表；`unused/semantic_
+  stage0_dump.py` 里 `--layers ""` 会让 `layers=set()`，
+  `_assert_layers_are_recordable` 的两个校验对空集合都是空真值（vacuously
+  true），一条都拦不住，`recorded_layers != layers` 的事后检查也因为两边
+  都是空 `set()` 而判定"相等"，一样拦不住；`--max_samples 0`（或
+  `--samples` 指向空文件）同理，会让 `samples=[]`，主循环直接零次迭代。
+  **修法**：在解析完参数、进入任何耗时工作之前，给这三处新增显式空值
+  拒绝（`if not g_values: raise`/`if not l_values: raise`/
+  `if not layers: raise`/`if not samples: raise`），错误信息里点明"如果不
+  拦，会静默写出一份看起来合法、实际空的 manifest/sweep 结果，退出码 0"，
+  和这两个脚本里已有的 `_assert_layers_are_recordable`/`_assert_checkpoint_
+  loaded_cleanly` 等"宁可拒绝、不可静默"的既有风格保持一致。核对确认
+  `tests/test_semantic_stage0_dump.py`/`tests/test_semantic_s0_sweep.py`
+  都只测独立的辅助函数、不调用 `main()`，这几处新增的检查不会破坏任何
+  现有测试。
 
 - **2026-08-20｜第二十六轮：Stage 0 的 S0.0 级 k/v dump + sweep 工具链已经落地
   （`litgpt/semantic_s0.py`、`unused/semantic_stage0_dump.py`、`unused/

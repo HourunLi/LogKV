@@ -55,7 +55,14 @@ optional-dependencies.extra = [
   "litserve>0.2",
   # lm-eval: pinned <0.4.9.1 due to trust_remote_code issues with datasets like logiqa.
   # See: https://github.com/EleutherAI/lm-evaluation-harness/issues/3171
-  "lm-eval>=0.4.2,<0.4.9.1",
+  # Floor raised to 0.4.9: eval.py unconditionally passes metadata=... to
+  # evaluator.simple_evaluate() (needed for RULER/NIAH's {"pretrained":...,
+  # "max_seq_lengths":...} metadata), but simple_evaluate()/TaskManager.__init__()
+  # only gained a `metadata` kwarg in lm-eval 0.4.9 (confirmed absent in the
+  # 0.4.2/0.4.5/0.4.7/0.4.8 source) -- any version <0.4.9 in the old >=0.4.2
+  # range raises TypeError on every eval.py call, not just NIAH ones. With the
+  # <0.4.9.1 ceiling above, this pins to exactly 0.4.9.
+  "lm-eval>=0.4.9,<0.4.9.1",
   # litgpt.data.prepare_starcoder.py:
   "pandas>=1.9",
   "pyarrow>=15.0.2",
