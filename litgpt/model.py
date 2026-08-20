@@ -699,6 +699,10 @@ class CausalSelfAttention(nn.Module):
         # Last pin selection (batch, groups, n_pin) token indices — kept for
         # introspection and the pinning tests; not used by the forward pass.
         self._log_kv_pin_indices: torch.Tensor | None = None
+        # Optional Stage-0 SemanticLogKV dump recorder. This is deliberately a
+        # duck-typed offline hook so the production path does not import the
+        # analysis code or allocate anything unless a dump script attaches it.
+        self._semantic_s0_recorder: Any | None = None
         self.apply_sliding_window_attention = False
         if config.sliding_window_size is not None and config.sliding_window_indices is not None:
             self.apply_sliding_window_attention = config.sliding_window_indices[block_idx]
@@ -800,6 +804,9 @@ class CausalSelfAttention(nn.Module):
         if self.config.norm_qk and self.config.norm_qk_type == "default":
             q = self.norm_q(q)
             k = self.norm_k(k)
+
+        if self._semantic_s0_recorder is not None:
+            self._semantic_s0_recorder.record_pre_rope(self.block_idx, k, v)
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
         # Partial rotary: the first rope_n_elem dims are the position channel (RoPE'd)
