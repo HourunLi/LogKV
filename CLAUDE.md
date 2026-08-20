@@ -555,6 +555,80 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-20｜第三十轮：`position_baseline` 从未真正是"现有 LogKV"——改名为
+  `single_cluster_bprime_baseline`（诚实标注为"同 B′ 单簇位置序对照组"），另加
+  一个真正忠实复现 vanilla LogKV 的 `vanilla_logkv_baseline`（`log_kv_B=512`/
+  `log_kv_recent_size=1024`，真实 recent window + 真实 level-0 两两预合并）；
+  `--require_needle_span` 检查提前到 forward 之前，避免失败时白跑一次长上下文
+  前向并留下半成品 `.npz`。** 动机：上一轮（第二十九轮）加的 `position_baseline`
+  被审查指出根本不是"现有 LogKV"——它用 sweep 自己的 `b_prime`（默认 8）而非
+  真实部署配置的 `log_kv_B=512`（`exp/qwen1.7b-32k/base.yaml:33`），且完全没有
+  `recent_size=1024` 的精确窗口概念。逐条结论：
+  ① **P2 核心问题，且比审查指出的"参数不匹配"更深一层：`route_position_single_
+  ladder` 用的 `_append_entry`（level 0 存单 token,`w=1`）本来就是**新语义设计**
+  的 ladder 约定,不是 vanilla 的。** 直接读 `litgpt/log_kv_cache.py` 的
+  `_flush_pairs`（990-1018 行）确认：vanilla 的 `add_recent()` 溢出时把 recent
+  window 最老的 2 个 raw token **在进入 level 0 之前就先两两预合并成一个 `w=2`
+  的 entry**（`pw = torch.full(...,2.0)`，`pk = frac_a*rk_pairs[...,0]+frac_b*
+  rk_pairs[...,1]`），level 0 从来不存单 token。这与 CLAUDE.md §2.1 早就写明的
+  "ladder 的 level 0 存单 token（w=1），不是现有方案的'2 token 合并'"完全对应——
+  `route_position_single_ladder` 用单 token 插入,复现的其实是**新设计**在"零聚类"
+  端点下的行为,不是 vanilla 的行为,即使把它的 `b_prime`/recent window 参数都
+  改成 512/1024 也不会变成 vanilla（粒度本身就不对）。
+  **修法分两步**：(a) 改名不改行为——`route_position_single_ladder` →
+  `route_single_cluster_bprime_ladder`，docstring 显式列出三点"为什么它不是
+  vanilla"（`b_prime` 而非 `log_kv_B`、无 recent window、level 0 是 w=1 而非
+  w=2）；sweep 脚本变量/字段/note 同步改名
+  （`single_cluster_bprime_baseline_by_layer_group` 等），保留它是因为它回答的
+  是另一个真实问题——"语义分组本身贡献多少,固定住新设计的 ladder 预算/机制不变"，
+  和"vanilla 对照"是两个不同的问题,值得都留着,不是互相替代关系。(b) 新增
+  `vanilla_logkv_entries()`（`litgpt/semantic_s0.py`）：纯组合数学重建 vanilla
+  最终会压缩哪些 token——不跑真实 GPU cache（`level_k_*`/`level_w_*` 合并后只剩
+  均值/权重,不保留成员身份,没法反推 span,真调用真 cache 反而拿不到 S0.4 要的
+  东西）,而是用 T/B/recent_size 三个数纯位置推导。**推导过程里发现一个奇偶性
+  细节,直接写进 docstring 并加测覆盖**：`add_recent()`（1186 行,`flush_len =
+  2*((overflow+1)//2)`）永远整对整对地 flush,`token_count - recent_size` 为奇数
+  时会多压缩 1 个 token,最终 recent window 收尾在 `recent_size - 1` 而不是满
+  `recent_size`——这个边界不写清楚,`vanilla_logkv_baseline` 在奇数长度输入上会
+  静默错开一个 token。sweep 脚本新增 `--vanilla_B`（默认 512）/
+  `--vanilla_recent_size`（默认 1024）,新字段 `vanilla_logkv_baseline_by_
+  layer_group`,与另外两个 baseline 同样按 `(layer, group)` 只算一次（不依赖
+  `(g_max, l_block)`）。
+  **验证方式：不只是推理,是对着真实 `LogStructuredKVCache` 跑出来对拍**——
+  用 `k[i]=i` 这种可反推的确定性输入喂 `add_recent()`（覆盖多种 chunk size：
+  1、3、`recent_size`、整段一次性喂,以及偶数/奇数溢出、`T<recent_size`、
+  `T==recent_size`、触发 level-1 及以上进位等边界）,逐层逐槽比较真实 cache 的
+  `level_w_*`/`level_k_*` 与 `vanilla_logkv_entries()` 推导出的
+  members/mean——不只对总数,新增的
+  `test_vanilla_logkv_entries_matches_real_cache`（参数化,7×3=21 组）全部通过。
+  额外用合成数据做了两次端到端 sweep 脚本验证：交替排列的两个紧凑 blob 上,
+  `single_cluster_bprime_baseline` 和 `vanilla_logkv_baseline` 的
+  `token_weighted_key_var` 接近（≈99.7 vs ≈100.0，符合预期——纯按位置分桶的方案
+  在这种对抗构造下无论 B′/recent_size 怎么调都救不回来,两者应该同样差）,确认
+  没有把同一件事算了两遍；`T=500 < vanilla_recent_size=1024` 时
+  `vanilla_logkv_baseline` 正确产出 0 个压缩 entry（整段都还在 recent window 内,
+  与 vanilla 真实语义一致）,而 `single_cluster_bprime_baseline`（没有 recent
+  window 概念）仍然产出 44 个,证明两个 baseline 确实在回答不同的问题,不是
+  同一份计算的两份拷贝。
+  ② **P3：`--require_needle_span` 的检查放在整段模型前向跑完之后**——失败时
+  `.npz` 已经写到 `output_dir`,且白跑了一次长上下文前向。检查本身只依赖
+  tokenizer/truncation 的结果（`_span_payload` 不需要模型输出）,不需要等到
+  forward 跑完。**修法**：把 `needle_spans = _span_payload(...)` +
+  `_assert_needle_span_present(...)` 挪到 `used_len` 校验之后、
+  `Stage0DumpRecorder` 构造之前,原处不再重复调用。`_assert_needle_span_
+  present` 本身（第二十九轮已作为独立函数抽出）不需要改,四个既有单测覆盖的是
+  函数自身行为,这一轮改的是调用时机,和已有的"main() 不单独测,只测抽出来的
+  helper"这一惯例一致,不新增針对调用顺序本身的测试。
+  **验证**：`pytest tests/test_semantic_s0.py tests/test_semantic_s0_sweep.py
+  tests/test_semantic_stage0_dump.py tests/test_log_kv_cache.py` 全部跑通,
+  203 个测试通过。`test_semantic_s0.py` 净增 25 个（`route_single_cluster_
+  bprime_ladder` 的 3 个是上一轮已有测试原地改名,不算新增；真正新增的是
+  `vanilla_logkv_entries` 的 4 个组合数学单测 + 参数化对拍真实 cache 的
+  `test_vanilla_logkv_entries_matches_real_cache` 展开出的 21 个用例——
+  `pytest.mark.parametrize` 覆盖 7 组 `(T,B,recent_size)` × 3 种 `add_recent()`
+  chunk size）；`ruff check`/对照 `git stash` 确认本轮未引入新 lint 问题（两处
+  import 顺序提示是上一轮提交里就有的,与本轮改动无关）。
+
 - **2026-08-20｜第二十九轮：给 S0.0 sweep/dump 工具链补上四处代码评审发现的
   缺口——S0.4 缺"现有位置槽"baseline、`route_dpmeans_segments`/CLI 缺
   `lambda_new`/`g_max` 的正负值校验、dump 对空/被截断的 needle span 只记录
