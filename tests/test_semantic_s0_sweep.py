@@ -13,6 +13,7 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 
 _effective_g_max = _MODULE._effective_g_max
+_groups_from_key_scale = _MODULE._groups_from_key_scale
 _manifest_sh = _MODULE._manifest_sh
 _manifest_vh = _MODULE._manifest_vh
 _process_record_task = _MODULE._process_record_task
@@ -50,6 +51,14 @@ def test_l_block_zero_reproduces_true_pure_semantic_routing() -> None:
         effective = _effective_g_max(nominal_g_max, l_block=0)
         route = route_dpmeans_segments(k, lambda_new=1.0, g_max=effective, gamma=0.0)
         assert route.cluster_ids.tolist() == route_true_pure_semantic.cluster_ids.tolist()
+
+
+def test_groups_from_key_scale_infers_manifest_group_ids() -> None:
+    manifest = {"key_scale": {"3": {"s_h": [1.0, 2.0, 3.0]}}}
+
+    assert _groups_from_key_scale(manifest, layer=3) == [0, 1, 2]
+    assert _groups_from_key_scale(manifest, layer=4) is None
+    assert _groups_from_key_scale({"key_scale": {"3": {"s_h": "bad"}}}, layer=3) is None
 
 
 def test_manifest_sh_hard_fails_by_default_when_uncalibrated() -> None:
@@ -148,3 +157,48 @@ def test_process_record_task_builds_deterministic_sweep_worker_shard() -> None:
     assert (0, 0) in first["vanilla_logkv_full_cache_baseline"]
     assert len(first["overall"]) == 4
     assert first["by_layer_group"][semantic_key].finalize() == second["by_layer_group"][semantic_key].finalize()
+
+
+def test_process_record_task_can_restrict_to_task_group() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir = Path(tmp)
+        k_raw = np.asarray(
+            [
+                [[0.0], [0.1], [8.0], [0.2]],
+                [[3.0], [3.1], [9.0], [3.2]],
+            ],
+            dtype=np.float32,
+        )
+        v = k_raw.copy()
+        np.savez(base_dir / "sample_0000_layer_00.npz", k_raw=k_raw, v=v)
+        task = {
+            "sample": {"sample_id": "smoke"},
+            "record": {"layer": 0, "path": "sample_0000_layer_00.npz"},
+            "record_i": 1,
+            "record_count": 1,
+            "base_dir": str(base_dir),
+            "scale_manifest": {
+                "key_scale": {"0": {"s_h": [1.0, 1.0]}},
+                "value_scale": {"0": {"s_h": [1.0, 1.0]}},
+            },
+            "g_values": [2.0],
+            "l_values": [1],
+            "group_filter": None,
+            "task_groups": [1],
+            "lambda_rel": 1.0,
+            "seg_forget": 0.5,
+            "b_prime": 2,
+            "vanilla_B": 2,
+            "vanilla_recent_size": 2,
+            "skip_value_var": False,
+            "allow_fallback_sh": False,
+        }
+
+        result = _process_record_task(task)
+
+    assert result["processed_pairs"] == 1
+    assert result["groups_seen"] == {0, 1}
+    assert ("2", 1, 0, 1) in result["by_layer_group"]
+    assert (0, 1) in result["single_cluster_bprime_baseline"]
+    assert all(key[-1] == 1 for key in result["by_layer_group"])
+    assert "[1]" in result["message"]
