@@ -14,6 +14,8 @@ Examples:
     python unused/semantic_s0_analyze.py stage0_dump/s0_sweep.json
     python unused/semantic_s0_analyze.py './stage0_dump/*s0_sweep*.json' --layers 23-26 --top 20
     python unused/semantic_s0_analyze.py stage0_dump/s0_sweep.json --csv stage0_dump/s0_summary.csv
+    python unused/semantic_s0_analyze.py stage0_dump/s0_sweep.json \
+      --csv_by_layer stage0_dump/s0_summary_by_layer.csv
 """
 
 from __future__ import annotations
@@ -836,6 +838,41 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow({name: row.get(name) for name in fieldnames})
 
 
+def _write_csv_by_layer(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write ``best_by_layer`` (one row per layer, its winning config) to CSV.
+
+    ``--csv`` writes ``baseline_comparison`` -- the (g_max, l_block) table
+    aggregated *across* every layer/group -- regardless of whether ``--by_layer``
+    was passed; ``--by_layer`` only ever controlled an extra section of the
+    *stdout* report (``_print_report``'s ``if by_layer and analysis.get(
+    "best_by_layer")`` branch). So there was previously no way to persist the
+    per-layer breakdown at all: a caller who ran ``--by_layer --csv out.csv``
+    got a CSV byte-identical to one without ``--by_layer``, silently. This
+    writer, and the paired ``--csv_by_layer`` flag, close that gap. Note
+    ``analysis["best_by_layer"]`` is computed unconditionally in
+    ``build_analysis`` whenever a baseline resolves (not gated by the
+    ``--by_layer`` CLI flag, which only affects printing), so ``--csv_by_layer``
+    does not require ``--by_layer`` to also be passed.
+    """
+    fieldnames = [
+        "layer",
+        "g_max",
+        "l_block",
+        "score",
+        "key_ratio_median",
+        "value_ratio_median",
+        "key_wins",
+        "key_valid",
+        "group_count",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name) for name in fieldnames})
+
+
 def _write_summary_json(path: Path, analysis: dict[str, Any], *, top: int) -> None:
     compact = dict(analysis)
     compact["config_rankings"] = compact.get("config_rankings", [])[:top]
@@ -871,6 +908,14 @@ def main() -> None:
     )
     parser.add_argument("--worst", type=int, default=8, help="Worst layer/groups to print for --inspect_config")
     parser.add_argument("--csv", type=Path, help="Write the compact baseline-ratio table to CSV")
+    parser.add_argument(
+        "--csv_by_layer",
+        type=Path,
+        help="Write the per-layer best-config table (one row per layer, its winning (g_max,l_block) "
+        "config vs the baseline) to CSV. Independent of --by_layer, which only controls whether this "
+        "table is also printed to stdout -- --csv alone never persists it, so use this flag if you "
+        "need the per-layer breakdown in a file.",
+    )
     parser.add_argument("--summary_json", type=Path, help="Write a compact top-N JSON summary")
     args = parser.parse_args()
 
@@ -928,6 +973,12 @@ def main() -> None:
             raise SystemExit("--csv needs a baseline comparison; pass --baseline other than 'none'")
         _write_csv(args.csv, comparison)
         print(f"\nwrote CSV: {args.csv}")
+    if args.csv_by_layer:
+        best_layers = analysis.get("best_by_layer", [])
+        if not best_layers:
+            raise SystemExit("--csv_by_layer needs a baseline comparison; pass --baseline other than 'none'")
+        _write_csv_by_layer(args.csv_by_layer, best_layers)
+        print(f"wrote per-layer CSV: {args.csv_by_layer}")
     if args.summary_json:
         _write_summary_json(args.summary_json, analysis, top=max(args.top, 1))
         print(f"wrote compact JSON: {args.summary_json}")
