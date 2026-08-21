@@ -12,6 +12,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 NeedleIsolationAccumulator = _MODULE.NeedleIsolationAccumulator
 _draw_random_intervals = _MODULE._draw_random_intervals
+_groups_from_key_scale = _MODULE._groups_from_key_scale
 parse_lambda_rel_list = _MODULE.parse_lambda_rel_list
 _process_record_task = _MODULE._process_record_task
 _surviving_needle_intervals = _MODULE._surviving_needle_intervals
@@ -76,6 +77,13 @@ def test_parse_lambda_rel_list_accepts_comma_separated_values() -> None:
     assert parse_lambda_rel_list([0.75, 1]) == [0.75, 1.0]
 
 
+def test_groups_from_key_scale_infers_group_ids_without_opening_npz() -> None:
+    manifest = {"key_scale": {"3": {"s_h": [1.0, 2.0, 3.0]}}}
+
+    assert _groups_from_key_scale(manifest, 3) == [0, 1, 2]
+    assert _groups_from_key_scale(manifest, 4) is None
+
+
 def test_process_record_task_is_deterministic_for_worker_shards() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         base_dir = Path(tmp)
@@ -138,3 +146,90 @@ def test_process_record_task_is_deterministic_for_worker_shards() -> None:
     ]
     assert first["overall"][(0.5, "2")].finalize()["random_token_count"] == 3
     assert first["overall"][(0.5, "2")].finalize() == second["overall"][(0.5, "2")].finalize()
+
+
+def test_process_record_task_can_process_one_group_subset() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir = Path(tmp)
+        k_raw = np.asarray(
+            [
+                [[0.0, 0.0], [0.1, 0.0], [8.0, 0.0], [0.2, 0.0]],
+                [[1.0, 0.0], [1.1, 0.0], [9.0, 0.0], [1.2, 0.0]],
+            ],
+            dtype=np.float32,
+        )
+        np.savez(base_dir / "sample_0000_layer_00.npz", k_raw=k_raw, v=k_raw.copy())
+        task = {
+            "sample": {
+                "sample_id": "smoke",
+                "prompt_token_offset": 0,
+                "needle_spans": [
+                    {"used_token_start": 2, "used_token_end": 3, "survived_left_truncation": True}
+                ],
+            },
+            "record": {"layer": 0, "path": "sample_0000_layer_00.npz"},
+            "record_i": 1,
+            "record_index": 0,
+            "record_count": 1,
+            "base_dir": str(base_dir),
+            "scale_manifest": {"key_scale": {"0": {"s_h": [1.0, 1.0]}}},
+            "g_values": [float("inf")],
+            "group_filter": None,
+            "task_groups": [1],
+            "lambda_rel_values": [1.0],
+            "seg_forget": 0.5,
+            "b_prime": 2,
+            "random_trials": 1,
+            "seed": 99,
+            "allow_fallback_sh": False,
+            "collect_by_layer_group": True,
+        }
+
+        result = _process_record_task(task)
+
+    assert result["matched_group_pairs"] == 1
+    assert result["processed_pairs"] == 1
+    assert sorted(result["by_layer_group"]) == [(1.0, "inf", 0, 1)]
+
+
+def test_process_record_task_skip_message_keeps_group_task_context() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir = Path(tmp)
+        k_raw = np.asarray(
+            [
+                [[0.0], [0.1], [0.2]],
+                [[1.0], [1.1], [1.2]],
+            ],
+            dtype=np.float32,
+        )
+        np.savez(base_dir / "sample_0000_layer_00.npz", k_raw=k_raw, v=k_raw.copy())
+        task = {
+            "sample": {"sample_id": "smoke", "needle_spans": []},
+            "record": {"layer": 0, "path": "sample_0000_layer_00.npz"},
+            "record_i": 1,
+            "record_index": 0,
+            "record_count": 1,
+            "task_i": 2,
+            "task_count": 4,
+            "base_dir": str(base_dir),
+            "scale_manifest": {"key_scale": {"0": {"s_h": [1.0, 1.0]}}},
+            "g_values": [float("inf")],
+            "group_filter": None,
+            "task_groups": [1],
+            "lambda_rel_values": [1.0],
+            "seg_forget": 0.5,
+            "b_prime": 2,
+            "random_trials": 1,
+            "seed": 99,
+            "allow_fallback_sh": False,
+            "collect_by_layer_group": True,
+            "log_timing": True,
+        }
+
+        result = _process_record_task(task)
+
+    assert result["matched_group_pairs"] == 1
+    assert result["processed_pairs"] == 0
+    assert "task=2/4" in result["message"]
+    assert "groups=[1]" in result["message"]
+    assert "elapsed=" in result["message"]
