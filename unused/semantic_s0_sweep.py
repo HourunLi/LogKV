@@ -217,6 +217,7 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
     vanilla_logkv_compressed_prefix_baseline: dict[tuple[int, int], SweepAccumulator] = {}
     vanilla_logkv_full_cache_baseline: dict[tuple[int, int], SweepAccumulator] = {}
     processed_pairs = 0
+    timing_events: list[dict[str, Any]] = []
 
     with np.load(base_dir / record["path"]) as payload:
         k_raw = payload["k_raw"]
@@ -240,7 +241,8 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
             k_group,
             allow_fallback=bool(task["allow_fallback_sh"]),
         )
-        lambda_new = float(task["lambda_rel"]) * sh
+        lambda_rel = float(task["lambda_rel"])
+        lambda_new = lambda_rel * sh
         vh, vh_source = (
             _manifest_vh(
                 task["scale_manifest"],
@@ -313,15 +315,21 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
         for g_max in g_values:
             g_label = format_g_max(g_max)
             for l_block in l_values:
+                cell_started_at = time.perf_counter()
                 effective_g_max = _effective_g_max(g_max, int(l_block))
+                effective_g_label = format_g_max(effective_g_max)
                 route = route_cache.get(effective_g_max)
+                route_cached = route is not None
+                route_elapsed = 0.0
                 if route is None:
+                    route_started_at = time.perf_counter()
                     route = route_dpmeans_segments(
                         k_group,
                         lambda_new=lambda_new,
                         g_max=effective_g_max,
                         gamma=float(task["seg_forget"]),
                     )
+                    route_elapsed = time.perf_counter() - route_started_at
                     route_cache[effective_g_max] = route
                 entries, ladder_meta = simulate_segment_ladders(
                     route,
@@ -339,6 +347,26 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
                     vh=vh,
                     vh_source=vh_source,
                 )
+                if task.get("log_timing"):
+                    timing_events.append(
+                        {
+                            "task_i": task.get("task_i"),
+                            "task_count": task.get("task_count"),
+                            "record_i": record_i,
+                            "record_count": record_count,
+                            "layer": layer,
+                            "group": int(group),
+                            "lambda_rel": lambda_rel,
+                            "g_max": g_label,
+                            "l_block": int(l_block),
+                            "effective_g_max": effective_g_label,
+                            "route_cached": route_cached,
+                            "route_elapsed_seconds": route_elapsed,
+                            "cell_elapsed_seconds": time.perf_counter() - cell_started_at,
+                            "cluster_count": int(route.cluster_count),
+                            "segment_count": int(route.segment_count),
+                        }
+                    )
                 overall.setdefault((g_label, int(l_block)), SweepAccumulator()).add(
                     route=route,
                     ladder_meta=ladder_meta,
@@ -368,8 +396,95 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
         "processed_pairs": processed_pairs,
         "groups_seen": groups_seen,
         "elapsed_seconds": elapsed,
+        "timing_events": timing_events,
         "message": message,
     }
+
+
+def _format_timing_event(event: dict[str, Any]) -> str:
+    cached = "cached" if event.get("route_cached") else "computed"
+    return (
+        "[s0-sweep-timing] "
+        f"task={event.get('task_i')}/{event.get('task_count')} "
+        f"record={event.get('record_i')}/{event.get('record_count')} "
+        f"layer={event.get('layer')} group={event.get('group')} "
+        f"lambda_rel={float(event['lambda_rel']):g} g_max={event.get('g_max')} "
+        f"l_block={event.get('l_block')} effective_g_max={event.get('effective_g_max')} "
+        f"route={float(event.get('route_elapsed_seconds') or 0.0):.3f}s({cached}) "
+        f"cell={float(event.get('cell_elapsed_seconds') or 0.0):.3f}s "
+        f"clusters={event.get('cluster_count')} segments={event.get('segment_count')}"
+    )
+
+
+def _add_timing_stat(stats: dict[tuple[float, str, int, str], dict[str, Any]], event: dict[str, Any]) -> None:
+    key = (float(event["lambda_rel"]), str(event["g_max"]), int(event["l_block"]), str(event["effective_g_max"]))
+    row = stats.setdefault(
+        key,
+        {
+            "lambda_rel": key[0],
+            "g_max": key[1],
+            "l_block": key[2],
+            "effective_g_max": key[3],
+            "cell_count": 0,
+            "route_calls": 0,
+            "route_elapsed_total": 0.0,
+            "route_elapsed_max": 0.0,
+            "cell_elapsed_total": 0.0,
+            "cell_elapsed_max": 0.0,
+            "cluster_count_max": 0,
+            "segment_count_max": 0,
+        },
+    )
+    route_elapsed = float(event.get("route_elapsed_seconds") or 0.0)
+    cell_elapsed = float(event.get("cell_elapsed_seconds") or 0.0)
+    row["cell_count"] += 1
+    row["cell_elapsed_total"] += cell_elapsed
+    row["cell_elapsed_max"] = max(float(row["cell_elapsed_max"]), cell_elapsed)
+    row["cluster_count_max"] = max(int(row["cluster_count_max"]), int(event.get("cluster_count") or 0))
+    row["segment_count_max"] = max(int(row["segment_count_max"]), int(event.get("segment_count") or 0))
+    if not event.get("route_cached"):
+        row["route_calls"] += 1
+        row["route_elapsed_total"] += route_elapsed
+        row["route_elapsed_max"] = max(float(row["route_elapsed_max"]), route_elapsed)
+
+
+def _timing_rows(stats: dict[tuple[float, str, int, str], dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in stats.values():
+        out = dict(row)
+        out["route_elapsed_mean"] = (
+            float(out["route_elapsed_total"]) / int(out["route_calls"]) if int(out["route_calls"]) else 0.0
+        )
+        out["cell_elapsed_mean"] = (
+            float(out["cell_elapsed_total"]) / int(out["cell_count"]) if int(out["cell_count"]) else 0.0
+        )
+        rows.append(out)
+    return sorted(rows, key=lambda x: (float(x["lambda_rel"]), str(x["g_max"]), int(x["l_block"])))
+
+
+def _print_timing_summary(rows: list[dict[str, Any]], *, top: int = 20) -> None:
+    if not rows:
+        return
+    print("== S0.0 routing timing by (lambda_rel, g_max, l_block) ==")
+    print(
+        "lambda_rel  g_max  l_block  eff_g  route_total  route_mean  route_max  "
+        "cell_total  cell_mean  clusters_max  segments_max  cells"
+    )
+    for row in sorted(rows, key=lambda x: float(x["route_elapsed_total"]), reverse=True)[:top]:
+        print(
+            f"{float(row['lambda_rel']):>10g}  "
+            f"{str(row['g_max']).rjust(5)}  "
+            f"{int(row['l_block']):7d}  "
+            f"{str(row['effective_g_max']).rjust(5)}  "
+            f"{float(row['route_elapsed_total']):11.3f}s  "
+            f"{float(row['route_elapsed_mean']):10.3f}s  "
+            f"{float(row['route_elapsed_max']):9.3f}s  "
+            f"{float(row['cell_elapsed_total']):10.3f}s  "
+            f"{float(row['cell_elapsed_mean']):9.3f}s  "
+            f"{int(row['cluster_count_max']):12d}  "
+            f"{int(row['segment_count_max']):12d}  "
+            f"{int(row['cell_count'])}"
+        )
 
 
 def main() -> None:
@@ -425,7 +540,7 @@ def main() -> None:
     parser.add_argument(
         "--log_timing",
         action="store_true",
-        help="Append per-task elapsed seconds to progress lines.",
+        help="Append task elapsed seconds and print per-(lambda_rel, g_max, l_block) routing timing details.",
     )
     parser.add_argument(
         "--allow_fallback_sh",
@@ -504,6 +619,7 @@ def main() -> None:
 
     processed_pairs = 0
     groups_seen: set[int] = set()
+    timing_stats: dict[tuple[float, str, int, str], dict[str, Any]] = {}
     scale_manifest = {
         "key_scale": manifest.get("key_scale", {}),
         "value_scale": manifest.get("value_scale", {}),
@@ -567,6 +683,10 @@ def main() -> None:
             result["vanilla_logkv_compressed_prefix_baseline"],
         )
         _merge_accumulator_map(vanilla_logkv_full_cache_baseline, result["vanilla_logkv_full_cache_baseline"])
+        if args.log_timing:
+            for event in result.get("timing_events", []):
+                print(_format_timing_event(event), flush=True)
+                _add_timing_stat(timing_stats, event)
         print(result["message"], flush=True)
 
     if args.workers == 1:
@@ -736,11 +856,14 @@ def main() -> None:
             "group), not swept."
         ),
         "vanilla_logkv_full_cache_baseline_by_layer_group": vanilla_logkv_full_cache_baseline_rows,
+        "timing_by_config": _timing_rows(timing_stats) if args.log_timing else [],
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
+    if args.log_timing:
+        _print_timing_summary(result["timing_by_config"])
     print(f"[s0-sweep] wrote {args.output}")
 
 
