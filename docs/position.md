@@ -540,8 +540,8 @@ anchor bias，甚至学习 compact KV。
 | 指标 | 目的 |
 |---|---|
 | entry span = `p_hi - p_lo` | 判断三锚点面对的跨度分布 |
-| `E[M]` | 估算虚拟 slot 膨胀 |
-| anchor 去重率 | 判断 `p_mid` 是否常常提供新信息 |
+| `E[M]` | 估算去重后平均每个 entry 需要多少不同 anchor；它衡量的是 fixed-3 展开里有多少可被未来 gather/packed 省掉的成本，不是"anchor 越少信息越好" |
+| anchor 去重率 | 判断 `p_mid` 是否常常提供新信息；anchor 多通常表达力更强，但也意味着读出宽度更贵 |
 | per-frequency phase coherence `ρ_f` | 量化相位抵消强度 |
 | dense score vs anchor score 误差 | 直接测位置近似对 attention logits 的影响 |
 | dense attention KL | 测 softmax 分布偏移 |
@@ -626,7 +626,9 @@ learned bias over fixed anchors
 ### 未决
 
 - `p_mid` 是否值得保留，还是 `p_lo+p_hi` 足够。
-- `E[M]` 实测是否接近 3；若接近，三锚点 compute 开销可能超过收益。
+- `E[M]` 首轮实测约 2.0：三锚点没有退化成"几乎每个 entry 都需要 3 个不同锚点"，
+  但 fixed-3 物理宽度仍明显超 vanilla，尤其 `lambda_rel=0.875` 的高召回配置更贵；
+  后续必须用真实 anchor-score 消融判断这笔表达力是否值回成本。
 - anchor 是否应由 entry span/phase coherence 自适应选择。
 - compressed slots 是否应采用频率裁剪或频率自适应 RoPE。
 - learned bias / learned anchor 是否能在少量 CPT 下显著优于固定锚点。

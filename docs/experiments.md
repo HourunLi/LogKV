@@ -67,14 +67,13 @@ Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生�
 >
 > **"dump 提供的数据够不够"和"有没有分析代码去算某个 S0.x 指标"是两回事，
 > 下面这条紧接着的"覆盖 S0.0、S0.2–S0.7"说的是前者（这条 dump 脚本设计上要
-> 覆盖哪些子项的数据依赖），不代表这些子项已经有现成分析代码能直接跑。** 已经
-> 配了分析代码、能直接跑的只有 S0.0、S0.4、S0.5、S0.2 口径①（`SweepAccumulator`/
-> `route_dpmeans_segments` 已经算出这些量，见 `CLAUDE.md` §0"下一步"第 2 项的
-> 精确分解）；**S0.3（`unused/semantic_s0_needle_isolation.py`）、S0.6
-> （`unused/semantic_s0_anchor_dedup.py`）的分析代码已经写好并配了单测**（见
-> `CLAUDE.md` §14 2026-08-21 第二条），**但还没有跑过真实 dump**；S0.7 的
-> supersession 判定逻辑还没写；S0.1 不需要 dump（纯 CPU 单测，见
-> 下表），不在这个"数据依赖"讨论范围内。
+> 覆盖哪些子项的数据依赖），不代表这些子项已经有现成分析代码能直接跑。** 目前
+> 已经配了分析代码、能直接跑的是 S0.0、S0.3、S0.4、S0.5、S0.6、S0.2 口径①：
+> S0.0/S0.4/S0.5/S0.2 口径①由 `SweepAccumulator`/`route_dpmeans_segments`
+> 覆盖；S0.3 是 `unused/semantic_s0_needle_isolation.py`；S0.6 是
+> `unused/semantic_s0_anchor_dedup.py`。S0.3/S0.6 已完成首批真实 dump 实跑
+> （见 `CLAUDE.md` §14 2026-08-21 最新条）。S0.7 的 supersession 判定逻辑还没写；
+> S0.1 不需要 dump（纯 CPU 单测，见下表），不在这个"数据依赖"讨论范围内。
 
 > **这句话的范围（这一轮补的）：覆盖 S0.0、S0.2–S0.7 和 S0.8 的第 1/2/3a 项，
 > 不覆盖 S0.8 的 3b 项；S0.1 不在此列**——它是 `log_kv_position.py`（还没写）
@@ -281,6 +280,24 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   > 调参。
 - **S0.3**：needle 落在成员数 `≤ B′` 的簇里的比例应显著高于随机基线。若 needle 大多
   并入大簇，§3 的机制不成立，方案应就地停止。
+  > **首次实证结果（2026-08-21，首轮跑，样本/层覆盖有限，不是最终确认）**：
+  > `stage0_dump/s0_3.csv` 覆盖 `lambda_rel={0.875,1.0,1.125}` 与
+  > `g_max={inf,8192,4096,2048,1024,256}`。全部候选的 token-level lift
+  > 均显著高于随机（约 7–8×），所以 **S0.3 没有触发"就地停止"**。但
+  > 绝对隔离率仍有限：`lambda_rel=1.0` 的 `needle_token_isolated_rate`
+  > 约 11.7–12.3%，`span_any_token_isolated_rate` 约 61.5–64.0%，
+  > `span_all_tokens_isolated_rate` 约 0.065–0.13%；`lambda_rel=0.875`
+  > 把 token 召回提高到约 17.6–18.9%、`span_any` 提高到约 70.8–72.8%，
+  > 但随机隔离率也从约 1.5% 涨到约 2.5–2.6%，且簇/entry 成本同步上涨。
+  > 因此当前读法是：**语义信号成立，经常能从 needle span 里捞出至少一部分
+  > token；但还不能指望完整 span 被隔离。**
+  >
+  > 同一 `lambda_rel` 内扫 `g_max` 的信息量很小：`g_max` 收紧不会提升
+  > needle 隔离率，反而主要把 `segment_count_mean` 推高（如 `lambda_rel=1.0`
+  > 下 `g_max=inf` 的 segment 均值约 311，`g_max=256` 涨到约 1672）。这也
+  > 校正了此前"g_max 完全不影响簇归属"的过强说法：代码上 `g_max` 触发新
+  > segment 时会通过 `gamma` 衰减改变后续 centroid 更新，所以 cluster_count
+  > 可有轻微变化；但实测影响远小于 `lambda_rel`。
 - **S0.4**：key 方差应显著低于现有位置槽；**若 value 方差没有同步下降**，说明读出侧
   仍是 smear，收益要打对折，需要考虑按 `[k;v]` 联合聚类或簇内二次分裂。
 - **S0.6（更正：不再是"预测会不会超过 vanilla"的决策门，那件事已经确定，
@@ -297,6 +314,21 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   差距更小），不是"`E[M]` 测出来逼近 3 之后才该考虑"的条件退路——两者是
   解决同一问题的不同思路，报告 S0.6 结果时不要把"实测 E[M]" 和"要不要退到
   两锚点"包装成因果关系。
+  > **首次实证结果（2026-08-21，与 S0.3 同批 dump，首轮跑）**：
+  > `stage0_dump/s0_6_rel1.csv` 与 `stage0_dump/s0_6_rel0.875.csv` 分别
+  > 对应 `lambda_rel=1.0` 和 `0.875`。`lambda_rel=1.0` 的 `E[M]` 约
+  > 2.04–2.10，`entry_count_mean_ratio_vs_single_cluster` 约 30.7–39.9×，
+  > 当前 fixed-3 物理宽度约为 vanilla full 的 1.96–2.55×；`lambda_rel=0.875`
+  > 的 `E[M]` 更低（约 1.93–2.00，说明更多小 entry 的 anchor 可去重），但
+  > entry/fixed3 总成本更高：entry 相对 single-cluster 约 44.8–59.8×，
+  > 物理宽度约为 vanilla full 的 2.87–3.83×。所以 **不要按最低 `E[M]`
+  > 选配置**；低 `E[M]` 可能只是 entry 更碎、小 entry 更多，并不代表整体更省。
+  >
+  > 当前配置判断：`lambda_rel=1.0, g_max=inf` 是默认主线（S0.3 lift 约
+  > 8.27×，S0.6 物理宽度约 1.96× vanilla full）；`lambda_rel=0.875,
+  > g_max=inf/8192` 是高召回候选（S0.3 token 召回约 18.5–18.9%、span_any
+  > 约 72.5–72.8%，但 S0.6 成本约 1.45–1.5× 于 `lambda_rel=1.0`）。`l_block`
+  > 不宜过大，尤其 `l_block=2/3` 会显著增加 pad entry 和 fixed3 宽度。
 - **S0.7**：若簇内 value 系统性作废的比例 > 30%，把 Γ 的 delta-rule 广义化提到
   Stage 1 范围内；否则记录结论并搁置 §2.4。
 - **S0.8**：分歧率不是一个单一标量，必须拆成三项分别报告，理由是它们诊断的是

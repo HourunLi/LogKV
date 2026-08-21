@@ -30,7 +30,7 @@
 `experiments.md` 的 Stage 0 决策门；**看不懂某个词或符号就查
 `glossary.md`**（尤其 `B` 在代码里有两个含义这个坑）。
 
-## 0. 现状速览（2026-08-14）
+## 0. 现状速览（2026-08-21）
 
 **这是什么**：LogKV 现有压缩机制（`litgpt/log_kv_cache.py`）按**位置**做 Fenwick 树式
 分层压缩——固定 2:1 合并，越老的 token 槽越宽、压得越狠。已验证的结论（另一分支的
@@ -58,10 +58,11 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 **v3.1 的核心转变**：时序打断不再 fork 出新的**簇**，而是在同一个簇下开一个新的
 **segment**。簇只负责语义身份（一个 centroid，用于路由），segment 负责存储局部性。
 
-**当前阶段：设计与算法规格已完成（§5），Stage 0 的 S0.0 级 k/v dump + sweep
-工具链已落地，**并已完成首次真实数据端到端运行**——S0.0 决策门给出初步结论
-（继续走聚类路线，不转向纯分段；样本/层覆盖有限，是强信号不是最终确认，见 §14
-2026-08-21 条），Stage 1（生产实现）尚未开始。**
+**当前阶段：设计与算法规格已完成（§5），Stage 0 的 mechanism A（k/v）dump 与
+S0.0/S0.3/S0.6 分析工具链已落地，并已完成首批真实数据端到端运行**——S0.0 决策门
+给出初步结论（继续走聚类路线，不转向纯分段），S0.3 证明 needle 隔离有稳定语义信号
+但还不能完整隔离整个 span，S0.6 给出 `lambda_rel=1.0` 主线与 `0.875` 高召回线之间的
+成本账（见 §14 2026-08-21 最新条）。Stage 1（生产实现）尚未开始。**
 
 > **务必读清楚这句话字面的意思，不要被下面大段的伪代码/公式/`raise
 > ValueError(...)` 片段误导，也不要把"Stage 0 有代码了"误读成"设计已经在
@@ -76,8 +77,8 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 > 自身的逻辑漏洞**——两处描述互相矛盾、一条公式在某个边界条件下算错、一个
 > 反例说明某条规则不成立——不是已经在跑的代码里发现的 bug。
 >
-> **已经写好的是 Stage 0 dump 规格里 mechanism A（k/v）那一半，且只覆盖
-> S0.0 这一档，不是完整的 Stage 0 dump 脚本。** `litgpt/semantic_s0.py`
+> **已经写好的是 Stage 0 dump 规格里 mechanism A（k/v）那一半，不是完整的
+> Stage 0 dump 脚本。** `litgpt/semantic_s0.py`
 > （可复用的纯函数：DP-means 路由、ladder 模拟、entry 统计，均带单测
 > `tests/test_semantic_s0.py`）+ `unused/semantic_stage0_dump.py`（k/v dump
 > CLI，`tests/test_semantic_stage0_dump.py`）+ `unused/semantic_s0_sweep.py`
@@ -91,17 +92,19 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 >
 > **"机制 A 够用"和"分析代码已经写好"是两件事，不要混为一谈**（下方"下一步"
 > 第 2 项有精确到每个 S0.x 的分解，这里只给结论）：**已经配了现成分析代码、
-> 能直接跑的只有 S0.0、S0.4、S0.5、S0.2 口径①**（`SweepAccumulator`/
-> `route_dpmeans_segments` 已经算出这些量）。**S0.3/S0.6/S0.7 虽然只需要
-> 机制 A 的 k/v 数据，但隔离率/锚点去重/supersession 这几个分析逻辑本身还
-> 没写**；**S0.1 和这份 dump 无关**——它是 `log_kv_position.py`（还没写）的
+> 能直接跑的是 S0.0、S0.3、S0.4、S0.5、S0.6、S0.2 口径①**（S0.0/S0.4/S0.5/
+> S0.2 口径①由 `SweepAccumulator`/`route_dpmeans_segments` 覆盖；S0.3 是
+> `unused/semantic_s0_needle_isolation.py`；S0.6 是 `unused/
+> semantic_s0_anchor_dedup.py`）。**S0.7 虽然只需要机制 A 的 k/v 数据，但
+> supersession 判定逻辑还没写**；**S0.1 和这份 dump 无关**——它是
+> `log_kv_position.py`（还没写）的
 > 纯 CPU 单测，`experiments.md` 的 S0.1 行本来就写着"不需要 dump"；**S0.8
 > 无论如何都跑不了**，缺的不是数据，是 `cache_serial`/`cache_batch` 这**两块
 > CPU 分析基础设施**——S0.8 比较的就是这两侧的 cache 状态，而 `cache_batch`
 > （**§5.4 Phase 1/2/3 的朴素 CPU 参考实现，不是下方"下一步"第 4 项那份要等
 > Stage 0 结果才决定投不投的 Stage 1 向量化生产实现**）完全没有对应代码，
 > `cache_serial` 也只有 `route_dpmeans_segments` 这个路由级雏形、还没接上
-> anchor/ladder 读出。上面这两块，以及 S0.3/S0.6/S0.7 的分析逻辑、S0.8 3b
+> anchor/ladder 读出。上面这两块，以及 S0.7 的分析逻辑、S0.8 3b
 > 本身、`litgpt/log_kv_position.py`、`CacheAttentionState` 扩展、全部
 > Stage 1 生产实现，都还没有开始写。
 > 详见 `unused/semantic_stage0_dump.py` 模块 docstring 里的显式 scope 声明。
@@ -120,10 +123,10 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
    以及"样本/层覆盖有限、不是最终确认"的限定，见 §14 2026-08-21 第一条。
    S0.3（needle 隔离率，仍是唯一能让方案就地停止的判据）、S0.6（锚点去重
    `E[M]`，衡量的是未来 gather/packed 优化的潜力，不是"v1 会不会超过
-   vanilla"这个已确定的结果，见 §2.2 更正框）**的分析工具已经写好并配了
-   单测**（`unused/semantic_s0_needle_isolation.py`/`unused/
-   semantic_s0_anchor_dedup.py`，见 §14 2026-08-21 第二条），**但还没有跑过
-   真实 dump**——下一步是拿现有 dump 实际跑一次并读结果。
+   vanilla"这个已确定的结果，见 §2.2 更正框）**也已经对同一批真实 dump 跑出
+   首批结果**：`lambda_rel=1.0` 是当前主线，`0.875` 是高召回候选但成本约
+   1.45–1.5×；`g_max` 对 S0.3 核心隔离率影响小，主要推高 segment 数。完整数字
+   和读法见 §14 2026-08-21 最新条。
 2. Stage 0 其余离线证伪实验（§7）——一次 dump + CPU 分析，决定方案值不值得往下做。
    **第 1 项同一套 k/v 工具链目前直接覆盖到的是 S0.4（`token_weighted_key_var`/
    `token_weighted_value_var`，已在 `SweepAccumulator` 里）、S0.5（`entry_span_*`，
@@ -133,7 +136,7 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
    驱动脚本）**。**S0.1（`log_kv_position.py` 的纯 CPU 单测）、S0.7
    （supersession 判定）、S0.2 口径②（生产三路路由，需要 `η`，
    `route_dpmeans_segments` 结构上不支持）都还没有实现；S0.3/S0.6 的分析
-   逻辑已实现（见 §14 2026-08-21 第二条），但尚未对真实 dump 跑过**。**S0.8 全部
+   逻辑已实现且已首轮实跑（见 §14 2026-08-21 最新条）**。**S0.8 全部
    三项都还没法跑，不只是 3b**——它比较的是"批量近似路由 vs 严格串行参考"，
    `semantic_s0.py` 的 `route_dpmeans_segments` 只是**严格串行**那一侧的参考
    实现（`cache_serial`），缺的另一侧是 `cache_batch`——**§5.4 Phase 1/2/3
@@ -633,6 +636,43 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
+- **2026-08-21（最新）｜S0.3/S0.6 已完成首批真实 dump 实跑：`lambda_rel=1.0`
+  成为当前主线，`0.875` 降级为"更贵但召回更高"的候选；`g_max` 不再是 S0.3 的
+  核心旋钮。** 动机：S0.0 已经确认"继续做聚类"之后，真正会让方案就地停止的
+  判据是 S0.3（needle 隔离），而 S0.6 要给这条路的 entry/anchor 成本记账。
+  最新结果文件：`stage0_dump/s0_3.csv`、`stage0_dump/s0_3_layer.csv`、
+  `stage0_dump/s0_6_rel1.csv`、`stage0_dump/s0_6_rel0.875.csv` 及对应 layer
+  CSV。核心结论：
+  ① **S0.3 没有触发"就地停止"**。`lambda_rel={0.875,1.0,1.125}` 与
+  `g_max={inf,8192,4096,2048,1024,256}` 的全量表里，token-level lift 稳定在
+  约 7–8×，说明 needle token 被隔离不是随机事件，§3 的"捞针"机制有真实
+  语义信号。`lambda_rel=1.0` 的 `needle_token_isolated_rate` 约 11.7–12.3%，
+  `random_token_isolated_rate` 约 1.45–1.49%，`span_any_token_isolated_rate`
+  约 61.5–64.0%；`lambda_rel=0.875` 把 needle token 召回提高到约 17.6–18.9%，
+  `span_any` 提高到约 70.8–72.8%，但随机隔离率也涨到约 2.5–2.6%。所以当前
+  结论是"经常能从 needle span 里捞出至少一部分 token"，不是"整个 needle span
+  已经能完整隔离"——`span_all_tokens_isolated_rate` 仍然很低。
+  ② **`g_max` 对 S0.3 的核心指标影响小，主要增加 segment 成本**。同一个
+  `lambda_rel` 下，`g_max=inf` 往 `256` 收紧没有提升 needle 隔离；反而把
+  `segment_count_mean` 推高约 5×（例如 `lambda_rel=1.0` 从约 311 到约 1672，
+  `lambda_rel=0.875` 从约 519 到约 2628）。需要校正此前一句过强表述：
+  `g_max` 不是数学上完全不影响簇归属，因为新 segment 会通过 `gamma` 衰减改变
+  后续 centroid 更新；但实测影响远小于 `lambda_rel`，不足以作为主扫描核心旋钮。
+  ③ **S0.6 给出明确成本账：`0.875` 的低 `E[M]` 不等于整体更省**。
+  `lambda_rel=1.0` 的 `E[M]` 约 2.04–2.10，`entry_count_mean_ratio_vs_single_cluster`
+  约 30.7–39.9×，current fixed-3 物理宽度约为 vanilla full 的 1.96–2.55×；
+  `lambda_rel=0.875` 的 `E[M]` 更低（约 1.93–2.00），但 entry/fixed3 总成本更高：
+  entry 相对 single-cluster 约 44.8–59.8×，物理宽度约为 vanilla full 的
+  2.87–3.83×。这是因为阈值收紧后 entry 更碎，小 entry 更多，anchor 更容易去重；
+  低 `E[M]` 只是说明未来 gather/packed 的可省比例更高，不说明当前 fixed-3
+  物理宽度更低。
+  ④ **当前推荐进入下一阶段的两条线**：主线用 `lambda_rel=1.0, g_max=inf`
+  （或保留 `4096/2048` 作小 ablation；S0.3 lift 最高但差异很小），高召回线用
+  `lambda_rel=0.875, g_max=inf/8192`。`l_block=0/1` 优先；`l_block=2/3`
+  会显著增加 pad entry 和 fixed3 宽度，不宜作为默认。正文已同步更新：
+  `docs/experiments.md` 的 S0.3/S0.6 决策门、`docs/risks-and-open-questions.md`
+  的 `lambda_rel`/锚点展开风险表、`docs/position.md` 的 `E[M]` 解释与未决项。
+
 - **2026-08-21（第二条）｜S0.3（needle 隔离率）、S0.6（锚点去重 `E[M]`）分析
   工具落地，代码评审修掉一处会静默产生错误比值的 bug（`by_layer_group` 的
   scheme→baseline 查找按 layer/group 交叉污染）。** 动机：S0.0 首次真实数据
@@ -672,11 +712,11 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
   只会除以它自己那个 (layer, group) 的 baseline。新增回归测试用"故意让
   layer 1 的 baseline 排在最后"的构造方式复现过这个 bug（不修的话 layer 0
   会算出 `10/100=0.1` 而不是正确的 `10/2=5.0`）。
-  **当前状态**：两个工具自己的单测 11/11 全过；连带整个 `semantic_s0` 系列
+  **当时状态**：两个工具自己的单测 11/11 全过；连带整个 `semantic_s0` 系列
   （S0.0 sweep/analyze + dump + S0.3 + S0.6 全部测试文件，`mineru` env）
-  94/94 全过，改动没有引入回归。但**还没有跑过真实 dump**——不像本节第一条
+  94/94 全过，改动没有引入回归。但当时**还没有跑过真实 dump**——不像本节第一条
   的 S0.0 已经有一轮真实数据结果，S0.3/S0.6 仍处于"代码写完、待实跑"阶段，
-  下一步是拿现有的 stage0_dump 实际跑一次。
+  下一步是拿现有的 stage0_dump 实际跑一次。这个状态已被 2026-08-21 最新条更新。
 
 - **2026-08-21｜S0.0 第一次真实数据端到端运行：`dump → sweep → analyze` 全链路
   跑通，S0.0 决策门给出初步结论——继续走聚类路线，不转向纯分段；顺带修掉
@@ -710,7 +750,8 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
   **诚实的限定，不要当成最终确认**：这是单次、层子集有限（5 层）、NIAH 样本数
   不大的首轮跑；S0.0 本身只回答"要不要继续做聚类"这一层，不覆盖"捞针机制本身
   成不成立"——那是 S0.3（needle 隔离率，仍是唯一能让方案就地停止的判据）的
-  职责，S0.3 的分析逻辑还没写。建议扩大样本/层覆盖后复核当前结论。
+  职责。当时 S0.3 的分析逻辑还没写；这个状态已被 2026-08-21 最新条更新。
+  仍建议扩大样本/层覆盖后复核当前结论。
   顺带修掉一个工具链缺口：`unused/semantic_s0_analyze.py` 的 `--csv` 此前
   无论有没有传 `--by_layer`，写出的都是跨层聚合的 `(g_max, l_block)` 表——
   `--by_layer` 只影响*终端打印*里额外的一段（`_print_report` 的
