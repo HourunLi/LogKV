@@ -59,7 +59,9 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 **segment**。簇只负责语义身份（一个 centroid，用于路由），segment 负责存储局部性。
 
 **当前阶段：设计与算法规格已完成（§5），Stage 0 的 S0.0 级 k/v dump + sweep
-工具链已落地，Stage 1（生产实现）尚未开始。**
+工具链已落地，**并已完成首次真实数据端到端运行**——S0.0 决策门给出初步结论
+（继续走聚类路线，不转向纯分段；样本/层覆盖有限，是强信号不是最终确认，见 §14
+2026-08-21 条），Stage 1（生产实现）尚未开始。**
 
 > **务必读清楚这句话字面的意思，不要被下面大段的伪代码/公式/`raise
 > ValueError(...)` 片段误导，也不要把"Stage 0 有代码了"误读成"设计已经在
@@ -107,21 +109,31 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 **下一步（按优先级）**：
 1. **S0.0（§7）：扫 `(g_max, ℓ_block)`。** 全课题最根本的实验——一端是纯语义聚类，
    另一端退化成"连续性约束语义分段"，扫它等于直接回答"收益来自语义分组本身，还是
-   仅仅来自更好的分段边界"。纯 CPU 可测，**排在所有事情之前**。**工具链已落地**
-   （`litgpt/semantic_s0.py` + `unused/semantic_stage0_dump.py` +
-   `unused/semantic_s0_sweep.py`，见 §0 开头的说明）——剩下的是拿真实 checkpoint
-   实际跑一次并读结果，不是再写代码。
+   仅仅来自更好的分段边界"。纯 CPU 可测，**排在所有事情之前**。**工具链已落地
+   且已跑通一次真实数据**（`litgpt/semantic_s0.py` + `unused/semantic_stage0_dump.py`
+   + `unused/semantic_s0_sweep.py` + `unused/semantic_s0_analyze.py`，见 §0 开头的
+   说明）——`dump → sweep → analyze` 全链路已对真实 checkpoint + NIAH prompt 跑过，
+   S0.0 决策门给出初步判定：**继续走聚类路线，不转向纯分段**（对比
+   `single_cluster_bprime_baseline` 这个"同 ladder 机制、不聚类"的对照组，
+   key/value 方差中位数均 ≈0.44×/0.71×，40/40 layer×group 全赢）。完整数字、
+   连带发现（entry 数在 unclipped 口径下涨了 ~32–37×，跨 K_max 校准要用）、
+   以及"样本/层覆盖有限、不是最终确认"的限定，见 §14 2026-08-21 第一条。
+   S0.3（needle 隔离率，仍是唯一能让方案就地停止的判据）、S0.6（锚点去重
+   `E[M]`，衡量的是未来 gather/packed 优化的潜力，不是"v1 会不会超过
+   vanilla"这个已确定的结果，见 §2.2 更正框）**的分析工具已经写好并配了
+   单测**（`unused/semantic_s0_needle_isolation.py`/`unused/
+   semantic_s0_anchor_dedup.py`，见 §14 2026-08-21 第二条），**但还没有跑过
+   真实 dump**——下一步是拿现有 dump 实际跑一次并读结果。
 2. Stage 0 其余离线证伪实验（§7）——一次 dump + CPU 分析，决定方案值不值得往下做。
    **第 1 项同一套 k/v 工具链目前直接覆盖到的是 S0.4（`token_weighted_key_var`/
    `token_weighted_value_var`，已在 `SweepAccumulator` 里）、S0.5（`entry_span_*`，
    同上）、以及 S0.2 口径①（unclipped 纯 DP-means K_eff，`route_dpmeans_segments`
    传 `g_max=inf` 即可，因为它结构上没有 `η` 参数、`g_max=inf` 又天然关掉
    `γ`；但目前只覆盖单一长度，"n 从 1k 到 32k 扫一条曲线"这一步还没有配套的
-   驱动脚本）**。**S0.1（`log_kv_position.py` 的纯 CPU 单测）、S0.3（needle
-   隔离率，需要把 needle span 和已有的 entry 归属交叉统计，逻辑还没写）、
-   S0.6（锚点去重 `E[M]`，需要 `p_lo/p_hi/p_mid`/去重逻辑，`semantic_s0.py`
-   完全没有）、S0.7（supersession 判定）、S0.2 口径②（生产三路路由，需要
-   `η`，`route_dpmeans_segments` 结构上不支持）都还没有实现**。**S0.8 全部
+   驱动脚本）**。**S0.1（`log_kv_position.py` 的纯 CPU 单测）、S0.7
+   （supersession 判定）、S0.2 口径②（生产三路路由，需要 `η`，
+   `route_dpmeans_segments` 结构上不支持）都还没有实现；S0.3/S0.6 的分析
+   逻辑已实现（见 §14 2026-08-21 第二条），但尚未对真实 dump 跑过**。**S0.8 全部
    三项都还没法跑，不只是 3b**——它比较的是"批量近似路由 vs 严格串行参考"，
    `semantic_s0.py` 的 `route_dpmeans_segments` 只是**严格串行**那一侧的参考
    实现（`cache_serial`），缺的另一侧是 `cache_batch`——**§5.4 Phase 1/2/3
@@ -620,6 +632,95 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-21（第二条）｜S0.3（needle 隔离率）、S0.6（锚点去重 `E[M]`）分析
+  工具落地，代码评审修掉一处会静默产生错误比值的 bug（`by_layer_group` 的
+  scheme→baseline 查找按 layer/group 交叉污染）。** 动机：S0.0 首次真实数据
+  跑通后（本节第一条），S0.3/S0.6 是文档"下一步"里排在最前的两项——S0.3 是
+  唯一能让方案就地停止的判据，S0.6 衡量的是未来 gather/packed 优化的潜力
+  （不是"会不会超过 vanilla"这个已确定的结果，见 §2.2 更正框）。新增
+  `unused/semantic_s0_needle_isolation.py`（S0.3）+ `unused/
+  semantic_s0_anchor_dedup.py`（S0.6），各自配 `tests/test_semantic_s0_
+  needle_isolation.py`/`tests/test_semantic_s0_anchor_dedup.py`。逐行核对
+  后的结论：
+  ① **S0.3 的核心指标正确**：`_cluster_sizes_for_interval` 查的是
+  `route.cluster_sizes`（即 `n_total`，整个序列处理完之后的最终簇成员数，
+  不是 γ 衰减的 `n_eff`），`isolated = size <= b_prime` 精确对应 CLAUDE.md
+  §3 的论证"成员数 ≤ B′ ⇒ ladder 永不填满 ⇒ entry 永不合并"；random 基线用
+  同一个 `route`（同一次 DP-means 结果）在同一 prompt 里抽等长随机 span,
+  是真正的 apples-to-apples 对照，不是跨路由比较。`l_block` 不参与
+  `route_dpmeans_segments`（`cluster_sizes` 只由 k/g_max/gamma 决定,`l_block`
+  只影响 `simulate_segment_ladders` 的填充对齐,S0.3 从不调用它),工具只扫
+  `g_max` 不扫 `l_block` 是正确的设计,不是遗漏。
+  ② **S0.6 的锚点数学与 CLAUDE.md §2.2 逐位一致**：`_mid_anchor` 用的
+  round-half-up 整数公式 `(2·sum_wp + w) // (2·w)` 、`clamp(p_lo, p_hi)`
+  跟正文公式对上,去重用 `sorted({p_lo,p_mid,p_hi})` 的 set 语义,`m` 为
+  1/2/3 的判定与 `mid_is_new` 都验证过边界情况（单 token、相邻对、稀疏对）。
+  ③ **发现的 bug（已修复）**：`_add_ratios(rows)` 的 baseline 查找是
+  `{row["scheme"]: row for row in rows if ...}`——对 `overall_rows`（每个
+  scheme 只有一行,没有 layer/group 维度）是对的,但脚本从未把它套到
+  `by_layer_group` 行（每个 scheme 有 `layer×group` 那么多行）,只调过一次
+  `_add_ratios(overall_rows)`。后果是 **`by_layer_group` 输出里完全没有
+  `_ratio_vs_*` 字段**——没法回答"E[M]/entry 数膨胀在不同层之间是不是均匀
+  的"这个 CLAUDE.md §2.5 要求必须能回答的问题,是本 changelog 上一条刚发现
+  的"per-layer 结果没有真正落盘"同一类缺口的变体。若照原样直接把
+  `_add_ratios` 套到 `by_layer_group` 行上,`{scheme: row}` 的字典推导式会
+  按遍历顺序保留**最后一个**匹配某 scheme 的行——多个 layer/group 的行会
+  被悄悄拿"最后一个 layer 的 baseline"去除其他所有 layer 的分子,产出的比值
+  在数值上完全错误却不会报错。**修法**：新增 `_add_ratios_by_layer_group`,
+  按 `(layer, group)` 先分组、组内再调用现有 `_add_ratios`,保证每个语义行
+  只会除以它自己那个 (layer, group) 的 baseline。新增回归测试用"故意让
+  layer 1 的 baseline 排在最后"的构造方式复现过这个 bug（不修的话 layer 0
+  会算出 `10/100=0.1` 而不是正确的 `10/2=5.0`）。
+  **当前状态**：两个工具自己的单测 11/11 全过；连带整个 `semantic_s0` 系列
+  （S0.0 sweep/analyze + dump + S0.3 + S0.6 全部测试文件，`mineru` env）
+  94/94 全过，改动没有引入回归。但**还没有跑过真实 dump**——不像本节第一条
+  的 S0.0 已经有一轮真实数据结果，S0.3/S0.6 仍处于"代码写完、待实跑"阶段，
+  下一步是拿现有的 stage0_dump 实际跑一次。
+
+- **2026-08-21｜S0.0 第一次真实数据端到端运行：`dump → sweep → analyze` 全链路
+  跑通，S0.0 决策门给出初步结论——继续走聚类路线，不转向纯分段；顺带修掉
+  `semantic_s0_analyze.py` 一个"`--by_layer` 的结果从来没被存进任何文件"的
+  工具链缺口。** 动机：此前 §0/§14 记录的都是"工具链已落地但没跑过真实数据"
+  的状态；这一轮第一次拿真实 checkpoint + NIAH prompt（dump 层子集
+  `{0,7,14,21,27}`）跑通了整条链路，产出了本课题第一份真实的 Stage-0 实证
+  数字。结论分两层，都来自同一次 sweep（`(g_max, ℓ_block)` 全网格，
+  `λ_rel=1.0`, `b_prime=8`）：
+  ① **对比真实部署的 vanilla LogKV**（`vanilla_logkv_compressed_prefix_
+  baseline`，真实 `B=512`/`recent_size=1024`/level-0 两两预合并）：
+  `token_weighted_key_var_relative` 中位数 ≈0.52×（**40/40 个 layer×group
+  组合全赢**）、value 中位数 ≈0.82×（37/40 赢，未赢的 3 个例外集中在
+  layer 14/21）、entry 数比值 ≈0.97×–1.1×——**内存基本持平**，直接回应 §4
+  "论文最大的攻击面：niah 变好可能仅仅因为多用了内存"。
+  ② **对比 `single_cluster_bprime_baseline`**（同样 `b_prime=8` ladder 机制、
+  但完全不聚类、按到达顺序的对照组——S0.0 真正要问的"聚类本身 vs. 只是
+  ladder/分段机制"这个问题，答案在这张表里，不在①）：key 中位数 ≈0.44×，
+  value 中位数 ≈0.71×–0.72×，**两个指标都是 40/40 全赢，比①更干净**。
+  **S0.0 决策门初步判定：语义聚类本身在稳定起作用，不是"收益全部来自更好的
+  分段边界"，不转向更简单的纯分段方案。**
+  两个连带发现，都来自②这张对照表：`span_p99` 相对 `single_cluster` 只涨
+  ~2.3–3.2×（相对 vanilla 是 ~150–215×）——说明此前担心的"聚类把 entry 跨度
+  炸得很大"，大部分其实是"任何脱离位置局部性的 ladder 结构都会有的现象"，
+  语义聚类本身只贡献其中一小部分，被这个对照组部分证伪；`entry_count` 相对
+  `single_cluster` 涨了 ~32–37×——同预算下拆成 `K≈300` 个独立簇、每簇一条
+  ladder 的必然代价，这是 **unclipped** 结果（S0.0 设计上不设 `K_max` 上限，
+  `routing_mode: strict_serial_dpmeans_unclipped`），不直接等于生产内存开销，
+  但是第一次拿到具体数字，应该喂给 `algorithm-spec.md` §5.6 的 `K_max`/`c`
+  校准，让 S0.6（锚点去重 `E[M]`）和 K_max 绑定率的优先级更靠前。
+  **诚实的限定，不要当成最终确认**：这是单次、层子集有限（5 层）、NIAH 样本数
+  不大的首轮跑；S0.0 本身只回答"要不要继续做聚类"这一层，不覆盖"捞针机制本身
+  成不成立"——那是 S0.3（needle 隔离率，仍是唯一能让方案就地停止的判据）的
+  职责，S0.3 的分析逻辑还没写。建议扩大样本/层覆盖后复核当前结论。
+  顺带修掉一个工具链缺口：`unused/semantic_s0_analyze.py` 的 `--csv` 此前
+  无论有没有传 `--by_layer`，写出的都是跨层聚合的 `(g_max, l_block)` 表——
+  `--by_layer` 只影响*终端打印*里额外的一段（`_print_report` 的
+  `if by_layer and analysis.get("best_by_layer")` 分支），`best_by_layer`
+  从来没被写进任何 CSV/JSON，导致这一轮一度把"不分层"和"分层"两次导出的 CSV
+  错当成两份不同的数据（实际逐字节相同）。新增 `--csv_by_layer`，单独导出
+  `best_by_layer`（每层一行、该层自己赢的 `(g_max, l_block)` 配置），不依赖
+  `--by_layer` 是否传入（`analysis["best_by_layer"]` 在 `build_analysis` 里
+  只要 baseline 能解析就无条件算出，`--by_layer` 只管打不打印）。
+  `tests/test_semantic_s0_analyze.py` 补 3 条测试。
 
 - **2026-08-20｜第三十六轮：修第三十五轮自己引入/遗留的一处 P1（`phase_after`
   对 `NEW_SEGMENT` 分支套错公式，在三处独立描述里重复了三遍）、一处 P1 跨文档

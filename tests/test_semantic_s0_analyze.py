@@ -1,3 +1,4 @@
+import csv
 import importlib.util
 from pathlib import Path
 
@@ -10,6 +11,7 @@ _SPEC.loader.exec_module(_MODULE)
 build_analysis = _MODULE.build_analysis
 _parse_int_spec = _MODULE._parse_int_spec
 _worst_layer_groups = _MODULE._worst_layer_groups
+_write_csv_by_layer = _MODULE._write_csv_by_layer
 
 
 def _row(g_max: str, l_block: int, layer: int, group: int, key: float, value: float, span: float) -> dict:
@@ -144,6 +146,48 @@ def test_explicit_position_baseline_still_resolves_when_requested() -> None:
     assert analysis["baseline"]["field"] == "position_baseline_by_layer_group"
     assert analysis["baseline"]["row_count"] == 2
     assert analysis["baseline_comparison"] != []
+
+
+def test_write_csv_by_layer_persists_the_per_layer_table(tmp_path: Path) -> None:
+    # --csv (see _write_csv) always writes the (g_max, l_block) table aggregated
+    # across every layer/group, even when --by_layer was passed -- the per-layer
+    # breakdown never made it into any file before this writer existed. Check it
+    # actually persists one row per layer with that layer's own winning config,
+    # not a copy of the g_max/l_block table (which has no "layer" column at all).
+    analysis = build_analysis(_payload())
+    out = tmp_path / "by_layer.csv"
+
+    _write_csv_by_layer(out, analysis["best_by_layer"])
+
+    with out.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+
+    assert fieldnames is not None and "layer" in fieldnames and "g_max" in fieldnames
+    assert [row["layer"] for row in rows] == ["0", "1"]
+    assert [row["g_max"] for row in rows] == ["256", "256"]
+    assert [row["l_block"] for row in rows] == ["1", "1"]
+    assert float(rows[0]["key_ratio_median"]) == 0.3
+    assert float(rows[0]["value_ratio_median"]) == 0.6
+    assert float(rows[1]["key_ratio_median"]) == 0.2
+    assert float(rows[1]["value_ratio_median"]) == 0.5
+
+
+def test_best_by_layer_is_populated_independent_of_any_by_layer_flag() -> None:
+    # analysis["best_by_layer"] is computed unconditionally in build_analysis
+    # whenever a baseline resolves -- it is not gated by the --by_layer CLI
+    # flag (that flag only controls whether _print_report also prints it). This
+    # is what lets --csv_by_layer work without also requiring --by_layer.
+    analysis = build_analysis(_payload())
+    assert len(analysis["best_by_layer"]) == 2
+
+
+def test_csv_by_layer_has_nothing_to_write_without_a_baseline() -> None:
+    payload = _payload()
+    del payload["vanilla_logkv_compressed_prefix_baseline_by_layer_group"]
+    analysis = build_analysis(payload, baseline="none")
+    assert analysis.get("best_by_layer", []) == []
 
 
 def test_worst_layer_groups_sort_by_largest_key_ratio() -> None:
