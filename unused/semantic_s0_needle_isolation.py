@@ -25,6 +25,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -51,6 +52,16 @@ route_dpmeans_segments = _S0.route_dpmeans_segments
 
 def _wanted(values: str | None) -> set[int] | None:
     return None if values is None else set(parse_int_list(values))
+
+
+def _groups_from_key_scale(manifest: dict[str, Any], layer: int) -> list[int] | None:
+    try:
+        values = manifest["key_scale"][str(int(layer))]["s_h"]
+    except Exception:
+        return None
+    if not isinstance(values, list):
+        return None
+    return list(range(len(values)))
 
 
 def parse_lambda_rel_list(text: str | list[float] | tuple[float, ...]) -> list[float]:
@@ -355,6 +366,7 @@ def _merge_accumulator_map(
 
 
 def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
+    started_at = time.perf_counter()
     sample = task["sample"]
     record = task["record"]
     layer = int(record["layer"])
@@ -368,6 +380,7 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
         raw_lambda_rel_values = [task["lambda_rel"]]
     lambda_rel_values = [float(x) for x in raw_lambda_rel_values]
     group_filter = None if task["group_filter"] is None else set(int(x) for x in task["group_filter"])
+    task_groups = None if task.get("task_groups") is None else set(int(x) for x in task["task_groups"])
     b_prime = int(task["b_prime"])
     collect_by_layer_group = bool(task["collect_by_layer_group"])
 
@@ -385,14 +398,22 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
     groups_seen = set(groups)
     if group_filter is not None:
         groups = [g for g in groups if g in group_filter]
+    if task_groups is not None:
+        groups = [g for g in groups if g in task_groups]
     matched_group_pairs = len(groups)
+    task_i = task.get("task_i")
+    task_count = task.get("task_count")
+    task_prefix = f"task={task_i}/{task_count} " if task_i is not None and task_count is not None else ""
+    group_suffix = f" groups={sorted(task_groups)}" if task_groups is not None else ""
 
     intervals = _surviving_needle_intervals(sample, int(k_raw.shape[1]))
     if not intervals:
         records_without_surviving_needle = 1
+        elapsed = time.perf_counter() - started_at
+        timing_suffix = f" elapsed={elapsed:.2f}s" if task.get("log_timing") else ""
         message = (
-            f"[s0-needle] {record_i}/{record_count} sample={sample.get('sample_id')} "
-            f"layer={layer} skipped_no_surviving_needle"
+            f"[s0-needle] {task_prefix}record={record_i}/{record_count} sample={sample.get('sample_id')} "
+            f"layer={layer} path={record['path']}{group_suffix} skipped_no_surviving_needle{timing_suffix}"
         )
         return {
             "overall": overall,
@@ -402,6 +423,9 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
             "comparable_pairs": comparable_pairs,
             "groups_seen": groups_seen,
             "records_without_surviving_needle": records_without_surviving_needle,
+            "records_without_surviving_needle_indices": [record_index],
+            "record_index": record_index,
+            "elapsed_seconds": elapsed,
             "message": message,
         }
 
@@ -470,9 +494,11 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
                         cluster_sizes=route.cluster_sizes,
                     )
 
+    elapsed = time.perf_counter() - started_at
+    timing_suffix = f" elapsed={elapsed:.2f}s" if task.get("log_timing") else ""
     message = (
-        f"[s0-needle] {record_i}/{record_count} sample={sample.get('sample_id')} "
-        f"layer={layer} path={record['path']}"
+        f"[s0-needle] {task_prefix}record={record_i}/{record_count} sample={sample.get('sample_id')} "
+        f"layer={layer} path={record['path']}{group_suffix}{timing_suffix}"
     )
     return {
         "overall": overall,
@@ -482,6 +508,9 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
         "comparable_pairs": comparable_pairs,
         "groups_seen": groups_seen,
         "records_without_surviving_needle": records_without_surviving_needle,
+        "records_without_surviving_needle_indices": [] if intervals else [record_index],
+        "record_index": record_index,
+        "elapsed_seconds": elapsed,
         "message": message,
     }
 
@@ -564,7 +593,21 @@ def main() -> None:
         "--workers",
         type=int,
         default=1,
-        help="Number of worker processes over layer records. Use 1 for deterministic single-process execution.",
+        help="Number of worker processes. Use 1 for deterministic single-process execution.",
+    )
+    parser.add_argument(
+        "--parallel_unit",
+        choices=("record", "group"),
+        default="record",
+        help=(
+            "Task granularity. record reads each npz once and is best for I/O efficiency; "
+            "group splits each npz by KV group to reduce stragglers when route costs are imbalanced."
+        ),
+    )
+    parser.add_argument(
+        "--log_timing",
+        action="store_true",
+        help="Append elapsed seconds to each completed task log line.",
     )
     parser.add_argument("--top", type=int, default=12, help="Rows to print in the terminal summary")
     parser.add_argument(
@@ -609,16 +652,17 @@ def main() -> None:
     if not records:
         raise ValueError("No layer records matched the requested filters")
 
-    overall: dict[str, NeedleIsolationAccumulator] = {}
-    by_layer_group: dict[tuple[str, int, int], NeedleIsolationAccumulator] = {}
+    overall: dict[tuple[float, str], NeedleIsolationAccumulator] = {}
+    by_layer_group: dict[tuple[float, str, int, int], NeedleIsolationAccumulator] = {}
     processed_pairs = 0
     matched_group_pairs = 0
     comparable_pairs = 0
     groups_seen: set[int] = set()
-    records_without_surviving_needle = 0
+    records_without_surviving_needle_indices: set[int] = set()
     scale_manifest = {"key_scale": manifest.get("key_scale", {})}
-    tasks = [
-        {
+    base_tasks = []
+    for record_i, (sample, record) in enumerate(records, start=1):
+        base_task = {
             "sample": sample,
             "record": record,
             "record_i": record_i,
@@ -635,19 +679,47 @@ def main() -> None:
             "seed": args.seed,
             "allow_fallback_sh": args.allow_fallback_sh,
             "collect_by_layer_group": not args.skip_by_layer_group,
+            "log_timing": args.log_timing,
         }
-        for record_i, (sample, record) in enumerate(records, start=1)
-    ]
+        base_tasks.append(base_task)
+
+    if args.parallel_unit == "record":
+        tasks = base_tasks
+    else:
+        tasks = []
+        for base_task in base_tasks:
+            layer = int(base_task["record"]["layer"])
+            if group_filter is None:
+                groups_for_record = _groups_from_key_scale(manifest, layer)
+                if groups_for_record is None:
+                    raise ValueError(
+                        "--parallel_unit group requires calibrated manifest key_scale to infer KV groups. "
+                        "Pass --groups explicitly, or run with --parallel_unit record."
+                    )
+            else:
+                groups_for_record = sorted(group_filter)
+            for group in groups_for_record:
+                task = dict(base_task)
+                task["task_groups"] = [int(group)]
+                tasks.append(task)
+
+    for task_i, task in enumerate(tasks, start=1):
+        task["task_i"] = task_i
+        task["task_count"] = len(tasks)
 
     def consume_result(result: dict[str, Any]) -> None:
         nonlocal processed_pairs
         nonlocal matched_group_pairs
         nonlocal comparable_pairs
-        nonlocal records_without_surviving_needle
         processed_pairs += int(result["processed_pairs"])
         matched_group_pairs += int(result["matched_group_pairs"])
         comparable_pairs += int(result["comparable_pairs"])
-        records_without_surviving_needle += int(result["records_without_surviving_needle"])
+        skipped = result.get("records_without_surviving_needle_indices")
+        if skipped is None:
+            if int(result["records_without_surviving_needle"]):
+                records_without_surviving_needle_indices.add(int(result.get("record_index", -1)))
+        else:
+            records_without_surviving_needle_indices.update(int(x) for x in skipped)
         groups_seen.update(int(x) for x in result["groups_seen"])
         _merge_accumulator_map(overall, result["overall"], b_prime=args.b_prime)
         if not args.skip_by_layer_group:
@@ -702,6 +774,8 @@ def main() -> None:
             "random_trials": args.random_trials,
             "seed": args.seed,
             "workers": args.workers,
+            "parallel_unit": args.parallel_unit,
+            "task_count": len(tasks),
             "routing_eta": 0.0,
             "routing_mode": "strict_serial_dpmeans_unclipped",
             "random_baseline_rng": "per_record_layer_group_seedsequence_v1",
@@ -713,9 +787,10 @@ def main() -> None:
         },
         "summary": {
             "record_count": len(records),
+            "task_count": len(tasks),
             "processed_layer_group_pairs": processed_pairs,
             "comparable_layer_group_pairs": comparable_pairs,
-            "records_without_surviving_needle": records_without_surviving_needle,
+            "records_without_surviving_needle": len(records_without_surviving_needle_indices),
         },
         "overall_by_config": overall_rows,
         "by_layer_group": [] if args.skip_by_layer_group else by_lg_rows,
