@@ -11,8 +11,8 @@ to inspect directly. This script turns them into compact reports:
   * span/entry-count tradeoff signals for S0.5;
   * optional layer-wise winners and CSV/JSON summary exports.
   * S0.3 needle isolation:
-    top ``g_max`` configs by needle isolation lift over same-length random
-    spans, plus optional per-layer winners and CSV export.
+    top ``(lambda_rel, g_max)`` configs by needle isolation lift over
+    same-length random spans, plus optional per-layer winners and CSV export.
   * S0.6 anchor dedup:
     top semantic ``(g_max, l_block)`` configs by ``E[M]``/gather potential,
     baseline rows, optional per-layer winners, and CSV export.
@@ -54,6 +54,7 @@ SCHEME_VANILLA_FULL = "vanilla_logkv_full_cache_baseline"
 
 NEEDLE_CSV_FIELDS = [
     "rank",
+    "lambda_rel",
     "g_max",
     "token_isolation_lift",
     "needle_token_isolated_rate",
@@ -81,6 +82,7 @@ NEEDLE_CSV_FIELDS = [
 
 NEEDLE_LAYER_CSV_FIELDS = [
     "layer",
+    "lambda_rel",
     "g_max",
     "token_isolation_lift",
     "needle_token_isolated_rate",
@@ -741,7 +743,37 @@ def _fraction_from_counts(counts: dict[str, int], key: str, denominator: float) 
     return float(counts.get(key, 0)) / denominator if denominator else None
 
 
-def _aggregate_needle_group(g_max: str, rows: list[dict[str, Any]], *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+def _needle_default_lambda_rel(payload: dict[str, Any]) -> float | None:
+    config = payload.get("config") or {}
+    value = config.get("lambda_rel")
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    return _finite_float(value)
+
+
+def _needle_row_with_default_lambda(row: dict[str, Any], default_lambda_rel: float | None) -> dict[str, Any]:
+    normalized = dict(row)
+    if "lambda_rel" not in normalized and default_lambda_rel is not None:
+        normalized["lambda_rel"] = default_lambda_rel
+    return normalized
+
+
+def _needle_config_key(row: dict[str, Any]) -> tuple[float | None, str]:
+    return _metric(row, "lambda_rel"), str(row["g_max"])
+
+
+def _needle_config_sort_key(key: tuple[float | None, str]) -> tuple[float, str]:
+    lambda_rel, g_max = key
+    return (math.inf if lambda_rel is None else float(lambda_rel), g_max)
+
+
+def _aggregate_needle_group(
+    lambda_rel: float | None,
+    g_max: str,
+    rows: list[dict[str, Any]],
+    *,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     sums: dict[str, float] = defaultdict(float)
     count_fields = [
         "sample_groups",
@@ -770,6 +802,7 @@ def _aggregate_needle_group(g_max: str, rows: list[dict[str, Any]], *, extra: di
     span_any_rate = _ratio(sums["span_any_token_isolated_count"], sums["span_count"])
     random_span_any_rate = _ratio(sums["random_span_any_token_isolated_count"], sums["random_span_count"])
     row: dict[str, Any] = {
+        "lambda_rel": lambda_rel,
         "g_max": g_max,
         "sample_groups": int(sums["sample_groups"]),
         "sample_groups_with_needle": int(sums["sample_groups_with_needle"]),
@@ -818,18 +851,27 @@ def _needle_config_rows(
     layers: set[int] | None,
     groups: set[int] | None,
 ) -> tuple[list[dict[str, Any]], str]:
+    default_lambda_rel = _needle_default_lambda_rel(payload)
     if layers is None and groups is None:
-        return [dict(row, layer_group_count=row.get("sample_groups")) for row in payload.get("overall_by_config", [])], (
-            "overall_by_config"
-        )
+        return [
+            dict(
+                _needle_row_with_default_lambda(row, default_lambda_rel),
+                layer_group_count=row.get("sample_groups"),
+            )
+            for row in payload.get("overall_by_config", [])
+        ], "overall_by_config"
 
-    scoped = _scope_layer_group_rows(payload.get("by_layer_group", []), layers=layers, groups=groups)
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    rows = [
+        _needle_row_with_default_lambda(row, default_lambda_rel)
+        for row in payload.get("by_layer_group", [])
+    ]
+    scoped = _scope_layer_group_rows(rows, layers=layers, groups=groups)
+    grouped: dict[tuple[float | None, str], list[dict[str, Any]]] = defaultdict(list)
     for row in scoped:
-        grouped[str(row["g_max"])].append(row)
+        grouped[_needle_config_key(row)].append(row)
     return [
-        _aggregate_needle_group(g_max, rows)
-        for g_max, rows in sorted(grouped.items(), key=lambda item: item[0])
+        _aggregate_needle_group(lambda_rel, g_max, rows)
+        for (lambda_rel, g_max), rows in sorted(grouped.items(), key=lambda item: _needle_config_sort_key(item[0]))
     ], "by_layer_group_count_aggregate"
 
 
@@ -839,13 +881,19 @@ def _needle_best_by_layer(
     layers: set[int] | None,
     groups: set[int] | None,
 ) -> list[dict[str, Any]]:
-    scoped = _scope_layer_group_rows(payload.get("by_layer_group", []), layers=layers, groups=groups)
-    grouped: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    default_lambda_rel = _needle_default_lambda_rel(payload)
+    rows = [
+        _needle_row_with_default_lambda(row, default_lambda_rel)
+        for row in payload.get("by_layer_group", [])
+    ]
+    scoped = _scope_layer_group_rows(rows, layers=layers, groups=groups)
+    grouped: dict[tuple[int, float | None, str], list[dict[str, Any]]] = defaultdict(list)
     for row in scoped:
-        grouped[(int(row["layer"]), str(row["g_max"]))].append(row)
+        lambda_rel, g_max = _needle_config_key(row)
+        grouped[(int(row["layer"]), lambda_rel, g_max)].append(row)
     candidates = [
-        _aggregate_needle_group(g_max, rows, extra={"layer": layer})
-        for (layer, g_max), rows in grouped.items()
+        _aggregate_needle_group(lambda_rel, g_max, rows, extra={"layer": layer})
+        for (layer, lambda_rel, g_max), rows in grouped.items()
     ]
     best: dict[int, dict[str, Any]] = {}
     for row in candidates:
@@ -856,14 +904,16 @@ def _needle_best_by_layer(
     return [best[layer] for layer in sorted(best)]
 
 
-def _needle_rank_key(row: dict[str, Any]) -> tuple[float, float, float, str]:
+def _needle_rank_key(row: dict[str, Any]) -> tuple[float, float, float, float, str]:
     lift = _metric(row, "token_isolation_lift")
     rate = _metric(row, "needle_token_isolated_rate")
     span_lift = _metric(row, "span_all_tokens_isolation_lift")
+    lambda_rel = _metric(row, "lambda_rel")
     return (
         -(lift if lift is not None else -math.inf),
         -(rate if rate is not None else -math.inf),
         -(span_lift if span_lift is not None else -math.inf),
+        lambda_rel if lambda_rel is not None else math.inf,
         str(row.get("g_max")),
     )
 
@@ -1394,18 +1444,20 @@ def _print_needle_report(path: Path, analysis: dict[str, Any], *, top: int, by_l
     )
     print(
         "config: "
-        f"g_max={config.get('g_max')} lambda_rel={config.get('lambda_rel')} "
+        f"g_max={config.get('g_max')} "
+        f"lambda_rel={config.get('lambda_rel_values', config.get('lambda_rel'))} "
         f"b_prime={config.get('b_prime')} random_trials={config.get('random_trials')}"
     )
     for warning in analysis.get("warnings", []):
         print(f"warning: {warning}")
 
-    print("\n== Top g_max by needle isolation lift, higher is better ==")
+    print("\n== Top lambda_rel/g_max by needle isolation lift, higher is better ==")
     print(
         _table(
             _ranked(analysis.get("config_rankings", [])),
             [
                 ("#", "rank", _fmt_int),
+                ("lambda", "lambda_rel", _fmt_num),
                 ("g_max", "g_max", str),
                 ("token_iso", "needle_token_isolated_rate", _fmt_pct),
                 ("random", "random_token_isolated_rate", _fmt_pct),
@@ -1429,6 +1481,7 @@ def _print_needle_report(path: Path, analysis: dict[str, Any], *, top: int, by_l
                 analysis["best_by_layer"],
                 [
                     ("layer", "layer", _fmt_int),
+                    ("lambda", "lambda_rel", _fmt_num),
                     ("g_max", "g_max", str),
                     ("token_iso", "needle_token_isolated_rate", _fmt_pct),
                     ("random", "random_token_isolated_rate", _fmt_pct),
