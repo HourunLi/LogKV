@@ -1,17 +1,26 @@
 #!/usr/bin/env python
-"""Summarize ``unused/semantic_s0_sweep.py`` JSON output.
+"""Summarize SemanticLogKV Stage-0 analysis JSON output.
 
-The sweep JSON is intentionally machine-readable and can be awkward to inspect
-directly. This script turns it into a compact report:
+The Stage-0 JSON files are intentionally machine-readable and can be awkward
+to inspect directly. This script turns them into compact reports:
 
+  * S0.0 sweep:
   * top ``(g_max, l_block)`` configs by scale-comparable key/value variance;
   * per-layer/group ratios against the real vanilla LogKV compressed-prefix
     baseline;
   * span/entry-count tradeoff signals for S0.5;
   * optional layer-wise winners and CSV/JSON summary exports.
+  * S0.3 needle isolation:
+    top ``g_max`` configs by needle isolation lift over same-length random
+    spans, plus optional per-layer winners and CSV export.
+  * S0.6 anchor dedup:
+    top semantic ``(g_max, l_block)`` configs by ``E[M]``/gather potential,
+    baseline rows, optional per-layer winners, and CSV export.
 
 Examples:
     python unused/semantic_s0_analyze.py stage0_dump/s0_sweep.json
+    python unused/semantic_s0_analyze.py stage0_dump/s0_3_needle_isolation.json --csv stage0_dump/s0_3.csv
+    python unused/semantic_s0_analyze.py stage0_dump/s0_6_anchor_dedup.json --csv stage0_dump/s0_6.csv
     python unused/semantic_s0_analyze.py './stage0_dump/*s0_sweep*.json' --layers 23-26 --top 20
     python unused/semantic_s0_analyze.py stage0_dump/s0_sweep.json --csv stage0_dump/s0_summary.csv
     python unused/semantic_s0_analyze.py stage0_dump/s0_sweep.json \
@@ -35,6 +44,103 @@ PRIMARY_KEY_METRIC = "token_weighted_key_var_relative"
 PRIMARY_VALUE_METRIC = "token_weighted_value_var_relative"
 SPAN_P99_METRIC = "entry_span_global_quantiles.p99"
 ENTRY_COUNT_METRIC = "entry_count_mean"
+KIND_SWEEP = "semantic_logkv_s0_0_sweep"
+KIND_NEEDLE = "semantic_logkv_s0_3_needle_isolation"
+KIND_ANCHOR = "semantic_logkv_s0_6_anchor_dedup"
+SCHEME_SEMANTIC = "semantic"
+SCHEME_SINGLE_CLUSTER = "single_cluster_bprime_baseline"
+SCHEME_VANILLA_COMPRESSED = "vanilla_logkv_compressed_prefix_baseline"
+SCHEME_VANILLA_FULL = "vanilla_logkv_full_cache_baseline"
+
+NEEDLE_CSV_FIELDS = [
+    "rank",
+    "g_max",
+    "token_isolation_lift",
+    "needle_token_isolated_rate",
+    "random_token_isolated_rate",
+    "span_all_tokens_isolation_lift",
+    "span_all_tokens_isolated_rate",
+    "random_span_all_tokens_isolated_rate",
+    "span_any_token_isolation_lift",
+    "span_any_token_isolated_rate",
+    "random_span_any_token_isolated_rate",
+    "cluster_size_mean",
+    "cluster_size_quantiles.p50",
+    "cluster_size_quantiles.p90",
+    "cluster_size_quantiles.p99",
+    "cluster_size_max",
+    "cluster_count_mean",
+    "segment_count_mean",
+    "sample_groups",
+    "sample_groups_with_needle",
+    "span_count",
+    "needle_token_count",
+    "random_token_count",
+    "layer_group_count",
+]
+
+NEEDLE_LAYER_CSV_FIELDS = [
+    "layer",
+    "g_max",
+    "token_isolation_lift",
+    "needle_token_isolated_rate",
+    "random_token_isolated_rate",
+    "span_all_tokens_isolation_lift",
+    "span_all_tokens_isolated_rate",
+    "random_span_all_tokens_isolated_rate",
+    "span_any_token_isolation_lift",
+    "span_any_token_isolated_rate",
+    "random_span_any_token_isolated_rate",
+    "cluster_count_mean",
+    "segment_count_mean",
+    "sample_groups",
+    "span_count",
+    "needle_token_count",
+    "layer_group_count",
+]
+
+ANCHOR_CSV_FIELDS = [
+    "rank",
+    "scheme",
+    "g_max",
+    "l_block",
+    "E_M",
+    "m_fractions.1",
+    "m_fractions.2",
+    "m_fractions.3",
+    "gather_savings_fraction_vs_fixed3",
+    "logical_anchor_count_mean",
+    "fixed3_anchor_count_mean",
+    "current_scheme_physical_slot_count_mean",
+    "entry_count_mean",
+    "real_entry_count_mean",
+    "pad_entry_count_mean",
+    "entry_count_mean_ratio_vs_single_cluster",
+    "logical_anchor_count_mean_ratio_vs_single_cluster",
+    "fixed3_anchor_count_mean_ratio_vs_single_cluster",
+    "current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full",
+    "sample_groups",
+    "layer_group_count",
+]
+
+ANCHOR_LAYER_CSV_FIELDS = [
+    "layer",
+    "g_max",
+    "l_block",
+    "E_M",
+    "m_fractions.1",
+    "m_fractions.2",
+    "m_fractions.3",
+    "gather_savings_fraction_vs_fixed3",
+    "logical_anchor_count_mean",
+    "fixed3_anchor_count_mean",
+    "current_scheme_physical_slot_count_mean",
+    "entry_count_mean",
+    "real_entry_count_mean",
+    "pad_entry_count_mean",
+    "sample_groups",
+    "layer_group_count",
+]
 
 BASELINE_KEYS = {
     "vanilla": (
@@ -609,6 +715,469 @@ def build_analysis(
     }
 
 
+def _scope_layer_group_rows(
+    rows: list[dict[str, Any]],
+    *,
+    layers: set[int] | None,
+    groups: set[int] | None,
+) -> list[dict[str, Any]]:
+    return [row for row in rows if _row_in_scope(row, layers, groups)]
+
+
+def _weighted_mean_from_mean_rows(rows: list[dict[str, Any]], metric: str, *, weight: str = "sample_groups") -> float | None:
+    num = 0.0
+    den = 0.0
+    for row in rows:
+        value = _metric(row, metric)
+        row_weight = _metric(row, weight)
+        if value is None or row_weight is None:
+            continue
+        num += value * row_weight
+        den += row_weight
+    return num / den if den else None
+
+
+def _fraction_from_counts(counts: dict[str, int], key: str, denominator: float) -> float | None:
+    return float(counts.get(key, 0)) / denominator if denominator else None
+
+
+def _aggregate_needle_group(g_max: str, rows: list[dict[str, Any]], *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    sums: dict[str, float] = defaultdict(float)
+    count_fields = [
+        "sample_groups",
+        "sample_groups_with_needle",
+        "span_count",
+        "needle_token_count",
+        "needle_token_isolated_count",
+        "span_all_tokens_isolated_count",
+        "span_any_token_isolated_count",
+        "random_span_count",
+        "random_token_count",
+        "random_token_isolated_count",
+        "random_span_all_tokens_isolated_count",
+        "random_span_any_token_isolated_count",
+    ]
+    for row in rows:
+        for field in count_fields:
+            value = _metric(row, field)
+            if value is not None:
+                sums[field] += value
+
+    token_rate = _ratio(sums["needle_token_isolated_count"], sums["needle_token_count"])
+    random_token_rate = _ratio(sums["random_token_isolated_count"], sums["random_token_count"])
+    span_all_rate = _ratio(sums["span_all_tokens_isolated_count"], sums["span_count"])
+    random_span_all_rate = _ratio(sums["random_span_all_tokens_isolated_count"], sums["random_span_count"])
+    span_any_rate = _ratio(sums["span_any_token_isolated_count"], sums["span_count"])
+    random_span_any_rate = _ratio(sums["random_span_any_token_isolated_count"], sums["random_span_count"])
+    row: dict[str, Any] = {
+        "g_max": g_max,
+        "sample_groups": int(sums["sample_groups"]),
+        "sample_groups_with_needle": int(sums["sample_groups_with_needle"]),
+        "span_count": int(sums["span_count"]),
+        "needle_token_count": int(sums["needle_token_count"]),
+        "needle_token_isolated_count": int(sums["needle_token_isolated_count"]),
+        "needle_token_isolated_rate": token_rate,
+        "span_all_tokens_isolated_count": int(sums["span_all_tokens_isolated_count"]),
+        "span_all_tokens_isolated_rate": span_all_rate,
+        "span_any_token_isolated_count": int(sums["span_any_token_isolated_count"]),
+        "span_any_token_isolated_rate": span_any_rate,
+        "random_span_count": int(sums["random_span_count"]),
+        "random_token_count": int(sums["random_token_count"]),
+        "random_token_isolated_count": int(sums["random_token_isolated_count"]),
+        "random_token_isolated_rate": random_token_rate,
+        "random_span_all_tokens_isolated_count": int(sums["random_span_all_tokens_isolated_count"]),
+        "random_span_all_tokens_isolated_rate": random_span_all_rate,
+        "random_span_any_token_isolated_count": int(sums["random_span_any_token_isolated_count"]),
+        "random_span_any_token_isolated_rate": random_span_any_rate,
+        "token_isolation_lift": _ratio(token_rate, random_token_rate),
+        "span_all_tokens_isolation_lift": _ratio(span_all_rate, random_span_all_rate),
+        "span_any_token_isolation_lift": _ratio(span_any_rate, random_span_any_rate),
+        "cluster_count_mean": _weighted_mean_from_mean_rows(rows, "cluster_count_mean"),
+        "segment_count_mean": _weighted_mean_from_mean_rows(rows, "segment_count_mean"),
+        "cluster_size_mean": _weighted_mean_from_mean_rows(rows, "cluster_size_mean"),
+        "layer_group_count": len(rows),
+    }
+    if len(rows) == 1:
+        row["cluster_size_quantiles"] = rows[0].get("cluster_size_quantiles")
+        row["cluster_size_max"] = rows[0].get("cluster_size_max")
+        row["random_cluster_size_quantiles"] = rows[0].get("random_cluster_size_quantiles")
+    else:
+        row["cluster_size_quantiles"] = {"p50": None, "p90": None, "p99": None}
+        row["random_cluster_size_quantiles"] = {"p50": None, "p90": None, "p99": None}
+        max_values = [_metric(source, "cluster_size_max") for source in rows]
+        clean_max_values = [value for value in max_values if value is not None]
+        row["cluster_size_max"] = max(clean_max_values) if clean_max_values else None
+    if extra:
+        row.update(extra)
+    return row
+
+
+def _needle_config_rows(
+    payload: dict[str, Any],
+    *,
+    layers: set[int] | None,
+    groups: set[int] | None,
+) -> tuple[list[dict[str, Any]], str]:
+    if layers is None and groups is None:
+        return [dict(row, layer_group_count=row.get("sample_groups")) for row in payload.get("overall_by_config", [])], (
+            "overall_by_config"
+        )
+
+    scoped = _scope_layer_group_rows(payload.get("by_layer_group", []), layers=layers, groups=groups)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in scoped:
+        grouped[str(row["g_max"])].append(row)
+    return [
+        _aggregate_needle_group(g_max, rows)
+        for g_max, rows in sorted(grouped.items(), key=lambda item: item[0])
+    ], "by_layer_group_count_aggregate"
+
+
+def _needle_best_by_layer(
+    payload: dict[str, Any],
+    *,
+    layers: set[int] | None,
+    groups: set[int] | None,
+) -> list[dict[str, Any]]:
+    scoped = _scope_layer_group_rows(payload.get("by_layer_group", []), layers=layers, groups=groups)
+    grouped: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in scoped:
+        grouped[(int(row["layer"]), str(row["g_max"]))].append(row)
+    candidates = [
+        _aggregate_needle_group(g_max, rows, extra={"layer": layer})
+        for (layer, g_max), rows in grouped.items()
+    ]
+    best: dict[int, dict[str, Any]] = {}
+    for row in candidates:
+        layer = int(row["layer"])
+        old = best.get(layer)
+        if old is None or _needle_rank_key(row) < _needle_rank_key(old):
+            best[layer] = row
+    return [best[layer] for layer in sorted(best)]
+
+
+def _needle_rank_key(row: dict[str, Any]) -> tuple[float, float, float, str]:
+    lift = _metric(row, "token_isolation_lift")
+    rate = _metric(row, "needle_token_isolated_rate")
+    span_lift = _metric(row, "span_all_tokens_isolation_lift")
+    return (
+        -(lift if lift is not None else -math.inf),
+        -(rate if rate is not None else -math.inf),
+        -(span_lift if span_lift is not None else -math.inf),
+        str(row.get("g_max")),
+    )
+
+
+def build_needle_analysis(
+    payload: dict[str, Any],
+    *,
+    layers: set[int] | None = None,
+    groups: set[int] | None = None,
+) -> dict[str, Any]:
+    rows, source = _needle_config_rows(payload, layers=layers, groups=groups)
+    ranked = sorted(rows, key=_needle_rank_key)
+    best_layers = _needle_best_by_layer(payload, layers=layers, groups=groups)
+    warnings: list[str] = []
+    if not rows:
+        warnings.append("no needle-isolation rows found for the selected scope")
+    if (layers is not None or groups is not None) and not payload.get("by_layer_group"):
+        warnings.append("selected scope requires by_layer_group rows, but the JSON has none")
+    return {
+        "kind": payload.get("kind"),
+        "version": payload.get("version"),
+        "config": payload.get("config", {}),
+        "scope": {
+            "layers": None if layers is None else sorted(layers),
+            "groups": None if groups is None else sorted(groups),
+        },
+        "config_source": source,
+        "warnings": warnings,
+        "config_rankings": ranked,
+        "best_by_layer": best_layers,
+        "csv_rows": ranked,
+    }
+
+
+def _anchor_scheme_physical_width(row: dict[str, Any]) -> None:
+    scheme = row.get("scheme")
+    if row.get("current_scheme_physical_slot_count_mean") is not None:
+        return
+    if scheme in {SCHEME_SEMANTIC, SCHEME_SINGLE_CLUSTER}:
+        row["current_scheme_physical_slot_count_mean"] = row.get("fixed3_anchor_count_mean")
+    elif scheme in {SCHEME_VANILLA_COMPRESSED, SCHEME_VANILLA_FULL}:
+        row["current_scheme_physical_slot_count_mean"] = row.get("entry_count_mean")
+    else:
+        row["current_scheme_physical_slot_count_mean"] = None
+
+
+def _normalize_anchor_config(row: dict[str, Any], *, collapse_l0: bool) -> dict[str, Any]:
+    normalized = dict(row)
+    if (
+        collapse_l0
+        and normalized.get("scheme") == SCHEME_SEMANTIC
+        and normalized.get("l_block") is not None
+        and int(normalized["l_block"]) == 0
+    ):
+        normalized["g_max"] = "inf"
+    return normalized
+
+
+def _dedupe_anchor_rows(rows: list[dict[str, Any]], *, collapse_l0: bool) -> tuple[list[dict[str, Any]], int]:
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    duplicates = 0
+    for row in rows:
+        normalized = _normalize_anchor_config(row, collapse_l0=collapse_l0)
+        key = (
+            normalized.get("scheme"),
+            normalized.get("g_max"),
+            normalized.get("l_block"),
+            normalized.get("layer"),
+            normalized.get("group"),
+        )
+        if key in seen:
+            duplicates += 1
+            continue
+        seen.add(key)
+        out.append(normalized)
+    return out, duplicates
+
+
+def _anchor_aggregate_group(
+    scheme: str,
+    g_max: str | None,
+    l_block: int | None,
+    rows: list[dict[str, Any]],
+    *,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    sample_groups = sum(_metric(row, "sample_groups") or 0.0 for row in rows)
+    mean_fields = [
+        "entry_count_mean",
+        "real_entry_count_mean",
+        "pad_entry_count_mean",
+        "token_count_mean",
+        "logical_anchor_count_mean",
+        "fixed3_anchor_count_mean",
+        "fixed3_entry_anchor_count_mean",
+        "fixed3_real_anchor_count_mean",
+        "lo_hi_anchor_count_mean",
+    ]
+    sums = {
+        field: sum((_metric(row, field) or 0.0) * (_metric(row, "sample_groups") or 0.0) for row in rows)
+        for field in mean_fields
+    }
+    m_counts = {"1": 0, "2": 0, "3": 0}
+    lo_hi_m_counts = {"1": 0, "2": 0}
+    for row in rows:
+        for key, value in (row.get("m_counts") or {}).items():
+            m_counts[str(key)] = m_counts.get(str(key), 0) + int(value)
+        for key, value in (row.get("lo_hi_m_counts") or {}).items():
+            lo_hi_m_counts[str(key)] = lo_hi_m_counts.get(str(key), 0) + int(value)
+
+    denom = sample_groups or 1.0
+    logical = sums["logical_anchor_count_mean"]
+    real_entries = sums["real_entry_count_mean"]
+    fixed3 = sums["fixed3_anchor_count_mean"]
+    fixed3_real = sums["fixed3_real_anchor_count_mean"]
+    lo_hi = sums["lo_hi_anchor_count_mean"]
+    row: dict[str, Any] = {
+        "scheme": scheme,
+        "g_max": g_max,
+        "l_block": l_block,
+        "sample_groups": int(sample_groups),
+        "layer_group_count": len(rows),
+    }
+    for field in mean_fields:
+        row[field] = sums[field] / denom
+    row.update(
+        {
+            "E_M": _ratio(logical, real_entries),
+            "E_M_lo_hi": _ratio(lo_hi, real_entries),
+            "anchor_count_per_token": _ratio(logical, sums["token_count_mean"]),
+            "fixed3_over_logical_ratio": _ratio(fixed3, logical),
+            "fixed3_real_over_logical_ratio": _ratio(fixed3_real, logical),
+            "logical_over_lo_hi_ratio": _ratio(logical, lo_hi),
+            "gather_savings_fraction_vs_fixed3": None if fixed3 <= 0 else 1.0 - logical / fixed3,
+            "gather_savings_fraction_vs_fixed3_real": None if fixed3_real <= 0 else 1.0 - logical / fixed3_real,
+            "lo_hi_savings_fraction_vs_fixed3": None if fixed3 <= 0 else 1.0 - lo_hi / fixed3,
+            "lo_hi_savings_fraction_vs_fixed3_real": None if fixed3_real <= 0 else 1.0 - lo_hi / fixed3_real,
+            "m_counts": {key: int(m_counts.get(key, 0)) for key in ("1", "2", "3")},
+            "m_fractions": {key: _fraction_from_counts(m_counts, key, real_entries) for key in ("1", "2", "3")},
+            "lo_hi_m_counts": {key: int(lo_hi_m_counts.get(key, 0)) for key in ("1", "2")},
+            "entry_width_max": max([value for value in (_metric(source, "entry_width_max") for source in rows) if value is not None], default=None),
+            "entry_span_max": max([value for value in (_metric(source, "entry_span_max") for source in rows) if value is not None], default=None),
+        }
+    )
+    if len(rows) == 1:
+        row["M_quantiles"] = rows[0].get("M_quantiles")
+        row["entry_width_quantiles"] = rows[0].get("entry_width_quantiles")
+        row["entry_span_quantiles"] = rows[0].get("entry_span_quantiles")
+    else:
+        row["M_quantiles"] = {"p50": None, "p90": None, "p99": None}
+        row["entry_width_quantiles"] = {"p50": None, "p90": None, "p99": None}
+        row["entry_span_quantiles"] = {"p50": None, "p90": None, "p99": None}
+    _anchor_scheme_physical_width(row)
+    if extra:
+        row.update(extra)
+    return row
+
+
+def _anchor_add_ratios(rows: list[dict[str, Any]]) -> None:
+    baselines = {row["scheme"]: row for row in rows if row.get("scheme") != SCHEME_SEMANTIC}
+    metrics = [
+        "entry_count_mean",
+        "real_entry_count_mean",
+        "logical_anchor_count_mean",
+        "fixed3_anchor_count_mean",
+        "fixed3_entry_anchor_count_mean",
+        "fixed3_real_anchor_count_mean",
+        "current_scheme_physical_slot_count_mean",
+        "lo_hi_anchor_count_mean",
+    ]
+    suffixes = {
+        "single_cluster": SCHEME_SINGLE_CLUSTER,
+        "vanilla_compressed": SCHEME_VANILLA_COMPRESSED,
+        "vanilla_full": SCHEME_VANILLA_FULL,
+    }
+    for row in rows:
+        if row.get("scheme") != SCHEME_SEMANTIC:
+            continue
+        for suffix, baseline_scheme in suffixes.items():
+            baseline = baselines.get(baseline_scheme)
+            if baseline is None:
+                continue
+            for metric in metrics:
+                row[f"{metric}_ratio_vs_{suffix}"] = _ratio(
+                    _metric(row, metric),
+                    _metric(baseline, metric),
+                )
+
+
+def _anchor_rows(
+    payload: dict[str, Any],
+    *,
+    layers: set[int] | None,
+    groups: set[int] | None,
+    collapse_l0: bool,
+) -> tuple[list[dict[str, Any]], str, int]:
+    if layers is None and groups is None:
+        rows = [dict(row) for row in payload.get("overall_by_config", [])]
+        for row in rows:
+            _anchor_scheme_physical_width(row)
+        rows, duplicates = _dedupe_anchor_rows(rows, collapse_l0=collapse_l0)
+        return rows, "overall_by_config", duplicates
+
+    deduped, duplicates = _dedupe_anchor_rows(
+        payload.get("by_layer_group", []),
+        collapse_l0=collapse_l0,
+    )
+    scoped = _scope_layer_group_rows(deduped, layers=layers, groups=groups)
+    grouped: dict[tuple[str, str | None, int | None], list[dict[str, Any]]] = defaultdict(list)
+    for row in scoped:
+        key = row["scheme"], row.get("g_max"), row.get("l_block")
+        grouped[key].append(row)
+    rows = [
+        _anchor_aggregate_group(scheme, g_max, None if l_block is None else int(l_block), group_rows)
+        for (scheme, g_max, l_block), group_rows in sorted(
+            grouped.items(),
+            key=lambda item: (item[0][0], "" if item[0][1] is None else item[0][1], -1 if item[0][2] is None else item[0][2]),
+        )
+    ]
+    _anchor_add_ratios(rows)
+    return rows, "by_layer_group_count_aggregate", duplicates
+
+
+def _anchor_rank_key(row: dict[str, Any]) -> tuple[float, float, float, str, int]:
+    e_m = _metric(row, "E_M")
+    savings = _metric(row, "gather_savings_fraction_vs_fixed3")
+    phys_ratio = _metric(row, "current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full")
+    return (
+        e_m if e_m is not None else math.inf,
+        -(savings if savings is not None else -math.inf),
+        phys_ratio if phys_ratio is not None else math.inf,
+        str(row.get("g_max")),
+        int(row.get("l_block") or -1),
+    )
+
+
+def _anchor_best_by_layer(
+    payload: dict[str, Any],
+    *,
+    layers: set[int] | None,
+    groups: set[int] | None,
+    collapse_l0: bool,
+) -> list[dict[str, Any]]:
+    deduped, _duplicates = _dedupe_anchor_rows(
+        payload.get("by_layer_group", []),
+        collapse_l0=collapse_l0,
+    )
+    scoped = _scope_layer_group_rows(deduped, layers=layers, groups=groups)
+    grouped: dict[tuple[int, str, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in scoped:
+        if row.get("scheme") == SCHEME_SEMANTIC:
+            grouped[(int(row["layer"]), str(row.get("g_max")), int(row.get("l_block")))].append(row)
+    candidates = [
+        _anchor_aggregate_group(SCHEME_SEMANTIC, g_max, l_block, rows, extra={"layer": layer})
+        for (layer, g_max, l_block), rows in grouped.items()
+    ]
+    best: dict[int, dict[str, Any]] = {}
+    for row in candidates:
+        layer = int(row["layer"])
+        old = best.get(layer)
+        if old is None or _anchor_rank_key(row) < _anchor_rank_key(old):
+            best[layer] = row
+    return [best[layer] for layer in sorted(best)]
+
+
+def build_anchor_analysis(
+    payload: dict[str, Any],
+    *,
+    layers: set[int] | None = None,
+    groups: set[int] | None = None,
+    collapse_l0: bool = True,
+) -> dict[str, Any]:
+    rows, source, duplicates = _anchor_rows(
+        payload,
+        layers=layers,
+        groups=groups,
+        collapse_l0=collapse_l0,
+    )
+    baseline_rows = [row for row in rows if row.get("scheme") != SCHEME_SEMANTIC]
+    semantic_rows = [row for row in rows if row.get("scheme") == SCHEME_SEMANTIC]
+    _anchor_add_ratios(rows)
+    ranked = sorted(semantic_rows, key=_anchor_rank_key)
+    best_layers = _anchor_best_by_layer(
+        payload,
+        layers=layers,
+        groups=groups,
+        collapse_l0=collapse_l0,
+    )
+    warnings: list[str] = []
+    if not rows:
+        warnings.append("no anchor-dedup rows found for the selected scope")
+    if (layers is not None or groups is not None) and not payload.get("by_layer_group"):
+        warnings.append("selected scope requires by_layer_group rows, but the JSON has none")
+    if duplicates:
+        warnings.append(f"collapsed {duplicates} duplicate semantic l_block=0 anchor rows")
+    return {
+        "kind": payload.get("kind"),
+        "version": payload.get("version"),
+        "config": payload.get("config", {}),
+        "scope": {
+            "layers": None if layers is None else sorted(layers),
+            "groups": None if groups is None else sorted(groups),
+            "collapse_l0": collapse_l0,
+        },
+        "config_source": source,
+        "warnings": warnings,
+        "baseline_rows": baseline_rows,
+        "config_rankings": ranked,
+        "best_by_layer": best_layers,
+        "csv_rows": ranked,
+    }
+
+
 def _fmt_num(value: Any, digits: int = 4) -> str:
     number = _finite_float(value)
     if number is None:
@@ -623,6 +1192,11 @@ def _fmt_num(value: Any, digits: int = 4) -> str:
 def _fmt_ratio(value: Any) -> str:
     number = _finite_float(value)
     return "n/a" if number is None else f"{number:.3g}x"
+
+
+def _fmt_pct(value: Any) -> str:
+    number = _finite_float(value)
+    return "n/a" if number is None else f"{number:.1%}"
 
 
 def _fmt_int(value: Any) -> str:
@@ -807,6 +1381,146 @@ def _print_report(
         )
 
 
+def _print_needle_report(path: Path, analysis: dict[str, Any], *, top: int, by_layer: bool) -> None:
+    config = analysis.get("config", {})
+    print("== Semantic S0.3 needle isolation summary ==")
+    print(f"file: {path}")
+    print(f"kind/version: {analysis.get('kind')}/{analysis.get('version')}")
+    print(
+        "scope: "
+        f"layers={_format_layers(None if analysis['scope']['layers'] is None else set(analysis['scope']['layers']))} "
+        f"groups={_format_layers(None if analysis['scope']['groups'] is None else set(analysis['scope']['groups']))} "
+        f"source={analysis.get('config_source')}"
+    )
+    print(
+        "config: "
+        f"g_max={config.get('g_max')} lambda_rel={config.get('lambda_rel')} "
+        f"b_prime={config.get('b_prime')} random_trials={config.get('random_trials')}"
+    )
+    for warning in analysis.get("warnings", []):
+        print(f"warning: {warning}")
+
+    print("\n== Top g_max by needle isolation lift, higher is better ==")
+    print(
+        _table(
+            _ranked(analysis.get("config_rankings", [])),
+            [
+                ("#", "rank", _fmt_int),
+                ("g_max", "g_max", str),
+                ("token_iso", "needle_token_isolated_rate", _fmt_pct),
+                ("random", "random_token_isolated_rate", _fmt_pct),
+                ("lift", "token_isolation_lift", _fmt_ratio),
+                ("span_all", "span_all_tokens_isolated_rate", _fmt_pct),
+                ("span_lift", "span_all_tokens_isolation_lift", _fmt_ratio),
+                ("cluster_p50", "cluster_size_quantiles.p50", _fmt_num),
+                ("cluster_p90", "cluster_size_quantiles.p90", _fmt_num),
+                ("clusters", "cluster_count_mean", _fmt_num),
+                ("segments", "segment_count_mean", _fmt_num),
+                ("n", "sample_groups", _fmt_int),
+            ],
+            limit=top,
+        )
+    )
+
+    if by_layer and analysis.get("best_by_layer"):
+        print("\n== Best g_max per layer ==")
+        print(
+            _table(
+                analysis["best_by_layer"],
+                [
+                    ("layer", "layer", _fmt_int),
+                    ("g_max", "g_max", str),
+                    ("token_iso", "needle_token_isolated_rate", _fmt_pct),
+                    ("random", "random_token_isolated_rate", _fmt_pct),
+                    ("lift", "token_isolation_lift", _fmt_ratio),
+                    ("span_lift", "span_all_tokens_isolation_lift", _fmt_ratio),
+                    ("groups", "layer_group_count", _fmt_int),
+                    ("n", "sample_groups", _fmt_int),
+                ],
+            )
+        )
+
+
+def _print_anchor_report(path: Path, analysis: dict[str, Any], *, top: int, by_layer: bool) -> None:
+    config = analysis.get("config", {})
+    print("== Semantic S0.6 anchor dedup summary ==")
+    print(f"file: {path}")
+    print(f"kind/version: {analysis.get('kind')}/{analysis.get('version')}")
+    print(
+        "scope: "
+        f"layers={_format_layers(None if analysis['scope']['layers'] is None else set(analysis['scope']['layers']))} "
+        f"groups={_format_layers(None if analysis['scope']['groups'] is None else set(analysis['scope']['groups']))} "
+        f"source={analysis.get('config_source')}"
+    )
+    print(
+        "config: "
+        f"g_max={config.get('g_max')} l_block={config.get('l_block')} "
+        f"lambda_rel={config.get('lambda_rel')} b_prime={config.get('b_prime')}"
+    )
+    print("note: lower E[M] means more anchor dedup potential; current v1 physical width is the phys column.")
+    for warning in analysis.get("warnings", []):
+        print(f"warning: {warning}")
+
+    baseline_rows = analysis.get("baseline_rows", [])
+    if baseline_rows:
+        print("\n== Baselines ==")
+        print(
+            _table(
+                baseline_rows,
+                [
+                    ("scheme", "scheme", str),
+                    ("E[M]", "E_M", _fmt_num),
+                    ("M=3", "m_fractions.3", _fmt_pct),
+                    ("logical", "logical_anchor_count_mean", _fmt_num),
+                    ("fixed3", "fixed3_anchor_count_mean", _fmt_num),
+                    ("phys", "current_scheme_physical_slot_count_mean", _fmt_num),
+                    ("entries", "entry_count_mean", _fmt_num),
+                    ("n", "sample_groups", _fmt_int),
+                ],
+            )
+        )
+
+    print("\n== Semantic configs by E[M], lower is better for gather potential ==")
+    print(
+        _table(
+            _ranked(analysis.get("config_rankings", [])),
+            [
+                ("#", "rank", _fmt_int),
+                ("cfg", _fmt_config, str),
+                ("E[M]", "E_M", _fmt_num),
+                ("M=3", "m_fractions.3", _fmt_pct),
+                ("save", "gather_savings_fraction_vs_fixed3", _fmt_pct),
+                ("logical", "logical_anchor_count_mean", _fmt_num),
+                ("fixed3", "fixed3_anchor_count_mean", _fmt_num),
+                ("phys", "current_scheme_physical_slot_count_mean", _fmt_num),
+                ("entries", "entry_count_mean", _fmt_num),
+                ("entry/single", "entry_count_mean_ratio_vs_single_cluster", _fmt_ratio),
+                ("logical/single", "logical_anchor_count_mean_ratio_vs_single_cluster", _fmt_ratio),
+                ("phys/vanilla", "current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full", _fmt_ratio),
+            ],
+            limit=top,
+        )
+    )
+
+    if by_layer and analysis.get("best_by_layer"):
+        print("\n== Best anchor-dedup config per layer ==")
+        print(
+            _table(
+                analysis["best_by_layer"],
+                [
+                    ("layer", "layer", _fmt_int),
+                    ("cfg", _fmt_config, str),
+                    ("E[M]", "E_M", _fmt_num),
+                    ("M=3", "m_fractions.3", _fmt_pct),
+                    ("save", "gather_savings_fraction_vs_fixed3", _fmt_pct),
+                    ("logical", "logical_anchor_count_mean", _fmt_num),
+                    ("phys", "current_scheme_physical_slot_count_mean", _fmt_num),
+                    ("groups", "layer_group_count", _fmt_int),
+                ],
+            )
+        )
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fieldnames = [
         "g_max",
@@ -873,18 +1587,60 @@ def _write_csv_by_layer(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow({name: row.get(name) for name in fieldnames})
 
 
+def _csv_cell(row: dict[str, Any], field: str) -> Any:
+    if field in row:
+        value = row.get(field)
+    else:
+        value = _metric(row, field)
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return value
+
+
+def _write_rows_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: _csv_cell(row, name) for name in fieldnames})
+
+
+def _write_needle_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    _write_rows_csv(path, _ranked(rows), NEEDLE_CSV_FIELDS)
+
+
+def _write_needle_csv_by_layer(path: Path, rows: list[dict[str, Any]]) -> None:
+    _write_rows_csv(path, rows, NEEDLE_LAYER_CSV_FIELDS)
+
+
+def _write_anchor_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    _write_rows_csv(path, _ranked(rows), ANCHOR_CSV_FIELDS)
+
+
+def _write_anchor_csv_by_layer(path: Path, rows: list[dict[str, Any]]) -> None:
+    _write_rows_csv(path, rows, ANCHOR_LAYER_CSV_FIELDS)
+
+
 def _write_summary_json(path: Path, analysis: dict[str, Any], *, top: int) -> None:
     compact = dict(analysis)
     compact["config_rankings"] = compact.get("config_rankings", [])[:top]
     compact["baseline_comparison"] = compact.get("baseline_comparison", [])[:top]
+    compact["csv_rows"] = compact.get("csv_rows", [])[:top]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(compact, f, indent=2, ensure_ascii=False)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("sweep_json", help="Path or glob for semantic_s0_sweep.py output JSON; .gz is supported")
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "stage0_json",
+        help="Path or glob for SemanticLogKV S0 analysis JSON; .gz is supported",
+    )
     parser.add_argument("--top", type=int, default=12, help="Rows to print in each ranked table")
     parser.add_argument("--layers", help="Optional layer filter, e.g. '23-26' or '0,7,14'")
     parser.add_argument("--groups", help="Optional KV-group filter, e.g. '0-3'")
@@ -892,7 +1648,7 @@ def main() -> None:
         "--baseline",
         choices=("auto", "none", "vanilla", "vanilla_full", "single_cluster", "position"),
         default="auto",
-        help="Baseline for ratios. auto prefers the real vanilla compressed-prefix baseline.",
+        help="S0.0 only: baseline for ratios. auto prefers the real vanilla compressed-prefix baseline.",
     )
     parser.add_argument(
         "--keep_duplicate_l0",
@@ -907,21 +1663,64 @@ def main() -> None:
         help="Config to drill into for worst layer/groups, formatted as 'g_max:l_block'. Defaults to best ratio row.",
     )
     parser.add_argument("--worst", type=int, default=8, help="Worst layer/groups to print for --inspect_config")
-    parser.add_argument("--csv", type=Path, help="Write the compact baseline-ratio table to CSV")
+    parser.add_argument("--csv", type=Path, help="Write the compact ranked table to CSV")
     parser.add_argument(
         "--csv_by_layer",
         type=Path,
-        help="Write the per-layer best-config table (one row per layer, its winning (g_max,l_block) "
-        "config vs the baseline) to CSV. Independent of --by_layer, which only controls whether this "
-        "table is also printed to stdout -- --csv alone never persists it, so use this flag if you "
-        "need the per-layer breakdown in a file.",
+        help="Write the per-layer best-config table to CSV. Independent of --by_layer, which only "
+        "controls whether this table is also printed to stdout.",
     )
     parser.add_argument("--summary_json", type=Path, help="Write a compact top-N JSON summary")
     args = parser.parse_args()
 
     layers = _parse_int_spec(args.layers)
     groups = _parse_int_spec(args.groups)
-    path, payload = _load_json(args.sweep_json)
+    path, payload = _load_json(args.stage0_json)
+    top = max(args.top, 1)
+    kind = payload.get("kind")
+
+    if kind == KIND_NEEDLE:
+        analysis = build_needle_analysis(payload, layers=layers, groups=groups)
+        _print_needle_report(path, analysis, top=top, by_layer=args.by_layer)
+        if args.csv:
+            _write_needle_csv(args.csv, analysis.get("csv_rows", []))
+            print(f"\nwrote CSV: {args.csv}")
+        if args.csv_by_layer:
+            best_layers = analysis.get("best_by_layer", [])
+            if not best_layers:
+                raise SystemExit("--csv_by_layer needs by_layer_group rows in the S0.3 JSON")
+            _write_needle_csv_by_layer(args.csv_by_layer, best_layers)
+            print(f"wrote per-layer CSV: {args.csv_by_layer}")
+        if args.summary_json:
+            _write_summary_json(args.summary_json, analysis, top=top)
+            print(f"wrote compact JSON: {args.summary_json}")
+        return
+
+    if kind == KIND_ANCHOR:
+        analysis = build_anchor_analysis(
+            payload,
+            layers=layers,
+            groups=groups,
+            collapse_l0=not args.keep_duplicate_l0,
+        )
+        _print_anchor_report(path, analysis, top=top, by_layer=args.by_layer)
+        if args.csv:
+            _write_anchor_csv(args.csv, analysis.get("csv_rows", []))
+            print(f"\nwrote CSV: {args.csv}")
+        if args.csv_by_layer:
+            best_layers = analysis.get("best_by_layer", [])
+            if not best_layers:
+                raise SystemExit("--csv_by_layer needs by_layer_group rows in the S0.6 JSON")
+            _write_anchor_csv_by_layer(args.csv_by_layer, best_layers)
+            print(f"wrote per-layer CSV: {args.csv_by_layer}")
+        if args.summary_json:
+            _write_summary_json(args.summary_json, analysis, top=top)
+            print(f"wrote compact JSON: {args.summary_json}")
+        return
+
+    if kind not in (None, KIND_SWEEP):
+        raise SystemExit(f"unsupported SemanticLogKV S0 analysis kind: {kind!r}")
+
     analysis = build_analysis(
         payload,
         layers=layers,
@@ -960,7 +1759,7 @@ def main() -> None:
     _print_report(
         path,
         analysis,
-        top=max(args.top, 1),
+        top=top,
         by_layer=args.by_layer,
         worst_rows=worst_rows,
         inspected_config=inspected_config,
@@ -980,7 +1779,7 @@ def main() -> None:
         _write_csv_by_layer(args.csv_by_layer, best_layers)
         print(f"wrote per-layer CSV: {args.csv_by_layer}")
     if args.summary_json:
-        _write_summary_json(args.summary_json, analysis, top=max(args.top, 1))
+        _write_summary_json(args.summary_json, analysis, top=top)
         print(f"wrote compact JSON: {args.summary_json}")
 
 

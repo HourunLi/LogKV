@@ -9,9 +9,13 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 
 build_analysis = _MODULE.build_analysis
+build_anchor_analysis = _MODULE.build_anchor_analysis
+build_needle_analysis = _MODULE.build_needle_analysis
 _parse_int_spec = _MODULE._parse_int_spec
+_write_anchor_csv = _MODULE._write_anchor_csv
 _worst_layer_groups = _MODULE._worst_layer_groups
 _write_csv_by_layer = _MODULE._write_csv_by_layer
+_write_needle_csv = _MODULE._write_needle_csv
 
 
 def _row(g_max: str, l_block: int, layer: int, group: int, key: float, value: float, span: float) -> dict:
@@ -74,6 +78,140 @@ def _payload() -> dict:
         "vanilla_logkv_compressed_prefix_baseline_by_layer_group": [
             _baseline(0, 0),
             _baseline(1, 0),
+        ],
+    }
+
+
+def _needle_row(
+    g_max: str,
+    layer: int | None,
+    group: int | None,
+    *,
+    needle_iso: int,
+    needle_total: int,
+    random_iso: int,
+    random_total: int,
+    span_all_iso: int = 1,
+    random_span_all_iso: int = 0,
+) -> dict:
+    row = {
+        "g_max": g_max,
+        "sample_groups": 1,
+        "sample_groups_with_needle": 1,
+        "span_count": 1,
+        "needle_token_count": needle_total,
+        "needle_token_isolated_count": needle_iso,
+        "needle_token_isolated_rate": needle_iso / needle_total,
+        "span_all_tokens_isolated_count": span_all_iso,
+        "span_all_tokens_isolated_rate": span_all_iso,
+        "span_any_token_isolated_count": 1 if needle_iso else 0,
+        "span_any_token_isolated_rate": 1.0 if needle_iso else 0.0,
+        "random_span_count": 1,
+        "random_token_count": random_total,
+        "random_token_isolated_count": random_iso,
+        "random_token_isolated_rate": random_iso / random_total,
+        "random_span_all_tokens_isolated_count": random_span_all_iso,
+        "random_span_all_tokens_isolated_rate": random_span_all_iso,
+        "random_span_any_token_isolated_count": 1 if random_iso else 0,
+        "random_span_any_token_isolated_rate": 1.0 if random_iso else 0.0,
+        "token_isolation_lift": (needle_iso / needle_total) / (random_iso / random_total),
+        "span_all_tokens_isolation_lift": None if random_span_all_iso == 0 else span_all_iso / random_span_all_iso,
+        "span_any_token_isolation_lift": 1.0 if random_iso else None,
+        "cluster_size_mean": 2.0,
+        "cluster_size_quantiles": {"p50": 2.0, "p90": 3.0, "p99": 4.0},
+        "cluster_size_max": 5,
+        "cluster_count_mean": 3.0,
+        "segment_count_mean": 4.0,
+    }
+    if layer is not None and group is not None:
+        row.update({"layer": layer, "group": group})
+    return row
+
+
+def _needle_payload() -> dict:
+    return {
+        "version": 1,
+        "kind": "semantic_logkv_s0_3_needle_isolation",
+        "config": {"g_max": ["256", "inf"], "lambda_rel": 1.0, "b_prime": 8, "random_trials": 4},
+        "overall_by_config": [
+            _needle_row("256", None, None, needle_iso=3, needle_total=4, random_iso=1, random_total=4),
+            _needle_row("inf", None, None, needle_iso=2, needle_total=4, random_iso=1, random_total=4),
+        ],
+        "by_layer_group": [
+            _needle_row("256", 0, 0, needle_iso=3, needle_total=4, random_iso=1, random_total=4),
+            _needle_row("inf", 0, 0, needle_iso=2, needle_total=4, random_iso=1, random_total=4),
+            _needle_row("256", 1, 0, needle_iso=1, needle_total=2, random_iso=1, random_total=2),
+            _needle_row("inf", 1, 0, needle_iso=2, needle_total=2, random_iso=1, random_total=2),
+        ],
+    }
+
+
+def _anchor_row(
+    scheme: str,
+    g_max: str | None,
+    l_block: int | None,
+    *,
+    entry: float,
+    real: float,
+    logical: float,
+    fixed3: float,
+    layer: int | None = None,
+    group: int | None = None,
+) -> dict:
+    row = {
+        "scheme": scheme,
+        "g_max": g_max,
+        "l_block": l_block,
+        "sample_groups": 1,
+        "entry_count_mean": entry,
+        "real_entry_count_mean": real,
+        "pad_entry_count_mean": entry - real,
+        "token_count_mean": 128.0,
+        "logical_anchor_count_mean": logical,
+        "fixed3_anchor_count_mean": fixed3,
+        "fixed3_entry_anchor_count_mean": fixed3,
+        "fixed3_real_anchor_count_mean": real * 3.0,
+        "lo_hi_anchor_count_mean": real * 2.0,
+        "E_M": logical / real,
+        "E_M_lo_hi": 2.0,
+        "anchor_count_per_token": logical / 128.0,
+        "fixed3_over_logical_ratio": fixed3 / logical,
+        "fixed3_real_over_logical_ratio": real * 3.0 / logical,
+        "logical_over_lo_hi_ratio": logical / (real * 2.0),
+        "gather_savings_fraction_vs_fixed3": 1.0 - logical / fixed3,
+        "m_counts": {"1": 2, "2": 5, "3": 3},
+        "m_fractions": {"1": 0.2, "2": 0.5, "3": 0.3},
+        "entry_width_max": 8,
+        "entry_span_max": 16,
+    }
+    if layer is not None and group is not None:
+        row.update({"layer": layer, "group": group})
+    return row
+
+
+def _anchor_payload() -> dict:
+    single = "single_cluster_bprime_baseline"
+    vanilla_full = "vanilla_logkv_full_cache_baseline"
+    semantic = "semantic"
+    return {
+        "version": 1,
+        "kind": "semantic_logkv_s0_6_anchor_dedup",
+        "config": {"g_max": ["256", "inf"], "l_block": [1], "lambda_rel": 1.0, "b_prime": 8},
+        "overall_by_config": [
+            _anchor_row(single, None, None, entry=10.0, real=10.0, logical=10.0, fixed3=30.0),
+            _anchor_row(vanilla_full, None, None, entry=100.0, real=100.0, logical=100.0, fixed3=300.0),
+            _anchor_row(semantic, "256", 1, entry=32.0, real=30.0, logical=45.0, fixed3=96.0),
+            _anchor_row(semantic, "inf", 1, entry=30.0, real=30.0, logical=60.0, fixed3=90.0),
+        ],
+        "by_layer_group": [
+            _anchor_row(single, None, None, entry=10.0, real=10.0, logical=10.0, fixed3=30.0, layer=0, group=0),
+            _anchor_row(vanilla_full, None, None, entry=100.0, real=100.0, logical=100.0, fixed3=300.0, layer=0, group=0),
+            _anchor_row(semantic, "256", 1, entry=12.0, real=10.0, logical=12.0, fixed3=36.0, layer=0, group=0),
+            _anchor_row(semantic, "inf", 1, entry=12.0, real=10.0, logical=20.0, fixed3=36.0, layer=0, group=0),
+            _anchor_row(single, None, None, entry=10.0, real=10.0, logical=10.0, fixed3=30.0, layer=1, group=0),
+            _anchor_row(vanilla_full, None, None, entry=100.0, real=100.0, logical=100.0, fixed3=300.0, layer=1, group=0),
+            _anchor_row(semantic, "256", 1, entry=12.0, real=10.0, logical=15.0, fixed3=36.0, layer=1, group=0),
+            _anchor_row(semantic, "inf", 1, entry=12.0, real=10.0, logical=11.0, fixed3=36.0, layer=1, group=0),
         ],
     }
 
@@ -188,6 +326,93 @@ def test_csv_by_layer_has_nothing_to_write_without_a_baseline() -> None:
     del payload["vanilla_logkv_compressed_prefix_baseline_by_layer_group"]
     analysis = build_analysis(payload, baseline="none")
     assert analysis.get("best_by_layer", []) == []
+
+
+def test_build_needle_analysis_ranks_by_isolation_lift_and_reaggregates_layer_scope() -> None:
+    analysis = build_needle_analysis(_needle_payload())
+
+    assert [row["g_max"] for row in analysis["config_rankings"]] == ["256", "inf"]
+    assert analysis["config_rankings"][0]["token_isolation_lift"] == 3.0
+    assert [row["g_max"] for row in analysis["best_by_layer"]] == ["256", "inf"]
+
+    scoped = build_needle_analysis(_needle_payload(), layers={1})
+
+    assert scoped["config_source"] == "by_layer_group_count_aggregate"
+    assert [row["g_max"] for row in scoped["config_rankings"]] == ["inf", "256"]
+    assert scoped["config_rankings"][0]["needle_token_isolated_rate"] == 1.0
+
+
+def test_write_needle_csv_persists_ranked_needle_fields(tmp_path: Path) -> None:
+    analysis = build_needle_analysis(_needle_payload())
+    out = tmp_path / "needle.csv"
+
+    _write_needle_csv(out, analysis["csv_rows"])
+
+    with out.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+
+    assert fieldnames is not None and "token_isolation_lift" in fieldnames
+    assert rows[0]["rank"] == "1"
+    assert rows[0]["g_max"] == "256"
+    assert float(rows[0]["cluster_size_quantiles.p90"]) == 3.0
+
+
+def test_build_anchor_analysis_ranks_by_e_m_and_attaches_baseline_ratios() -> None:
+    analysis = build_anchor_analysis(_anchor_payload())
+
+    best = analysis["config_rankings"][0]
+    assert best["g_max"] == "256"
+    assert best["E_M"] == 1.5
+    assert best["entry_count_mean_ratio_vs_single_cluster"] == 3.2
+    assert best["logical_anchor_count_mean_ratio_vs_single_cluster"] == 4.5
+    assert best["current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full"] == 0.96
+    assert [row["g_max"] for row in analysis["best_by_layer"]] == ["256", "inf"]
+
+    scoped = build_anchor_analysis(_anchor_payload(), layers={1})
+
+    assert scoped["config_source"] == "by_layer_group_count_aggregate"
+    assert [row["g_max"] for row in scoped["config_rankings"]] == ["inf", "256"]
+    assert scoped["config_rankings"][0]["E_M"] == 1.1
+
+
+def test_anchor_analysis_collapses_l_block_zero_duplicate_configs() -> None:
+    payload = _anchor_payload()
+    payload["overall_by_config"].extend(
+        [
+            _anchor_row("semantic", "128", 0, entry=8.0, real=8.0, logical=8.0, fixed3=24.0),
+            _anchor_row("semantic", "inf", 0, entry=8.0, real=8.0, logical=8.0, fixed3=24.0),
+        ]
+    )
+
+    analysis = build_anchor_analysis(payload)
+    l0_configs = [(row["g_max"], row["l_block"]) for row in analysis["config_rankings"] if row["l_block"] == 0]
+
+    assert l0_configs == [("inf", 0)]
+    assert any("duplicate semantic l_block=0" in warning for warning in analysis["warnings"])
+
+    keep = build_anchor_analysis(payload, collapse_l0=False)
+    kept_l0 = [(row["g_max"], row["l_block"]) for row in keep["config_rankings"] if row["l_block"] == 0]
+    assert kept_l0 == [("128", 0), ("inf", 0)]
+
+
+def test_write_anchor_csv_persists_ranked_anchor_fields(tmp_path: Path) -> None:
+    analysis = build_anchor_analysis(_anchor_payload())
+    out = tmp_path / "anchor.csv"
+
+    _write_anchor_csv(out, analysis["csv_rows"])
+
+    with out.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+
+    assert fieldnames is not None and "E_M" in fieldnames and "m_fractions.3" in fieldnames
+    assert rows[0]["rank"] == "1"
+    assert rows[0]["g_max"] == "256"
+    assert float(rows[0]["m_fractions.3"]) == 0.3
+    assert float(rows[0]["current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full"]) == 0.96
 
 
 def test_worst_layer_groups_sort_by_largest_key_ratio() -> None:
