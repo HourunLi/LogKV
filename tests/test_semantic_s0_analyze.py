@@ -87,6 +87,7 @@ def _needle_row(
     layer: int | None,
     group: int | None,
     *,
+    lambda_rel: float | None = None,
     needle_iso: int,
     needle_total: int,
     random_iso: int,
@@ -125,6 +126,8 @@ def _needle_row(
     }
     if layer is not None and group is not None:
         row.update({"layer": layer, "group": group})
+    if lambda_rel is not None:
+        row["lambda_rel"] = lambda_rel
     return row
 
 
@@ -332,6 +335,7 @@ def test_build_needle_analysis_ranks_by_isolation_lift_and_reaggregates_layer_sc
     analysis = build_needle_analysis(_needle_payload())
 
     assert [row["g_max"] for row in analysis["config_rankings"]] == ["256", "inf"]
+    assert [row["lambda_rel"] for row in analysis["config_rankings"]] == [1.0, 1.0]
     assert analysis["config_rankings"][0]["token_isolation_lift"] == 3.0
     assert [row["g_max"] for row in analysis["best_by_layer"]] == ["256", "inf"]
 
@@ -340,6 +344,65 @@ def test_build_needle_analysis_ranks_by_isolation_lift_and_reaggregates_layer_sc
     assert scoped["config_source"] == "by_layer_group_count_aggregate"
     assert [row["g_max"] for row in scoped["config_rankings"]] == ["inf", "256"]
     assert scoped["config_rankings"][0]["needle_token_isolated_rate"] == 1.0
+
+
+def test_build_needle_analysis_keeps_lambda_rel_as_a_config_axis() -> None:
+    payload = _needle_payload()
+    payload["config"]["lambda_rel"] = [0.5, 1.0]
+    payload["config"]["lambda_rel_values"] = [0.5, 1.0]
+    payload["overall_by_config"] = [
+        _needle_row(
+            "256",
+            None,
+            None,
+            lambda_rel=0.5,
+            needle_iso=3,
+            needle_total=4,
+            random_iso=1,
+            random_total=4,
+        ),
+        _needle_row(
+            "256",
+            None,
+            None,
+            lambda_rel=1.0,
+            needle_iso=2,
+            needle_total=4,
+            random_iso=1,
+            random_total=4,
+        ),
+    ]
+    payload["by_layer_group"] = [
+        _needle_row(
+            "256",
+            0,
+            0,
+            lambda_rel=0.5,
+            needle_iso=3,
+            needle_total=4,
+            random_iso=1,
+            random_total=4,
+        ),
+        _needle_row(
+            "256",
+            0,
+            0,
+            lambda_rel=1.0,
+            needle_iso=2,
+            needle_total=4,
+            random_iso=1,
+            random_total=4,
+        ),
+    ]
+
+    analysis = build_needle_analysis(payload, layers={0})
+
+    assert [(row["lambda_rel"], row["g_max"]) for row in analysis["config_rankings"]] == [
+        (0.5, "256"),
+        (1.0, "256"),
+    ]
+    assert len(analysis["best_by_layer"]) == 1
+    assert analysis["best_by_layer"][0]["lambda_rel"] == 0.5
 
 
 def test_write_needle_csv_persists_ranked_needle_fields(tmp_path: Path) -> None:
@@ -355,6 +418,7 @@ def test_write_needle_csv_persists_ranked_needle_fields(tmp_path: Path) -> None:
 
     assert fieldnames is not None and "token_isolation_lift" in fieldnames
     assert rows[0]["rank"] == "1"
+    assert rows[0]["lambda_rel"] == "1.0"
     assert rows[0]["g_max"] == "256"
     assert float(rows[0]["cluster_size_quantiles.p90"]) == 3.0
 

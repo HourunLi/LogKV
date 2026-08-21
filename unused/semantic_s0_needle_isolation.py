@@ -11,6 +11,7 @@ Example:
       --dump stage0_dump \
       --output stage0_dump/s0_3_needle_isolation.json \
       --g_max inf,8192,4096,2048,1024,256 \
+      --lambda_rel 0.25,0.5,0.75,1.0 \
       --b_prime 8 \
       --random_trials 100
 """
@@ -50,6 +51,16 @@ route_dpmeans_segments = _S0.route_dpmeans_segments
 
 def _wanted(values: str | None) -> set[int] | None:
     return None if values is None else set(parse_int_list(values))
+
+
+def parse_lambda_rel_list(text: str | list[float] | tuple[float, ...]) -> list[float]:
+    if not isinstance(text, str):
+        return [float(value) for value in text]
+    return [float(raw.strip()) for raw in text.split(",") if raw.strip()]
+
+
+def format_lambda_rel(value: float) -> str:
+    return f"{float(value):g}"
 
 
 def _fallback_scale(x: np.ndarray) -> float:
@@ -352,12 +363,16 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
     record_index = int(task["record_index"])
     base_dir = Path(task["base_dir"])
     g_values = [float(x) for x in task["g_values"]]
+    raw_lambda_rel_values = task.get("lambda_rel_values")
+    if raw_lambda_rel_values is None:
+        raw_lambda_rel_values = [task["lambda_rel"]]
+    lambda_rel_values = [float(x) for x in raw_lambda_rel_values]
     group_filter = None if task["group_filter"] is None else set(int(x) for x in task["group_filter"])
     b_prime = int(task["b_prime"])
     collect_by_layer_group = bool(task["collect_by_layer_group"])
 
-    overall: dict[str, NeedleIsolationAccumulator] = {}
-    by_layer_group: dict[tuple[str, int, int], NeedleIsolationAccumulator] = {}
+    overall: dict[tuple[float, str], NeedleIsolationAccumulator] = {}
+    by_layer_group: dict[tuple[float, str, int, int], NeedleIsolationAccumulator] = {}
     processed_pairs = 0
     comparable_pairs = 0
     records_without_surviving_needle = 0
@@ -401,8 +416,7 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
             k_group,
             allow_fallback=bool(task["allow_fallback_sh"]),
         )
-        lambda_new = float(task["lambda_rel"]) * sh
-        route_cache: dict[str, Any] = {}
+        route_cache: dict[tuple[float, str], Any] = {}
         random_intervals = _draw_random_intervals(
             intervals,
             token_count=int(k_group.shape[0]),
@@ -414,44 +428,47 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
             ),
             trials=int(task["random_trials"]),
         )
-        for g_max in g_values:
-            g_label = format_g_max(g_max)
-            route = route_cache.get(g_label)
-            if route is None:
-                route = route_dpmeans_segments(
-                    k_group,
-                    lambda_new=lambda_new,
-                    g_max=g_max,
-                    gamma=float(task["seg_forget"]),
-                )
-                route_cache[g_label] = route
-
-            accs = [
-                overall.setdefault(g_label, NeedleIsolationAccumulator(b_prime=b_prime)),
-            ]
-            if collect_by_layer_group:
-                accs.append(
-                    by_layer_group.setdefault(
-                        (g_label, layer, int(group)),
-                        NeedleIsolationAccumulator(b_prime=b_prime),
+        for lambda_rel in lambda_rel_values:
+            lambda_new = float(lambda_rel) * sh
+            for g_max in g_values:
+                g_label = format_g_max(g_max)
+                route_key = (float(lambda_rel), g_label)
+                route = route_cache.get(route_key)
+                if route is None:
+                    route = route_dpmeans_segments(
+                        k_group,
+                        lambda_new=lambda_new,
+                        g_max=g_max,
+                        gamma=float(task["seg_forget"]),
                     )
-                )
-            for acc in accs:
-                acc.add_route_meta(
-                    cluster_count=route.cluster_count,
-                    segment_count=route.segment_count,
-                    sh_source=sh_source,
-                )
-                acc.add_intervals(
-                    intervals=intervals,
-                    cluster_ids=route.cluster_ids,
-                    cluster_sizes=route.cluster_sizes,
-                )
-                acc.add_random_intervals(
-                    intervals=random_intervals,
-                    cluster_ids=route.cluster_ids,
-                    cluster_sizes=route.cluster_sizes,
-                )
+                    route_cache[route_key] = route
+
+                accs = [
+                    overall.setdefault(route_key, NeedleIsolationAccumulator(b_prime=b_prime)),
+                ]
+                if collect_by_layer_group:
+                    accs.append(
+                        by_layer_group.setdefault(
+                            (float(lambda_rel), g_label, layer, int(group)),
+                            NeedleIsolationAccumulator(b_prime=b_prime),
+                        )
+                    )
+                for acc in accs:
+                    acc.add_route_meta(
+                        cluster_count=route.cluster_count,
+                        segment_count=route.segment_count,
+                        sh_source=sh_source,
+                    )
+                    acc.add_intervals(
+                        intervals=intervals,
+                        cluster_ids=route.cluster_ids,
+                        cluster_sizes=route.cluster_sizes,
+                    )
+                    acc.add_random_intervals(
+                        intervals=random_intervals,
+                        cluster_ids=route.cluster_ids,
+                        cluster_sizes=route.cluster_sizes,
+                    )
 
     message = (
         f"[s0-needle] {record_i}/{record_count} sample={sample.get('sample_id')} "
@@ -487,16 +504,16 @@ def _print_summary(rows: list[dict[str, Any]], *, top: int) -> None:
         "口径: needle token/span 所在 semantic cluster 的成员数 <= B'；"
         "random 为同 prompt 等长随机 span。"
     )
-    print("注意: 这是 cluster-level 判据，l_block 不参与路由；需要扫的是 g_max/lambda_rel。")
+    print("注意: 这是 cluster-level 判据，l_block 不参与路由；核心扫描轴是 lambda_rel。")
     if not rows:
         print("no rows")
         return
     print(
-        "g_max  token_iso  random  lift  span_all  random  lift  "
+        "lambda  g_max  token_iso  random  lift  span_all  random  lift  "
         "cluster_p50  cluster_p90  clusters  segments  n"
     )
     print(
-        "-----  ---------  ------  ----  --------  ------  ----  "
+        "------  -----  ---------  ------  ----  --------  ------  ----  "
         "-----------  -----------  --------  --------  -"
     )
     ranked = sorted(
@@ -508,7 +525,10 @@ def _print_summary(rows: list[dict[str, Any]], *, top: int) -> None:
     )
     for row in ranked[: max(int(top), 1)]:
         q = row.get("cluster_size_quantiles") or {}
+        lambda_rel = row.get("lambda_rel")
+        lambda_text = "n/a" if lambda_rel is None else format_lambda_rel(float(lambda_rel))
         print(
+            f"{lambda_text.ljust(6)}  "
             f"{str(row['g_max']).ljust(5)}  "
             f"{_fmt_pct(row.get('needle_token_isolated_rate')).rjust(9)}  "
             f"{_fmt_pct(row.get('random_token_isolated_rate')).rjust(6)}  "
@@ -529,7 +549,11 @@ def main() -> None:
     parser.add_argument("--dump", required=True, help="Stage-0 dump directory or manifest.json")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--g_max", default="inf,8192,4096,2048,1024,256")
-    parser.add_argument("--lambda_rel", type=float, default=1.0)
+    parser.add_argument(
+        "--lambda_rel",
+        default="1.0",
+        help="Comma-separated lambda_rel values to scan, e.g. '0.25,0.5,0.75,1.0'.",
+    )
     parser.add_argument("--seg_forget", type=float, default=0.5)
     parser.add_argument("--b_prime", type=int, default=8)
     parser.add_argument("--layers", help="Optional comma-separated layer filter")
@@ -555,8 +579,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not (math.isfinite(args.lambda_rel) and args.lambda_rel > 0.0):
-        raise ValueError(f"--lambda_rel must be finite and > 0, got {args.lambda_rel}")
+    lambda_rel_values = parse_lambda_rel_list(args.lambda_rel)
+    if not lambda_rel_values:
+        raise ValueError(f"--lambda_rel {args.lambda_rel!r} parsed to an empty list -- pass at least one value")
+    bad_lambda_rel = [value for value in lambda_rel_values if not (math.isfinite(value) and value > 0.0)]
+    if bad_lambda_rel:
+        raise ValueError(f"--lambda_rel values must be finite and > 0, got {bad_lambda_rel}")
     if not (math.isfinite(args.seg_forget) and 0.0 <= args.seg_forget <= 1.0):
         raise ValueError(f"--seg_forget must be in [0, 1], got {args.seg_forget}")
     if args.b_prime <= 0:
@@ -600,7 +628,7 @@ def main() -> None:
             "scale_manifest": scale_manifest,
             "g_values": g_values,
             "group_filter": None if group_filter is None else sorted(group_filter),
-            "lambda_rel": args.lambda_rel,
+            "lambda_rel_values": lambda_rel_values,
             "seg_forget": args.seg_forget,
             "b_prime": args.b_prime,
             "random_trials": args.random_trials,
@@ -648,14 +676,14 @@ def main() -> None:
         )
 
     overall_rows = []
-    for g_label, acc in sorted(overall.items(), key=lambda item: item[0]):
-        row = {"g_max": g_label}
+    for (lambda_rel, g_label), acc in sorted(overall.items(), key=lambda item: (item[0][0], item[0][1])):
+        row = {"lambda_rel": lambda_rel, "g_max": g_label}
         row.update(acc.finalize())
         overall_rows.append(row)
 
     by_lg_rows = []
-    for (g_label, layer, group), acc in sorted(by_layer_group.items(), key=lambda item: item[0]):
-        row = {"g_max": g_label, "layer": layer, "group": group}
+    for (lambda_rel, g_label, layer, group), acc in sorted(by_layer_group.items(), key=lambda item: item[0]):
+        row = {"lambda_rel": lambda_rel, "g_max": g_label, "layer": layer, "group": group}
         row.update(acc.finalize())
         by_lg_rows.append(row)
 
@@ -664,7 +692,8 @@ def main() -> None:
         "kind": "semantic_logkv_s0_3_needle_isolation",
         "source_manifest": str(Path(args.dump)),
         "config": {
-            "lambda_rel": args.lambda_rel,
+            "lambda_rel": lambda_rel_values[0] if len(lambda_rel_values) == 1 else lambda_rel_values,
+            "lambda_rel_values": lambda_rel_values,
             "seg_forget": args.seg_forget,
             "b_prime": args.b_prime,
             "g_max": [format_g_max(x) for x in g_values],
@@ -677,8 +706,9 @@ def main() -> None:
             "routing_mode": "strict_serial_dpmeans_unclipped",
             "random_baseline_rng": "per_record_layer_group_seedsequence_v1",
             "l_block_caveat": (
-                "S0.3 is a cluster-membership metric. l_block only affects the later segment/ladder "
-                "packing path, not route_dpmeans_segments cluster_ids, so this analyzer reports by g_max."
+                "S0.3 is a cluster-membership metric. lambda_rel controls the clustering threshold. "
+                "l_block only affects the later segment/ladder packing path, not route_dpmeans_segments "
+                "cluster_ids, so this analyzer reports by (lambda_rel, g_max)."
             ),
         },
         "summary": {

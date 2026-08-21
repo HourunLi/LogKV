@@ -12,6 +12,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 NeedleIsolationAccumulator = _MODULE.NeedleIsolationAccumulator
 _draw_random_intervals = _MODULE._draw_random_intervals
+parse_lambda_rel_list = _MODULE.parse_lambda_rel_list
 _process_record_task = _MODULE._process_record_task
 _surviving_needle_intervals = _MODULE._surviving_needle_intervals
 
@@ -70,6 +71,11 @@ def test_draw_random_intervals_preserves_lengths_and_bounds() -> None:
     assert all(0 <= start < end <= 12 for start, end in intervals)
 
 
+def test_parse_lambda_rel_list_accepts_comma_separated_values() -> None:
+    assert parse_lambda_rel_list("0.25,0.5,1.0") == [0.25, 0.5, 1.0]
+    assert parse_lambda_rel_list([0.75, 1]) == [0.75, 1.0]
+
+
 def test_process_record_task_is_deterministic_for_worker_shards() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         base_dir = Path(tmp)
@@ -108,7 +114,7 @@ def test_process_record_task_is_deterministic_for_worker_shards() -> None:
             "scale_manifest": {"key_scale": {"0": {"s_h": [1.0]}}},
             "g_values": [float("inf"), 2.0],
             "group_filter": [0],
-            "lambda_rel": 1.0,
+            "lambda_rel_values": [0.5, 1.0],
             "seg_forget": 0.5,
             "b_prime": 2,
             "random_trials": 3,
@@ -123,7 +129,12 @@ def test_process_record_task_is_deterministic_for_worker_shards() -> None:
     assert first["processed_pairs"] == 1
     assert first["matched_group_pairs"] == 1
     assert first["comparable_pairs"] == 1
-    assert sorted(first["overall"]) == ["2", "inf"]
-    assert sorted(first["by_layer_group"]) == [("2", 0, 0), ("inf", 0, 0)]
-    assert first["overall"]["2"].finalize()["random_token_count"] == 3
-    assert first["overall"]["2"].finalize() == second["overall"]["2"].finalize()
+    assert sorted(first["overall"]) == [(0.5, "2"), (0.5, "inf"), (1.0, "2"), (1.0, "inf")]
+    assert sorted(first["by_layer_group"]) == [
+        (0.5, "2", 0, 0),
+        (0.5, "inf", 0, 0),
+        (1.0, "2", 0, 0),
+        (1.0, "inf", 0, 0),
+    ]
+    assert first["overall"][(0.5, "2")].finalize()["random_token_count"] == 3
+    assert first["overall"][(0.5, "2")].finalize() == second["overall"][(0.5, "2")].finalize()
