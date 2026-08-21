@@ -11,6 +11,7 @@ Example:
       --dump stage0_dump \
       --output stage0_dump/s0_6_anchor_dedup.json \
       --g_max inf,8192,4096,2048,1024,256 \
+      --k_max unclipped,16,32,64,128 \
       --l_block 0,1,2,3 \
       --b_prime 8 \
       --workers 8
@@ -45,10 +46,12 @@ _S0_SPEC.loader.exec_module(_S0)
 
 OfflineEntry = _S0.OfflineEntry
 format_g_max = _S0.format_g_max
+format_k_max = _S0.format_k_max
 load_manifest = _S0.load_manifest
 manifest_base_dir = _S0.manifest_base_dir
 parse_g_max_list = _S0.parse_g_max_list
 parse_int_list = _S0.parse_int_list
+parse_k_max_list = _S0.parse_k_max_list
 route_dpmeans_segments = _S0.route_dpmeans_segments
 route_single_cluster_bprime_ladder = _S0.route_single_cluster_bprime_ladder
 simulate_segment_ladders = _S0.simulate_segment_ladders
@@ -206,9 +209,20 @@ class AnchorDedupAccumulator:
         self.spans: list[float] = []
         self.m_values: list[float] = []
         self.lo_hi_m_values: list[float] = []
+        self.new_cluster_attempt_count_sum = 0.0
+        self.k_max_binding_count_sum = 0.0
+        self.ward_merge_count_sum = 0.0
+        self.novelty_suppressed_count_sum = 0.0
         self.sh_sources: set[str] = set()
 
-    def add(self, *, entries: list[Any], ladder_meta: dict[str, Any], sh_source: str = "n/a") -> None:
+    def add(
+        self,
+        *,
+        entries: list[Any],
+        ladder_meta: dict[str, Any],
+        sh_source: str = "n/a",
+        route: Any | None = None,
+    ) -> None:
         self.sample_groups += 1
         entry_count = float(ladder_meta.get("entry_count", len(entries)))
         self.entry_count_sum += entry_count
@@ -217,6 +231,11 @@ class AnchorDedupAccumulator:
         self.fixed3_entry_anchor_count_sum += 3.0 * entry_count
         self.pad_entry_count_sum += float(ladder_meta.get("pad_entry_count", 0))
         self.sh_sources.add(sh_source)
+        if route is not None:
+            self.new_cluster_attempt_count_sum += int(getattr(route, "new_cluster_attempt_count", 0))
+            self.k_max_binding_count_sum += int(getattr(route, "k_max_binding_count", 0))
+            self.ward_merge_count_sum += int(getattr(route, "ward_merge_count", 0))
+            self.novelty_suppressed_count_sum += int(getattr(route, "novelty_suppressed_count", 0))
         for entry in entries:
             stats = _entry_anchor_stats(entry)
             if stats is None:
@@ -256,6 +275,10 @@ class AnchorDedupAccumulator:
         self.spans.extend(other.spans)
         self.m_values.extend(other.m_values)
         self.lo_hi_m_values.extend(other.lo_hi_m_values)
+        self.new_cluster_attempt_count_sum += other.new_cluster_attempt_count_sum
+        self.k_max_binding_count_sum += other.k_max_binding_count_sum
+        self.ward_merge_count_sum += other.ward_merge_count_sum
+        self.novelty_suppressed_count_sum += other.novelty_suppressed_count_sum
         self.sh_sources.update(other.sh_sources)
 
     def finalize(self) -> dict[str, Any]:
@@ -299,6 +322,11 @@ class AnchorDedupAccumulator:
             "entry_span_quantiles": _quantiles(self.spans),
             "entry_width_max": max(self.widths) if self.widths else None,
             "entry_span_max": max(self.spans) if self.spans else None,
+            "new_cluster_attempt_count_mean": self.new_cluster_attempt_count_sum / denom,
+            "k_max_binding_count_mean": self.k_max_binding_count_sum / denom,
+            "K_max_binding_rate": _rate(self.k_max_binding_count_sum, self.new_cluster_attempt_count_sum),
+            "ward_merge_count_mean": self.ward_merge_count_sum / denom,
+            "novelty_suppressed_count_mean": self.novelty_suppressed_count_sum / denom,
             "sh_source": sorted(self.sh_sources),
         }
 
@@ -387,12 +415,16 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
     base_dir = Path(task["base_dir"])
     g_values = [float(x) for x in task["g_values"]]
     l_values = [int(x) for x in task["l_values"]]
+    raw_k_max_values = task.get("k_max_values")
+    if raw_k_max_values is None:
+        raw_k_max_values = [None]
+    k_max_values = [None if value is None else int(value) for value in raw_k_max_values]
     group_filter = None if task["group_filter"] is None else set(int(x) for x in task["group_filter"])
     task_groups = None if task.get("task_groups") is None else set(int(x) for x in task["task_groups"])
     collect_by_layer_group = bool(task["collect_by_layer_group"])
 
-    overall: dict[tuple[str, str | None, int | None], AnchorDedupAccumulator] = {}
-    by_layer_group: dict[tuple[str, str | None, int | None, int, int], AnchorDedupAccumulator] = {}
+    overall: dict[tuple[str, str | None, int | None, str | None], AnchorDedupAccumulator] = {}
+    by_layer_group: dict[tuple[str, str | None, int | None, str | None, int, int], AnchorDedupAccumulator] = {}
     processed_pairs = 0
     timing_events: list[dict[str, Any]] = []
 
@@ -405,20 +437,24 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
         group: int,
         g_label: str | None = None,
         l_block: int | None = None,
+        k_label: str | None = None,
+        route: Any | None = None,
     ) -> None:
-        overall.setdefault((scheme, g_label, l_block), AnchorDedupAccumulator()).add(
+        overall.setdefault((scheme, g_label, l_block, k_label), AnchorDedupAccumulator()).add(
             entries=entries,
             ladder_meta=ladder_meta,
             sh_source=sh_source,
+            route=route,
         )
         if collect_by_layer_group:
             by_layer_group.setdefault(
-                (scheme, g_label, l_block, layer, group),
+                (scheme, g_label, l_block, k_label, layer, group),
                 AnchorDedupAccumulator(),
             ).add(
                 entries=entries,
                 ladder_meta=ladder_meta,
                 sh_source=sh_source,
+                route=route,
             )
 
     with np.load(base_dir / record["path"]) as payload:
@@ -484,60 +520,70 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
             group=int(group),
         )
 
-        route_cache: dict[float, Any] = {}
+        route_cache: dict[tuple[float, str], Any] = {}
         for g_max in g_values:
             g_label = format_g_max(g_max)
             for l_block in l_values:
-                cell_started_at = time.perf_counter()
                 effective_g_max = _effective_g_max(g_max, int(l_block))
                 effective_g_label = format_g_max(effective_g_max)
-                route = route_cache.get(effective_g_max)
-                route_cached = route is not None
-                route_elapsed = 0.0
-                if route is None:
-                    route_started_at = time.perf_counter()
-                    route = route_dpmeans_segments(
-                        k_group,
-                        lambda_new=lambda_new,
-                        g_max=effective_g_max,
-                        gamma=float(task["seg_forget"]),
+                for k_max in k_max_values:
+                    cell_started_at = time.perf_counter()
+                    k_label = format_k_max(k_max)
+                    route_key = (float(effective_g_max), k_label)
+                    route = route_cache.get(route_key)
+                    route_cached = route is not None
+                    route_elapsed = 0.0
+                    if route is None:
+                        route_started_at = time.perf_counter()
+                        route = route_dpmeans_segments(
+                            k_group,
+                            lambda_new=lambda_new,
+                            g_max=effective_g_max,
+                            gamma=float(task["seg_forget"]),
+                            k_max=k_max,
+                        )
+                        route_elapsed = time.perf_counter() - route_started_at
+                        route_cache[route_key] = route
+                    entries, meta = simulate_segment_ladders(
+                        route,
+                        b_prime=int(task["b_prime"]),
+                        l_block=int(l_block),
                     )
-                    route_elapsed = time.perf_counter() - route_started_at
-                    route_cache[effective_g_max] = route
-                entries, meta = simulate_segment_ladders(
-                    route,
-                    b_prime=int(task["b_prime"]),
-                    l_block=int(l_block),
-                )
-                add_stats(
-                    scheme=SCHEME_SEMANTIC,
-                    entries=entries,
-                    ladder_meta=meta,
-                    sh_source=sh_source,
-                    group=int(group),
-                    g_label=g_label,
-                    l_block=int(l_block),
-                )
-                if task.get("log_timing"):
-                    timing_events.append(
-                        {
-                            "task_i": task.get("task_i"),
-                            "task_count": task.get("task_count"),
-                            "record_i": record_i,
-                            "record_count": record_count,
-                            "layer": layer,
-                            "group": int(group),
-                            "lambda_rel": lambda_rel,
-                            "g_max": g_label,
-                            "l_block": int(l_block),
-                            "effective_g_max": effective_g_label,
-                            "route_cached": route_cached,
-                            "route_elapsed_seconds": route_elapsed,
-                            "cell_elapsed_seconds": time.perf_counter() - cell_started_at,
-                            "cluster_count": int(route.cluster_count),
-                            "segment_count": int(route.segment_count),
-                        }
+                    add_stats(
+                        scheme=SCHEME_SEMANTIC,
+                        entries=entries,
+                        ladder_meta=meta,
+                        sh_source=sh_source,
+                        group=int(group),
+                        g_label=g_label,
+                        l_block=int(l_block),
+                        k_label=k_label,
+                        route=route,
                     )
+                    if task.get("log_timing"):
+                        timing_events.append(
+                            {
+                                "task_i": task.get("task_i"),
+                                "task_count": task.get("task_count"),
+                                "record_i": record_i,
+                                "record_count": record_count,
+                                "layer": layer,
+                                "group": int(group),
+                                "lambda_rel": lambda_rel,
+                                "g_max": g_label,
+                                "k_max": k_label,
+                                "l_block": int(l_block),
+                                "effective_g_max": effective_g_label,
+                                "route_cached": route_cached,
+                                "route_elapsed_seconds": route_elapsed,
+                                "cell_elapsed_seconds": time.perf_counter() - cell_started_at,
+                                "cluster_count": int(route.cluster_count),
+                                "segment_count": int(route.segment_count),
+                                "ward_merge_count": int(getattr(route, "ward_merge_count", 0)),
+                                "k_max_binding_count": int(getattr(route, "k_max_binding_count", 0)),
+                                "new_cluster_attempt_count": int(getattr(route, "new_cluster_attempt_count", 0)),
+                            }
+                        )
 
     task_i = task.get("task_i")
     task_count = task.get("task_count")
@@ -602,19 +648,19 @@ def _print_summary(rows: list[dict[str, Any]], *, top: int) -> None:
     if semantic_rows:
         print("\n== Semantic configs ==")
         print(
-            "cfg          E[M]  M=3    save   logical  fixed3  phys  entries  "
-            "entry/single  logical/single  phys/vanilla"
+            "cfg                  E[M]  M=3    save   logical  fixed3  phys  entries  "
+            "bind     ward  entry/single  logical/single  phys/vanilla"
         )
         print(
-            "-----------  ----  -----  -----  -------  ------  ----  -------  "
-            "------------  --------------  ------------"
+            "-------------------  ----  -----  -----  -------  ------  ----  -------  "
+            "-------  ----  ------------  --------------  ------------"
         )
         ranked = sorted(semantic_rows, key=lambda row: (float(row.get("E_M") or 0), str(row.get("g_max"))))
         for row in ranked[: max(int(top), 1)]:
             m_frac = row.get("m_fractions") or {}
-            cfg = f"{row.get('g_max')}:{row.get('l_block')}"
+            cfg = f"{row.get('g_max')}:{row.get('l_block')}:K={row.get('k_max', 'unclipped')}"
             print(
-                f"{cfg.ljust(11)}  "
+                f"{cfg.ljust(19)}  "
                 f"{_fmt_num(row.get('E_M')).rjust(4)}  "
                 f"{_fmt_pct(m_frac.get('3')).rjust(5)}  "
                 f"{_fmt_pct(row.get('gather_savings_fraction_vs_fixed3')).rjust(5)}  "
@@ -622,6 +668,8 @@ def _print_summary(rows: list[dict[str, Any]], *, top: int) -> None:
                 f"{_fmt_num(row.get('fixed3_anchor_count_mean')).rjust(6)}  "
                 f"{_fmt_num(row.get('current_scheme_physical_slot_count_mean')).rjust(4)}  "
                 f"{_fmt_num(row.get('entry_count_mean')).rjust(7)}  "
+                f"{_fmt_pct(row.get('K_max_binding_rate')).rjust(7)}  "
+                f"{_fmt_num(row.get('ward_merge_count_mean')).rjust(4)}  "
                 f"{_fmt_num(row.get('entry_count_mean_ratio_vs_single_cluster')).rjust(12)}  "
                 f"{_fmt_num(row.get('logical_anchor_count_mean_ratio_vs_single_cluster')).rjust(14)}  "
                 f"{_fmt_num(row.get('current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full')).rjust(12)}"
@@ -636,22 +684,31 @@ def _format_timing_event(event: dict[str, Any]) -> str:
         f"record={event.get('record_i')}/{event.get('record_count')} "
         f"layer={event.get('layer')} group={event.get('group')} "
         f"lambda_rel={float(event['lambda_rel']):g} g_max={event.get('g_max')} "
-        f"l_block={event.get('l_block')} effective_g_max={event.get('effective_g_max')} "
+        f"k_max={event.get('k_max')} l_block={event.get('l_block')} effective_g_max={event.get('effective_g_max')} "
         f"route={float(event.get('route_elapsed_seconds') or 0.0):.3f}s({cached}) "
         f"cell={float(event.get('cell_elapsed_seconds') or 0.0):.3f}s "
-        f"clusters={event.get('cluster_count')} segments={event.get('segment_count')}"
+        f"clusters={event.get('cluster_count')} segments={event.get('segment_count')} "
+        f"ward={event.get('ward_merge_count')} bind={event.get('k_max_binding_count')}/"
+        f"{event.get('new_cluster_attempt_count')}"
     )
 
 
-def _add_timing_stat(stats: dict[tuple[float, str, int, str], dict[str, Any]], event: dict[str, Any]) -> None:
-    key = (float(event["lambda_rel"]), str(event["g_max"]), int(event["l_block"]), str(event["effective_g_max"]))
+def _add_timing_stat(stats: dict[tuple[float, str, str, int, str], dict[str, Any]], event: dict[str, Any]) -> None:
+    key = (
+        float(event["lambda_rel"]),
+        str(event["g_max"]),
+        str(event.get("k_max", "unclipped")),
+        int(event["l_block"]),
+        str(event["effective_g_max"]),
+    )
     row = stats.setdefault(
         key,
         {
             "lambda_rel": key[0],
             "g_max": key[1],
-            "l_block": key[2],
-            "effective_g_max": key[3],
+            "k_max": key[2],
+            "l_block": key[3],
+            "effective_g_max": key[4],
             "cell_count": 0,
             "route_calls": 0,
             "route_elapsed_total": 0.0,
@@ -660,6 +717,9 @@ def _add_timing_stat(stats: dict[tuple[float, str, int, str], dict[str, Any]], e
             "cell_elapsed_max": 0.0,
             "cluster_count_max": 0,
             "segment_count_max": 0,
+            "ward_merge_count_max": 0,
+            "k_max_binding_count_max": 0,
+            "new_cluster_attempt_count_max": 0,
         },
     )
     route_elapsed = float(event.get("route_elapsed_seconds") or 0.0)
@@ -669,13 +729,22 @@ def _add_timing_stat(stats: dict[tuple[float, str, int, str], dict[str, Any]], e
     row["cell_elapsed_max"] = max(float(row["cell_elapsed_max"]), cell_elapsed)
     row["cluster_count_max"] = max(int(row["cluster_count_max"]), int(event.get("cluster_count") or 0))
     row["segment_count_max"] = max(int(row["segment_count_max"]), int(event.get("segment_count") or 0))
+    row["ward_merge_count_max"] = max(int(row["ward_merge_count_max"]), int(event.get("ward_merge_count") or 0))
+    row["k_max_binding_count_max"] = max(
+        int(row["k_max_binding_count_max"]),
+        int(event.get("k_max_binding_count") or 0),
+    )
+    row["new_cluster_attempt_count_max"] = max(
+        int(row["new_cluster_attempt_count_max"]),
+        int(event.get("new_cluster_attempt_count") or 0),
+    )
     if not event.get("route_cached"):
         row["route_calls"] += 1
         row["route_elapsed_total"] += route_elapsed
         row["route_elapsed_max"] = max(float(row["route_elapsed_max"]), route_elapsed)
 
 
-def _timing_rows(stats: dict[tuple[float, str, int, str], dict[str, Any]]) -> list[dict[str, Any]]:
+def _timing_rows(stats: dict[tuple[float, str, str, int, str], dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for row in stats.values():
         out = dict(row)
@@ -686,21 +755,22 @@ def _timing_rows(stats: dict[tuple[float, str, int, str], dict[str, Any]]) -> li
             float(out["cell_elapsed_total"]) / int(out["cell_count"]) if int(out["cell_count"]) else 0.0
         )
         rows.append(out)
-    return sorted(rows, key=lambda x: (float(x["lambda_rel"]), str(x["g_max"]), int(x["l_block"])))
+    return sorted(rows, key=lambda x: (float(x["lambda_rel"]), str(x["g_max"]), str(x["k_max"]), int(x["l_block"])))
 
 
 def _print_timing_summary(rows: list[dict[str, Any]], *, top: int = 20) -> None:
     if not rows:
         return
-    print("== S0.6 routing timing by (lambda_rel, g_max, l_block) ==")
+    print("== S0.6 routing timing by (lambda_rel, g_max, k_max, l_block) ==")
     print(
-        "lambda_rel  g_max  l_block  eff_g  route_total  route_mean  route_max  "
-        "cell_total  cell_mean  clusters_max  segments_max  cells"
+        "lambda_rel  g_max  k_max      l_block  eff_g  route_total  route_mean  route_max  "
+        "cell_total  cell_mean  clusters_max  ward_max  bind_max  segments_max  cells"
     )
     for row in sorted(rows, key=lambda x: float(x["route_elapsed_total"]), reverse=True)[:top]:
         print(
             f"{float(row['lambda_rel']):>10g}  "
             f"{str(row['g_max']).rjust(5)}  "
+            f"{str(row['k_max']).rjust(9)}  "
             f"{int(row['l_block']):7d}  "
             f"{str(row['effective_g_max']).rjust(5)}  "
             f"{float(row['route_elapsed_total']):11.3f}s  "
@@ -709,6 +779,8 @@ def _print_timing_summary(rows: list[dict[str, Any]], *, top: int = 20) -> None:
             f"{float(row['cell_elapsed_total']):10.3f}s  "
             f"{float(row['cell_elapsed_mean']):9.3f}s  "
             f"{int(row['cluster_count_max']):12d}  "
+            f"{int(row['ward_merge_count_max']):8d}  "
+            f"{int(row['k_max_binding_count_max']):8d}  "
             f"{int(row['segment_count_max']):12d}  "
             f"{int(row['cell_count'])}"
         )
@@ -721,6 +793,14 @@ def main() -> None:
     parser.add_argument("--g_max", default="inf,8192,4096,2048,1024,256")
     parser.add_argument("--l_block", default="0,1,2,3")
     parser.add_argument("--lambda_rel", type=float, default=1.0)
+    parser.add_argument(
+        "--k_max",
+        default="unclipped",
+        help=(
+            "Comma-separated K_max values for the Ward-clipped probe. "
+            "Use 'unclipped' (default) to preserve the original no-Ward Stage-0 route."
+        ),
+    )
     parser.add_argument("--seg_forget", type=float, default=0.5)
     parser.add_argument("--b_prime", type=int, default=8)
     parser.add_argument("--vanilla_B", type=int, default=512)
@@ -746,7 +826,7 @@ def main() -> None:
     parser.add_argument(
         "--log_timing",
         action="store_true",
-        help="Append task elapsed seconds and print per-(lambda_rel, g_max, l_block) routing timing details.",
+        help="Append task elapsed seconds and print per-(lambda_rel, g_max, k_max, l_block) routing timing details.",
     )
     parser.add_argument(
         "--allow_fallback_sh",
@@ -756,16 +836,19 @@ def main() -> None:
     parser.add_argument(
         "--skip_by_layer_group",
         action="store_true",
-        help="Omit per-(scheme, g_max, l_block, layer, group) rows and write only overall_by_config.",
+        help="Omit per-(scheme, g_max, l_block, k_max, layer, group) rows and write only overall_by_config.",
     )
     args = parser.parse_args()
 
     g_values = parse_g_max_list(args.g_max)
     l_values = parse_int_list(args.l_block)
+    k_max_values = parse_k_max_list(args.k_max)
     if not g_values:
         raise ValueError(f"--g_max {args.g_max!r} parsed to an empty list -- pass at least one value")
     if not l_values:
         raise ValueError(f"--l_block {args.l_block!r} parsed to an empty list -- pass at least one value")
+    if not k_max_values:
+        raise ValueError(f"--k_max {args.k_max!r} parsed to an empty list -- pass at least one value")
     if not (math.isfinite(args.lambda_rel) and args.lambda_rel > 0.0):
         raise ValueError(f"--lambda_rel must be finite and > 0, got {args.lambda_rel}")
     if not (math.isfinite(args.seg_forget) and 0.0 <= args.seg_forget <= 1.0):
@@ -790,11 +873,11 @@ def main() -> None:
     if not records:
         raise ValueError("No layer records matched the requested filters")
 
-    overall: dict[tuple[str, str | None, int | None], AnchorDedupAccumulator] = {}
-    by_layer_group: dict[tuple[str, str | None, int | None, int, int], AnchorDedupAccumulator] = {}
+    overall: dict[tuple[str, str | None, int | None, str | None], AnchorDedupAccumulator] = {}
+    by_layer_group: dict[tuple[str, str | None, int | None, str | None, int, int], AnchorDedupAccumulator] = {}
     processed_pairs = 0
     groups_seen: set[int] = set()
-    timing_stats: dict[tuple[float, str, int, str], dict[str, Any]] = {}
+    timing_stats: dict[tuple[float, str, str, int, str], dict[str, Any]] = {}
     scale_manifest = {"key_scale": manifest.get("key_scale", {})}
     base_tasks = []
     for record_i, (sample, record) in enumerate(records, start=1):
@@ -807,6 +890,7 @@ def main() -> None:
             "scale_manifest": scale_manifest,
             "g_values": g_values,
             "l_values": l_values,
+            "k_max_values": k_max_values,
             "group_filter": None if group_filter is None else sorted(group_filter),
             "lambda_rel": args.lambda_rel,
             "seg_forget": args.seg_forget,
@@ -873,32 +957,48 @@ def main() -> None:
         )
 
     overall_rows = []
-    for (scheme, g_label, l_block), acc in sorted(
+    for (scheme, g_label, l_block, k_label), acc in sorted(
         overall.items(),
         key=lambda item: (
             item[0][0],
             "" if item[0][1] is None else item[0][1],
             -1 if item[0][2] is None else item[0][2],
+            "" if item[0][3] is None else item[0][3],
         ),
     ):
-        row = {"scheme": scheme, "g_max": g_label, "l_block": l_block}
+        row = {
+            "scheme": scheme,
+            "lambda_rel": args.lambda_rel,
+            "g_max": g_label,
+            "l_block": l_block,
+            "k_max": k_label,
+        }
         row.update(acc.finalize())
         _attach_scheme_physical_width(row)
         overall_rows.append(row)
     _add_ratios(overall_rows)
 
     by_lg_rows = []
-    for (scheme, g_label, l_block, layer, group), acc in sorted(
+    for (scheme, g_label, l_block, k_label, layer, group), acc in sorted(
         by_layer_group.items(),
         key=lambda item: (
             item[0][0],
             "" if item[0][1] is None else item[0][1],
             -1 if item[0][2] is None else item[0][2],
-            item[0][3],
+            "" if item[0][3] is None else item[0][3],
             item[0][4],
+            item[0][5],
         ),
     ):
-        row = {"scheme": scheme, "g_max": g_label, "l_block": l_block, "layer": layer, "group": group}
+        row = {
+            "scheme": scheme,
+            "lambda_rel": args.lambda_rel,
+            "g_max": g_label,
+            "l_block": l_block,
+            "k_max": k_label,
+            "layer": layer,
+            "group": group,
+        }
         row.update(acc.finalize())
         _attach_scheme_physical_width(row)
         by_lg_rows.append(row)
@@ -916,14 +1016,20 @@ def main() -> None:
             "vanilla_recent_size": args.vanilla_recent_size,
             "g_max": [format_g_max(x) for x in g_values],
             "l_block": l_values,
+            "k_max": [format_k_max(x) for x in k_max_values],
             "layers": None if layer_filter is None else sorted(layer_filter),
             "groups": None if group_filter is None else sorted(group_filter),
             "workers": args.workers,
             "parallel_unit": args.parallel_unit,
             "task_count": len(tasks),
             "routing_eta": 0.0,
-            "routing_mode": "strict_serial_dpmeans_unclipped",
+            "routing_mode": "strict_serial_dpmeans_unclipped_or_kmax_ward_probe",
             "l_block_zero_forces_g_max_inf": True,
+            "k_max_probe_note": (
+                "k_max='unclipped' preserves the original no-Ward Stage-0 DP-means route. Integer k_max "
+                "values enable the algorithm-spec §5.6 Ward cap; K_max_binding_rate is "
+                "k_max_binding_count / new_cluster_attempt_count."
+            ),
         },
         "summary": {
             "record_count": len(records),

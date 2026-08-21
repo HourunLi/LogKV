@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -48,7 +49,7 @@ def test_accumulator_reports_token_and_span_isolation_against_b_prime() -> None:
     cluster_sizes = [2, 3, 2]
     acc = NeedleIsolationAccumulator(b_prime=2)
 
-    acc.add_route_meta(cluster_count=3, segment_count=4, sh_source="calibrated")
+    acc.add_route_meta(route=SimpleNamespace(cluster_count=3, segment_count=4), sh_source="calibrated")
     acc.add_intervals(intervals=[(0, 3), (5, 7)], cluster_ids=cluster_ids, cluster_sizes=cluster_sizes)
     acc.add_random_intervals(intervals=[(2, 5)], cluster_ids=cluster_ids, cluster_sizes=cluster_sizes)
     row = acc.finalize()
@@ -138,15 +139,20 @@ def test_process_record_task_is_deterministic_for_worker_shards() -> None:
     assert first["processed_pairs"] == 1
     assert first["matched_group_pairs"] == 1
     assert first["comparable_pairs"] == 1
-    assert sorted(first["overall"]) == [(0.5, "2"), (0.5, "inf"), (1.0, "2"), (1.0, "inf")]
-    assert sorted(first["by_layer_group"]) == [
-        (0.5, "2", 0, 0),
-        (0.5, "inf", 0, 0),
-        (1.0, "2", 0, 0),
-        (1.0, "inf", 0, 0),
+    assert sorted(first["overall"]) == [
+        (0.5, "2", "unclipped"),
+        (0.5, "inf", "unclipped"),
+        (1.0, "2", "unclipped"),
+        (1.0, "inf", "unclipped"),
     ]
-    assert first["overall"][(0.5, "2")].finalize()["random_token_count"] == 3
-    assert first["overall"][(0.5, "2")].finalize() == second["overall"][(0.5, "2")].finalize()
+    assert sorted(first["by_layer_group"]) == [
+        (0.5, "2", "unclipped", 0, 0),
+        (0.5, "inf", "unclipped", 0, 0),
+        (1.0, "2", "unclipped", 0, 0),
+        (1.0, "inf", "unclipped", 0, 0),
+    ]
+    assert first["overall"][(0.5, "2", "unclipped")].finalize()["random_token_count"] == 3
+    assert first["overall"][(0.5, "2", "unclipped")].finalize() == second["overall"][(0.5, "2", "unclipped")].finalize()
 
 
 def test_process_record_task_can_process_one_group_subset() -> None:
@@ -191,7 +197,7 @@ def test_process_record_task_can_process_one_group_subset() -> None:
 
     assert result["matched_group_pairs"] == 1
     assert result["processed_pairs"] == 1
-    assert sorted(result["by_layer_group"]) == [(1.0, "inf", 0, 1)]
+    assert sorted(result["by_layer_group"]) == [(1.0, "inf", "unclipped", 0, 1)]
     assert len(result["timing_events"]) == 1
     event = result["timing_events"][0]
     assert event["lambda_rel"] == 1.0
