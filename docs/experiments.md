@@ -242,7 +242,7 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
 | S0.3 | needle 隔离率：所在簇的成员数分布（关键是 `≤ B′` 的比例）| §3 + §5.9 的核心机制成不成立 |
 | S0.4 | 簇内 **key 方差**与 **value 方差**（两个都要）/ 现有位置槽内方差 | key 方差管分数侧，**value 方差管读出侧**，只测前者会高估收益（§11-D）|
 | S0.5 | entry 的 `(p_hi − p_lo)` 跨度分布，随 `(g_max, ℓ_block)` 变化 | 验证段机制确实压住了跨度 |
-| S0.6 | 锚点去重后的平均倍数 `E[M]` 与分布 | 读出槽池会不会失控（§4）|
+| S0.6 | 锚点去重后的平均倍数 `E[M]` 与分布 | 值不值得为未来 gather/packed 实现投入（§4）——v1 本身的读出槽池是固定宽度，不受 `E[M]` 影响 |
 | S0.7 | 簇内 value 的并存 vs 作废比例，**分相邻/远距离统计** | §2.4 开放问题的判定实验 |
 | S0.8 | 批量化路由（§5.4）与严格串行版的分歧率——**拆成三项**（cluster assignment/Ward 事件、segment+PAD 开销、最终 cache/readout 误差），定义见下方决策门 | 那个近似能不能用 |
 
@@ -275,13 +275,20 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   并入大簇，§3 的机制不成立，方案应就地停止。
 - **S0.4**：key 方差应显著低于现有位置槽；**若 value 方差没有同步下降**，说明读出侧
   仍是 smear，收益要打对折，需要考虑按 `[k;v]` 联合聚类或簇内二次分裂。
-- **S0.6（自 `p_mid` 修正后升格为真正的决策门）**：`E[M]` 应 < 1.6。修正前的
-  `p_mid` 继承规则在平衡 Fenwick 路径下恒等于 `p_lo`（CLAUDE.md §2.2 更正框），
-  副作用是把 `M` 压在 2；改成真质心后 `p_mid` 通常严格落在 `(p_lo, p_hi)` 内，
-  `M` 趋近 3，**直接顶到 §4 那张表里"E[M]=3 ⇒ 4984 槽 ⇒ 超过 vanilla 3584"那一行**。
-  若实测确实逼近 3，除 §4 的三层缓解外还有一条干净退路：**砍掉第三锚点只留
-  `(p_lo, p_hi)`**——相对修正前的实现零损失（它本来就等于 `p_lo`），只是放弃了
-  修正带来的那部分中心估计能力。
+- **S0.6（更正：不再是"预测会不会超过 vanilla"的决策门，那件事已经确定，
+  与 `E[M]` 无关）**：CLAUDE.md §4 已经更正——`dedup_anchors` 固定返回
+  `(..., S, 3)`，v1 读出时的物理槽池恒为 `entry × 3 = 4984`（不随 `E[M]`
+  变化，无效/重复锚点靠 `slot_valid` 掩码而非收缩张量宽度剔除），`4984 >
+  vanilla 3584` 是当前（无 gather）设计的**确定结果**，不是"`E[M]` 不好才
+  会发生"的风险。S0.6 真正测的是**这项差距值不值得投入未来的 gather/
+  packed 优化**：`E[M]` 越接近 1（越多 entry 去重后只剩 1~2 个锚点），
+  gather 能把物理槽数拉回接近 `E[M]` 对应的逻辑锚点数（重新回到 vanilla
+  之下）的空间就越大；`E[M]` 越接近 3，gather 的收益越小。**"砍掉第三
+  锚点只留 `(p_lo, p_hi)`" 是一条独立于 `E[M]` 测量结果的设计选择**（把
+  固定宽度从 3 降到 2，`1024+1320×2=3664`，仍然超过 vanilla 的 3584，只是
+  差距更小），不是"`E[M]` 测出来逼近 3 之后才该考虑"的条件退路——两者是
+  解决同一问题的不同思路，报告 S0.6 结果时不要把"实测 E[M]" 和"要不要退到
+  两锚点"包装成因果关系。
 - **S0.7**：若簇内 value 系统性作废的比例 > 30%，把 Γ 的 delta-rule 广义化提到
   Stage 1 范围内；否则记录结论并搁置 §2.4。
 - **S0.8**：分歧率不是一个单一标量，必须拆成三项分别报告，理由是它们诊断的是
@@ -514,12 +521,15 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        （或匈牙利算法求最大权二分匹配）看"大致对应哪个簇"，但那是可选
        的调试辅助，产出的字段误差不作为正式报告数字，因为不同簇之间
        字段值天然没有可比性。
-     - **3b（决策依据，唯一的硬性决策门）：两条路径各自处理完整条序列、
-       最终 cache 状态都已构造完毕之后，做一次真实 attention 读出，比较
-       批量路径与严格串行参考给出的注意力输出的相对 L2 误差**——是针对
-       整条序列处理完毕后那个最终状态的**单次**测量，不是逐个 flush 批
-       重复测量再平均，也不是"每处理完一批就测一次"的意思（具体用哪些
-       query、选多大范围，见下方 blockquote）。**这一项不需要任何簇
+     - **3b（决策依据，唯一的硬性决策门）：两条路径各自处理到
+       `cutoff = T − tail_query_count` 为止、把这一步的 cache 状态当作
+       冻结前缀，再把尾部 `tail_query_count` 个 token 当作真正意义上的
+       in-flight chunk 拼接上去，做一次真实 attention 读出，比较批量
+       路径与严格串行参考给出的注意力输出的相对 L2 误差**（具体构造见
+       下方 blockquote 的"更正"）——是针对这一个 `cutoff` 参考点的
+       **单次**测量，不是逐个 flush 批重复测量再平均，也不是"每处理完
+       一批就测一次"的意思（具体用哪些 query、选多大范围，见下方
+       blockquote）。**这一项不需要任何簇
        对齐**——直接对同一批 query 分别跑一次 attention、比较输出张量，
        两条路径的簇怎么编号、有没有一一对应完全不影响这个比较是否良定义，
        因此是唯一在"聚类本身发生真实分歧"时依然能给出干净数字的一项，
@@ -547,100 +557,93 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > `p ∈ [T−tail_query_count, T−1)`，真实自回归 serving 下它只该
        > 看到"刚摄入 token p 那一刻"的 cache 状态；但"两条路径各自处理
        > 完整条序列之后的最终 cache 状态"已经包含了 `p` 之后全部
-       > `T−1−p` 个 token 的压缩贡献——若某个 entry 的 `[p_lo, p_hi]`
-       > 横跨 `p`，拿这个最终状态给位置 `p` 的 query 做读出，就是在喂它
-       > 本不该看到的未来信息。这不是"多一点误差"：算出来的相对 L2
-       > 误差会同时包含"批量近似 vs 严格串行"的真实分歧**和**"读到了
-       > 不该读到的未来 token"两种效应叠加在一起，`<5%` 的结论会好看
-       > 但不可信。根因是 `algorithm-spec.md` §5.14"虚拟槽展开必须扣上
-       > `causal_tail`/`mask` API"一节里 pooled 区域"无条件可见"这条
-       > 既有语义的前提被违反了：那条语义只在"pooled 里的内容天生都比
-       > 当前 query 老"（真实 serving 下必然成立，因为 compaction 只
-       > 发生在 token 被挤出 recent window 之后）这个前提下才安全，3b
-       > 用同一份最终 cache 服务尾部窗口里**除最后一个 query 外的所有
-       > query**时，这个前提并不成立。
+       > `T−1−p` 个 token 的压缩贡献。
        >
-       > **修法：不重新构造多份 cache 状态（代价太大），而是把
-       > `tail_query_count` 这批 query 当成 `log_kv_slot_attention`
-       > 现有 `causal_tail` 参数里那批"in-flight exact chunk"，直接
-       > 复用生产读出路径，让"pooled 区域无条件可见"这条假设的前提
-       > 重新成立。** `causal_tail` 现有语义（`algorithm-spec.md`
-       > §5.14）正是"最后 `causal_tail` 个 slot 是逐 token 对齐的
-       > in-flight 精确 chunk、彼此三角因果互相掩蔽；它之前的所有
-       > pooled slot 无条件可见"——字面上就是 3b 需要的东西，前提是
-       > pooled 区域里确实不含任何比这批 query 里最早那个位置更"新"的
-       > 内容。
+       > **上一版曾经尝试证明"只要 `recent_count ≥ tail_query_count`，
+       > 用最终 cache 就安全"——这个精确度不够，必须再收紧一轮。** 那版
+       > 论证止步于"pooled 里的原始 token 不含来自 `p` 之后的内容"（可以
+       > 证明成立：给定 `recent_count ≥ tail_query_count`，任意 pooled
+       > 成员的位置都 `< T−recent_count ≤ T−tail_query_count`，早于每一个
+       > 尾部 query），但这只排除了**内容泄漏**（不该出现的原始 token
+       > 混进读出集合），没有排除**表示粒度泄漏**：`p` 和 `T−1` 之间还有
+       > `T−1−p` 个 token，它们在真实"处理到 p 那一刻"根本还没被摄入，
+       > 但在最终 cache 里已经把 recent window 挤过了一轮——`p` 之前那些
+       > 原本"as of p"还该待在 recent window 里、以精确 `w=1` 槽形式
+       > 存在的 token，到了最终 cache 里可能已经被后续（`p` 之后）的
+       > flush 事件挤出、压缩进了 pooled 层级。这些内容依然**早于** `p`
+       > （不违反因果，读出结果不会看到未来 token），但**被更粗的粒度
+       > 代表了**——用最终 cache 服务尾部窗口里除最后一个 query 外的
+       > 任何 query，读出用的表示和"真实 as-of-p 状态"不是同一个东西，
+       > 会让 3b 测量的到底是"批量近似 vs 严格串行的路由分歧"还是"用了
+       > 错误粒度表示的副作用"变得含糊——即使两者都不改变`<5%`判定的
+       > 方向（下面会说明为什么这层差异不足以让已经跑过的历史结论作废），
+       > 继续依赖一个需要这么多篇幅才能讲清楚"为什么安全"的构造，不如
+       > 换一个从构造上就不需要这层论证的方案。
        >
-       > **前提必须用真实存在的状态量表达，不能凭空发明一个**：
-       > cache 唯一持久维护的滑窗状态是 `recent_count`——当前 recent
-       > window 里还没被挤出去的 token 数，核对
-       > `litgpt/log_kv_cache.py:1246-1336`（`get_attention_state()`
-       > 现有实现）确认这是真实字段，函数本来就要读它。前提精确写作
-       > `recent_count ≥ tail_query_count`：尾部 `tail_query_count`
-       > 个 token 此刻是否**完整位于 recent window 内**，直接决定它们
-       > 会不会出现在 `get_attention_state()` 返回值的"recent 部分"里
-       > （见下方修法，这正是让 `causal_tail` 免于重新拼接的关键）。
-       > 两条路径分别断言，不能只查一条（批量近似和严格串行参考各自的
-       > `recent_count` 可能因为路由近似而略有不同）。不满足就是配置
-       > 错误，**硬失败**——换更小的 `tail_query_count`，或另挑一条不是
-       > 刚好卡在 flush 边界上的 prompt，不做静默截断或自动缩小（同
-       > §5.21-2"预分配 + 硬失败"原则）。`tail_query_count` **默认取
-       > `flush_granularity` 这个数值做初始化，但保存成独立字段**——
-       > 不是运行时去读 `flush_granularity` 这种隐式耦合，改
-       > `flush_granularity` 不会连带改变已经跑过的实验用的
-       > `tail_query_count`，复现实验只需要 `tail_query_count` 这一个
-       > 数字，不需要连带确认 `flush_granularity` 当时是多少。
-       > `recent_size` 默认 1024，正常情况下这条断言天然满足，只有
-       > 病态/边界配置才会触发。
+       > **修法：不再复用最终 cache，3b 为自己单独构造一对"只处理到
+       > `cutoff = T − tail_query_count`"的 CPU 参考 cache（`cache_
+       > batch_prefix`/`cache_serial_prefix`），把尾部当成真正意义上
+       > "尚未提交"的 in-flight chunk 通过 `append_exact_tokens` 拼上去，
+       > 再用 `causal_tail=tail_query_count` 读出。** 这精确复现了
+       > `p=cutoff`（尾部窗口里最早的那个 query）此刻的真实 cache 状态
+       > ——`[0, cutoff)` 已提交、`[cutoff, T)` 是这一次 forward 正在
+       > 处理、还没写回 cache 的当前 chunk，和生产路径
+       > `CausalSelfAttention._log_kv_training_forward()` 处理任意一个
+       > 流式 chunk 时的状态完全同构（都是"冻结的已提交前缀 + 当前 in-
+       > flight chunk"）。`causal_tail` 的三角掩码则保证尾部窗口内部
+       > 每个 query 只看到自己和更早的尾部位置，不看到更晚的——三点合起来
+       > （前缀严格早于 `cutoff`、`causal_tail` 挡住尾部内部的"未来"、
+       > 附加的尾部 token 从未被压缩过，精确保留）对尾部窗口里的**每一个**
+       > query 都精确成立，不再需要"pooled 内容是否碰巧早于 p"这类需要
+       > 额外证明的不变量，也不再需要 `recent_count ≥ tail_query_count`
+       > 这条前提——这条前提连同它要求的"两条路径分别断言""硬失败换更小
+       > 的 `tail_query_count`"等配套机制一并作废，不再需要维护。
+       > **`cache_batch_prefix`/`cache_serial_prefix` 是 3b 专用的一对
+       > 独立实例**，用同一套 §5.3/§5.4 CPU 参考实现构造，只是喂给它们
+       > 的输入截短到 `k_raw[:cutoff]`/`v[:cutoff]`/`pos[:cutoff]`——不
+       > 是 S0.8 第 1/2/3a 项比较用的那对 `cache_batch`/`cache_serial`
+       > （那对依然处理完整条序列，1/2/3a 关心的是"完整序列处理完之后
+       > 的最终路由/cache 结构分歧"，用完整序列是对的，不受这条更正
+       > 影响）。**惟一新增的前置条件是 `T > tail_query_count`**（否则
+       > `cutoff ≤ 0`，前缀为空，需要另挑一条更长的 prompt，同样硬
+       > 失败不做静默处理）——这比原来的 `recent_count ≥ tail_query_
+       > count` 更弱、更不容易触发。
        >
-       > **CPU 参考实现必须真正维护一个 recent window 缓冲区，不能只做
-       > `op_log` 重放/只保留压缩后的层级。** `recent_count`/
-       > `get_attention_state()` 这条前提能不能立住，取决于两条模拟
-       > 路径（批量近似、严格串行参考）各自的 CPU 实现是否忠实复刻了
-       > "滑窗、按到达顺序追加、溢出时把最老的 `flush_granularity` 个
-       > token 推出去做压缩"这条既有语义（同 CLAUDE.md §10"现有 recent
-       > window 溢出即驱逐的语义"）——如果某个实现图省事，只维护"最终
-       > 压缩层级"，或者只靠 `op_log` 重放去重建 pooled 部分而不单独
-       > 维护一段忠实的 recent-window 缓冲，`recent_count` 这个量就没有
-       > 对应的真实状态可查：上面的断言要么无法执行，要么执行了但查到
-       > 的是一个不代表真实滑窗状态的值——产出一个"看起来能跑"但因果
-       > 尾部已经错位的 cache，且没有任何报错信号提示这一点。这条要求
-       > 同样适用于 `algorithm-spec.md` §5.4"必须补的单测"用到的同一套
-       > CPU 参考实现（那是实现单测，不是 S0.1，见其"实现单测"更正框），
-       > 不是 3b 专属的新增负担，只是把已经隐含的要求显式写出来。
+       > **`k_tail_roped` 需要现算，不能照抄前缀部分的现成物化逻辑**：
+       > dump 只落盘 pre-RoPE 的 `k_raw`（机制 A），尾部 `[cutoff, T)`
+       > 这批 token 要作为 in-flight **精确**槽拼接，按既有约定
+       > （`algorithm-spec.md` §5.14"in-flight chunk 必须用 post-RoPE
+       > k"）必须是 post-RoPE。这不需要模型前向的中间变量——`apply_rope`
+       > 是纯位置索引的函数，尾部每个 token 的绝对位置已知（`cutoff`
+       > 到 `T−1`），直接对 dump 出来的 `k_raw[cutoff:T]` 在各自绝对
+       > 位置上调用标准 `apply_rope` 即可得到 `k_tail_roped`，和
+       > `materialize_anchor_keys` 给单点（`M=1`）entry 物化 key 用的
+       > 是同一个原语，不是新写一套逻辑。`v_tail` 不需要 RoPE，直接取
+       > `v[cutoff:T]`。
+       >
+       > CPU 参考实现（`cache_batch_prefix`/`cache_serial_prefix` 和
+       > S0.8 其它子项共用的 `cache_batch`/`cache_serial`）依然必须真正
+       > 维护一个 recent window 缓冲区，不能只做 `op_log` 重放/只保留
+       > 压缩后的层级——这是"滑窗、按到达顺序追加、溢出时把最老的
+       > `flush_granularity` 个 token 推出去做压缩"这条既有语义（同
+       > CLAUDE.md §10）对任何 CPU 参考实现的通用要求，`algorithm-
+       > spec.md` §5.4"必须补的单测"用到的同一套参考实现同样要满足，
+       > 不是 3b 专属的新增负担。
        >
        > **更正（这一轮修的，P0）：具体做法上一版还有两个坑，不是加了
-       > `causal_tail` 就完事。** ①**忘了真正拼接 in-flight chunk，
-       > `causal_tail` 会遮错对象**：上一版手工算出
-       > `k_tail_roped`/`v_tail`，但调用 `log_kv_slot_attention` 时传
-       > 的 `slot_k`/`slot_v` 是 `get_attention_state()` 的原始返回值，
-       > 从未把算出来的 `k_tail_roped`/`v_tail` 真正拼进去——`causal_
-       > tail` 遮住的是"调用方传入的张量最后 `causal_tail` 个位置"，
-       > 如果那里还是 `get_attention_state()` 原样返回的东西，被当成
-       > in-flight chunk 三角因果掩蔽的就是它恰好排在最后的那几个
-       > pooled slot，不是真正的尾部 token。②**`get_attention_state()`
-       > 是否已经包含 recent window 没说清楚，叠上①就会双计**：核对
-       > 上面引用的实现确认，它的返回值本来就是"压缩 levels（老到新）
-       > + recent window（原始顺序，`w=1` 精确槽）"拼接后的完整状态，
-       > **recent window 已经在里面**，不是只有 pooled 前缀——上一版
-       > "# pooled 前缀"这条注释是错的。若真的又手工拼一份
-       > `k_tail_roped`/`v_tail` 上去，尾部这 `tail_query_count` 个
-       > token 会在最终 attend 到的集合里出现两次。
-       >
-       > **两个坑一起看，修法反而比上一版更简单**：只要上面
-       > `recent_count ≥ tail_query_count` 的前提成立，`tail_query_
-       > count` 这批 token 本来就是 recent window 末尾的那部分，
-       > `get_attention_state()` 原样返回的 `slot_k`/`slot_v` 最后
-       > `tail_query_count` 个位置恰好已经是它们——**不需要任何手工
-       > 重建或拼接**，直接把这个原始返回值传给
-       > `log_kv_slot_attention(..., causal_tail=tail_query_count)`
-       > 即可。之前的压缩 levels，以及 recent window 里比尾部窗口更早
-       > 的那部分（`recent_count > tail_query_count` 时会有），保持
-       > 无条件可见对它们同样正确——它们的位置全都严格早于
-       > `T−tail_query_count`，早于尾部窗口里的任意一个 query，
-       > `p_earlier < p_query` 恒成立，不需要区分"是压缩 level 还是
-       > 较早的 recent token"，"无条件可见"这条假设的前提对它们从未
-       > 被违反过。
+       > `causal_tail` 就完事——这两条在新构造下依然成立，一并保留。**
+       > ①**忘了真正拼接 in-flight chunk，`causal_tail` 会遮错对象**：
+       > 必须把 `k_tail_roped`/`v_tail` 真正通过 `append_exact_tokens`
+       > 拼进 `cache_batch_prefix.get_attention_state()` 的返回值，不能
+       > 只是算出来却不用——`causal_tail` 遮住的是"调用方传入的张量
+       > 最后 `causal_tail` 个位置"，如果那里不是真正拼接过的尾部
+       > token，三角因果掩蔽的就是不相关的内容。②**`get_attention_
+       > state()` 的返回值本来就是"压缩 levels（老到新） + recent
+       > window（原始顺序，`w=1` 精确槽）"拼接后的完整状态**——`cache_
+       > batch_prefix`/`cache_serial_prefix` 各自的 recent window（可能
+       > 还留着 `cutoff` 之前的一些精确 token）已经在这份返回值里，
+       > `append_exact_tokens` 只需要把**尾部**（`[cutoff, T)`）接在
+       > 后面一次，不要重复拼接已经在返回值里的内容。
        >
        > **更正（这一轮修的，P0）：3b 的比较对象一度被错误地混进了"稠密
        > 侧 ground truth"，必须收回，不是措辞问题，是要删掉一整段设计。**
@@ -665,9 +668,12 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > ① **`log_kv_slot_attention` 调用传的是错误的位置参数。** 现有
        > 签名（`algorithm-spec.md` §5.14"虚拟槽展开必须扣上
        > `causal_tail`/`mask` API"一节）是
-       > `(q, slot_k, slot_v, slot_w, scale, mask=None, causal_tail=0,
+       > `(q, slot_k, slot_v, slot_w, scale, mask=None, lam=1.0, causal_tail=0,
        > slot_valid=None, M_s=None, ...)`——`scale` 排在 `slot_w` 之后、
-       > `mask` 之前，`slot_valid`/`M_s` 是排在更后面的具名参数。上一版
+       > `mask` 之前，`lam` 排在 `mask`/`causal_tail` 之间（**这一轮补的**：
+       > 上一版这里的签名片段漏抄了 `lam`，容易让人以为它被移除了——它一直
+       > 都在，下面的调用也一直显式传它，只是这个片段本身抄漏了），
+       > `slot_valid`/`M_s` 是排在更后面的具名参数。上一版
        > `log_kv_slot_attention(q_tail, *cache.get_attention_state(),
        > causal_tail=...)` 把 `get_attention_state()` 返回的 5 元组
        > `(slot_k,slot_v,slot_w,slot_valid,M_s)` 整个展开成位置参数，
@@ -755,8 +761,41 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        >     # 同一个精神。cache_batch/cache_serial 的 k̄_raw/v̄/w 同样要转
        >     # fp32 才能和 fp32 的 q_tail 相乘，不能指望参考实现"恰好"存的就是
        >     # 这个 dtype。
-       > assert cache_batch.recent_count  >= tail_query_count   # 前提，两条
-       > assert cache_serial.recent_count >= tail_query_count   # 路径各查一次
+       > assert T > tail_query_count   # cutoff = T - tail_query_count 必须 > 0，
+       >                                  # 否则前缀为空，换一条更长的 prompt
+       > cutoff = T - tail_query_count
+       >
+       > # cache_batch_prefix/cache_serial_prefix：3b 专用的一对独立 CPU 参考
+       > # cache，和 S0.8 第 1/2/3a 项用的 cache_batch/cache_serial 是不同实例
+       > # ——用同一套 §5.3/§5.4 CPU 参考实现构造，只是喂给它们的输入截短到
+       > # [0, cutoff)，不是完整的 [0, T)：
+       > #
+       > # 更正（这一轮修的，P1）：上一版写的 k_raw[:cutoff]/v[:cutoff] 按的是
+       > # dim 0 切片，但"dump 什么"表（本节前面）已经钉死 k_raw/v 的落盘形状是
+       > # (G, T, hs)——dim 0 是 KV group（默认 G=8），dim 1 才是时间轴 T。
+       > # k_raw[:cutoff] 字面上会切掉除前 cutoff 个 KV group 之外的一切（当
+       > # cutoff 是几千的 token 数量级、G 只有 8 时，这个切片要么整个越界、
+       > # 要么静默切出一个形状对不上下游的怪张量），不是按时间戳截断。pos 是
+       > # 例外：它是纯位置索引，形状 (T,)，没有 G 这一维，pos[:cutoff] 原来就是
+       > # 对的，不用改。改成显式按 dim 1 取子集：
+       > cache_batch_prefix  = build_cache_batch(k_raw[:, :cutoff, :], v[:, :cutoff, :], pos[:cutoff])
+       > cache_serial_prefix = build_cache_serial(k_raw[:, :cutoff, :], v[:, :cutoff, :], pos[:cutoff])
+       >
+       > # 尾部 [cutoff, T) 作为 in-flight 精确槽，必须是 post-RoPE——dump 只有
+       > # pre-RoPE 的 k_raw，用标准 apply_rope 在各自绝对位置上现算，和
+       > # materialize_anchor_keys 给单点 entry 物化 key 是同一个原语。同样按
+       > # dim 1（T 轴）取尾部子集，不是 dim 0：
+       > # 更正（这一轮修的，P3）：apply_rope 要求 cos/sin 恰好是三维
+       > # （见 litgpt/model.py:2081 的显式 `if cos.dim() != 3: raise
+       > # ValueError`），但 cos_cache[cutoff:T]/sin_cache[cutoff:T] 是从
+       > # 按位置索引的 cache 里切出来的，形状是 (tail, hs)，只有 2 维，
+       > # 直接传会立即报错，不是静默算错。k_raw[:, cutoff:T, :] 本身已经
+       > # 是 (G, tail, hs) 3 维（dim 0=G 权当 apply_rope 签名里的"B"，
+       > # 与本节其它地方把 k_raw/v 当 (G,T,hs) 处理一致），补一个前导
+       > # 维度让 cos/sin 变成 (1, tail, hs) 即可，dims_diff=0，直接靠
+       > # 前导维 1 对 G 做标准 broadcasting，不需要额外 reshape：
+       > k_tail_roped = apply_rope(k_raw[:, cutoff:T, :], cos_cache[None, cutoff:T, :], sin_cache[None, cutoff:T, :])
+       > v_tail = v[:, cutoff:T, :]
        >
        > # log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale, mask=None,
        > # lam=1.0, causal_tail=0, slot_valid=None, M_s=None, ...)——scale 是
@@ -772,23 +811,47 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > # 一个独立扫描轴，λ=0 时 mass bias 整项不加（log_kv_cache.py:1625
        > # 的 `if lam != 0.0:` 门控），若 3b 悄悄固定用默认值 1.0，扫 λ=0 时
        > # 3b 比较的就不是这次实验实际配置的读出行为：
-       > state_batch = cache_batch.get_attention_state(with_stats=False)
-       > out_batch = log_kv_slot_attention(
-       >     q_tail, state_batch.slot_k.float(), state_batch.slot_v.float(),
-       >     state_batch.slot_w.float(), scale,        # scale 复用机制 B 循环
-       >     lam=log_kv_lambda,                          # 里已经在用的同一个
-       >     causal_tail=tail_query_count,                # scale；lam 是本次
-       >     slot_valid=state_batch.slot_valid,           # 实验实际配置的值，
-       >     M_s=state_batch.M_s,                          # 不留给默认值 1.0
+       > # 更正（这一轮修的，P2）：上一版把 append_exact_tokens 当成"收三个裸
+       > # 张量、吐三个裸张量"的老式函数调用——但 algorithm-spec.md §5.14
+       > # （CacheAttentionState 定义那一节）已经钉死它的新契约是"收一个
+       > # CacheAttentionState、吐一个 CacheAttentionState"，输入输出都要迁移，
+       > # 不是只迁移 get_attention_state() 一个函数。改成按新契约调用：先用
+       > # NamedTuple 的 _replace() 只转 dtype（slot_valid/M_s 等其余字段原样
+       > # 透传，_replace 不碰未指定的字段），再整个 state 传给
+       > # append_exact_tokens，返回值也是一个完整 CacheAttentionState，直接
+       > # 按字段名取给 log_kv_slot_attention，不再有裸位置元组：
+       > state_batch_f32 = state_batch._replace(
+       >     slot_k=state_batch.slot_k.float(),
+       >     slot_v=state_batch.slot_v.float(),
+       >     slot_w=state_batch.slot_w.float(),
        > )
-       > state_serial = cache_serial.get_attention_state(with_stats=False)
+       > state_batch_full = append_exact_tokens(state_batch_f32, k_tail_roped.float(), v_tail.float())
+       >     # 尾部拼在 prefix 的 pooled+recent 之后；state_batch_full.slot_valid/
+       >     # M_s 原样透传自 state_batch_f32，只覆盖 pooled 前缀宽度，不需要为
+       >     # 拼接的尾部额外扩展（log_kv_slot_attention 对 S_pooled 之外的位置
+       >     # 隐式按 slot_valid=True/M_s=1 处理，和 exact 后缀天然 w=1 是同一条
+       >     # 既有约定）
+       > out_batch = log_kv_slot_attention(
+       >     q_tail, state_batch_full.slot_k, state_batch_full.slot_v,   # scale 复用机制 B
+       >     state_batch_full.slot_w, scale,                                # 循环里已经在用
+       >     lam=log_kv_lambda,                                             # 的同一个 scale；
+       >     causal_tail=tail_query_count,                                  # lam 是本次实验
+       >     slot_valid=state_batch_full.slot_valid,                        # 实际配置的值，
+       >     M_s=state_batch_full.M_s,                                       # 不留给默认值 1.0
+       > )
+       > state_serial = cache_serial_prefix.get_attention_state(with_stats=False)
+       > state_serial_f32 = state_serial._replace(
+       >     slot_k=state_serial.slot_k.float(),
+       >     slot_v=state_serial.slot_v.float(),
+       >     slot_w=state_serial.slot_w.float(),
+       > )
+       > state_serial_full = append_exact_tokens(state_serial_f32, k_tail_roped.float(), v_tail.float())
        > out_serial = log_kv_slot_attention(
-       >     q_tail, state_serial.slot_k.float(), state_serial.slot_v.float(),
-       >     state_serial.slot_w.float(), scale,
+       >     q_tail, state_serial_full.slot_k, state_serial_full.slot_v, state_serial_full.slot_w, scale,
        >     lam=log_kv_lambda,
        >     causal_tail=tail_query_count,
-       >     slot_valid=state_serial.slot_valid,
-       >     M_s=state_serial.M_s,
+       >     slot_valid=state_serial_full.slot_valid,
+       >     M_s=state_serial_full.M_s,
        > )
        > error_3b = relative_l2(out_batch, out_serial)   # 3b 的分子/分母；
        >                                                    # 两次调用用的是
@@ -846,8 +909,8 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
        > 向它要东西"这条边界。压缩侧两次调用**直接、原样传递生产函数
        > `get_attention_state()` 的返回值给 `log_kv_slot_attention`，不
        > 做任何手工重建或平行实现**（GQA 折叠、`slot_valid`、`M_s`、
-       > `λ log(w/M)`、fp32 分数缓冲这些细节因此全部自动保持一致，不
-       > 需要在这里重新枚举）。
+       > `λ·log(w) − log(M)`（`−log(M)` 不受 `λ` 门控，§2.3）、fp32
+       > 分数缓冲这些细节因此全部自动保持一致，不需要在这里重新枚举）。
        >
        > `tail_query_count > block_size` 时 `q_tail` 会跨越不止一块——
        > 上面"先逐块累积、循环结束后统一 `cat`"的写法对这种情形和
@@ -978,7 +1041,7 @@ Stage 2 有信号后再投入。v3 没有需要 warmup 的新标量（v2 的 `κ
 | `K:B′` 分配 | 32×4 / 16×8 / 8×16 | 语义分辨率 vs 时序分辨率，总预算固定 |
 | `anchor_mode` | `lo_hi_mid` / `lo_hi` / `mid` / `z` | 锚点表示 vs v2 的 z 统计量 |
 | `λ_rel` | 0.5 – 2.0 | needle 隔离与簇纯度的平衡点 |
-| `λ`（mass bias）| 0 / 1 | 大簇的计数质量补偿是否仍然正确 |
+| `λ`（mass bias）| 0 / 1 | 原始 vanilla `log(w)` 那部分计数质量补偿开/关，值不值——`−log(M)` 这个锚点展开候选数校正项不受这个开关影响，两档下都无条件生效（§2.3），扫这一行不会像旧公式那样连带改变 anchor-count 校正的行为 |
 | `γ`（遗忘因子）| 0 / 0.5 / 1 | centroid 门控更新值不值 |
 | rank-1 Σ/Γ | 关 / 现有构造 / delta-rule 构造 | 第三档取决于 S0.7；**"现有构造"/"delta-rule 构造"两档在 Stage 2 还不能跑**——`algorithm-spec.md` §5.14"S0.8 3b 明确只走 with_stats=False"一节：3b 只验证过路由/compaction 的一阶分歧，从没验证过批量近似路由下 Σ/Γ 聚合状态本身是否也和严格串行参考一致，Stage 1 因此把 `second_order_scale` 默认锁在 0（即这一行的"关"），要跑另外两档必须先有类似 3b 的独立验证（那节称为 3c，未展开设计） |
 | vanilla memory-matched | B 调大到同 entry 数 | **排除"只是多用了内存"** |

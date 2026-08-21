@@ -201,6 +201,24 @@ def test_vanilla_logkv_full_cache_entries_appends_recent_tokens_after_compressed
     assert summary["real_token_count"] == 12
 
 
+def test_vanilla_logkv_full_cache_entries_level_counts_only_covers_compressed_prefix() -> None:
+    # meta["level_counts"] from vanilla_logkv_compressed_entries is renamed to
+    # "compressed_level_counts" in the full-cache meta (not carried over under
+    # its original key): it only ever describes the 4 compressed-prefix
+    # entries (see test_vanilla_logkv_full_cache_entries_appends_recent_tokens_
+    # after_compressed for why T=12, b=4, recent_size=4 -> 4 compressed
+    # entries), never the 4 appended width-1 recent entries, so it must NOT
+    # sum to full-cache entry_count (8) -- a stale "level_counts" key next to
+    # a full-cache entry_count would invite slicing full_entries by it as if
+    # it covered every returned entry, which it does not.
+    entries, meta = vanilla_logkv_full_cache_entries(12, b=4, recent_size=4)
+
+    assert "level_counts" not in meta
+    assert meta["entry_count"] == len(entries) == 8
+    assert sum(meta["compressed_level_counts"].values()) == meta["compressed_entry_count"] == 4
+    assert sum(meta["compressed_level_counts"].values()) != meta["entry_count"]
+
+
 def _run_real_cache_add_recent(
     token_count: int, b: int, recent_size: int, chunk_size: int
 ) -> LogStructuredKVCache:
@@ -524,6 +542,149 @@ def _dummy_route(n: int = 1) -> RouteResult:
 
 
 _DUMMY_LADDER_META = {"entry_count": 1, "pad_entry_count": 0}
+
+
+def test_sweep_accumulator_omits_coverage_meta_when_ladder_meta_lacks_it() -> None:
+    # simulate_segment_ladders's meta (used by the semantic sweep cells and the
+    # single-cluster-b'-budget baseline) never carries compactable_token_count/
+    # recent_count/coverage_token_count/compressed_entry_count/recent_entry_count
+    # -- every token there always lands in some entry by construction. finalize()
+    # must leave the corresponding "{key}_mean"/covered_token_fraction fields out
+    # entirely (not default them to 0, which would misleadingly read as "0 tokens
+    # covered").
+    acc = SweepAccumulator()
+    acc.add(
+        route=_dummy_route(10),
+        ladder_meta=_DUMMY_LADDER_META,
+        sh=1.0,
+        summary={"nonpad_entry_count": 1, "real_token_count": 10, "key_sse": 0.0},
+    )
+    result = acc.finalize()
+
+    for key in SweepAccumulator._META_MEAN_KEYS:
+        assert f"{key}_mean" not in result
+    assert "covered_token_fraction" not in result
+
+
+def test_sweep_accumulator_coverage_meta_matches_vanilla_compressed_prefix() -> None:
+    # Two samples fed through the real vanilla_logkv_compressed_entries meta
+    # (mirroring how the sweep script's vanilla_logkv_compressed_prefix_baseline
+    # accumulator is populated): T=12,recent_size=4 -> compactable=8, recent=4,
+    # coverage=8 (see test_vanilla_logkv_full_cache_entries_appends_recent_
+    # tokens_after_compressed); T=3,recent_size=4 -> compactable=0, recent=3,
+    # coverage=0 (nothing compacted yet, see test_vanilla_logkv_full_cache_
+    # entries_covers_every_token_below_recent_size). compressed_entry_count/
+    # recent_entry_count are full-cache-only fields, absent from this meta, and
+    # must stay absent from the aggregate too.
+    acc = SweepAccumulator()
+    for token_count in (12, 3):
+        _, meta = vanilla_logkv_compressed_entries(token_count, b=4, recent_size=4)
+        acc.add(
+            route=_dummy_route(token_count),
+            ladder_meta=meta,
+            sh=1.0,
+            summary={
+                "nonpad_entry_count": meta["entry_count"],
+                "real_token_count": meta["compactable_token_count"],
+                "key_sse": 0.0,
+            },
+        )
+    result = acc.finalize()
+
+    assert result["compactable_token_count_mean"] == pytest.approx((8 + 0) / 2)
+    assert result["recent_count_mean"] == pytest.approx((4 + 3) / 2)
+    assert result["coverage_token_count_mean"] == pytest.approx((8 + 0) / 2)
+    # 8 covered out of 12+3=15 source tokens -- well below 1.0, correctly
+    # reflecting that the exact recent window is not represented at all here.
+    assert result["covered_token_fraction"] == pytest.approx(8 / 15)
+    assert "compressed_entry_count_mean" not in result
+    assert "recent_entry_count_mean" not in result
+
+
+def test_sweep_accumulator_coverage_meta_matches_vanilla_full_cache() -> None:
+    # vanilla_logkv_full_cache_entries's meta covers every source token by
+    # construction, so the aggregate's covered_token_fraction should read ~1.0
+    # -- the complement of the compressed-prefix case above.
+    acc = SweepAccumulator()
+    token_count = 12
+    _, meta = vanilla_logkv_full_cache_entries(token_count, b=4, recent_size=4)
+    acc.add(
+        route=_dummy_route(token_count),
+        ladder_meta=meta,
+        sh=1.0,
+        summary={"nonpad_entry_count": meta["entry_count"], "real_token_count": token_count, "key_sse": 0.0},
+    )
+    result = acc.finalize()
+
+    assert result["coverage_token_count_mean"] == pytest.approx(12.0)
+    assert result["covered_token_fraction"] == pytest.approx(1.0)
+    assert result["compressed_entry_count_mean"] == pytest.approx(4.0)
+    assert result["recent_entry_count_mean"] == pytest.approx(4.0)
+
+
+def test_sweep_accumulator_reports_genuinely_zero_coverage_not_absent() -> None:
+    # Every sample has token_count <= recent_size, so vanilla_logkv_compressed_
+    # entries reports coverage_token_count=0 for all of them (nothing compacted
+    # yet -- a real, meaningful "0% covered" measurement, not "not computed").
+    # covered_token_fraction must still be present and read 0.0: gating its
+    # presence on "coverage_token_sum > 0" (rather than on "did any sample
+    # supply coverage_token_count at all") would wrongly suppress this
+    # legitimate zero, indistinguishable from the "never measured" case that
+    # test_sweep_accumulator_omits_coverage_meta_when_ladder_meta_lacks_it
+    # covers.
+    acc = SweepAccumulator()
+    for token_count in (3, 4):
+        _, meta = vanilla_logkv_compressed_entries(token_count, b=4, recent_size=4)
+        assert meta["coverage_token_count"] == 0  # sanity: both below/at recent_size
+        acc.add(
+            route=_dummy_route(token_count),
+            ladder_meta=meta,
+            sh=1.0,
+            summary={"nonpad_entry_count": meta["entry_count"], "real_token_count": 0, "key_sse": 0.0},
+        )
+    result = acc.finalize()
+
+    assert result["coverage_token_count_mean"] == pytest.approx(0.0)
+    assert "covered_token_fraction" in result
+    assert result["covered_token_fraction"] == pytest.approx(0.0)
+
+
+def test_sweep_accumulator_covered_token_fraction_denominator_excludes_uncovered_samples() -> None:
+    # SweepAccumulator.add()'s contract does not forbid mixing coverage-
+    # bearing ladder_meta (vanilla_logkv_compressed_entries's) with
+    # coverage-less ladder_meta (simulate_segment_ladders's, used by the
+    # semantic sweep cells) within one accumulator -- the sweep script
+    # happens not to do this today (each of its three accumulators is fed a
+    # single consistent ladder_meta shape throughout), but the class itself
+    # must not silently fold a coverage-less call's route.cluster_sizes into
+    # covered_token_fraction's denominator, or that call's tokens would drag
+    # the fraction toward 0 despite never having their coverage measured.
+    acc = SweepAccumulator()
+    # A large coverage-less contributor: if its 1000 source tokens leaked
+    # into the denominator, covered_token_fraction would be ~8/1012 (~0.008)
+    # instead of the correct 8/12.
+    acc.add(
+        route=_dummy_route(1000),
+        ladder_meta=_DUMMY_LADDER_META,
+        sh=1.0,
+        summary={"nonpad_entry_count": 1, "real_token_count": 1000, "key_sse": 0.0},
+    )
+    _, meta = vanilla_logkv_compressed_entries(12, b=4, recent_size=4)
+    # sanity, see test_vanilla_logkv_full_cache_entries_appends_recent_tokens_after_compressed
+    assert meta["coverage_token_count"] == 8
+    acc.add(
+        route=_dummy_route(12),
+        ladder_meta=meta,
+        sh=1.0,
+        summary={
+            "nonpad_entry_count": meta["entry_count"],
+            "real_token_count": meta["compactable_token_count"],
+            "key_sse": 0.0,
+        },
+    )
+    result = acc.finalize()
+
+    assert result["covered_token_fraction"] == pytest.approx(8 / 12)
 
 
 def test_value_var_reported_as_none_not_zero_when_any_sample_skipped_it() -> None:
