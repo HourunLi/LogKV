@@ -1,6 +1,9 @@
 import importlib.util
 import math
 from pathlib import Path
+import tempfile
+
+import numpy as np
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "unused" / "semantic_s0_anchor_dedup.py"
 _SPEC = importlib.util.spec_from_file_location("semantic_s0_anchor_dedup_under_test", _SCRIPT_PATH)
@@ -19,6 +22,7 @@ _attach_scheme_physical_width = _MODULE._attach_scheme_physical_width
 _effective_g_max = _MODULE._effective_g_max
 _entry_anchor_stats = _MODULE._entry_anchor_stats
 _mid_anchor = _MODULE._mid_anchor
+_process_record_task = _MODULE._process_record_task
 
 
 def test_mid_anchor_uses_round_half_up_integer_mean() -> None:
@@ -182,3 +186,51 @@ def test_scheme_physical_width_uses_anchor_x3_for_semantic_and_entries_for_vanil
 def test_effective_g_max_forces_inf_at_l_block_zero() -> None:
     assert _effective_g_max(256, 0) == float("inf")
     assert _effective_g_max(256, 1) == 256
+
+
+def test_process_record_task_builds_deterministic_worker_shard() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir = Path(tmp)
+        k_raw = np.asarray(
+            [
+                [
+                    [0.0, 0.0],
+                    [0.1, 0.0],
+                    [8.0, 0.0],
+                    [0.2, 0.0],
+                    [8.1, 0.0],
+                    [0.3, 0.0],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        np.savez(base_dir / "sample_0000_layer_00.npz", k_raw=k_raw, v=k_raw.copy())
+        task = {
+            "sample": {"sample_id": "smoke"},
+            "record": {"layer": 0, "path": "sample_0000_layer_00.npz"},
+            "record_i": 1,
+            "record_count": 1,
+            "base_dir": str(base_dir),
+            "scale_manifest": {"key_scale": {"0": {"s_h": [1.0]}}},
+            "g_values": [float("inf"), 2.0],
+            "l_values": [0, 1],
+            "group_filter": [0],
+            "lambda_rel": 1.0,
+            "seg_forget": 0.5,
+            "b_prime": 2,
+            "vanilla_B": 2,
+            "vanilla_recent_size": 2,
+            "allow_fallback_sh": False,
+            "collect_by_layer_group": True,
+        }
+
+        first = _process_record_task(task)
+        second = _process_record_task(task)
+
+    semantic_key = (SCHEME_SEMANTIC, "2", 1)
+    assert first["processed_pairs"] == 1
+    assert first["groups_seen"] == {0}
+    assert semantic_key in first["overall"]
+    assert (semantic_key + (0, 0)) in first["by_layer_group"]
+    assert len(first["overall"]) == 7
+    assert first["overall"][semantic_key].finalize() == second["overall"][semantic_key].finalize()

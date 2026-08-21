@@ -12,13 +12,15 @@ Example:
       --output stage0_dump/s0_6_anchor_dedup.json \
       --g_max inf,8192,4096,2048,1024,256 \
       --l_block 0,1,2,3 \
-      --b_prime 8
+      --b_prime 8 \
+      --workers 8
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import importlib.util
 import json
 import math
@@ -356,6 +358,157 @@ def _attach_scheme_physical_width(row: dict[str, Any]) -> None:
         row["current_scheme_physical_slot_note"] = "unknown_scheme"
 
 
+def _merge_accumulator_map(
+    dst: dict[Any, AnchorDedupAccumulator],
+    src: dict[Any, AnchorDedupAccumulator],
+) -> None:
+    for key, acc in src.items():
+        dst.setdefault(key, AnchorDedupAccumulator()).merge(acc)
+
+
+def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
+    sample = task["sample"]
+    record = task["record"]
+    layer = int(record["layer"])
+    record_i = int(task["record_i"])
+    record_count = int(task["record_count"])
+    base_dir = Path(task["base_dir"])
+    g_values = [float(x) for x in task["g_values"]]
+    l_values = [int(x) for x in task["l_values"]]
+    group_filter = None if task["group_filter"] is None else set(int(x) for x in task["group_filter"])
+    collect_by_layer_group = bool(task["collect_by_layer_group"])
+
+    overall: dict[tuple[str, str | None, int | None], AnchorDedupAccumulator] = {}
+    by_layer_group: dict[tuple[str, str | None, int | None, int, int], AnchorDedupAccumulator] = {}
+    processed_pairs = 0
+
+    def add_stats(
+        *,
+        scheme: str,
+        entries: list[Any],
+        ladder_meta: dict[str, Any],
+        sh_source: str,
+        group: int,
+        g_label: str | None = None,
+        l_block: int | None = None,
+    ) -> None:
+        overall.setdefault((scheme, g_label, l_block), AnchorDedupAccumulator()).add(
+            entries=entries,
+            ladder_meta=ladder_meta,
+            sh_source=sh_source,
+        )
+        if collect_by_layer_group:
+            by_layer_group.setdefault(
+                (scheme, g_label, l_block, layer, group),
+                AnchorDedupAccumulator(),
+            ).add(
+                entries=entries,
+                ladder_meta=ladder_meta,
+                sh_source=sh_source,
+            )
+
+    with np.load(base_dir / record["path"]) as payload:
+        k_raw = payload["k_raw"]
+
+    groups = list(range(k_raw.shape[0]))
+    groups_seen = set(groups)
+    if group_filter is not None:
+        groups = [g for g in groups if g in group_filter]
+
+    for group in groups:
+        processed_pairs += 1
+        k_group = np.asarray(k_raw[group], dtype=np.float32)
+        sh, sh_source = _manifest_sh(
+            task["scale_manifest"],
+            layer,
+            int(group),
+            k_group,
+            allow_fallback=bool(task["allow_fallback_sh"]),
+        )
+        lambda_new = float(task["lambda_rel"]) * sh
+
+        single_route = route_single_cluster_bprime_ladder(k_group.shape[0])
+        single_entries, single_meta = simulate_segment_ladders(
+            single_route,
+            b_prime=int(task["b_prime"]),
+            l_block=0,
+        )
+        add_stats(
+            scheme=SCHEME_SINGLE_CLUSTER,
+            entries=single_entries,
+            ladder_meta=single_meta,
+            sh_source=sh_source,
+            group=int(group),
+        )
+
+        vanilla_compressed_entries, vanilla_compressed_meta = vanilla_logkv_compressed_entries(
+            k_group.shape[0],
+            b=int(task["vanilla_B"]),
+            recent_size=int(task["vanilla_recent_size"]),
+        )
+        add_stats(
+            scheme=SCHEME_VANILLA_COMPRESSED,
+            entries=vanilla_compressed_entries,
+            ladder_meta=vanilla_compressed_meta,
+            sh_source=sh_source,
+            group=int(group),
+        )
+
+        vanilla_full_entries, vanilla_full_meta = vanilla_logkv_full_cache_entries(
+            k_group.shape[0],
+            b=int(task["vanilla_B"]),
+            recent_size=int(task["vanilla_recent_size"]),
+        )
+        add_stats(
+            scheme=SCHEME_VANILLA_FULL,
+            entries=vanilla_full_entries,
+            ladder_meta=vanilla_full_meta,
+            sh_source=sh_source,
+            group=int(group),
+        )
+
+        route_cache: dict[float, Any] = {}
+        for g_max in g_values:
+            g_label = format_g_max(g_max)
+            for l_block in l_values:
+                effective_g_max = _effective_g_max(g_max, int(l_block))
+                route = route_cache.get(effective_g_max)
+                if route is None:
+                    route = route_dpmeans_segments(
+                        k_group,
+                        lambda_new=lambda_new,
+                        g_max=effective_g_max,
+                        gamma=float(task["seg_forget"]),
+                    )
+                    route_cache[effective_g_max] = route
+                entries, meta = simulate_segment_ladders(
+                    route,
+                    b_prime=int(task["b_prime"]),
+                    l_block=int(l_block),
+                )
+                add_stats(
+                    scheme=SCHEME_SEMANTIC,
+                    entries=entries,
+                    ladder_meta=meta,
+                    sh_source=sh_source,
+                    group=int(group),
+                    g_label=g_label,
+                    l_block=int(l_block),
+                )
+
+    message = (
+        f"[s0-anchor] {record_i}/{record_count} sample={sample.get('sample_id')} "
+        f"layer={layer} path={record['path']}"
+    )
+    return {
+        "overall": overall,
+        "by_layer_group": by_layer_group,
+        "processed_pairs": processed_pairs,
+        "groups_seen": groups_seen,
+        "message": message,
+    }
+
+
 def _fmt_num(value: float | int | None) -> str:
     if value is None:
         return "n/a"
@@ -439,6 +592,12 @@ def main() -> None:
     parser.add_argument("--groups", help="Optional comma-separated KV-group filter")
     parser.add_argument("--top", type=int, default=16, help="Rows to print in the terminal summary")
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes over layer records. Use 1 for deterministic single-process execution.",
+    )
+    parser.add_argument(
         "--allow_fallback_sh",
         action="store_true",
         help="Use this prompt's local key variance if calibrated manifest key_scale is missing/corrupt.",
@@ -469,6 +628,8 @@ def main() -> None:
         raise ValueError(f"--vanilla_B must be a positive integer, got {args.vanilla_B}")
     if args.vanilla_recent_size < 2:
         raise ValueError(f"--vanilla_recent_size must be >= 2, got {args.vanilla_recent_size}")
+    if args.workers <= 0:
+        raise ValueError(f"--workers must be a positive integer, got {args.workers}")
 
     manifest = load_manifest(args.dump)
     base_dir = manifest_base_dir(args.dump)
@@ -482,120 +643,46 @@ def main() -> None:
     by_layer_group: dict[tuple[str, str | None, int | None, int, int], AnchorDedupAccumulator] = {}
     processed_pairs = 0
     groups_seen: set[int] = set()
+    scale_manifest = {"key_scale": manifest.get("key_scale", {})}
+    tasks = [
+        {
+            "sample": sample,
+            "record": record,
+            "record_i": record_i,
+            "record_count": len(records),
+            "base_dir": str(base_dir),
+            "scale_manifest": scale_manifest,
+            "g_values": g_values,
+            "l_values": l_values,
+            "group_filter": None if group_filter is None else sorted(group_filter),
+            "lambda_rel": args.lambda_rel,
+            "seg_forget": args.seg_forget,
+            "b_prime": args.b_prime,
+            "vanilla_B": args.vanilla_B,
+            "vanilla_recent_size": args.vanilla_recent_size,
+            "allow_fallback_sh": args.allow_fallback_sh,
+            "collect_by_layer_group": not args.skip_by_layer_group,
+        }
+        for record_i, (sample, record) in enumerate(records, start=1)
+    ]
 
-    def add_stats(
-        *,
-        scheme: str,
-        entries: list[Any],
-        ladder_meta: dict[str, Any],
-        sh_source: str,
-        layer: int,
-        group: int,
-        g_label: str | None = None,
-        l_block: int | None = None,
-    ) -> None:
-        overall.setdefault((scheme, g_label, l_block), AnchorDedupAccumulator()).add(
-            entries=entries,
-            ladder_meta=ladder_meta,
-            sh_source=sh_source,
-        )
-        by_layer_group.setdefault((scheme, g_label, l_block, layer, group), AnchorDedupAccumulator()).add(
-            entries=entries,
-            ladder_meta=ladder_meta,
-            sh_source=sh_source,
-        )
+    def consume_result(result: dict[str, Any]) -> None:
+        nonlocal processed_pairs
+        processed_pairs += int(result["processed_pairs"])
+        groups_seen.update(int(x) for x in result["groups_seen"])
+        _merge_accumulator_map(overall, result["overall"])
+        if not args.skip_by_layer_group:
+            _merge_accumulator_map(by_layer_group, result["by_layer_group"])
+        print(result["message"], flush=True)
 
-    for record_i, (sample, record) in enumerate(records, start=1):
-        layer = int(record["layer"])
-        payload = np.load(base_dir / record["path"])
-        k_raw = payload["k_raw"]
-        groups: Any = range(k_raw.shape[0])
-        groups_seen.update(groups)
-        if group_filter is not None:
-            groups = [g for g in groups if g in group_filter]
-
-        for group in groups:
-            processed_pairs += 1
-            k_group = np.asarray(k_raw[group], dtype=np.float32)
-            sh, sh_source = _manifest_sh(
-                manifest,
-                layer,
-                int(group),
-                k_group,
-                allow_fallback=args.allow_fallback_sh,
-            )
-            lambda_new = float(args.lambda_rel) * sh
-
-            single_route = route_single_cluster_bprime_ladder(k_group.shape[0])
-            single_entries, single_meta = simulate_segment_ladders(single_route, b_prime=args.b_prime, l_block=0)
-            add_stats(
-                scheme=SCHEME_SINGLE_CLUSTER,
-                entries=single_entries,
-                ladder_meta=single_meta,
-                sh_source=sh_source,
-                layer=layer,
-                group=int(group),
-            )
-
-            vanilla_compressed_entries, vanilla_compressed_meta = vanilla_logkv_compressed_entries(
-                k_group.shape[0],
-                b=args.vanilla_B,
-                recent_size=args.vanilla_recent_size,
-            )
-            add_stats(
-                scheme=SCHEME_VANILLA_COMPRESSED,
-                entries=vanilla_compressed_entries,
-                ladder_meta=vanilla_compressed_meta,
-                sh_source=sh_source,
-                layer=layer,
-                group=int(group),
-            )
-
-            vanilla_full_entries, vanilla_full_meta = vanilla_logkv_full_cache_entries(
-                k_group.shape[0],
-                b=args.vanilla_B,
-                recent_size=args.vanilla_recent_size,
-            )
-            add_stats(
-                scheme=SCHEME_VANILLA_FULL,
-                entries=vanilla_full_entries,
-                ladder_meta=vanilla_full_meta,
-                sh_source=sh_source,
-                layer=layer,
-                group=int(group),
-            )
-
-            route_cache: dict[float, Any] = {}
-            for g_max in g_values:
-                g_label = format_g_max(g_max)
-                for l_block in l_values:
-                    effective_g_max = _effective_g_max(g_max, int(l_block))
-                    route = route_cache.get(effective_g_max)
-                    if route is None:
-                        route = route_dpmeans_segments(
-                            k_group,
-                            lambda_new=lambda_new,
-                            g_max=effective_g_max,
-                            gamma=args.seg_forget,
-                        )
-                        route_cache[effective_g_max] = route
-                    entries, meta = simulate_segment_ladders(route, b_prime=args.b_prime, l_block=int(l_block))
-                    add_stats(
-                        scheme=SCHEME_SEMANTIC,
-                        entries=entries,
-                        ladder_meta=meta,
-                        sh_source=sh_source,
-                        layer=layer,
-                        group=int(group),
-                        g_label=g_label,
-                        l_block=int(l_block),
-                    )
-
-        print(
-            f"[s0-anchor] {record_i}/{len(records)} sample={sample.get('sample_id')} "
-            f"layer={layer} path={record['path']}",
-            flush=True,
-        )
+    if args.workers == 1:
+        for task in tasks:
+            consume_result(_process_record_task(task))
+    else:
+        with ProcessPoolExecutor(max_workers=int(args.workers)) as executor:
+            future_to_record = {executor.submit(_process_record_task, task): task["record_i"] for task in tasks}
+            for future in as_completed(future_to_record):
+                consume_result(future.result())
 
     if processed_pairs == 0:
         raise ValueError(
@@ -650,6 +737,8 @@ def main() -> None:
             "l_block": l_values,
             "layers": None if layer_filter is None else sorted(layer_filter),
             "groups": None if group_filter is None else sorted(group_filter),
+            "workers": args.workers,
+            "parallel_unit": "layer_record",
             "routing_eta": 0.0,
             "routing_mode": "strict_serial_dpmeans_unclipped",
             "l_block_zero_forces_g_max_inf": True,

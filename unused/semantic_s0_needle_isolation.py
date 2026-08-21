@@ -18,6 +18,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import importlib.util
 import json
 import math
@@ -321,6 +322,153 @@ def _draw_random_intervals(
     return out
 
 
+def _rng_for_record_group(*, seed: int, record_index: int, layer: int, group: int) -> np.random.Generator:
+    words = [
+        int(seed) & 0xFFFFFFFF,
+        (int(seed) >> 32) & 0xFFFFFFFF,
+        int(record_index) & 0xFFFFFFFF,
+        int(layer) & 0xFFFFFFFF,
+        int(group) & 0xFFFFFFFF,
+    ]
+    return np.random.default_rng(np.random.SeedSequence(words))
+
+
+def _merge_accumulator_map(
+    dst: dict[Any, NeedleIsolationAccumulator],
+    src: dict[Any, NeedleIsolationAccumulator],
+    *,
+    b_prime: int,
+) -> None:
+    for key, acc in src.items():
+        dst.setdefault(key, NeedleIsolationAccumulator(b_prime=b_prime)).merge(acc)
+
+
+def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
+    sample = task["sample"]
+    record = task["record"]
+    layer = int(record["layer"])
+    record_i = int(task["record_i"])
+    record_count = int(task["record_count"])
+    record_index = int(task["record_index"])
+    base_dir = Path(task["base_dir"])
+    g_values = [float(x) for x in task["g_values"]]
+    group_filter = None if task["group_filter"] is None else set(int(x) for x in task["group_filter"])
+    b_prime = int(task["b_prime"])
+    collect_by_layer_group = bool(task["collect_by_layer_group"])
+
+    overall: dict[str, NeedleIsolationAccumulator] = {}
+    by_layer_group: dict[tuple[str, int, int], NeedleIsolationAccumulator] = {}
+    processed_pairs = 0
+    comparable_pairs = 0
+    records_without_surviving_needle = 0
+
+    path = base_dir / record["path"]
+    with np.load(path) as payload:
+        k_raw = payload["k_raw"]
+
+    groups = list(range(k_raw.shape[0]))
+    groups_seen = set(groups)
+    if group_filter is not None:
+        groups = [g for g in groups if g in group_filter]
+    matched_group_pairs = len(groups)
+
+    intervals = _surviving_needle_intervals(sample, int(k_raw.shape[1]))
+    if not intervals:
+        records_without_surviving_needle = 1
+        message = (
+            f"[s0-needle] {record_i}/{record_count} sample={sample.get('sample_id')} "
+            f"layer={layer} skipped_no_surviving_needle"
+        )
+        return {
+            "overall": overall,
+            "by_layer_group": by_layer_group,
+            "processed_pairs": processed_pairs,
+            "matched_group_pairs": matched_group_pairs,
+            "comparable_pairs": comparable_pairs,
+            "groups_seen": groups_seen,
+            "records_without_surviving_needle": records_without_surviving_needle,
+            "message": message,
+        }
+
+    for group in groups:
+        processed_pairs += 1
+        comparable_pairs += 1
+        k_group = np.asarray(k_raw[group], dtype=np.float32)
+        sh, sh_source = _manifest_sh(
+            task["scale_manifest"],
+            layer,
+            int(group),
+            k_group,
+            allow_fallback=bool(task["allow_fallback_sh"]),
+        )
+        lambda_new = float(task["lambda_rel"]) * sh
+        route_cache: dict[str, Any] = {}
+        random_intervals = _draw_random_intervals(
+            intervals,
+            token_count=int(k_group.shape[0]),
+            rng=_rng_for_record_group(
+                seed=int(task["seed"]),
+                record_index=record_index,
+                layer=layer,
+                group=int(group),
+            ),
+            trials=int(task["random_trials"]),
+        )
+        for g_max in g_values:
+            g_label = format_g_max(g_max)
+            route = route_cache.get(g_label)
+            if route is None:
+                route = route_dpmeans_segments(
+                    k_group,
+                    lambda_new=lambda_new,
+                    g_max=g_max,
+                    gamma=float(task["seg_forget"]),
+                )
+                route_cache[g_label] = route
+
+            accs = [
+                overall.setdefault(g_label, NeedleIsolationAccumulator(b_prime=b_prime)),
+            ]
+            if collect_by_layer_group:
+                accs.append(
+                    by_layer_group.setdefault(
+                        (g_label, layer, int(group)),
+                        NeedleIsolationAccumulator(b_prime=b_prime),
+                    )
+                )
+            for acc in accs:
+                acc.add_route_meta(
+                    cluster_count=route.cluster_count,
+                    segment_count=route.segment_count,
+                    sh_source=sh_source,
+                )
+                acc.add_intervals(
+                    intervals=intervals,
+                    cluster_ids=route.cluster_ids,
+                    cluster_sizes=route.cluster_sizes,
+                )
+                acc.add_random_intervals(
+                    intervals=random_intervals,
+                    cluster_ids=route.cluster_ids,
+                    cluster_sizes=route.cluster_sizes,
+                )
+
+    message = (
+        f"[s0-needle] {record_i}/{record_count} sample={sample.get('sample_id')} "
+        f"layer={layer} path={record['path']}"
+    )
+    return {
+        "overall": overall,
+        "by_layer_group": by_layer_group,
+        "processed_pairs": processed_pairs,
+        "matched_group_pairs": matched_group_pairs,
+        "comparable_pairs": comparable_pairs,
+        "groups_seen": groups_seen,
+        "records_without_surviving_needle": records_without_surviving_needle,
+        "message": message,
+    }
+
+
 def _fmt_pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1%}"
 
@@ -388,6 +536,12 @@ def main() -> None:
     parser.add_argument("--groups", help="Optional comma-separated KV-group filter")
     parser.add_argument("--random_trials", type=int, default=100)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes over layer records. Use 1 for deterministic single-process execution.",
+    )
     parser.add_argument("--top", type=int, default=12, help="Rows to print in the terminal summary")
     parser.add_argument(
         "--allow_fallback_sh",
@@ -409,6 +563,8 @@ def main() -> None:
         raise ValueError(f"--b_prime must be a positive integer, got {args.b_prime}")
     if args.random_trials < 0:
         raise ValueError(f"--random_trials must be >= 0, got {args.random_trials}")
+    if args.workers <= 0:
+        raise ValueError(f"--workers must be a positive integer, got {args.workers}")
 
     manifest = load_manifest(args.dump)
     base_dir = manifest_base_dir(args.dump)
@@ -425,7 +581,6 @@ def main() -> None:
     if not records:
         raise ValueError("No layer records matched the requested filters")
 
-    rng = np.random.default_rng(int(args.seed))
     overall: dict[str, NeedleIsolationAccumulator] = {}
     by_layer_group: dict[tuple[str, int, int], NeedleIsolationAccumulator] = {}
     processed_pairs = 0
@@ -433,87 +588,52 @@ def main() -> None:
     comparable_pairs = 0
     groups_seen: set[int] = set()
     records_without_surviving_needle = 0
+    scale_manifest = {"key_scale": manifest.get("key_scale", {})}
+    tasks = [
+        {
+            "sample": sample,
+            "record": record,
+            "record_i": record_i,
+            "record_index": record_i - 1,
+            "record_count": len(records),
+            "base_dir": str(base_dir),
+            "scale_manifest": scale_manifest,
+            "g_values": g_values,
+            "group_filter": None if group_filter is None else sorted(group_filter),
+            "lambda_rel": args.lambda_rel,
+            "seg_forget": args.seg_forget,
+            "b_prime": args.b_prime,
+            "random_trials": args.random_trials,
+            "seed": args.seed,
+            "allow_fallback_sh": args.allow_fallback_sh,
+            "collect_by_layer_group": not args.skip_by_layer_group,
+        }
+        for record_i, (sample, record) in enumerate(records, start=1)
+    ]
 
-    for record_i, (sample, record) in enumerate(records, start=1):
-        layer = int(record["layer"])
-        path = base_dir / record["path"]
-        payload = np.load(path)
-        k_raw = payload["k_raw"]
-        groups = list(range(k_raw.shape[0]))
-        groups_seen.update(groups)
-        if group_filter is not None:
-            groups = [g for g in groups if g in group_filter]
-        matched_group_pairs += len(groups)
+    def consume_result(result: dict[str, Any]) -> None:
+        nonlocal processed_pairs
+        nonlocal matched_group_pairs
+        nonlocal comparable_pairs
+        nonlocal records_without_surviving_needle
+        processed_pairs += int(result["processed_pairs"])
+        matched_group_pairs += int(result["matched_group_pairs"])
+        comparable_pairs += int(result["comparable_pairs"])
+        records_without_surviving_needle += int(result["records_without_surviving_needle"])
+        groups_seen.update(int(x) for x in result["groups_seen"])
+        _merge_accumulator_map(overall, result["overall"], b_prime=args.b_prime)
+        if not args.skip_by_layer_group:
+            _merge_accumulator_map(by_layer_group, result["by_layer_group"], b_prime=args.b_prime)
+        print(result["message"], flush=True)
 
-        intervals = _surviving_needle_intervals(sample, int(k_raw.shape[1]))
-        if not intervals:
-            records_without_surviving_needle += 1
-            print(
-                f"[s0-needle] {record_i}/{len(records)} sample={sample.get('sample_id')} "
-                f"layer={layer} skipped_no_surviving_needle",
-                flush=True,
-            )
-            continue
-
-        for group in groups:
-            processed_pairs += 1
-            comparable_pairs += 1
-            k_group = np.asarray(k_raw[group], dtype=np.float32)
-            sh, sh_source = _manifest_sh(
-                manifest,
-                layer,
-                int(group),
-                k_group,
-                allow_fallback=args.allow_fallback_sh,
-            )
-            lambda_new = float(args.lambda_rel) * sh
-            route_cache: dict[str, Any] = {}
-            random_intervals = _draw_random_intervals(
-                intervals,
-                token_count=int(k_group.shape[0]),
-                rng=rng,
-                trials=args.random_trials,
-            )
-            for g_max in g_values:
-                g_label = format_g_max(g_max)
-                route = route_cache.get(g_label)
-                if route is None:
-                    route = route_dpmeans_segments(
-                        k_group,
-                        lambda_new=lambda_new,
-                        g_max=g_max,
-                        gamma=args.seg_forget,
-                    )
-                    route_cache[g_label] = route
-
-                for acc in (
-                    overall.setdefault(g_label, NeedleIsolationAccumulator(b_prime=args.b_prime)),
-                    by_layer_group.setdefault(
-                        (g_label, layer, int(group)),
-                        NeedleIsolationAccumulator(b_prime=args.b_prime),
-                    ),
-                ):
-                    acc.add_route_meta(
-                        cluster_count=route.cluster_count,
-                        segment_count=route.segment_count,
-                        sh_source=sh_source,
-                    )
-                    acc.add_intervals(
-                        intervals=intervals,
-                        cluster_ids=route.cluster_ids,
-                        cluster_sizes=route.cluster_sizes,
-                    )
-                    acc.add_random_intervals(
-                        intervals=random_intervals,
-                        cluster_ids=route.cluster_ids,
-                        cluster_sizes=route.cluster_sizes,
-                    )
-
-        print(
-            f"[s0-needle] {record_i}/{len(records)} sample={sample.get('sample_id')} "
-            f"layer={layer} path={record['path']}",
-            flush=True,
-        )
+    if args.workers == 1:
+        for task in tasks:
+            consume_result(_process_record_task(task))
+    else:
+        with ProcessPoolExecutor(max_workers=int(args.workers)) as executor:
+            future_to_record = {executor.submit(_process_record_task, task): task["record_i"] for task in tasks}
+            for future in as_completed(future_to_record):
+                consume_result(future.result())
 
     if matched_group_pairs == 0:
         raise ValueError(
@@ -552,8 +672,10 @@ def main() -> None:
             "groups": None if group_filter is None else sorted(group_filter),
             "random_trials": args.random_trials,
             "seed": args.seed,
+            "workers": args.workers,
             "routing_eta": 0.0,
             "routing_mode": "strict_serial_dpmeans_unclipped",
+            "random_baseline_rng": "per_record_layer_group_seedsequence_v1",
             "l_block_caveat": (
                 "S0.3 is a cluster-membership metric. l_block only affects the later segment/ladder "
                 "packing path, not route_dpmeans_segments cluster_ids, so this analyzer reports by g_max."

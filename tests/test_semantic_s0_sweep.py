@@ -1,6 +1,7 @@
 import importlib.util
 import math
 from pathlib import Path
+import tempfile
 
 import numpy as np
 import pytest
@@ -14,8 +15,8 @@ _SPEC.loader.exec_module(_MODULE)
 _effective_g_max = _MODULE._effective_g_max
 _manifest_sh = _MODULE._manifest_sh
 _manifest_vh = _MODULE._manifest_vh
-
-from litgpt.semantic_s0 import route_dpmeans_segments  # noqa: E402
+_process_record_task = _MODULE._process_record_task
+route_dpmeans_segments = _MODULE.route_dpmeans_segments
 
 
 def test_effective_g_max_forces_inf_at_l_block_zero() -> None:
@@ -92,3 +93,58 @@ def test_manifest_vh_hard_fails_on_old_manifest_missing_value_scale_entirely() -
     v = np.asarray([[0.0], [2.0]], dtype=np.float32)
     with pytest.raises(ValueError, match="no usable calibrated value_scale"):
         _manifest_vh(manifest, layer=0, group=0, v=v, allow_fallback=False)
+
+
+def test_process_record_task_builds_deterministic_sweep_worker_shard() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir = Path(tmp)
+        k_raw = np.asarray(
+            [
+                [
+                    [0.0, 0.0],
+                    [0.1, 0.0],
+                    [8.0, 0.0],
+                    [0.2, 0.0],
+                    [8.1, 0.0],
+                    [0.3, 0.0],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        v = k_raw.copy()
+        np.savez(base_dir / "sample_0000_layer_00.npz", k_raw=k_raw, v=v)
+        task = {
+            "sample": {"sample_id": "smoke"},
+            "record": {"layer": 0, "path": "sample_0000_layer_00.npz"},
+            "record_i": 1,
+            "record_count": 1,
+            "base_dir": str(base_dir),
+            "scale_manifest": {
+                "key_scale": {"0": {"s_h": [1.0]}},
+                "value_scale": {"0": {"s_h": [1.0]}},
+            },
+            "g_values": [math.inf, 2.0],
+            "l_values": [0, 1],
+            "group_filter": [0],
+            "lambda_rel": 1.0,
+            "seg_forget": 0.5,
+            "b_prime": 2,
+            "vanilla_B": 2,
+            "vanilla_recent_size": 2,
+            "skip_value_var": False,
+            "allow_fallback_sh": False,
+        }
+
+        first = _process_record_task(task)
+        second = _process_record_task(task)
+
+    semantic_key = ("2", 1, 0, 0)
+    assert first["processed_pairs"] == 1
+    assert first["groups_seen"] == {0}
+    assert semantic_key in first["by_layer_group"]
+    assert ("2", 1) in first["overall"]
+    assert (0, 0) in first["single_cluster_bprime_baseline"]
+    assert (0, 0) in first["vanilla_logkv_compressed_prefix_baseline"]
+    assert (0, 0) in first["vanilla_logkv_full_cache_baseline"]
+    assert len(first["overall"]) == 4
+    assert first["by_layer_group"][semantic_key].finalize() == second["by_layer_group"][semantic_key].finalize()
