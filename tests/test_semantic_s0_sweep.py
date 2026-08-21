@@ -142,6 +142,7 @@ def test_process_record_task_builds_deterministic_sweep_worker_shard() -> None:
             "vanilla_recent_size": 2,
             "skip_value_var": False,
             "allow_fallback_sh": False,
+            "log_timing": True,
         }
 
         first = _process_record_task(task)
@@ -192,6 +193,7 @@ def test_process_record_task_can_restrict_to_task_group() -> None:
             "vanilla_recent_size": 2,
             "skip_value_var": False,
             "allow_fallback_sh": False,
+            "log_timing": True,
         }
 
         result = _process_record_task(task)
@@ -202,3 +204,11 @@ def test_process_record_task_can_restrict_to_task_group() -> None:
     assert (0, 1) in result["single_cluster_bprime_baseline"]
     assert all(key[-1] == 1 for key in result["by_layer_group"])
     assert "[1]" in result["message"]
+    assert len(result["timing_events"]) == 1
+    event = result["timing_events"][0]
+    assert event["lambda_rel"] == 1.0
+    assert event["g_max"] == "2"
+    assert event["l_block"] == 1
+    assert event["effective_g_max"] == "2"
+    assert event["group"] == 1
+    assert event["route_elapsed_seconds"] >= 0.0

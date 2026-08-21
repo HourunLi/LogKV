@@ -129,6 +129,7 @@ def test_process_record_task_is_deterministic_for_worker_shards() -> None:
             "seed": 99,
             "allow_fallback_sh": False,
             "collect_by_layer_group": True,
+            "log_timing": True,
         }
 
         first = _process_record_task(task)
@@ -183,6 +184,7 @@ def test_process_record_task_can_process_one_group_subset() -> None:
             "seed": 99,
             "allow_fallback_sh": False,
             "collect_by_layer_group": True,
+            "log_timing": True,
         }
 
         result = _process_record_task(task)
@@ -190,6 +192,13 @@ def test_process_record_task_can_process_one_group_subset() -> None:
     assert result["matched_group_pairs"] == 1
     assert result["processed_pairs"] == 1
     assert sorted(result["by_layer_group"]) == [(1.0, "inf", 0, 1)]
+    assert len(result["timing_events"]) == 1
+    event = result["timing_events"][0]
+    assert event["lambda_rel"] == 1.0
+    assert event["g_max"] == "inf"
+    assert event["group"] == 1
+    assert event["cluster_count"] >= 1
+    assert event["route_elapsed_seconds"] >= 0.0
 
 
 def test_process_record_task_skip_message_keeps_group_task_context() -> None:
