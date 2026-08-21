@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import tempfile
 
 import numpy as np
 
@@ -11,6 +12,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 NeedleIsolationAccumulator = _MODULE.NeedleIsolationAccumulator
 _draw_random_intervals = _MODULE._draw_random_intervals
+_process_record_task = _MODULE._process_record_task
 _surviving_needle_intervals = _MODULE._surviving_needle_intervals
 
 
@@ -66,3 +68,62 @@ def test_draw_random_intervals_preserves_lengths_and_bounds() -> None:
     assert len(intervals) == 8
     assert [end - start for start, end in intervals] == [3, 3, 3, 3, 2, 2, 2, 2]
     assert all(0 <= start < end <= 12 for start, end in intervals)
+
+
+def test_process_record_task_is_deterministic_for_worker_shards() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir = Path(tmp)
+        k_raw = np.asarray(
+            [
+                [
+                    [0.0, 0.0],
+                    [0.1, 0.0],
+                    [8.0, 0.0],
+                    [0.2, 0.0],
+                    [8.1, 0.0],
+                    [0.3, 0.0],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        np.savez(base_dir / "sample_0000_layer_00.npz", k_raw=k_raw, v=k_raw.copy())
+        sample = {
+            "sample_id": "smoke",
+            "prompt_token_offset": 0,
+            "needle_spans": [
+                {
+                    "used_token_start": 2,
+                    "used_token_end": 3,
+                    "survived_left_truncation": True,
+                }
+            ],
+        }
+        task = {
+            "sample": sample,
+            "record": {"layer": 0, "path": "sample_0000_layer_00.npz"},
+            "record_i": 1,
+            "record_index": 0,
+            "record_count": 1,
+            "base_dir": str(base_dir),
+            "scale_manifest": {"key_scale": {"0": {"s_h": [1.0]}}},
+            "g_values": [float("inf"), 2.0],
+            "group_filter": [0],
+            "lambda_rel": 1.0,
+            "seg_forget": 0.5,
+            "b_prime": 2,
+            "random_trials": 3,
+            "seed": 99,
+            "allow_fallback_sh": False,
+            "collect_by_layer_group": True,
+        }
+
+        first = _process_record_task(task)
+        second = _process_record_task(task)
+
+    assert first["processed_pairs"] == 1
+    assert first["matched_group_pairs"] == 1
+    assert first["comparable_pairs"] == 1
+    assert sorted(first["overall"]) == ["2", "inf"]
+    assert sorted(first["by_layer_group"]) == [("2", 0, 0), ("inf", 0, 0)]
+    assert first["overall"]["2"].finalize()["random_token_count"] == 3
+    assert first["overall"]["2"].finalize() == second["overall"]["2"].finalize()

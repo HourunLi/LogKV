@@ -6,12 +6,14 @@ Example:
       --dump stage0_dump \
       --output stage0_dump/s0_sweep.json \
       --g_max inf,8192,4096,2048,1024,256 \
-      --l_block 0,1,2,3
+      --l_block 0,1,2,3 \
+      --workers 8
 """
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import importlib.util
 import json
 import math
@@ -152,6 +154,202 @@ def _iter_records(
     return out
 
 
+def _merge_sweep_accumulator(dst: Any, src: Any) -> None:
+    dst.sample_groups += src.sample_groups
+    dst.cluster_count_sum += src.cluster_count_sum
+    dst.segment_count_sum += src.segment_count_sum
+    dst.entry_count_sum += src.entry_count_sum
+    dst.nonpad_entry_count_sum += src.nonpad_entry_count_sum
+    dst.pad_entry_count_sum += src.pad_entry_count_sum
+    dst.token_count_sum += src.token_count_sum
+    dst.key_sse_sum += src.key_sse_sum
+    dst.value_sse_sum += src.value_sse_sum
+    dst.key_sse_norm_sum += src.key_sse_norm_sum
+    dst.value_sse_norm_sum += src.value_sse_norm_sum
+    dst.widths.extend(src.widths)
+    dst.spans.extend(src.spans)
+    dst.all_widths.extend(src.all_widths)
+    dst.all_spans.extend(src.all_spans)
+    dst.sh_sources.update(src.sh_sources)
+    dst.vh_sources.update(src.vh_sources)
+    dst.value_var_available = bool(dst.value_var_available and src.value_var_available)
+    dst.value_var_relative_available = bool(dst.value_var_relative_available and src.value_var_relative_available)
+    for key, value in src.meta_sums.items():
+        dst.meta_sums[key] = dst.meta_sums.get(key, 0.0) + value
+    for key, value in src.meta_counts.items():
+        dst.meta_counts[key] = dst.meta_counts.get(key, 0) + value
+    dst.coverage_source_token_sum += src.coverage_source_token_sum
+    dst.coverage_token_sum += src.coverage_token_sum
+
+
+def _merge_accumulator_map(dst: dict[Any, Any], src: dict[Any, Any]) -> None:
+    for key, acc in src.items():
+        _merge_sweep_accumulator(dst.setdefault(key, SweepAccumulator()), acc)
+
+
+def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
+    sample = task["sample"]
+    record = task["record"]
+    layer = int(record["layer"])
+    record_i = int(task["record_i"])
+    record_count = int(task["record_count"])
+    base_dir = Path(task["base_dir"])
+    g_values = [float(x) for x in task["g_values"]]
+    l_values = [int(x) for x in task["l_values"]]
+    group_filter = None if task["group_filter"] is None else set(int(x) for x in task["group_filter"])
+
+    by_layer_group: dict[tuple[str, int, int, int], SweepAccumulator] = {}
+    overall: dict[tuple[str, int], SweepAccumulator] = {}
+    single_cluster_bprime_baseline: dict[tuple[int, int], SweepAccumulator] = {}
+    vanilla_logkv_compressed_prefix_baseline: dict[tuple[int, int], SweepAccumulator] = {}
+    vanilla_logkv_full_cache_baseline: dict[tuple[int, int], SweepAccumulator] = {}
+    processed_pairs = 0
+
+    with np.load(base_dir / record["path"]) as payload:
+        k_raw = payload["k_raw"]
+        v = None if bool(task["skip_value_var"]) else payload["v"]
+
+    groups = list(range(k_raw.shape[0]))
+    groups_seen = set(groups)
+    if group_filter is not None:
+        groups = [g for g in groups if g in group_filter]
+
+    for group in groups:
+        processed_pairs += 1
+        k_group = np.asarray(k_raw[group], dtype=np.float32)
+        v_group = None if v is None else np.asarray(v[group], dtype=np.float32)
+        sh, sh_source = _manifest_sh(
+            task["scale_manifest"],
+            layer,
+            int(group),
+            k_group,
+            allow_fallback=bool(task["allow_fallback_sh"]),
+        )
+        lambda_new = float(task["lambda_rel"]) * sh
+        vh, vh_source = (
+            _manifest_vh(
+                task["scale_manifest"],
+                layer,
+                int(group),
+                v_group,
+                allow_fallback=bool(task["allow_fallback_sh"]),
+            )
+            if v_group is not None
+            else (None, None)
+        )
+
+        sc_route = route_single_cluster_bprime_ladder(k_group.shape[0])
+        sc_entries, sc_ladder_meta = simulate_segment_ladders(
+            sc_route,
+            b_prime=int(task["b_prime"]),
+            l_block=0,
+        )
+        sc_summary = summarize_entries(k_group, v_group, sc_entries)
+        single_cluster_bprime_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
+            route=sc_route,
+            ladder_meta=sc_ladder_meta,
+            summary=sc_summary,
+            sh=sh,
+            sh_source=sh_source,
+            vh=vh,
+            vh_source=vh_source,
+        )
+
+        vanilla_route = RouteResult(
+            cluster_ids=np.zeros(0, dtype=np.int32),
+            segment_ids=np.zeros(0, dtype=np.int32),
+            cluster_count=1,
+            segment_count=1,
+            cluster_sizes=[k_group.shape[0]],
+        )
+        vanilla_compressed_entries, vanilla_compressed_meta = vanilla_logkv_compressed_entries(
+            k_group.shape[0],
+            b=int(task["vanilla_B"]),
+            recent_size=int(task["vanilla_recent_size"]),
+        )
+        vanilla_compressed_summary = summarize_entries(k_group, v_group, vanilla_compressed_entries)
+        vanilla_logkv_compressed_prefix_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
+            route=vanilla_route,
+            ladder_meta=vanilla_compressed_meta,
+            summary=vanilla_compressed_summary,
+            sh=sh,
+            sh_source=sh_source,
+            vh=vh,
+            vh_source=vh_source,
+        )
+
+        vanilla_full_entries, vanilla_full_meta = vanilla_logkv_full_cache_entries(
+            k_group.shape[0],
+            b=int(task["vanilla_B"]),
+            recent_size=int(task["vanilla_recent_size"]),
+        )
+        vanilla_full_summary = summarize_entries(k_group, v_group, vanilla_full_entries)
+        vanilla_logkv_full_cache_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
+            route=vanilla_route,
+            ladder_meta=vanilla_full_meta,
+            summary=vanilla_full_summary,
+            sh=sh,
+            sh_source=sh_source,
+            vh=vh,
+            vh_source=vh_source,
+        )
+
+        route_cache: dict[float, Any] = {}
+        for g_max in g_values:
+            g_label = format_g_max(g_max)
+            for l_block in l_values:
+                effective_g_max = _effective_g_max(g_max, int(l_block))
+                route = route_cache.get(effective_g_max)
+                if route is None:
+                    route = route_dpmeans_segments(
+                        k_group,
+                        lambda_new=lambda_new,
+                        g_max=effective_g_max,
+                        gamma=float(task["seg_forget"]),
+                    )
+                    route_cache[effective_g_max] = route
+                entries, ladder_meta = simulate_segment_ladders(
+                    route,
+                    b_prime=int(task["b_prime"]),
+                    l_block=int(l_block),
+                )
+                summary = summarize_entries(k_group, v_group, entries)
+                key = (g_label, int(l_block), layer, int(group))
+                by_layer_group.setdefault(key, SweepAccumulator()).add(
+                    route=route,
+                    ladder_meta=ladder_meta,
+                    summary=summary,
+                    sh=sh,
+                    sh_source=sh_source,
+                    vh=vh,
+                    vh_source=vh_source,
+                )
+                overall.setdefault((g_label, int(l_block)), SweepAccumulator()).add(
+                    route=route,
+                    ladder_meta=ladder_meta,
+                    summary=summary,
+                    sh=sh,
+                    sh_source=sh_source,
+                    vh=vh,
+                    vh_source=vh_source,
+                )
+
+    message = (
+        f"[s0-sweep] {record_i}/{record_count} sample={sample.get('sample_id')} "
+        f"layer={layer} path={record['path']}"
+    )
+    return {
+        "by_layer_group": by_layer_group,
+        "overall": overall,
+        "single_cluster_bprime_baseline": single_cluster_bprime_baseline,
+        "vanilla_logkv_compressed_prefix_baseline": vanilla_logkv_compressed_prefix_baseline,
+        "vanilla_logkv_full_cache_baseline": vanilla_logkv_full_cache_baseline,
+        "processed_pairs": processed_pairs,
+        "groups_seen": groups_seen,
+        "message": message,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dump", required=True, help="Dump directory or manifest.json")
@@ -187,6 +385,12 @@ def main() -> None:
     parser.add_argument("--layers", help="Optional comma-separated layer filter")
     parser.add_argument("--groups", help="Optional comma-separated KV-group filter")
     parser.add_argument("--skip_value_var", action="store_true")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of worker processes over layer records. Use 1 for deterministic single-process execution.",
+    )
     parser.add_argument(
         "--allow_fallback_sh",
         action="store_true",
@@ -225,6 +429,8 @@ def main() -> None:
         raise ValueError(f"--vanilla_B must be a positive integer, got {args.vanilla_B}")
     if args.vanilla_recent_size < 2:
         raise ValueError(f"--vanilla_recent_size must be >= 2, got {args.vanilla_recent_size}")
+    if args.workers <= 0:
+        raise ValueError(f"--workers must be a positive integer, got {args.workers}")
     layer_filter = _wanted(args.layers)
     group_filter = _wanted(args.groups)
 
@@ -262,146 +468,54 @@ def main() -> None:
 
     processed_pairs = 0
     groups_seen: set[int] = set()
-    for record_i, (sample, record) in enumerate(records, start=1):
-        layer = int(record["layer"])
-        path = base_dir / record["path"]
-        payload = np.load(path)
-        k_raw = payload["k_raw"]
-        v = None if args.skip_value_var else payload["v"]
-        groups = range(k_raw.shape[0])
-        groups_seen.update(groups)
-        if group_filter is not None:
-            groups = [g for g in groups if g in group_filter]
+    scale_manifest = {
+        "key_scale": manifest.get("key_scale", {}),
+        "value_scale": manifest.get("value_scale", {}),
+    }
+    tasks = [
+        {
+            "sample": sample,
+            "record": record,
+            "record_i": record_i,
+            "record_count": len(records),
+            "base_dir": str(base_dir),
+            "scale_manifest": scale_manifest,
+            "g_values": g_values,
+            "l_values": l_values,
+            "group_filter": None if group_filter is None else sorted(group_filter),
+            "lambda_rel": args.lambda_rel,
+            "seg_forget": args.seg_forget,
+            "b_prime": args.b_prime,
+            "vanilla_B": args.vanilla_B,
+            "vanilla_recent_size": args.vanilla_recent_size,
+            "skip_value_var": args.skip_value_var,
+            "allow_fallback_sh": args.allow_fallback_sh,
+        }
+        for record_i, (sample, record) in enumerate(records, start=1)
+    ]
 
-        for group in groups:
-            processed_pairs += 1
-            k_group = np.asarray(k_raw[group], dtype=np.float32)
-            v_group = None if v is None else np.asarray(v[group], dtype=np.float32)
-            sh, sh_source = _manifest_sh(
-                manifest, layer, int(group), k_group, allow_fallback=args.allow_fallback_sh
-            )
-            lambda_new = float(args.lambda_rel) * sh
-            # Only look up a value-space scale when value variance is actually
-            # being computed at all (--skip_value_var means v_group is None).
-            vh, vh_source = (
-                _manifest_vh(manifest, layer, int(group), v_group, allow_fallback=args.allow_fallback_sh)
-                if v_group is not None
-                else (None, None)
-            )
-
-            # S0.4 baseline 1/2: same B'-budget ladder construction, but with
-            # no semantic clustering at all (single cluster, arrival order) --
-            # see single_cluster_bprime_baseline's docstring comment above.
-            sc_route = route_single_cluster_bprime_ladder(k_group.shape[0])
-            sc_entries, sc_ladder_meta = simulate_segment_ladders(
-                sc_route,
-                b_prime=args.b_prime,
-                l_block=0,
-            )
-            sc_summary = summarize_entries(k_group, v_group, sc_entries)
-            single_cluster_bprime_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
-                route=sc_route,
-                ladder_meta=sc_ladder_meta,
-                summary=sc_summary,
-                sh=sh,
-                sh_source=sh_source,
-                vh=vh,
-                vh_source=vh_source,
-            )
-
-            # S0.4 baselines 2-3/3: the actual existing/deployed vanilla LogKV
-            # -- see the two vanilla_logkv_*_baseline dicts' docstring comment
-            # above. Neither vanilla_logkv_compressed_entries nor
-            # vanilla_logkv_full_cache_entries has a cluster/segment concept
-            # (both are a single flat ladder with a real recent-window
-            # carve-out), so there is no meaningful RouteResult for either;
-            # this placeholder only exists to satisfy SweepAccumulator.add()'s
-            # interface, and is why cluster_count_mean/segment_count_mean
-            # read 1.0/1.0 for every row of both baselines (correctly --
-            # vanilla has neither).
-            vanilla_route = RouteResult(
-                cluster_ids=np.zeros(0, dtype=np.int32),
-                segment_ids=np.zeros(0, dtype=np.int32),
-                cluster_count=1,
-                segment_count=1,
-                cluster_sizes=[k_group.shape[0]],
-            )
-            vanilla_compressed_entries, vanilla_compressed_meta = vanilla_logkv_compressed_entries(
-                k_group.shape[0], b=args.vanilla_B, recent_size=args.vanilla_recent_size,
-            )
-            vanilla_compressed_summary = summarize_entries(k_group, v_group, vanilla_compressed_entries)
-            vanilla_logkv_compressed_prefix_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
-                route=vanilla_route,
-                ladder_meta=vanilla_compressed_meta,
-                summary=vanilla_compressed_summary,
-                sh=sh,
-                sh_source=sh_source,
-                vh=vh,
-                vh_source=vh_source,
-            )
-
-            vanilla_full_entries, vanilla_full_meta = vanilla_logkv_full_cache_entries(
-                k_group.shape[0], b=args.vanilla_B, recent_size=args.vanilla_recent_size,
-            )
-            vanilla_full_summary = summarize_entries(k_group, v_group, vanilla_full_entries)
-            vanilla_logkv_full_cache_baseline.setdefault((layer, int(group)), SweepAccumulator()).add(
-                route=vanilla_route,
-                ladder_meta=vanilla_full_meta,
-                summary=vanilla_full_summary,
-                sh=sh,
-                sh_source=sh_source,
-                vh=vh,
-                vh_source=vh_source,
-            )
-
-            # route only depends on (lambda_new, effective_g_max, gamma) -- see
-            # _effective_g_max -- so cache by effective_g_max: otherwise the
-            # g_max=inf route would get recomputed once per swept g_max value
-            # purely because every l_block=0 cell collapses to the same one.
-            route_cache: dict[float, Any] = {}
-            for g_max in g_values:
-                g_label = format_g_max(g_max)
-                for l_block in l_values:
-                    effective_g_max = _effective_g_max(g_max, int(l_block))
-                    route = route_cache.get(effective_g_max)
-                    if route is None:
-                        route = route_dpmeans_segments(
-                            k_group,
-                            lambda_new=lambda_new,
-                            g_max=effective_g_max,
-                            gamma=args.seg_forget,
-                        )
-                        route_cache[effective_g_max] = route
-                    entries, ladder_meta = simulate_segment_ladders(
-                        route,
-                        b_prime=args.b_prime,
-                        l_block=int(l_block),
-                    )
-                    summary = summarize_entries(k_group, v_group, entries)
-                    key = (g_label, int(l_block), layer, int(group))
-                    by_layer_group.setdefault(key, SweepAccumulator()).add(
-                        route=route,
-                        ladder_meta=ladder_meta,
-                        summary=summary,
-                        sh=sh,
-                        sh_source=sh_source,
-                        vh=vh,
-                        vh_source=vh_source,
-                    )
-                    overall.setdefault((g_label, int(l_block)), SweepAccumulator()).add(
-                        route=route,
-                        ladder_meta=ladder_meta,
-                        summary=summary,
-                        sh=sh,
-                        sh_source=sh_source,
-                        vh=vh,
-                        vh_source=vh_source,
-                    )
-        print(
-            f"[s0-sweep] {record_i}/{len(records)} sample={sample.get('sample_id')} "
-            f"layer={layer} path={record['path']}",
-            flush=True,
+    def consume_result(result: dict[str, Any]) -> None:
+        nonlocal processed_pairs
+        processed_pairs += int(result["processed_pairs"])
+        groups_seen.update(int(x) for x in result["groups_seen"])
+        _merge_accumulator_map(by_layer_group, result["by_layer_group"])
+        _merge_accumulator_map(overall, result["overall"])
+        _merge_accumulator_map(single_cluster_bprime_baseline, result["single_cluster_bprime_baseline"])
+        _merge_accumulator_map(
+            vanilla_logkv_compressed_prefix_baseline,
+            result["vanilla_logkv_compressed_prefix_baseline"],
         )
+        _merge_accumulator_map(vanilla_logkv_full_cache_baseline, result["vanilla_logkv_full_cache_baseline"])
+        print(result["message"], flush=True)
+
+    if args.workers == 1:
+        for task in tasks:
+            consume_result(_process_record_task(task))
+    else:
+        with ProcessPoolExecutor(max_workers=int(args.workers)) as executor:
+            future_to_record = {executor.submit(_process_record_task, task): task["record_i"] for task in tasks}
+            for future in as_completed(future_to_record):
+                consume_result(future.result())
 
     if processed_pairs == 0:
         # _iter_records already ruled out an empty --layers filter; getting here
@@ -472,6 +586,8 @@ def main() -> None:
             "layers": None if layer_filter is None else sorted(layer_filter),
             "groups": None if group_filter is None else sorted(group_filter),
             "skip_value_var": bool(args.skip_value_var),
+            "workers": args.workers,
+            "parallel_unit": "layer_record",
             "routing_eta": 0.0,
             "routing_mode": "strict_serial_dpmeans_unclipped",
             "l_block_zero_forces_g_max_inf": True,
