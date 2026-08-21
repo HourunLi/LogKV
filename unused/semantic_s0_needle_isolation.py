@@ -12,6 +12,7 @@ Example:
       --output stage0_dump/s0_3_needle_isolation.json \
       --g_max inf,8192,4096,2048,1024,256 \
       --lambda_rel 0.25,0.5,0.75,1.0 \
+      --k_max unclipped,16,32,64,128 \
       --b_prime 8 \
       --random_trials 100
 """
@@ -43,10 +44,12 @@ sys.modules[_S0_SPEC.name] = _S0
 _S0_SPEC.loader.exec_module(_S0)
 
 format_g_max = _S0.format_g_max
+format_k_max = _S0.format_k_max
 load_manifest = _S0.load_manifest
 manifest_base_dir = _S0.manifest_base_dir
 parse_g_max_list = _S0.parse_g_max_list
 parse_int_list = _S0.parse_int_list
+parse_k_max_list = _S0.parse_k_max_list
 route_dpmeans_segments = _S0.route_dpmeans_segments
 
 
@@ -189,17 +192,39 @@ class NeedleIsolationAccumulator:
         self.random_token_isolated = 0
         self.random_span_all_isolated = 0
         self.random_span_any_isolated = 0
+        self.needle_token_ward_merged = 0
+        self.needle_token_ward_touched = 0
+        self.span_any_ward_merged = 0
+        self.span_any_ward_touched = 0
+        self.random_token_ward_merged = 0
+        self.random_token_ward_touched = 0
+        self.random_span_any_ward_merged = 0
+        self.random_span_any_ward_touched = 0
         self.cluster_size_values: list[float] = []
         self.random_cluster_size_values: list[float] = []
         self.cluster_count_sum = 0.0
         self.segment_count_sum = 0.0
+        self.new_cluster_attempt_count_sum = 0.0
+        self.k_max_binding_count_sum = 0.0
+        self.ward_merge_count_sum = 0.0
+        self.novelty_suppressed_count_sum = 0.0
         self.sh_sources: set[str] = set()
 
-    def add_route_meta(self, *, cluster_count: int, segment_count: int, sh_source: str) -> None:
+    def add_route_meta(self, *, route: Any, sh_source: str) -> None:
         self.sample_groups += 1
-        self.cluster_count_sum += int(cluster_count)
-        self.segment_count_sum += int(segment_count)
+        self.cluster_count_sum += int(route.cluster_count)
+        self.segment_count_sum += int(route.segment_count)
+        self.new_cluster_attempt_count_sum += int(getattr(route, "new_cluster_attempt_count", 0))
+        self.k_max_binding_count_sum += int(getattr(route, "k_max_binding_count", 0))
+        self.ward_merge_count_sum += int(getattr(route, "ward_merge_count", 0))
+        self.novelty_suppressed_count_sum += int(getattr(route, "novelty_suppressed_count", 0))
         self.sh_sources.add(sh_source)
+
+    @staticmethod
+    def _mask_hits(mask: np.ndarray | None, start: int, end: int) -> list[bool]:
+        if mask is None:
+            return [False] * max(int(end) - int(start), 0)
+        return [bool(mask[pos]) for pos in range(int(start), int(end))]
 
     def add_intervals(
         self,
@@ -207,6 +232,8 @@ class NeedleIsolationAccumulator:
         intervals: list[tuple[int, int]],
         cluster_ids: np.ndarray,
         cluster_sizes: list[int],
+        ward_merged_mask: np.ndarray | None = None,
+        ward_touched_mask: np.ndarray | None = None,
     ) -> None:
         if not intervals:
             return
@@ -222,6 +249,12 @@ class NeedleIsolationAccumulator:
             self.span_all_isolated += int(all(isolated))
             self.span_any_isolated += int(any(isolated))
             self.cluster_size_values.extend(float(size) for size in sizes)
+            merged_hits = self._mask_hits(ward_merged_mask, start, end)
+            touched_hits = self._mask_hits(ward_touched_mask, start, end)
+            self.needle_token_ward_merged += sum(1 for value in merged_hits if value)
+            self.needle_token_ward_touched += sum(1 for value in touched_hits if value)
+            self.span_any_ward_merged += int(any(merged_hits))
+            self.span_any_ward_touched += int(any(touched_hits))
 
     def add_random_intervals(
         self,
@@ -229,6 +262,8 @@ class NeedleIsolationAccumulator:
         intervals: list[tuple[int, int]],
         cluster_ids: np.ndarray,
         cluster_sizes: list[int],
+        ward_merged_mask: np.ndarray | None = None,
+        ward_touched_mask: np.ndarray | None = None,
     ) -> None:
         for start, end in intervals:
             sizes = _cluster_sizes_for_interval(cluster_ids, cluster_sizes, start, end)
@@ -241,6 +276,12 @@ class NeedleIsolationAccumulator:
             self.random_span_all_isolated += int(all(isolated))
             self.random_span_any_isolated += int(any(isolated))
             self.random_cluster_size_values.extend(float(size) for size in sizes)
+            merged_hits = self._mask_hits(ward_merged_mask, start, end)
+            touched_hits = self._mask_hits(ward_touched_mask, start, end)
+            self.random_token_ward_merged += sum(1 for value in merged_hits if value)
+            self.random_token_ward_touched += sum(1 for value in touched_hits if value)
+            self.random_span_any_ward_merged += int(any(merged_hits))
+            self.random_span_any_ward_touched += int(any(touched_hits))
 
     def merge(self, other: "NeedleIsolationAccumulator") -> None:
         self.sample_groups += other.sample_groups
@@ -255,10 +296,22 @@ class NeedleIsolationAccumulator:
         self.random_token_isolated += other.random_token_isolated
         self.random_span_all_isolated += other.random_span_all_isolated
         self.random_span_any_isolated += other.random_span_any_isolated
+        self.needle_token_ward_merged += other.needle_token_ward_merged
+        self.needle_token_ward_touched += other.needle_token_ward_touched
+        self.span_any_ward_merged += other.span_any_ward_merged
+        self.span_any_ward_touched += other.span_any_ward_touched
+        self.random_token_ward_merged += other.random_token_ward_merged
+        self.random_token_ward_touched += other.random_token_ward_touched
+        self.random_span_any_ward_merged += other.random_span_any_ward_merged
+        self.random_span_any_ward_touched += other.random_span_any_ward_touched
         self.cluster_size_values.extend(other.cluster_size_values)
         self.random_cluster_size_values.extend(other.random_cluster_size_values)
         self.cluster_count_sum += other.cluster_count_sum
         self.segment_count_sum += other.segment_count_sum
+        self.new_cluster_attempt_count_sum += other.new_cluster_attempt_count_sum
+        self.k_max_binding_count_sum += other.k_max_binding_count_sum
+        self.ward_merge_count_sum += other.ward_merge_count_sum
+        self.novelty_suppressed_count_sum += other.novelty_suppressed_count_sum
         self.sh_sources.update(other.sh_sources)
 
     def finalize(self) -> dict[str, Any]:
@@ -268,6 +321,14 @@ class NeedleIsolationAccumulator:
         random_span_all_rate = _rate(self.random_span_all_isolated, self.random_span_count)
         span_any_rate = _rate(self.span_any_isolated, self.span_count)
         random_span_any_rate = _rate(self.random_span_any_isolated, self.random_span_count)
+        needle_token_ward_merged_rate = _rate(self.needle_token_ward_merged, self.needle_token_count)
+        needle_token_ward_touched_rate = _rate(self.needle_token_ward_touched, self.needle_token_count)
+        span_any_ward_merged_rate = _rate(self.span_any_ward_merged, self.span_count)
+        span_any_ward_touched_rate = _rate(self.span_any_ward_touched, self.span_count)
+        random_token_ward_merged_rate = _rate(self.random_token_ward_merged, self.random_token_count)
+        random_token_ward_touched_rate = _rate(self.random_token_ward_touched, self.random_token_count)
+        random_span_any_ward_merged_rate = _rate(self.random_span_any_ward_merged, self.random_span_count)
+        random_span_any_ward_touched_rate = _rate(self.random_span_any_ward_touched, self.random_span_count)
         denom = max(self.sample_groups, 1)
         return {
             "sample_groups": int(self.sample_groups),
@@ -291,6 +352,23 @@ class NeedleIsolationAccumulator:
             "random_span_all_tokens_isolated_rate": random_span_all_rate,
             "random_span_any_token_isolated_count": int(self.random_span_any_isolated),
             "random_span_any_token_isolated_rate": random_span_any_rate,
+            "needle_token_ward_merged_count": int(self.needle_token_ward_merged),
+            "needle_token_ward_merged_rate": needle_token_ward_merged_rate,
+            "needle_token_ward_touched_count": int(self.needle_token_ward_touched),
+            "needle_token_ward_touched_rate": needle_token_ward_touched_rate,
+            "span_any_ward_merged_count": int(self.span_any_ward_merged),
+            "span_any_ward_merged_rate": span_any_ward_merged_rate,
+            "span_any_ward_touched_count": int(self.span_any_ward_touched),
+            "span_any_ward_touched_rate": span_any_ward_touched_rate,
+            "needle_cluster_merged_by_ward_rate": span_any_ward_merged_rate,
+            "random_token_ward_merged_count": int(self.random_token_ward_merged),
+            "random_token_ward_merged_rate": random_token_ward_merged_rate,
+            "random_token_ward_touched_count": int(self.random_token_ward_touched),
+            "random_token_ward_touched_rate": random_token_ward_touched_rate,
+            "random_span_any_ward_merged_count": int(self.random_span_any_ward_merged),
+            "random_span_any_ward_merged_rate": random_span_any_ward_merged_rate,
+            "random_span_any_ward_touched_count": int(self.random_span_any_ward_touched),
+            "random_span_any_ward_touched_rate": random_span_any_ward_touched_rate,
             "random_cluster_size_mean": _mean(self.random_cluster_size_values),
             "random_cluster_size_quantiles": _quantiles(self.random_cluster_size_values),
             "token_isolation_lift": _lift(token_rate, random_token_rate),
@@ -298,6 +376,11 @@ class NeedleIsolationAccumulator:
             "span_any_token_isolation_lift": _lift(span_any_rate, random_span_any_rate),
             "cluster_count_mean": self.cluster_count_sum / denom,
             "segment_count_mean": self.segment_count_sum / denom,
+            "new_cluster_attempt_count_mean": self.new_cluster_attempt_count_sum / denom,
+            "k_max_binding_count_mean": self.k_max_binding_count_sum / denom,
+            "K_max_binding_rate": _rate(self.k_max_binding_count_sum, self.new_cluster_attempt_count_sum),
+            "ward_merge_count_mean": self.ward_merge_count_sum / denom,
+            "novelty_suppressed_count_mean": self.novelty_suppressed_count_sum / denom,
             "sh_source": sorted(self.sh_sources),
         }
 
@@ -379,13 +462,17 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
     if raw_lambda_rel_values is None:
         raw_lambda_rel_values = [task["lambda_rel"]]
     lambda_rel_values = [float(x) for x in raw_lambda_rel_values]
+    raw_k_max_values = task.get("k_max_values")
+    if raw_k_max_values is None:
+        raw_k_max_values = [None]
+    k_max_values = [None if value is None else int(value) for value in raw_k_max_values]
     group_filter = None if task["group_filter"] is None else set(int(x) for x in task["group_filter"])
     task_groups = None if task.get("task_groups") is None else set(int(x) for x in task["task_groups"])
     b_prime = int(task["b_prime"])
     collect_by_layer_group = bool(task["collect_by_layer_group"])
 
-    overall: dict[tuple[float, str], NeedleIsolationAccumulator] = {}
-    by_layer_group: dict[tuple[float, str, int, int], NeedleIsolationAccumulator] = {}
+    overall: dict[tuple[float, str, str], NeedleIsolationAccumulator] = {}
+    by_layer_group: dict[tuple[float, str, str, int, int], NeedleIsolationAccumulator] = {}
     processed_pairs = 0
     comparable_pairs = 0
     records_without_surviving_needle = 0
@@ -442,7 +529,7 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
             k_group,
             allow_fallback=bool(task["allow_fallback_sh"]),
         )
-        route_cache: dict[tuple[float, str], Any] = {}
+        route_cache: dict[tuple[float, str, str], Any] = {}
         random_intervals = _draw_random_intervals(
             intervals,
             token_count=int(k_group.shape[0]),
@@ -457,67 +544,74 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
         for lambda_rel in lambda_rel_values:
             lambda_new = float(lambda_rel) * sh
             for g_max in g_values:
-                cell_started_at = time.perf_counter()
                 g_label = format_g_max(g_max)
-                route_key = (float(lambda_rel), g_label)
-                route = route_cache.get(route_key)
-                route_cached = route is not None
-                route_elapsed = 0.0
-                if route is None:
-                    route_started_at = time.perf_counter()
-                    route = route_dpmeans_segments(
-                        k_group,
-                        lambda_new=lambda_new,
-                        g_max=g_max,
-                        gamma=float(task["seg_forget"]),
-                    )
-                    route_elapsed = time.perf_counter() - route_started_at
-                    route_cache[route_key] = route
-
-                accs = [
-                    overall.setdefault(route_key, NeedleIsolationAccumulator(b_prime=b_prime)),
-                ]
-                if collect_by_layer_group:
-                    accs.append(
-                        by_layer_group.setdefault(
-                            (float(lambda_rel), g_label, layer, int(group)),
-                            NeedleIsolationAccumulator(b_prime=b_prime),
+                for k_max in k_max_values:
+                    cell_started_at = time.perf_counter()
+                    k_label = format_k_max(k_max)
+                    route_key = (float(lambda_rel), g_label, k_label)
+                    route = route_cache.get(route_key)
+                    route_cached = route is not None
+                    route_elapsed = 0.0
+                    if route is None:
+                        route_started_at = time.perf_counter()
+                        route = route_dpmeans_segments(
+                            k_group,
+                            lambda_new=lambda_new,
+                            g_max=g_max,
+                            gamma=float(task["seg_forget"]),
+                            k_max=k_max,
                         )
-                    )
-                for acc in accs:
-                    acc.add_route_meta(
-                        cluster_count=route.cluster_count,
-                        segment_count=route.segment_count,
-                        sh_source=sh_source,
-                    )
-                    acc.add_intervals(
-                        intervals=intervals,
-                        cluster_ids=route.cluster_ids,
-                        cluster_sizes=route.cluster_sizes,
-                    )
-                    acc.add_random_intervals(
-                        intervals=random_intervals,
-                        cluster_ids=route.cluster_ids,
-                        cluster_sizes=route.cluster_sizes,
-                    )
-                if task.get("log_timing"):
-                    timing_events.append(
-                        {
-                            "task_i": task_i,
-                            "task_count": task_count,
-                            "record_i": record_i,
-                            "record_count": record_count,
-                            "layer": layer,
-                            "group": int(group),
-                            "lambda_rel": float(lambda_rel),
-                            "g_max": g_label,
-                            "route_cached": route_cached,
-                            "route_elapsed_seconds": route_elapsed,
-                            "cell_elapsed_seconds": time.perf_counter() - cell_started_at,
-                            "cluster_count": int(route.cluster_count),
-                            "segment_count": int(route.segment_count),
-                        }
-                    )
+                        route_elapsed = time.perf_counter() - route_started_at
+                        route_cache[route_key] = route
+
+                    accs = [
+                        overall.setdefault(route_key, NeedleIsolationAccumulator(b_prime=b_prime)),
+                    ]
+                    if collect_by_layer_group:
+                        accs.append(
+                            by_layer_group.setdefault(
+                                (float(lambda_rel), g_label, k_label, layer, int(group)),
+                                NeedleIsolationAccumulator(b_prime=b_prime),
+                            )
+                        )
+                    for acc in accs:
+                        acc.add_route_meta(route=route, sh_source=sh_source)
+                        acc.add_intervals(
+                            intervals=intervals,
+                            cluster_ids=route.cluster_ids,
+                            cluster_sizes=route.cluster_sizes,
+                            ward_merged_mask=getattr(route, "ward_merged_token_mask", None),
+                            ward_touched_mask=getattr(route, "ward_touched_token_mask", None),
+                        )
+                        acc.add_random_intervals(
+                            intervals=random_intervals,
+                            cluster_ids=route.cluster_ids,
+                            cluster_sizes=route.cluster_sizes,
+                            ward_merged_mask=getattr(route, "ward_merged_token_mask", None),
+                            ward_touched_mask=getattr(route, "ward_touched_token_mask", None),
+                        )
+                    if task.get("log_timing"):
+                        timing_events.append(
+                            {
+                                "task_i": task_i,
+                                "task_count": task_count,
+                                "record_i": record_i,
+                                "record_count": record_count,
+                                "layer": layer,
+                                "group": int(group),
+                                "lambda_rel": float(lambda_rel),
+                                "g_max": g_label,
+                                "k_max": k_label,
+                                "route_cached": route_cached,
+                                "route_elapsed_seconds": route_elapsed,
+                                "cell_elapsed_seconds": time.perf_counter() - cell_started_at,
+                                "cluster_count": int(route.cluster_count),
+                                "segment_count": int(route.segment_count),
+                                "ward_merge_count": int(getattr(route, "ward_merge_count", 0)),
+                                "k_max_binding_count": int(getattr(route, "k_max_binding_count", 0)),
+                                "new_cluster_attempt_count": int(getattr(route, "new_cluster_attempt_count", 0)),
+                            }
+                        )
 
     elapsed = time.perf_counter() - started_at
     timing_suffix = f" elapsed={elapsed:.2f}s" if task.get("log_timing") else ""
@@ -559,17 +653,17 @@ def _print_summary(rows: list[dict[str, Any]], *, top: int) -> None:
         "口径: needle token/span 所在 semantic cluster 的成员数 <= B'；"
         "random 为同 prompt 等长随机 span。"
     )
-    print("注意: 这是 cluster-level 判据，l_block 不参与路由；核心扫描轴是 lambda_rel。")
+    print("注意: 这是 cluster-level 判据，l_block 不参与路由；核心扫描轴是 lambda_rel 和 k_max。")
     if not rows:
         print("no rows")
         return
     print(
-        "lambda  g_max  token_iso  random  lift  span_all  random  lift  "
-        "cluster_p50  cluster_p90  clusters  segments  n"
+        "lambda  g_max  k_max      token_iso  random  lift  span_all  random  lift  "
+        "ward_merge  bind_rate  cluster_p50  cluster_p90  clusters  segments  n"
     )
     print(
-        "------  -----  ---------  ------  ----  --------  ------  ----  "
-        "-----------  -----------  --------  --------  -"
+        "------  -----  ---------  ---------  ------  ----  --------  ------  ----  "
+        "----------  ---------  -----------  -----------  --------  --------  -"
     )
     ranked = sorted(
         rows,
@@ -585,12 +679,15 @@ def _print_summary(rows: list[dict[str, Any]], *, top: int) -> None:
         print(
             f"{lambda_text.ljust(6)}  "
             f"{str(row['g_max']).ljust(5)}  "
+            f"{str(row.get('k_max', 'unclipped')).ljust(9)}  "
             f"{_fmt_pct(row.get('needle_token_isolated_rate')).rjust(9)}  "
             f"{_fmt_pct(row.get('random_token_isolated_rate')).rjust(6)}  "
             f"{_fmt_num(row.get('token_isolation_lift')).rjust(4)}  "
             f"{_fmt_pct(row.get('span_all_tokens_isolated_rate')).rjust(8)}  "
             f"{_fmt_pct(row.get('random_span_all_tokens_isolated_rate')).rjust(6)}  "
             f"{_fmt_num(row.get('span_all_tokens_isolation_lift')).rjust(4)}  "
+            f"{_fmt_num(row.get('ward_merge_count_mean')).rjust(10)}  "
+            f"{_fmt_pct(row.get('K_max_binding_rate')).rjust(9)}  "
             f"{_fmt_num(q.get('p50')).rjust(11)}  "
             f"{_fmt_num(q.get('p90')).rjust(11)}  "
             f"{_fmt_num(row.get('cluster_count_mean')).rjust(8)}  "
@@ -606,20 +703,23 @@ def _format_timing_event(event: dict[str, Any]) -> str:
         f"task={event.get('task_i')}/{event.get('task_count')} "
         f"record={event.get('record_i')}/{event.get('record_count')} "
         f"layer={event.get('layer')} group={event.get('group')} "
-        f"lambda_rel={float(event['lambda_rel']):g} g_max={event.get('g_max')} "
+        f"lambda_rel={float(event['lambda_rel']):g} g_max={event.get('g_max')} k_max={event.get('k_max')} "
         f"route={float(event.get('route_elapsed_seconds') or 0.0):.3f}s({cached}) "
         f"cell={float(event.get('cell_elapsed_seconds') or 0.0):.3f}s "
-        f"clusters={event.get('cluster_count')} segments={event.get('segment_count')}"
+        f"clusters={event.get('cluster_count')} segments={event.get('segment_count')} "
+        f"ward={event.get('ward_merge_count')} bind={event.get('k_max_binding_count')}/"
+        f"{event.get('new_cluster_attempt_count')}"
     )
 
 
-def _add_timing_stat(stats: dict[tuple[float, str], dict[str, Any]], event: dict[str, Any]) -> None:
-    key = (float(event["lambda_rel"]), str(event["g_max"]))
+def _add_timing_stat(stats: dict[tuple[float, str, str], dict[str, Any]], event: dict[str, Any]) -> None:
+    key = (float(event["lambda_rel"]), str(event["g_max"]), str(event.get("k_max", "unclipped")))
     row = stats.setdefault(
         key,
         {
             "lambda_rel": key[0],
             "g_max": key[1],
+            "k_max": key[2],
             "cell_count": 0,
             "route_calls": 0,
             "route_elapsed_total": 0.0,
@@ -628,6 +728,9 @@ def _add_timing_stat(stats: dict[tuple[float, str], dict[str, Any]], event: dict
             "cell_elapsed_max": 0.0,
             "cluster_count_max": 0,
             "segment_count_max": 0,
+            "ward_merge_count_max": 0,
+            "k_max_binding_count_max": 0,
+            "new_cluster_attempt_count_max": 0,
         },
     )
     route_elapsed = float(event.get("route_elapsed_seconds") or 0.0)
@@ -637,13 +740,22 @@ def _add_timing_stat(stats: dict[tuple[float, str], dict[str, Any]], event: dict
     row["cell_elapsed_max"] = max(float(row["cell_elapsed_max"]), cell_elapsed)
     row["cluster_count_max"] = max(int(row["cluster_count_max"]), int(event.get("cluster_count") or 0))
     row["segment_count_max"] = max(int(row["segment_count_max"]), int(event.get("segment_count") or 0))
+    row["ward_merge_count_max"] = max(int(row["ward_merge_count_max"]), int(event.get("ward_merge_count") or 0))
+    row["k_max_binding_count_max"] = max(
+        int(row["k_max_binding_count_max"]),
+        int(event.get("k_max_binding_count") or 0),
+    )
+    row["new_cluster_attempt_count_max"] = max(
+        int(row["new_cluster_attempt_count_max"]),
+        int(event.get("new_cluster_attempt_count") or 0),
+    )
     if not event.get("route_cached"):
         row["route_calls"] += 1
         row["route_elapsed_total"] += route_elapsed
         row["route_elapsed_max"] = max(float(row["route_elapsed_max"]), route_elapsed)
 
 
-def _timing_rows(stats: dict[tuple[float, str], dict[str, Any]]) -> list[dict[str, Any]]:
+def _timing_rows(stats: dict[tuple[float, str, str], dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for row in stats.values():
         out = dict(row)
@@ -654,24 +766,30 @@ def _timing_rows(stats: dict[tuple[float, str], dict[str, Any]]) -> list[dict[st
             float(out["cell_elapsed_total"]) / int(out["cell_count"]) if int(out["cell_count"]) else 0.0
         )
         rows.append(out)
-    return sorted(rows, key=lambda x: (float(x["lambda_rel"]), str(x["g_max"])))
+    return sorted(rows, key=lambda x: (float(x["lambda_rel"]), str(x["g_max"]), str(x["k_max"])))
 
 
 def _print_timing_summary(rows: list[dict[str, Any]], *, top: int = 20) -> None:
     if not rows:
         return
-    print("== S0.3 routing timing by (lambda_rel, g_max) ==")
-    print("lambda_rel  g_max  route_total  route_mean  route_max  cell_total  cell_mean  clusters_max  cells")
+    print("== S0.3 routing timing by (lambda_rel, g_max, k_max) ==")
+    print(
+        "lambda_rel  g_max  k_max      route_total  route_mean  route_max  "
+        "cell_total  cell_mean  clusters_max  ward_max  bind_max  cells"
+    )
     for row in sorted(rows, key=lambda x: float(x["route_elapsed_total"]), reverse=True)[:top]:
         print(
             f"{float(row['lambda_rel']):>10g}  "
             f"{str(row['g_max']).rjust(5)}  "
+            f"{str(row['k_max']).rjust(9)}  "
             f"{float(row['route_elapsed_total']):11.3f}s  "
             f"{float(row['route_elapsed_mean']):10.3f}s  "
             f"{float(row['route_elapsed_max']):9.3f}s  "
             f"{float(row['cell_elapsed_total']):10.3f}s  "
             f"{float(row['cell_elapsed_mean']):9.3f}s  "
             f"{int(row['cluster_count_max']):12d}  "
+            f"{int(row['ward_merge_count_max']):8d}  "
+            f"{int(row['k_max_binding_count_max']):8d}  "
             f"{int(row['cell_count'])}"
         )
 
@@ -685,6 +803,14 @@ def main() -> None:
         "--lambda_rel",
         default="1.0",
         help="Comma-separated lambda_rel values to scan, e.g. '0.25,0.5,0.75,1.0'.",
+    )
+    parser.add_argument(
+        "--k_max",
+        default="unclipped",
+        help=(
+            "Comma-separated K_max values for the Ward-clipped probe. "
+            "Use 'unclipped' (default) to preserve the original no-Ward Stage-0 route."
+        ),
     )
     parser.add_argument("--seg_forget", type=float, default=0.5)
     parser.add_argument("--b_prime", type=int, default=8)
@@ -710,7 +836,7 @@ def main() -> None:
     parser.add_argument(
         "--log_timing",
         action="store_true",
-        help="Append task elapsed seconds and print per-(lambda_rel, g_max) routing timing details.",
+        help="Append task elapsed seconds and print per-(lambda_rel, g_max, k_max) routing timing details.",
     )
     parser.add_argument("--top", type=int, default=12, help="Rows to print in the terminal summary")
     parser.add_argument(
@@ -721,7 +847,7 @@ def main() -> None:
     parser.add_argument(
         "--skip_by_layer_group",
         action="store_true",
-        help="Omit per-(g_max, layer, group) rows and write only overall_by_config.",
+        help="Omit per-(lambda_rel, g_max, k_max, layer, group) rows and write only overall_by_config.",
     )
     args = parser.parse_args()
 
@@ -731,6 +857,9 @@ def main() -> None:
     bad_lambda_rel = [value for value in lambda_rel_values if not (math.isfinite(value) and value > 0.0)]
     if bad_lambda_rel:
         raise ValueError(f"--lambda_rel values must be finite and > 0, got {bad_lambda_rel}")
+    k_max_values = parse_k_max_list(args.k_max)
+    if not k_max_values:
+        raise ValueError(f"--k_max {args.k_max!r} parsed to an empty list -- pass at least one value")
     if not (math.isfinite(args.seg_forget) and 0.0 <= args.seg_forget <= 1.0):
         raise ValueError(f"--seg_forget must be in [0, 1], got {args.seg_forget}")
     if args.b_prime <= 0:
@@ -755,14 +884,14 @@ def main() -> None:
     if not records:
         raise ValueError("No layer records matched the requested filters")
 
-    overall: dict[tuple[float, str], NeedleIsolationAccumulator] = {}
-    by_layer_group: dict[tuple[float, str, int, int], NeedleIsolationAccumulator] = {}
+    overall: dict[tuple[float, str, str], NeedleIsolationAccumulator] = {}
+    by_layer_group: dict[tuple[float, str, str, int, int], NeedleIsolationAccumulator] = {}
     processed_pairs = 0
     matched_group_pairs = 0
     comparable_pairs = 0
     groups_seen: set[int] = set()
     records_without_surviving_needle_indices: set[int] = set()
-    timing_stats: dict[tuple[float, str], dict[str, Any]] = {}
+    timing_stats: dict[tuple[float, str, str], dict[str, Any]] = {}
     scale_manifest = {"key_scale": manifest.get("key_scale", {})}
     base_tasks = []
     for record_i, (sample, record) in enumerate(records, start=1):
@@ -775,6 +904,7 @@ def main() -> None:
             "base_dir": str(base_dir),
             "scale_manifest": scale_manifest,
             "g_values": g_values,
+            "k_max_values": k_max_values,
             "group_filter": None if group_filter is None else sorted(group_filter),
             "lambda_rel_values": lambda_rel_values,
             "seg_forget": args.seg_forget,
@@ -856,14 +986,14 @@ def main() -> None:
         )
 
     overall_rows = []
-    for (lambda_rel, g_label), acc in sorted(overall.items(), key=lambda item: (item[0][0], item[0][1])):
-        row = {"lambda_rel": lambda_rel, "g_max": g_label}
+    for (lambda_rel, g_label, k_label), acc in sorted(overall.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])):
+        row = {"lambda_rel": lambda_rel, "g_max": g_label, "k_max": k_label}
         row.update(acc.finalize())
         overall_rows.append(row)
 
     by_lg_rows = []
-    for (lambda_rel, g_label, layer, group), acc in sorted(by_layer_group.items(), key=lambda item: item[0]):
-        row = {"lambda_rel": lambda_rel, "g_max": g_label, "layer": layer, "group": group}
+    for (lambda_rel, g_label, k_label, layer, group), acc in sorted(by_layer_group.items(), key=lambda item: item[0]):
+        row = {"lambda_rel": lambda_rel, "g_max": g_label, "k_max": k_label, "layer": layer, "group": group}
         row.update(acc.finalize())
         by_lg_rows.append(row)
 
@@ -877,6 +1007,7 @@ def main() -> None:
             "seg_forget": args.seg_forget,
             "b_prime": args.b_prime,
             "g_max": [format_g_max(x) for x in g_values],
+            "k_max": [format_k_max(x) for x in k_max_values],
             "layers": None if layer_filter is None else sorted(layer_filter),
             "groups": None if group_filter is None else sorted(group_filter),
             "random_trials": args.random_trials,
@@ -885,12 +1016,17 @@ def main() -> None:
             "parallel_unit": args.parallel_unit,
             "task_count": len(tasks),
             "routing_eta": 0.0,
-            "routing_mode": "strict_serial_dpmeans_unclipped",
+            "routing_mode": "strict_serial_dpmeans_unclipped_or_kmax_ward_probe",
             "random_baseline_rng": "per_record_layer_group_seedsequence_v1",
             "l_block_caveat": (
                 "S0.3 is a cluster-membership metric. lambda_rel controls the clustering threshold. "
                 "l_block only affects the later segment/ladder packing path, not route_dpmeans_segments "
-                "cluster_ids, so this analyzer reports by (lambda_rel, g_max)."
+                "cluster_ids, so this analyzer reports by (lambda_rel, g_max, k_max)."
+            ),
+            "k_max_probe_note": (
+                "k_max='unclipped' preserves the original no-Ward Stage-0 DP-means route. Integer k_max "
+                "values enable the algorithm-spec §5.6 Ward cap; K_max_binding_rate is "
+                "k_max_binding_count / new_cluster_attempt_count."
             ),
         },
         "summary": {

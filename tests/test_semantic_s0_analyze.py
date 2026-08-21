@@ -2,6 +2,8 @@ import csv
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "unused" / "semantic_s0_analyze.py"
 _SPEC = importlib.util.spec_from_file_location("semantic_s0_analyze_under_test", _SCRIPT_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -439,6 +441,53 @@ def test_build_anchor_analysis_ranks_by_e_m_and_attaches_baseline_ratios() -> No
     assert scoped["config_source"] == "by_layer_group_count_aggregate"
     assert [row["g_max"] for row in scoped["config_rankings"]] == ["inf", "256"]
     assert scoped["config_rankings"][0]["E_M"] == 1.1
+
+
+def test_anchor_best_by_layer_populates_ratio_fields_using_per_layer_aggregated_baseline() -> None:
+    # Regression test for a real bug: _anchor_best_by_layer built its
+    # candidates via _anchor_aggregate_group but never called
+    # _anchor_add_ratios on them before ranking, even though _anchor_rank_key
+    # reads current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full as a
+    # tie-break -- silently making that field always None (so the tie-break
+    # never actually discriminated between candidates). Fixing that naively
+    # (just calling _anchor_add_ratios on a flat per-layer row list) would
+    # trade it for a second bug: _anchor_add_ratios keys its baseline lookup
+    # only by scheme, assuming one row per scheme, but a layer with multiple
+    # groups has one baseline row *per group* -- so it would silently use
+    # whichever group's baseline happens to be last in iteration order
+    # instead of the correct sample_groups-weighted average across the whole
+    # layer. This payload gives layer 0 two groups with deliberately
+    # different vanilla_full entry_count_mean (10 and 30, average 20) so a
+    # "last group wins" bug and a "properly averaged" fix disagree.
+    single = "single_cluster_bprime_baseline"
+    vanilla_full = "vanilla_logkv_full_cache_baseline"
+    semantic = "semantic"
+    payload = {
+        "version": 1,
+        "kind": "semantic_logkv_s0_6_anchor_dedup",
+        "config": {"g_max": ["256"], "l_block": [1], "lambda_rel": 1.0, "b_prime": 8},
+        "overall_by_config": [],
+        "by_layer_group": [
+            _anchor_row(single, None, None, entry=10.0, real=10.0, logical=10.0, fixed3=30.0, layer=0, group=0),
+            _anchor_row(vanilla_full, None, None, entry=10.0, real=10.0, logical=10.0, fixed3=30.0, layer=0, group=0),
+            _anchor_row(semantic, "256", 1, entry=12.0, real=10.0, logical=15.0, fixed3=36.0, layer=0, group=0),
+            _anchor_row(single, None, None, entry=30.0, real=30.0, logical=30.0, fixed3=90.0, layer=0, group=1),
+            _anchor_row(vanilla_full, None, None, entry=30.0, real=30.0, logical=30.0, fixed3=90.0, layer=0, group=1),
+            _anchor_row(semantic, "256", 1, entry=12.0, real=10.0, logical=15.0, fixed3=36.0, layer=0, group=1),
+        ],
+    }
+
+    analysis = build_anchor_analysis(payload)
+    best = analysis["best_by_layer"][0]
+
+    assert best["layer"] == 0
+    # semantic's physical width is fixed3_anchor_count_mean (36.0 in both
+    # groups, so the aggregate is also 36.0); vanilla_full's is
+    # entry_count_mean, whose *correctly averaged* value across the two
+    # groups is (10+30)/2=20.0, not group 1's 30.0 (which a last-group-wins
+    # bug would silently use instead).
+    assert best["current_scheme_physical_slot_count_mean"] == 36.0
+    assert best["current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full"] == pytest.approx(36.0 / 20.0)
 
 
 def test_anchor_analysis_collapses_l_block_zero_duplicate_configs() -> None:

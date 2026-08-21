@@ -237,7 +237,7 @@ def test_process_record_task_builds_deterministic_worker_shard() -> None:
         first = _process_record_task(task)
         second = _process_record_task(task)
 
-    semantic_key = (SCHEME_SEMANTIC, "2", 1)
+    semantic_key = (SCHEME_SEMANTIC, "2", 1, "unclipped")
     assert first["processed_pairs"] == 1
     assert first["groups_seen"] == {0}
     assert semantic_key in first["overall"]

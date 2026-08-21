@@ -11,11 +11,13 @@ to inspect directly. This script turns them into compact reports:
   * span/entry-count tradeoff signals for S0.5;
   * optional layer-wise winners and CSV/JSON summary exports.
   * S0.3 needle isolation:
-    top ``(lambda_rel, g_max)`` configs by needle isolation lift over
-    same-length random spans, plus optional per-layer winners and CSV export.
+    top ``(lambda_rel, g_max, k_max)`` configs by needle isolation lift over
+    same-length random spans, plus Ward/K_max binding probes, optional
+    per-layer winners and CSV export.
   * S0.6 anchor dedup:
-    top semantic ``(g_max, l_block)`` configs by ``E[M]``/gather potential,
-    baseline rows, optional per-layer winners, and CSV export.
+    top semantic ``(g_max, l_block, k_max)`` configs by ``E[M]``/gather
+    potential, baseline rows, Ward/K_max binding probes, optional per-layer
+    winners, and CSV export.
 
 Examples:
     python unused/semantic_s0_analyze.py stage0_dump/s0_sweep.json
@@ -56,9 +58,17 @@ NEEDLE_CSV_FIELDS = [
     "rank",
     "lambda_rel",
     "g_max",
+    "k_max",
     "token_isolation_lift",
     "needle_token_isolated_rate",
     "random_token_isolated_rate",
+    "needle_cluster_merged_by_ward_rate",
+    "needle_token_ward_merged_rate",
+    "span_any_ward_merged_rate",
+    "K_max_binding_rate",
+    "ward_merge_count_mean",
+    "k_max_binding_count_mean",
+    "new_cluster_attempt_count_mean",
     "span_all_tokens_isolation_lift",
     "span_all_tokens_isolated_rate",
     "random_span_all_tokens_isolated_rate",
@@ -84,9 +94,17 @@ NEEDLE_LAYER_CSV_FIELDS = [
     "layer",
     "lambda_rel",
     "g_max",
+    "k_max",
     "token_isolation_lift",
     "needle_token_isolated_rate",
     "random_token_isolated_rate",
+    "needle_cluster_merged_by_ward_rate",
+    "needle_token_ward_merged_rate",
+    "span_any_ward_merged_rate",
+    "K_max_binding_rate",
+    "ward_merge_count_mean",
+    "k_max_binding_count_mean",
+    "new_cluster_attempt_count_mean",
     "span_all_tokens_isolation_lift",
     "span_all_tokens_isolated_rate",
     "random_span_all_tokens_isolated_rate",
@@ -104,9 +122,15 @@ NEEDLE_LAYER_CSV_FIELDS = [
 ANCHOR_CSV_FIELDS = [
     "rank",
     "scheme",
+    "lambda_rel",
     "g_max",
     "l_block",
+    "k_max",
     "E_M",
+    "K_max_binding_rate",
+    "ward_merge_count_mean",
+    "k_max_binding_count_mean",
+    "new_cluster_attempt_count_mean",
     "m_fractions.1",
     "m_fractions.2",
     "m_fractions.3",
@@ -127,9 +151,15 @@ ANCHOR_CSV_FIELDS = [
 
 ANCHOR_LAYER_CSV_FIELDS = [
     "layer",
+    "lambda_rel",
     "g_max",
     "l_block",
+    "k_max",
     "E_M",
+    "K_max_binding_rate",
+    "ward_merge_count_mean",
+    "k_max_binding_count_mean",
+    "new_cluster_attempt_count_mean",
     "m_fractions.1",
     "m_fractions.2",
     "m_fractions.3",
@@ -758,18 +788,19 @@ def _needle_row_with_default_lambda(row: dict[str, Any], default_lambda_rel: flo
     return normalized
 
 
-def _needle_config_key(row: dict[str, Any]) -> tuple[float | None, str]:
-    return _metric(row, "lambda_rel"), str(row["g_max"])
+def _needle_config_key(row: dict[str, Any]) -> tuple[float | None, str, str]:
+    return _metric(row, "lambda_rel"), str(row["g_max"]), str(row.get("k_max", "unclipped"))
 
 
-def _needle_config_sort_key(key: tuple[float | None, str]) -> tuple[float, str]:
-    lambda_rel, g_max = key
-    return (math.inf if lambda_rel is None else float(lambda_rel), g_max)
+def _needle_config_sort_key(key: tuple[float | None, str, str]) -> tuple[float, str, str]:
+    lambda_rel, g_max, k_max = key
+    return (math.inf if lambda_rel is None else float(lambda_rel), g_max, k_max)
 
 
 def _aggregate_needle_group(
     lambda_rel: float | None,
     g_max: str,
+    k_max: str,
     rows: list[dict[str, Any]],
     *,
     extra: dict[str, Any] | None = None,
@@ -788,6 +819,14 @@ def _aggregate_needle_group(
         "random_token_isolated_count",
         "random_span_all_tokens_isolated_count",
         "random_span_any_token_isolated_count",
+        "needle_token_ward_merged_count",
+        "needle_token_ward_touched_count",
+        "span_any_ward_merged_count",
+        "span_any_ward_touched_count",
+        "random_token_ward_merged_count",
+        "random_token_ward_touched_count",
+        "random_span_any_ward_merged_count",
+        "random_span_any_ward_touched_count",
     ]
     for row in rows:
         for field in count_fields:
@@ -801,9 +840,18 @@ def _aggregate_needle_group(
     random_span_all_rate = _ratio(sums["random_span_all_tokens_isolated_count"], sums["random_span_count"])
     span_any_rate = _ratio(sums["span_any_token_isolated_count"], sums["span_count"])
     random_span_any_rate = _ratio(sums["random_span_any_token_isolated_count"], sums["random_span_count"])
+    needle_token_ward_merged_rate = _ratio(sums["needle_token_ward_merged_count"], sums["needle_token_count"])
+    needle_token_ward_touched_rate = _ratio(sums["needle_token_ward_touched_count"], sums["needle_token_count"])
+    span_any_ward_merged_rate = _ratio(sums["span_any_ward_merged_count"], sums["span_count"])
+    span_any_ward_touched_rate = _ratio(sums["span_any_ward_touched_count"], sums["span_count"])
+    random_token_ward_merged_rate = _ratio(sums["random_token_ward_merged_count"], sums["random_token_count"])
+    random_token_ward_touched_rate = _ratio(sums["random_token_ward_touched_count"], sums["random_token_count"])
+    random_span_any_ward_merged_rate = _ratio(sums["random_span_any_ward_merged_count"], sums["random_span_count"])
+    random_span_any_ward_touched_rate = _ratio(sums["random_span_any_ward_touched_count"], sums["random_span_count"])
     row: dict[str, Any] = {
         "lambda_rel": lambda_rel,
         "g_max": g_max,
+        "k_max": k_max,
         "sample_groups": int(sums["sample_groups"]),
         "sample_groups_with_needle": int(sums["sample_groups_with_needle"]),
         "span_count": int(sums["span_count"]),
@@ -822,11 +870,36 @@ def _aggregate_needle_group(
         "random_span_all_tokens_isolated_rate": random_span_all_rate,
         "random_span_any_token_isolated_count": int(sums["random_span_any_token_isolated_count"]),
         "random_span_any_token_isolated_rate": random_span_any_rate,
+        "needle_token_ward_merged_count": int(sums["needle_token_ward_merged_count"]),
+        "needle_token_ward_merged_rate": needle_token_ward_merged_rate,
+        "needle_token_ward_touched_count": int(sums["needle_token_ward_touched_count"]),
+        "needle_token_ward_touched_rate": needle_token_ward_touched_rate,
+        "span_any_ward_merged_count": int(sums["span_any_ward_merged_count"]),
+        "span_any_ward_merged_rate": span_any_ward_merged_rate,
+        "span_any_ward_touched_count": int(sums["span_any_ward_touched_count"]),
+        "span_any_ward_touched_rate": span_any_ward_touched_rate,
+        "needle_cluster_merged_by_ward_rate": span_any_ward_merged_rate,
+        "random_token_ward_merged_count": int(sums["random_token_ward_merged_count"]),
+        "random_token_ward_merged_rate": random_token_ward_merged_rate,
+        "random_token_ward_touched_count": int(sums["random_token_ward_touched_count"]),
+        "random_token_ward_touched_rate": random_token_ward_touched_rate,
+        "random_span_any_ward_merged_count": int(sums["random_span_any_ward_merged_count"]),
+        "random_span_any_ward_merged_rate": random_span_any_ward_merged_rate,
+        "random_span_any_ward_touched_count": int(sums["random_span_any_ward_touched_count"]),
+        "random_span_any_ward_touched_rate": random_span_any_ward_touched_rate,
         "token_isolation_lift": _ratio(token_rate, random_token_rate),
         "span_all_tokens_isolation_lift": _ratio(span_all_rate, random_span_all_rate),
         "span_any_token_isolation_lift": _ratio(span_any_rate, random_span_any_rate),
         "cluster_count_mean": _weighted_mean_from_mean_rows(rows, "cluster_count_mean"),
         "segment_count_mean": _weighted_mean_from_mean_rows(rows, "segment_count_mean"),
+        "new_cluster_attempt_count_mean": _weighted_mean_from_mean_rows(rows, "new_cluster_attempt_count_mean"),
+        "k_max_binding_count_mean": _weighted_mean_from_mean_rows(rows, "k_max_binding_count_mean"),
+        "K_max_binding_rate": _ratio(
+            sum((_metric(row, "k_max_binding_count_mean") or 0.0) * (_metric(row, "sample_groups") or 0.0) for row in rows),
+            sum((_metric(row, "new_cluster_attempt_count_mean") or 0.0) * (_metric(row, "sample_groups") or 0.0) for row in rows),
+        ),
+        "ward_merge_count_mean": _weighted_mean_from_mean_rows(rows, "ward_merge_count_mean"),
+        "novelty_suppressed_count_mean": _weighted_mean_from_mean_rows(rows, "novelty_suppressed_count_mean"),
         "cluster_size_mean": _weighted_mean_from_mean_rows(rows, "cluster_size_mean"),
         "layer_group_count": len(rows),
     }
@@ -866,12 +939,12 @@ def _needle_config_rows(
         for row in payload.get("by_layer_group", [])
     ]
     scoped = _scope_layer_group_rows(rows, layers=layers, groups=groups)
-    grouped: dict[tuple[float | None, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[float | None, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in scoped:
         grouped[_needle_config_key(row)].append(row)
     return [
-        _aggregate_needle_group(lambda_rel, g_max, rows)
-        for (lambda_rel, g_max), rows in sorted(grouped.items(), key=lambda item: _needle_config_sort_key(item[0]))
+        _aggregate_needle_group(lambda_rel, g_max, k_max, rows)
+        for (lambda_rel, g_max, k_max), rows in sorted(grouped.items(), key=lambda item: _needle_config_sort_key(item[0]))
     ], "by_layer_group_count_aggregate"
 
 
@@ -887,13 +960,13 @@ def _needle_best_by_layer(
         for row in payload.get("by_layer_group", [])
     ]
     scoped = _scope_layer_group_rows(rows, layers=layers, groups=groups)
-    grouped: dict[tuple[int, float | None, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[int, float | None, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in scoped:
-        lambda_rel, g_max = _needle_config_key(row)
-        grouped[(int(row["layer"]), lambda_rel, g_max)].append(row)
+        lambda_rel, g_max, k_max = _needle_config_key(row)
+        grouped[(int(row["layer"]), lambda_rel, g_max, k_max)].append(row)
     candidates = [
-        _aggregate_needle_group(lambda_rel, g_max, rows, extra={"layer": layer})
-        for (layer, lambda_rel, g_max), rows in grouped.items()
+        _aggregate_needle_group(lambda_rel, g_max, k_max, rows, extra={"layer": layer})
+        for (layer, lambda_rel, g_max, k_max), rows in grouped.items()
     ]
     best: dict[int, dict[str, Any]] = {}
     for row in candidates:
@@ -904,17 +977,20 @@ def _needle_best_by_layer(
     return [best[layer] for layer in sorted(best)]
 
 
-def _needle_rank_key(row: dict[str, Any]) -> tuple[float, float, float, float, str]:
+def _needle_rank_key(row: dict[str, Any]) -> tuple[float, float, float, float, float, str, str]:
     lift = _metric(row, "token_isolation_lift")
     rate = _metric(row, "needle_token_isolated_rate")
     span_lift = _metric(row, "span_all_tokens_isolation_lift")
+    binding = _metric(row, "K_max_binding_rate")
     lambda_rel = _metric(row, "lambda_rel")
     return (
         -(lift if lift is not None else -math.inf),
         -(rate if rate is not None else -math.inf),
         -(span_lift if span_lift is not None else -math.inf),
+        binding if binding is not None else 0.0,
         lambda_rel if lambda_rel is not None else math.inf,
         str(row.get("g_max")),
+        str(row.get("k_max", "unclipped")),
     )
 
 
@@ -960,6 +1036,18 @@ def _anchor_scheme_physical_width(row: dict[str, Any]) -> None:
         row["current_scheme_physical_slot_count_mean"] = None
 
 
+def _anchor_default_lambda_rel(payload: dict[str, Any]) -> float | None:
+    config = payload.get("config") or {}
+    return _finite_float(config.get("lambda_rel"))
+
+
+def _anchor_row_with_default_lambda(row: dict[str, Any], default_lambda_rel: float | None) -> dict[str, Any]:
+    normalized = dict(row)
+    if "lambda_rel" not in normalized and default_lambda_rel is not None:
+        normalized["lambda_rel"] = default_lambda_rel
+    return normalized
+
+
 def _normalize_anchor_config(row: dict[str, Any], *, collapse_l0: bool) -> dict[str, Any]:
     normalized = dict(row)
     if (
@@ -980,8 +1068,10 @@ def _dedupe_anchor_rows(rows: list[dict[str, Any]], *, collapse_l0: bool) -> tup
         normalized = _normalize_anchor_config(row, collapse_l0=collapse_l0)
         key = (
             normalized.get("scheme"),
+            normalized.get("lambda_rel"),
             normalized.get("g_max"),
             normalized.get("l_block"),
+            normalized.get("k_max"),
             normalized.get("layer"),
             normalized.get("group"),
         )
@@ -995,8 +1085,10 @@ def _dedupe_anchor_rows(rows: list[dict[str, Any]], *, collapse_l0: bool) -> tup
 
 def _anchor_aggregate_group(
     scheme: str,
+    lambda_rel: float | None,
     g_max: str | None,
     l_block: int | None,
+    k_max: str | None,
     rows: list[dict[str, Any]],
     *,
     extra: dict[str, Any] | None = None,
@@ -1012,6 +1104,10 @@ def _anchor_aggregate_group(
         "fixed3_entry_anchor_count_mean",
         "fixed3_real_anchor_count_mean",
         "lo_hi_anchor_count_mean",
+        "new_cluster_attempt_count_mean",
+        "k_max_binding_count_mean",
+        "ward_merge_count_mean",
+        "novelty_suppressed_count_mean",
     ]
     sums = {
         field: sum((_metric(row, field) or 0.0) * (_metric(row, "sample_groups") or 0.0) for row in rows)
@@ -1033,8 +1129,10 @@ def _anchor_aggregate_group(
     lo_hi = sums["lo_hi_anchor_count_mean"]
     row: dict[str, Any] = {
         "scheme": scheme,
+        "lambda_rel": lambda_rel,
         "g_max": g_max,
         "l_block": l_block,
+        "k_max": k_max,
         "sample_groups": int(sample_groups),
         "layer_group_count": len(rows),
     }
@@ -1052,6 +1150,10 @@ def _anchor_aggregate_group(
             "gather_savings_fraction_vs_fixed3_real": None if fixed3_real <= 0 else 1.0 - logical / fixed3_real,
             "lo_hi_savings_fraction_vs_fixed3": None if fixed3 <= 0 else 1.0 - lo_hi / fixed3,
             "lo_hi_savings_fraction_vs_fixed3_real": None if fixed3_real <= 0 else 1.0 - lo_hi / fixed3_real,
+            "K_max_binding_rate": _ratio(
+                sums["k_max_binding_count_mean"],
+                sums["new_cluster_attempt_count_mean"],
+            ),
             "m_counts": {key: int(m_counts.get(key, 0)) for key in ("1", "2", "3")},
             "m_fractions": {key: _fraction_from_counts(m_counts, key, real_entries) for key in ("1", "2", "3")},
             "lo_hi_m_counts": {key: int(lo_hi_m_counts.get(key, 0)) for key in ("1", "2")},
@@ -1111,43 +1213,62 @@ def _anchor_rows(
     groups: set[int] | None,
     collapse_l0: bool,
 ) -> tuple[list[dict[str, Any]], str, int]:
+    default_lambda_rel = _anchor_default_lambda_rel(payload)
     if layers is None and groups is None:
-        rows = [dict(row) for row in payload.get("overall_by_config", [])]
+        rows = [_anchor_row_with_default_lambda(row, default_lambda_rel) for row in payload.get("overall_by_config", [])]
         for row in rows:
             _anchor_scheme_physical_width(row)
         rows, duplicates = _dedupe_anchor_rows(rows, collapse_l0=collapse_l0)
         return rows, "overall_by_config", duplicates
 
     deduped, duplicates = _dedupe_anchor_rows(
-        payload.get("by_layer_group", []),
+        [_anchor_row_with_default_lambda(row, default_lambda_rel) for row in payload.get("by_layer_group", [])],
         collapse_l0=collapse_l0,
     )
     scoped = _scope_layer_group_rows(deduped, layers=layers, groups=groups)
-    grouped: dict[tuple[str, str | None, int | None], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, float | None, str | None, int | None, str | None], list[dict[str, Any]]] = defaultdict(list)
     for row in scoped:
-        key = row["scheme"], row.get("g_max"), row.get("l_block")
+        key = row["scheme"], _metric(row, "lambda_rel"), row.get("g_max"), row.get("l_block"), row.get("k_max")
         grouped[key].append(row)
     rows = [
-        _anchor_aggregate_group(scheme, g_max, None if l_block is None else int(l_block), group_rows)
-        for (scheme, g_max, l_block), group_rows in sorted(
+        _anchor_aggregate_group(
+            scheme,
+            lambda_rel,
+            g_max,
+            None if l_block is None else int(l_block),
+            k_max,
+            group_rows,
+        )
+        for (scheme, lambda_rel, g_max, l_block, k_max), group_rows in sorted(
             grouped.items(),
-            key=lambda item: (item[0][0], "" if item[0][1] is None else item[0][1], -1 if item[0][2] is None else item[0][2]),
+            key=lambda item: (
+                item[0][0],
+                math.inf if item[0][1] is None else float(item[0][1]),
+                "" if item[0][2] is None else item[0][2],
+                -1 if item[0][3] is None else item[0][3],
+                "" if item[0][4] is None else item[0][4],
+            ),
         )
     ]
     _anchor_add_ratios(rows)
     return rows, "by_layer_group_count_aggregate", duplicates
 
 
-def _anchor_rank_key(row: dict[str, Any]) -> tuple[float, float, float, str, int]:
+def _anchor_rank_key(row: dict[str, Any]) -> tuple[float, float, float, float, float, str, int, str]:
     e_m = _metric(row, "E_M")
     savings = _metric(row, "gather_savings_fraction_vs_fixed3")
     phys_ratio = _metric(row, "current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full")
+    binding = _metric(row, "K_max_binding_rate")
+    lambda_rel = _metric(row, "lambda_rel")
     return (
         e_m if e_m is not None else math.inf,
         -(savings if savings is not None else -math.inf),
         phys_ratio if phys_ratio is not None else math.inf,
+        binding if binding is not None else 0.0,
+        lambda_rel if lambda_rel is not None else math.inf,
         str(row.get("g_max")),
         int(row.get("l_block") or -1),
+        str(row.get("k_max", "unclipped")),
     )
 
 
@@ -1158,19 +1279,58 @@ def _anchor_best_by_layer(
     groups: set[int] | None,
     collapse_l0: bool,
 ) -> list[dict[str, Any]]:
+    default_lambda_rel = _anchor_default_lambda_rel(payload)
     deduped, _duplicates = _dedupe_anchor_rows(
-        payload.get("by_layer_group", []),
+        [_anchor_row_with_default_lambda(row, default_lambda_rel) for row in payload.get("by_layer_group", [])],
         collapse_l0=collapse_l0,
     )
     scoped = _scope_layer_group_rows(deduped, layers=layers, groups=groups)
-    grouped: dict[tuple[int, str, int], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[int, float | None, str, int, str | None], list[dict[str, Any]]] = defaultdict(list)
+    baseline_groups: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
     for row in scoped:
         if row.get("scheme") == SCHEME_SEMANTIC:
-            grouped[(int(row["layer"]), str(row.get("g_max")), int(row.get("l_block")))].append(row)
+            grouped[
+                (
+                    int(row["layer"]),
+                    _metric(row, "lambda_rel"),
+                    str(row.get("g_max")),
+                    int(row.get("l_block")),
+                    row.get("k_max"),
+                )
+            ].append(row)
+        else:
+            baseline_groups[(int(row["layer"]), str(row["scheme"]))].append(row)
+
+    # Each baseline scheme has one raw row per (layer, group) in the source
+    # data (unaffected by g_max/l_block/k_max), so aggregate them per layer
+    # with the same sample_groups-weighted logic used for semantic rows --
+    # not just "keep whichever group's row is seen last" -- before handing
+    # them to _anchor_add_ratios below.
+    baselines_by_layer: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for (layer, scheme), base_rows in baseline_groups.items():
+        baselines_by_layer[layer].append(
+            _anchor_aggregate_group(scheme, None, None, None, None, base_rows, extra={"layer": layer})
+        )
+
     candidates = [
-        _anchor_aggregate_group(SCHEME_SEMANTIC, g_max, l_block, rows, extra={"layer": layer})
-        for (layer, g_max, l_block), rows in grouped.items()
+        _anchor_aggregate_group(SCHEME_SEMANTIC, lambda_rel, g_max, l_block, k_max, rows, extra={"layer": layer})
+        for (layer, lambda_rel, g_max, l_block, k_max), rows in grouped.items()
     ]
+    # _anchor_rank_key reads current_scheme_physical_slot_count_mean_ratio_
+    # vs_vanilla_full as a tie-break, but that field is only ever populated by
+    # _anchor_add_ratios -- which nothing called on these candidates before,
+    # silently making the tie-break inert (always None -> math.inf for every
+    # candidate, so it never actually discriminates between tied E[M]/savings
+    # rows, e.g. the l_block=0 collapse group). _anchor_add_ratios keys its
+    # baseline lookup purely by scheme, assuming one row per scheme, so it
+    # must be called per layer (each layer's own baseline aggregate) rather
+    # than on one flat list, or a later layer's baseline would silently
+    # overwrite an earlier layer's in the lookup dict.
+    for candidate in candidates:
+        layer_baselines = baselines_by_layer.get(int(candidate["layer"]), [])
+        if layer_baselines:
+            _anchor_add_ratios([*layer_baselines, candidate])
+
     best: dict[int, dict[str, Any]] = {}
     for row in candidates:
         layer = int(row["layer"])

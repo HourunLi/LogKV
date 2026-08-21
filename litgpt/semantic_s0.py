@@ -8,7 +8,7 @@ come from semantic grouping itself, or from better temporal segment boundaries?
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
@@ -37,6 +37,47 @@ def parse_g_max_list(text: str | Iterable[int | float]) -> list[float]:
 
 def format_g_max(value: float) -> str:
     return "inf" if math.isinf(float(value)) else f"{float(value):g}"
+
+
+def parse_k_max_list(text: str | Iterable[int | None]) -> list[int | None]:
+    """Parse a comma-separated ``K_max`` list.
+
+    ``None`` means the original Stage-0 unclipped DP-means path. The spelling is
+    intentionally human-facing because the S0.3/S0.6 probes are often launched
+    from shell scripts: ``unclipped``, ``none`` and ``inf`` all select the old
+    no-Ward route, while positive integers enable the clipped Ward probe.
+    """
+
+    if not isinstance(text, str):
+        values: list[int | None] = []
+        for value in text:
+            if value is None:
+                values.append(None)
+            else:
+                parsed = int(value)
+                if parsed <= 0:
+                    raise ValueError(f"K_max values must be positive integers or unclipped, got {parsed}")
+                values.append(parsed)
+        return values
+
+    values = []
+    for raw in text.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        lowered = raw.lower()
+        if lowered in {"none", "unclipped", "inf", "infty", "infinite", "∞"}:
+            values.append(None)
+            continue
+        parsed = int(raw)
+        if parsed <= 0:
+            raise ValueError(f"K_max values must be positive integers or unclipped, got {parsed}")
+        values.append(parsed)
+    return values
+
+
+def format_k_max(value: int | None) -> str:
+    return "unclipped" if value is None else str(int(value))
 
 
 def quantiles(values: list[float], qs: Iterable[float] = (0.5, 0.9, 0.99)) -> dict[str, float]:
@@ -176,6 +217,26 @@ class RouteResult:
     cluster_count: int
     segment_count: int
     cluster_sizes: list[int]
+    k_max: int | None = None
+    new_cluster_attempt_count: int = 0
+    k_max_binding_count: int = 0
+    ward_merge_count: int = 0
+    novelty_suppressed_count: int = 0
+    route_events: list[tuple[int, int, int, int]] | None = None
+    ward_merged_token_mask: np.ndarray | None = None
+    ward_touched_token_mask: np.ndarray | None = None
+
+    @property
+    def k_max_binding_rate(self) -> float | None:
+        return (
+            float(self.k_max_binding_count) / float(self.new_cluster_attempt_count)
+            if self.new_cluster_attempt_count
+            else None
+        )
+
+
+ROUTE_EVENT_APPEND = 0
+ROUTE_EVENT_WARD_MERGE = 1
 
 
 def route_single_cluster_bprime_ladder(token_count: int) -> RouteResult:
@@ -421,13 +482,17 @@ def route_dpmeans_segments(
     lambda_new: float,
     g_max: float,
     gamma: float = 0.5,
+    k_max: int | None = None,
 ) -> RouteResult:
     """Strict serial DP-means routing with ``eta=0``.
 
     ``g_max`` controls segment creation inside the winning semantic cluster.
     ``gamma`` is the centroid count forgetting factor applied when a new segment
-    opens, matching the algorithm spec. No ``K_max`` clipping or Ward merge is
-    applied; this is the Stage-0 offline scientific measurement path.
+    opens, matching the algorithm spec. By default this is the original
+    unclipped Stage-0 scientific measurement path. Passing ``k_max`` enables the
+    S0.3/S0.6 production-proximity probe: when semantic novelty wants a new
+    cluster and all ``K_max`` slots are alive, the two alive clusters with the
+    smallest Ward cost are merged first to free one slot.
     """
 
     k = np.asarray(k_raw, dtype=np.float32)
@@ -452,6 +517,10 @@ def route_dpmeans_segments(
         )
     if not 0.0 <= float(gamma) <= 1.0:
         raise ValueError(f"gamma must be in [0,1], got {gamma}")
+    if k_max is not None:
+        k_max = int(k_max)
+        if k_max <= 0:
+            raise ValueError(f"k_max must be a positive integer or None, got {k_max}")
     t_total, dim = k.shape
     if t_total == 0:
         return RouteResult(
@@ -460,6 +529,18 @@ def route_dpmeans_segments(
             cluster_count=0,
             segment_count=0,
             cluster_sizes=[],
+            k_max=k_max,
+            route_events=[] if k_max is not None else None,
+            ward_merged_token_mask=np.zeros(0, dtype=bool) if k_max is not None else None,
+            ward_touched_token_mask=np.zeros(0, dtype=bool) if k_max is not None else None,
+        )
+    if k_max is not None:
+        return _route_dpmeans_segments_clipped(
+            k,
+            lambda_new=float(lambda_new),
+            g_max=float(g_max),
+            gamma=float(gamma),
+            k_max=int(k_max),
         )
 
     centroids = np.empty((max(1, t_total), dim), dtype=np.float32)
@@ -521,6 +602,192 @@ def route_dpmeans_segments(
         cluster_count=int(cluster_count),
         segment_count=int(segment_count),
         cluster_sizes=n_total[:cluster_count].astype(int).tolist(),
+        new_cluster_attempt_count=int(cluster_count),
+    )
+
+
+def _route_dpmeans_segments_clipped(
+    k: np.ndarray,
+    *,
+    lambda_new: float,
+    g_max: float,
+    gamma: float,
+    k_max: int,
+) -> RouteResult:
+    """Serial DP-means route with the algorithm-spec K_max/Ward cap.
+
+    This is deliberately an offline probe, not a vectorized production
+    implementation. The goal is exact event order for S0.3/S0.6 diagnostics:
+    final ``cluster_ids`` reflect all historical Ward merges, while
+    ``route_events`` preserves when those merges happened so
+    ``simulate_segment_ladders`` can merge the two per-cluster ladders online
+    instead of rebuilding storage from final labels.
+    """
+
+    t_total, dim = k.shape
+    centroids = np.empty((k_max, dim), dtype=np.float32)
+    n_eff = np.zeros(k_max, dtype=np.float32)
+    n_total = np.zeros(k_max, dtype=np.int64)
+    p_hi = np.zeros(k_max, dtype=np.int64)
+    current_segment = np.zeros(k_max, dtype=np.int32)
+    alive = np.zeros(k_max, dtype=bool)
+    members: list[list[int]] = [[] for _ in range(k_max)]
+
+    cluster_ids = np.empty(t_total, dtype=np.int32)
+    segment_ids = np.empty(t_total, dtype=np.int32)
+    ward_merged_token_mask = np.zeros(t_total, dtype=bool)
+    ward_touched_token_mask = np.zeros(t_total, dtype=bool)
+    route_events: list[tuple[int, int, int, int]] = []
+
+    segment_count = 0
+    new_cluster_attempt_count = 0
+    k_max_binding_count = 0
+    ward_merge_count = 0
+    novelty_suppressed_count = 0
+
+    def first_free_slot() -> int:
+        free = np.flatnonzero(~alive)
+        if free.size == 0:
+            raise AssertionError("first_free_slot called when no free slot exists")
+        return int(free[0])
+
+    def allocate_new_cluster(slot: int, pos: int, x: np.ndarray) -> None:
+        nonlocal segment_count
+        alive[slot] = True
+        centroids[slot] = x
+        n_eff[slot] = 1.0
+        n_total[slot] = 1
+        p_hi[slot] = pos
+        current_segment[slot] = 0
+        members[slot] = [int(pos)]
+        cluster_ids[pos] = int(slot)
+        segment_ids[pos] = 0
+        segment_count += 1
+        route_events.append((ROUTE_EVENT_APPEND, int(pos), int(slot), 0))
+
+    def append_existing(slot: int, pos: int, x: np.ndarray) -> None:
+        nonlocal segment_count
+        if not math.isinf(float(g_max)) and pos - int(p_hi[slot]) > float(g_max):
+            current_segment[slot] += 1
+            segment_count += 1
+            n_eff[slot] *= float(gamma)
+
+        n_eff_pre = float(n_eff[slot])
+        n_eff[slot] = n_eff_pre + 1.0
+        if n_eff_pre == 0.0:
+            centroids[slot] = x
+        else:
+            centroids[slot] = (n_eff_pre * centroids[slot] + x) / float(n_eff[slot])
+        n_total[slot] += 1
+        p_hi[slot] = pos
+        members[slot].append(int(pos))
+        cluster_ids[pos] = int(slot)
+        segment_ids[pos] = int(current_segment[slot])
+        route_events.append((ROUTE_EVENT_APPEND, int(pos), int(slot), int(current_segment[slot])))
+
+    def ward_merge_only() -> int:
+        nonlocal ward_merge_count
+        active = np.flatnonzero(alive)
+        if active.size < 2:
+            raise AssertionError("K_max>=2 Ward merge requires at least two alive clusters")
+
+        best_pair: tuple[int, int] | None = None
+        best_cost: float | None = None
+        for i, a_raw in enumerate(active[:-1]):
+            a = int(a_raw)
+            for b_raw in active[i + 1 :]:
+                b = int(b_raw)
+                na = float(n_total[a])
+                nb = float(n_total[b])
+                if na <= 0.0 or nb <= 0.0:
+                    raise AssertionError(f"alive Ward candidate has non-positive n_total: {a}={na}, {b}={nb}")
+                diff = centroids[a] - centroids[b]
+                dist2 = float(np.dot(diff, diff))
+                cost = (na * nb) / (na + nb) * dist2
+                if best_cost is None or cost < best_cost or (cost == best_cost and (a, b) < best_pair):
+                    best_cost = cost
+                    best_pair = (a, b)
+        if best_pair is None:
+            raise AssertionError("Ward candidate pool unexpectedly empty")
+
+        keep, free = best_pair
+        keep_idx = np.asarray(members[keep], dtype=np.int64)
+        free_idx = np.asarray(members[free], dtype=np.int64)
+        if keep_idx.size:
+            ward_touched_token_mask[keep_idx] = True
+        if free_idx.size:
+            ward_touched_token_mask[free_idx] = True
+            ward_merged_token_mask[free_idx] = True
+            cluster_ids[free_idx] = int(keep)
+
+        eff_sum = float(n_eff[keep] + n_eff[free])
+        if eff_sum > 0.0:
+            centroids[keep] = (float(n_eff[keep]) * centroids[keep] + float(n_eff[free]) * centroids[free]) / eff_sum
+            n_eff[keep] = eff_sum
+        n_total[keep] += n_total[free]
+        p_hi[keep] = max(int(p_hi[keep]), int(p_hi[free]))
+        current_segment[keep] = max(int(current_segment[keep]), int(current_segment[free]))
+        members[keep].extend(members[free])
+
+        alive[free] = False
+        n_eff[free] = 0.0
+        n_total[free] = 0
+        p_hi[free] = 0
+        current_segment[free] = 0
+        members[free] = []
+        ward_merge_count += 1
+        route_events.append((ROUTE_EVENT_WARD_MERGE, int(keep), int(free), -1))
+        return int(free)
+
+    for pos in range(t_total):
+        x = k[pos]
+        active = np.flatnonzero(alive)
+        if active.size == 0:
+            new_cluster_attempt_count += 1
+            allocate_new_cluster(first_free_slot(), pos, x)
+            continue
+
+        if k_max == 1:
+            # algorithm-spec.md §5.6: K_max=1 is a structural degenerate
+            # boundary, not a failed Ward merge. Semantic novelty cannot open
+            # a second cluster, so routing stays on slot 0 and only g_max can
+            # open new segments.
+            slot = int(active[0])
+            diff = centroids[slot] - x
+            if float(np.dot(diff, diff)) > float(lambda_new):
+                novelty_suppressed_count += 1
+            append_existing(slot, pos, x)
+            continue
+
+        diff = centroids[active] - x
+        d2 = np.einsum("kd,kd->k", diff, diff, optimize=True)
+        nearest_i = int(np.argmin(d2))
+        slot = int(active[nearest_i])
+        if float(d2[nearest_i]) > float(lambda_new):
+            new_cluster_attempt_count += 1
+            if int(active.size) >= int(k_max):
+                k_max_binding_count += 1
+                slot = ward_merge_only()
+            else:
+                slot = first_free_slot()
+            allocate_new_cluster(slot, pos, x)
+        else:
+            append_existing(slot, pos, x)
+
+    return RouteResult(
+        cluster_ids=cluster_ids,
+        segment_ids=segment_ids,
+        cluster_count=int(np.count_nonzero(alive)),
+        segment_count=int(segment_count),
+        cluster_sizes=[int(len(values)) for values in members],
+        k_max=int(k_max),
+        new_cluster_attempt_count=int(new_cluster_attempt_count),
+        k_max_binding_count=int(k_max_binding_count),
+        ward_merge_count=int(ward_merge_count),
+        novelty_suppressed_count=int(novelty_suppressed_count),
+        route_events=route_events,
+        ward_merged_token_mask=ward_merged_token_mask,
+        ward_touched_token_mask=ward_touched_token_mask,
     )
 
 
@@ -528,6 +795,7 @@ def route_dpmeans_segments(
 class OfflineEntry:
     members: list[int]
     pad_count: int = 0
+    order: int = field(default=0, compare=False)
 
     @property
     def is_pad_only(self) -> bool:
@@ -535,7 +803,11 @@ class OfflineEntry:
 
 
 def _merge_entries(a: OfflineEntry, b: OfflineEntry) -> OfflineEntry:
-    return OfflineEntry(members=a.members + b.members, pad_count=a.pad_count + b.pad_count)
+    return OfflineEntry(
+        members=a.members + b.members,
+        pad_count=a.pad_count + b.pad_count,
+        order=min(int(a.order), int(b.order)),
+    )
 
 
 def _append_entry(levels: list[list[OfflineEntry]], entry: OfflineEntry, b_prime: int) -> None:
@@ -580,6 +852,150 @@ def _append_entry(levels: list[list[OfflineEntry]], entry: OfflineEntry, b_prime
         level += 1
 
 
+def _flatten_ladders(ladders: dict[int, list[list[OfflineEntry]]], *, pad_entries: int) -> tuple[list[OfflineEntry], dict[str, Any]]:
+    entries: list[OfflineEntry] = []
+    level_counts: dict[int, int] = {}
+    for levels in ladders.values():
+        for level, level_entries in enumerate(levels):
+            level_counts[level] = level_counts.get(level, 0) + len(level_entries)
+            entries.extend(level_entries)
+
+    meta = {
+        "entry_count": len(entries),
+        "real_entry_count": sum(1 for e in entries if e.members),
+        "pad_entry_count": int(pad_entries),
+        "level_counts": {str(k): int(v) for k, v in sorted(level_counts.items())},
+    }
+    return entries, meta
+
+
+def _ward_resident_and_ejected(
+    incoming: list[OfflineEntry],
+    *,
+    b_prime: int,
+) -> tuple[list[OfflineEntry], list[OfflineEntry]]:
+    """One Ward ladder level fold from algorithm-spec.md §5.12.
+
+    Ward can inject a non-``B'``-wide carry into a level. The offline probe keeps
+    the same invariant as the spec's ``carry_into_level`` helper: while the
+    current level would exceed capacity, compact the oldest two entries into one
+    ejected entry for the next level; leave the remaining newest entries resident
+    here. This is intentionally separate from ``_append_entry``'s vanilla
+    binary-counter carry, whose incoming block shape is always exactly ``B'``.
+    """
+
+    resident = list(incoming)
+    ejected: list[OfflineEntry] = []
+    while len(resident) > int(b_prime):
+        ejected.append(_merge_entries(resident[0], resident[1]))
+        resident = resident[2:]
+    return resident, ejected
+
+
+def _merge_ladders_for_ward(
+    keep_levels: list[list[OfflineEntry]],
+    free_levels: list[list[OfflineEntry]],
+    *,
+    b_prime: int,
+) -> None:
+    keep_snapshot = [list(level) for level in keep_levels]
+    free_snapshot = [list(level) for level in free_levels]
+    merged_levels: list[list[OfflineEntry]] = []
+    ejected: list[OfflineEntry] = []
+    level = 0
+    max_level_count = max(len(keep_snapshot), len(free_snapshot))
+    while level < max_level_count or ejected:
+        native: list[OfflineEntry] = []
+        if level < len(keep_snapshot):
+            native.extend(keep_snapshot[level])
+        if level < len(free_snapshot):
+            native.extend(free_snapshot[level])
+        # native and ejected are each individually sorted by .order (native by
+        # the explicit sort below; ejected because _ward_resident_and_ejected
+        # only ever folds the front of an already-sorted list, so the merged
+        # entries it appends come out in non-decreasing order -- see that
+        # function's docstring). But keep and free grew as two *independent*
+        # ladders before this merge, so keep's/free's own native content at
+        # this level is not guaranteed to be chronologically newer than
+        # whatever just cascaded up from the level below in *this* merge --
+        # e.g. an active cluster's level-1 entry can easily be newer (larger
+        # .order) than a quiet cluster's level-0 entry that only now got
+        # folded into `ejected`. A plain `native + ejected` concatenation
+        # would silently leave the list out of order, so
+        # _ward_resident_and_ejected's "fold the front two" rule could compact
+        # two chronologically-distant entries together while a genuinely
+        # older entry sits unmerged right next to them -- inflating entry
+        # spans and E[M] for no reason. Merging both sorted lists together
+        # (not just sorting native alone) is required for "fold the oldest
+        # pair first" to actually hold once two independently-grown ladders
+        # combine, not just within a single native block.
+        native.sort(key=lambda entry: int(entry.order))
+        combined = sorted(native + ejected, key=lambda entry: int(entry.order))
+        resident, ejected = _ward_resident_and_ejected(combined, b_prime=b_prime)
+        merged_levels.append(resident)
+        level += 1
+
+    keep_levels[:] = merged_levels if merged_levels else [[]]
+
+
+def _simulate_route_event_ladders(
+    route: RouteResult,
+    *,
+    b_prime: int,
+    l_block: int,
+) -> tuple[list[OfflineEntry], dict[str, Any]]:
+    align = 1 << int(l_block)
+    ladders: dict[int, list[list[OfflineEntry]]] = {}
+    active_segment: dict[int, int] = {}
+    logical_count: dict[int, int] = {}
+    pad_entries = 0
+    order_counter = 0
+
+    for kind, a, b, c in route.route_events or []:
+        if int(kind) == ROUTE_EVENT_WARD_MERGE:
+            keep = int(a)
+            free = int(b)
+            keep_levels = ladders.setdefault(keep, [[]])
+            free_levels = ladders.get(free, [[]])
+            _merge_ladders_for_ward(keep_levels, free_levels, b_prime=b_prime)
+            if free in ladders:
+                del ladders[free]
+            active_segment[keep] = max(int(active_segment.get(keep, 0)), int(active_segment.get(free, 0)))
+            logical_count[keep] = len(keep_levels[0]) if keep_levels else 0
+            active_segment.pop(free, None)
+            logical_count.pop(free, None)
+            continue
+
+        if int(kind) != ROUTE_EVENT_APPEND:
+            raise ValueError(f"unknown route event kind {kind!r}")
+
+        pos = int(a)
+        cluster = int(b)
+        segment = int(c)
+        if cluster not in ladders:
+            ladders[cluster] = [[]]
+            active_segment[cluster] = segment
+            logical_count[cluster] = 0
+        elif segment != active_segment[cluster]:
+            count = (-logical_count[cluster]) % align
+            for _ in range(count):
+                _append_entry(
+                    ladders[cluster],
+                    OfflineEntry(members=[], pad_count=1, order=order_counter),
+                    b_prime,
+                )
+                order_counter += 1
+                pad_entries += 1
+                logical_count[cluster] += 1
+            active_segment[cluster] = segment
+
+        _append_entry(ladders[cluster], OfflineEntry(members=[pos], order=order_counter), b_prime)
+        order_counter += 1
+        logical_count[cluster] += 1
+
+    return _flatten_ladders(ladders, pad_entries=pad_entries)
+
+
 def simulate_segment_ladders(
     route: RouteResult,
     *,
@@ -590,12 +1006,15 @@ def simulate_segment_ladders(
         raise ValueError(f"b_prime must be a positive even integer, got {b_prime}")
     if l_block < 0:
         raise ValueError(f"l_block must be non-negative, got {l_block}")
+    if route.route_events:
+        return _simulate_route_event_ladders(route, b_prime=b_prime, l_block=l_block)
     align = 1 << int(l_block)
 
     ladders: dict[int, list[list[OfflineEntry]]] = {}
     active_segment: dict[int, int] = {}
     logical_count: dict[int, int] = {}
     pad_entries = 0
+    order_counter = 0
 
     for pos, (cluster, segment) in enumerate(zip(route.cluster_ids.tolist(), route.segment_ids.tolist())):
         cluster = int(cluster)
@@ -607,27 +1026,20 @@ def simulate_segment_ladders(
         elif segment != active_segment[cluster]:
             count = (-logical_count[cluster]) % align
             for _ in range(count):
-                _append_entry(ladders[cluster], OfflineEntry(members=[], pad_count=1), b_prime)
+                _append_entry(
+                    ladders[cluster],
+                    OfflineEntry(members=[], pad_count=1, order=order_counter),
+                    b_prime,
+                )
+                order_counter += 1
                 pad_entries += 1
                 logical_count[cluster] += 1
             active_segment[cluster] = segment
-        _append_entry(ladders[cluster], OfflineEntry(members=[pos]), b_prime)
+        _append_entry(ladders[cluster], OfflineEntry(members=[pos], order=order_counter), b_prime)
+        order_counter += 1
         logical_count[cluster] += 1
 
-    entries: list[OfflineEntry] = []
-    level_counts: dict[int, int] = {}
-    for levels in ladders.values():
-        for level, level_entries in enumerate(levels):
-            level_counts[level] = level_counts.get(level, 0) + len(level_entries)
-            entries.extend(level_entries)
-
-    meta = {
-        "entry_count": len(entries),
-        "real_entry_count": sum(1 for e in entries if e.members),
-        "pad_entry_count": pad_entries,
-        "level_counts": {str(k): int(v) for k, v in sorted(level_counts.items())},
-    }
-    return entries, meta
+    return _flatten_ladders(ladders, pad_entries=pad_entries)
 
 
 def summarize_entries(k_raw: np.ndarray, v: np.ndarray | None, entries: list[OfflineEntry]) -> dict[str, Any]:

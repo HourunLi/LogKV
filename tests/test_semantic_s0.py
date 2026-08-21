@@ -6,10 +6,12 @@ import torch
 
 from litgpt.log_kv_cache import LogStructuredKVCache
 from litgpt.semantic_s0 import (
+    OfflineEntry,
     RouteResult,
     RunningKeyScale,
     Stage0DumpRecorder,
     SweepAccumulator,
+    _merge_ladders_for_ward,
     route_dpmeans_segments,
     route_single_cluster_bprime_ladder,
     simulate_segment_ladders,
@@ -75,6 +77,35 @@ def test_route_dpmeans_accepts_boundary_g_max_values() -> None:
     k = np.asarray([[0.0], [0.1]], dtype=np.float32)
     route_dpmeans_segments(k, lambda_new=1.0, g_max=0.0, gamma=0.5)
     route_dpmeans_segments(k, lambda_new=1.0, g_max=math.inf, gamma=0.5)
+
+
+def test_route_dpmeans_kmax_triggers_ward_before_new_cluster() -> None:
+    k = np.asarray([[0.0], [10.0], [20.0]], dtype=np.float32)
+
+    route = route_dpmeans_segments(k, lambda_new=1.0, g_max=math.inf, gamma=0.5, k_max=2)
+
+    assert route.cluster_count == 2
+    assert route.cluster_ids.tolist() == [0, 0, 1]
+    assert route.cluster_sizes == [2, 1]
+    assert route.new_cluster_attempt_count == 3
+    assert route.k_max_binding_count == 1
+    assert route.ward_merge_count == 1
+    assert route.k_max_binding_rate == pytest.approx(1 / 3)
+    assert route.ward_merged_token_mask.tolist() == [False, True, False]
+    assert route.ward_touched_token_mask.tolist() == [True, True, False]
+
+
+def test_route_dpmeans_kmax_one_is_single_cluster_degenerate_boundary() -> None:
+    k = np.asarray([[0.0], [10.0], [20.0]], dtype=np.float32)
+
+    route = route_dpmeans_segments(k, lambda_new=1.0, g_max=math.inf, gamma=0.5, k_max=1)
+
+    assert route.cluster_count == 1
+    assert route.cluster_ids.tolist() == [0, 0, 0]
+    assert route.cluster_sizes == [3]
+    assert route.ward_merge_count == 0
+    assert route.k_max_binding_count == 0
+    assert route.novelty_suppressed_count == 2
 
 
 def test_route_single_cluster_bprime_ladder_is_one_sequential_cluster() -> None:
@@ -353,6 +384,55 @@ def test_l_block_padding_blocks_low_level_cross_segment_merge() -> None:
     assert not any(4 in entry.members and 5 in entry.members for entry in entries_blocked)
     assert meta_blocked["pad_entry_count"] == 1
     assert summary_blocked["token_weighted_key_var"] < summary_unblocked["token_weighted_key_var"]
+
+
+def test_kmax_ward_ladder_replay_uses_online_merge_events_not_final_labels() -> None:
+    k = (np.arange(9, dtype=np.float32) * 10.0).reshape(-1, 1)
+    route = route_dpmeans_segments(k, lambda_new=1.0, g_max=math.inf, gamma=0.5, k_max=2)
+
+    event_entries, event_meta = simulate_segment_ladders(route, b_prime=4, l_block=0)
+    final_label_route = RouteResult(
+        cluster_ids=route.cluster_ids.copy(),
+        segment_ids=route.segment_ids.copy(),
+        cluster_count=route.cluster_count,
+        segment_count=route.segment_count,
+        cluster_sizes=route.cluster_sizes,
+    )
+    static_entries, static_meta = simulate_segment_ladders(final_label_route, b_prime=4, l_block=0)
+
+    assert sorted(pos for entry in event_entries for pos in entry.members) == list(range(9))
+    assert event_meta["entry_count"] == 7
+    assert event_meta["entry_count"] != static_meta["entry_count"]
+    assert sorted(entry.members for entry in event_entries) != sorted(entry.members for entry in static_entries)
+
+
+def test_merge_ladders_for_ward_keeps_each_level_order_sorted() -> None:
+    # Regression test for a real bug: keep and free grow as two *independent*
+    # ladders before a Ward merge, so keep's own pre-existing content at some
+    # level is not guaranteed to be chronologically newer than whatever just
+    # cascaded up from the level below *in this merge* -- e.g. an active
+    # cluster's level-1 entry (order=900) can be newer than a quiet cluster's
+    # level-0 entry (order=5) that only now got folded into `ejected` on its
+    # way up. Concatenating native (sorted) with ejected (also individually
+    # sorted, but not merged back in) without a final sort would leave a
+    # level's resident list out of order and let two chronologically-distant
+    # entries get compacted together while a genuinely older entry sits
+    # unmerged right next to them -- inflating entry spans/E[M] for no reason.
+    keep_levels: list[list[OfflineEntry]] = [
+        [OfflineEntry(members=[950], order=950), OfflineEntry(members=[951], order=951)],
+        [OfflineEntry(members=[900], order=900)],
+    ]
+    free_levels: list[list[OfflineEntry]] = [
+        [OfflineEntry(members=[5], order=5)],
+    ]
+
+    _merge_ladders_for_ward(keep_levels, free_levels, b_prime=2)
+
+    for level_entries in keep_levels:
+        orders = [entry.order for entry in level_entries]
+        assert orders == sorted(orders)
+    all_members = sorted(pos for level in keep_levels for entry in level for pos in entry.members)
+    assert all_members == [5, 900, 950, 951]
 
 
 def test_running_key_scale_matches_global_variance() -> None:
