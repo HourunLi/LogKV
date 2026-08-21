@@ -384,6 +384,17 @@ def vanilla_logkv_full_cache_entries(
     fields; ``entry_count``/``coverage_token_count`` are overwritten to
     reflect the full (compressed + recent) picture rather than the
     compressed-only one.
+
+    ``level_counts`` is renamed to ``compressed_level_counts`` in the
+    returned meta (rather than carried over under its original key): it only
+    ever describes the compressed-prefix ladder levels (from the inherited
+    ``vanilla_logkv_compressed_entries`` meta) and never included the
+    appended recent-window entries, so ``sum(compressed_level_counts.values())
+    == compressed_entry_count``, not ``entry_count`` -- leaving it named
+    ``level_counts`` next to a full-cache ``entry_count`` invites slicing
+    ``full_entries`` by it as if it covered every returned entry, which it
+    does not (see ``test_vanilla_logkv_full_cache_entries_level_counts_only_
+    covers_compressed_prefix`` in tests/test_semantic_s0.py).
     """
     entries, meta = vanilla_logkv_compressed_entries(token_count, b=b, recent_size=recent_size)
     recent_start = meta["compactable_token_count"]
@@ -392,6 +403,7 @@ def vanilla_logkv_full_cache_entries(
         full_entries.append(OfflineEntry(members=[pos]))
 
     full_meta = dict(meta)
+    full_meta["compressed_level_counts"] = full_meta.pop("level_counts")
     full_meta.update(
         {
             "compressed_entry_count": len(entries),
@@ -728,7 +740,44 @@ class SweepAccumulator:
     ``entry_spans``) into ``entry_width_global_*``/``entry_span_global_*``,
     which are quantiles/max over that flat, entry-level pool and do not
     dilute outliers the way the per-sample-mean fields do.
+
+    ``{key}_mean`` (for ``key`` in ``_META_MEAN_KEYS`` --
+    ``compactable_token_count``, ``recent_count``, ``coverage_token_count``,
+    ``compressed_entry_count``, ``recent_entry_count``) and
+    ``covered_token_fraction`` surface the ``vanilla_logkv_compressed_
+    entries``/``vanilla_logkv_full_cache_entries`` meta fields that ``add()``
+    would otherwise silently drop. Without these, the sweep script's JSON
+    output can only *say* in a free-text note that the compressed-prefix
+    baseline reports 0 entries whenever ``token_count <= recent_size``, or
+    that the full-cache baseline covers every token -- a reader has no field
+    in the row itself to check either claim against. ``add()`` only
+    populates a given ``{key}_mean`` when ``ladder_meta`` actually contains
+    that key: ``simulate_segment_ladders``'s meta (used by the semantic
+    sweep cells and the single-cluster-b'-budget baseline) has none of them,
+    since every token there always lands in some entry, so these fields are
+    simply absent (not zero) from accumulators that never saw them.
+    ``covered_token_fraction`` is ``coverage_token_sum /
+    coverage_source_token_sum``, where both are accumulated *only* from
+    ``add()`` calls that actually supplied ``coverage_token_count`` in
+    ``ladder_meta`` (``coverage_source_token_sum`` adds that call's
+    ``sum(route.cluster_sizes)``, not every call's -- a call whose
+    ``ladder_meta`` never carried coverage info contributes to neither sum,
+    so it cannot dilute the fraction). It should read close to 1.0 for
+    ``vanilla_logkv_full_cache_baseline`` (every token is represented, by
+    construction) and well below 1.0 for
+    ``vanilla_logkv_compressed_prefix_baseline`` whenever ``token_count`` is
+    not much larger than ``recent_size`` (the exact recent window is not
+    represented there at all -- see ``vanilla_logkv_compressed_entries``'s
+    docstring).
     """
+
+    _META_MEAN_KEYS = (
+        "compactable_token_count",
+        "recent_count",
+        "coverage_token_count",
+        "compressed_entry_count",
+        "recent_entry_count",
+    )
 
     def __init__(self) -> None:
         self.sample_groups = 0
@@ -750,6 +799,10 @@ class SweepAccumulator:
         self.vh_sources: set[str] = set()
         self.value_var_available: bool = True
         self.value_var_relative_available: bool = True
+        self.meta_sums: dict[str, float] = {k: 0.0 for k in self._META_MEAN_KEYS}
+        self.meta_counts: dict[str, int] = {k: 0 for k in self._META_MEAN_KEYS}
+        self.coverage_source_token_sum: float = 0.0
+        self.coverage_token_sum: float = 0.0
 
     def add(
         self,
@@ -788,9 +841,33 @@ class SweepAccumulator:
         self.all_spans.extend(summary.get("entry_spans", []))
         self.sh_sources.add(sh_source)
 
+        # coverage/recent meta (only present on vanilla_logkv_compressed_
+        # entries/vanilla_logkv_full_cache_entries's ladder_meta -- see the
+        # class docstring's _META_MEAN_KEYS paragraph for why absence here is
+        # not treated as zero).
+        for key in self._META_MEAN_KEYS:
+            if key in ladder_meta:
+                self.meta_sums[key] += float(ladder_meta[key])
+                self.meta_counts[key] += 1
+        if "coverage_token_count" in ladder_meta:
+            self.coverage_token_sum += float(ladder_meta["coverage_token_count"])
+            # Denominator kept in lockstep with the numerator: only accumulate
+            # a call's source-token count here when that same call actually
+            # supplied coverage_token_count. The current sweep script never
+            # mixes coverage-bearing and coverage-less add() calls within one
+            # accumulator (each of the three baseline/sweep-cell accumulators
+            # is fed a single, consistent ladder_meta shape throughout), so
+            # this is presently equivalent to summing route.cluster_sizes
+            # unconditionally -- but SweepAccumulator's contract does not
+            # promise callers won't mix the two, and doing so with an
+            # unconditional denominator would silently fold in source tokens
+            # from samples whose coverage was never measured, understating
+            # covered_token_fraction.
+            self.coverage_source_token_sum += float(sum(route.cluster_sizes))
+
     def finalize(self) -> dict[str, Any]:
         denom = max(self.sample_groups, 1)
-        return {
+        out = {
             "sample_groups": int(self.sample_groups),
             "cluster_count_mean": self.cluster_count_sum / denom,
             "segment_count_mean": self.segment_count_sum / denom,
@@ -839,6 +916,23 @@ class SweepAccumulator:
             "sh_source": sorted(self.sh_sources),
             "vh_source": sorted(self.vh_sources) if self.value_var_relative_available else [],
         }
+        # Coverage/recent meta -- absent (not defaulted to 0) for accumulators
+        # whose ladder_meta never carried a given key (e.g. the semantic sweep
+        # cells and the single-cluster-b'-budget baseline, whose entries always
+        # cover 100% of their input tokens by construction) -- see the class
+        # docstring's _META_MEAN_KEYS paragraph.
+        for key in self._META_MEAN_KEYS:
+            if self.meta_counts[key]:
+                out[f"{key}_mean"] = self.meta_sums[key] / self.meta_counts[key]
+        # Gated on whether any sample supplied coverage_token_count at all, not
+        # on coverage_token_sum > 0: a baseline where every sample has
+        # token_count <= recent_size genuinely covers 0 tokens (nothing has
+        # been compacted yet, per vanilla_logkv_compressed_entries's
+        # docstring) -- that 0.0 is a real, reportable measurement, not a
+        # "not computed" sentinel, so it must not be suppressed here.
+        if self.meta_counts["coverage_token_count"] and self.coverage_source_token_sum > 0:
+            out["covered_token_fraction"] = self.coverage_token_sum / self.coverage_source_token_sum
+        return out
 
 
 def load_manifest(path: str | Path) -> dict[str, Any]:

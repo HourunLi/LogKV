@@ -226,13 +226,12 @@ M = len(anchors)
 for p in anchors:
     slot_k = apply_rope(k_raw_mean, p)
     slot_v = v_mean
-    slot_mass = w / M
 ```
 
 实际打分：
 
 ```
-score_{s,a} = scale · (q · apply_rope(k_raw_s, p_a)) + λ · log(w_s / M_s)
+score_{s,a} = scale · (q · apply_rope(k_raw_s, p_a)) + λ · log(w_s) − log(M_s)
 value_{s,a} = v_s
 ```
 
@@ -245,22 +244,26 @@ value_{s,a} = v_s
 - `k_raw_s` 是 pre-RoPE 内容均值；
 - `value` 不随 anchor 改变。
 
-### P5.2 为什么必须除以 `M`
+### P5.2 为什么必须减去 `log(M)`，而且不能挂在 `λ` 门控之内
 
-如果一个 entry 展开成 3 个 slot，而每个 slot 都用 `log(w)`，softmax 里的总质量会被
-静默放大约 3 倍：
+如果一个 entry 展开成 3 个 slot，而每个 slot 都用 `λ·log(w)`、不做任何抵消，
+softmax 里该 entry 实际拿到的质量会被放大 `M^{1-λ}` 倍（`λ=1` 时这个因子恰好是 1，
+不容易被发现；`λ=0` 是最坏情形，退化成整整 `M` 倍——大跨度 entry 因为锚点多，白拿
+额外注意力质量，且这个膨胀量和内容/权重完全无关，纯粹是"被拆成几个虚拟槽"这个存储
+细节的副产品）。
+
+早期版本把修正写成 `λ·log(w/M)`（等价于 `λ·log(w) − λ·log(M)`），这只在 `λ=1`
+时才精确抵消，`λ` 一旦不是 1（尤其 `λ=0` 消融档，`experiments.md` §7 计划扫）
+`M` 就会重新泄漏进总质量。正确写法是把抵消项挪到 `λ` 的门控**之外**：
 
 ```
-3 · w · exp(score)
+λ · log(w) − log(M)
 ```
 
-所以每个虚拟 slot 的 mass bias 必须是：
-
-```
-log(w / M)
-```
-
-这不是调参项，而是正确性修正。否则大跨度 entry 因为锚点多，反而获得额外注意力质量。
+`λ` 只控制原始 `log(w)` 那部分（继承自 vanilla LogKV 的 mass bias，可以整体关掉），
+`−log(M)` 永远无条件生效，只负责抵消锚点展开本身造成的候选膨胀。这样
+`Σ_a exp(λ·log(w) − log(M)) = w^λ`，对**任意** `λ` 精确成立，不只是 `λ=1`。
+这不是调参项，而是正确性修正。
 
 ### P5.3 读出伪代码
 
@@ -280,7 +283,7 @@ def materialize_entry(entry):
         slots.append({
             "k": apply_rope(entry.k_raw_mean, p),
             "v": entry.v_mean,
-            "bias": lambda_mass * log(entry.w / M),
+            "bias": lambda_mass * log(entry.w) - log(M),
         })
     return slots
 ```
@@ -347,8 +350,8 @@ segment 不直接出现在 attention 中；它通过影响 ladder 的合并边�
 `ℓ_block` 表示 segment 边界保护到第几层：
 
 ```
-保护到第 ℓ 层 => 新 segment 开始前，把 level 0 当前占用数对齐到 2^ℓ 的倍数
-count = (-level_count[cluster, 0]) mod 2^ℓ_block
+保护到第 ℓ 层 => 新 segment 开始前，把 level 0 逻辑插入流的相位对齐到 2^ℓ 的倍数
+count = (-level0_phase[cluster]) mod 2^ℓ_block
 ```
 
 `count` 个 `w=0` pad 只插入 level 0，然后靠普通 binary carry 自然上升。
@@ -356,12 +359,23 @@ count = (-level_count[cluster, 0]) mod 2^ℓ_block
 > **不能用 `n_total_c`（该簇累计的真实 token 数）算这个余数**——`n_total_c` 只数
 > 真实 token，不含已经插入过的 pad，而这里要对齐的是 level 0 上"真实 token + pad
 > 混合而成的插入流"，两者从第一次填充起就会分叉（具体反例见
-> [`algorithm-spec.md`](algorithm-spec.md) §5.11 的更正框）。正确的量是
-> `level_count[cluster, 0]`——该簇 level 0 **当前**的真实占用数，本来就是
-> `_binary_carry` 要维护的既有状态，不需要新增计数器：只要 `B′` 是 `2^ℓ_block`
-> 的倍数（默认配置天然满足），"当前占用数 mod `2^ℓ_block`"和"累积逻辑插入数 mod
-> `2^ℓ_block`"全程相等，且这个量在 Ward 合并之后自动保持正确（合并过程本就会
-> 重写 `level_count`）。这里只复述结论，`algorithm-spec.md` 才是权威定义，两处
+> [`algorithm-spec.md`](algorithm-spec.md) §5.11 的更正框）。
+>
+> **也不能用 `level_count[cluster, 0]`（该簇 level 0 当前的真实占用数）**——
+> 早期版本这样做过，在"level 满 `B′` 个后一次性清空/重置"这个进位模型下是对
+> 的；但 `algorithm-spec.md` §5.12 把逐 token 进位精确定义成"每次溢出只合并
+> 最老的两个、留下 `B′-1` 个 + 新到的 1 个"之后，`level_count` 只在 `B′-1`/
+> `B′` 两个值之间永久振荡，不再遍历 `mod 2^ℓ_block` 的全部剩余类，这条等价
+> 关系随之失效（具体反例同样见 `algorithm-spec.md` §5.11 的更正框）。
+>
+> **正确的量是独立的持久相位计数器 `level0_phase[cluster]`**——不依赖
+> `level_count` 如何振荡、不依赖 `B′` 与 `2^ℓ_block` 的整除关系，只是老实地
+> 数"该簇 level 0 逻辑插入流（真实 token + pad 混合计数）目前的相位"：每插入
+> 1 个 entry（不论真实还是 pad）就 `+1 mod 2^ℓ_block`；新段事件（`NEW_
+> CLUSTER`/`NEW_SEGMENT`）落地后重置为 `1 % 2^ℓ_block`，不是"先 pad 归零、
+> 再套用逐 token 的 `+1` 公式"——这两条规则共享同一个 `prev_mod`/`count`
+> 输入但不是同一条公式，混用会在 pad 之后把相位算大（`algorithm-spec.md`
+> §5.11 有具体反例）。这里只复述结论，`algorithm-spec.md` 才是权威定义，两处
 > 一旦不一致，以那边为准。
 
 ### P7.2 保护不是永久隔离
@@ -434,16 +448,17 @@ count = (-level_count[cluster, 0]) mod 2^ℓ_block
 保留合法 RoPE 坐标，只学习每个 anchor 的额外 logit bias：
 
 ```
-score_{s,a} = q · R(p_a)k_s + λ log(w_s / M_s) + b_a(entry_stats)
+score_{s,a} = q · R(p_a)k_s + λ log(w_s) − log(M_s) + b_a(entry_stats)
 ```
 
-**`/M_s` 不能丢**——P5.2 已经证明这不是调参项，是正确性修正：一个 entry
-展开成 `M_s` 个 anchor 时若每个都用 `log(w_s)`，softmax 里的总质量会被
-静默放大约 `M_s` 倍。`b_a(entry_stats)` 是在这个已经修正过的 mass bias
-之上**额外**学到的一项 logit 偏置，不是用来替代 `/M_s` 的——两者共存，
-`b_a` 学的是"这个 anchor 除了计数质量之外还应该多一点/少一点可信度"，
-不应该、也学不出"除以 `M_s`"这件事本身（`b_a` 只吃 `entry_stats`，不
-知道其它 anchor 的存在，没有信息量去推导一个跨 anchor 的归一化项）。
+**`− log(M_s)` 不能丢，且不能挂在 `λ` 门控之内**——P5.2 已经证明这不是调参项，
+是正确性修正：一个 entry 展开成 `M_s` 个 anchor 时若每个都用 `λ·log(w_s)`、不做
+任何抵消，softmax 里的总质量会被放大 `M_s^{1-λ}` 倍（`λ=0` 时退化成整整 `M_s`
+倍）。`b_a(entry_stats)` 是在这个已经修正过的 mass bias 之上**额外**学到的一项
+logit 偏置，不是用来替代 `− log(M_s)` 的——两者共存，`b_a` 学的是"这个 anchor
+除了计数质量之外还应该多一点/少一点可信度"，不应该、也学不出"减去 `log(M_s)`"
+这件事本身（`b_a` 只吃 `entry_stats`，不知道其它 anchor 的存在，没有信息量去
+推导一个跨 anchor 的归一化项）。
 
 这最安全，因为 key 仍在模型熟悉的 RoPE 坐标上。
 
@@ -591,7 +606,8 @@ learned bias over fixed anchors
 2. `p_lo/p_hi/sum_wp` 必须随 entry 走 ladder 合并，不能只存在 cluster 级。
 3. `p_mid` 只在读出时算，不要在 compact 时逐层舍入。
 4. `dedup_anchors` 必须先过滤 `w=0` pad/dead entry，再处理 `[lo, mid, hi]` 内部去重。
-5. `log(w/M)` 是必须项，不是可选优化。
+5. `λ·log(w) − log(M)` 是必须项，不是可选优化——`−log(M)` 必须挂在 `λ` 的
+   门控之外无条件生效，不能挂在 `λ` 门控之内（P5.2）。
 6. 二阶统计里的 key-space 方向要跟 anchor 一起 RoPE，value-space 方向不 RoPE。
 7. `segment` 不进入 attention，只影响低层 compact 边界。
 8. learned position 如果使用连续位置，不能走离散 `cos_cache[p]`；需要直接按频率算
@@ -603,7 +619,7 @@ learned bias over fixed anchors
 
 - v1 采用 `p_lo/p_mid/p_hi` 三锚点读出。
 - entry 持久存储不复制成 3 份；只在 attention 读出时虚拟展开。
-- mass bias 用 `log(w/M)`。
+- mass bias 用 `λ·log(w) − log(M)`，`−log(M)` 不受 `λ` 门控。
 - segment 只通过 padding/`ℓ_block` 保护低层合并，不拥有独立 ladder。
 - learned cluster-level position 不进 v1 主线。
 

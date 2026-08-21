@@ -108,6 +108,44 @@ def test_layer_filter_reaggregates_from_by_layer_group_not_overall_rows() -> Non
     assert by_config[("inf", 0)]["token_weighted_key_var_relative"] == 0.50
 
 
+def test_auto_baseline_does_not_fall_back_to_position_or_single_cluster() -> None:
+    # position_baseline_by_layer_group is the old field name that used to *be*
+    # misread as "the vanilla baseline" before it was renamed to make clear it
+    # is a same-B'-budget position-order CONTROL, not the deployed LogKV (see
+    # BASELINE_KEYS["single_cluster"]'s backward-compat entry). --baseline
+    # auto (the default) must never silently resolve to it, or to
+    # single_cluster_bprime_baseline_by_layer_group, when no real vanilla
+    # field is present -- doing so would produce ratio numbers that read as
+    # "vs. deployed LogKV" while actually comparing against a control.
+    payload = _payload()
+    del payload["vanilla_logkv_compressed_prefix_baseline_by_layer_group"]
+    payload["position_baseline_by_layer_group"] = [_baseline(0, 0), _baseline(1, 0)]
+    payload["single_cluster_bprime_baseline_by_layer_group"] = [_baseline(0, 0), _baseline(1, 0)]
+
+    analysis = build_analysis(payload, baseline="auto")
+
+    assert analysis["baseline"]["field"] is None
+    assert analysis["baseline"]["row_count"] == 0
+    assert analysis["baseline_comparison"] == []
+    assert any("no matching baseline rows were found" in warning for warning in analysis["warnings"])
+
+
+def test_explicit_position_baseline_still_resolves_when_requested() -> None:
+    # The old position_baseline_by_layer_group field is still usable, but only
+    # when a caller explicitly opts into the position-order control via
+    # --baseline position (or single_cluster) rather than getting it for free
+    # under auto.
+    payload = _payload()
+    del payload["vanilla_logkv_compressed_prefix_baseline_by_layer_group"]
+    payload["position_baseline_by_layer_group"] = [_baseline(0, 0), _baseline(1, 0)]
+
+    analysis = build_analysis(payload, baseline="position")
+
+    assert analysis["baseline"]["field"] == "position_baseline_by_layer_group"
+    assert analysis["baseline"]["row_count"] == 2
+    assert analysis["baseline_comparison"] != []
+
+
 def test_worst_layer_groups_sort_by_largest_key_ratio() -> None:
     payload = _payload()
     rows = _worst_layer_groups(

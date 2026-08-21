@@ -67,15 +67,15 @@ cache（每 layer 一个）
 | `L_alloc` | 每簇 ladder 的层数，按均衡界推导（§5.12）。**纯推导量，无 CLI 开关**；覆盖 `K_max` 时必须连带重算，否则预算算术失效 |
 | `L_max` | "单簇独吞整条序列"所需层数。只用于说明超配，不用于定尺 |
 | `ℓ` | 层索引 |
-| `ℓ_block` | 段对齐保护到第几层。代价 `2^ℓ_block − 1` 槽/边界，**指数增长，只能取 1~2**；生产路径构造时硬校验 `ℓ_block ∈ {0,1,2}`，Stage 0 的离线扫描（不经过 `op_log`/真实 cache）不受此约束（§5.21-2）|
+| `ℓ_block` | 段对齐保护到第几层。`0` 是合法的"关闭段边界保护"消融档（零代价，`2^0-1=0`）；需要非退化保护时代价是 `2^ℓ_block − 1` 槽/边界，**指数增长，只能取 1~2**；生产路径构造时硬校验 `ℓ_block ∈ {0,1,2}`（`0` 在内），Stage 0 的离线扫描（不经过 `op_log`/真实 cache）不受此约束（§5.21-2，§5.11 更正框）|
 | `n_eff` | 簇 `c` 的 centroid 混合权重，**`γ` 衰减，浮点**。只喂 §5.5 的在线均值更新，不进 Ward 代价 |
-| `n_total` | 簇 `c` 的真实物理规模（token/entry 数，**不含 pad**），**单调不减，从不衰减，整数**。Ward 合并代价（§5.6）和 §5.8 的 O(log n) 空间界都用这个，不能用 `n_eff`——早期版本只有一个 `n_c` 两处混用，会让 Ward 把"历史长但被衰减过"的簇误判成小簇（§5.5/§5.6 更正框）。**`§5.11` 的 `PAD_INSERT` 对齐也不能用它**（会在第一次填充后算错），但那处直接复用 `level_count[cluster,0]`，不是再拆一个新计数器（§5.11 更正框）|
+| `n_total` | 簇 `c` 的真实物理规模（token/entry 数，**不含 pad**），**单调不减，从不衰减，整数**。Ward 合并代价（§5.6）和 §5.8 的 O(log n) 空间界都用这个，不能用 `n_eff`——早期版本只有一个 `n_c` 两处混用，会让 Ward 把"历史长但被衰减过"的簇误判成小簇（§5.5/§5.6 更正框）。**`§5.11` 的 `PAD_INSERT` 对齐也不能用它**（会在第一次填充后算错），改用独立的持久相位计数器 `level0_phase`——**不是**复用 `level_count[cluster,0]`：两者一度被认为等价，但 `carry_into_level`（§5.12）精确定义后这个等价性不再成立，见 §5.11 更正框 |
 
 ## T4. 算法参数（当前有效）
 
 | 符号 | 参数名 | 含义 |
 |---|---|---|
-| `λ` | `log_kv_lambda` | **mass bias 系数**，`+λ·log(w/M)`。沿用现有语义 |
+| `λ` | `log_kv_lambda` | **mass bias 系数**，只控制 `+λ·log(w)` 这一半；`−log(M)` 不受 `λ` 门控，无条件生效（§2.3）。沿用现有语义 |
 | `λ_new` | — | 开新簇的距离阈值 = `λ_rel · s_h` |
 | `λ_rel` | `log_kv_cluster_lambda_rel` | 上面那个的相对系数。**全方案最敏感的超参** |
 | `s_h` | — | 每 (layer, **KV group**，不是 query head——聚类只在 k 空间做，一个 KV group 只有一份 k) 的 key 尺度估计 `E‖k−k̄‖²`，`k̄` 是整个标定集上的全局均值。**v1 用离线标定**（§5.21-4），标定值须写进 eval metadata；在线估计降级为消融 |
@@ -122,15 +122,17 @@ cache（每 layer 一个）
 | `_append_level0()` | 往 level 0 追加 entry，满 `B′` 个就触发进位 |
 | `_flush_pairs()` | 批量版的窗口 flush。**它存在的唯一理由就是消除逐对串行**——语义路由会把这个串行请回来（§11-B）|
 | `_pair_rank1_stats()` | 算两个槽合并时新增的协方差，rank-1 化 |
-| `log_kv_slot_attention()` | 槽级 attention。**这一行描述的是现有代码**：`score = scale·(q·k) + ½scale²σ²(q·σu)² + λ·log w`，`read = v̄ + scale·γ(q·γa)·γb`。语义簇版本把 `log w` 换成 **`log(w/M)`**，见 §2.3/§5.15，**写单测时不要抄这一行的公式** |
+| `log_kv_slot_attention()` | 槽级 attention。**这一行描述的是现有代码**：`score = scale·(q·k) + ½scale²σ²(q·σu)² + λ·log w`，`read = v̄ + scale·γ(q·γa)·γb`。语义簇版本把 mass bias 换成 **`λ·log(w) − log(M)`**（`−log(M)` 不受 `λ` 门控），见 §2.3/§5.15，**写单测时不要抄这一行的公式** |
 | `LogKVStreamTrainingAttention` | 训练用的自定义 autograd。**forward 不建图，backward 重置 cache 并重放整条流**——语义路由打破了它的确定性前提（§11-A）|
 | `second_order` / `second_order_scale` | 是否构建 Σ/Γ / 它们的运行时缩放（CPT 期间 warmup 爬坡）|
 | `causal_tail` | 在途 chunk 的因果掩码，省掉一个全尺寸 mask |
 | `importance_pooling` | 已验证为负结果的邻近方案（niah 0.0827→0.0787）。**建议保持关闭**；语义簇开关打开时与 `pin` 一起被构造时硬性禁止组合（§5.1），共存数学尚未推导 |
 
 **新增的 buffer**（§5.13）：`centroid`、`n_eff`、`n_total`、`p_hi_c`、
-`current_segment`、`alive`、`level_count`、`pad_mask`、`op_log`、
-`op_log_len`、`s_h`。
+`current_segment`、`level0_phase`、`alive`、`level_count`、`pad_mask`、
+`op_log`、`op_log_len`、`s_h`。`level0_phase` 是 `PAD_INSERT` 对齐唯一依据
+的独立相位计数器，不能用 `level_count[cluster,0] mod 2^ℓ_block` 代替
+（§5.11 的更正框：`carry_into_level` 精确定义后两者不再等价）。
 
 ## T8. 外部概念
 

@@ -286,24 +286,48 @@ sum_wp = A.sum_wp + B.sum_wp          # 整数加法：精确、可结合
 > 产生 `p_mid ≠ p_lo`，而那是罕见事件。
 >
 > **代价要诚实记一笔**：这个 bug 的副作用恰好压低了 `M`。修好之后 `p_mid` 通常
-> 严格落在 `(p_lo, p_hi)` 内，`M` 从 2 变成 3，**直接顶到 §4 那张表里"最坏
-> E[M]=3 ⇒ 4984 槽 ⇒ 超过 vanilla 的 3584"那一行**。所以 S0.6 从"验证性测量"
-> 升格为**真正的决策门**：若实测 `E[M]` 逼近 3，退路是砍掉第三锚点只留
-> `(p_lo, p_hi)`——反正按修复前的实现它本来就等于 `p_lo`，砍掉相对**现状**零损失。
+> 严格落在 `(p_lo, p_hi)` 内，`M` 从 2 变成 3，把 §4 表里"逻辑有效锚点"这一档的
+> 参考值从 ~2 推到 ~3。
+>
+> **更正：`S0.6` 的角色不是"预测 v1 会不会超过 vanilla"，那件事和 `E[M]` 实测值
+> 无关，是确定会发生的。** §4 已经更正过：v1（固定宽度、无 gather）读出时的
+> 物理槽池恒为 `entry × 3 = 4984`，不随 `E[M]` 变化——`E[M]` 逼近 3 还是停在
+> 1.5，v1 付出的 matmul 宽度和峰值内存都是同一个数字，`4984 > vanilla 3584`
+> 是**当前设计的确定结果**，不是"如果 E[M] 不好会发生"的风险。**S0.6 真正
+> 衡量的是"值不值得为 v1 之后的优化投入 gather/packed 实现"**：`E[M]` 越接近
+> 1.5，gather 能省下的空间越大（把 4984 降到接近 3004，重新回到 vanilla 之下）；
+> `E[M]` 越接近 3，说明大多数 entry 本来就需要三个不同的锚点（去重很少生效），
+> gather 的收益也就越小。**"砍掉第三锚点只留 `(p_lo, p_hi)`" 不是 S0.6 测出
+> "E[M] 逼近 3"之后才该考虑的退路，而是独立于 `E[M]` 的另一种设计选择**（把
+> 固定宽度从 3 降到 2，`1024+1320×2=3664`——仍然超过 vanilla 的 3584，只是差距
+> 更小），两者是解决同一问题的不同思路，不是"E[M] 差就退到 2 锚点、E[M] 好就
+> 保持 3 锚点"这种因果关系。
 
 ### 2.3 打分接入：复用现有 kernel + 一处必须做的 mass bias 修正
 
 每个 entry 展开成 1~3 个虚拟槽（去重后，`p_lo == p_hi` 的年轻 entry 自动只剩 1 个）：
 
 ```
-score_{s,a} = scale·(q · k_eff_{s,a}) + λ·log( w_s / M_s )   ← 注意分母
+score_{s,a} = scale·(q · k_eff_{s,a}) + λ·log(w_s) − log(M_s)   ← −log(M_s) 恒定生效，不受 λ 门控
 value_{s,a} = v̄_s
 ```
 
-**`/M_s` 是必须做的正确性修正。** 若一个 entry 展开成 `M_s` 个虚拟槽而每个都带完整的
-`w_s`，`+λ·log(w_s)` 会被计入 `M_s` 次，softmax 里该 entry 实际拿到 `M_s · w_s ·
-exp(score)`——一个静默放大大跨度簇权重的 bug。**这个坑是 v3 引入的，写实现时必须
-首先处理。**
+**`−log(M_s)` 是必须做的正确性修正，且不能挂在 `λ` 门控之内。** 若一个 entry 展开成
+`M_s` 个虚拟槽而每个都带完整的 `+λ·log(w_s)`、不做任何抵消，softmax 里该 entry 实际
+拿到 `M_s^{1-λ} · w_s^λ · exp(score)`——`λ=1` 时这个放大因子恰好是 1（无感），但
+`λ≠1` 时残留一个 `M_s^{1-λ}` 的静默放大/缩小；**`λ=0`（mass bias 消融的关闭档，
+`experiments.md` §7 计划扫）是最坏情形**：放大因子退化成 `M_s`，一个展开成 3 个锚点
+的大跨度 entry 会白拿 3 倍于单锚点 entry 的候选质量，且这与"内容/权重"完全无关，只是
+锚点展开这个存储实现细节的副产品。**这个坑是 v3 引入的，写实现时必须首先处理。**
+
+早期版本把修正写成 `λ·log(w_s/M_s)`（等价于 `λ·log(w_s) − λ·log(M_s)`），只在 `λ=1`
+时把这个放大因子精确抵消成 1；**正确写法是把 `−log(M_s)` 挪到 `λ` 的门控之外**——
+`λ` 只控制原始（继承自 vanilla LogKV 的）`log(w_s)` 这一项要不要计入，`−log(M_s)`
+永远无条件生效，专门、只用来抵消"一个 entry 被拆成 `M_s` 个虚拟槽"这件存储实现细节
+本身造成的候选膨胀。这样无论 `λ` 取何值，`Σ_a exp(λ·log(w_s) − log(M_s)) = w_s^λ`
+精确成立——和只展开成 1 个虚拟槽的 entry 贡献的 `w_s^λ` 完全一致，`M_s` 不再泄漏
+进最终质量，这是比"仅 `λ=1` 时守恒"更强、也更简单的不变量（见 §5.14 的"计数守恒"
+单测，`algorithm-spec.md`）。
 
 不再需要 `κ`/`log ρ` 置信项——没有任何虚拟槽在"撒谎"。
 
@@ -391,22 +415,40 @@ v_slot   = ( v_needle + Σ_{j≠n} v_j ) / w
 返回的 `v_slot` 也已是 haystack 均值，而 Γ 是 rank-1。这解释了为什么二阶修正把 niah
 从 0.032 提到 0.0827（2.6×）却依然离 0.9353 极远：**它修的是分数，修不了读出。**
 
-**SemanticLogKV**：needle 与所有 centroid 距离 `> λ_new` ⇒ 自成一簇 ⇒ 成员数 ≤ B′ ⇒
-**ladder 永不填满 ⇒ entry 永不合并**（§5.9）；且 `p_lo = p_hi = p_mid` ⇒ `M = 1`：
+**SemanticLogKV**：（premise）needle 内容与 haystack 里的一切都语义无关，所以它与
+**所有**既有 centroid 的距离都 `> λ_new`——这比路由本身的 novelty 判据更强，novelty
+判据只要求 needle 到统一代价 argmin 赢家 `c*` 的语义距离 `> λ_new`（§5.3），但既然
+premise 保证了"距离所有簇都远"，无论 `c*` 落在哪个簇上，novelty 判据都必然成立，
+不需要关心 `c*` 具体是谁。needle 因此自成一簇 ⇒ 成员数 ≤ B′ ⇒ **ladder 永不填满 ⇒
+entry 永不合并**（§5.9）；且 `p_lo = p_hi = p_mid` ⇒ `M = 1`：
 
 ```
-score = scale·(q · k_needle) + λ·log(1/1) = scale·(q · k_needle)   ← 与稠密逐位相同
-value = v_needle                                                    ← 与稠密逐位相同
-位置  = 在 p_needle 上的标准 RoPE                                    ← 与稠密逐位相同
+score = scale·(q · k_needle) + λ·log(1) − log(1) = scale·(q · k_needle)   ← 与稠密逐位相同
+value = v_needle                                                          ← 与稠密逐位相同
+位置  = 在 p_needle 上的标准 RoPE                                          ← 与稠密逐位相同
 ```
 
-**分数、读出、位置三者同时恢复到稠密**，而且这个论证**不依赖任何超参**。
+**分数、读出、位置三者同时恢复到稠密。**
 
 代价只有一个槽——haystack 语义同质、`K_eff` 小、压得很狠，省下的预算转移给异常点。
 **这就是为什么自适应预算不是锦上添花而是唯一机制**：固定均匀预算在信息论上无法同时
 做到"压缩 haystack"和"保留 needle"。
 
-**失败模式（Stage 0 必须证伪）**：`λ_new` 太大 → needle 并入 haystack 簇 → 退回稀释。
+> **更正：上一版说这个论证"不依赖任何超参"，这话说过头了。** 它只在"needle 已经
+> 成功自成一簇、且此后从未被迫合并"这个**结论**成立的前提下，分数/读出/位置三者才
+> 逐位恢复到稠密——但这个前提本身**依赖三个条件**，紧接着的"失败模式"和 §5.6 的
+> "小簇合并零损失"更正框（`algorithm-spec.md`）早就分别写清楚了其中两条，这里只是
+> 缺一句话把它们和这条论证显式挂钩：①`λ_new` 必须校准得让 needle 与 haystack 的
+> 语义分离度真实超过阈值（下面"失败模式"那一行）；②`K_max` 不能绑定——K 满时 Ward
+> 会强制合并，即使 needle 当初成功自成一簇，也可能在后续被合并进别的簇、失去精确性
+> （§5.6"小簇合并零损失是有条件的暂态性质"更正框，multi-needle+sink 是最坏情形）；
+> ③needle 自身簇的成员数必须保持 `≤ B′`（这条通常由①②共同保证，很少独立失效）。
+> **"分数/读出/位置逐位恢复稠密"这个计算本身**（给定 needle 确实是孤立的 `M=1`
+> 单点簇）不依赖任何超参，是纯代数事实；但"needle 能不能达到、保持这个状态"依赖
+> 上面三条，三者缺一，退化到不同程度的稀释。
+
+**失败模式（Stage 0 必须证伪）**：`λ_new` 太大 → needle 并入 haystack 簇 → 退回稀释；
+`K_max` 绑定 → Ward 合并可能在事后吞掉已经孤立的 needle 簇（`algorithm-spec.md` §5.6）。
 
 ## 4. 最坏情况的双重兜底
 
@@ -423,13 +465,30 @@ RoPE）这些改动是设计里不可选的（§2.1、§5.6 的 `K_max=1` 讨论
 | 口径 | vanilla | SemanticLogKV @32k | 用途 |
 |---|---:|---:|---|
 | **持久 cache 内存**（entry 数）| 3584 | **2344** = 1024 + 15×8×11 | memory-matched 公平性对比 |
-| 读出时槽池（entry × M，瞬时）| 3584 | ~3004（E[M]=1.5）| 计算量/峰值内存 |
-| 同上，最坏 E[M]=3 | 3584 | 4984 ✗ | **S0.6 的决策门** |
+| **读出时物理槽池**（entry × 3，固定宽度）| 3584 | **4984** | **计算量/峰值内存**——v1 的真实代价 |
+| 逻辑有效锚点（entry × E[M]，去重后）| — | ~3004（E[M]=1.5）/ 最坏 4984（E[M]=3）| 仅供参考，**不是** v1 的算力预算，见下方说明 |
 
-**锚点展开的 `M` 只影响读出时的瞬时槽池，不影响持久 cache 内存**——每 entry 存的是
-3 个整数，不是 3 份键值。
+**锚点展开的 `M` 只影响持久 cache 内存以外的账，但对"读出时物理槽池"这一行不生效
+——这一行是 v1 的真实计算量/峰值内存代价，恒为 entry 数的 3 倍，不随 E[M] 变化。**
+`dedup_anchors` 返回的是**固定形状** `(..., S, 3)`（§5.14），`S_pooled =
+K_max·L_alloc·B′·3` 是只由 `K_max/L_alloc/B′` 决定的编译期常量（`algorithm-spec.md`
+§5.14"`S_pooled` 因此是一个只由...决定的编译期常量"一节）——无效/重复的锚点靠
+`slot_valid` **掩码**而非收缩张量宽度来剔除，`mask_fill` 不会让 matmul/score
+张量本身变窄。所以 v1（无 gather，"读出不需要 gather"是 §5.13 的既有设计原则）
+无论 `E[M]` 实测是 1.5 还是逼近 3，**物理上付出的 matmul 宽度和峰值内存都恒为
+`1024 + 1320×3 = 4984`**，"~3004（E[M]=1.5）"从未是 v1 会真正付出的代价，只是
+"如果未来引入 gather/packed 实现、只物化真正去重后的锚点"这个假设性优化能省下
+多少的参考数字——`E[M]` 因此从"计算量决策门"降级为"值不值得投入 gather/packed
+实现（或改用更省锚点数的 `lo_hi`-only 表示，§8 消融）"这个**未来**优化决策的
+输入，S0.6 的角色相应从"预测 v1 峰值内存落在哪个区间"改为"衡量这项未来优化的
+潜在收益有多大"——v1 本身的内存/算力预算不受 `E[M]` 实测值影响，恒定 4984。
+每 entry 持久存的仍然是 3 个整数（`p_lo/p_mid/p_hi`），不是 3 份键值——这一点
+不受本次更正影响，持久 cache 内存那一行的账目不变。
 
-**第三笔账，此前漏记：训练期 `op_log` 重放元数据，约 448MB/28 层@32k，**且是
+**第三笔账，此前漏记：训练期 `op_log` 重放元数据，约 448MiB×`B`/28 层@32k
+（`B` 是真实训练 batch size；下面"448MB"这个数字统一按本文档惯用的
+`B=1` 展示口径给出，`algorithm-spec.md` §5.21-2 已经显式标注过这一点，
+读到具体数字时心里要乘回真实 `B`），**且是
 每个尚未执行 `backward()` 的 in-flight forward 各付一份**（`algorithm-spec.md`
 §5.21-2 的推导）。这笔账只属于训练侧，不属于上面两笔里的任何一笔，也不进
 memory-matched 对比**——`op_log` 是给 backward 重放用的操作日志（§11-A），
@@ -443,18 +502,25 @@ serving/推理路径不做反向传播，**不分配、不持有这块内存**�
 两笔账比较的是"cache 里究竟存了多少 entry"和"读出时瞬时展开多大"，两者都是
 serving 也会付的代价，`op_log` 不是。
 
-**"448MB" 不是训练期的固定开销，是每个 in-flight forward 的单价**：只要
-下一次 `forward()` 在这次 forward 对应的 `backward()` 跑完之前发生，两份
-448MB 就会同时存活，训练峰值因此是 `448MB × 同一时刻并存的 in-flight
-forward 数`。本仓库 `litgpt/pretrain.py` 的梯度累积循环每个 microbatch 都
-立即调用 `fabric.backward()`（只有 `optimizer.step()` 被推迟），所以在这条
-训练循环下 in-flight 数恒为 1，"448MB"就是准确的峰值；但"累积 loss、只在
-最后统一调一次 `backward()`"或 pipeline 并行的 microbatch 调度会让这个数字
-按并发 forward 数相乘，完整分析、以及哪些模式安全/哪些需要重新核算，见
-`algorithm-spec.md` §5.21-2 新增的"『448MB』只是每个 in-flight forward 的
-代价"一节——训练时这笔额外的显存是真实成本，但它和"压缩率""memory-matched
-公平性"这两个 serving 侧的论证是两件独立的事——放进同一张表比较会把训练
-开销和推理内存预算混为一谈，所以单独列出，不进上面那张表。
+**"448MB"（`B=1` 口径）不是训练期的固定开销，是每个 in-flight forward 的单价，
+还要再乘上两个独立的因子**：只要下一次 `forward()` 在这次 forward 对应的
+`backward()` 跑完之前发生，两份 `op_log` 就会同时存活，训练峰值因此是
+`448MiB × B（真实 batch size）× 同一时刻并存的 in-flight forward 数`——
+这是两个**互相独立、都要乘**的倍数：`B` 是单次 forward 自己张量形状
+`(B,G,OP_max,4)` 里的批大小（`algorithm-spec.md` §5.13 buffer 表），
+"in-flight forward 数"是**有几个不同的 forward 调用**各自持有一份尚未
+释放的 `op_log`（梯度累积/pipeline 并行才会 >1）——前者是"这一次 forward
+本身有多宽"，后者是"同一时刻有几次 forward 同时挂着"，不是同一件事，
+必须分别核算再相乘。本仓库 `litgpt/pretrain.py` 的梯度累积循环每个
+microbatch 都立即调用 `fabric.backward()`（只有 `optimizer.step()` 被
+推迟），所以在这条训练循环下 in-flight 数恒为 1，"448MB×B"就是准确的
+峰值；但"累积 loss、只在最后统一调一次 `backward()`"或 pipeline 并行的
+microbatch 调度会让 in-flight 这个因子继续按并发 forward 数相乘，完整
+分析、以及哪些模式安全/哪些需要重新核算，见 `algorithm-spec.md` §5.21-2
+新增的"『448MB』只是每个 in-flight forward 的代价"一节——训练时这笔额外的
+显存是真实成本，但它和"压缩率""memory-matched 公平性"这两个 serving 侧的
+论证是两件独立的事——放进同一张表比较会把训练开销和推理内存预算混为一谈，
+所以单独列出，不进上面那张表。
 
 > **这笔账中途差点被算错一次，教训值得留着**：为了让 `op_log` 安全地活过
 > `backward()`（不被下一次 `forward()` 的 reset 清空），中间一版实现是
@@ -554,6 +620,542 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
+
+- **2026-08-20｜第三十六轮：修第三十五轮自己引入/遗留的一处 P1（`phase_after`
+  对 `NEW_SEGMENT` 分支套错公式，在三处独立描述里重复了三遍）、一处 P1 跨文档
+  传播缺口（`position.md`/`glossary.md` 仍停在被推翻的 `level_count` 公式）、
+  六处"新簇初始化/Phase 3 写入清单"漏了 `level0_phase`、`carry_into_level`
+  docstring 留着过时的 `1..2B′` 上界、`ℓ_block` 合法取值在三处自相矛盾、
+  `scan_op_log` 对未知槽引用静默按 `epoch=0` 处理。** 动机：一次独立代码评审
+  （对照当前文档给出 file:line 级证据）指出六处问题，两处 P1、三处 P2、一处
+  P2/P3。逐条结论：
+  ① **P1，本轮最重要的一处：`phase_after[t] = (prev_mod[t] + 1) mod
+  2^ℓ_block` 这条公式对 `new_seg[t]=True`（该 token 触发新段、前面刚插过
+  PAD）的情形是错的，且这个错误在文档里被独立复述了三遍。** 用具体反例验证：
+  `prev_mod[t]=2`，`2^ℓ_block=4`。正确过程是先插 `count[t]=(-2) mod 4=2`
+  个 PAD 把相位从 2 推到 0（`2→3→0`），t 自己落地后相位变成 1；但公式无
+  条件套用 `(prev_mod[t]+1) mod 2^ℓ_block` 会算出 `(2+1) mod 4=3`，比正确值
+  多 2。根因是"没插 PAD 时相位单纯 +1"这条公式（`JOIN` 分支）被错误地也套用
+  到了"插了 PAD、相位已经被拉回 0"的分支（`NEW_SEGMENT`/`NEW_CLUSTER`）上
+  ——讽刺的是，紧接着这条公式之后、为 `steps_since` 的 "-1" 做完整推导的那段
+  证明，本身已经正确写出了分叉的递推 `M_{r+1}=1（若 new_seg=True）或
+  (M_r+1) mod 2^ℓ_block（否则）`，公式却没有照这个已经证明对的递推来写，是
+  一处"证明是对的、抄成公式时抄错"的典型 bug。**修法**：`phase_after[t]`
+  拆成两个分支——`new_seg[t]=True` 时恒为 `1 % 2^ℓ_block`（`ℓ_block=0` 时
+  退化成 0，与该配置下 `level0_phase`/`count` 恒为 0 一致，不需要单独
+  特判）；`new_seg[t]=False` 时才是 `(prev_mod[t]+1) mod 2^ℓ_block`。**同一
+  个错误分别复述在三个地方，必须一并改**：Phase 1 的公式定义本身、"三个
+  写入点"里 Phase 3a（直接复述同一条错公式）和 Phase 3b（"做同一条 `+1 mod
+  2^ℓ_block` 更新"，同一个错误的另一种措辞，且遗漏了 Phase 2 内部同一
+  orphan 组后续成员一样可能触发 `NEW_SEGMENT` 这一情形）、以及"必须有 CPU
+  参考实现"段落对朴素串行参考实现的描述（同样无条件写"`+1 mod
+  2^ℓ_block` 递推"）。**这一条尤其致命**：如果只改向量化公式、不改参考
+  实现的描述，对拍单测会拿两份同样错误的实现互相比较，"逐位一致"会在两边
+  一致算错的情况下"通过"，完全测不出问题——三处必须同步改正，不是可以
+  分批处理的独立问题。
+  ② **P1：`docs/position.md`、`docs/glossary.md` 都还停留在被第三十五轮推翻
+  的 `level_count[cluster,0]` 公式上，从未跟进 `level0_phase` 这次修正。**
+  `position.md` P7.1 的代码块和讲解仍然是"直接复用 `level_count[cluster,0]`
+  不需要新计数器"这条已经被证明有反例（`carry_into_level` 精确定义后
+  `level_count` 只在 `B′-1`/`B′` 间振荡，不再遍历全部剩余类）的旧结论；
+  `glossary.md` 更明显——`n_total` 词条的尾注仍写"那处直接复用
+  `level_count[cluster,0]`"，但仅隔 60 行的"新增的 buffer"清单已经是正确
+  的 `level0_phase` 描述，同一份文件内部自相矛盾。两处都已按
+  `algorithm-spec.md` §5.11 的权威定义改正：`count = (-level0_phase[
+  cluster]) mod 2^ℓ_block`，并补充说明新旧两条公式为什么不再等价。
+  ③ **P1/P2：至少六处"这是一个新簇/Phase 3(a) 要初始化或更新哪些字段"的
+  枚举列表漏了 `level0_phase`**——`allocate_new_cluster` 的清零列表、
+  `K` 未满/冷启动分支"白纸"前提、Phase 3 总览、Phase 3a 两处独立描述、
+  "如果 Phase 3 严格等到批末才运行"那段反例说明，全部只列了
+  `centroid`/`n_eff`/`n_total`/`p_hi_c`/`current_segment` 五个字段，但
+  `level0_phase` 正是同一轮（第三十五轮）新增、且明确要求"新建簇初始
+  `level0_phase=0`……`allocate_new_cluster` 清零的字段列表里加上它"的
+  字段——要求本身写在文档里，却没有传播到它引用的那些列表本身。六处全部
+  补上 `level0_phase`（各自标注它归属 §5.11 而非 §5.5，避免被误读成
+  `n_eff`/`centroid` 那一类在线均值更新字段）。**未改动的三处**（"重放
+  正确性断言范围外"列表、"生产路径 vs 独立参考实现对拍"列表、`Metadata`
+  struct 打包字段）**留白是刻意的**：`level0_phase` 已经有 §5.11 自己独立
+  的 CPU 参考实现和对拍单测（本轮①已修正），把它并进这个专门服务
+  `centroid`/`n_eff` 一类字段的另一个测试的 `Metadata` 结构，需要同步改
+  这个测试自己的参考实现伪代码，超出"修一处过时枚举"的范围，不属于本轮。
+  ④ **P2：`carry_into_level` 的 docstring 仍写"incoming_block（时间序，
+  1..2B′个）"，与后文"更正（第三次）②"证明的"Ward 合并级联到足够深的层
+  时，非顶层同样会收到 `3B′`"直接矛盾——同一个函数的前置条件在 100 行内
+  自相矛盾。** 核实证明本身：递推 `E(ℓ)=⌈(B′+E(ℓ-1))/2⌉` 在 `B′=8` 时从
+  `E(3)=8=B′` 起饱和，此后任何一层（不只是顶层）收到的 `incoming =
+  native_ℓ(≤2B′) + ejected_from_below(=B′) = 3B′`，`carry_into_level` 的
+  真实上界因此是 `3B′`，`2B′` 只是"只算了 Ward 合并两源簇原生内容、漏了
+  上一层级联下来的 `ejected`"这个更早版本的证明留下的过时数字。**修法**：
+  docstring 改为 `1..3B′` 并给出简短理由；同时给 §5.12"必须补的单测"第 3
+  条追加一句要求——同一组构造需要显式断言至少一个**非顶层**在这次合并中
+  收到的 `incoming_block` 长度也达到 `3B′`，不能只测顶层（此前的测试只
+  显式断言了顶层，这正是 docstring 长期没被这条测试揪出来的原因）。
+  ⑤ **P2：`ℓ_block` 的合法取值在三处互相矛盾**——§5.3 把 `ℓ_block=0` 定义
+  为"纯语义聚类"消融端点的一部分，§5.21-2 生产路径硬校验的合法范围是
+  `{0,1,2}`（含 0），但 §5.11"代价是指数的"一节结论句写的是"`ℓ_block`
+  实际只能取 1 或 2"，字面读成排除 0，与前两处直接冲突；`glossary.md` 的
+  `ℓ_block` 词条把"指数增长，只能取 1~2"和"硬校验 `ℓ_block ∈ {0,1,2}`"
+  两句紧挨着写，同一个矛盾在这里更加显眼。**厘清**：`ℓ_block=0` 时
+  `2^ℓ_block=1`，每边界浪费 `2^0-1=0`，代价恒为零——§5.11 那张代价表从 1
+  开始列，不是漏了 0，是 0 在"讨论代价多大"的表里天然没有意义（零成本，
+  没什么好讨论的）。**准确的表述是三档而非二选一**：`ℓ_block=0` 是合法
+  的"关闭段边界保护"消融/关闭档（零代价零保护）；`ℓ_block∈{1,2}` 是"确实
+  需要非退化保护"时唯一负担得起的两档；`ℓ_block≥3` 一律不可接受。生产
+  路径的三值校验 `{0,1,2}` 本身是精确的、不需要改动，需要改的只是 §5.11
+  结论句和 `glossary.md` 词条的措辞。
+  ⑥ **P2/P3：`scan_op_log` 对 `JOIN`/`NEW_SEGMENT`/`WARD_MERGE` 引用的槽
+  用 `epoch.get(..., 0)`，缺失时静默当作"epoch 恰好是 0"，而不是报错。**
+  这正是它自己 docstring 前提 3 专门警告过的场景（切片调用忘了传
+  `initial_epoch`，或 `op_log` 拼接顺序本身有 bug）——docstring 把责任全部
+  推给调用方，但函数自己不维护任何能顺带暴露这类错误的状态。这和姊妹函数
+  `scan_op_log_for_ward_events` 在更早一轮（第二十轮）已经改正过的
+  `.get(ident, EMPTY_SKETCH)`/`.get(ident, 0)` 反模式是同一类问题，但
+  `scan_op_log` 当时没有跟着一起改——不是风险更小，是这个函数本来就更简单
+  （没有 `sketches`/`sizes` 之类会顺带兜底暴露错误的额外状态），问题反而
+  更容易被放过。**修法**：不引入 `scan_op_log_for_ward_events` 那一整套
+  `_require`/`sketches`/`sizes`/`pending` 机制（这个函数刻意保持"只维护
+  `epoch`/`parent`，足够简单以便独立确信正确"的既有取舍不变），只做最小
+  的对称改动——`JOIN`/`NEW_SEGMENT`/`WARD_MERGE` 引用的槽不在当前 `epoch`
+  字典（含调用方传入的种子）里就直接 `raise`，不再用 `.get(...,0)` 垫一个
+  可能是假的默认值；`NEW_CLUSTER` 不受影响，因为它是在**建立**新身份而非
+  **引用**已有身份，"槽此前没见过"对它而言是合法输入。新增单测要求：
+  不传 `initial_epoch` 就对中间切片调用、`op_log` 第一条引用未知槽，
+  断言 `raise`；正确传种子的对照场景断言不受影响。
+  **验证**：`grep -rn "log_kv_semantic_clusters\|level0_phase\|
+  saturating_top_carry\|carry_into_level" litgpt/ tests/` 零匹配，确认
+  本轮改动（`docs/algorithm-spec.md`/`docs/position.md`/`docs/glossary.md`）
+  全部是文档，不涉及任何代码/测试文件，与历轮基线一致；本地临时环境没有
+  torch/numpy（`ModuleNotFoundError`），延续既往轮次的处理方式，未安装
+  完整依赖跑测试套件，改为对每处核心结论手工代入验证（①的反例直接代入两条
+  公式对比数值、④的递推 `E(ℓ)` 手工迭代到饱和值）而非仅凭推导；`**` 计数
+  （`grep -o '\*\*' | wc -l`）核对三个改动文件均为偶数
+  （algorithm-spec.md 2134、position.md 50、glossary.md 208），且逐一确认
+  本轮新引入的 `2**ℓ_block` 类字符串（若有）均在反引号内、非 markdown 加粗
+  ——实际核查确认本轮未新增任何此类字符串，全部沿用已有的 `2^ℓ_block`
+  记号，不受历史上"级联加粗渲染 bug"这一类问题影响。
+
+- **2026-08-20｜第三十五轮：修第三十四轮自己引入的四处 P1——`PAD_INSERT`
+  相位计数不能再用 `level_count[cluster,0]`（`carry_into_level` 精确定义后
+  两者不再等价，新增独立计数器 `level0_phase`）；`saturating_top_carry` 把
+  折叠结果放队尾会破坏时间序（改放队首，顺带发现这才是真正符合"饱和累加器"
+  设计意图的做法）；`ward_merge_only` 没有显式清空 `keep_slot` 就会把它的
+  合并前内容计入两次（补 `snapshot_ladder`/`clear_ladder`）；`incoming_block`
+  的真实上界是 `3B′` 不是 `2B′`（漏算了 `ejected` 这一项，且 `L_alloc` 够深时
+  这个上界是精确达到、不是渐近逼近）；`§5.7` 的"每个 entry `w=2^ℓ`"改为只对
+  非顶层成立；`experiments.md` S0.8 3b 的 `apply_rope` 伪代码补 batch 维。**
+  动机：一次独立代码评审（对照当前文档逐条给出 file:line 级证据）指出第
+  三十四轮"统一有界折叠原语"这次修复本身还留了四处会静默产生错误结构的
+  bug，外加一处次要的 shape bug。逐条用代入验证/直接模拟确认后结论：
+  ① **P1，本轮最要命的一处：`§5.11` 的 `PAD_INSERT` 对齐公式一直读
+  `level_count[cluster,0] mod 2^ℓ_block`，这条公式的正确性证明（第八轮
+  建立）依赖"level 满 `B′` 个触发进位时 resident count 会干净地回到某个
+  固定基准，重新从头计数"这个进位模型——但第三十四轮把进位精确定义成
+  "每次溢出只合并最老的两个、留下 `B′-1`+新到的 1 个"之后，resident count
+  从此只在 `B′-1`/`B′` 两个值之间永久振荡，不再遍历 `mod 2^ℓ_block` 的
+  全部剩余类。** 用 Python 直接模拟 `B′=8,ℓ_block=2` 验证：累积插入数第
+  9 次起，`resident mod 4` 序列是 `3,0,3,0,...`，而正确的"累积插入数
+  mod 4"应该依次取遍 `1,2,3,0,1,2,3,0,...`，两者从第 9 次插入起就不再
+  相等，且没有规律可循（不是"暂时分叉迟早追上"）。这不是边界条件疏漏，是
+  第八轮的等价性证明本身依赖的进位模型已经被第三十四轮换掉，没人回头检查
+  这个下游推论是否还成立。**修法**：引入真正独立的持久计数器 `level0_phase
+  ∈[0,2^ℓ_block)`，语义是"该簇 level 0 逻辑插入流（真实 token+pad 混合
+  计数）的当前相位"，每次 level 0 收到 1 个 entry（不论真实还是 pad）
+  `+1 mod 2^ℓ_block`——不依赖 resident count 如何振荡，不依赖 `B′`/
+  `2^ℓ_block` 的整除关系，按定义天然正确。三个写入点（同 `current_segment`/
+  `p_hi_c` 的既有模式）：Phase 3a 向量化写回（复用已经算出的 `prev_mod[t]`，
+  按簇取组内最后一个 `t` 的 `phase_after[t]`）、Phase 3b 内联写回（新建簇
+  初始为 0）、`ward_merge_only` 合并后重置为
+  `level_count[keep_slot,0] mod 2^ℓ_block`（段对齐本来就允许被 Ward 合并
+  打断，这条重置只是把同一容忍显式延伸到相位计数器上）。**直接推论**：
+  第八轮为这条等价性写的"`B′` 必须整除 `2^ℓ_block`"运行时校验随之作废，
+  已从 `§5.21-2` 删除——`level0_phase` 的正确性不依赖这个数论关系。
+  ② **P1：`saturating_top_carry` 把折叠结果放回队尾（`combined[2:] +
+  [merged]`）会破坏时间序，且这不只是局部 bug，是对"顶层该不该链式合并"
+  这件事本身判断反了。** 用 `B′=8`、13 个原始 raw item 手算并用脚本验证：
+  队尾版本 5 轮后收敛到 `[11,12,13,M12,M34,M56,M78,M910]`——较新的原始
+  item（11-13）排在数组最前，覆盖最老内容的 M12 反而被挤到中间，直接违反
+  `§5.7`"簇内成员序列就是位置序列"这条贯穿全文的不变量；更严重的是这个
+  错误会复合，第二轮追加 `[14,15]` 后产出一个 `p_lo=1,p_hi=13,w=3` 的
+  entry——声称覆盖 1-13 的跨度，实际只包含其中 3 个原始 item，读出锚点
+  `p_mid` 可能落在这个 entry 根本没有真实内容的位置。**这条 bug 的根子
+  是第三十四轮抄错了理由**：队尾注释写"避免链式合并"，理由抄自
+  `carry_into_level`（非顶层，那里"每个 entry 恰为 `2^ℓ`"确实是要保护的
+  不变量），但 `§5.12` 开头明确说顶层"`w` 允许超过名义的 `2^L`，继续吸收
+  进位"——这句话字面意思就是顶层的合并应该链式发生，套用非顶层的"避免
+  链式"理由本身就是错的。**修法**：折叠结果放回队首（`[merged] +
+  combined[2:]`）。用脚本验证两轮：稳定收敛成"恰好 1 个不断增长的最老
+  summary entry（`w` 可远超 `2^top`）+ 至多 `B′-1` 个仍未合并的较新原始
+  entry"，`p_hi<下一个 p_lo` 恒成立、span 连续不重叠、总权重守恒——这才是
+  "饱和累加器"这个名字字面描述的行为，比队尾版本更贴合 `§5.12` 本来的
+  设计意图，不只是修 bug，是修对了设计。`§5.12`"必须补的单测"第 2 条
+  相应改写：不再断言"两两配对而非链式"（这条断言测的是错误的性质，已
+  删除），改为断言 span 连续不重叠、时间序、总权重守恒这三条真正重要的
+  不变量。
+  ③ **P1：`ward_merge_only` 的 `native_ℓ`（"a、b 第 ℓ 层各自原有内容归并"）
+  显式包含 `keep_slot`（=a）自己的原有内容，但循环里
+  `carry_into_level(keep_slot,ℓ,incoming)` 内部又会 `read_level(keep_slot,
+  ℓ)`——旧版本靠一句注释断言"这一层此时还是空的"，但伪代码里从没有任何
+  一步真正清空过 `keep_slot`，这句断言从未被建立。** 若照字面实现，
+  `keep_slot` 的原内容会被计入两次：一次通过 `native_ℓ`，一次通过
+  `carry_into_level` 内部隐式的 `read_level`。**修法**：合并簇级元数据
+  之后，显式 `snapshot_ladder`（清空前，为 `native_ℓ` 保留数据来源）→
+  `clear_ladder(keep_slot)`（所有 level 清零，之后 `read_level` 在本次
+  重建过程中确实读到空，不再依赖一句从未被执行的注释）→ 用快照重建。
+  `§5.12`"必须补的单测"新增第 4 条：构造 `keep_slot` 自己该层本来就非空
+  的合并场景（"该层为空、只有 free_slot 有内容"这种平凡情形测不出这个
+  bug），断言总权重精确等于两侧原权重之和，不多不少。
+  ④ **P1：`incoming_block` 的真实上界是 `3B′`，不是第三十四轮写的
+  `2B′`。** 第三十四轮的注释只算了 `native_ℓ`（两源簇各自内容，合计
+  `≤2B′`）这一项，漏了 `incoming=native_ℓ+ejected` 里的第二项——上一层
+  级联下来的 `ejected`。对 `carry_into_level` 代入递推
+  `E(ℓ)=⌈(B′+E(ℓ-1))/2⌉`（`E(-1)=0`）验证：`B′=8` 时
+  `E(0)=4,E(1)=6,E(2)=7,E(3)=8`——**从第 4 层起精确稳定在 `E=B′`，不是
+  渐近逼近**（整数上取整的缘故），而 `L_alloc` 在 32k 参考配置下是 11，
+  远超过 4 层，所以顶层 `incoming=native_top(≤2B′)+ejected(=B′)=3B′` 是
+  确定发生、不是最坏情形假设。**这条修正同时解释了③的双计数 bug 为什么
+  更危险**：若不清空 `keep_slot`，`existing` 会在 `3B′` 之上再叠加最多
+  `B′`，峰值能到 `4B′`。**这条修正只影响 `saturating_top_carry` 的迭代
+  轮数上界（从声称的"至多 `B′` 轮"改为"至多 `2B′` 轮"），不影响
+  `carry_into_level` 的既有结论**——后者每轮 `-2`，`⌈(3B′-B′)/2⌉=B′` 与
+  "至多 `B′` 轮"这个已经写出的结论恰好依然成立，是 `/2` 吸收了上界从
+  `2B′` 改到 `3B′` 的差异，不是巧合的凑数。`§5.12`"必须补的单测"第 3 条
+  补一组独立构造，专门触达 `incoming=3B′=24` 这个上界本身。
+  ⑤ **P2：`§5.7`"level ℓ: 每个 entry `w=2^ℓ`"这条不变量只对非顶层成立，
+  原表述没有区分。** 顶层是"饱和累加器"，`w` 允许超过名义 `2^top`——用
+  `carry_into_level` 的 `ejected.append`（产物离开这一层交给上一层）可以
+  证明非顶层确实维持"每个 entry 恰为 `2^ℓ`"，但顶层用 `saturating_top_
+  carry`，折叠结果留在原地继续参与后续折叠（见②），权重持续累积，不再是
+  干净的 `2^top`。补了这条区分，读出侧不受影响（`dedup_anchors` 等依赖
+  entry 自带字段，不依赖"权重恰为 `2^level`"这条假设）。
+  ⑥ **P3：`experiments.md` S0.8 3b 的 `apply_rope(k_raw[:,cutoff:T,:],
+  cos_cache[cutoff:T], sin_cache[cutoff:T])` 传的 `cos`/`sin` 只有 2 维**
+  （从按位置索引的 cache 切出，形状 `(tail,hs)`），但 `apply_rope` 显式
+  要求 `cos.dim()==3`（`litgpt/model.py:2081` 的 `if cos.dim()!=3: raise
+  ValueError`），直接传会立即报错。**修法**：`cos_cache[None,cutoff:T,:]`/
+  `sin_cache[None,cutoff:T,:]`，补一个前导维度让 cos/sin 变成
+  `(1,tail,hs)`——`k_raw[:,cutoff:T,:]` 本身已经是 `(G,tail,hs)` 3 维
+  （dim 0=G 权当 `apply_rope` 签名里的"B"，与本节其它地方把 `k_raw`/`v`
+  当 `(G,T,hs)` 处理一致），`dims_diff=0`，直接靠前导维 1 对 G 做标准
+  broadcasting，不需要额外 reshape。
+  **顺带修正了本轮起草过程中自己引入的一处格式 bug**：给 `saturating_
+  top_carry` 补"循环保证终止"段落时手滑漏掉了 blockquote 的 `>` 前缀，
+  把一段本该延续同一个 `更正` 区块的文字断成了游离在外的普通段落——核对
+  `git show HEAD` 确认原文这一段确实是同一个 blockquote 的延续（用行首
+  `>` 续行，不是空行），已补回；顺带用脚本扫了一遍全文"空行夹在两条
+  `>` 引用行之间"的模式，确认现存 10 处里另外 9 处在 HEAD 版本里就已存在
+  （该文档一贯用空行分隔两个独立的 `更正` 区块、用行首孤立 `>` 续同一个
+  区块，本轮新增的那一处经核对属于"另起一个独立区块"，用空行是对的，
+  不是同一类 bug）。另发现并改正一处自己写岔的中英混排 typo（"恰好
+  still成立"应为"恰好依然成立"）。
+  **验证**：`grep -rn "log_kv_semantic_clusters\|level0_phase\|saturating_
+  top_carry\|carry_into_level" litgpt/ tests/` 零匹配，确认本轮改动
+  （`docs/algorithm-spec.md`/`docs/experiments.md`/`docs/glossary.md`）
+  全部是文档，不涉及任何代码/测试文件，与此前历轮基线一致；本地临时环境
+  没有 torch/numpy/pytest（`ModuleNotFoundError`），延续第二十六轮起的
+  处理方式，未安装完整依赖跑测试套件，改为对本轮四处核心结论（`level_count`
+  相位振荡、`saturating_top_carry` 排序/收敛行为、`ejected` 递推收敛到
+  `B′`）逐一写 Python 脚本代入验证，而不是仅凭推导；`**` 计数在纳入代码
+  span（Python 幂运算符 `2**ℓ_block` 出现在反引号内、非 markdown 加粗）
+  之后核对为偶数（2018），原始 raw 计数看起来是奇数（2099）但已定位到
+  全部差异来自反引号包住的字面 `**` 文本，与该文档历史上"`**A**B**C**`"
+  级联加粗渲染 bug 是同一类已知安全模式，不受影响。
+
+- **2026-08-20｜第三十四轮：推翻上一轮"顶层进位恒为 `B′` 宽"这条假不变量，
+  §5.12/§5.6 改用统一的有界折叠原语 `carry_into_level`/`saturating_top_carry`；
+  修正 S0.8 3b 伪代码里 k_raw/v 按错轴切片（切了 KV group 维不是时间维）；
+  `append_exact_tokens` 的调用点补齐迁移到 `CacheAttentionState` 契约；收紧
+  Σ/Γ 覆盖范围的首次表述；补全一处漏抄 `lam` 的签名片段。**
+  动机：用户对第三十三轮的修复再核一遍，给出两处 P1、三处 P2/P3。逐条结论：
+  ① **P1，本轮最重要的一处：`saturating_top_carry` 假设"进顶层的 carry block
+  永远是 `B′` 个 entry"，这条不变量是假的，反例直接来自 Ward 合并自己的
+  `其余成对 compact 进位` 步骤。** `total`（两源簇同层归并后的总数，≤2B′）
+  减去 `B′` 剩下的"其余"可以是 1 到 `B′` 之间任意值，既不保证等于 `B′`
+  也不保证是偶数（例如 `B′=8`，两源簇同层分别 8、5 个，"其余"是 5）——
+  `compact()`"两个 `B′` 宽输入拼成 `2B′` 按 `(2i,2i+1)` 配对"这条既有用法在
+  这里根本用不上。深挖之后发现问题比 Ward 合并这一处更深：**连普通单 token
+  逐个 append 的进位机制本身，这份文档从未给出过精确定义**——§5.7 只有
+  "level 满时成对合并进位"这一句概括，`append_to_ladder` 被反复引用但从未
+  给出实现。逐步排除多个候选语义后确认唯一自洽的定义是：level 未满时新
+  entry 直接追加；level 恰好满（`B′` 个）时收到第 `B′+1` 个，取**时间序最老
+  的两个**做一次 `merge()`，产出 1 个双倍权重 entry 向上进位，本层剩下
+  `B′-1` 个——在这个语义下，**普通进位的宽度恒为 1**，和 Ward 合并可能宽达
+  `B′` 的注入完全是两类不同分布的输入。**修法**：不再假设任何固定宽度，
+  改用两个共享的有界折叠原语——`carry_into_level(cluster, level,
+  incoming_block)`（非顶层，反复取"当前最老的两个"`merge()`，折叠出的部分
+  **不放回**继续参与下一轮折叠而是收进 `ejected` 返回给调用方，避免相邻两次
+  折叠链式合并成一个吸收了 3、4 个原始成员的大 entry，退化成非两两配对）；
+  `saturating_top_carry(cluster, incoming_block)`（顶层专用，折叠结果放回
+  队尾而不是丢弃或继续向上，因为顶层没有更高层可去，这是"饱和累加"字面
+  意思——不丢弃、只折叠）。两个循环都有显式终止证明（每轮严格收缩，至多
+  `B′` 轮）。§5.6 的 Ward 合并步骤 2 相应重写，逐层调用这两个共享原语（不再
+  是本节自己的"保留最新 `B′`，其余成对 compact"独立规则），普通逐 token
+  append 也改写成对 `carry_into_level` 的驱动循环。**连带修正一条错误的单测
+  要求**：上一轮说 `level_count[cluster,top]` "只在 `{0,B′}` 两个值之间
+  跳变"，这也是错的——顶层第一次被触碰时和其它层一样从 0 逐个递增填到
+  `B′`，会经过每一个中间值，不是直接跳变；正确的不变量是"单调不减、上界
+  `B′`、一旦达到 `B′` 便永久保持"。新增单测要求覆盖三类场景：顶层渐进填充
+  （断言 `level_count` 依次经过 `1..B′`）、顶层持续饱和（断言折叠是两两配对
+  不是链式）、Ward 合并注入奇数宽度进位（`B′=8`、源簇 8+5 这类具体构造）。
+  ② **P1/P2：S0.8 3b 伪代码里 `k_raw[:cutoff]`/`v[:cutoff]` 按的是 dim 0
+  切片，但"dump 什么"表早已钉死 `k_raw`/`v` 的落盘形状是 `(G, T, hs)`——
+  dim 0 是 KV group（默认 8），dim 1 才是时间轴。** 照抄这行代码会切掉除
+  前 `cutoff` 个 KV group 之外的一切，不是按时间戳截断 prompt 前缀。`pos`
+  是例外——它是纯位置索引，形状 `(T,)`，没有 G 这一维，`pos[:cutoff]`
+  原来就是对的。**修法**：`k_raw`/`v` 的三处切片（`cache_batch_prefix`/
+  `cache_serial_prefix` 构造、`k_tail_roped`/`v_tail` 提取）统一改成
+  `[:, :cutoff, :]`/`[:, cutoff:T, :]`，显式按 dim 1（T 轴）取子集。
+  ③ **P2：`append_exact_tokens` 的调用契约前后不一致**——§5.20-B 的调用点
+  迁移清单早就说"输入输出都要跟着换成 `CacheAttentionState`"，但一直没给出
+  具体签名，S0.8 3b 的两处调用因此还停留在"收三个裸张量、吐三个裸张量"的
+  老式约定。**修法**：在 `CacheAttentionState` 定义处（§5.14）补上
+  `append_exact_tokens(state: CacheAttentionState, k_new, v_new) ->
+  CacheAttentionState` 的具体签名与行为说明（`slot_valid`/`M_s`/rank-1
+  字段原样透传，不随拼接改变宽度；`k_new`/`v_new` 仍是裸张量，不强求也包成
+  `CacheAttentionState`），3b 的两处调用改成先用 `_replace()` 转 dtype 再
+  整个 state 传入、取整个 state 返回，不再手工拆包三元组。
+  ④ **P2/P3：Σ/Γ 覆盖范围的首次表述过强，读者不读到 17 行之后的限定就会
+  误以为"Σ/Γ 正确性已经全部覆盖"。** 原文"Σ/Γ 的正确性已经由本节这两条单测
+  独立覆盖"这句话单独摘出来看确实容易被误读——完整读下去会发现下面"这个
+  范围决定留下一个必须显式接住的后果"一节已经把"锚点旋转数学正确"和"批量
+  路由下 Σ/Γ 聚合状态是否一致"这两件事分得很清楚，但**第一次提到的地方没有
+  这个限定**，容易让只读到那一句的人产生过强印象。**修法**：紧缩第一次表述
+  为"Σ/Γ 的**锚点旋转数学**正确性已经覆盖"，并在原地补一句"这不等于『Σ/Γ
+  的正确性』这个更笼统的说法"，直接指向下面的完整限定，不需要读者自己拼凑
+  两处才能得到准确认识。
+  ⑤ **P3：S0.8 3b"①`log_kv_slot_attention` 调用传的是错误的位置参数"这条
+  更正框自己的签名片段漏抄了 `lam`**——同一份文档另一处（3b 实际调用前的
+  注释）已经正确写出 `lam=1.0` 排在 `mask`/`causal_tail` 之间，唯独这处
+  签名片段没有，容易让人以为 `lam` 被移除了。补上 `lam=1.0` 并加一句说明
+  这是抄漏不是移除。
+  **验证**：`pytest tests/test_semantic_s0.py tests/test_semantic_s0_analyze.py
+  tests/test_semantic_s0_sweep.py tests/test_semantic_stage0_dump.py
+  tests/test_log_kv_cache.py` 全部跑通，219 个测试通过（本轮改动全部是
+  文档，不涉及任何代码/测试文件，和上一轮基线一致）；`CLAUDE.md`、
+  `docs/algorithm-spec.md`、`docs/experiments.md`、
+  `docs/risks-and-open-questions.md` 逐个核对 `**` 出现次数均为偶数（
+  `CLAUDE.md` 的唯一"奇数"读数复核后确认是历史已知的、被反引号包住的字面
+  字符串 `` `**A**B**C**` ``，不是真实的加粗标记，不受影响）；对本轮新增的
+  每一处"更正（这一轮修的）"框逐一定位其开合标记的字符偏移，确认闭合于
+  预期位置，未引入新的级联加粗渲染问题。
+
+- **2026-08-20｜第三十三轮：S0.8 3b 的 tail-cache 改用 cutoff + `append_exact_
+  tokens` 精确复现真实 streaming attention 状态；计算/峰值内存表拆开"逻辑
+  有效锚点"与"物理槽池宽度"两个口径，v1 超基线（4984>3584）从"S0.6 测出来
+  才知道"改为"确定发生"；新增 `saturating_top_carry` 顶层饱和累加原语的
+  完整可执行状态转移；semantic clusters 构造校验补上训练期 pin 注入参数；
+  `log_kv_slot_attention` 补上"query 行全部候选被掩码"的显式运行时检查；
+  activation checkpointing 首轮跳过 `op_log` 分配的说法降级为需要调用方
+  显式信号，不再暗示 v1 能靠 `is_grad_enabled()` 自动判断。**
+  动机：用户对照文档与实际代码逐条核实，给出四处 P1、两处 P2 级发现。
+  逐条结论：
+  ① **P1：S0.8 3b 的 tail-cache 时点此前用"完整 prompt 处理完之后的 final
+  cache"冒充"真实 streaming attention 该看到的 pre-tail 状态"，两者不
+  等价。** final cache 已经把 tail chunk commit 进 recent window、并顺带把
+  一批更早的 recent token 挤进了 pooled hierarchy——这批 token 在真实
+  streaming 下、tail chunk 到达那一刻本该仍是 recent 里的精确表示，final
+  cache 里却已经被压缩，表示粒度不同，即使内容本身不丢（上一轮已修的
+  "dense ground truth"问题是另一件事）。**修法**：`docs/experiments.md`
+  的 3b 定义改为显式 `cutoff = T − tail_query_count`，两条 CPU 参考实现
+  （`cache_batch`/`cache_serial`）只处理到 `cutoff` 为止；`k_raw[cutoff:T]`
+  单独 `apply_rope` 得到 `k_tail_roped`、连同 `v[cutoff:T]` 通过生产函数
+  `append_exact_tokens` 拼成 in-flight chunk，再调用
+  `log_kv_slot_attention(..., causal_tail=tail_query_count)`——这正是真实
+  streaming 每个 chunk 到达时实际执行的模式，不是另一套平行逻辑。原有的
+  `recent_count ≥ tail_query_count` 前置断言随之替换为更宽松、也更准确的
+  `T > tail_query_count`。
+  ② **P1：计算量/峰值内存表用 `E[M]=1.5` 算出的 ~3004，但 `dedup_anchors`
+  按 §5.13/§5.14 的既定设计固定返回 `(...,S,3)`，`S_pooled=K_max·L_alloc·
+  B′·3` 是编译期常量，v1 没有 gather，mask 掉无效锚点不会让 matmul/score
+  张量变窄。** `E[M]` 衡量的是"去重后逻辑上有多少锚点是真正不同的"，和
+  "v1 这次 forward 实际要付出的物理槽池宽度"是两个不同的量，前者此前被
+  错误地当成了后者的代理。**修法**：CLAUDE.md §4、`docs/experiments.md`
+  的 S0.6 表格行与决策门段落，统一拆成"持久 cache 内存"（不变，2344）、
+  "读出时物理槽池，固定宽度"（v1 的真实代价，4984，**确定**超过 vanilla
+  的 3584，不是 S0.6 测出来才知道）、"逻辑有效锚点"（仅供参考，衡量未来
+  gather/packed 实现的优化空间上限，不是 v1 的算力预算）三档。连带更新
+  `docs/risks-and-open-questions.md` §8 风险表"锚点展开撑爆读出槽池"一行
+  ——"对策"列从"S0.6 先测；缓解见 §4"改为"确定发生，无缓解；S0.6 只衡量
+  未来优化空间"，与上面两处保持一致。
+  ③ **P1：`L_alloc` 顶层"饱和累加器"只有一句原则性描述（"`w` 允许超过名义
+  `2^L`，继续吸收进位"），没有可执行的状态转移，且和现有代码的真实行为
+  （`log_kv_cache.py:944-950` 顶层溢出直接 `RuntimeError`）不一致。** 上一版
+  "不需要新机制，`compact` 本来就不要求两侧等宽"这句话没错，但回答的不是
+  真正缺的东西——缺的是**围绕** `compact()` **的控制流**："什么时候调用、
+  结果写回哪里、`level_count` 怎么更新、pad/锚点/ΣΓ 怎么处理、replay 要不要
+  跟着改"，这些此前完全没有定义，`§5.19-2` 也只是把它标记为"最集中的风险
+  点"而未给出定义。**修法**：先证明"抵达顶层的进位块宽度恒为 `B′`，永不
+  需要 zero-pad"这条支撑简化的不变量（由普通层间进位的"同层等宽"性质加
+  `compact` 输出宽度恒为输入宽度的性质归纳得到），再给出
+  `saturating_top_carry(cluster, incoming_block)` 的完整状态转移伪代码：
+  顶层从未占用时原样写入（不调用 `compact`）；已占用时（此时恒有
+  `level_count=B′`）与既有内容做一次标准 `compact`、结果原地写回同一层、
+  不再向上传播、`level_count` 钉死在 `B′`。全部字段（`w`/`p_lo`/`p_hi`/
+  `sum_wp`/rank-1 ΣΓ/pad 规则）复用普通层间进位的既有 `compact` 调用，没有
+  新公式。**replay 不需要新的 `op_log` 条目类型**——和普通二进制进位一样，
+  这个事件完全由"重放到这一步时顶层是否已经是 `B′`"这一状态本身决定；
+  forward 路由和 replay 必须调用同一个实现（不允许平行重写），与
+  `ward_merge_only`/`PAD_INSERT` 扫描已经确立的"forward/replay 共享
+  primitive"纪律一致。新增单测要求：构造单簇极端不均衡序列，强制顶层
+  饱和合并 2~3 次，forward 与 replay 产出的顶层 entry 做完整字段元组对拍，
+  并断言 `level_count[top]` 全程只在 `{0, B′}` 间跳变。
+  ④ **P2：semantic clusters 构造校验只挡了 `pin_size>0`（eval-time pin），
+  没挡训练期的 `log_kv_pin_train_max`/`log_kv_pin_train_prob`。** 核实
+  后确认这两个参数确实经 `model.py:1020` 一带传进
+  `LogKVStreamTrainingAttention.apply(...)`，最终由
+  `_sample_training_pin_positions`（`log_kv_cache.py:1780-1808`）调用
+  `cache.set_pinned(...)`；但由于该函数内部本来就有
+  `pin_train_max = min(int(pin_train_max), cache.pin_size)` 这一步 clamp，
+  一旦 `pin_size` 已被现有校验钉死为 0，这条训练注入路径就已经被下游早退
+  分支挡死——**不是当前会触发的活跃正确性 bug，而是"因为另一处代码的下游
+  行为副作用而碰巧安全"**，下游 clamp 逻辑一旦被重构就可能在毫无警觉的
+  情况下失守。**修法**：构造时校验补上 `pin_train_max > 0`/
+  `pin_train_prob > 0.0` 两个条件，把"没有 pin 共存语义"这条契约做成不
+  依赖任何下游实现细节的自证不变量（fail loud, not silent），定性为纵深
+  防御而非活跃 bug 修复。
+  ⑤ **P2：`log_kv_slot_attention` 是通用函数，测试/诊断代码可能直接拿
+  cache 的 `slot_valid` 调它、不额外拼 in-flight chunk（`causal_tail=0`）
+  也不传显式 `mask`——若 `slot_valid` 恰好整段为 `False`（如刚构造的空
+  cache），会产出整行 `-inf` 的 score、softmax 出 NaN。** 现有代码
+  （`log_kv_cache.py:1553`）只特判了 `S==0` 这一种"cache 为空"的表现
+  形式，没覆盖"`S>0` 但被掩码全部遮住、又没有 exact 后缀兜底"这第二种
+  同样会导致空结果的情形。**修法**：函数内部在全部 `masked_fill_` 之后、
+  `softmax` 之前，新增 `effective_valid = (score > -inf)` 归约检查，逐
+  `(B,head,T_q)` 行断言至少一个有效候选，不满足直接 `raise ValueError`，
+  不允许 NaN 静默流入下游；`S==0` 的早退路径保留，两者覆盖"cache 为空"
+  这同一根因下的两种不同表现，不冲突。
+  ⑥ **P3：activation checkpointing"首轮跳过 `op_log` 分配"的说法暗示 v1
+  能自动检测，但没交代信号从哪来。** 直觉候选信号 `torch.is_grad_enabled()`
+  乍看能区分"checkpoint throwaway 首轮"（外层显式 `no_grad()`）和"recompute
+  轮/正常训练 forward"（外层梯度开启）——但 `LogKVStreamTrainingAttention.
+  forward()` 是 `torch.autograd.Function` 的 `forward()` 方法，PyTorch 的
+  `Function.apply()` 机制本身就会在整个 `forward()` 执行期间统一禁用梯度
+  追踪，`log_kv_cache.py:1879` 那处显式 `torch.no_grad()` 只是让这一点在
+  代码里变得可见，不是额外施加的限制——所以 `is_grad_enabled()` 在
+  `forward()` 内部任意位置查询恒为 `False`，三种调用场景在函数内部结构性
+  地不可区分，不是"查询位置不对"这么简单。**修法**：把这项优化降级为
+  "需要调用方（checkpoint 包装层）显式传入新信号才能做的未来工作"，v1 不
+  承诺、也不实现自动检测；`record_op_log` 继续由调用方在 `.apply(...)`
+  之前决定好并传入，不影响本节"448MB×B"这个峰值数字本身的正确性，只影响
+  能不能省掉一次可回收的 throwaway 分配。
+  **验证**：`pytest tests/test_semantic_s0.py tests/test_semantic_s0_analyze.py
+  tests/test_semantic_s0_sweep.py tests/test_semantic_stage0_dump.py
+  tests/test_log_kv_cache.py` 全部跑通，219 个测试通过，与本轮之前的基线
+  一致（本轮改动全部是文档，不涉及任何代码/测试文件）；改动覆盖的四个文件
+  （CLAUDE.md、`docs/algorithm-spec.md`、`docs/experiments.md`、
+  `docs/risks-and-open-questions.md`）逐个核对 `**` 出现次数均为偶数，并对
+  本轮新增的三处"更正（这一轮修的）"框逐一定位其开合标记的确切字符位置，
+  确认闭合于预期的引导句末尾，未触发本文档历史上出现过的"`**A**B**C**`"
+  级联加粗渲染 bug。
+
+- **2026-08-20｜第三十二轮：mass bias 公式改正，`−log(M)` 不受 `λ` 门控；
+  修正两处 novelty 判据里与 `c*` 定义矛盾的 `min_c`/"到所有既有簇都远"
+  表述；O(log n) 求和式补回 `⌈⌉`/`+1`；`op_log` 显存数字补上 batch size
+  乘数；needle "不依赖任何超参"改条件式；YAML/CLI 覆盖方向文字改正。**
+  动机：一次独立审查逐条对照当前文档给出六处发现（两处 P1、两处 P2、两处
+  P3），核实后确认前五处都是真实问题，第六处是纯文字方向写反。逐条结论：
+  ① P1：mass bias 公式 `λ·log(w/M)` 只在 `λ=1` 时让"entry 被展开成 `M`
+  个虚拟槽"这件存储细节不影响最终质量，`λ≠1`（尤其 `experiments.md` §7
+  计划扫的 `λ=0` 档）残留一个 `M^(1-λ)` 的放大因子，`λ=0` 时退化成整整
+  `M` 倍。这个问题此前（2026-08-14"收紧 mass bias 单测的表述"一条）已经
+  被发现，但当时的处理方式是弱化测试断言绕开它，没有触碰公式本身——而
+  `λ∈{0,1}` 恰恰是 `experiments.md` §7 计划扫的两档，弱化过的测试掩盖不了
+  `λ=0` 这一档下真实存在的、与内容/权重无关的质量膨胀。修法是把 `−log(M)`
+  从 `λ` 的门控里挪出来，公式改成 `λ·log(w) − log(M)`，`−log(M)` 无条件
+  生效，只有 `λ·log(w)` 这一半受 `λ` 控制。这样 `Σ_a exp(λ·log(w) −
+  log(M)) = w^λ` 对任意 `λ` 精确成立，是比"仅 `λ=1` 时守恒"更强、也更简单
+  的不变量，"计数守恒"单测因此从"只能测 `λ=1`"升级为"可以直接测任意
+  `λ`，旧公式在 `λ≠1` 时会让这条测试失败"，重新变回一条能真正抓 bug 的
+  正回归测试。实现上一个容易踩的新坑：`λ·log(w)` 和 `−log(M)` 拆成两次
+  独立运算后，`λ·log(w)` 依旧需要 `if lam != 0.0:` 门控（避免 `w=0` 时
+  `0·(-inf)=NaN`，和旧公式同源的坑），但 `−log(M)` 必须在这个门控之外
+  无条件算（`M` 经 `clamp_min(1)` 后恒 `≥1`，`log(M)` 恒有限，没有这个
+  风险）——如果照抄"公式整体从 `log(w)` 换成 `log(w/M)`"这种理解，把
+  `−log(M)` 也塞进 `if lam != 0.0:`，就会退回本轮要修的问题本身。这次
+  修正不改变"`slot_valid` 在语义模式下必须无条件产出、不是可选项"这条既有
+  结论：重新核算发现 `−log(M)` 对区分"死/pad entry"和"正常 entry"完全
+  没有帮助（dead entry 的 `M` 同样被 clamp 成 1，`−log(1)=0`，是个中性值，
+  不是 `-inf`），挡住无效槽的机制在新旧公式下都只有 `slot_valid`，这条
+  论证没有被这次公式改动削弱。改动面覆盖 CLAUDE.md §2.3、
+  `docs/position.md`（P5.1/P5.2/P5.3/P8.4）、`docs/algorithm-spec.md`
+  （§5.1 参数表注、§5.6 imp1/imp2 冲突理由、§5.14 `dedup_anchors`/
+  `materialize_*`/签名/`slot_valid` 强制性论证/计数守恒单测、§5.15、
+  §5.20-B 改动对照表两处）、`docs/glossary.md`（`λ` 词条、
+  `log_kv_slot_attention()` 词条）、`docs/experiments.md`（S0.8 3b 引用、
+  §7 消融表 `λ` 行）。
+  ② P1：`docs/algorithm-spec.md` 有两处新簇/orphan 判据仍在用
+  `min_c ‖k_x−μ_c‖²`（纯语义最近簇），与 §5.3/§5.4 已经确立、且专门写过
+  更正框改正过一次的权威定义（novelty 判据必须用统一代价 argmin 赢家
+  `c*` 自己的语义距离，不是全体簇的最小语义距离）直接矛盾。两处都是"局部
+  改对了、没有传播到别处"的遗留。第一处是 §5.6"新簇形成的条件"一节独立
+  写着"唯一的语义条件：`min_c ‖k_x − μ_c‖² > λ_new`"，是 §5.4 那次更正框
+  明确纠正过的旧表述，没有同步过来，修法是把它换成
+  `‖k_x−μ_{c*}‖² > λ_new`，`c*=argmin_c d_c`，并指回 §5.4 那条更正框。
+  第二处是 §5.4"为什么 Phase 1 全部先写、Phase 2 再写满足三条契约"一节，
+  论证"orphan 永远不会 JOIN 一个 Phase 1 本批也在写的既有簇"时写的理由是
+  "按定义，orphan 到所有既有簇（含被 Phase 1 命中的那些）的语义距离都
+  `> λ_new`"——这句话在 `η>0` 时不成立：完全可能存在一个语义上很近
+  （`S[τ,c']≤λ_new`）但因太久未访问、时序惩罚项够大而在 argmin 里输给了
+  `c*` 的既有簇 `c'`，此时 τ 依然满足 `s*[τ]=S[τ,c*]>λ_new`（是
+  orphan），但离 `c'` 并不远，"orphan 到所有既有簇都远"这个结论在这类
+  输入上是假的，即使它此前从未被写成可执行的断言，也是一处会误导后来
+  实现者写出错误校验代码的说法。好在这一处的结论本身（Phase 1 本批不会
+  给既有簇产生 Phase 2 的主操作）依然成立，只是论据要换：Phase 2 的算法
+  范围（§5.4 伪代码）本来就只有"在这批 orphan 内部跑一个小 DP-means"，
+  从未尝试把某个 orphan 重新并入任何既有簇，这是纯结构性事实，novelty
+  判定只在 Phase 1 用 `c*` 做过一次，Phase 2 不会回头质疑或复用它，和
+  语义距离无关。修法是新增一条更正框，用上面的反例撤回距离论证、换成
+  结构性论证，并显式提醒不要写类似
+  `assert all(semantic_dist(orphan,c)>λ_new for c in existing_clusters)`
+  这样的校验，它在合法输入上会失败。
+  ③ P2：§5.8 的 O(log n) 求和式
+  `Σ_c B′·log₂(n_total_c/B′) ≤ K·B′·log₂(n/(K·B′))` 丢了 `L_c` 定义本身
+  带的 `⌈⌉` 和 `+1`，数学上不严谨——每一项都比对应的真实 `B′·L_c` 小，这个
+  不等式证明的其实是一个下界成立，没有证明真正关心的"真实占用 entry 数
+  `Σ_c B′·L_c`"也满足同一个界；且 `n_total_c<B′` 时（任何小于 `B′` 个
+  成员的簇，比如 needle 单点簇）该式给出负数，不适合当 entry 数的上界看。
+  结论（`O(K·B′·log n)`）大概率仍然成立，但推导本身站不住。修法是把
+  `⌈⌉`/`+1` 显式带回去重新推导：`⌈x⌉≤x+1`，`log(x+1)` 仍是凹函数（仿射
+  平移不改变凹性），Jensen 不等式在均衡分布时给出同样的最大值，`+1`/`⌈⌉`
+  各自贡献一个 `O(K·B′)` 的低阶加项，不改变 `O(K·B′·log n)` 这个阶，界
+  依然安全，只是必须把这些项显式写出来，不能像原写法那样直接省略。顺带
+  核实了审查提出的另一半怀疑（`E_max`/§5.12 把 live-occupancy 上界和矩形
+  预分配容量混在一起）——细读后不成立：`E_max`（§5.12 的均衡界公式）从头
+  到尾只被用作"推导 `L_alloc` 该定多深"的中间量，实际分配的矩形容量是
+  `L_alloc`（均衡界加安全余量 `δ`）算出的 1320（`K=15,B′=8,L_alloc=11`），
+  这个数字才是 CLAUDE.md §4、`risks-and-open-questions.md` 等处全文统一
+  使用的真实预算数字，`E_max=1080` 从未被当成预算数字使用过。但既然一位
+  仔细的审查者确实把两者读混了，说明现有文字对这层区分不够显式，在 §5.12
+  加了一条更正框把这层关系挑明，防止同样的误读再发生。
+  ④ P2：`op_log`（及本地缓冲）的"约 448MB"系列数字全部是显式声明过的
+  `B=1` 展示口径（`(1,8,4·32768,4)` int32），但训练显存的完整核算此前只
+  覆盖了"同一时刻并存的 in-flight forward 数"这一个乘数（§5.21-2 已有的
+  梯度累积/pipeline 并行分析），从未把"这次 forward 自己的真实 batch
+  size `B`"作为第二个独立乘数显式点出来——两者是完全独立、都要乘的因子
+  （一个是"这次 forward 本身有多宽"，一个是"同一时刻有几次 forward 同时
+  挂着"），漏掉前者会让"梯度累积安全、in-flight 数恒为 1"这个结论被误读
+  成"训练期就是固定 448MB"，而真实训练 batch size 通常不是 1。修法是在
+  buffer 表、§5.21-2"448MB 只是……代价"一节标题与正文、§4 headline 三处，
+  把公式统一改写成"448MB × `B` × in-flight forward 数"，梯度累积/
+  pipeline 并行两类模式的公式也相应补上 `×B`。
+  ⑤ P3：CLAUDE.md §3"needle 论证不依赖任何超参"这句话过强，且与紧接着的
+  "失败模式：`λ_new` 太大 → 退回稀释"直接矛盾——分数/读出/位置三者逐位
+  恢复稠密这个计算本身（给定 needle 已经是孤立的 `M=1` 单点簇）确实不
+  依赖超参，但"needle 能不能达到、保持这个状态"依赖三个条件：`λ_new`
+  校准得当（否则并入 haystack）、`K_max` 不绑定（否则 Ward 强制合并可能
+  事后吞掉已孤立的 needle 簇，§5.6"小簇合并零损失是有条件的暂态性质"更正
+  框）、needle 自身簇成员数 `≤ B′`（通常由前两条保证）。修法是把"不依赖
+  任何超参"这句结论性断言改写成区分"计算本身"与"能否达成这个前提"的
+  条件式表述，并把"失败模式"一行从只提 `λ_new` 扩展到同时提 `K_max` 绑定
+  这第二条早已在 §5.6 写过、但没有从这里链接过去的失败路径。
+  ⑥ P3：`algorithm-spec.md` §5.1"YAML 新字段默认必须写 `null`"那句话的
+  方向写反了——写的是"否则会被同名 CLI 参数静默覆盖"（CLI 赢），但按
+  CLAUDE.md §10"工程习惯"一节记录的 `_o()` 实际行为、以及 `eval.sh` 把
+  YAML 展平成 CLI flag 这个既有事实，真实方向是 YAML 非 null 默认值静默
+  覆盖 CLI（YAML 赢）。这是纯文字方向错误，不影响任何已经做出的设计决定
+  （"新字段默认写 `null`"这条操作性规则本身是对的，说反的只是"为什么必须
+  这样做"的理由），但容易在以后扫参数时被反过来误用。修法是改成正确方向，
+  并把此前指向不相关章节的"见 §12"交叉引用换成指向 CLAUDE.md §10 的具体
+  位置。
 
 - **2026-08-20｜第三十一轮：`vanilla_logkv_entries()` 拆成两个口径——
   `vanilla_logkv_compressed_entries()`（只算已压缩前缀,S0.4 主判定）+
