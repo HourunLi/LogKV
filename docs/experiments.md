@@ -35,85 +35,28 @@ query head 共享）与 needle 的 token span（复用另一分支已有的 `log
 > 的"完全连续分段"）。它的职责是回答科学问题：**可负担的区间里是否包含了大部分
 > 价值**。
 
-> **一处范围明确的例外（这一轮补的）**：这个"1 次 GPU dump + 全部 CPU 分析"
-> 的两阶段划分对 S0.0、S0.2–S0.7、以及 S0.8 的第 1/2/3a 项精确成立——它们只吃
-> `k_raw`/`v`/`pos`/`attn_mass_by_dist`，全部来自持久化的 dump 文件，可以在
-> GPU dump 完成、进程退出之后，随时用一个独立的纯 CPU 后处理脚本重新跑，
-> 想跑几次跑几次。**这条"随时能重新跑"说的是它们不需要回到 GPU dump 进程
-> 里，不代表现在就能跑出结果**——S0.8 1/2/3a 除了这些持久化文件，还需要
-> `cache_serial`/`cache_batch` 两块分析基础设施，其中 `cache_batch` 要的是
-> §5.4 Phase 1/2/3 的**朴素 CPU 参考实现**（伪代码逐字翻译成普通 Python
-> 循环，不做任何向量化，目前完全没有对应代码），**不是** §5.18 第 4 步那份
-> 要等 Stage 0 结果才决定投不投的向量化生产实现；把这句话读成"要先有
-> Stage 1 才能跑 S0.8"就把依赖方向搞反了，两块各自的状态与完整论证见下方
-> "这句话的范围"一节。**S0.1
-> 不在这个列表里**——它是 `log_kv_position.py`（还没写）的纯 CPU 单测，
-> 根本不读 dump 文件，见下表。**S0.8 的 3b 项不满足这个划分**——它的读出
-> 比较需要 `q_tail`（下方 S0.8 一节论证过它不落盘，用完即弃），必须在 GPU
-> dump 那个进程内、mechanism B 算出 `q_tail` 之后（且尚未被丢弃）就地完成，
-> 不能推迟到一个独立的、只读取已落盘 dump 文件的后处理脚本里——具体的执行
-> 顺序要求见下方 S0.8 3b 一节"不选『额外持久化…』"之后的补充说明。
+> **范围边界**：这个"1 次 GPU dump + CPU 后处理"的划分覆盖 S0.0、S0.2–S0.7
+> 和 S0.8 的 1/2/3a 项；S0.1 是纯 CPU 单测，不读 dump；S0.8 3b 需要未落盘的
+> `q_tail`，必须在 GPU dump 进程内完成。S0.8 目前仍缺 `cache_serial`/
+> `cache_batch` 两份朴素 CPU 参考 cache，尤其 `cache_batch` 指 §5.4 Phase 1/2/3
+> 的慢速参考实现，不是 Stage 1 的向量化生产实现。
 
 #### Stage 0 dump 规格（这个脚本是本项目该写的第一段代码）
 
 Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生产代码之前**（§5.21-5）。
 
-> **这份规格的机制 A（k/v）部分已经实现**：`litgpt/semantic_s0.py` +
-> `unused/semantic_stage0_dump.py` + `unused/semantic_s0_sweep.py`（各带单测，
-> 详见 `CLAUDE.md` §0 开头的说明）。**机制 B（下方）以及本节"落盘格式"要求
-> 的 `tail_query_count`/MinHash 三元组等字段仍未实现**——现有脚本的 manifest
-> 只有 k/v、`s_h`/`vh`、基础样本信息，不满足下面完整 schema，不要把它当成
-> 已经覆盖了整份 Stage 0 dump 规格。
+> **这份规格的机制 A（k/v）部分已经实现**，核心文件清单见 `CLAUDE.md` §0。
+> **机制 B（下方）以及本节"落盘格式"要求的 `tail_query_count`/MinHash 三元组等字段
+> 仍未实现**——现有脚本的 manifest 只有 k/v、`s_h`/`vh`、基础样本信息，不满足下面
+> 完整 schema，不要把它当成已经覆盖了整份 Stage 0 dump 规格。
 >
-> **"dump 提供的数据够不够"和"有没有分析代码去算某个 S0.x 指标"是两回事，
-> 下面这条紧接着的"覆盖 S0.0、S0.2–S0.7"说的是前者（这条 dump 脚本设计上要
-> 覆盖哪些子项的数据依赖），不代表这些子项已经有现成分析代码能直接跑。** 目前
-> 已经配了分析代码、能直接跑的是 S0.0、S0.3、S0.4、S0.5、S0.6、S0.2 口径①：
+> **"dump 提供的数据够不够"和"有没有分析代码去算某个 S0.x 指标"是两回事。**
+> 目前已经配了分析代码、能直接跑的是 S0.0、S0.3、S0.4、S0.5、S0.6、S0.2 口径①：
 > S0.0/S0.4/S0.5/S0.2 口径①由 `SweepAccumulator`/`route_dpmeans_segments`
 > 覆盖；S0.3 是 `unused/semantic_s0_needle_isolation.py`；S0.6 是
-> `unused/semantic_s0_anchor_dedup.py`。S0.3/S0.6 已完成首批真实 dump 实跑
-> （见 `CLAUDE.md` §14 2026-08-21 最新条）。S0.7 的 supersession 判定逻辑还没写；
-> S0.1 不需要 dump（纯 CPU 单测，见下表），不在这个"数据依赖"讨论范围内。
-
-> **这句话的范围（这一轮补的）：覆盖 S0.0、S0.2–S0.7 和 S0.8 的第 1/2/3a 项，
-> 不覆盖 S0.8 的 3b 项；S0.1 不在此列**——它是 `log_kv_position.py`（还没写）
-> 的纯 CPU 单测，不需要 dump 提供任何数据，见上表的对应行。
->
-> **S0.8 的第 1/2/3a 项本身也不是"dump 完就能跑"，这一点上一版没写清楚，
-> 容易和"覆盖"这个词混为一谈。** dump 只满足 S0.8 全部子项（含 1/2/3a）共同
-> 的数据依赖；要真正算出任何分歧率，S0.8 的每个子项都还需要比较批量路径与
-> 严格串行路径这两侧的 cache 状态——`cache_serial` 和 `cache_batch` 这两份
-> **朴素、慢但正确的 CPU 参考实现**，都在 `algorithm-spec.md` §5.18 第 2 步
-> 构造：`cache_serial` 是 §5.3 严格串行算法的朴素实现，`cache_batch` 是 §5.4
-> Phase 1/2/3 批量近似算法的朴素实现（伪代码逐字翻译成普通 Python 循环，不做
-> 任何向量化）。
->
-> **`cache_batch` 的朴素实现不是 §5.18 第 4 步"多簇路由 + 向量化"那份生产
-> 实现，两者是不同的制品——这一点必须显式分开，否则会把 S0.8 变成一个循环
-> 依赖：S0.8 是 Stage 0 的决策门，但如果 `cache_batch` 等同于第 4 步的产物，
-> 跑 S0.8 就要先做完第 4 步这块本该由 Stage 0 结果决定要不要投入的 Stage 1
-> 生产实现。** 拆开后就不循环了：`cache_batch` 的朴素 CPU 版本和 `cache_serial`
-> 一样，是第 2 步就该写的测试脚手架，代价同一个量级，不是要部署的代码；
-> 第 4 步的向量化生产实现是否值得投入，仍然完全由 Stage 0（含 S0.8）的结果
-> 决定，且第 4 步完工后拿这份朴素 `cache_batch` 测的是它自己的实现正确性
-> （向量化写对了没有），跟 S0.8 是两件独立的事——**两份朴素 CPU 参考实现目前
-> 在仓库里都完全没有实现**（见 `algorithm-spec.md` §5.18 第 0 步、第 2 步的
-> 更正框）。3b 在 `cache_serial`/`cache_batch` 都齐备之上，才**额外**需要
-> `log_kv_slot_attention()`/`get_attention_state()` 按 §5.14/§5.20-B 扩展出的
-> `CacheAttentionState`/`slot_valid`/`M_s`——这几块在 `algorithm-spec.md` §5.18
-> 的编号里排在 dump 脚本（第 0 步）之后，字面上和"第一段代码"冲突。这不是需要
-> 靠改期望解决的问题：真正被"先看 Stage 0 结果再决定要不要投入"这道门挡住的是
-> 多簇路由的**生产向量化**实现、段对齐填充、`op_log` 训练路径重放（§5.18 第
-> 3–6 步）；两份 CPU 参考路由本来就是"慢但正确"的测试脚手架、不是要部署的
-> 代码，写它们不构成这个决策的组成部分；
-> `log_kv_slot_attention`/`get_attention_state()` 的扩展**不是纯加法式改动
-> ——是一次 breaking 的返回类型迁移**（`get_attention_state()` 在任何模式下
-> 都改返回恒定 10 字段的 `CacheAttentionState`，现有位置解包调用会直接
-> `ValueError`，需要原子迁移全部约 30 处调用点，字节等价 CI 闸门管的是数值
-> 不是接口形状，管不到这里，完整论证见 `algorithm-spec.md` §5.18 第 2 步的
-> 更正框）——但迁移动作本身机械、不涉及新算法。这几块都是让 S0.8 这个决策门
-> 本身可信所必需的最小基础设施，应当在报告 S0.8 任何一项结果之前先落地，
-> 完整论证见 `algorithm-spec.md` §5.21-5 的更正框。
+> `unused/semantic_s0_anchor_dedup.py`。S0.3/S0.6 已完成首批真实 dump 实跑，
+> 并已补上 `K_max` + Ward clipped 探针；下一步是实跑 clipped gate。
+> S0.7 的 supersession 判定逻辑还没写；S0.8 仍缺上述两份 CPU 参考 cache。
 
 **两套机制，不是一个 hook——`attn_mass_by_dist` 在原来那个 hook 点算不出来。**
 原设计把它写成"在 hook 里就地累加"，但真实注意力质量需要**已经做完 RoPE 的 q、k
@@ -298,6 +241,13 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   > 校正了此前"g_max 完全不影响簇归属"的过强说法：代码上 `g_max` 触发新
   > segment 时会通过 `gamma` 衰减改变后续 centroid 更新，所以 cluster_count
   > 可有轻微变化；但实测影响远小于 `lambda_rel`。
+  >
+  > **下一轮 gate（已实现，待实跑）**：S0.3 必须补 `K_max` + Ward clipped
+  > 口径。核心字段是 `K_max_binding_rate`、`needle_token_isolated_rate`、
+  > `span_any_token_isolated_rate`、`needle_token_ward_touched_rate` 和
+  > `needle_cluster_merged_by_ward_rate`（列名以 CSV 实际输出为准）。如果
+  > `lambda_rel=0.875` 的高召回主要来自大量新簇，但在默认附近的 `K_max=15/16`
+  > 或 `K_max=32` 下高频绑定、Ward 反复触碰 needle 小簇，它不能进入生产主线。
 - **S0.4**：key 方差应显著低于现有位置槽；**若 value 方差没有同步下降**，说明读出侧
   仍是 smear，收益要打对折，需要考虑按 `[k;v]` 联合聚类或簇内二次分裂。
 - **S0.6（更正：不再是"预测会不会超过 vanilla"的决策门，那件事已经确定，
@@ -329,6 +279,59 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   > g_max=inf/8192` 是高召回候选（S0.3 token 召回约 18.5–18.9%、span_any
   > 约 72.5–72.8%，但 S0.6 成本约 1.45–1.5× 于 `lambda_rel=1.0`）。`l_block`
   > 不宜过大，尤其 `l_block=2/3` 会显著增加 pad entry 和 fixed3 宽度。
+  >
+  > **下一轮 gate（已实现，待实跑）**：S0.6 同样必须带 `K_max`。除 `E[M]` 外，
+  > 必须同时报告 `entry_count_mean`、`fixed3_anchor_count_mean`、
+  > `current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full`、
+  > `ward_merge_count_mean`、`K_max_binding_rate` 和
+  > `gather_savings_fraction_vs_fixed3`。
+  > 选择配置时不能只按最低 `E[M]` 排名；`E[M]` 低但 entry 数暴涨，仍然是更贵的
+  > 配置。
+
+  推荐的 clipped gate 命令（worker 数按机器物理核心和实际吞吐调整，CPU 负载型任务
+  通常先用 64 比盲目开满更稳）：
+
+  ```bash
+  python unused/semantic_s0_needle_isolation.py \
+    --dump <stage0_manifest.json> \
+    --output <out_dir>/s0_3_kmax_ward.json \
+    --lambda_rel 1.0,0.875 \
+    --g_max inf,8192,4096 \
+    --k_max unclipped,15,16,32,64,128 \
+    --b_prime 8 \
+    --workers 64 \
+    --parallel_unit group \
+    --log_timing
+
+  python unused/semantic_s0_anchor_dedup.py \
+    --dump <stage0_manifest.json> \
+    --output <out_dir>/s0_6_kmax_ward_rel1.json \
+    --lambda_rel 1.0 \
+    --g_max inf,8192,4096 \
+    --l_block 0,1 \
+    --k_max unclipped,15,16,32,64,128 \
+    --b_prime 8 \
+    --workers 64 \
+    --parallel_unit group \
+    --log_timing
+
+  python unused/semantic_s0_anchor_dedup.py \
+    --dump <stage0_manifest.json> \
+    --output <out_dir>/s0_6_kmax_ward_rel0875.json \
+    --lambda_rel 0.875 \
+    --g_max inf,8192,4096 \
+    --l_block 0,1 \
+    --k_max unclipped,15,16,32,64,128 \
+    --b_prime 8 \
+    --workers 64 \
+    --parallel_unit group \
+    --log_timing
+  ```
+
+  实现审计状态：Ward ladder 合并已回归锁定为 `native+ejected` 整体按 `order` 排序；
+  S0.6 analyzer 的 best-by-layer baseline 已改为按 layer 聚合，不再被多 KV group 的
+  baseline 行覆盖。当前环境缺 `torch`，完整 pytest 未跑；目标脚本、analyzer、相关
+  回归和 toy dump 端到端已通过。
 - **S0.7**：若簇内 value 系统性作废的比例 > 30%，把 Γ 的 delta-rule 广义化提到
   Stage 1 范围内；否则记录结论并搁置 §2.4。
 - **S0.8**：分歧率不是一个单一标量，必须拆成三项分别报告，理由是它们诊断的是

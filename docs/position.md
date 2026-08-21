@@ -628,7 +628,11 @@ learned bias over fixed anchors
 - `p_mid` 是否值得保留，还是 `p_lo+p_hi` 足够。
 - `E[M]` 首轮实测约 2.0：三锚点没有退化成"几乎每个 entry 都需要 3 个不同锚点"，
   但 fixed-3 物理宽度仍明显超 vanilla，尤其 `lambda_rel=0.875` 的高召回配置更贵；
-  后续必须用真实 anchor-score 消融判断这笔表达力是否值回成本。
+  现在先跑 `K_max` + Ward clipped S0.6，确认生产预算下的 entry/fixed-3 成本和绑定率，
+  再用真实 anchor-score 消融判断这笔表达力是否值回成本。
+- `lambda_rel=1.0` 与 `0.875` 的最终选择：首轮 unclipped 结果支持 `1.0` 作默认主线、
+  `0.875` 作高召回候选；进入真实实现前必须看 S0.3 clipped gate 是否出现
+  `K_max` 绑定或 Ward 吞并 needle 小簇。
 - anchor 是否应由 entry span/phase coherence 自适应选择。
 - compressed slots 是否应采用频率裁剪或频率自适应 RoPE。
 - learned bias / learned anchor 是否能在少量 CPT 下显著优于固定锚点。
@@ -636,11 +640,10 @@ learned bias over fixed anchors
 
 ## P13. 推荐实验顺序
 
-1. 先做 CPU 离线 reference：实现 `merge_anchors`、`mid_anchor`、`dedup_anchors`、
-   `materialize_anchor_keys`。
-2. 在 dump 上比较 old post-RoPE mean vs `p_mid only` vs `p_lo+p_hi` vs 三锚点。
-3. 同时扫 `(g_max, ℓ_block)`，确认 segment 是否真的降低 entry span 和 anchor 误差。
-4. 如果三锚点有效，再进入生产 cache 实现。
+1. 在现有 dump 上跑 S0.3/S0.6 的 `K_max` + Ward clipped gate，先定 `lambda_rel`。
+2. 补 S0.2 口径②和 S0.7，确认 `K_eff`/supersession 这两条风险没有反转结论。
+3. 用真实 anchor-score 消融比较 `p_mid only`、`p_lo+p_hi`、三锚点和必要的自适应 anchor。
+4. clipped gate 与 anchor-score 都过线后，再进入生产 cache 实现。
 5. 如果三锚点不足，先试 learned bias over fixed anchors；不要直接跳到 learned compactor。
 
 ## P14. 术语速查
