@@ -183,7 +183,7 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
 | **S0.0** | **扫 `(g_max, ℓ_block)`（固定 `η=0`，理由见 `algorithm-spec.md` §5.3 的更正框——`η>0` 会让"纯语义聚类"端点混入未受控的时序 tie-break）：一端纯语义聚类，一端完全连续分段。看槽内内容方差与锚点跨度的联合曲线** | **全课题最根本的问题：收益来自语义分组本身，还是仅仅来自更好的分段边界？** |
 | S0.1 | §5.14 单测（含 mass bias **计数**守恒、`w=0` 恒等元）| 数学正确性，纯 CPU，不需要 dump |
 | S0.2 | **`K_eff(n)` 整条曲线**（n 从 1k 到 32k）+ 每簇 segment 数，拟合饱和/log/幂律。**测两个口径,不是一个**：①纯 DP-means（不含 `η`/`g_max`/`γ`，不设 `K_max` 上限，离线 CPU 分析，衡量"内容本身有多少语义多样性"，喂曲线形状判定）；②生产三路路由（`η`/`g_max`/`γ` 按生产默认值打开，只是不设 `K_max` 上限，衡量"这套算法实际会尝试开多少簇"，喂 `algorithm-spec.md` §5.6 的 `c` 决策规则）。两者都与生产路径里被 `K_max` 截断后的实际簇数（§5.6）是不同的量，后者永远 `≤ K_max` | 预算故事成不成立；外推到 1M；**并决定 §5.11 走 Fenwick 还是扁平贪心** |
-| S0.3 | needle 隔离率：所在簇的成员数分布（关键是 `≤ B′` 的比例）| §3 + §5.9 的核心机制成不成立 |
+| S0.3 | needle exact-entry 隔离率（主口径：最终 entry 只有一个真实成员）+ 小簇代理口径（所在簇成员数 `≤ B′`）| §3 + §5.9 的核心机制成不成立 |
 | S0.4 | 簇内 **key 方差**与 **value 方差**（两个都要）/ 现有位置槽内方差 | key 方差管分数侧，**value 方差管读出侧**，只测前者会高估收益（§11-D）|
 | S0.5 | entry 的 `(p_hi − p_lo)` 跨度分布，随 `(g_max, ℓ_block)` 变化 | 验证段机制确实压住了跨度 |
 | S0.6 | 锚点去重后的平均倍数 `E[M]` 与分布 | 值不值得为未来 gather/packed 实现投入（§4）——v1 本身的读出槽池是固定宽度，不受 `E[M]` 影响 |
@@ -194,7 +194,8 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
 - **S0.0**：如果"完全连续分段"已经拿到大部分收益，语义聚类这条线的边际价值有限，
   应当直接转向更简单的"语义分段"方案（工程量小一个量级、不需要 CPT）。
   **这个门开在最前面，就是为了避免在错误的复杂度上投入。**
-  > **首次实证结果（2026-08-21，首轮跑，样本/层覆盖有限，不是最终确认）**：
+  > **首次实证结果（2026-08-21，首轮跑，样本/层覆盖有限，不是最终确认；这是旧
+  > `B′=8` 小簇代理口径，不是新版 exact-entry 主口径）**：
   > 对比 `single_cluster_bprime_baseline`（同 ladder 机制、不聚类的对照组，
   > 即这道门真正要问的问题）,语义聚类的 key/value 方差中位数分别 ≈0.44×/
   > 0.71×,40/40 layer×group 全赢。**初步判定：不转向纯分段。** 完整数字、
@@ -221,8 +222,9 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   > 低估已验证区间内的需求），再用新增的"`K_max` 绑定率"这个 Stage 1/2 运行时
   > 指标校正；加大 `c` 也压不下绑定率时应该转向重新评估曲线形状，而不是继续
   > 调参。
-- **S0.3**：needle 落在成员数 `≤ B′` 的簇里的比例应显著高于随机基线。若 needle 大多
-  并入大簇，§3 的机制不成立，方案应就地停止。
+- **S0.3**：主看 `needle_token_exact_entry_rate` 是否显著高于等长随机 span 基线；
+  `needle_token_isolated_rate`（成员数 `≤ B′`）只作为小簇代理口径辅助解释。若 needle
+  大多已经和其它真实 token 合并进同一个 entry，§3 的机制不成立，方案应就地停止。
   > **首次实证结果（2026-08-21，首轮跑，样本/层覆盖有限，不是最终确认）**：
   > `stage0_dump/s0_3.csv` 覆盖 `lambda_rel={0.875,1.0,1.125}` 与
   > `g_max={inf,8192,4096,2048,1024,256}`。全部候选的 token-level lift
@@ -243,7 +245,9 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   > 可有轻微变化；但实测影响远小于 `lambda_rel`。
   >
   > **下一轮 gate（已实现，待实跑）**：S0.3 必须补 `K_max` + Ward clipped
-  > 口径。核心字段是 `K_max_binding_rate`、`needle_token_isolated_rate`、
+  > 口径。核心字段是 `needle_token_exact_entry_rate`、
+  > `random_token_exact_entry_rate`、`token_exact_entry_lift`、
+  > `K_max_binding_rate`、`needle_token_isolated_rate`、
   > `span_any_token_isolated_rate`、`needle_token_ward_touched_rate` 和
   > `needle_cluster_merged_by_ward_rate`（列名以 CSV 实际输出为准）。如果
   > `lambda_rel=0.875` 的高召回主要来自大量新簇，但在默认附近的 `K_max=15/16`
@@ -298,7 +302,7 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
     --lambda_rel 1.0,0.875 \
     --g_max inf,8192,4096 \
     --k_max unclipped,15,16,32,64,128 \
-    --b_prime 8 \
+    --b_prime 128 \
     --workers 64 \
     --parallel_unit group \
     --log_timing
@@ -310,7 +314,7 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
     --g_max inf,8192,4096 \
     --l_block 0,1 \
     --k_max unclipped,15,16,32,64,128 \
-    --b_prime 8 \
+    --b_prime 128 \
     --workers 64 \
     --parallel_unit group \
     --log_timing
@@ -322,7 +326,7 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
     --g_max inf,8192,4096 \
     --l_block 0,1 \
     --k_max unclipped,15,16,32,64,128 \
-    --b_prime 8 \
+    --b_prime 128 \
     --workers 64 \
     --parallel_unit group \
     --log_timing
@@ -1081,7 +1085,7 @@ Stage 2 有信号后再投入。v3 没有需要 warmup 的新标量（v2 的 `κ
 | **`(g_max, ℓ_block)`** | 纯语义 → 完全分段 | **语义分组 vs 分段边界，谁贡献大？（S0.0 的 eval 版）** |
 | **query 位置** | prompt 尾部 / 中部 / 前置 | **区分本方案与 eviction 类方法的关键设定**（§9-A）——尾部 query 是 retrieval-head 类方法的最佳工况。**这一行是独立的 eval-time 测量，不是 S0.8 3b 的延伸**——3b 只用固定的尾部 `tail_query_count` 窗口，其 <5% 决策门不覆盖、也不能借用来回答中部/前置 query 的表现，两者结论不互相代入 |
 | `K_max` | 1 / 4 / 16 / 64 | 语义分组本身值多少分？**`K_max=1` 是单簇消融参考点，不是现有 LogKV 的数值锚点**——即使实现完全正确也不预期复现现有 LogKV 的 0.1716/0.0827（`algorithm-spec.md` §5.18"K_max=1 是退化边界"一节），正确性检验走 `anchor_mode=z` 的 CPU 单测，不在这张表里。**覆盖默认值时要连带重算 `L_alloc`**（§5.6）|
-| `K:B′` 分配 | 32×4 / 16×8 / 8×16 | 语义分辨率 vs 时序分辨率，总预算固定 |
+| `K:B′` 分配 | 32×64 / 16×128 / 8×256 | 语义分辨率 vs 时序分辨率，总 level-0 exact 预算约 2k |
 | `anchor_mode` | `lo_hi_mid` / `lo_hi` / `mid` / `z` | 锚点表示 vs v2 的 z 统计量 |
 | `λ_rel` | 0.5 – 2.0 | needle 隔离与簇纯度的平衡点 |
 | `λ`（mass bias）| 0 / 1 | 原始 vanilla `log(w)` 那部分计数质量补偿开/关，值不值——`−log(M)` 这个锚点展开候选数校正项不受这个开关影响，两档下都无条件生效（§2.3），扫这一行不会像旧公式那样连带改变 anchor-count 校正的行为 |

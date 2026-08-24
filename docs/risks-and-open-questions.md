@@ -15,8 +15,8 @@
 |---|---|---|
 | **key 空间未必是语义空间**（§2.5，最根本）| 对句法头/位置头，前提不成立 | per-KV-group 聚类下自动退化为 no-op；Stage 0 的聚类/路由统计必须逐 (layer, KV group) 报告，注意力质量统计（`attn_mass_by_dist` 等）逐 (layer, query head) 报告——两档粒度不同，见 §2.5 的更正框 |
 | **`(g_max, ℓ_block)` 选错** | 要么跨度失控，要么语义分组白做 | S0.0 是最高优先级实验 |
-| **`λ_rel` 敏感** | needle 并入大簇，机制失效；阈值收紧又会推高簇数/entry 数 | S0.3 首轮已证实语义信号成立但存在召回-成本 tradeoff：`lambda_rel=1.0` 作默认主线，`0.875` 作高召回候选；最终选择必须过 S0.3/S0.6 的 `K_max` + Ward clipped gate |
-| **`K_max` 绑定后 Ward 吞并 needle 小簇** | unclipped 路由看起来能捞针，但生产预算一绑定，小簇被 Ward 反复合并，§3 机制失效 | 已实现 S0.3 clipped 探针；主扫描必须报告 `K_max_binding_rate`、`needle_token_ward_touched_rate`、`needle_cluster_merged_by_ward_rate`，并按 `k_max={15,16,32,64,128}` 比较 |
+| **`λ_rel` 敏感** | needle 并入大簇或被过早压缩，机制失效；阈值收紧又会推高簇数/entry 数 | S0.3 首轮已证实语义信号成立但存在召回-成本 tradeoff：`lambda_rel=1.0` 作默认主线，`0.875` 作高召回候选；最终选择必须过 S0.3/S0.6 的 `K_max` + Ward clipped gate。新版 gate 主看 `needle_token_exact_entry_rate` / `token_exact_entry_lift`，旧 `needle_token_isolated_rate` 只作小簇 proxy |
+| **`K_max` 绑定后 Ward 吞并 needle 小簇** | unclipped 路由看起来能捞针，但生产预算一绑定，小簇被 Ward 反复合并，§3 机制失效 | 已实现 S0.3 clipped 探针；主扫描必须报告 `K_max_binding_rate`、`needle_token_ward_touched_rate`、`needle_cluster_merged_by_ward_rate`，并按 `k_max={15,16,32,64,128}` 比较；同时看 exact-entry 指标确认 needle 是否最终仍未被压缩 |
 | **按 key 聚类不保证 value 同质**（§11-D）| 分数侧准了但读出侧仍 smear，收益打对折 | S0.4 必须同时测 value 方差 |
 | **早期路由错误不可恢复**（§5.6）| 只合并从不分裂，冷启动的错误永久留存 | `γ` 遗忘因子缓解 centroid 漂移；冷启动方案待定（§13-F）|
 | **锚点展开撑爆读出槽池** | 计算量和峰值内存**确定**超基线（`dedup_anchors` 固定 `(...,S,3)` 无 gather，不是 S0.6 测出来才知道，见 §4）；阈值收紧会进一步推高 entry/fixed3 宽度 | v1 现状即如此，无缓解；S0.6 只衡量未来 gather/packed 优化的收益上限（E[M]），不是"是否超基线"的判据。首轮结果：`lambda_rel=1.0` 的 fixed3 物理宽度约 1.96–2.55× vanilla full，`0.875` 约 2.87–3.83×；下一步用 clipped S0.6 同时看 `entry_count_mean`、`ward_merge_count_mean`、`K_max_binding_rate` 和 `gather_savings_fraction_vs_fixed3` |
@@ -235,6 +235,10 @@ CPT 分布漂移、还是实现 bug。另一分支有 D1 自检那种在线诊�
 这个选项，窗口是唯一能保证精确的地方。**新设计下这个比例没有理由不变。** 提高 `B′`
 还直接抬高 §5.9 的无损阈值，所以应该把 **`recent_size : K_max : B′` 当作一个三方
 分配整体扫**，而不是只扫 `K:B′`。
+
+当前 Stage-0 默认已从旧 smoke-test 的 `B′=8` 调到 `B′=128`：在 `K_max=16/32` 下，
+所有簇合计 level-0 exact 容量约 2k/4k，更接近原 LogKV 32k 配置的精确/压缩槽预算量级。
+如果扫到更大的 `K_max`，应同时考虑 `B′` 下调以固定总 exact 预算。
 
 ### 13.2 分辨率的分配曲线 `B′_ℓ`（纯离线可测，可独立成文）
 

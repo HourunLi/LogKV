@@ -13,6 +13,7 @@ _SPEC.loader.exec_module(_MODULE)
 
 NeedleIsolationAccumulator = _MODULE.NeedleIsolationAccumulator
 _draw_random_intervals = _MODULE._draw_random_intervals
+_exact_entry_token_mask = _MODULE._exact_entry_token_mask
 _groups_from_key_scale = _MODULE._groups_from_key_scale
 parse_lambda_rel_list = _MODULE.parse_lambda_rel_list
 _process_record_task = _MODULE._process_record_task
@@ -47,21 +48,50 @@ def test_surviving_needle_intervals_supports_old_original_token_fields() -> None
 def test_accumulator_reports_token_and_span_isolation_against_b_prime() -> None:
     cluster_ids = np.asarray([0, 0, 1, 1, 1, 2, 2], dtype=np.int32)
     cluster_sizes = [2, 3, 2]
+    exact_entry_mask = np.asarray([True, False, True, False, False, False, True], dtype=bool)
     acc = NeedleIsolationAccumulator(b_prime=2)
 
     acc.add_route_meta(route=SimpleNamespace(cluster_count=3, segment_count=4), sh_source="calibrated")
-    acc.add_intervals(intervals=[(0, 3), (5, 7)], cluster_ids=cluster_ids, cluster_sizes=cluster_sizes)
-    acc.add_random_intervals(intervals=[(2, 5)], cluster_ids=cluster_ids, cluster_sizes=cluster_sizes)
+    acc.add_intervals(
+        intervals=[(0, 3), (5, 7)],
+        cluster_ids=cluster_ids,
+        cluster_sizes=cluster_sizes,
+        exact_entry_mask=exact_entry_mask,
+    )
+    acc.add_random_intervals(
+        intervals=[(2, 5)],
+        cluster_ids=cluster_ids,
+        cluster_sizes=cluster_sizes,
+        exact_entry_mask=exact_entry_mask,
+    )
     row = acc.finalize()
 
     assert row["needle_token_count"] == 5
     assert row["needle_token_isolated_count"] == 4
     assert row["needle_token_isolated_rate"] == 0.8
+    assert row["needle_token_exact_entry_count"] == 3
+    assert row["needle_token_exact_entry_rate"] == 0.6
     assert row["span_all_tokens_isolated_count"] == 1
     assert row["span_any_token_isolated_count"] == 2
+    assert row["span_all_tokens_exact_entry_count"] == 0
+    assert row["span_any_token_exact_entry_count"] == 2
     assert row["random_token_isolated_count"] == 0
+    assert row["random_token_exact_entry_count"] == 1
+    assert row["random_token_exact_entry_rate"] == 1 / 3
     assert row["random_span_all_tokens_isolated_count"] == 0
     assert row["cluster_size_quantiles"]["p50"] == 2.0
+
+
+def test_exact_entry_token_mask_marks_only_single_real_member_entries() -> None:
+    entries = [
+        SimpleNamespace(members=[0]),
+        SimpleNamespace(members=[1, 2]),
+        SimpleNamespace(members=[3]),
+        SimpleNamespace(members=[]),
+        SimpleNamespace(members=[99]),
+    ]
+
+    assert _exact_entry_token_mask(entries, token_count=5).tolist() == [True, False, False, True, False]
 
 
 def test_draw_random_intervals_preserves_lengths_and_bounds() -> None:

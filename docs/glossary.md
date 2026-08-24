@@ -44,7 +44,7 @@ cache（每 layer 一个）
 | 符号 | 含义 | Qwen3-1.7B 取值 |
 |---|---|---|
 | **`B`** | ⚠️ **重载**：张量 shape 注释 `(B,G,S,d)` 里是 **batch size**；构造函数参数 `B`、`self.B`、CLI `--log_kv_B`、`compact` docstring 里的 "B-slot block" 是**每层 entry 数** | batch 通常 1~8；entry 数默认 **512**（现有方案）|
-| **`B′`** | 设计文档专用，就是上面那个"每层 entry 数"，**改名只为避免和 batch 撞车** | 新方案默认 **8** |
+| **`B′`** | 设计文档专用，就是上面那个"每层 entry 数"，**改名只为避免和 batch 撞车** | 当前 Stage-0 默认 **128**；旧 **8** 只作为 smoke-test 紧预算或历史反例 |
 | **`G`** | KV 头数 = `n_query_groups`。**不是 query 头数** | **8** |
 | `nh` | query 头数 = `n_head` | 16 |
 | `rf` | `nh / G`，几个 query 头共享一个 KV 头。共享 KV 头的 query 头**必然共享同一套簇** | 2 |

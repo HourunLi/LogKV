@@ -94,9 +94,19 @@ def _needle_row(
     needle_total: int,
     random_iso: int,
     random_total: int,
+    exact_iso: int | None = None,
+    random_exact: int | None = None,
     span_all_iso: int = 1,
     random_span_all_iso: int = 0,
+    span_all_exact: int | None = None,
+    random_span_all_exact: int | None = None,
 ) -> dict:
+    exact_iso = needle_iso if exact_iso is None else exact_iso
+    random_exact = random_iso if random_exact is None else random_exact
+    span_all_exact = span_all_iso if span_all_exact is None else span_all_exact
+    random_span_all_exact = random_span_all_iso if random_span_all_exact is None else random_span_all_exact
+    exact_rate = exact_iso / needle_total
+    random_exact_rate = random_exact / random_total
     row = {
         "g_max": g_max,
         "sample_groups": 1,
@@ -105,21 +115,38 @@ def _needle_row(
         "needle_token_count": needle_total,
         "needle_token_isolated_count": needle_iso,
         "needle_token_isolated_rate": needle_iso / needle_total,
+        "needle_token_exact_entry_count": exact_iso,
+        "needle_token_exact_entry_rate": exact_rate,
         "span_all_tokens_isolated_count": span_all_iso,
         "span_all_tokens_isolated_rate": span_all_iso,
+        "span_all_tokens_exact_entry_count": span_all_exact,
+        "span_all_tokens_exact_entry_rate": span_all_exact,
         "span_any_token_isolated_count": 1 if needle_iso else 0,
         "span_any_token_isolated_rate": 1.0 if needle_iso else 0.0,
+        "span_any_token_exact_entry_count": 1 if exact_iso else 0,
+        "span_any_token_exact_entry_rate": 1.0 if exact_iso else 0.0,
         "random_span_count": 1,
         "random_token_count": random_total,
         "random_token_isolated_count": random_iso,
         "random_token_isolated_rate": random_iso / random_total,
+        "random_token_exact_entry_count": random_exact,
+        "random_token_exact_entry_rate": random_exact_rate,
         "random_span_all_tokens_isolated_count": random_span_all_iso,
         "random_span_all_tokens_isolated_rate": random_span_all_iso,
+        "random_span_all_tokens_exact_entry_count": random_span_all_exact,
+        "random_span_all_tokens_exact_entry_rate": random_span_all_exact,
         "random_span_any_token_isolated_count": 1 if random_iso else 0,
         "random_span_any_token_isolated_rate": 1.0 if random_iso else 0.0,
+        "random_span_any_token_exact_entry_count": 1 if random_exact else 0,
+        "random_span_any_token_exact_entry_rate": 1.0 if random_exact else 0.0,
         "token_isolation_lift": (needle_iso / needle_total) / (random_iso / random_total),
+        "token_exact_entry_lift": None if random_exact_rate == 0 else exact_rate / random_exact_rate,
         "span_all_tokens_isolation_lift": None if random_span_all_iso == 0 else span_all_iso / random_span_all_iso,
+        "span_all_tokens_exact_entry_lift": (
+            None if random_span_all_exact == 0 else span_all_exact / random_span_all_exact
+        ),
         "span_any_token_isolation_lift": 1.0 if random_iso else None,
+        "span_any_token_exact_entry_lift": 1.0 if random_exact else None,
         "cluster_size_mean": 2.0,
         "cluster_size_quantiles": {"p50": 2.0, "p90": 3.0, "p99": 4.0},
         "cluster_size_max": 5,
@@ -338,6 +365,7 @@ def test_build_needle_analysis_ranks_by_isolation_lift_and_reaggregates_layer_sc
 
     assert [row["g_max"] for row in analysis["config_rankings"]] == ["256", "inf"]
     assert [row["lambda_rel"] for row in analysis["config_rankings"]] == [1.0, 1.0]
+    assert analysis["config_rankings"][0]["token_exact_entry_lift"] == 3.0
     assert analysis["config_rankings"][0]["token_isolation_lift"] == 3.0
     assert [row["g_max"] for row in analysis["best_by_layer"]] == ["256", "inf"]
 
@@ -346,6 +374,41 @@ def test_build_needle_analysis_ranks_by_isolation_lift_and_reaggregates_layer_sc
     assert scoped["config_source"] == "by_layer_group_count_aggregate"
     assert [row["g_max"] for row in scoped["config_rankings"]] == ["inf", "256"]
     assert scoped["config_rankings"][0]["needle_token_isolated_rate"] == 1.0
+
+
+def test_build_needle_analysis_prefers_exact_entry_lift_over_small_cluster_proxy() -> None:
+    payload = _needle_payload()
+    payload["overall_by_config"] = [
+        _needle_row(
+            "small-wins",
+            None,
+            None,
+            needle_iso=4,
+            needle_total=4,
+            random_iso=1,
+            random_total=4,
+            exact_iso=1,
+            random_exact=1,
+        ),
+        _needle_row(
+            "exact-wins",
+            None,
+            None,
+            needle_iso=2,
+            needle_total=4,
+            random_iso=1,
+            random_total=4,
+            exact_iso=3,
+            random_exact=1,
+        ),
+    ]
+    payload["by_layer_group"] = []
+
+    analysis = build_needle_analysis(payload)
+
+    assert [row["g_max"] for row in analysis["config_rankings"]] == ["exact-wins", "small-wins"]
+    assert analysis["config_rankings"][0]["token_exact_entry_lift"] == 3.0
+    assert analysis["config_rankings"][1]["token_isolation_lift"] == 4.0
 
 
 def test_build_needle_analysis_keeps_lambda_rel_as_a_config_axis() -> None:
@@ -418,7 +481,8 @@ def test_write_needle_csv_persists_ranked_needle_fields(tmp_path: Path) -> None:
         fieldnames = reader.fieldnames
         rows = list(reader)
 
-    assert fieldnames is not None and "token_isolation_lift" in fieldnames
+    assert fieldnames is not None and "token_exact_entry_lift" in fieldnames
+    assert "token_isolation_lift" in fieldnames
     assert rows[0]["rank"] == "1"
     assert rows[0]["lambda_rel"] == "1.0"
     assert rows[0]["g_max"] == "256"

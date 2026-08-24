@@ -13,7 +13,7 @@ Example:
       --g_max inf,8192,4096,2048,1024,256 \
       --k_max unclipped,16,32,64,128 \
       --l_block 0,1,2,3 \
-      --b_prime 8 \
+      --b_prime 128 \
       --workers 8
 """
 
@@ -45,6 +45,7 @@ sys.modules[_S0_SPEC.name] = _S0
 _S0_SPEC.loader.exec_module(_S0)
 
 OfflineEntry = _S0.OfflineEntry
+DEFAULT_SEMANTIC_B_PRIME = _S0.DEFAULT_SEMANTIC_B_PRIME
 format_g_max = _S0.format_g_max
 format_k_max = _S0.format_k_max
 load_manifest = _S0.load_manifest
@@ -802,7 +803,16 @@ def main() -> None:
         ),
     )
     parser.add_argument("--seg_forget", type=float, default=0.5)
-    parser.add_argument("--b_prime", type=int, default=8)
+    parser.add_argument(
+        "--b_prime",
+        type=int,
+        default=DEFAULT_SEMANTIC_B_PRIME,
+        help=(
+            "Per-cluster semantic ladder level capacity. Default 128 gives roughly 2k total "
+            "level-0 exact capacity at K_max=16 and 4k at K_max=32; the old value 8 was "
+            "only a tight smoke-test budget."
+        ),
+    )
     parser.add_argument("--vanilla_B", type=int, default=512)
     parser.add_argument("--vanilla_recent_size", type=int, default=1024)
     parser.add_argument("--layers", help="Optional comma-separated layer filter")

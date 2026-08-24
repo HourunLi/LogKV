@@ -30,7 +30,7 @@
 `experiments.md` 的 Stage 0 决策门；**看不懂某个词或符号就查
 `glossary.md`**（尤其 `B` 在代码里有两个含义这个坑）。
 
-## 0. 现状速览（2026-08-21）
+## 0. 现状速览（2026-08-24）
 
 **这是什么**：LogKV 现有压缩机制（`litgpt/log_kv_cache.py`）按**位置**做 Fenwick 树式
 分层压缩——固定 2:1 合并，越老的 token 槽越宽、压得越狠。已验证的结论（另一分支的
@@ -62,9 +62,11 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 S0.0/S0.3/S0.6 分析工具链已落地。** 首批真实 dump 已给出三条结论：S0.0 支持继续
 走聚类路线；S0.3 证明 needle 隔离有稳定语义信号但还不能完整隔离整个 span；
 S0.6 说明 `lambda_rel=0.875` 的召回更高但 entry/fixed-3 成本明显更贵。当前最新
-进展是：**S0.3/S0.6 已补上 `K_max` + Ward clipped 探针，代码已过静态和合成回归检查，
-下一步要实跑这道 gate 来决定 `lambda_rel=1.0` 还是 `0.875` 能进入生产实现。**
-Stage 1（生产实现）尚未开始。
+进展是：**S0.3/S0.6 已补上 `K_max` + Ward clipped 探针，且 Stage-0 语义 ladder 的
+默认 `B′` 从旧 smoke-test 的 8 调到 128；S0.3 的主判据也从“小簇成员数 `≤B′`”
+改成“最终 replay 的 ladder entry 仍只有一个真实 token”。** 旧小簇隔离率仍输出，
+但只作为 proxy/解释项。下一步要用这个新版口径实跑 clipped gate 来决定
+`lambda_rel=1.0` 还是 `0.875` 能进入生产实现。Stage 1（生产实现）尚未开始。
 
 > **务必读清楚这句话字面的意思，不要被下面大段的伪代码/公式/`raise
 > ValueError(...)` 片段误导，也不要把"Stage 0 有代码了"误读成"设计已经在
@@ -94,10 +96,12 @@ Stage 1（生产实现）尚未开始。
 **下一步（按优先级）**：
 1. **实跑 S0.3/S0.6 的 `K_max` + Ward clipped gate。** 这是当前最高优先级：同一批
    dump 上扫 `lambda_rel={1.0,0.875}`、`g_max={inf,8192,4096}`、`k_max={unclipped,15,16,32,64,128}`。
-   S0.3 看 `needle_token_isolated_rate`、`span_any_token_isolated_rate`、Ward 是否触碰/
-   合并 needle span、以及 `K_max_binding_rate`；S0.6 看 fixed-3 物理宽度、`E[M]`、
-   `entry_count_mean`、Ward merge 数和绑定率。命令与判定字段见
-   `docs/experiments.md` 的 S0.3/S0.6 决策门。
+   S0.3 主看 `needle_token_exact_entry_rate`、`random_token_exact_entry_rate`、
+   `token_exact_entry_lift`，再用 `needle_token_isolated_rate` / `span_any_token_isolated_rate`
+   解释旧小簇 proxy，并同时看 Ward 是否触碰/合并 needle span、以及
+   `K_max_binding_rate`；S0.6 看 fixed-3 物理宽度、`E[M]`、`entry_count_mean`、
+   Ward merge 数和绑定率。命令与判定字段见 `docs/experiments.md` 的 S0.3/S0.6
+   决策门。
 2. **用这道 gate 选择进入真实实现的 `lambda_rel`。** 默认假设仍是 `lambda_rel=1.0`；
    只有当 `0.875` 的 needle 召回增益足以覆盖 S0.6 成本、且 `K_max` 绑定/needle Ward
    合并不失控，才把它升为主线。`g_max` 暂不作为核心旋钮，只保留 `inf` 和少量跨度
@@ -375,8 +379,9 @@ v_slot   = ( v_needle + Σ_{j≠n} v_j ) / w
 **所有**既有 centroid 的距离都 `> λ_new`——这比路由本身的 novelty 判据更强，novelty
 判据只要求 needle 到统一代价 argmin 赢家 `c*` 的语义距离 `> λ_new`（§5.3），但既然
 premise 保证了"距离所有簇都远"，无论 `c*` 落在哪个簇上，novelty 判据都必然成立，
-不需要关心 `c*` 具体是谁。needle 因此自成一簇 ⇒ 成员数 ≤ B′ ⇒ **ladder 永不填满 ⇒
-entry 永不合并**（§5.9）；且 `p_lo = p_hi = p_mid` ⇒ `M = 1`：
+不需要关心 `c*` 具体是谁。理想情况下 needle 因此自成一簇，并在最终 ladder replay
+后仍是**单真实成员 entry**（Stage-0 新主口径 `needle_token_exact_entry_rate`）；此时
+`p_lo = p_hi = p_mid` ⇒ `M = 1`：
 
 ```
 score = scale·(q · k_needle) + λ·log(1) − log(1) = scale·(q · k_needle)   ← 与稠密逐位相同
@@ -398,7 +403,8 @@ value = v_needle                                                          ← �
 > 语义分离度真实超过阈值（下面"失败模式"那一行）；②`K_max` 不能绑定——K 满时 Ward
 > 会强制合并，即使 needle 当初成功自成一簇，也可能在后续被合并进别的簇、失去精确性
 > （§5.6"小簇合并零损失是有条件的暂态性质"更正框，multi-needle+sink 是最坏情形）；
-> ③needle 自身簇的成员数必须保持 `≤ B′`（这条通常由①②共同保证，很少独立失效）。
+> ③needle 在最终重放出的 entry 里必须仍是单真实成员；`needle_token_isolated_rate`
+> 里的"簇成员数 `≤B′`"只是这条的早期小簇代理，真实 gate 以 exact-entry 口径为准。
 > **"分数/读出/位置逐位恢复稠密"这个计算本身**（给定 needle 确实是孤立的 `M=1`
 > 单点簇）不依赖任何超参，是纯代数事实；但"needle 能不能达到、保持这个状态"依赖
 > 上面三条，三者缺一，退化到不同程度的稀释。
@@ -577,7 +583,27 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
-- **2026-08-21（最新）｜S0.3/S0.6 已补上 `K_max` + Ward clipped 探针，当前 gate
+- **2026-08-24（最新）｜Stage-0 语义 ladder 的默认 `B′` 从 8 调到 128，S0.3 主口径
+  从“小簇代理”改成 exact-entry 隔离。** 动机：原 LogKV 在 32k 下有约
+  `recent_size=1024` 的精确窗口和 `B=512` 的压缩前缀宽度；语义分簇后若
+  `K_max≈16/32`，所有簇合计的第一层未压缩容量应在 1k–4k 量级，而 `B′=8`
+  会把 ladder 堆得过高、32k 下压缩过重，只适合 smoke-test。
+  ① `litgpt/semantic_s0.py` 新增 `DEFAULT_SEMANTIC_B_PRIME=128`，S0.0/S0.3/S0.6
+  三个 Stage-0 入口默认跟随它；`K_max=16` 时总 level-0 exact 容量约 2k，
+  `K_max=32` 时约 4k。若实验要固定总 exact 预算，`K_max=64/128` 应配套把
+  `B′` 降到 64/32，而不是继续照搬 128。
+  ② S0.3 新增 exact-entry 指标：对每条路由用 `simulate_segment_ladders(...,
+  l_block=0)` 重放最终 ladder，只有最终 entry 的真实成员数恰为 1 的 token 才算
+  `needle_token_exact_entry_rate`。旧的 `needle_token_isolated_rate`（所在簇成员数
+  `≤B′`）仍保留，但只作为小簇 proxy；因为簇小不等于最终 entry 一定未压缩，
+  尤其在 Ward 合并和 bounded carry 后更不能混着读。
+  ③ `unused/semantic_s0_analyze.py`、CSV 字段、命令行摘要和 `docs/experiments.md` /
+  `docs/algorithm-spec.md` 已同步：新版 JSON 按 `token_exact_entry_lift` 排名；
+  旧 JSON 缺 exact 字段时自动回退到小簇 proxy。当前环境验证：目标文件
+  `py_compile`、`git diff --check`、S0.3/analyze 纯 Python 回归和 toy dump 分析均通过；
+  完整 pytest 仍因系统环境缺 `torch` 卡在 `tests/conftest.py`。
+
+- **2026-08-21｜S0.3/S0.6 已补上 `K_max` + Ward clipped 探针，当前 gate
   从"unclipped 首轮读数"升级为"预算绑定后是否仍能捞针"。** 动机：首轮 S0.3
   只回答了 unclipped 路由下 needle 是否有语义隔离信号，S0.6 只给了 entry/anchor
   成本账；真正进入生产实现前还必须知道 `K_max` 撞满后的 Ward 合并是否会吞掉
@@ -648,15 +674,18 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
   semantic_s0_anchor_dedup.py`（S0.6），各自配 `tests/test_semantic_s0_
   needle_isolation.py`/`tests/test_semantic_s0_anchor_dedup.py`。逐行核对
   后的结论：
-  ① **S0.3 的核心指标正确**：`_cluster_sizes_for_interval` 查的是
+  ① **S0.3 的旧小簇代理指标在当时口径下是自洽的；后续 2026-08-24 已降级为
+  proxy，不再是主判据。** `_cluster_sizes_for_interval` 查的是
   `route.cluster_sizes`（即 `n_total`，整个序列处理完之后的最终簇成员数，
   不是 γ 衰减的 `n_eff`），`isolated = size <= b_prime` 精确对应 CLAUDE.md
   §3 的论证"成员数 ≤ B′ ⇒ ladder 永不填满 ⇒ entry 永不合并"；random 基线用
   同一个 `route`（同一次 DP-means 结果）在同一 prompt 里抽等长随机 span,
   是真正的 apples-to-apples 对照，不是跨路由比较。`l_block` 不参与
   `route_dpmeans_segments`（`cluster_sizes` 只由 k/g_max/gamma 决定,`l_block`
-  只影响 `simulate_segment_ladders` 的填充对齐,S0.3 从不调用它),工具只扫
-  `g_max` 不扫 `l_block` 是正确的设计,不是遗漏。
+  只影响 `simulate_segment_ladders` 的填充对齐）。后续更正点是：生产上真正关心的是
+  needle 是否在最终 replay 后仍是单真实成员 entry，因此新版 S0.3 会实际重放 ladder
+  并输出 `needle_token_exact_entry_rate` / `token_exact_entry_lift`，旧字段只用于解释
+  “语义小簇信号”。
   ② **S0.6 的锚点数学与 CLAUDE.md §2.2 逐位一致**：`_mid_anchor` 用的
   round-half-up 整数公式 `(2·sum_wp + w) // (2·w)` 、`clamp(p_lo, p_hi)`
   跟正文公式对上,去重用 `sorted({p_lo,p_mid,p_hi})` 的 set 语义,`m` 为
