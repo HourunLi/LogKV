@@ -17,6 +17,9 @@ from typing import Any, Iterable
 import numpy as np
 
 
+DEFAULT_SEMANTIC_B_PRIME = 128
+
+
 def parse_int_list(text: str | Iterable[int]) -> list[int]:
     if isinstance(text, str):
         return [int(x.strip()) for x in text.split(",") if x.strip()]
@@ -249,7 +252,7 @@ def route_single_cluster_bprime_ladder(token_count: int) -> RouteResult:
     for its semantic cells. That is a real, useful control -- but it must not
     be read as "the existing/vanilla LogKV" reference:
 
-    1. It runs at the sweep's ``b_prime`` (default 8), not the deployed
+    1. It runs at the sweep's ``b_prime`` (default 128), not the deployed
        vanilla config's ``log_kv_B`` (512, exp/qwen1.7b-32k/base.yaml).
     2. It has no recent-window carve-out at all (every token, including the
        most recent ones, goes through compaction), unlike vanilla's
@@ -995,7 +998,7 @@ def _simulate_route_event_ladders(
 def simulate_segment_ladders(
     route: RouteResult,
     *,
-    b_prime: int = 8,
+    b_prime: int = DEFAULT_SEMANTIC_B_PRIME,
     l_block: int = 1,
 ) -> tuple[list[OfflineEntry], dict[str, Any]]:
     if b_prime <= 0 or b_prime % 2 != 0:

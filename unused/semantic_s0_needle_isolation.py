@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """Run the SemanticLogKV S0.3 needle-isolation analysis on a Stage-0 dump.
 
-S0.3 asks whether the needle lands in a small semantic cluster. The decision
-gate in docs/experiments.md is the fraction of needle tokens/spans whose
-containing cluster has size <= B', compared with a same-length random-span
-baseline from the same prompt.
+S0.3 asks whether the needle remains exact after the semantic ladder replay,
+and also reports the older small-cluster proxy for comparison. The primary
+exact-entry metric counts a token as isolated when its final ladder entry has
+exactly one real member. The small-cluster proxy counts tokens whose containing
+cluster has size <= B'.
 
 Example:
     python unused/semantic_s0_needle_isolation.py \
@@ -13,7 +14,7 @@ Example:
       --g_max inf,8192,4096,2048,1024,256 \
       --lambda_rel 0.25,0.5,0.75,1.0 \
       --k_max unclipped,16,32,64,128 \
-      --b_prime 8 \
+      --b_prime 128 \
       --random_trials 100
 """
 
@@ -45,12 +46,14 @@ _S0_SPEC.loader.exec_module(_S0)
 
 format_g_max = _S0.format_g_max
 format_k_max = _S0.format_k_max
+DEFAULT_SEMANTIC_B_PRIME = _S0.DEFAULT_SEMANTIC_B_PRIME
 load_manifest = _S0.load_manifest
 manifest_base_dir = _S0.manifest_base_dir
 parse_g_max_list = _S0.parse_g_max_list
 parse_int_list = _S0.parse_int_list
 parse_k_max_list = _S0.parse_k_max_list
 route_dpmeans_segments = _S0.route_dpmeans_segments
+simulate_segment_ladders = _S0.simulate_segment_ladders
 
 
 def _wanted(values: str | None) -> set[int] | None:
@@ -185,13 +188,19 @@ class NeedleIsolationAccumulator:
         self.span_count = 0
         self.needle_token_count = 0
         self.needle_token_isolated = 0
+        self.needle_token_exact_entry = 0
         self.span_all_isolated = 0
         self.span_any_isolated = 0
+        self.span_all_exact_entry = 0
+        self.span_any_exact_entry = 0
         self.random_span_count = 0
         self.random_token_count = 0
         self.random_token_isolated = 0
+        self.random_token_exact_entry = 0
         self.random_span_all_isolated = 0
         self.random_span_any_isolated = 0
+        self.random_span_all_exact_entry = 0
+        self.random_span_any_exact_entry = 0
         self.needle_token_ward_merged = 0
         self.needle_token_ward_touched = 0
         self.span_any_ward_merged = 0
@@ -232,6 +241,7 @@ class NeedleIsolationAccumulator:
         intervals: list[tuple[int, int]],
         cluster_ids: np.ndarray,
         cluster_sizes: list[int],
+        exact_entry_mask: np.ndarray | None = None,
         ward_merged_mask: np.ndarray | None = None,
         ward_touched_mask: np.ndarray | None = None,
     ) -> None:
@@ -243,11 +253,15 @@ class NeedleIsolationAccumulator:
             if not sizes:
                 continue
             isolated = [size <= self.b_prime for size in sizes]
+            exact_hits = self._mask_hits(exact_entry_mask, start, end)
             self.span_count += 1
             self.needle_token_count += len(sizes)
             self.needle_token_isolated += sum(1 for value in isolated if value)
+            self.needle_token_exact_entry += sum(1 for value in exact_hits if value)
             self.span_all_isolated += int(all(isolated))
             self.span_any_isolated += int(any(isolated))
+            self.span_all_exact_entry += int(all(exact_hits))
+            self.span_any_exact_entry += int(any(exact_hits))
             self.cluster_size_values.extend(float(size) for size in sizes)
             merged_hits = self._mask_hits(ward_merged_mask, start, end)
             touched_hits = self._mask_hits(ward_touched_mask, start, end)
@@ -262,6 +276,7 @@ class NeedleIsolationAccumulator:
         intervals: list[tuple[int, int]],
         cluster_ids: np.ndarray,
         cluster_sizes: list[int],
+        exact_entry_mask: np.ndarray | None = None,
         ward_merged_mask: np.ndarray | None = None,
         ward_touched_mask: np.ndarray | None = None,
     ) -> None:
@@ -270,11 +285,15 @@ class NeedleIsolationAccumulator:
             if not sizes:
                 continue
             isolated = [size <= self.b_prime for size in sizes]
+            exact_hits = self._mask_hits(exact_entry_mask, start, end)
             self.random_span_count += 1
             self.random_token_count += len(sizes)
             self.random_token_isolated += sum(1 for value in isolated if value)
+            self.random_token_exact_entry += sum(1 for value in exact_hits if value)
             self.random_span_all_isolated += int(all(isolated))
             self.random_span_any_isolated += int(any(isolated))
+            self.random_span_all_exact_entry += int(all(exact_hits))
+            self.random_span_any_exact_entry += int(any(exact_hits))
             self.random_cluster_size_values.extend(float(size) for size in sizes)
             merged_hits = self._mask_hits(ward_merged_mask, start, end)
             touched_hits = self._mask_hits(ward_touched_mask, start, end)
@@ -289,13 +308,19 @@ class NeedleIsolationAccumulator:
         self.span_count += other.span_count
         self.needle_token_count += other.needle_token_count
         self.needle_token_isolated += other.needle_token_isolated
+        self.needle_token_exact_entry += other.needle_token_exact_entry
         self.span_all_isolated += other.span_all_isolated
         self.span_any_isolated += other.span_any_isolated
+        self.span_all_exact_entry += other.span_all_exact_entry
+        self.span_any_exact_entry += other.span_any_exact_entry
         self.random_span_count += other.random_span_count
         self.random_token_count += other.random_token_count
         self.random_token_isolated += other.random_token_isolated
+        self.random_token_exact_entry += other.random_token_exact_entry
         self.random_span_all_isolated += other.random_span_all_isolated
         self.random_span_any_isolated += other.random_span_any_isolated
+        self.random_span_all_exact_entry += other.random_span_all_exact_entry
+        self.random_span_any_exact_entry += other.random_span_any_exact_entry
         self.needle_token_ward_merged += other.needle_token_ward_merged
         self.needle_token_ward_touched += other.needle_token_ward_touched
         self.span_any_ward_merged += other.span_any_ward_merged
@@ -316,11 +341,17 @@ class NeedleIsolationAccumulator:
 
     def finalize(self) -> dict[str, Any]:
         token_rate = _rate(self.needle_token_isolated, self.needle_token_count)
+        exact_token_rate = _rate(self.needle_token_exact_entry, self.needle_token_count)
         random_token_rate = _rate(self.random_token_isolated, self.random_token_count)
+        random_exact_token_rate = _rate(self.random_token_exact_entry, self.random_token_count)
         span_all_rate = _rate(self.span_all_isolated, self.span_count)
+        span_all_exact_rate = _rate(self.span_all_exact_entry, self.span_count)
         random_span_all_rate = _rate(self.random_span_all_isolated, self.random_span_count)
+        random_span_all_exact_rate = _rate(self.random_span_all_exact_entry, self.random_span_count)
         span_any_rate = _rate(self.span_any_isolated, self.span_count)
+        span_any_exact_rate = _rate(self.span_any_exact_entry, self.span_count)
         random_span_any_rate = _rate(self.random_span_any_isolated, self.random_span_count)
+        random_span_any_exact_rate = _rate(self.random_span_any_exact_entry, self.random_span_count)
         needle_token_ward_merged_rate = _rate(self.needle_token_ward_merged, self.needle_token_count)
         needle_token_ward_touched_rate = _rate(self.needle_token_ward_touched, self.needle_token_count)
         span_any_ward_merged_rate = _rate(self.span_any_ward_merged, self.span_count)
@@ -337,10 +368,16 @@ class NeedleIsolationAccumulator:
             "needle_token_count": int(self.needle_token_count),
             "needle_token_isolated_count": int(self.needle_token_isolated),
             "needle_token_isolated_rate": token_rate,
+            "needle_token_exact_entry_count": int(self.needle_token_exact_entry),
+            "needle_token_exact_entry_rate": exact_token_rate,
             "span_all_tokens_isolated_count": int(self.span_all_isolated),
             "span_all_tokens_isolated_rate": span_all_rate,
             "span_any_token_isolated_count": int(self.span_any_isolated),
             "span_any_token_isolated_rate": span_any_rate,
+            "span_all_tokens_exact_entry_count": int(self.span_all_exact_entry),
+            "span_all_tokens_exact_entry_rate": span_all_exact_rate,
+            "span_any_token_exact_entry_count": int(self.span_any_exact_entry),
+            "span_any_token_exact_entry_rate": span_any_exact_rate,
             "cluster_size_mean": _mean(self.cluster_size_values),
             "cluster_size_quantiles": _quantiles(self.cluster_size_values),
             "cluster_size_max": max(self.cluster_size_values) if self.cluster_size_values else None,
@@ -348,10 +385,16 @@ class NeedleIsolationAccumulator:
             "random_token_count": int(self.random_token_count),
             "random_token_isolated_count": int(self.random_token_isolated),
             "random_token_isolated_rate": random_token_rate,
+            "random_token_exact_entry_count": int(self.random_token_exact_entry),
+            "random_token_exact_entry_rate": random_exact_token_rate,
             "random_span_all_tokens_isolated_count": int(self.random_span_all_isolated),
             "random_span_all_tokens_isolated_rate": random_span_all_rate,
             "random_span_any_token_isolated_count": int(self.random_span_any_isolated),
             "random_span_any_token_isolated_rate": random_span_any_rate,
+            "random_span_all_tokens_exact_entry_count": int(self.random_span_all_exact_entry),
+            "random_span_all_tokens_exact_entry_rate": random_span_all_exact_rate,
+            "random_span_any_token_exact_entry_count": int(self.random_span_any_exact_entry),
+            "random_span_any_token_exact_entry_rate": random_span_any_exact_rate,
             "needle_token_ward_merged_count": int(self.needle_token_ward_merged),
             "needle_token_ward_merged_rate": needle_token_ward_merged_rate,
             "needle_token_ward_touched_count": int(self.needle_token_ward_touched),
@@ -372,8 +415,11 @@ class NeedleIsolationAccumulator:
             "random_cluster_size_mean": _mean(self.random_cluster_size_values),
             "random_cluster_size_quantiles": _quantiles(self.random_cluster_size_values),
             "token_isolation_lift": _lift(token_rate, random_token_rate),
+            "token_exact_entry_lift": _lift(exact_token_rate, random_exact_token_rate),
             "span_all_tokens_isolation_lift": _lift(span_all_rate, random_span_all_rate),
+            "span_all_tokens_exact_entry_lift": _lift(span_all_exact_rate, random_span_all_exact_rate),
             "span_any_token_isolation_lift": _lift(span_any_rate, random_span_any_rate),
+            "span_any_token_exact_entry_lift": _lift(span_any_exact_rate, random_span_any_exact_rate),
             "cluster_count_mean": self.cluster_count_sum / denom,
             "segment_count_mean": self.segment_count_sum / denom,
             "new_cluster_attempt_count_mean": self.new_cluster_attempt_count_sum / denom,
@@ -425,6 +471,18 @@ def _draw_random_intervals(
             random_start = int(rng.integers(0, high_exclusive))
             out.append((random_start, random_start + length))
     return out
+
+
+def _exact_entry_token_mask(entries: list[Any], *, token_count: int) -> np.ndarray:
+    mask = np.zeros(int(token_count), dtype=bool)
+    for entry in entries:
+        members = [int(pos) for pos in getattr(entry, "members", [])]
+        if len(members) != 1:
+            continue
+        pos = int(members[0])
+        if 0 <= pos < int(token_count):
+            mask[pos] = True
+    return mask
 
 
 def _rng_for_record_group(*, seed: int, record_index: int, layer: int, group: int) -> np.random.Generator:
@@ -530,6 +588,7 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
             allow_fallback=bool(task["allow_fallback_sh"]),
         )
         route_cache: dict[tuple[float, str, str], Any] = {}
+        exact_entry_mask_cache: dict[tuple[float, str, str], np.ndarray] = {}
         random_intervals = _draw_random_intervals(
             intervals,
             token_count=int(k_group.shape[0]),
@@ -563,6 +622,11 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
                         )
                         route_elapsed = time.perf_counter() - route_started_at
                         route_cache[route_key] = route
+                    exact_entry_mask = exact_entry_mask_cache.get(route_key)
+                    if exact_entry_mask is None:
+                        entries, _ = simulate_segment_ladders(route, b_prime=b_prime, l_block=0)
+                        exact_entry_mask = _exact_entry_token_mask(entries, token_count=int(k_group.shape[0]))
+                        exact_entry_mask_cache[route_key] = exact_entry_mask
 
                     accs = [
                         overall.setdefault(route_key, NeedleIsolationAccumulator(b_prime=b_prime)),
@@ -580,6 +644,7 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
                             intervals=intervals,
                             cluster_ids=route.cluster_ids,
                             cluster_sizes=route.cluster_sizes,
+                            exact_entry_mask=exact_entry_mask,
                             ward_merged_mask=getattr(route, "ward_merged_token_mask", None),
                             ward_touched_mask=getattr(route, "ward_touched_token_mask", None),
                         )
@@ -587,6 +652,7 @@ def _process_record_task(task: dict[str, Any]) -> dict[str, Any]:
                             intervals=random_intervals,
                             cluster_ids=route.cluster_ids,
                             cluster_sizes=route.cluster_sizes,
+                            exact_entry_mask=exact_entry_mask,
                             ward_merged_mask=getattr(route, "ward_merged_token_mask", None),
                             ward_touched_mask=getattr(route, "ward_touched_token_mask", None),
                         )
@@ -650,26 +716,27 @@ def _fmt_num(value: float | int | None) -> str:
 def _print_summary(rows: list[dict[str, Any]], *, top: int) -> None:
     print("== S0.3 needle isolation ==")
     print(
-        "口径: needle token/span 所在 semantic cluster 的成员数 <= B'；"
-        "random 为同 prompt 等长随机 span。"
+        "口径: exact 表示 token 最终 ladder entry 只有一个真实成员；"
+        "small 表示旧代理口径 cluster size <= B'；random 为同 prompt 等长随机 span。"
     )
-    print("注意: 这是 cluster-level 判据，l_block 不参与路由；核心扫描轴是 lambda_rel 和 k_max。")
+    print("注意: exact entry 用 l_block=0 重放当前 S0.3 路由；核心扫描轴是 lambda_rel 和 k_max。")
     if not rows:
         print("no rows")
         return
     print(
-        "lambda  g_max  k_max      token_iso  random  lift  span_all  random  lift  "
-        "ward_merge  bind_rate  cluster_p50  cluster_p90  clusters  segments  n"
+        "lambda  g_max  k_max      exact  random  lift  small  random  lift  "
+        "span_exact  ward_merge  bind_rate  cluster_p50  clusters  n"
     )
     print(
-        "------  -----  ---------  ---------  ------  ----  --------  ------  ----  "
-        "----------  ---------  -----------  -----------  --------  --------  -"
+        "------  -----  ---------  -----  ------  ----  -----  ------  ----  "
+        "----------  ----------  ---------  -----------  --------  -"
     )
     ranked = sorted(
         rows,
         key=lambda row: (
+            -float(row.get("token_exact_entry_lift") or -1.0),
+            -float(row.get("needle_token_exact_entry_rate") or -1.0),
             -float(row.get("token_isolation_lift") or -1.0),
-            -float(row.get("needle_token_isolated_rate") or -1.0),
         ),
     )
     for row in ranked[: max(int(top), 1)]:
@@ -680,18 +747,17 @@ def _print_summary(rows: list[dict[str, Any]], *, top: int) -> None:
             f"{lambda_text.ljust(6)}  "
             f"{str(row['g_max']).ljust(5)}  "
             f"{str(row.get('k_max', 'unclipped')).ljust(9)}  "
+            f"{_fmt_pct(row.get('needle_token_exact_entry_rate')).rjust(5)}  "
+            f"{_fmt_pct(row.get('random_token_exact_entry_rate')).rjust(6)}  "
+            f"{_fmt_num(row.get('token_exact_entry_lift')).rjust(4)}  "
             f"{_fmt_pct(row.get('needle_token_isolated_rate')).rjust(9)}  "
             f"{_fmt_pct(row.get('random_token_isolated_rate')).rjust(6)}  "
             f"{_fmt_num(row.get('token_isolation_lift')).rjust(4)}  "
-            f"{_fmt_pct(row.get('span_all_tokens_isolated_rate')).rjust(8)}  "
-            f"{_fmt_pct(row.get('random_span_all_tokens_isolated_rate')).rjust(6)}  "
-            f"{_fmt_num(row.get('span_all_tokens_isolation_lift')).rjust(4)}  "
+            f"{_fmt_pct(row.get('span_all_tokens_exact_entry_rate')).rjust(10)}  "
             f"{_fmt_num(row.get('ward_merge_count_mean')).rjust(10)}  "
             f"{_fmt_pct(row.get('K_max_binding_rate')).rjust(9)}  "
             f"{_fmt_num(q.get('p50')).rjust(11)}  "
-            f"{_fmt_num(q.get('p90')).rjust(11)}  "
             f"{_fmt_num(row.get('cluster_count_mean')).rjust(8)}  "
-            f"{_fmt_num(row.get('segment_count_mean')).rjust(8)}  "
             f"{row.get('sample_groups')}"
         )
 
@@ -813,7 +879,16 @@ def main() -> None:
         ),
     )
     parser.add_argument("--seg_forget", type=float, default=0.5)
-    parser.add_argument("--b_prime", type=int, default=8)
+    parser.add_argument(
+        "--b_prime",
+        type=int,
+        default=DEFAULT_SEMANTIC_B_PRIME,
+        help=(
+            "Per-cluster semantic ladder level capacity. Default 128 gives roughly 2k total "
+            "level-0 exact capacity at K_max=16 and 4k at K_max=32, matching the deployed "
+            "LogKV 32k slot-budget scale much better than the old smoke-test value 8."
+        ),
+    )
     parser.add_argument("--layers", help="Optional comma-separated layer filter")
     parser.add_argument("--groups", help="Optional comma-separated KV-group filter")
     parser.add_argument("--random_trials", type=int, default=100)
@@ -862,8 +937,8 @@ def main() -> None:
         raise ValueError(f"--k_max {args.k_max!r} parsed to an empty list -- pass at least one value")
     if not (math.isfinite(args.seg_forget) and 0.0 <= args.seg_forget <= 1.0):
         raise ValueError(f"--seg_forget must be in [0, 1], got {args.seg_forget}")
-    if args.b_prime <= 0:
-        raise ValueError(f"--b_prime must be a positive integer, got {args.b_prime}")
+    if args.b_prime <= 0 or args.b_prime % 2 != 0:
+        raise ValueError(f"--b_prime must be a positive even integer, got {args.b_prime}")
     if args.random_trials < 0:
         raise ValueError(f"--random_trials must be >= 0, got {args.random_trials}")
     if args.workers <= 0:
@@ -998,7 +1073,7 @@ def main() -> None:
         by_lg_rows.append(row)
 
     result = {
-        "version": 1,
+        "version": 2,
         "kind": "semantic_logkv_s0_3_needle_isolation",
         "source_manifest": str(Path(args.dump)),
         "config": {
@@ -1006,6 +1081,8 @@ def main() -> None:
             "lambda_rel_values": lambda_rel_values,
             "seg_forget": args.seg_forget,
             "b_prime": args.b_prime,
+            "exact_entry_metric": "token is exact if its replayed ladder entry has exactly one real member",
+            "exact_entry_l_block": 0,
             "g_max": [format_g_max(x) for x in g_values],
             "k_max": [format_k_max(x) for x in k_max_values],
             "layers": None if layer_filter is None else sorted(layer_filter),

@@ -11,9 +11,9 @@ to inspect directly. This script turns them into compact reports:
   * span/entry-count tradeoff signals for S0.5;
   * optional layer-wise winners and CSV/JSON summary exports.
   * S0.3 needle isolation:
-    top ``(lambda_rel, g_max, k_max)`` configs by needle isolation lift over
-    same-length random spans, plus Ward/K_max binding probes, optional
-    per-layer winners and CSV export.
+    top ``(lambda_rel, g_max, k_max)`` configs by exact-entry needle isolation
+    lift over same-length random spans, plus the older small-cluster proxy,
+    Ward/K_max binding probes, optional per-layer winners and CSV export.
   * S0.6 anchor dedup:
     top semantic ``(g_max, l_block, k_max)`` configs by ``E[M]``/gather
     potential, baseline rows, Ward/K_max binding probes, optional per-layer
@@ -59,6 +59,9 @@ NEEDLE_CSV_FIELDS = [
     "lambda_rel",
     "g_max",
     "k_max",
+    "token_exact_entry_lift",
+    "needle_token_exact_entry_rate",
+    "random_token_exact_entry_rate",
     "token_isolation_lift",
     "needle_token_isolated_rate",
     "random_token_isolated_rate",
@@ -69,9 +72,15 @@ NEEDLE_CSV_FIELDS = [
     "ward_merge_count_mean",
     "k_max_binding_count_mean",
     "new_cluster_attempt_count_mean",
+    "span_all_tokens_exact_entry_lift",
+    "span_all_tokens_exact_entry_rate",
+    "random_span_all_tokens_exact_entry_rate",
     "span_all_tokens_isolation_lift",
     "span_all_tokens_isolated_rate",
     "random_span_all_tokens_isolated_rate",
+    "span_any_token_exact_entry_lift",
+    "span_any_token_exact_entry_rate",
+    "random_span_any_token_exact_entry_rate",
     "span_any_token_isolation_lift",
     "span_any_token_isolated_rate",
     "random_span_any_token_isolated_rate",
@@ -95,6 +104,9 @@ NEEDLE_LAYER_CSV_FIELDS = [
     "lambda_rel",
     "g_max",
     "k_max",
+    "token_exact_entry_lift",
+    "needle_token_exact_entry_rate",
+    "random_token_exact_entry_rate",
     "token_isolation_lift",
     "needle_token_isolated_rate",
     "random_token_isolated_rate",
@@ -105,9 +117,15 @@ NEEDLE_LAYER_CSV_FIELDS = [
     "ward_merge_count_mean",
     "k_max_binding_count_mean",
     "new_cluster_attempt_count_mean",
+    "span_all_tokens_exact_entry_lift",
+    "span_all_tokens_exact_entry_rate",
+    "random_span_all_tokens_exact_entry_rate",
     "span_all_tokens_isolation_lift",
     "span_all_tokens_isolated_rate",
     "random_span_all_tokens_isolated_rate",
+    "span_any_token_exact_entry_lift",
+    "span_any_token_exact_entry_rate",
+    "random_span_any_token_exact_entry_rate",
     "span_any_token_isolation_lift",
     "span_any_token_isolated_rate",
     "random_span_any_token_isolated_rate",
@@ -812,13 +830,19 @@ def _aggregate_needle_group(
         "span_count",
         "needle_token_count",
         "needle_token_isolated_count",
+        "needle_token_exact_entry_count",
         "span_all_tokens_isolated_count",
+        "span_all_tokens_exact_entry_count",
         "span_any_token_isolated_count",
+        "span_any_token_exact_entry_count",
         "random_span_count",
         "random_token_count",
         "random_token_isolated_count",
+        "random_token_exact_entry_count",
         "random_span_all_tokens_isolated_count",
+        "random_span_all_tokens_exact_entry_count",
         "random_span_any_token_isolated_count",
+        "random_span_any_token_exact_entry_count",
         "needle_token_ward_merged_count",
         "needle_token_ward_touched_count",
         "span_any_ward_merged_count",
@@ -835,11 +859,23 @@ def _aggregate_needle_group(
                 sums[field] += value
 
     token_rate = _ratio(sums["needle_token_isolated_count"], sums["needle_token_count"])
+    exact_token_rate = _ratio(sums["needle_token_exact_entry_count"], sums["needle_token_count"])
     random_token_rate = _ratio(sums["random_token_isolated_count"], sums["random_token_count"])
+    random_exact_token_rate = _ratio(sums["random_token_exact_entry_count"], sums["random_token_count"])
     span_all_rate = _ratio(sums["span_all_tokens_isolated_count"], sums["span_count"])
+    span_all_exact_rate = _ratio(sums["span_all_tokens_exact_entry_count"], sums["span_count"])
     random_span_all_rate = _ratio(sums["random_span_all_tokens_isolated_count"], sums["random_span_count"])
+    random_span_all_exact_rate = _ratio(
+        sums["random_span_all_tokens_exact_entry_count"],
+        sums["random_span_count"],
+    )
     span_any_rate = _ratio(sums["span_any_token_isolated_count"], sums["span_count"])
+    span_any_exact_rate = _ratio(sums["span_any_token_exact_entry_count"], sums["span_count"])
     random_span_any_rate = _ratio(sums["random_span_any_token_isolated_count"], sums["random_span_count"])
+    random_span_any_exact_rate = _ratio(
+        sums["random_span_any_token_exact_entry_count"],
+        sums["random_span_count"],
+    )
     needle_token_ward_merged_rate = _ratio(sums["needle_token_ward_merged_count"], sums["needle_token_count"])
     needle_token_ward_touched_rate = _ratio(sums["needle_token_ward_touched_count"], sums["needle_token_count"])
     span_any_ward_merged_rate = _ratio(sums["span_any_ward_merged_count"], sums["span_count"])
@@ -858,18 +894,30 @@ def _aggregate_needle_group(
         "needle_token_count": int(sums["needle_token_count"]),
         "needle_token_isolated_count": int(sums["needle_token_isolated_count"]),
         "needle_token_isolated_rate": token_rate,
+        "needle_token_exact_entry_count": int(sums["needle_token_exact_entry_count"]),
+        "needle_token_exact_entry_rate": exact_token_rate,
         "span_all_tokens_isolated_count": int(sums["span_all_tokens_isolated_count"]),
         "span_all_tokens_isolated_rate": span_all_rate,
+        "span_all_tokens_exact_entry_count": int(sums["span_all_tokens_exact_entry_count"]),
+        "span_all_tokens_exact_entry_rate": span_all_exact_rate,
         "span_any_token_isolated_count": int(sums["span_any_token_isolated_count"]),
         "span_any_token_isolated_rate": span_any_rate,
+        "span_any_token_exact_entry_count": int(sums["span_any_token_exact_entry_count"]),
+        "span_any_token_exact_entry_rate": span_any_exact_rate,
         "random_span_count": int(sums["random_span_count"]),
         "random_token_count": int(sums["random_token_count"]),
         "random_token_isolated_count": int(sums["random_token_isolated_count"]),
         "random_token_isolated_rate": random_token_rate,
+        "random_token_exact_entry_count": int(sums["random_token_exact_entry_count"]),
+        "random_token_exact_entry_rate": random_exact_token_rate,
         "random_span_all_tokens_isolated_count": int(sums["random_span_all_tokens_isolated_count"]),
         "random_span_all_tokens_isolated_rate": random_span_all_rate,
+        "random_span_all_tokens_exact_entry_count": int(sums["random_span_all_tokens_exact_entry_count"]),
+        "random_span_all_tokens_exact_entry_rate": random_span_all_exact_rate,
         "random_span_any_token_isolated_count": int(sums["random_span_any_token_isolated_count"]),
         "random_span_any_token_isolated_rate": random_span_any_rate,
+        "random_span_any_token_exact_entry_count": int(sums["random_span_any_token_exact_entry_count"]),
+        "random_span_any_token_exact_entry_rate": random_span_any_exact_rate,
         "needle_token_ward_merged_count": int(sums["needle_token_ward_merged_count"]),
         "needle_token_ward_merged_rate": needle_token_ward_merged_rate,
         "needle_token_ward_touched_count": int(sums["needle_token_ward_touched_count"]),
@@ -888,8 +936,11 @@ def _aggregate_needle_group(
         "random_span_any_ward_touched_count": int(sums["random_span_any_ward_touched_count"]),
         "random_span_any_ward_touched_rate": random_span_any_ward_touched_rate,
         "token_isolation_lift": _ratio(token_rate, random_token_rate),
+        "token_exact_entry_lift": _ratio(exact_token_rate, random_exact_token_rate),
         "span_all_tokens_isolation_lift": _ratio(span_all_rate, random_span_all_rate),
+        "span_all_tokens_exact_entry_lift": _ratio(span_all_exact_rate, random_span_all_exact_rate),
         "span_any_token_isolation_lift": _ratio(span_any_rate, random_span_any_rate),
+        "span_any_token_exact_entry_lift": _ratio(span_any_exact_rate, random_span_any_exact_rate),
         "cluster_count_mean": _weighted_mean_from_mean_rows(rows, "cluster_count_mean"),
         "segment_count_mean": _weighted_mean_from_mean_rows(rows, "segment_count_mean"),
         "new_cluster_attempt_count_mean": _weighted_mean_from_mean_rows(rows, "new_cluster_attempt_count_mean"),
@@ -978,9 +1029,16 @@ def _needle_best_by_layer(
 
 
 def _needle_rank_key(row: dict[str, Any]) -> tuple[float, float, float, float, float, str, str]:
-    lift = _metric(row, "token_isolation_lift")
-    rate = _metric(row, "needle_token_isolated_rate")
-    span_lift = _metric(row, "span_all_tokens_isolation_lift")
+    exact_lift = _metric(row, "token_exact_entry_lift")
+    exact_rate = _metric(row, "needle_token_exact_entry_rate")
+    exact_span_lift = _metric(row, "span_all_tokens_exact_entry_lift")
+    lift = exact_lift if exact_lift is not None else _metric(row, "token_isolation_lift")
+    rate = exact_rate if exact_rate is not None else _metric(row, "needle_token_isolated_rate")
+    span_lift = (
+        exact_span_lift
+        if exact_span_lift is not None
+        else _metric(row, "span_all_tokens_isolation_lift")
+    )
     binding = _metric(row, "K_max_binding_rate")
     lambda_rel = _metric(row, "lambda_rel")
     return (
@@ -1611,7 +1669,7 @@ def _print_needle_report(path: Path, analysis: dict[str, Any], *, top: int, by_l
     for warning in analysis.get("warnings", []):
         print(f"warning: {warning}")
 
-    print("\n== Top lambda_rel/g_max by needle isolation lift, higher is better ==")
+    print("\n== Top lambda_rel/g_max/k_max by exact-entry needle isolation lift, higher is better ==")
     print(
         _table(
             _ranked(analysis.get("config_rankings", [])),
@@ -1619,11 +1677,14 @@ def _print_needle_report(path: Path, analysis: dict[str, Any], *, top: int, by_l
                 ("#", "rank", _fmt_int),
                 ("lambda", "lambda_rel", _fmt_num),
                 ("g_max", "g_max", str),
-                ("token_iso", "needle_token_isolated_rate", _fmt_pct),
-                ("random", "random_token_isolated_rate", _fmt_pct),
-                ("lift", "token_isolation_lift", _fmt_ratio),
-                ("span_all", "span_all_tokens_isolated_rate", _fmt_pct),
-                ("span_lift", "span_all_tokens_isolation_lift", _fmt_ratio),
+                ("k_max", "k_max", str),
+                ("exact", "needle_token_exact_entry_rate", _fmt_pct),
+                ("random", "random_token_exact_entry_rate", _fmt_pct),
+                ("lift", "token_exact_entry_lift", _fmt_ratio),
+                ("small", "needle_token_isolated_rate", _fmt_pct),
+                ("small_lift", "token_isolation_lift", _fmt_ratio),
+                ("span_exact", "span_all_tokens_exact_entry_rate", _fmt_pct),
+                ("span_lift", "span_all_tokens_exact_entry_lift", _fmt_ratio),
                 ("cluster_p50", "cluster_size_quantiles.p50", _fmt_num),
                 ("cluster_p90", "cluster_size_quantiles.p90", _fmt_num),
                 ("clusters", "cluster_count_mean", _fmt_num),
@@ -1643,10 +1704,13 @@ def _print_needle_report(path: Path, analysis: dict[str, Any], *, top: int, by_l
                     ("layer", "layer", _fmt_int),
                     ("lambda", "lambda_rel", _fmt_num),
                     ("g_max", "g_max", str),
-                    ("token_iso", "needle_token_isolated_rate", _fmt_pct),
-                    ("random", "random_token_isolated_rate", _fmt_pct),
-                    ("lift", "token_isolation_lift", _fmt_ratio),
-                    ("span_lift", "span_all_tokens_isolation_lift", _fmt_ratio),
+                    ("k_max", "k_max", str),
+                    ("exact", "needle_token_exact_entry_rate", _fmt_pct),
+                    ("random", "random_token_exact_entry_rate", _fmt_pct),
+                    ("lift", "token_exact_entry_lift", _fmt_ratio),
+                    ("small", "needle_token_isolated_rate", _fmt_pct),
+                    ("small_lift", "token_isolation_lift", _fmt_ratio),
+                    ("span_lift", "span_all_tokens_exact_entry_lift", _fmt_ratio),
                     ("groups", "layer_group_count", _fmt_int),
                     ("n", "sample_groups", _fmt_int),
                 ],

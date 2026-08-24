@@ -632,7 +632,8 @@ learned bias over fixed anchors
   再用真实 anchor-score 消融判断这笔表达力是否值回成本。
 - `lambda_rel=1.0` 与 `0.875` 的最终选择：首轮 unclipped 结果支持 `1.0` 作默认主线、
   `0.875` 作高召回候选；进入真实实现前必须看 S0.3 clipped gate 是否出现
-  `K_max` 绑定或 Ward 吞并 needle 小簇。
+  `K_max` 绑定或 Ward 吞并 needle 小簇，并以 `needle_token_exact_entry_rate` /
+  `token_exact_entry_lift` 为主口径确认 needle 最终是否仍是单真实成员 entry。
 - anchor 是否应由 entry span/phase coherence 自适应选择。
 - compressed slots 是否应采用频率裁剪或频率自适应 RoPE。
 - learned bias / learned anchor 是否能在少量 CPT 下显著优于固定锚点。
@@ -640,7 +641,8 @@ learned bias over fixed anchors
 
 ## P13. 推荐实验顺序
 
-1. 在现有 dump 上跑 S0.3/S0.6 的 `K_max` + Ward clipped gate，先定 `lambda_rel`。
+1. 在现有 dump 上用新版 `B′=128` / exact-entry 主口径跑 S0.3/S0.6 的 `K_max` +
+   Ward clipped gate，先定 `lambda_rel`。
 2. 补 S0.2 口径②和 S0.7，确认 `K_eff`/supersession 这两条风险没有反转结论。
 3. 用真实 anchor-score 消融比较 `p_mid only`、`p_lo+p_hi`、三锚点和必要的自适应 anchor。
 4. clipped gate 与 anchor-score 都过线后，再进入生产 cache 实现。

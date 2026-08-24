@@ -38,6 +38,7 @@ _S0_SPEC.loader.exec_module(_S0)
 
 RouteResult = _S0.RouteResult
 SweepAccumulator = _S0.SweepAccumulator
+DEFAULT_SEMANTIC_B_PRIME = _S0.DEFAULT_SEMANTIC_B_PRIME
 format_g_max = _S0.format_g_max
 load_manifest = _S0.load_manifest
 manifest_base_dir = _S0.manifest_base_dir
@@ -495,7 +496,16 @@ def main() -> None:
     parser.add_argument("--l_block", default="0,1,2,3")
     parser.add_argument("--lambda_rel", type=float, default=1.0)
     parser.add_argument("--seg_forget", type=float, default=0.5)
-    parser.add_argument("--b_prime", type=int, default=8)
+    parser.add_argument(
+        "--b_prime",
+        type=int,
+        default=DEFAULT_SEMANTIC_B_PRIME,
+        help=(
+            "Per-cluster semantic ladder level capacity. Default 128 gives roughly 2k total "
+            "level-0 exact capacity at K_max=16 and 4k at K_max=32; the old value 8 was "
+            "only a tight smoke-test budget."
+        ),
+    )
     parser.add_argument(
         "--vanilla_B",
         type=int,
