@@ -243,11 +243,11 @@ def route_single_cluster_bprime_ladder(token_count: int) -> RouteResult:
     """Single-cluster, same-B' position-order control -- NOT a vanilla-LogKV baseline.
 
     Every token lands in cluster 0, segment 0, in arrival order (no semantic
-    clustering at all), so feeding this through simulate_segment_ladders/
-    _append_entry isolates what semantic clustering itself contributes when
-    the B' ladder budget and mechanics are held fixed to whatever the sweep is
-    already using for its semantic cells. That is a real, useful control --
-    but it must not be read as "the existing/vanilla LogKV" reference:
+    clustering at all), so feeding this through ``simulate_segment_ladders``
+    isolates what semantic clustering itself contributes when the B' ladder
+    budget and mechanics are held fixed to whatever the sweep is already using
+    for its semantic cells. That is a real, useful control -- but it must not
+    be read as "the existing/vanilla LogKV" reference:
 
     1. It runs at the sweep's ``b_prime`` (default 8), not the deployed
        vanilla config's ``log_kv_B`` (512, exp/qwen1.7b-32k/base.yaml).
@@ -852,6 +852,42 @@ def _append_entry(levels: list[list[OfflineEntry]], entry: OfflineEntry, b_prime
         level += 1
 
 
+def _ensure_ladder_level(levels: list[list[OfflineEntry]], level: int) -> None:
+    while level >= len(levels):
+        levels.append([])
+
+
+def _carry_into_semantic_level(
+    levels: list[list[OfflineEntry]],
+    level: int,
+    incoming: list[OfflineEntry],
+    *,
+    b_prime: int,
+) -> list[OfflineEntry]:
+    _ensure_ladder_level(levels, level)
+    combined = sorted(list(levels[level]) + list(incoming), key=lambda entry: int(entry.order))
+    ejected: list[OfflineEntry] = []
+    while len(combined) > int(b_prime):
+        ejected.append(_merge_entries(combined[0], combined[1]))
+        combined = combined[2:]
+    levels[level] = combined
+    return ejected
+
+
+def _append_semantic_entry(levels: list[list[OfflineEntry]], entry: OfflineEntry, b_prime: int) -> None:
+    """Append one semantic-ladder entry using bounded oldest-pair folding.
+
+    Unlike the vanilla LogKV reconstruction in ``_append_entry``, the semantic
+    ladder can receive partial carries after Ward merges. Each overflow folds
+    only the oldest resident pair and sends that single merged entry upward.
+    """
+    incoming = [entry]
+    level = 0
+    while incoming:
+        incoming = _carry_into_semantic_level(levels, level, incoming, b_prime=b_prime)
+        level += 1
+
+
 def _flatten_ladders(ladders: dict[int, list[list[OfflineEntry]]], *, pad_entries: int) -> tuple[list[OfflineEntry], dict[str, Any]]:
     entries: list[OfflineEntry] = []
     level_counts: dict[int, int] = {}
@@ -867,29 +903,6 @@ def _flatten_ladders(ladders: dict[int, list[list[OfflineEntry]]], *, pad_entrie
         "level_counts": {str(k): int(v) for k, v in sorted(level_counts.items())},
     }
     return entries, meta
-
-
-def _ward_resident_and_ejected(
-    incoming: list[OfflineEntry],
-    *,
-    b_prime: int,
-) -> tuple[list[OfflineEntry], list[OfflineEntry]]:
-    """One Ward ladder level fold from algorithm-spec.md §5.12.
-
-    Ward can inject a non-``B'``-wide carry into a level. The offline probe keeps
-    the same invariant as the spec's ``carry_into_level`` helper: while the
-    current level would exceed capacity, compact the oldest two entries into one
-    ejected entry for the next level; leave the remaining newest entries resident
-    here. This is intentionally separate from ``_append_entry``'s vanilla
-    binary-counter carry, whose incoming block shape is always exactly ``B'``.
-    """
-
-    resident = list(incoming)
-    ejected: list[OfflineEntry] = []
-    while len(resident) > int(b_prime):
-        ejected.append(_merge_entries(resident[0], resident[1]))
-        resident = resident[2:]
-    return resident, ejected
 
 
 def _merge_ladders_for_ward(
@@ -910,29 +923,12 @@ def _merge_ladders_for_ward(
             native.extend(keep_snapshot[level])
         if level < len(free_snapshot):
             native.extend(free_snapshot[level])
-        # native and ejected are each individually sorted by .order (native by
-        # the explicit sort below; ejected because _ward_resident_and_ejected
-        # only ever folds the front of an already-sorted list, so the merged
-        # entries it appends come out in non-decreasing order -- see that
-        # function's docstring). But keep and free grew as two *independent*
-        # ladders before this merge, so keep's/free's own native content at
-        # this level is not guaranteed to be chronologically newer than
-        # whatever just cascaded up from the level below in *this* merge --
-        # e.g. an active cluster's level-1 entry can easily be newer (larger
-        # .order) than a quiet cluster's level-0 entry that only now got
-        # folded into `ejected`. A plain `native + ejected` concatenation
-        # would silently leave the list out of order, so
-        # _ward_resident_and_ejected's "fold the front two" rule could compact
-        # two chronologically-distant entries together while a genuinely
-        # older entry sits unmerged right next to them -- inflating entry
-        # spans and E[M] for no reason. Merging both sorted lists together
-        # (not just sorting native alone) is required for "fold the oldest
-        # pair first" to actually hold once two independently-grown ladders
-        # combine, not just within a single native block.
-        native.sort(key=lambda entry: int(entry.order))
-        combined = sorted(native + ejected, key=lambda entry: int(entry.order))
-        resident, ejected = _ward_resident_and_ejected(combined, b_prime=b_prime)
-        merged_levels.append(resident)
+        # keep and free grew as independent ladders, and the previous level's
+        # ejected entries can interleave with this level's native entries. The
+        # shared carry helper sorts before folding so "oldest pair first" holds
+        # for both Ward replay and ordinary appends after a Ward merge.
+        incoming = native + ejected
+        ejected = _carry_into_semantic_level(merged_levels, level, incoming, b_prime=b_prime)
         level += 1
 
     keep_levels[:] = merged_levels if merged_levels else [[]]
@@ -979,7 +975,7 @@ def _simulate_route_event_ladders(
         elif segment != active_segment[cluster]:
             count = (-logical_count[cluster]) % align
             for _ in range(count):
-                _append_entry(
+                _append_semantic_entry(
                     ladders[cluster],
                     OfflineEntry(members=[], pad_count=1, order=order_counter),
                     b_prime,
@@ -989,7 +985,7 @@ def _simulate_route_event_ladders(
                 logical_count[cluster] += 1
             active_segment[cluster] = segment
 
-        _append_entry(ladders[cluster], OfflineEntry(members=[pos], order=order_counter), b_prime)
+        _append_semantic_entry(ladders[cluster], OfflineEntry(members=[pos], order=order_counter), b_prime)
         order_counter += 1
         logical_count[cluster] += 1
 
@@ -1026,7 +1022,7 @@ def simulate_segment_ladders(
         elif segment != active_segment[cluster]:
             count = (-logical_count[cluster]) % align
             for _ in range(count):
-                _append_entry(
+                _append_semantic_entry(
                     ladders[cluster],
                     OfflineEntry(members=[], pad_count=1, order=order_counter),
                     b_prime,
@@ -1035,7 +1031,7 @@ def simulate_segment_ladders(
                 pad_entries += 1
                 logical_count[cluster] += 1
             active_segment[cluster] = segment
-        _append_entry(ladders[cluster], OfflineEntry(members=[pos], order=order_counter), b_prime)
+        _append_semantic_entry(ladders[cluster], OfflineEntry(members=[pos], order=order_counter), b_prime)
         order_counter += 1
         logical_count[cluster] += 1
 

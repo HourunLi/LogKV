@@ -134,12 +134,9 @@ def test_route_single_cluster_bprime_ladder_empty_input() -> None:
 
 
 def test_route_single_cluster_bprime_ladder_matches_binary_carry_reference() -> None:
-    # Feeding the single-cluster route through simulate_segment_ladders must
-    # reduce to exactly the same b_prime binary-carry construction as the
-    # dedicated LogStructuredKVCache-equivalence test below (see
-    # test_b_prime_members_relocate_unmerged_before_second_batch_merges):
-    # exactly b_prime members land as b_prime still-unmerged, single-member
-    # entries relocated to level 1, not merged pairs.
+    # Feeding the single-cluster route through simulate_segment_ladders keeps
+    # the first b_prime tokens as still-unmerged, single-member entries. The
+    # next token is what triggers oldest-pair folding.
     b_prime = 4
     route = route_single_cluster_bprime_ladder(b_prime)
     entries, _ = simulate_segment_ladders(route, b_prime=b_prime, l_block=0)
@@ -289,9 +286,8 @@ def _run_real_cache_add_recent(
 def test_vanilla_logkv_compressed_entries_matches_real_cache(token_count: int, b: int, recent_size: int, chunk_size: int | None) -> None:
     # Validates vanilla_logkv_compressed_entries' combinatorial derivation (recent-window
     # carve-out incl. odd-overflow parity, and w=2 level-0 pre-pairing)
-    # against the actual LogStructuredKVCache -- not just the shared carry
-    # primitive (_append_entry), which test_b_prime_members_relocate_
-    # unmerged_before_second_batch_merges already covers independently.
+    # against the actual LogStructuredKVCache -- not just the vanilla carry
+    # primitive (_append_entry).
     # Checked per-level *and* per-slot (weight and mean, not just aggregate
     # counts), across several add_recent() chunkings, since the real cache's
     # docstring claims (and this confirms) the final state is chunk-invariant.
@@ -324,18 +320,11 @@ def test_vanilla_logkv_compressed_entries_matches_real_cache(token_count: int, b
         assert int(cache.level_count[level].item()) == 0, f"unexpected occupied level {level}"
 
 
-def test_b_prime_members_relocate_unmerged_before_second_batch_merges() -> None:
-    # Mirrors LogStructuredKVCache._add_compact_entry/_binary_carry exactly
-    # (verified empirically against the real cache, not just read off the
-    # docstring): a level that is *empty* when a full b_prime-wide block
-    # arrives absorbs it unmerged (LogStructuredKVCache._binary_carry's
-    # "if self._counts[ell] == 0: self._set_level(...); return" -- no
-    # compact() call). Only a level that *already* holds a full block merges
-    # the two b_prime-wide blocks pairwise into one new b_prime-wide block
-    # and keeps propagating. So exactly b_prime members must land as
-    # b_prime still-separate, single-member entries (just relocated to
-    # level 1), and it takes a *second* full batch (2*b_prime members total)
-    # before the first real pairwise merge happens.
+def test_semantic_ladder_overflow_folds_oldest_pair_one_at_a_time() -> None:
+    # Semantic ladders use the algorithm-spec carry_into_level rule, not
+    # vanilla LogKV's full-block binary carry: once a level is full, the next
+    # entry folds only the oldest pair and sends that single merged entry
+    # upward, leaving the newer entries resident.
     b_prime = 4
     route_one_batch = RouteResult(
         cluster_ids=np.zeros(b_prime, dtype=np.int32),
@@ -344,8 +333,13 @@ def test_b_prime_members_relocate_unmerged_before_second_batch_merges() -> None:
         segment_count=1,
         cluster_sizes=[b_prime],
     )
-    entries_one_batch, _ = simulate_segment_ladders(route_one_batch, b_prime=b_prime, l_block=0)
+    entries_one_batch, meta_one_batch = simulate_segment_ladders(
+        route_one_batch,
+        b_prime=b_prime,
+        l_block=0,
+    )
     assert sorted(e.members for e in entries_one_batch) == [[0], [1], [2], [3]]
+    assert meta_one_batch["level_counts"] == {"0": 4}
 
     route_two_batches = RouteResult(
         cluster_ids=np.zeros(2 * b_prime, dtype=np.int32),
@@ -354,25 +348,28 @@ def test_b_prime_members_relocate_unmerged_before_second_batch_merges() -> None:
         segment_count=1,
         cluster_sizes=[2 * b_prime],
     )
-    entries_two_batches, _ = simulate_segment_ladders(route_two_batches, b_prime=b_prime, l_block=0)
-    assert sorted(e.members for e in entries_two_batches) == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    entries_two_batches, meta_two_batches = simulate_segment_ladders(
+        route_two_batches,
+        b_prime=b_prime,
+        l_block=0,
+    )
+    assert sorted(e.members for e in entries_two_batches) == [[0, 1], [2, 3], [4], [5], [6], [7]]
+    assert meta_two_batches["level_counts"] == {"0": 4, "1": 2}
 
 
 def test_l_block_padding_blocks_low_level_cross_segment_merge() -> None:
-    # b_prime=4 needs a *second* full batch to trigger any real merge (see
-    # test_b_prime_members_relocate_unmerged_before_second_batch_merges), so
-    # this needs 8 members, not 4, to exercise an actual straddling pair.
-    # Segment 0 has an odd length (5) so the natural (0,1)(2,3)(4,5)(6,7)
-    # pairing at that merge event lands the segment boundary *inside* the
-    # (4,5) pair when unblocked.
+    # With b_prime=4, the semantic carry folds one oldest pair at a time.
+    # Segment 0 has an odd length (5), so token 8 is the first append that
+    # would fold the cross-boundary pair (4,5) unless l_block padding inserts
+    # a pad entry before segment 1 starts.
     route = RouteResult(
-        cluster_ids=np.zeros(8, dtype=np.int32),
-        segment_ids=np.asarray([0, 0, 0, 0, 0, 1, 1, 1], dtype=np.int32),
+        cluster_ids=np.zeros(9, dtype=np.int32),
+        segment_ids=np.asarray([0, 0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int32),
         cluster_count=1,
         segment_count=2,
-        cluster_sizes=[8],
+        cluster_sizes=[9],
     )
-    k = np.asarray([[0.0]] * 5 + [[10.0]] * 3, dtype=np.float32)
+    k = np.asarray([[0.0]] * 5 + [[10.0]] * 4, dtype=np.float32)
 
     entries_unblocked, _ = simulate_segment_ladders(route, b_prime=4, l_block=0)
     summary_unblocked = summarize_entries(k, None, entries_unblocked)
@@ -387,8 +384,11 @@ def test_l_block_padding_blocks_low_level_cross_segment_merge() -> None:
 
 
 def test_kmax_ward_ladder_replay_uses_online_merge_events_not_final_labels() -> None:
-    k = (np.arange(9, dtype=np.float32) * 10.0).reshape(-1, 1)
-    route = route_dpmeans_segments(k, lambda_new=1.0, g_max=math.inf, gamma=0.5, k_max=2)
+    k = np.asarray(
+        [-9.0, -1.0, 19.0, -2.0, -2.0, -3.0, -7.0, -8.0, 10.0, 12.0],
+        dtype=np.float32,
+    ).reshape(-1, 1)
+    route = route_dpmeans_segments(k, lambda_new=20.0, g_max=math.inf, gamma=0.5, k_max=2)
 
     event_entries, event_meta = simulate_segment_ladders(route, b_prime=4, l_block=0)
     final_label_route = RouteResult(
@@ -400,9 +400,9 @@ def test_kmax_ward_ladder_replay_uses_online_merge_events_not_final_labels() -> 
     )
     static_entries, static_meta = simulate_segment_ladders(final_label_route, b_prime=4, l_block=0)
 
-    assert sorted(pos for entry in event_entries for pos in entry.members) == list(range(9))
-    assert event_meta["entry_count"] == 7
-    assert event_meta["entry_count"] != static_meta["entry_count"]
+    assert sorted(pos for entry in event_entries for pos in entry.members) == list(range(10))
+    assert event_meta["entry_count"] == 8
+    assert static_meta["entry_count"] == 8
     assert sorted(entry.members for entry in event_entries) != sorted(entry.members for entry in static_entries)
 
 
@@ -530,11 +530,10 @@ def test_sweep_accumulator_relative_variance_is_scale_invariant() -> None:
 
 
 def test_summarize_entries_reports_raw_widths_and_spans() -> None:
-    # 8 same-cluster tokens with b_prime=4 land as 4 merged entries at level 2
-    # (see test_b_prime_members_relocate_unmerged_before_second_batch_merges):
-    # [0,1],[2,3],[4,5],[6,7], each covering 2 members with span 1. The raw
-    # per-entry lists SweepAccumulator pools must match summarize_entries' own
-    # aggregate fields, not just be present.
+    # 8 same-cluster semantic-ladder tokens with b_prime=4 leave four newer
+    # singleton entries resident and two older folded pairs. The raw per-entry
+    # lists SweepAccumulator pools must match summarize_entries' own aggregate
+    # fields, not just be present.
     route = RouteResult(
         cluster_ids=np.zeros(8, dtype=np.int32),
         segment_ids=np.zeros(8, dtype=np.int32),
@@ -546,8 +545,8 @@ def test_summarize_entries_reports_raw_widths_and_spans() -> None:
     entries, _ = simulate_segment_ladders(route, b_prime=4, l_block=0)
     summary = summarize_entries(k, None, entries)
 
-    assert summary["entry_widths"] == [2.0, 2.0, 2.0, 2.0]
-    assert summary["entry_spans"] == [1.0, 1.0, 1.0, 1.0]
+    assert summary["entry_widths"] == [1.0, 1.0, 1.0, 1.0, 2.0, 2.0]
+    assert summary["entry_spans"] == [0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
     assert np.isclose(np.mean(summary["entry_widths"]), summary["entry_width_mean"])
     assert np.isclose(np.mean(summary["entry_spans"]), summary["entry_span_mean"])
 
