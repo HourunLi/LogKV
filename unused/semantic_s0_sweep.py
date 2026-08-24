@@ -798,7 +798,7 @@ def main() -> None:
             "note fields for that. This is a same-B' single-cluster position-order CONTROL: "
             "every token in one sequential cluster/segment (no semantic clustering, no "
             "g_max/l_block segmentation), run through the same simulate_segment_ladders b_prime "
-            "binary-carry construction as the semantic sweep cells (route_single_cluster_bprime_"
+            "bounded-carry construction as the semantic sweep cells (route_single_cluster_bprime_"
             "ladder), so it answers 'how much does semantic grouping itself help, holding the "
             "ladder budget/mechanics fixed to what the semantic sweep is already using' -- a "
             "real, separate question from S0.4's 'how does this compare to the currently "
