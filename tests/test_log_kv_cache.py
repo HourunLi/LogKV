@@ -64,6 +64,17 @@ def has_compacted_level(cache: LogStructuredKVCache) -> bool:
     return bool((cache.level_count > 0).any().item())
 
 
+def real_state_tensors(state: CacheAttentionState) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if state.slot_valid is None:
+        return state.slot_k, state.slot_v, state.slot_w
+    pooled = state.slot_valid.size(-1)
+    valid0 = state.slot_valid[0, 0]
+    slot_k = torch.cat([state.slot_k[:, :, :pooled, :][:, :, valid0, :], state.slot_k[:, :, pooled:, :]], dim=2)
+    slot_v = torch.cat([state.slot_v[:, :, :pooled, :][:, :, valid0, :], state.slot_v[:, :, pooled:, :]], dim=2)
+    slot_w = torch.cat([state.slot_w[:, :, :pooled][:, :, valid0], state.slot_w[:, :, pooled:]], dim=2)
+    return slot_k, slot_v, slot_w
+
+
 def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredKVCache) -> None:
     """The full cache state (counters, recent window, all levels) must match bitwise."""
     assert a.token_count == b.token_count
@@ -1124,7 +1135,7 @@ class TestExplicitCacheUpdates:
         assert c.recent_count == 1
 
         state = c.get_attention_state()
-        slot_k, slot_v, slot_w = state.slot_k, state.slot_v, state.slot_w
+        slot_k, slot_v, slot_w = real_state_tensors(state)
         # slot 0 = mean of tokens 0-1, slot 1 = exact token 2 (w=1)
         torch.testing.assert_close(slot_k[:, :, 0, :], k[:, :, :2, :].mean(dim=2))
         torch.testing.assert_close(slot_k[:, :, 1, :], k[:, :, 2, :])
@@ -1161,13 +1172,14 @@ class TestExplicitCacheUpdates:
 
 class TestGetAttentionState:
     def test_empty_cache_state(self, small_cache):
-        """Empty cache should return zero-size tensors."""
+        """Empty cache returns the fixed pooled prefix, fully masked invalid."""
         state = small_cache.get_attention_state()
         assert isinstance(state, CacheAttentionState)
-        assert state.slot_k.size(2) == 0
-        assert state.slot_v.size(2) == 0
-        assert state.slot_w.size(2) == 0
-        assert state.slot_valid is None
+        assert state.slot_k.size(2) == small_cache.L_alloc * small_cache.B_prime
+        assert state.slot_v.size(2) == small_cache.L_alloc * small_cache.B_prime
+        assert state.slot_w.size(2) == small_cache.L_alloc * small_cache.B_prime
+        assert state.slot_valid.shape == (small_cache.batch_size, small_cache.n_groups, state.slot_w.size(2))
+        assert not state.slot_valid.any()
         assert state.M_s is None
 
     def test_state_after_ingest(self, small_cache):
@@ -1176,9 +1188,11 @@ class TestGetAttentionState:
         c.ingest_chunk(torch.randn(1, 2, 2, 8), torch.randn(1, 2, 2, 8))
 
         state = c.get_attention_state()
+        _slot_k, _slot_v, slot_w = real_state_tensors(state)
 
-        assert state.slot_k.size(2) == 1
-        assert state.slot_w[0, 0, 0].item() == 2.0
+        assert int(state.slot_valid.sum().item()) == c.n_groups
+        assert slot_w.size(2) == 1
+        assert slot_w[0, 0, 0].item() == 2.0
 
     def test_state_with_rank1_stats(self, small_cache):
         """with_stats=True should append zero stats for exact recent tokens."""
@@ -1192,11 +1206,16 @@ class TestGetAttentionState:
         assert state.slot_k.shape == state.slot_sigma_u.shape == state.slot_gamma_a.shape
         assert state.slot_v.shape == state.slot_gamma_b.shape
         assert state.slot_w.shape == state.slot_sigma2.shape == state.slot_gamma.shape
-        assert state.slot_w[0, 0].tolist() == [2.0, 1.0]
-        assert state.slot_sigma2[0, 0, 0] > 0.0
-        assert state.slot_gamma[0, 0, 0] >= 0.0
-        assert state.slot_sigma2[0, 0, 1] == 0.0
-        assert state.slot_gamma[0, 0, 1] == 0.0
+        _slot_k, _slot_v, slot_w = real_state_tensors(state)
+        pooled = state.slot_valid.size(-1)
+        valid0 = state.slot_valid[0, 0]
+        sigma2 = torch.cat([state.slot_sigma2[:, :, :pooled][:, :, valid0], state.slot_sigma2[:, :, pooled:]], dim=2)
+        gamma = torch.cat([state.slot_gamma[:, :, :pooled][:, :, valid0], state.slot_gamma[:, :, pooled:]], dim=2)
+        assert slot_w[0, 0].tolist() == [2.0, 1.0]
+        assert sigma2[0, 0, 0] > 0.0
+        assert gamma[0, 0, 0] >= 0.0
+        assert sigma2[0, 0, 1] == 0.0
+        assert gamma[0, 0, 1] == 0.0
 
     def test_state_after_prefill(self, small_cache):
         """After prefill, compact slots + recent w=1 tokens should be present."""
@@ -1210,12 +1229,13 @@ class TestGetAttentionState:
         add_full_kv_in_chunks(c, k, v)
 
         state = c.get_attention_state()
+        _slot_k, _slot_v, slot_w = real_state_tensors(state)
 
         # 4 compact entries (after carry to level 1) + 1 recent token
-        assert state.slot_k.size(2) == c.B + 1
-        torch.testing.assert_close(state.slot_w[0, 0], torch.tensor([2.0, 2.0, 2.0, 2.0, 1.0]))
+        assert slot_w.size(2) == c.B + 1
+        torch.testing.assert_close(slot_w[0, 0], torch.tensor([2.0, 2.0, 2.0, 2.0, 1.0]))
         # Weights must account for every committed token
-        assert state.slot_w[0, 0].sum().item() == T
+        assert slot_w[0, 0].sum().item() == T
 
     def test_slot_exactness_weighted_mean(self, small_cache):
         """THE merge-exactness invariant: every slot's key/value equals the
@@ -1232,7 +1252,7 @@ class TestGetAttentionState:
         add_full_kv_in_chunks(c, k, v)
 
         state = c.get_attention_state()
-        slot_k, slot_v, slot_w = state.slot_k, state.slot_v, state.slot_w
+        slot_k, slot_v, slot_w = real_state_tensors(state)
         w = slot_w[0, 0]
         assert w.sum().item() == T  # all tokens accounted for
 
@@ -1668,7 +1688,9 @@ class TestIntegration:
         state = c.get_attention_state()
         assert state.slot_w[0, 0].sum().item() == T_prefill + 3
         q = torch.randn(B_batch, nh, 1, k_dim)
-        out = log_kv_slot_attention(q, state.slot_k, state.slot_v, state.slot_w, scale=0.1)
+        out = log_kv_slot_attention(
+            q, state.slot_k, state.slot_v, state.slot_w, scale=0.1, slot_valid=state.slot_valid,
+        )
         assert out.shape == (B_batch, nh, 1, v_dim)
         assert not torch.isnan(out).any()
 
@@ -1699,7 +1721,9 @@ class TestIntegration:
         q = torch.randn(B_batch, nh, 1, k_dim)
 
         state = c.get_attention_state()
-        out_slot = log_kv_slot_attention(q, state.slot_k, state.slot_v, state.slot_w, scale=scale)
+        out_slot = log_kv_slot_attention(
+            q, state.slot_k, state.slot_v, state.slot_w, scale=scale, slot_valid=state.slot_valid,
+        )
 
         # Dense attention over all T tokens
         q_per_kv = nh // G
@@ -2459,8 +2483,9 @@ class TestSaliencePinning:
             assert torch.equal(cache.pin_v[0, g, j], v[0, g, self.NEEDLE])
         # Pins surface in the attention state as extra exact w=1 slots.
         state = cache.get_attention_state()
-        assert state.slot_k.size(2) == cache.total_slots
-        assert int((state.slot_w[0, 0] == 1).sum()) == cache.pin_count + cache.recent_count
+        _, _, real_w = real_state_tensors(state)
+        assert real_w.size(2) == cache.total_slots
+        assert int((real_w[0, 0] == 1).sum()) == cache.pin_count + cache.recent_count
 
     def test_hierarchy_trajectory_unchanged_by_pinning(self):
         torch.manual_seed(0)
