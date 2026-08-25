@@ -70,6 +70,7 @@ def _build_case(n_prefix: int, blk: int = 6, recent: int = 4, B: int = 4, seed: 
         "slot_k": state.slot_k,
         "slot_v": state.slot_v,
         "slot_w": state.slot_w,
+        "slot_valid": state.slot_valid,
         "k_tail": k[:, :, n_prefix:total, :],
         "v_tail": v[:, :, n_prefix:total, :],
     }
@@ -81,7 +82,7 @@ def _run(mode: str, case: dict, q_chunk: int = 64) -> torch.Tensor:
             case["q"], case["k_prefix"], case["v_prefix"],
             case["slot_k"], case["slot_v"], case["slot_w"],
             case["k_tail"], case["v_tail"],
-            scale=SCALE, lam=1.0, layer=0,
+            scale=SCALE, lam=1.0, layer=0, slot_valid=case["slot_valid"],
         )
 
 
@@ -119,7 +120,9 @@ class TestBaselineMatchesProduction:
         out_base = _run("baseline", case)
 
         state = append_exact_tokens(
-            CacheAttentionState(case["slot_k"], case["slot_v"], case["slot_w"]),
+            CacheAttentionState(
+                case["slot_k"], case["slot_v"], case["slot_w"], slot_valid=case["slot_valid"],
+            ),
             case["k_tail"],
             case["v_tail"],
         )
@@ -130,6 +133,7 @@ class TestBaselineMatchesProduction:
             state.slot_w,
             scale=SCALE,
             causal_tail=case["k_tail"].size(2),
+            slot_valid=state.slot_valid,
         )
         assert torch.equal(out_base, out_prod)
 
@@ -173,7 +177,7 @@ class TestStatsPerLevel:
                 case["q"], case["k_prefix"], case["v_prefix"],
                 case["slot_k"], case["slot_v"], case["slot_w"],
                 case["k_tail"], case["v_tail"],
-                scale=SCALE, lam=1.0, layer=0,
+                scale=SCALE, lam=1.0, layer=0, slot_valid=case["slot_valid"],
             )
             summ = st.summary()
 

@@ -518,10 +518,6 @@ class LogStructuredKVCache(nn.Module):
     # Level accessors
     # ------------------------------------------------------------------
 
-    def _level_count(self, ell: int) -> int:
-        # ponytail: K_max=1 bridge; replace with masked (B,G,K) carry when multi-cluster routing lands.
-        return int(self.level_count[0, 0, 0, ell].item())
-
     def _get_level(self, ell: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
             self.level_k[:, :, 0, ell],
@@ -543,6 +539,32 @@ class LogStructuredKVCache(nn.Module):
     def _get_level_imp(self, ell: int) -> torch.Tensor:
         return self.level_imp[:, :, 0, ell]
 
+    @staticmethod
+    def _masked_level_copy(dst: torch.Tensor, src: torch.Tensor, active: torch.Tensor | None) -> None:
+        if active is None:
+            dst.copy_(src)
+            return
+        view_shape = active.shape + (1,) * (dst.dim() - active.dim())
+        dst.copy_(torch.where(active.view(view_shape), src, dst))
+
+    @staticmethod
+    def _masked_scatter_slots(
+        dst: torch.Tensor,
+        positions: torch.Tensor,
+        active: torch.Tensor,
+        src: torch.Tensor,
+    ) -> None:
+        tail = src.shape[3:]
+        for j in range(src.size(2)):
+            pos = positions[..., j].clamp(0, dst.size(2) - 1)
+            index = pos.view(pos.shape + (1,) * (1 + len(tail))).expand(pos.shape + (1,) + tail)
+            current = dst.gather(2, index).squeeze(2)
+            mask = active[..., j]
+            if tail:
+                mask = mask.view(mask.shape + (1,) * len(tail))
+            value = torch.where(mask, src[:, :, j], current)
+            dst.scatter_(2, index, value.unsqueeze(2))
+
     def _set_level(
         self,
         ell: int,
@@ -555,41 +577,46 @@ class LogStructuredKVCache(nn.Module):
         gamma_b: torch.Tensor | None = None,
         gamma: torch.Tensor | None = None,
         imp: torch.Tensor | None = None,
+        active: torch.Tensor | None = None,
     ) -> None:
-        self.level_k[:, :, 0, ell].copy_(k)
-        self.level_v[:, :, 0, ell].copy_(v)
-        self.level_w[:, :, 0, ell].copy_(w)
+        self._masked_level_copy(self.level_k[:, :, 0, ell], k, active)
+        self._masked_level_copy(self.level_v[:, :, 0, ell], v, active)
+        self._masked_level_copy(self.level_w[:, :, 0, ell], w, active)
         if sigma_u is None:
-            self.level_sigma_u[:, :, 0, ell].zero_()
-            self.level_sigma2[:, :, 0, ell].zero_()
-            self.level_gamma_a[:, :, 0, ell].zero_()
-            self.level_gamma_b[:, :, 0, ell].zero_()
-            self.level_gamma[:, :, 0, ell].zero_()
+            self._masked_level_copy(self.level_sigma_u[:, :, 0, ell], torch.zeros_like(self.level_sigma_u[:, :, 0, ell]), active)
+            self._masked_level_copy(self.level_sigma2[:, :, 0, ell], torch.zeros_like(self.level_sigma2[:, :, 0, ell]), active)
+            self._masked_level_copy(self.level_gamma_a[:, :, 0, ell], torch.zeros_like(self.level_gamma_a[:, :, 0, ell]), active)
+            self._masked_level_copy(self.level_gamma_b[:, :, 0, ell], torch.zeros_like(self.level_gamma_b[:, :, 0, ell]), active)
+            self._masked_level_copy(self.level_gamma[:, :, 0, ell], torch.zeros_like(self.level_gamma[:, :, 0, ell]), active)
         else:
-            self.level_sigma_u[:, :, 0, ell].copy_(sigma_u)
-            self.level_sigma2[:, :, 0, ell].copy_(sigma2)
-            self.level_gamma_a[:, :, 0, ell].copy_(gamma_a)
-            self.level_gamma_b[:, :, 0, ell].copy_(gamma_b)
-            self.level_gamma[:, :, 0, ell].copy_(gamma)
+            self._masked_level_copy(self.level_sigma_u[:, :, 0, ell], sigma_u, active)
+            self._masked_level_copy(self.level_sigma2[:, :, 0, ell], sigma2, active)
+            self._masked_level_copy(self.level_gamma_a[:, :, 0, ell], gamma_a, active)
+            self._masked_level_copy(self.level_gamma_b[:, :, 0, ell], gamma_b, active)
+            self._masked_level_copy(self.level_gamma[:, :, 0, ell], gamma, active)
         if imp is None:
-            self.level_imp[:, :, 0, ell].zero_()
+            self._masked_level_copy(self.level_imp[:, :, 0, ell], torch.zeros_like(self.level_imp[:, :, 0, ell]), active)
         else:
-            self.level_imp[:, :, 0, ell].copy_(imp)
-        self.level_count[:, :, 0, ell] = self.B
-        self.pad_mask[:, :, 0, ell].zero_()
+            self._masked_level_copy(self.level_imp[:, :, 0, ell], imp, active)
+        counts = self.level_count[:, :, 0, ell]
+        full = torch.full_like(counts, self.B)
+        counts.copy_(full if active is None else torch.where(active, full, counts))
+        self._masked_level_copy(self.pad_mask[:, :, 0, ell], torch.zeros_like(self.pad_mask[:, :, 0, ell]), active)
 
-    def _clear_level(self, ell: int) -> None:
-        self.level_k[:, :, 0, ell].zero_()
-        self.level_v[:, :, 0, ell].zero_()
-        self.level_w[:, :, 0, ell].zero_()
-        self.level_imp[:, :, 0, ell].zero_()
-        self.level_sigma_u[:, :, 0, ell].zero_()
-        self.level_sigma2[:, :, 0, ell].zero_()
-        self.level_gamma_a[:, :, 0, ell].zero_()
-        self.level_gamma_b[:, :, 0, ell].zero_()
-        self.level_gamma[:, :, 0, ell].zero_()
-        self.level_count[:, :, 0, ell] = 0
-        self.pad_mask[:, :, 0, ell].zero_()
+    def _clear_level(self, ell: int, active: torch.Tensor | None = None) -> None:
+        self._masked_level_copy(self.level_k[:, :, 0, ell], torch.zeros_like(self.level_k[:, :, 0, ell]), active)
+        self._masked_level_copy(self.level_v[:, :, 0, ell], torch.zeros_like(self.level_v[:, :, 0, ell]), active)
+        self._masked_level_copy(self.level_w[:, :, 0, ell], torch.zeros_like(self.level_w[:, :, 0, ell]), active)
+        self._masked_level_copy(self.level_imp[:, :, 0, ell], torch.zeros_like(self.level_imp[:, :, 0, ell]), active)
+        self._masked_level_copy(self.level_sigma_u[:, :, 0, ell], torch.zeros_like(self.level_sigma_u[:, :, 0, ell]), active)
+        self._masked_level_copy(self.level_sigma2[:, :, 0, ell], torch.zeros_like(self.level_sigma2[:, :, 0, ell]), active)
+        self._masked_level_copy(self.level_gamma_a[:, :, 0, ell], torch.zeros_like(self.level_gamma_a[:, :, 0, ell]), active)
+        self._masked_level_copy(self.level_gamma_b[:, :, 0, ell], torch.zeros_like(self.level_gamma_b[:, :, 0, ell]), active)
+        self._masked_level_copy(self.level_gamma[:, :, 0, ell], torch.zeros_like(self.level_gamma[:, :, 0, ell]), active)
+        counts = self.level_count[:, :, 0, ell]
+        zero_counts = torch.zeros_like(counts)
+        counts.copy_(zero_counts if active is None else torch.where(active, zero_counts, counts))
+        self._masked_level_copy(self.pad_mask[:, :, 0, ell], torch.zeros_like(self.pad_mask[:, :, 0, ell]), active)
 
     # ------------------------------------------------------------------
     # Compact: compress tokens -> 1 entry via mean pooling (2:1 by default)
@@ -866,44 +893,17 @@ class LogStructuredKVCache(nn.Module):
         imp_entry: torch.Tensor | None = None,
     ) -> None:
         """Add one compact entry to level 0. If level 0 is full, binary carry to levels 1+."""
-        idx = self._level_count(0)
-        self.level_k[:, :, 0, 0, idx, :] = k_entry
-        self.level_v[:, :, 0, 0, idx, :] = v_entry
-        self.level_w[:, :, 0, 0, idx] = w_entry
-        if sigma_u_entry is None:
-            # Zero the slot in place rather than materializing zero tensors to
-            # copy from: this runs per compacted entry.
-            self.level_sigma_u[:, :, 0, 0, idx, :].zero_()
-            self.level_sigma2[:, :, 0, 0, idx].zero_()
-            self.level_gamma_a[:, :, 0, 0, idx, :].zero_()
-            self.level_gamma_b[:, :, 0, 0, idx, :].zero_()
-            self.level_gamma[:, :, 0, 0, idx].zero_()
-        else:
-            self.level_sigma_u[:, :, 0, 0, idx, :] = sigma_u_entry
-            self.level_sigma2[:, :, 0, 0, idx] = sigma2_entry
-            self.level_gamma_a[:, :, 0, 0, idx, :] = gamma_a_entry
-            self.level_gamma_b[:, :, 0, 0, idx, :] = gamma_b_entry
-            self.level_gamma[:, :, 0, 0, idx] = gamma_entry
-        if imp_entry is None:
-            self.level_imp[:, :, 0, 0, idx].zero_()
-        else:
-            self.level_imp[:, :, 0, 0, idx] = imp_entry
-        self.level_count[:, :, 0, 0] = idx + 1
-        self.pad_mask[:, :, 0, 0, idx] = False
-
-        if idx + 1 >= self.B:
-            lk, lv, lw = self._get_level(0)
-            limp = self._get_level_imp(0).clone() if imp_entry is not None else None
-            if self.second_order:
-                lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
-                self._binary_carry(
-                    lk.clone(), lv.clone(), lw.clone(),
-                    lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
-                    block_imp=limp,
-                )
-            else:
-                self._binary_carry(lk.clone(), lv.clone(), lw.clone(), block_imp=limp)
-            self._clear_level(0)
+        self._append_level0(
+            k_entry.unsqueeze(2),
+            v_entry.unsqueeze(2),
+            w_entry.unsqueeze(2),
+            None if sigma_u_entry is None else sigma_u_entry.unsqueeze(2),
+            None if sigma2_entry is None else sigma2_entry.unsqueeze(2),
+            None if gamma_a_entry is None else gamma_a_entry.unsqueeze(2),
+            None if gamma_b_entry is None else gamma_b_entry.unsqueeze(2),
+            None if gamma_entry is None else gamma_entry.unsqueeze(2),
+            None if imp_entry is None else imp_entry.unsqueeze(2),
+        )
 
     # ------------------------------------------------------------------
     # Binary carry: promote B entries through levels 1+
@@ -920,16 +920,23 @@ class LogStructuredKVCache(nn.Module):
         block_gamma_b: torch.Tensor | None = None,
         block_gamma: torch.Tensor | None = None,
         block_imp: torch.Tensor | None = None,
+        active: torch.Tensor | None = None,
     ) -> None:
         new_k, new_v, new_w = block_k, block_v, block_w
         new_su, new_s2 = block_sigma_u, block_sigma2
         new_ga, new_gb, new_gm = block_gamma_a, block_gamma_b, block_gamma
         new_imp = block_imp
+        if active is None:
+            active = torch.ones(self.batch_size, self.n_groups, dtype=torch.bool, device=block_k.device)
         for ell in range(1, self.max_levels):
-            if self._level_count(ell) == 0:
-                self._set_level(ell, new_k, new_v, new_w, new_su, new_s2, new_ga, new_gb, new_gm, imp=new_imp)
-                return
             ek, ev, ew = self._get_level(ell)
+            occupied = self.level_count[:, :, 0, ell] > 0
+            place = active & ~occupied
+            merge = active & occupied
+            self._set_level(
+                ell, new_k, new_v, new_w, new_su, new_s2, new_ga, new_gb, new_gm,
+                imp=new_imp, active=place,
+            )
             eimp = self._get_level_imp(ell) if new_imp is not None else None
             if new_su is None:
                 if new_imp is None:
@@ -974,13 +981,12 @@ class LogStructuredKVCache(nn.Module):
                         esu, es2, ega, egb, egm,
                         new_su, new_s2, new_ga, new_gb, new_gm,
                         imp1=eimp, imp2=new_imp, imp_lambda=self.importance_pooling_lambda,
-                    )
-            self._clear_level(ell)
-        raise RuntimeError(
-            f"LogStructuredKVCache: binary carry overflow! "
-            f"All {self.max_levels} levels occupied. "
-            f"max_seq_length={self.max_seq_length}, B={self.B}. "
-            f"This is a bug — max_levels formula needs review."
+            )
+            self._clear_level(ell, active=merge)
+            active = merge
+        torch._assert(
+            (~active).all(),
+            "LogStructuredKVCache: binary carry overflow; max_levels formula needs review.",
         )
 
     # ------------------------------------------------------------------
@@ -1093,47 +1099,84 @@ class LogStructuredKVCache(nn.Module):
         two entries as in the sequential version.
         """
         f = pk.size(2)
-        off = 0
-        while off < f:
-            idx = self._level_count(0)
-            take = min(self.B - idx, f - off)
-            self.level_k[:, :, 0, 0, idx:idx + take, :] = pk[:, :, off:off + take, :]
-            self.level_v[:, :, 0, 0, idx:idx + take, :] = pv[:, :, off:off + take, :]
-            self.level_w[:, :, 0, 0, idx:idx + take] = pw[:, :, off:off + take]
-            if psu is None:
-                # Zero in place instead of materializing zero tensors to copy
-                # from: this runs on every window flush.
-                self.level_sigma_u[:, :, 0, 0, idx:idx + take, :].zero_()
-                self.level_sigma2[:, :, 0, 0, idx:idx + take].zero_()
-                self.level_gamma_a[:, :, 0, 0, idx:idx + take, :].zero_()
-                self.level_gamma_b[:, :, 0, 0, idx:idx + take, :].zero_()
-                self.level_gamma[:, :, 0, 0, idx:idx + take].zero_()
-            else:
-                self.level_sigma_u[:, :, 0, 0, idx:idx + take, :] = psu[:, :, off:off + take, :]
-                self.level_sigma2[:, :, 0, 0, idx:idx + take] = ps2[:, :, off:off + take]
-                self.level_gamma_a[:, :, 0, 0, idx:idx + take, :] = pga[:, :, off:off + take, :]
-                self.level_gamma_b[:, :, 0, 0, idx:idx + take, :] = pgb[:, :, off:off + take, :]
-                self.level_gamma[:, :, 0, 0, idx:idx + take] = pgm[:, :, off:off + take]
-            if pimp is None:
-                self.level_imp[:, :, 0, 0, idx:idx + take].zero_()
-            else:
-                self.level_imp[:, :, 0, 0, idx:idx + take] = pimp[:, :, off:off + take]
-            self.level_count[:, :, 0, 0] = idx + take
-            self.pad_mask[:, :, 0, 0, idx:idx + take] = False
-            off += take
-            if idx + take >= self.B:
-                lk, lv, lw = self._get_level(0)
-                limp = self._get_level_imp(0).clone() if pimp is not None else None
-                if self.second_order:
-                    lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
-                    self._binary_carry(
-                        lk.clone(), lv.clone(), lw.clone(),
-                        lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
-                        block_imp=limp,
-                    )
-                else:
-                    self._binary_carry(lk.clone(), lv.clone(), lw.clone(), block_imp=limp)
-                self._clear_level(0)
+        if f == 0:
+            return
+        if f > self.B:
+            raise ValueError(f"cannot append {f} level-0 entries at once with B={self.B}")
+
+        count0 = self.level_count[:, :, 0, 0].to(torch.long)
+        offsets = torch.arange(f, device=pk.device).view(1, 1, f)
+        positions = count0.unsqueeze(-1) + offsets
+        pre_mask = positions < self.B
+        self._scatter_level0(pk, pv, pw, psu, ps2, pga, pgb, pgm, pimp, positions, pre_mask)
+
+        count_after = count0 + f
+        carry = count_after >= self.B
+        lk, lv, lw = self._get_level(0)
+        limp = self._get_level_imp(0).clone() if pimp is not None else None
+        if self.second_order:
+            lsu, ls2, lga, lgb, lgm = self._get_level_stats(0)
+            self._binary_carry(
+                lk.clone(), lv.clone(), lw.clone(),
+                lsu.clone(), ls2.clone(), lga.clone(), lgb.clone(), lgm.clone(),
+                block_imp=limp,
+                active=carry,
+            )
+        else:
+            self._binary_carry(lk.clone(), lv.clone(), lw.clone(), block_imp=limp, active=carry)
+        self._clear_level(0, active=carry)
+
+        post_mask = positions >= self.B
+        if f > 1:
+            self._scatter_level0(pk, pv, pw, psu, ps2, pga, pgb, pgm, pimp, positions - self.B, post_mask)
+        new_count = torch.where(carry, count_after - self.B, count_after).to(self.level_count.dtype)
+        self.level_count[:, :, 0, 0].copy_(new_count)
+
+    def _scatter_level0(
+        self,
+        pk: torch.Tensor,
+        pv: torch.Tensor,
+        pw: torch.Tensor,
+        psu: torch.Tensor | None,
+        ps2: torch.Tensor | None,
+        pga: torch.Tensor | None,
+        pgb: torch.Tensor | None,
+        pgm: torch.Tensor | None,
+        pimp: torch.Tensor | None,
+        positions: torch.Tensor,
+        active: torch.Tensor,
+    ) -> None:
+        self._masked_scatter_slots(self.level_k[:, :, 0, 0], positions, active, pk)
+        self._masked_scatter_slots(self.level_v[:, :, 0, 0], positions, active, pv)
+        self._masked_scatter_slots(self.level_w[:, :, 0, 0], positions, active, pw)
+        self._masked_scatter_slots(
+            self.level_sigma_u[:, :, 0, 0], positions, active,
+            torch.zeros_like(pk) if psu is None else psu,
+        )
+        self._masked_scatter_slots(
+            self.level_sigma2[:, :, 0, 0], positions, active,
+            torch.zeros_like(pw) if ps2 is None else ps2,
+        )
+        self._masked_scatter_slots(
+            self.level_gamma_a[:, :, 0, 0], positions, active,
+            torch.zeros_like(pk) if pga is None else pga,
+        )
+        self._masked_scatter_slots(
+            self.level_gamma_b[:, :, 0, 0], positions, active,
+            torch.zeros_like(pv) if pgb is None else pgb,
+        )
+        self._masked_scatter_slots(
+            self.level_gamma[:, :, 0, 0], positions, active,
+            torch.zeros_like(pw) if pgm is None else pgm,
+        )
+        self._masked_scatter_slots(
+            self.level_imp[:, :, 0, 0], positions, active,
+            torch.zeros_like(pw, dtype=torch.float32) if pimp is None else pimp,
+        )
+        self._masked_scatter_slots(
+            self.pad_mask[:, :, 0, 0], positions, active,
+            torch.zeros_like(pw, dtype=torch.bool),
+        )
 
     # ------------------------------------------------------------------
     # Ingest chunk (testing): direct compact into level 0, bypass buffer
@@ -1282,48 +1325,63 @@ class LogStructuredKVCache(nn.Module):
 
         Returns:
             slot_k: (B, G, n_slots, k_dim) — time-ordered slot keys: compact
-                    levels oldest (highest level) first down to level 0, then
-                    the recent-window tokens as exact w=1 slots.
+                    levels oldest (highest level) first down to level 0 as a
+                    fixed-size pooled prefix, then exact pin/recent slots.
             slot_v: (B, G, n_slots, v_dim)
-            slot_w: (B, G, n_slots) — token count per slot (1 for recent).
-            Returns a ``CacheAttentionState``. If ``with_stats=True``, also fills:
+            slot_w: (B, G, n_slots) — token count per slot (0 for invalid
+                    pooled slots, 1 for recent/exact pins).
+            Returns a ``CacheAttentionState`` with ``slot_valid`` masking the
+            fixed pooled prefix. If ``with_stats=True``, also fills:
             slot_sigma_u / slot_sigma2: rank-1 key covariance stats;
             slot_gamma_a / slot_gamma_b / slot_gamma: rank-1 value-key cross
                 covariance stats. Exact recent and pinned tokens have zero stats.
 
-        Slots cover contiguous, time-ordered spans, so ``cumsum(slot_w)`` gives
-        the token boundaries of every slot (used by exactness tests). With
-        salience pins active (pin_count > 0) that contiguity invariant no
-        longer holds: pins are scattered duplicates of tokens the hierarchy
-        also covers. Attention itself is order-agnostic over the state (the
-        whole state is fully visible; only the appended in-flight chunk is
-        causal), so ordering matters only to those boundary-based tests, which
-        run with pins disabled.
+        Valid pooled slots cover contiguous, time-ordered spans after filtering
+        by ``slot_valid``. With salience pins active (pin_count > 0) that
+        contiguity invariant no longer holds past the pooled prefix: pins are
+        scattered duplicates of tokens the hierarchy also covers. Attention
+        itself is order-agnostic over the state (the whole state is fully
+        visible; only the appended in-flight chunk is causal).
         """
-        k_parts: list[torch.Tensor] = []
-        v_parts: list[torch.Tensor] = []
-        w_parts: list[torch.Tensor] = []
+        pooled_k = self.level_k[:, :, 0].flip(2).reshape(
+            self.batch_size, self.n_groups, self.L_alloc * self.B_prime, self.k_dim
+        )
+        pooled_v = self.level_v[:, :, 0].flip(2).reshape(
+            self.batch_size, self.n_groups, self.L_alloc * self.B_prime, self.v_dim
+        )
+        pooled_w = self.level_w[:, :, 0].flip(2).reshape(
+            self.batch_size, self.n_groups, self.L_alloc * self.B_prime
+        )
+        counts = self.level_count[:, :, 0].flip(2).to(torch.long)
+        slot_ids = torch.arange(self.B_prime, device=self.level_count.device).view(1, 1, 1, self.B_prime)
+        pooled_valid = (slot_ids < counts.unsqueeze(-1)).reshape(
+            self.batch_size, self.n_groups, self.L_alloc * self.B_prime
+        )
+
+        k_parts: list[torch.Tensor] = [pooled_k]
+        v_parts: list[torch.Tensor] = [pooled_v]
+        w_parts: list[torch.Tensor] = [pooled_w]
         sigma_u_parts: list[torch.Tensor] = []
         sigma2_parts: list[torch.Tensor] = []
         gamma_a_parts: list[torch.Tensor] = []
         gamma_b_parts: list[torch.Tensor] = []
         gamma_parts: list[torch.Tensor] = []
-
-        # Compact levels: oldest (highest level) first, down to level 0.
-        for ell in range(self.max_levels - 1, -1, -1):
-            count = self._level_count(ell)
-            if count > 0:
-                lk, lv, lw = self._get_level(ell)
-                k_parts.append(lk[:, :, :count, :])
-                v_parts.append(lv[:, :, :count, :])
-                w_parts.append(lw[:, :, :count])
-                if with_stats:
-                    lsu, ls2, lga, lgb, lgm = self._get_level_stats(ell)
-                    sigma_u_parts.append(lsu[:, :, :count, :])
-                    sigma2_parts.append(ls2[:, :, :count])
-                    gamma_a_parts.append(lga[:, :, :count, :])
-                    gamma_b_parts.append(lgb[:, :, :count, :])
-                    gamma_parts.append(lgm[:, :, :count])
+        if with_stats:
+            sigma_u_parts.append(self.level_sigma_u[:, :, 0].flip(2).reshape(
+                self.batch_size, self.n_groups, self.L_alloc * self.B_prime, self.k_dim
+            ))
+            sigma2_parts.append(self.level_sigma2[:, :, 0].flip(2).reshape(
+                self.batch_size, self.n_groups, self.L_alloc * self.B_prime
+            ))
+            gamma_a_parts.append(self.level_gamma_a[:, :, 0].flip(2).reshape(
+                self.batch_size, self.n_groups, self.L_alloc * self.B_prime, self.k_dim
+            ))
+            gamma_b_parts.append(self.level_gamma_b[:, :, 0].flip(2).reshape(
+                self.batch_size, self.n_groups, self.L_alloc * self.B_prime, self.v_dim
+            ))
+            gamma_parts.append(self.level_gamma[:, :, 0].flip(2).reshape(
+                self.batch_size, self.n_groups, self.L_alloc * self.B_prime
+            ))
 
         # Salience pins: exact w=1 duplicates from the compressed region,
         # placed between the levels and the recent window (they are older than
@@ -1332,7 +1390,7 @@ class LogStructuredKVCache(nn.Module):
             k_parts.append(self.pin_k[:, :, :self.pin_count, :])
             v_parts.append(self.pin_v[:, :, :self.pin_count, :])
             w_parts.append(
-                self.pin_k.new_ones(self.batch_size, self.n_groups, self.pin_count)
+                self.level_w.new_ones(self.batch_size, self.n_groups, self.pin_count)
             )
             if with_stats:
                 sigma_u_parts.append(self.pin_k[:, :, :self.pin_count, :].new_zeros(
@@ -1352,7 +1410,7 @@ class LogStructuredKVCache(nn.Module):
             k_parts.append(self.recent_k[:, :, :self.recent_count, :])
             v_parts.append(self.recent_v[:, :, :self.recent_count, :])
             w_parts.append(
-                self.recent_k.new_ones(self.batch_size, self.n_groups, self.recent_count)
+                self.level_w.new_ones(self.batch_size, self.n_groups, self.recent_count)
             )
             if with_stats:
                 sigma_u_parts.append(self.recent_k[:, :, :self.recent_count, :].new_zeros(
@@ -1367,37 +1425,21 @@ class LogStructuredKVCache(nn.Module):
                 ))
                 gamma_parts.append(self.recent_k.new_zeros(self.batch_size, self.n_groups, self.recent_count))
 
-        if w_parts:
-            slot_k = torch.cat(k_parts, dim=-2)
-            slot_v = torch.cat(v_parts, dim=-2)
-            slot_w = torch.cat(w_parts, dim=-1)
-            if not with_stats:
-                return CacheAttentionState(slot_k, slot_v, slot_w)
-            return CacheAttentionState(
-                slot_k=slot_k,
-                slot_v=slot_v,
-                slot_w=slot_w,
-                slot_sigma_u=torch.cat(sigma_u_parts, dim=-2),
-                slot_sigma2=torch.cat(sigma2_parts, dim=-1),
-                slot_gamma_a=torch.cat(gamma_a_parts, dim=-2),
-                slot_gamma_b=torch.cat(gamma_b_parts, dim=-2),
-                slot_gamma=torch.cat(gamma_parts, dim=-1),
-            )
-
-        slot_k = self.recent_k[:, :, :0, :]
-        slot_v = self.recent_v[:, :, :0, :]
-        slot_w = self.level_w[:, :, 0, 0, :0]
+        slot_k = torch.cat(k_parts, dim=-2)
+        slot_v = torch.cat(v_parts, dim=-2)
+        slot_w = torch.cat(w_parts, dim=-1)
         if not with_stats:
-            return CacheAttentionState(slot_k, slot_v, slot_w)
+            return CacheAttentionState(slot_k, slot_v, slot_w, slot_valid=pooled_valid)
         return CacheAttentionState(
             slot_k=slot_k,
             slot_v=slot_v,
             slot_w=slot_w,
-            slot_sigma_u=self.recent_k[:, :, :0, :],
-            slot_sigma2=slot_w,
-            slot_gamma_a=self.recent_k[:, :, :0, :],
-            slot_gamma_b=self.recent_v[:, :, :0, :],
-            slot_gamma=slot_w,
+            slot_valid=pooled_valid,
+            slot_sigma_u=torch.cat(sigma_u_parts, dim=-2),
+            slot_sigma2=torch.cat(sigma2_parts, dim=-1),
+            slot_gamma_a=torch.cat(gamma_a_parts, dim=-2),
+            slot_gamma_b=torch.cat(gamma_b_parts, dim=-2),
+            slot_gamma=torch.cat(gamma_parts, dim=-1),
         )
 
     # ------------------------------------------------------------------

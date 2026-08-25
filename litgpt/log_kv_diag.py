@@ -555,15 +555,16 @@ def diag_mode(
 # ======================================================================
 
 
-def slot_runs(slot_w: torch.Tensor) -> tuple[list[tuple[int, int, int]], int]:
+def slot_runs(slot_w: torch.Tensor, slot_valid: torch.Tensor | None = None) -> tuple[list[tuple[int, int, int]], int]:
     """Group time-ordered slots into runs of equal width.
 
     LogKV produces slots in level order (every slot in a hierarchy level shares a
-    width — a power of two — and the recent window is all width 1), so the slot
-    sequence collapses into a few maximal runs of constant width. Each run of
-    ``n`` slots of ``width`` covers a contiguous block of ``n * width`` exact
+    width — a power of two — and the recent window is all width 1), so the valid
+    slot sequence collapses into a few maximal runs of constant width. Each run
+    of ``n`` slots of ``width`` covers a contiguous block of ``n * width`` exact
     tokens, so ``reshape(..., n, width)`` recovers the per-slot token spans without
-    any scatter.
+    any scatter. ``slot_valid`` filters the fixed pooled-prefix capacity used by
+    the GPU layout.
 
     Requires ``slot_w`` identical across batch/group: with salience pins active
     the slots are scattered duplicates rather than one contiguous token run, so
@@ -574,13 +575,29 @@ def slot_runs(slot_w: torch.Tensor) -> tuple[list[tuple[int, int, int]], int]:
         runs: list of ``(slot_offset, n_slots, width)`` in time order.
         total_tokens: sum of ``n_slots * width`` over all runs.
     """
-    if not torch.all(slot_w == slot_w[0, 0]):
-        raise ValueError(
-            "slot widths differ across batch/group — diagnostics require pin_size=0 "
-            "(salience pins scatter duplicate slots and break the contiguous "
-            "slot->token span mapping)"
-        )
-    widths = slot_w[0, 0].round().to(torch.long).tolist()
+    if slot_valid is not None:
+        if not torch.all(slot_valid == slot_valid[0, 0]):
+            raise ValueError("slot validity differs across batch/group — diagnostics require aligned slots")
+        valid0 = slot_valid[0, 0]
+        slot_w = slot_w[..., :valid0.size(-1)]
+        if not torch.all(slot_w == slot_w[0, 0]):
+            raise ValueError(
+                "slot widths differ across batch/group — diagnostics require pin_size=0 "
+                "(salience pins scatter duplicate slots and break the contiguous "
+                "slot->token span mapping)"
+            )
+        widths_tensor = slot_w[0, 0, valid0]
+    else:
+        if not torch.all(slot_w == slot_w[0, 0]):
+            raise ValueError(
+                "slot widths differ across batch/group — diagnostics require pin_size=0 "
+                "(salience pins scatter duplicate slots and break the contiguous "
+                "slot->token span mapping)"
+            )
+        widths_tensor = slot_w[0, 0]
+    if widths_tensor.numel() == 0:
+        return [], 0
+    widths = widths_tensor.round().to(torch.long).tolist()
     runs: list[tuple[int, int, int]] = []
     total = 0
     i, s = 0, len(widths)
@@ -1177,7 +1194,7 @@ def diag_block_attention(
             second_order_scale=prod_second_order_scale,
         )
         if mode in ("baseline", "baseline_1st_order") and DIAG.collect:
-            runs, total = slot_runs(slot_w)
+            runs, total = slot_runs(slot_w, slot_valid)
             if total != k_prefix.size(2):
                 raise ValueError(
                     f"slot span ({total}) != prefix length ({k_prefix.size(2)}): "
@@ -1211,7 +1228,7 @@ def diag_block_attention(
     if mode == "dense":
         return _diag_dense(q, k_prefix, v_prefix, k_tail, v_tail, scale, layer, q_offset, seq_len)
 
-    runs, total = slot_runs(slot_w)
+    runs, total = slot_runs(slot_w, slot_valid)
     if total != k_prefix.size(2):
         raise ValueError(
             f"slot span ({total}) != prefix length ({k_prefix.size(2)}): "
