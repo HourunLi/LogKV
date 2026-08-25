@@ -91,7 +91,7 @@ python unused/semantic_s0_analyze.py '<out_dir>/*.json' --csv <out_dir>/summary.
 | S0.5 | `(g_max, ℓ_block)` 能把 entry 跨度压到可接受区间 |
 | S0.6 | fixed-3 物理 slot 数和 entry 数不把 memory story 打穿 |
 | S0.7 | 若 value 作废比例高，才把 Γ delta-rule 纳入 v1 |
-| S0.8 | `cache_batch` 与 `cache_serial` 的路由/cache/readout 分歧低到可解释 |
+| S0.8 | `cache_batch` 与 `cache_serial` 的路由/cache/readout 分歧低到可解释；须单独覆盖跨 Phase1/Phase2 边界的构造 case，不能只看整体分歧率 |
 
 ### Stage 1 - 实现
 

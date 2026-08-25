@@ -50,7 +50,14 @@ import torch.nn as nn
 from torch.autograd.function import once_differentiable
 
 from litgpt.log_kv_pin_score_diag import DIAG as LOG_KV_PIN_SCORE_DIAG
-from litgpt.log_kv_position import anchor_mass_bias, merge_anchors
+from litgpt.log_kv_position import (
+    anchor_mass_bias,
+    dedup_anchors,
+    materialize_anchor_directions,
+    materialize_anchor_keys,
+    merge_anchors,
+    mid_anchor,
+)
 
 
 _RANK1_EPS = 1e-12
@@ -66,6 +73,12 @@ _RANK1_EPS = 1e-12
 # error over an exact eigh, measured on the near-degenerate case that converges
 # slowest). TestRank1Approximation pins the resulting quality.
 _RANK1_SQUARINGS = 8
+
+LOG_KV_OP_NEW_CLUSTER = 0
+LOG_KV_OP_NEW_SEGMENT = 1
+LOG_KV_OP_JOIN = 2
+LOG_KV_OP_WARD_MERGE = 3
+LOG_KV_OP_PAD_INSERT = 4
 
 
 class CacheAttentionState(NamedTuple):
@@ -295,6 +308,18 @@ class LogStructuredKVCache(nn.Module):
         importance_pooling: bool = False,
         importance_pooling_lambda: float = 1.0,
         importance_pooling_temperature: float = 1.0,
+        semantic_clusters: bool = False,
+        cluster_k_max: int = 1,
+        cluster_lambda_rel: float = 1.0,
+        seg_eta: float = 1.0,
+        seg_g0: float = 2048.0,
+        seg_gap_max: float | None = None,
+        seg_block_level: int = 0,
+        seg_forget: float = 0.5,
+        semantic_s_h: torch.Tensor | float | None = None,
+        cos_cache: torch.Tensor | None = None,
+        sin_cache: torch.Tensor | None = None,
+        rope_n_elem: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -307,11 +332,20 @@ class LogStructuredKVCache(nn.Module):
         self.k_dim = k_dim
         self.v_dim = v_dim
         self.B = B
-        self.K_max = 1
+        self.semantic_clusters = bool(semantic_clusters)
+        self.K_max = int(cluster_k_max) if self.semantic_clusters else 1
+        if self.K_max < 1:
+            raise ValueError(f"cluster_k_max must be >= 1, got {cluster_k_max}")
+        if self.semantic_clusters and self.B < 2:
+            raise ValueError(f"semantic LogKV requires B >= 2, got {self.B}")
         self.recent_size = recent_size if recent_size > 0 else 2
         # Explicit raise (not assert): must survive `python -O`.
         if self.recent_size < 2:
             raise ValueError(f"recent_size ({self.recent_size}) must be >= 2")
+        if self.semantic_clusters and importance_pooling:
+            raise ValueError("semantic LogKV rejects importance_pooling=True")
+        if self.semantic_clusters and pin_size > 0:
+            raise ValueError("semantic LogKV rejects salience pinning; set pin_size=0")
         self.importance_pooling = bool(importance_pooling)
         self.importance_pooling_lambda = float(importance_pooling_lambda)
         if not 0.0 <= self.importance_pooling_lambda <= 1.0:
@@ -324,12 +358,54 @@ class LogStructuredKVCache(nn.Module):
                 f"importance_pooling_temperature must be > 0, got {self.importance_pooling_temperature}"
             )
 
-        denom = B * 2
-        # +1 for the write level (level 0). The formula gives the number of carry
-        # levels needed; total levels = carry + 1 write level.
-        self.max_levels = max(2, math.ceil(math.log2(max((max_seq_length + 1) / denom, 1))) + 1)
+        if self.semantic_clusters:
+            if cos_cache is None or sin_cache is None or rope_n_elem is None:
+                raise ValueError("semantic LogKV requires cos_cache, sin_cache, and rope_n_elem")
+            if cos_cache.dim() != 2 or sin_cache.dim() != 2 or cos_cache.shape != sin_cache.shape:
+                raise ValueError(
+                    f"semantic LogKV requires 2-D matching RoPE caches, got {cos_cache.shape} and {sin_cache.shape}"
+                )
+            self.cluster_lambda_rel = float(cluster_lambda_rel)
+            if not (math.isfinite(self.cluster_lambda_rel) and self.cluster_lambda_rel > 0.0):
+                raise ValueError(f"cluster_lambda_rel must be finite and > 0, got {cluster_lambda_rel}")
+            self.seg_eta = float(seg_eta)
+            self.seg_g0 = float(seg_g0)
+            if not (math.isfinite(self.seg_g0) and self.seg_g0 > 0.0):
+                raise ValueError(f"seg_g0 must be finite and > 0, got {seg_g0}")
+            self.seg_gap_max = math.inf if seg_gap_max is None else float(seg_gap_max)
+            if not (self.seg_gap_max == math.inf or (math.isfinite(self.seg_gap_max) and self.seg_gap_max >= 0.0)):
+                raise ValueError(f"seg_gap_max must be finite >= 0 or inf, got {seg_gap_max}")
+            self.seg_block_level = int(seg_block_level)
+            if self.seg_block_level not in (0, 1, 2):
+                raise ValueError(f"seg_block_level must be one of {{0,1,2}}, got {seg_block_level}")
+            self.seg_forget = float(seg_forget)
+            if not 0.0 <= self.seg_forget <= 1.0:
+                raise ValueError(f"seg_forget must be in [0,1], got {seg_forget}")
+            self.rope_n_elem = int(rope_n_elem)
+            self.register_buffer("cos_cache", cos_cache.to(device=device), persistent=False)
+            self.register_buffer("sin_cache", sin_cache.to(device=device), persistent=False)
+            self.slot_k_dim = int(cos_cache.size(1)) + k_dim - self.rope_n_elem
+            # §5.12: K_max changes ladder budget. +2 is the v1 safety margin.
+            self.max_levels = max(2, math.ceil(math.log2(max_seq_length / max(self.K_max * B, 1) + 1.0)) + 2)
+        else:
+            self.cluster_lambda_rel = 1.0
+            self.seg_eta = 0.0
+            self.seg_g0 = 2048.0
+            self.seg_gap_max = math.inf
+            self.seg_block_level = 0
+            self.seg_forget = 1.0
+            self.rope_n_elem = None
+            self.cos_cache = None
+            self.sin_cache = None
+            self.slot_k_dim = k_dim
+            denom = B * 2
+            # +1 for the write level (level 0). The formula gives the number of carry
+            # levels needed; total levels = carry + 1 write level.
+            self.max_levels = max(2, math.ceil(math.log2(max((max_seq_length + 1) / denom, 1))) + 1)
         self.L_alloc = self.max_levels
         self.B_prime = B
+        self.recent_capacity = self.recent_size * 2 if self.semantic_clusters else self.recent_size
+        self.semantic_flush_granularity = 2
 
         # Total tokens ever committed (scalar bookkeeping only — replaces the
         # former Θ(N) per-token position-key buffer).
@@ -338,14 +414,25 @@ class LogStructuredKVCache(nn.Module):
         # ---- Sliding window: last < recent_size tokens (exact keys + values) ----
         self.register_buffer(
             "recent_k",
-            torch.zeros(batch_size, n_groups, self.recent_size, k_dim, device=device, dtype=dtype),
+            torch.zeros(batch_size, n_groups, self.recent_capacity, self.slot_k_dim, device=device, dtype=dtype),
             persistent=False,
         )
         self.register_buffer(
             "recent_v",
-            torch.zeros(batch_size, n_groups, self.recent_size, v_dim, device=device, dtype=dtype),
+            torch.zeros(batch_size, n_groups, self.recent_capacity, v_dim, device=device, dtype=dtype),
             persistent=False,
         )
+        if self.semantic_clusters:
+            self.register_buffer(
+                "recent_k_raw",
+                torch.zeros(batch_size, n_groups, self.recent_capacity, k_dim, device=device, dtype=dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                "recent_pos",
+                torch.zeros(batch_size, self.recent_capacity, device=device, dtype=torch.int64),
+                persistent=False,
+            )
         self.recent_count: int = 0
 
         # ---- Hierarchical entries: (B, G, K_max, L_alloc, B', ·) ----
@@ -411,6 +498,78 @@ class LogStructuredKVCache(nn.Module):
             torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, dtype=torch.bool, device=device),
             persistent=False,
         )
+        if self.semantic_clusters:
+            i64max = torch.iinfo(torch.int64).max
+            self.register_buffer(
+                "level_p_lo",
+                torch.full((batch_size, n_groups, self.K_max, self.L_alloc, B), i64max, dtype=torch.int64, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "level_p_hi",
+                torch.full((batch_size, n_groups, self.K_max, self.L_alloc, B), -1, dtype=torch.int64, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "level_sum_wp",
+                torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, dtype=torch.int64, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "level_order",
+                torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, dtype=torch.int64, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "centroid",
+                torch.zeros(batch_size, n_groups, self.K_max, k_dim, device=device, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "n_eff",
+                torch.zeros(batch_size, n_groups, self.K_max, device=device, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "n_total",
+                torch.zeros(batch_size, n_groups, self.K_max, device=device, dtype=torch.int32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "p_hi_c",
+                torch.full((batch_size, n_groups, self.K_max), -1, device=device, dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "current_segment",
+                torch.zeros(batch_size, n_groups, self.K_max, device=device, dtype=torch.int32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "level0_phase",
+                torch.zeros(batch_size, n_groups, self.K_max, device=device, dtype=torch.int32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "alive",
+                torch.zeros(batch_size, n_groups, self.K_max, device=device, dtype=torch.bool),
+                persistent=False,
+            )
+            if semantic_s_h is None:
+                s_h = torch.ones(batch_size, n_groups, device=device, dtype=torch.float32)
+            elif isinstance(semantic_s_h, torch.Tensor):
+                s_h = semantic_s_h.to(device=device, dtype=torch.float32)
+                if s_h.shape == (n_groups,):
+                    s_h = s_h.unsqueeze(0).expand(batch_size, -1).contiguous()
+                elif s_h.shape != (batch_size, n_groups):
+                    raise ValueError(f"semantic_s_h must have shape ({n_groups},) or ({batch_size},{n_groups}), got {tuple(s_h.shape)}")
+            else:
+                s_h = torch.full((batch_size, n_groups), float(semantic_s_h), device=device, dtype=torch.float32)
+            if not bool(torch.isfinite(s_h).all().item()) or not bool((s_h > 0).all().item()):
+                raise ValueError("semantic_s_h must be finite and > 0")
+            self.register_buffer("s_h", s_h, persistent=False)
+            self.op_log: torch.Tensor | None = None
+            self.op_log_len: torch.Tensor | None = None
 
         # When False, compaction skips the rank-1 second-order statistics
         # entirely (they stay zero) and the levels behave like the first-order
@@ -437,7 +596,7 @@ class LogStructuredKVCache(nn.Module):
         self.pin_size = pin_size
         self.register_buffer(
             "pin_k",
-            torch.zeros(batch_size, n_groups, pin_size, k_dim, device=device, dtype=dtype),
+            torch.zeros(batch_size, n_groups, pin_size, self.slot_k_dim, device=device, dtype=dtype),
             persistent=False,
         )
         self.register_buffer(
@@ -591,6 +750,626 @@ class LogStructuredKVCache(nn.Module):
         self.level_gamma[:, :, 0, ell].zero_()
         self.level_count[:, :, 0, ell].zero_()
         self.pad_mask[:, :, 0, ell].zero_()
+
+    def _semantic_clear_slot(self, b: int, g: int, c: int, ell: int, idx: int) -> None:
+        self.level_k[b, g, c, ell, idx].zero_()
+        self.level_v[b, g, c, ell, idx].zero_()
+        self.level_w[b, g, c, ell, idx].zero_()
+        self.level_imp[b, g, c, ell, idx].zero_()
+        self.level_sigma_u[b, g, c, ell, idx].zero_()
+        self.level_sigma2[b, g, c, ell, idx].zero_()
+        self.level_gamma_a[b, g, c, ell, idx].zero_()
+        self.level_gamma_b[b, g, c, ell, idx].zero_()
+        self.level_gamma[b, g, c, ell, idx].zero_()
+        self.level_p_lo[b, g, c, ell, idx].zero_()
+        self.level_p_hi[b, g, c, ell, idx].zero_()
+        self.level_sum_wp[b, g, c, ell, idx].zero_()
+        self.level_order[b, g, c, ell, idx].zero_()
+        self.pad_mask[b, g, c, ell, idx] = False
+
+    def _semantic_write_slot(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        ell: int,
+        idx: int,
+        entry: tuple[torch.Tensor, ...],
+    ) -> None:
+        k, v, w, su, s2, ga, gb, gm, p_lo, p_hi, sum_wp, order, is_pad = entry
+        self.level_k[b, g, c, ell, idx].copy_(k)
+        self.level_v[b, g, c, ell, idx].copy_(v)
+        self.level_w[b, g, c, ell, idx].copy_(w.float())
+        self.level_imp[b, g, c, ell, idx].zero_()
+        self.level_sigma_u[b, g, c, ell, idx].copy_(su)
+        self.level_sigma2[b, g, c, ell, idx].copy_(s2)
+        self.level_gamma_a[b, g, c, ell, idx].copy_(ga)
+        self.level_gamma_b[b, g, c, ell, idx].copy_(gb)
+        self.level_gamma[b, g, c, ell, idx].copy_(gm)
+        self.level_p_lo[b, g, c, ell, idx].copy_(p_lo.long())
+        self.level_p_hi[b, g, c, ell, idx].copy_(p_hi.long())
+        self.level_sum_wp[b, g, c, ell, idx].copy_(sum_wp.long())
+        self.level_order[b, g, c, ell, idx].copy_(order.long())
+        self.pad_mask[b, g, c, ell, idx] = bool(is_pad)
+
+    def _semantic_slot_entry(self, b: int, g: int, c: int, ell: int, idx: int) -> tuple[torch.Tensor, ...]:
+        return (
+            self.level_k[b, g, c, ell, idx].clone(),
+            self.level_v[b, g, c, ell, idx].clone(),
+            self.level_w[b, g, c, ell, idx].clone(),
+            self.level_sigma_u[b, g, c, ell, idx].clone(),
+            self.level_sigma2[b, g, c, ell, idx].clone(),
+            self.level_gamma_a[b, g, c, ell, idx].clone(),
+            self.level_gamma_b[b, g, c, ell, idx].clone(),
+            self.level_gamma[b, g, c, ell, idx].clone(),
+            self.level_p_lo[b, g, c, ell, idx].clone(),
+            self.level_p_hi[b, g, c, ell, idx].clone(),
+            self.level_sum_wp[b, g, c, ell, idx].clone(),
+            self.level_order[b, g, c, ell, idx].clone(),
+            bool(self.pad_mask[b, g, c, ell, idx].item()),
+        )
+
+    def _semantic_merge_entries(self, a: tuple[torch.Tensor, ...], b: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        k1, v1, w1, su1, s21, ga1, gb1, gm1, lo1, hi1, swp1, order1, pad1 = a
+        k2, v2, w2, su2, s22, ga2, gb2, gm2, lo2, hi2, swp2, order2, pad2 = b
+        base = (
+            k1.view(1, 1, 1, -1),
+            v1.view(1, 1, 1, -1),
+            w1.view(1, 1, 1),
+            k2.view(1, 1, 1, -1),
+            v2.view(1, 1, 1, -1),
+            w2.view(1, 1, 1),
+        )
+        anchors = {
+            "p_lo1": lo1.view(1, 1, 1),
+            "p_hi1": hi1.view(1, 1, 1),
+            "sum_wp1": swp1.view(1, 1, 1),
+            "p_lo2": lo2.view(1, 1, 1),
+            "p_hi2": hi2.view(1, 1, 1),
+            "sum_wp2": swp2.view(1, 1, 1),
+        }
+        if self.second_order:
+            out = self.compact(
+                *base,
+                su1.view(1, 1, 1, -1), s21.view(1, 1, 1),
+                ga1.view(1, 1, 1, -1), gb1.view(1, 1, 1, -1), gm1.view(1, 1, 1),
+                su2.view(1, 1, 1, -1), s22.view(1, 1, 1),
+                ga2.view(1, 1, 1, -1), gb2.view(1, 1, 1, -1), gm2.view(1, 1, 1),
+                **anchors,
+            )
+            k, v, w, su, s2, ga, gb, gm, p_lo, p_hi, sum_wp = out
+            return (
+                k[0, 0, 0], v[0, 0, 0], w[0, 0, 0],
+                su[0, 0, 0], s2[0, 0, 0], ga[0, 0, 0], gb[0, 0, 0], gm[0, 0, 0],
+                p_lo[0, 0, 0], p_hi[0, 0, 0], sum_wp[0, 0, 0],
+                torch.minimum(order1, order2), bool(pad1 and pad2),
+            )
+        k, v, w, p_lo, p_hi, sum_wp = self.compact(*base, **anchors)
+        return (
+            k[0, 0, 0], v[0, 0, 0], w[0, 0, 0],
+            torch.zeros_like(k1), torch.zeros_like(w1),
+            torch.zeros_like(k1), torch.zeros_like(v1), torch.zeros_like(w1),
+            p_lo[0, 0, 0], p_hi[0, 0, 0], sum_wp[0, 0, 0],
+            torch.minimum(order1, order2), bool(pad1 and pad2),
+        )
+
+    def _semantic_shift_after_oldest_pair_merge(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        ell: int,
+        incoming: tuple[torch.Tensor, ...],
+        *,
+        top_level: bool,
+    ) -> None:
+        if top_level:
+            for dst, src in enumerate(range(2, self.B)):
+                self._semantic_write_slot(b, g, c, ell, dst + 1, self._semantic_slot_entry(b, g, c, ell, src))
+            self._semantic_write_slot(b, g, c, ell, self.B - 1, incoming)
+            return
+        for dst, src in enumerate(range(2, self.B)):
+            self._semantic_write_slot(b, g, c, ell, dst, self._semantic_slot_entry(b, g, c, ell, src))
+        self._semantic_write_slot(b, g, c, ell, self.B - 2, incoming)
+        self._semantic_clear_slot(b, g, c, ell, self.B - 1)
+        self.level_count[b, g, c, ell] = self.B - 1
+
+    def _semantic_append_entry(self, b: int, g: int, c: int, entry: tuple[torch.Tensor, ...]) -> None:
+        ell = 0
+        incoming = entry
+        while True:
+            count = int(self.level_count[b, g, c, ell].item())
+            if count < self.B:
+                self._semantic_write_slot(b, g, c, ell, count, incoming)
+                self.level_count[b, g, c, ell] = count + 1
+                return
+
+            merged = self._semantic_merge_entries(
+                self._semantic_slot_entry(b, g, c, ell, 0),
+                self._semantic_slot_entry(b, g, c, ell, 1),
+            )
+            if ell == self.L_alloc - 1:
+                self._semantic_write_slot(b, g, c, ell, 0, merged)
+                self._semantic_shift_after_oldest_pair_merge(b, g, c, ell, incoming, top_level=True)
+                self.level_count[b, g, c, ell] = self.B
+                return
+            self._semantic_shift_after_oldest_pair_merge(b, g, c, ell, incoming, top_level=False)
+            incoming = merged
+            ell += 1
+
+    def _semantic_clear_cluster(self, b: int, g: int, c: int) -> None:
+        self.level_k[b, g, c].zero_()
+        self.level_v[b, g, c].zero_()
+        self.level_w[b, g, c].zero_()
+        self.level_imp[b, g, c].zero_()
+        self.level_sigma_u[b, g, c].zero_()
+        self.level_sigma2[b, g, c].zero_()
+        self.level_gamma_a[b, g, c].zero_()
+        self.level_gamma_b[b, g, c].zero_()
+        self.level_gamma[b, g, c].zero_()
+        self.level_p_lo[b, g, c].zero_()
+        self.level_p_hi[b, g, c].zero_()
+        self.level_sum_wp[b, g, c].zero_()
+        self.level_order[b, g, c].zero_()
+        self.level_count[b, g, c].zero_()
+        self.pad_mask[b, g, c].zero_()
+        self.level0_phase[b, g, c].zero_()
+
+    def begin_op_log(self) -> None:
+        """Bind a fresh per-(batch, group) route log for one training forward."""
+        cap = max(1, self.max_seq_length * 3)
+        self.op_log = torch.empty(
+            self.batch_size, self.n_groups, cap, 4,
+            device=self.level_count.device,
+            dtype=torch.int32,
+        )
+        self.op_log_len = torch.zeros(self.batch_size, self.n_groups, device=self.level_count.device, dtype=torch.int32)
+        self._op_replay_cursor = None
+
+    def take_op_log(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if getattr(self, "op_log", None) is None or getattr(self, "op_log_len", None) is None:
+            return None, None
+        max_len = int(self.op_log_len.max().item())
+        return self.op_log[:, :, :max_len].clone(), self.op_log_len.clone()
+
+    def _record_op(self, b: int, g: int, op: int, a: int, b_arg: int, c_arg: int) -> None:
+        if getattr(self, "op_log", None) is None or getattr(self, "op_log_len", None) is None:
+            return
+        idx = int(self.op_log_len[b, g].item())
+        if idx >= self.op_log.size(2):
+            raise RuntimeError("semantic LogKV op_log overflow")
+        self.op_log[b, g, idx] = torch.tensor((op, a, b_arg, c_arg), device=self.op_log.device, dtype=torch.int32)
+        self.op_log_len[b, g] += 1
+
+    def _semantic_entry_from_token(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        pos: torch.Tensor,
+        *,
+        is_pad: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        order = self.level0_phase[b, g, c].to(torch.int64).clone()
+        if is_pad:
+            return (
+                torch.zeros_like(k_raw),
+                torch.zeros_like(v),
+                self.level_w.new_zeros(()),
+                torch.zeros_like(k_raw),
+                self.level_sigma2.new_zeros(()),
+                torch.zeros_like(k_raw),
+                torch.zeros_like(v),
+                self.level_gamma.new_zeros(()),
+                self.level_p_lo.new_zeros(()),
+                self.level_p_hi.new_zeros(()),
+                self.level_sum_wp.new_zeros(()),
+                order,
+                True,
+            )
+        p = pos.to(device=self.level_p_lo.device, dtype=torch.int64)
+        return (
+            k_raw.detach(),
+            v.detach(),
+            self.level_w.new_ones(()),
+            torch.zeros_like(k_raw),
+            self.level_sigma2.new_zeros(()),
+            torch.zeros_like(k_raw),
+            torch.zeros_like(v),
+            self.level_gamma.new_zeros(()),
+            p.clone(),
+            p.clone(),
+            p.clone(),
+            order,
+            False,
+        )
+
+    def _semantic_append_token_entry(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        pos: torch.Tensor,
+        *,
+        is_pad: bool = False,
+    ) -> None:
+        self._semantic_append_entry(b, g, c, self._semantic_entry_from_token(b, g, c, k_raw, v, pos, is_pad=is_pad))
+        self.level0_phase[b, g, c] += 1
+
+    def _semantic_insert_pad(self, b: int, g: int, c: int, count: int, *, record: bool) -> None:
+        if count <= 0:
+            return
+        if record:
+            self._record_op(b, g, LOG_KV_OP_PAD_INSERT, c, 0, count)
+        z_k = self.level_k.new_zeros(self.k_dim)
+        z_v = self.level_v.new_zeros(self.v_dim)
+        z_pos = self.level_p_lo.new_zeros(())
+        for _ in range(int(count)):
+            self._semantic_append_token_entry(b, g, c, z_k, z_v, z_pos, is_pad=True)
+
+    def _semantic_update_member_metadata(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        k_raw: torch.Tensor,
+        pos: torch.Tensor,
+        *,
+        new_segment: bool = False,
+        segment: int | None = None,
+    ) -> None:
+        if new_segment:
+            self.n_eff[b, g, c].mul_(self.seg_forget)
+            if segment is None:
+                self.current_segment[b, g, c] += 1
+            else:
+                self.current_segment[b, g, c] = int(segment)
+        n_eff_pre = self.n_eff[b, g, c].clone()
+        denom = n_eff_pre + 1.0
+        self.centroid[b, g, c].copy_(
+            torch.where(
+                n_eff_pre > 0,
+                (n_eff_pre * self.centroid[b, g, c] + k_raw.float()) / denom,
+                k_raw.float(),
+            )
+        )
+        self.n_eff[b, g, c].copy_(denom)
+        self.n_total[b, g, c] += 1
+        self.p_hi_c[b, g, c].copy_(pos.to(self.p_hi_c.dtype))
+
+    def _semantic_new_cluster(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        token_idx: int,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        pos: torch.Tensor,
+        *,
+        record: bool,
+    ) -> None:
+        self._semantic_clear_cluster(b, g, c)
+        self.alive[b, g, c] = True
+        self.centroid[b, g, c].copy_(k_raw.float())
+        self.n_eff[b, g, c] = 1.0
+        self.n_total[b, g, c] = 1
+        self.p_hi_c[b, g, c].copy_(pos.to(self.p_hi_c.dtype))
+        self.current_segment[b, g, c].zero_()
+        self._semantic_append_token_entry(b, g, c, k_raw, v, pos)
+        if record:
+            self._record_op(b, g, LOG_KV_OP_NEW_CLUSTER, c, 0, int(token_idx))
+
+    def _semantic_join(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        segment: int,
+        token_idx: int,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        pos: torch.Tensor,
+        *,
+        record: bool,
+    ) -> None:
+        self._semantic_append_token_entry(b, g, c, k_raw, v, pos)
+        self._semantic_update_member_metadata(b, g, c, k_raw, pos, segment=segment)
+        if record:
+            self._record_op(b, g, LOG_KV_OP_JOIN, c, int(segment), int(token_idx))
+
+    def _semantic_new_segment(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        token_idx: int,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        pos: torch.Tensor,
+        *,
+        record: bool,
+    ) -> None:
+        align = 1 << self.seg_block_level
+        pad_count = 0 if self.seg_block_level == 0 else (-int(self.level0_phase[b, g, c].item())) % align
+        self._semantic_insert_pad(b, g, c, pad_count, record=record)
+        new_seg = int(self.current_segment[b, g, c].item()) + 1
+        self._semantic_append_token_entry(b, g, c, k_raw, v, pos)
+        self._semantic_update_member_metadata(b, g, c, k_raw, pos, new_segment=True, segment=new_seg)
+        if record:
+            self._record_op(b, g, LOG_KV_OP_NEW_SEGMENT, c, new_seg, int(token_idx))
+
+    def _semantic_collect_entries(self, b: int, g: int, c: int) -> list[tuple[torch.Tensor, ...]]:
+        entries: list[tuple[torch.Tensor, ...]] = []
+        for ell in range(self.L_alloc):
+            count = int(self.level_count[b, g, c, ell].item())
+            entries.extend(self._semantic_slot_entry(b, g, c, ell, idx) for idx in range(count))
+        return sorted(entries, key=lambda entry: int(entry[11].item()))
+
+    def _semantic_ward_pair(self, b: int, g: int) -> tuple[int, int]:
+        alive = self.alive[b, g]
+        idx = torch.nonzero(alive, as_tuple=False).flatten()
+        if idx.numel() < 2:
+            raise RuntimeError("semantic LogKV Ward merge needs at least two live clusters")
+        mu = self.centroid[b, g, idx]
+        n = self.n_total[b, g, idx].float()
+        diff = mu[:, None, :] - mu[None, :, :]
+        dist2 = diff.square().sum(dim=-1)
+        cost = (n[:, None] * n[None, :] / (n[:, None] + n[None, :]).clamp_min(1.0)) * dist2
+        cost.fill_diagonal_(float("inf"))
+        flat = int(cost.flatten().argmin().item())
+        i = flat // idx.numel()
+        j = flat % idx.numel()
+        keep = int(torch.minimum(idx[i], idx[j]).item())
+        free = int(torch.maximum(idx[i], idx[j]).item())
+        return keep, free
+
+    def _semantic_ward_merge(self, b: int, g: int, keep: int, free: int, *, record: bool) -> None:
+        if record:
+            self._record_op(b, g, LOG_KV_OP_WARD_MERGE, keep, free, -1)
+        def _effective_pos(seq: list[tuple[torch.Tensor, ...]], i: int) -> int:
+            if float(seq[i][2].item()) > 0.0:
+                return int(seq[i][8].item())
+            for j in range(i + 1, len(seq)):
+                if float(seq[j][2].item()) > 0.0:
+                    return int(seq[j][8].item())
+            return int(seq[i][11].item())
+
+        def _merge_time_ordered(
+            left: list[tuple[torch.Tensor, ...]], right: list[tuple[torch.Tensor, ...]]
+        ) -> list[tuple[torch.Tensor, ...]]:
+            out: list[tuple[torch.Tensor, ...]] = []
+            i = j = 0
+            while i < len(left) or j < len(right):
+                if j == len(right) or (i < len(left) and _effective_pos(left, i) <= _effective_pos(right, j)):
+                    out.append(left[i])
+                    i += 1
+                else:
+                    out.append(right[j])
+                    j += 1
+            return out
+
+        entries = _merge_time_ordered(
+            self._semantic_collect_entries(b, g, keep),
+            self._semantic_collect_entries(b, g, free),
+        )
+        n_keep = self.n_total[b, g, keep].float()
+        n_free = self.n_total[b, g, free].float()
+        n_sum = (n_keep + n_free).clamp_min(1.0)
+        centroid = (n_keep * self.centroid[b, g, keep] + n_free * self.centroid[b, g, free]) / n_sum
+        n_eff = self.n_eff[b, g, keep] + self.n_eff[b, g, free]
+        n_total = self.n_total[b, g, keep] + self.n_total[b, g, free]
+        p_hi = torch.maximum(self.p_hi_c[b, g, keep], self.p_hi_c[b, g, free])
+        segment = torch.maximum(self.current_segment[b, g, keep], self.current_segment[b, g, free])
+        self._semantic_clear_cluster(b, g, keep)
+        self.alive[b, g, keep] = True
+        self.centroid[b, g, keep].copy_(centroid)
+        self.n_eff[b, g, keep].copy_(n_eff)
+        self.n_total[b, g, keep].copy_(n_total)
+        self.p_hi_c[b, g, keep].copy_(p_hi)
+        self.current_segment[b, g, keep].copy_(segment)
+        for order, entry in enumerate(entries):
+            entry = entry[:11] + (entry[11].new_tensor(order), entry[12])
+            self._semantic_append_entry(b, g, keep, entry)
+        self.level0_phase[b, g, keep] = len(entries)
+        self._semantic_clear_cluster(b, g, free)
+        self.alive[b, g, free] = False
+        self.n_eff[b, g, free].zero_()
+        self.n_total[b, g, free].zero_()
+        self.p_hi_c[b, g, free] = -1
+        self.current_segment[b, g, free].zero_()
+
+    def _semantic_existing_assignments(
+        self,
+        k_raw: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        live = self.alive[: k_raw.size(0), : k_raw.size(1)]
+        diff = k_raw.float().unsqueeze(3) - self.centroid[: k_raw.size(0), : k_raw.size(1)].unsqueeze(2)
+        semantic = diff.square().sum(dim=-1)
+        gap = (positions[:, None, :, None].to(self.p_hi_c.dtype) - self.p_hi_c[: k_raw.size(0), : k_raw.size(1)].unsqueeze(2))
+        gap = gap.float().clamp_min(0.0)
+        temporal = self.seg_eta * (gap / (gap + self.seg_g0))
+        cost = (semantic + temporal).masked_fill(~live.unsqueeze(2), float("inf"))
+        winner = cost.argmin(dim=-1)
+        s_winner = semantic.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+        has_alive = live.any(dim=-1).unsqueeze(-1)
+        direct = has_alive & (s_winner <= self.cluster_lambda_rel * self.s_h[: k_raw.size(0), : k_raw.size(1)].unsqueeze(-1))
+        return winner, s_winner, direct
+
+    def _semantic_replay_token_offset(self, positions: torch.Tensor, b: int, token_idx: int) -> int:
+        hit = torch.nonzero(positions[b] == token_idx, as_tuple=False).flatten()
+        if hit.numel() != 1:
+            got = positions[b].detach().cpu().tolist()
+            raise RuntimeError(f"semantic LogKV replay token {token_idx} not in current flush positions {got}")
+        return int(hit[0].item())
+
+    def _semantic_join_or_segment(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        token_idx: int,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        pos: torch.Tensor,
+        *,
+        record: bool,
+    ) -> None:
+        gap = int(pos.item()) - int(self.p_hi_c[b, g, c].item())
+        if self.seg_gap_max != math.inf and gap > self.seg_gap_max:
+            self._semantic_new_segment(b, g, c, token_idx, k_raw, v, pos, record=record)
+        else:
+            self._semantic_join(b, g, c, int(self.current_segment[b, g, c].item()), token_idx, k_raw, v, pos, record=record)
+
+    def _semantic_route_k1_batch(
+        self,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        record: bool,
+    ) -> None:
+        for b in range(k_raw.size(0)):
+            for g in range(k_raw.size(1)):
+                for i in range(k_raw.size(2)):
+                    pos = positions[b, i]
+                    token_idx = int(pos.item())
+                    if not bool(self.alive[b, g, 0].item()):
+                        self._semantic_new_cluster(b, g, 0, token_idx, k_raw[b, g, i], v[b, g, i], pos, record=record)
+                    else:
+                        self._semantic_join_or_segment(
+                            b, g, 0, token_idx, k_raw[b, g, i], v[b, g, i], pos, record=record
+                        )
+
+    def _semantic_route_three_phase(
+        self,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        record: bool,
+    ) -> None:
+        if self.K_max == 1:
+            self._semantic_route_k1_batch(k_raw, v, positions, record=record)
+            return
+
+        winner, _s_winner, direct = self._semantic_existing_assignments(k_raw, positions)
+
+        # Phase 1: frozen-centroid direct assignments, grouped by logical cluster.
+        for b in range(k_raw.size(0)):
+            for g in range(k_raw.size(1)):
+                for c in range(self.K_max):
+                    idx = torch.nonzero(direct[b, g] & (winner[b, g] == c), as_tuple=False).flatten()
+                    for i in idx.tolist():
+                        pos = positions[b, i]
+                        self._semantic_join_or_segment(
+                            b,
+                            g,
+                            c,
+                            int(pos.item()),
+                            k_raw[b, g, i],
+                            v[b, g, i],
+                            pos,
+                            record=record,
+                        )
+
+        # Phase 2: only novelty orphans are allowed to bind to orphan-created clusters.
+        for b in range(k_raw.size(0)):
+            for g in range(k_raw.size(1)):
+                batch_clusters: list[int] = []
+                idx = torch.nonzero(~direct[b, g], as_tuple=False).flatten()
+                for i in idx.tolist():
+                    pos = positions[b, i]
+                    token_idx = int(pos.item())
+                    if batch_clusters:
+                        cand = torch.tensor(batch_clusters, device=self.alive.device, dtype=torch.long)
+                        dist = (self.centroid[b, g, cand] - k_raw[b, g, i].float()).square().sum(dim=-1)
+                        j = int(dist.argmin().item())
+                        c = int(batch_clusters[j])
+                        if bool((dist[j] <= self.cluster_lambda_rel * self.s_h[b, g]).item()):
+                            self._semantic_join_or_segment(
+                                b, g, c, token_idx, k_raw[b, g, i], v[b, g, i], pos, record=record
+                            )
+                            continue
+
+                    free_idx = torch.nonzero(~self.alive[b, g], as_tuple=False).flatten()
+                    if free_idx.numel() == 0:
+                        keep, free = self._semantic_ward_pair(b, g)
+                        self._semantic_ward_merge(b, g, keep, free, record=record)
+                        batch_clusters = [keep if c == free else c for c in batch_clusters if c != free]
+                        c = free
+                    else:
+                        c = int(free_idx[0].item())
+                    self._semantic_new_cluster(b, g, c, token_idx, k_raw[b, g, i], v[b, g, i], pos, record=record)
+                    batch_clusters.append(c)
+
+    def route_and_flush_batch(
+        self,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        record_op_log: bool = False,
+        replay_op_log: torch.Tensor | None = None,
+        replay_op_log_len: torch.Tensor | None = None,
+    ) -> None:
+        if not self.semantic_clusters:
+            raise RuntimeError("route_and_flush_batch is only valid for semantic LogKV")
+        if record_op_log and self.op_log is None:
+            self.begin_op_log()
+        if positions.dim() == 1:
+            positions = positions.unsqueeze(0).expand(k_raw.size(0), -1)
+        if replay_op_log is not None:
+            if replay_op_log_len is None:
+                raise ValueError("replay_op_log_len is required with replay_op_log")
+            if getattr(self, "_op_replay_cursor", None) is None:
+                self._op_replay_cursor = torch.zeros(
+                    self.batch_size, self.n_groups, device=self.level_count.device, dtype=torch.int32
+                )
+            for b in range(k_raw.size(0)):
+                for g in range(k_raw.size(1)):
+                    consumed = 0
+                    while consumed < k_raw.size(2):
+                        cursor = int(self._op_replay_cursor[b, g].item())
+                        if cursor >= int(replay_op_log_len[b, g].item()):
+                            break
+                        row = replay_op_log[b, g, cursor].tolist()
+                        self._op_replay_cursor[b, g] += 1
+                        op, a, b_arg, c_arg = map(int, row)
+                        if op == LOG_KV_OP_PAD_INSERT:
+                            self._semantic_insert_pad(b, g, a, c_arg, record=False)
+                        elif op == LOG_KV_OP_WARD_MERGE:
+                            self._semantic_ward_merge(b, g, a, b_arg, record=False)
+                        else:
+                            i = self._semantic_replay_token_offset(positions, b, c_arg)
+                            pos = positions[b, i]
+                            if op == LOG_KV_OP_NEW_CLUSTER:
+                                self._semantic_new_cluster(b, g, a, c_arg, k_raw[b, g, i], v[b, g, i], pos, record=False)
+                            elif op == LOG_KV_OP_NEW_SEGMENT:
+                                self._semantic_append_token_entry(b, g, a, k_raw[b, g, i], v[b, g, i], pos)
+                                self._semantic_update_member_metadata(
+                                    b, g, a, k_raw[b, g, i], pos, new_segment=True, segment=b_arg
+                                )
+                            elif op == LOG_KV_OP_JOIN:
+                                self._semantic_join(
+                                    b, g, a, b_arg, c_arg, k_raw[b, g, i], v[b, g, i], pos, record=False
+                                )
+                            else:
+                                raise ValueError(f"unknown semantic LogKV op {op}")
+                            consumed += 1
+                    if consumed != k_raw.size(2):
+                        raise RuntimeError(
+                            f"semantic LogKV replay consumed {consumed}/{k_raw.size(2)} tokens for batch={b}, group={g}"
+                        )
+            return
+
+        self._semantic_route_three_phase(k_raw, v, positions, record=record_op_log)
+
 
     # ------------------------------------------------------------------
     # Compact: compress tokens -> 1 entry via mean pooling (2:1 by default)
@@ -768,7 +1547,7 @@ class LogStructuredKVCache(nn.Module):
         if has_anchors:
             if any(x is None for x in (p_hi1, sum_wp1, p_lo2, p_hi2, sum_wp2)):
                 raise ValueError("compact() requires either all anchor fields or none")
-            anchors_out = merge_anchors(p_lo1, p_hi1, sum_wp1, p_lo2, p_hi2, sum_wp2)
+            anchors_out = merge_anchors(p_lo1, p_hi1, sum_wp1, p_lo2, p_hi2, sum_wp2, w1, w2)
 
         def _with_anchors(out: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
             return out + anchors_out if has_anchors else out
@@ -1044,6 +1823,98 @@ class LogStructuredKVCache(nn.Module):
         self.recent_v[:, :, remaining:self.recent_count, :].zero_()
         self.recent_count = remaining
 
+    def _semantic_input_positions(self, n: int, input_pos: torch.Tensor | None) -> torch.Tensor:
+        if input_pos is None:
+            return torch.arange(self.token_count, self.token_count + n, device=self.recent_pos.device).unsqueeze(0).expand(
+                self.batch_size, -1
+            )
+        if input_pos.dim() == 1:
+            if input_pos.numel() != n:
+                raise ValueError(f"input_pos length {input_pos.numel()} != chunk size {n}")
+            return input_pos.to(device=self.recent_pos.device, dtype=torch.int64).unsqueeze(0).expand(self.batch_size, -1)
+        if input_pos.dim() == 2:
+            if input_pos.shape != (self.batch_size, n):
+                raise ValueError(f"input_pos shape {tuple(input_pos.shape)} != ({self.batch_size}, {n})")
+            return input_pos.to(device=self.recent_pos.device, dtype=torch.int64)
+        raise ValueError(f"input_pos must be 1-D or 2-D, got shape {tuple(input_pos.shape)}")
+
+    def _semantic_flush_tokens(
+        self,
+        flush_len: int,
+        *,
+        record_op_log: bool = False,
+        replay_op_log: torch.Tensor | None = None,
+        replay_op_log_len: torch.Tensor | None = None,
+    ) -> None:
+        if flush_len <= 0:
+            return
+        pending = int(flush_len)
+        while pending > 0:
+            take = min(self.semantic_flush_granularity, pending)
+            if take > self.recent_count:
+                raise RuntimeError(
+                    f"semantic LogKV cannot flush {take} tokens from recent_count={self.recent_count}"
+                )
+            self.route_and_flush_batch(
+                self.recent_k_raw[:, :, :take, :],
+                self.recent_v[:, :, :take, :],
+                self.recent_pos[:, :take],
+                record_op_log=record_op_log,
+                replay_op_log=replay_op_log,
+                replay_op_log_len=replay_op_log_len,
+            )
+            remaining = self.recent_count - take
+            if remaining > 0:
+                self.recent_k[:, :, :remaining, :] = self.recent_k[:, :, take:self.recent_count, :].clone()
+                self.recent_k_raw[:, :, :remaining, :] = self.recent_k_raw[:, :, take:self.recent_count, :].clone()
+                self.recent_v[:, :, :remaining, :] = self.recent_v[:, :, take:self.recent_count, :].clone()
+                self.recent_pos[:, :remaining] = self.recent_pos[:, take:self.recent_count].clone()
+            self.recent_k[:, :, remaining:self.recent_count, :].zero_()
+            self.recent_k_raw[:, :, remaining:self.recent_count, :].zero_()
+            self.recent_v[:, :, remaining:self.recent_count, :].zero_()
+            self.recent_pos[:, remaining:self.recent_count].zero_()
+            self.recent_count = remaining
+            pending -= take
+
+    def _semantic_add_recent(
+        self,
+        k_roped: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        k_raw: torch.Tensor,
+        input_pos: torch.Tensor | None = None,
+        record_op_log: bool = False,
+        replay_op_log: torch.Tensor | None = None,
+        replay_op_log_len: torch.Tensor | None = None,
+    ) -> None:
+        n = k_roped.size(2)
+        if n > self.recent_size:
+            raise ValueError(f"chunk size {n} exceeds recent_size {self.recent_size}")
+        if k_raw.shape[:3] != k_roped.shape[:3] or k_raw.size(-1) != self.k_dim:
+            raise ValueError(f"k_raw shape {tuple(k_raw.shape)} does not match semantic cache shape")
+        positions = self._semantic_input_positions(n, input_pos)
+        self._count_tokens(n)
+        if self.recent_count + n > self.recent_capacity:
+            raise RuntimeError(
+                f"semantic LogKV recent buffer overflow: recent_count={self.recent_count}, n={n}, "
+                f"capacity={self.recent_capacity}"
+            )
+        dst = slice(self.recent_count, self.recent_count + n)
+        self.recent_k[:, :, dst, :] = k_roped
+        self.recent_k_raw[:, :, dst, :] = k_raw
+        self.recent_v[:, :, dst, :] = v
+        self.recent_pos[:, dst] = positions
+        self.recent_count += n
+        overflow = self.recent_count - self.recent_size
+        if overflow > 0:
+            flush_len = self.semantic_flush_granularity * ((overflow + self.semantic_flush_granularity - 1) // self.semantic_flush_granularity)
+            self._semantic_flush_tokens(
+                flush_len,
+                record_op_log=record_op_log,
+                replay_op_log=replay_op_log,
+                replay_op_log_len=replay_op_log_len,
+            )
+
     def _append_level0(
         self,
         pk: torch.Tensor,
@@ -1172,10 +2043,29 @@ class LogStructuredKVCache(nn.Module):
         self,
         k: torch.Tensor,   # (B, G, n, k_dim) full post-RoPE keys, detached
         v: torch.Tensor,   # (B, G, n, v_dim) detached
+        *,
+        k_raw: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
+        record_op_log: bool = False,
+        replay_op_log: torch.Tensor | None = None,
+        replay_op_log_len: torch.Tensor | None = None,
     ) -> None:
         """Add tokens to the sliding window. When the window overflows, the
         oldest 2 tokens are flushed (compacted) into level 0.
         """
+        if self.semantic_clusters:
+            if k_raw is None:
+                raise ValueError("semantic LogKV add_recent requires pre-RoPE k_raw")
+            self._semantic_add_recent(
+                k,
+                v,
+                k_raw=k_raw,
+                input_pos=input_pos,
+                record_op_log=record_op_log,
+                replay_op_log=replay_op_log,
+                replay_op_log_len=replay_op_log_len,
+            )
+            return
         n = k.size(2)
         # Explicit raise (not assert): must survive `python -O`.
         if n > self.recent_size:
@@ -1250,6 +2140,108 @@ class LogStructuredKVCache(nn.Module):
     # Build attention state: slot-granular, O(recent + B*log N) entries
     # ------------------------------------------------------------------
 
+    def _semantic_attention_state(self, with_stats: bool = False) -> CacheAttentionState:
+        assert self.rope_n_elem is not None
+        entry_k = self.level_k.flip(3).reshape(
+            self.batch_size, self.n_groups, self.K_max * self.L_alloc * self.B_prime, self.k_dim
+        )
+        entry_v = self.level_v.flip(3).reshape(
+            self.batch_size, self.n_groups, self.K_max * self.L_alloc * self.B_prime, self.v_dim
+        )
+        entry_w = self.level_w.flip(3).reshape(
+            self.batch_size, self.n_groups, self.K_max * self.L_alloc * self.B_prime
+        )
+        p_lo = self.level_p_lo.flip(3).reshape(
+            self.batch_size, self.n_groups, self.K_max * self.L_alloc * self.B_prime
+        )
+        p_hi = self.level_p_hi.flip(3).reshape_as(p_lo)
+        sum_wp = self.level_sum_wp.flip(3).reshape_as(p_lo)
+        mid = mid_anchor(p_lo, p_hi, sum_wp, entry_w)
+        anchors, valid3, M = dedup_anchors(p_lo, p_hi, mid, entry_w)
+        slot_k = materialize_anchor_keys(entry_k, anchors, self.cos_cache, self.sin_cache, self.rope_n_elem).reshape(
+            self.batch_size, self.n_groups, -1, self.slot_k_dim
+        )
+        slot_v = entry_v.unsqueeze(-2).expand(*entry_v.shape[:-1], 3, self.v_dim).reshape(
+            self.batch_size, self.n_groups, -1, self.v_dim
+        )
+        slot_w = entry_w.unsqueeze(-1).expand_as(valid3).reshape(self.batch_size, self.n_groups, -1)
+        slot_valid = valid3.reshape(self.batch_size, self.n_groups, -1)
+        M_s = M.unsqueeze(-1).expand_as(valid3).reshape(self.batch_size, self.n_groups, -1)
+
+        k_parts: list[torch.Tensor] = [slot_k]
+        v_parts: list[torch.Tensor] = [slot_v]
+        w_parts: list[torch.Tensor] = [slot_w]
+        sigma_u_parts: list[torch.Tensor] = []
+        sigma2_parts: list[torch.Tensor] = []
+        gamma_a_parts: list[torch.Tensor] = []
+        gamma_b_parts: list[torch.Tensor] = []
+        gamma_parts: list[torch.Tensor] = []
+        if with_stats:
+            entry_su = self.level_sigma_u.flip(3).reshape(
+                self.batch_size, self.n_groups, self.K_max * self.L_alloc * self.B_prime, self.k_dim
+            )
+            entry_ga = self.level_gamma_a.flip(3).reshape_as(entry_su)
+            su, ga = materialize_anchor_directions(
+                entry_su, entry_ga, anchors, self.cos_cache, self.sin_cache, self.rope_n_elem
+            )
+            sigma_u_parts.append(su.reshape(self.batch_size, self.n_groups, -1, self.slot_k_dim))
+            gamma_a_parts.append(ga.reshape(self.batch_size, self.n_groups, -1, self.slot_k_dim))
+            sigma2_parts.append(
+                self.level_sigma2.flip(3).reshape_as(entry_w).unsqueeze(-1).expand_as(valid3).reshape(
+                    self.batch_size, self.n_groups, -1
+                )
+            )
+            gamma_b_parts.append(
+                self.level_gamma_b.flip(3)
+                .reshape(self.batch_size, self.n_groups, self.K_max * self.L_alloc * self.B_prime, self.v_dim)
+                .unsqueeze(-2)
+                .expand(*entry_v.shape[:-1], 3, self.v_dim)
+                .reshape(self.batch_size, self.n_groups, -1, self.v_dim)
+            )
+            gamma_parts.append(
+                self.level_gamma.flip(3).reshape_as(entry_w).unsqueeze(-1).expand_as(valid3).reshape(
+                    self.batch_size, self.n_groups, -1
+                )
+            )
+
+        if self.recent_count > 0:
+            k_parts.append(self.recent_k[:, :, :self.recent_count, :])
+            v_parts.append(self.recent_v[:, :, :self.recent_count, :])
+            w_parts.append(self.level_w.new_ones(self.batch_size, self.n_groups, self.recent_count))
+            if with_stats:
+                sigma_u_parts.append(self.recent_k[:, :, :self.recent_count, :].new_zeros(
+                    self.batch_size, self.n_groups, self.recent_count, self.slot_k_dim
+                ))
+                sigma2_parts.append(self.level_w.new_zeros(self.batch_size, self.n_groups, self.recent_count))
+                gamma_a_parts.append(self.recent_k[:, :, :self.recent_count, :].new_zeros(
+                    self.batch_size, self.n_groups, self.recent_count, self.slot_k_dim
+                ))
+                gamma_b_parts.append(self.recent_v[:, :, :self.recent_count, :].new_zeros(
+                    self.batch_size, self.n_groups, self.recent_count, self.v_dim
+                ))
+                gamma_parts.append(self.level_w.new_zeros(self.batch_size, self.n_groups, self.recent_count))
+
+        if not with_stats:
+            return CacheAttentionState(
+                torch.cat(k_parts, dim=-2),
+                torch.cat(v_parts, dim=-2),
+                torch.cat(w_parts, dim=-1),
+                slot_valid=slot_valid,
+                M_s=M_s,
+            )
+        return CacheAttentionState(
+            slot_k=torch.cat(k_parts, dim=-2),
+            slot_v=torch.cat(v_parts, dim=-2),
+            slot_w=torch.cat(w_parts, dim=-1),
+            slot_valid=slot_valid,
+            M_s=M_s,
+            slot_sigma_u=torch.cat(sigma_u_parts, dim=-2),
+            slot_sigma2=torch.cat(sigma2_parts, dim=-1),
+            slot_gamma_a=torch.cat(gamma_a_parts, dim=-2),
+            slot_gamma_b=torch.cat(gamma_b_parts, dim=-2),
+            slot_gamma=torch.cat(gamma_parts, dim=-1),
+        )
+
     def get_attention_state(self, with_stats: bool = False) -> CacheAttentionState:
         """Assemble the cache state for ``log_kv_slot_attention``.
 
@@ -1273,6 +2265,8 @@ class LogStructuredKVCache(nn.Module):
         itself is order-agnostic over the state (the whole state is fully
         visible; only the appended in-flight chunk is causal).
         """
+        if self.semantic_clusters:
+            return self._semantic_attention_state(with_stats=with_stats)
         pooled_k = self.level_k[:, :, 0].flip(2).reshape(
             self.batch_size, self.n_groups, self.L_alloc * self.B_prime, self.k_dim
         )
@@ -1395,6 +2389,8 @@ class LogStructuredKVCache(nn.Module):
             return
         self.recent_k = self.recent_k.to(dtype)
         self.recent_v = self.recent_v.to(dtype)
+        if self.semantic_clusters:
+            self.recent_k_raw = self.recent_k_raw.to(dtype)
         self.pin_k = self.pin_k.to(dtype)
         self.pin_v = self.pin_v.to(dtype)
         self.level_k = self.level_k.to(dtype)
@@ -1410,6 +2406,9 @@ class LogStructuredKVCache(nn.Module):
         self.token_count = 0
         self.recent_k.zero_()
         self.recent_v.zero_()
+        if self.semantic_clusters:
+            self.recent_k_raw.zero_()
+            self.recent_pos.zero_()
         self.recent_count = 0
         self.pin_k.zero_()
         self.pin_v.zero_()
@@ -1425,10 +2424,25 @@ class LogStructuredKVCache(nn.Module):
         self.level_gamma.zero_()
         self.level_count.zero_()
         self.pad_mask.zero_()
+        if self.semantic_clusters:
+            self.level_p_lo.zero_()
+            self.level_p_hi.zero_()
+            self.level_sum_wp.zero_()
+            self.level_order.zero_()
+            self.centroid.zero_()
+            self.n_eff.zero_()
+            self.n_total.zero_()
+            self.p_hi_c.fill_(-1)
+            self.current_segment.zero_()
+            self.level0_phase.zero_()
+            self.alive.zero_()
+            self.op_log = None
+            self.op_log_len = None
+            self._op_replay_cursor = None
 
     @property
     def total_slots(self) -> int:
-        return self.recent_count + self.pin_count + int(self.level_count[0, 0, 0].sum().item())
+        return self.recent_count + self.pin_count + int(self.level_count[0, 0].sum().item())
 
     @property
     def total_tokens_covered(self) -> int:
@@ -1898,14 +2912,21 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, cache, scale, train_block, second_order_scale, *pin_args):
+        k_raw = None
+        if pin_args and torch.is_tensor(pin_args[-1]):
+            k_raw = pin_args[-1]
+            pin_args = pin_args[:-1]
         if len(pin_args) > 2:
             raise TypeError(
                 "LogKVStreamTrainingAttention accepts at most two pin args: "
-                "pin_train_max and pin_train_prob"
+                "pin_train_max and pin_train_prob, plus optional trailing k_raw"
             )
-        ctx._num_inputs = 7 + len(pin_args)
+        ctx._num_inputs = 7 + len(pin_args) + (1 if k_raw is not None else 0)
         pin_train_max = int(pin_args[0]) if len(pin_args) >= 1 else 0
         pin_train_prob = float(pin_args[1]) if len(pin_args) >= 2 else 0.0
+        if cache.semantic_clusters and (pin_train_max > 0 or pin_train_prob > 0.0):
+            raise ValueError("semantic LogKV rejects training pin injection")
+        commit_k_raw = k if k_raw is None else k_raw
 
         T = q.size(2)
         train_block = int(train_block)
@@ -1921,6 +2942,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         # this makes the invariant local and future-proof).
         with torch.no_grad():
             cache.reset_parameters()
+            if cache.semantic_clusters:
+                cache.begin_op_log()
             # Own the flag rather than trusting the caller, and set it AFTER
             # the reset above so the cache is always empty when this runs (the
             # guarded setter would otherwise raise on a cache left non-empty by
@@ -1951,21 +2974,38 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                         second_order_scale,
                     )
                 )
-                cache.add_recent(k[:, :, start:end], v[:, :, start:end])
+                cache.add_recent(
+                    k[:, :, start:end],
+                    v[:, :, start:end],
+                    k_raw=commit_k_raw[:, :, start:end] if cache.semantic_clusters else None,
+                    record_op_log=cache.semantic_clusters,
+                )
                 start = end
-        ctx.save_for_backward(q, k, v)
+        op_log, op_log_len = cache.take_op_log()
+        if k_raw is None:
+            ctx.save_for_backward(q, k, v)
+        else:
+            ctx.save_for_backward(q, k, v, k_raw)
         ctx.cache = cache
         ctx.scale = scale
         ctx.train_block = train_block
         ctx.second_order_scale = second_order_scale
         ctx.pin_inject_start = pin_inject_start
         ctx.pin_positions = pin_positions
+        ctx.has_k_raw = k_raw is not None
+        ctx.op_log = op_log
+        ctx.op_log_len = op_log_len
         return torch.cat(outputs, dim=2)  # (B, nh, T, v_dim)
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_y):
-        q, k, v = ctx.saved_tensors
+        saved = ctx.saved_tensors
+        if ctx.has_k_raw:
+            q, k, v, k_raw = saved
+        else:
+            q, k, v = saved
+            k_raw = k
         cache = ctx.cache
         scale = ctx.scale
         train_block = ctx.train_block
@@ -2000,7 +3040,15 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             dk[:, :, start:end] = g_k
             dv[:, :, start:end] = g_v
             with torch.no_grad():
-                cache.add_recent(k[:, :, start:end], v[:, :, start:end])
+                cache.add_recent(
+                    k[:, :, start:end],
+                    v[:, :, start:end],
+                    k_raw=k_raw[:, :, start:end] if cache.semantic_clusters else None,
+                    replay_op_log=ctx.op_log if cache.semantic_clusters else None,
+                    replay_op_log_len=ctx.op_log_len if cache.semantic_clusters else None,
+                )
             start = end
         grad_inputs = (dq, dk, dv, None, None, None, None)
+        if ctx.has_k_raw:
+            return grad_inputs + (None,) * (ctx._num_inputs - len(grad_inputs) - 1) + (None,)
         return grad_inputs + (None,) * (ctx._num_inputs - len(grad_inputs))

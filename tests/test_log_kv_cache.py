@@ -17,7 +17,7 @@ from litgpt.log_kv_cache import (
     log_kv_chunk_attention,
     log_kv_slot_attention,
 )
-from litgpt.model import CausalSelfAttention, GPT
+from litgpt.model import CausalSelfAttention, GPT, build_rope_cache
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +64,41 @@ def has_compacted_level(cache: LogStructuredKVCache) -> bool:
     return bool((cache.level_count > 0).any().item())
 
 
+def make_semantic_cache(
+    *,
+    batch_size: int = 1,
+    n_groups: int = 2,
+    max_seq_length: int = 64,
+    k_dim: int = 8,
+    v_dim: int = 8,
+    B: int = 4,
+    recent_size: int = 2,
+    K_max: int = 1,
+    cluster_lambda_rel: float = 1.0,
+    seg_gap_max: float | None = None,
+    seg_block_level: int = 0,
+    semantic_s_h: torch.Tensor | float | None = 1.0,
+) -> LogStructuredKVCache:
+    cos, sin = build_rope_cache(max_seq_length, k_dim)
+    return LogStructuredKVCache(
+        (batch_size, n_groups, max_seq_length, k_dim),
+        (batch_size, n_groups, max_seq_length, v_dim),
+        B=B,
+        recent_size=recent_size,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        semantic_clusters=True,
+        cluster_k_max=K_max,
+        cluster_lambda_rel=cluster_lambda_rel,
+        seg_gap_max=seg_gap_max,
+        seg_block_level=seg_block_level,
+        semantic_s_h=semantic_s_h,
+        cos_cache=cos,
+        sin_cache=sin,
+        rope_n_elem=k_dim,
+    )
+
+
 def real_state_tensors(state: CacheAttentionState) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if state.slot_valid is None:
         return state.slot_k, state.slot_v, state.slot_w
@@ -82,6 +117,9 @@ def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredK
     rc = a.recent_count
     assert torch.equal(a.recent_k[:, :, :rc], b.recent_k[:, :, :rc])
     assert torch.equal(a.recent_v[:, :, :rc], b.recent_v[:, :, :rc])
+    if a.semantic_clusters:
+        assert torch.equal(a.recent_k_raw[:, :, :rc], b.recent_k_raw[:, :, :rc])
+        assert torch.equal(a.recent_pos[:, :rc], b.recent_pos[:, :rc])
     assert torch.equal(a.level_count, b.level_count)
     for name in (
         "level_k",
@@ -96,6 +134,21 @@ def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredK
         "pad_mask",
     ):
         assert torch.equal(getattr(a, name), getattr(b, name)), f"{name} differ"
+    if a.semantic_clusters:
+        for name in (
+            "level_p_lo",
+            "level_p_hi",
+            "level_sum_wp",
+            "level_order",
+            "centroid",
+            "n_eff",
+            "n_total",
+            "p_hi_c",
+            "current_segment",
+            "level0_phase",
+            "alive",
+        ):
+            assert torch.equal(getattr(a, name), getattr(b, name)), f"{name} differ"
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +204,23 @@ class TestInit:
         assert c.pad_mask.shape == c.level_w.shape
         assert not hasattr(c, "_counts")
         assert c.level_count.sum() == 0
+
+    def test_semantic_layout_and_cluster_metadata(self):
+        c = make_semantic_cache(K_max=3, B=4)
+
+        assert c.semantic_clusters
+        assert c.K_max == 3
+        assert c.level_k.shape == (1, 2, 3, c.L_alloc, 4, 8)
+        assert c.level_count.shape == (1, 2, 3, c.L_alloc)
+        assert c.level_count.dtype == torch.int16
+        assert c.centroid.shape == (1, 2, 3, 8)
+        assert c.n_eff.shape == c.n_total.shape == c.p_hi_c.shape == (1, 2, 3)
+        assert c.current_segment.shape == c.level0_phase.shape == c.alive.shape == (1, 2, 3)
+        assert c.recent_k.shape[-1] == c.slot_k_dim == 8
+        assert c.recent_k_raw.shape[-1] == c.k_dim == 8
+        assert c.cos_cache.shape == c.sin_cache.shape == (64, 8)
+        assert c.op_log is None
+        assert c.op_log_len is None
 
     def test_initial_state_empty(self, small_cache):
         c = small_cache
@@ -1263,6 +1333,117 @@ class TestGetAttentionState:
             span_v = v[:, :, starts[s]:ends[s], :].mean(dim=2)
             torch.testing.assert_close(slot_k[:, :, s, :], span_k, atol=1e-5, rtol=1e-5)
             torch.testing.assert_close(slot_v[:, :, s, :], span_v, atol=1e-5, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# SemanticLogKV routing / anchors
+# ---------------------------------------------------------------------------
+
+class TestSemanticLogKV:
+    def test_kmax1_flushes_single_token_entries_and_materializes_anchors(self):
+        torch.manual_seed(0)
+        c = make_semantic_cache(K_max=1, recent_size=2)
+        k_raw = torch.randn(1, 2, 5, 8)
+        v = torch.randn(1, 2, 5, 8)
+
+        for i in range(5):
+            c.add_recent(k_raw[:, :, i:i + 1], v[:, :, i:i + 1], k_raw=k_raw[:, :, i:i + 1], input_pos=torch.tensor([i]))
+
+        assert c.token_count == 5
+        assert c.recent_count == 1
+        assert int(c.level_count[0, 0, 0, 0].item()) == 4
+        torch.testing.assert_close(c.level_w[0, 0, 0, 0, :4], torch.ones(4))
+        torch.testing.assert_close(c.level_p_lo[0, 0, 0, 0, :4], torch.tensor([0, 1, 2, 3]))
+        torch.testing.assert_close(c.level_p_hi[0, 0, 0, 0, :4], torch.tensor([0, 1, 2, 3]))
+        torch.testing.assert_close(c.level_sum_wp[0, 0, 0, 0, :4], torch.tensor([0, 1, 2, 3]))
+
+        state = c.get_attention_state(with_stats=True)
+        assert state.slot_valid is not None
+        assert state.M_s is not None
+        slot_k, _slot_v, slot_w = real_state_tensors(state)
+        assert slot_k.size(2) == 5
+        assert slot_w[0, 0].tolist() == [1.0, 1.0, 1.0, 1.0, 1.0]
+        assert int(state.slot_valid[0, 0].sum().item()) == 4
+        assert torch.equal(state.M_s[0, 0][state.slot_valid[0, 0]], torch.ones(4, dtype=torch.long))
+
+    def test_new_segment_inserts_zero_pad_before_boundary_token(self):
+        c = make_semantic_cache(K_max=1, n_groups=1, seg_gap_max=0.0, seg_block_level=1)
+        k_raw = torch.randn(1, 1, 2, 8)
+        v = torch.randn(1, 1, 2, 8)
+
+        c.route_and_flush_batch(k_raw, v, torch.tensor([0, 3]))
+
+        assert int(c.level_count[0, 0, 0, 0].item()) == 3
+        torch.testing.assert_close(c.level_w[0, 0, 0, 0, :3], torch.tensor([1.0, 0.0, 1.0]))
+        assert c.pad_mask[0, 0, 0, 0, 1]
+        assert not c.pad_mask[0, 0, 0, 0, 0]
+        assert not c.pad_mask[0, 0, 0, 0, 2]
+        assert torch.isfinite(c.level_k[0, 0, 0, 0, 1]).all()
+        assert torch.isfinite(c.level_v[0, 0, 0, 0, 1]).all()
+        state = c.get_attention_state()
+        assert state.slot_valid is not None
+        assert int(state.slot_valid[0, 0].sum().item()) == 2
+
+    def test_op_log_replay_rebuilds_multicluster_state(self):
+        c = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=2, cluster_lambda_rel=0.25, seg_gap_max=8.0)
+        r = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=2, cluster_lambda_rel=0.25, seg_gap_max=8.0)
+        k_raw = torch.tensor(
+            [[[
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [8.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ]]]
+        )
+        v = torch.randn(1, 1, 5, 8)
+        pos = torch.tensor([0, 1, 10, 11, 30])
+
+        c.begin_op_log()
+        c.route_and_flush_batch(k_raw, v, pos, record_op_log=True)
+        op_log, op_log_len = c.take_op_log()
+        assert op_log is not None
+        assert op_log_len is not None
+        assert op_log_len[0, 0] >= 6
+
+        r.route_and_flush_batch(k_raw, v, pos, replay_op_log=op_log, replay_op_log_len=op_log_len)
+
+        assert_cache_states_bit_identical(c, r)
+
+    def test_ward_merge_rebuild_phase_tracks_replayed_entries(self):
+        c = make_semantic_cache(K_max=2, n_groups=1, B=2, recent_size=2, seg_block_level=2)
+        k_raw = torch.randn(9, 8)
+        v = torch.randn(9, 8)
+
+        c._semantic_new_cluster(0, 0, 0, 0, k_raw[0], v[0], torch.tensor(0), record=False)
+        for i in range(1, 5):
+            c._semantic_join(0, 0, 0, 0, i, k_raw[i], v[i], torch.tensor(i), record=False)
+        c._semantic_new_cluster(0, 0, 1, 10, k_raw[5], v[5], torch.tensor(10), record=False)
+        for i in range(6, 9):
+            c._semantic_join(0, 0, 1, 0, i + 10, k_raw[i], v[i], torch.tensor(i + 10), record=False)
+
+        expected = len(c._semantic_collect_entries(0, 0, 0)) + len(c._semantic_collect_entries(0, 0, 1))
+        assert expected != int((c.level0_phase[0, 0, 0] + c.level0_phase[0, 0, 1]).item())
+
+        c._semantic_ward_merge(0, 0, 0, 1, record=False)
+
+        assert int(c.level0_phase[0, 0, 0].item()) == expected
+
+    def test_semantic_flush_schedule_is_independent_of_commit_chunking(self):
+        torch.manual_seed(123)
+        a = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=4, cluster_lambda_rel=0.25)
+        b = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=4, cluster_lambda_rel=0.25)
+        k_raw = torch.randn(1, 1, 8, 8)
+        v = torch.randn(1, 1, 8, 8)
+
+        for start in range(0, 8, 2):
+            end = start + 2
+            a.add_recent(k_raw[:, :, start:end], v[:, :, start:end], k_raw=k_raw[:, :, start:end], input_pos=torch.arange(start, end))
+        for start in range(0, 8, 4):
+            end = start + 4
+            b.add_recent(k_raw[:, :, start:end], v[:, :, start:end], k_raw=k_raw[:, :, start:end], input_pos=torch.arange(start, end))
+
+        assert_cache_states_bit_identical(a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -2726,6 +2907,26 @@ class TestLogKVMatchesDense:
             # recent_size >= seq_len -> entire prefill is exact (fast path, no compaction)
             model.set_log_kv_cache(batch_size=1, max_seq_length=seq_len, B=4, recent_size=16)
             logkv = model(idx, input_pos=torch.arange(seq_len))
+            model.clear_kv_cache()
+
+        torch.testing.assert_close(logkv, dense, atol=1e-4, rtol=1e-4)
+
+    def test_semantic_prefill_within_recent_matches_dense(self):
+        model = self._make_model()
+        idx = torch.randint(0, model.config.padded_vocab_size, (1, 6))
+
+        with torch.no_grad():
+            dense = model(idx)
+            model.set_log_kv_cache(
+                batch_size=1,
+                max_seq_length=6,
+                B=4,
+                recent_size=16,
+                semantic_clusters=True,
+                cluster_k_max=1,
+                pin_size=0,
+            )
+            logkv = model(idx, input_pos=torch.arange(6))
             model.clear_kv_cache()
 
         torch.testing.assert_close(logkv, dense, atol=1e-4, rtol=1e-4)

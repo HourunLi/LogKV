@@ -363,6 +363,15 @@ class GPT(nn.Module):
         importance_pooling: bool = False,
         importance_pooling_lambda: float = 1.0,
         importance_pooling_temperature: float = 1.0,
+        semantic_clusters: bool = False,
+        cluster_k_max: int = 1,
+        cluster_lambda_rel: float = 1.0,
+        seg_eta: float = 1.0,
+        seg_g0: float = 2048.0,
+        seg_gap_max: float | None = None,
+        seg_block_level: int = 0,
+        seg_forget: float = 0.5,
+        semantic_s_h: torch.Tensor | float | None = None,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -418,14 +427,41 @@ class GPT(nn.Module):
             # Default to the parameter dtype, not the process default: a bf16
             # model with fp32 cache buffers would fail on the first cat/matmul.
             dtype = next(self.parameters()).dtype
+        if semantic_clusters:
+            if self.config.rope_interleave:
+                raise ValueError("semantic LogKV requires rope_interleave=False")
+            if self.config.latent_attention is not None:
+                raise ValueError("semantic LogKV does not support MultiheadLatentAttention")
+            if importance_pooling:
+                raise ValueError("semantic LogKV rejects importance_pooling=True")
+            if pin_size > 0:
+                raise ValueError("semantic LogKV rejects pin_size>0")
+            if torch.is_tensor(semantic_s_h) and semantic_s_h.dim() == 2 and semantic_s_h.size(0) != self.config.n_layer:
+                raise ValueError(
+                    f"semantic_s_h with 2 dims must be (n_layer, n_query_groups), got {tuple(semantic_s_h.shape)}"
+                )
 
         for block_idx, block in enumerate(self.transformer.h):
+            cos_cache = self.cos[..., self.config.rope_indices[block_idx]] if semantic_clusters and self.config.rope_indices is not None else self.cos
+            sin_cache = self.sin[..., self.config.rope_indices[block_idx]] if semantic_clusters and self.config.rope_indices is not None else self.sin
+            block_s_h = semantic_s_h[block_idx] if torch.is_tensor(semantic_s_h) and semantic_s_h.dim() == 2 else semantic_s_h
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size, pin_size=pin_size,
                 importance_pooling=importance_pooling,
                 importance_pooling_lambda=importance_pooling_lambda,
                 importance_pooling_temperature=importance_pooling_temperature,
+                semantic_clusters=semantic_clusters,
+                cluster_k_max=cluster_k_max,
+                cluster_lambda_rel=cluster_lambda_rel,
+                seg_eta=seg_eta,
+                seg_g0=seg_g0,
+                seg_gap_max=seg_gap_max,
+                seg_block_level=seg_block_level,
+                seg_forget=seg_forget,
+                semantic_s_h=block_s_h,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
             )
             block.attn._log_kv_pending = None
             block.attn._log_kv_pin_indices = None
@@ -473,6 +509,10 @@ class GPT(nn.Module):
             raise ValueError(f"pin_train_prob must be in [0, 1], got {pin_train_prob}")
         for block in self.transformer.h:
             cache = block.attn.kv_cache
+            if isinstance(cache, LogStructuredKVCache) and cache.semantic_clusters and (
+                pin_train_max > 0 or pin_train_prob > 0.0
+            ):
+                raise ValueError("semantic LogKV rejects training pin injection")
             if isinstance(cache, LogStructuredKVCache) and pin_train_max > cache.pin_size:
                 raise ValueError(
                     f"pin_train_max ({pin_train_max}) exceeds training cache pin_size ({cache.pin_size})"
@@ -497,6 +537,15 @@ class GPT(nn.Module):
         importance_pooling: bool = False,
         importance_pooling_lambda: float = 1.0,
         importance_pooling_temperature: float = 1.0,
+        semantic_clusters: bool = False,
+        cluster_k_max: int = 1,
+        cluster_lambda_rel: float = 1.0,
+        seg_eta: float = 1.0,
+        seg_g0: float = 2048.0,
+        seg_gap_max: float | None = None,
+        seg_block_level: int = 0,
+        seg_forget: float = 0.5,
+        semantic_s_h: torch.Tensor | float | None = None,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -538,6 +587,19 @@ class GPT(nn.Module):
             raise ValueError(f"pin_train_max ({pin_train_max}) exceeds pin_size ({pin_size})")
         if not 0.0 <= pin_train_prob <= 1.0:
             raise ValueError(f"pin_train_prob must be in [0, 1], got {pin_train_prob}")
+        if semantic_clusters:
+            if self.config.rope_interleave:
+                raise ValueError("semantic LogKV requires rope_interleave=False")
+            if self.config.latent_attention is not None:
+                raise ValueError("semantic LogKV does not support MultiheadLatentAttention")
+            if importance_pooling:
+                raise ValueError("semantic LogKV rejects importance_pooling=True")
+            if pin_size > 0 or pin_train_max > 0 or pin_train_prob > 0.0:
+                raise ValueError("semantic LogKV rejects pin_size/pin_train; set all pin knobs to 0")
+            if torch.is_tensor(semantic_s_h) and semantic_s_h.dim() == 2 and semantic_s_h.size(0) != self.config.n_layer:
+                raise ValueError(
+                    f"semantic_s_h with 2 dims must be (n_layer, n_query_groups), got {tuple(semantic_s_h.shape)}"
+                )
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
         if max_seq_length is None:
@@ -548,12 +610,26 @@ class GPT(nn.Module):
             dtype = next(self.parameters()).dtype
 
         for block_idx, block in enumerate(self.transformer.h):
+            cos_cache = self.cos[..., self.config.rope_indices[block_idx]] if semantic_clusters and self.config.rope_indices is not None else self.cos
+            sin_cache = self.sin[..., self.config.rope_indices[block_idx]] if semantic_clusters and self.config.rope_indices is not None else self.sin
+            block_s_h = semantic_s_h[block_idx] if torch.is_tensor(semantic_s_h) and semantic_s_h.dim() == 2 else semantic_s_h
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size, pin_size=pin_size,
                 importance_pooling=importance_pooling,
                 importance_pooling_lambda=importance_pooling_lambda,
                 importance_pooling_temperature=importance_pooling_temperature,
+                semantic_clusters=semantic_clusters,
+                cluster_k_max=cluster_k_max,
+                cluster_lambda_rel=cluster_lambda_rel,
+                seg_eta=seg_eta,
+                seg_g0=seg_g0,
+                seg_gap_max=seg_gap_max,
+                seg_block_level=seg_block_level,
+                seg_forget=seg_forget,
+                semantic_s_h=block_s_h,
+                cos_cache=cos_cache,
+                sin_cache=sin_cache,
             )
             block.attn.training_log_kv = True
             block.attn._log_kv_pending = None
@@ -807,6 +883,7 @@ class CausalSelfAttention(nn.Module):
 
         if self._semantic_s0_recorder is not None:
             self._semantic_s0_recorder.record_pre_rope(self.block_idx, k, v)
+        k_raw = k
 
         # Unlike standard positional embeddings rotary embeddings must be applied at every layer.
         # Partial rotary: the first rope_n_elem dims are the position channel (RoPE'd)
@@ -830,7 +907,7 @@ class CausalSelfAttention(nn.Module):
         # low-memory Function (graph-free stream + backward replay): the naive
         # per-chunk graph saves O(T/2 x S) tensors per layer and OOMs at 32K.
         if self.training_log_kv and input_pos is None:
-            return self._log_kv_train_lowmem_forward(q, k, v, B, T)
+            return self._log_kv_train_lowmem_forward(q, k, v, B, T, k_raw=k_raw)
 
         # Apply kv-cache during inference.
         if input_pos is not None:
@@ -842,7 +919,9 @@ class CausalSelfAttention(nn.Module):
                 # Inference uses the same streaming chunker for prefill and decode.
                 # A trailing single token is kept pending so an odd-length prompt
                 # pairs with the first decode token, matching training chunks.
-                return self._log_kv_training_forward(q, k, v, B, T, reset_cache=False, defer_last_single=True)
+                return self._log_kv_training_forward(
+                    q, k, v, B, T, reset_cache=False, defer_last_single=True, k_raw=k_raw, input_pos=input_pos
+                )
 
             k, v = self.kv_cache(input_pos, k, v)
 
@@ -992,6 +1071,7 @@ class CausalSelfAttention(nn.Module):
         v: torch.Tensor,    # (B, n_query_groups, T, hs)
         B: int,
         T: int,
+        k_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Training forward over the logKV stream with O(T + S) memory.
 
@@ -1017,7 +1097,7 @@ class CausalSelfAttention(nn.Module):
         scale = scale * self.mscale * self.mscale
 
         train_block = max(2, min(int(self.log_kv_train_block), cache.recent_size))
-        y = LogKVStreamTrainingAttention.apply(
+        args = [
             q,
             k,
             v,
@@ -1027,7 +1107,12 @@ class CausalSelfAttention(nn.Module):
             self.log_kv_second_order_scale,
             int(self.log_kv_pin_train_max),
             float(self.log_kv_pin_train_prob),
-        )  # (B, n_head, T, hs)
+        ]
+        if cache.semantic_clusters:
+            if k_raw is None:
+                raise ValueError("semantic LogKV training requires pre-RoPE k_raw")
+            args.append(k_raw)
+        y = LogKVStreamTrainingAttention.apply(*args)  # (B, n_head, T, hs)
         y = y.transpose(1, 2).reshape(B, T, self.config.head_size * self.config.n_head)
         return self.proj(y)
 
@@ -1108,6 +1193,8 @@ class CausalSelfAttention(nn.Module):
         T: int,
         reset_cache: bool = True,
         defer_last_single: bool = False,
+        k_raw: torch.Tensor | None = None,
+        input_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reference forward simulating the logKV streaming compaction with a
         sliding window.
@@ -1169,6 +1256,8 @@ class CausalSelfAttention(nn.Module):
         # without this the first get_attention_state()/add_recent() would cat/matmul
         # fp32 buffers with bf16 activations and raise. No-op once dtypes match.
         cache._convert_dtype(q.dtype)
+        if cache.semantic_clusters and k_raw is None:
+            raise ValueError("semantic LogKV inference requires pre-RoPE k_raw")
 
         t = 2  # compaction chunk size (fixed: uniform 2:1)
         n_head = self.config.n_head
@@ -1180,6 +1269,10 @@ class CausalSelfAttention(nn.Module):
         # No content/position split: q and k are the full post-RoPE vectors
         # [R(p)·(pos slice) ; content slice]. Merged slots carry both channels,
         # so a single dot product covers the content AND the position score.
+        def _pos_slice(start_i: int, end_i: int) -> torch.Tensor | None:
+            if not cache.semantic_clusters or input_pos is None:
+                return None
+            return input_pos[start_i:end_i].detach() if input_pos.dim() == 1 else input_pos[:, start_i:end_i].detach()
 
         # ---- Salience pinning (fresh inference prefill only) ----
         # Must run BEFORE any token is committed: the trailing observation
@@ -1200,7 +1293,12 @@ class CausalSelfAttention(nn.Module):
 
         pending = self._log_kv_pending if defer_last_single else None
         if pending is not None:
-            pk, pv = pending
+            if cache.semantic_clusters:
+                pk, pv, pk_raw, ppos = pending
+            else:
+                pk, pv = pending
+                pk_raw = pk
+                ppos = None
             k_b = k[:, :, :1, :]
             v_b = v[:, :, :1, :]
 
@@ -1228,9 +1326,12 @@ class CausalSelfAttention(nn.Module):
             )
             outputs.append(y_b)
 
+            pos_b = _pos_slice(0, 1)
             cache.add_recent(
                 torch.cat([pk, k_b.detach()], dim=2),
                 torch.cat([pv, v_b.detach()], dim=2),
+                k_raw=torch.cat([pk_raw, k_raw[:, :, :1, :].detach()], dim=2) if cache.semantic_clusters else None,
+                input_pos=torch.cat([ppos, pos_b], dim=-1) if cache.semantic_clusters and ppos is not None and pos_b is not None else None,
             )
             self._log_kv_pending = None
             start = 1
@@ -1341,12 +1442,22 @@ class CausalSelfAttention(nn.Module):
                     cache.add_recent(
                         k[:, :, start:commit_end, :].detach(),
                         v[:, :, start:commit_end, :].detach(),
+                        k_raw=k_raw[:, :, start:commit_end, :].detach() if cache.semantic_clusters else None,
+                        input_pos=_pos_slice(start, commit_end),
                     )
                 if defer_tail:
-                    self._log_kv_pending = (
-                        k[:, :, commit_end:block_end, :].detach(),
-                        v[:, :, commit_end:block_end, :].detach(),
-                    )
+                    if cache.semantic_clusters:
+                        self._log_kv_pending = (
+                            k[:, :, commit_end:block_end, :].detach(),
+                            v[:, :, commit_end:block_end, :].detach(),
+                            k_raw[:, :, commit_end:block_end, :].detach(),
+                            _pos_slice(commit_end, block_end),
+                        )
+                    else:
+                        self._log_kv_pending = (
+                            k[:, :, commit_end:block_end, :].detach(),
+                            v[:, :, commit_end:block_end, :].detach(),
+                        )
                 start = block_end
 
         while start < T:
@@ -1389,9 +1500,17 @@ class CausalSelfAttention(nn.Module):
             # Add current chunk (detached) to the sliding window.
             # When the window overflows, oldest t tokens are compacted into hierarchy.
             if defer_chunk:
-                self._log_kv_pending = (k_b.detach(), v_b.detach())
+                if cache.semantic_clusters:
+                    self._log_kv_pending = (k_b.detach(), v_b.detach(), k_raw[:, :, start:end, :].detach(), _pos_slice(start, end))
+                else:
+                    self._log_kv_pending = (k_b.detach(), v_b.detach())
             else:
-                cache.add_recent(k_b.detach(), v_b.detach())
+                cache.add_recent(
+                    k_b.detach(),
+                    v_b.detach(),
+                    k_raw=k_raw[:, :, start:end, :].detach() if cache.semantic_clusters else None,
+                    input_pos=_pos_slice(start, end),
+                )
 
             start = end
 
@@ -1473,6 +1592,17 @@ class CausalSelfAttention(nn.Module):
         importance_pooling: bool = False,
         importance_pooling_lambda: float = 1.0,
         importance_pooling_temperature: float = 1.0,
+        semantic_clusters: bool = False,
+        cluster_k_max: int = 1,
+        cluster_lambda_rel: float = 1.0,
+        seg_eta: float = 1.0,
+        seg_g0: float = 2048.0,
+        seg_gap_max: float | None = None,
+        seg_block_level: int = 0,
+        seg_forget: float = 0.5,
+        semantic_s_h: torch.Tensor | float | None = None,
+        cos_cache: torch.Tensor | None = None,
+        sin_cache: torch.Tensor | None = None,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1496,12 +1626,13 @@ class CausalSelfAttention(nn.Module):
         if rope_cache_length is None:
             rope_cache_length = 2 if rope_n_elem == 1 else rope_n_elem
         k_dim = rope_cache_length + self.config.head_size - rope_n_elem
+        storage_k_dim = self.config.head_size if semantic_clusters else k_dim
 
         k_shape = (
             batch_size,
             self.config.n_query_groups,
             max_seq_length,
-            k_dim,
+            storage_k_dim,
         )
         v_shape = (
             batch_size,
@@ -1517,6 +1648,18 @@ class CausalSelfAttention(nn.Module):
             importance_pooling=importance_pooling,
             importance_pooling_lambda=importance_pooling_lambda,
             importance_pooling_temperature=importance_pooling_temperature,
+            semantic_clusters=semantic_clusters,
+            cluster_k_max=cluster_k_max,
+            cluster_lambda_rel=cluster_lambda_rel,
+            seg_eta=seg_eta,
+            seg_g0=seg_g0,
+            seg_gap_max=seg_gap_max,
+            seg_block_level=seg_block_level,
+            seg_forget=seg_forget,
+            semantic_s_h=semantic_s_h,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            rope_n_elem=rope_n_elem,
         )
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:

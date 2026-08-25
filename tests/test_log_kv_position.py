@@ -36,6 +36,14 @@ def test_merge_anchors_is_associative_and_pad_identity() -> None:
     for got, exp in zip(merge_anchors(pad_lo, pad_hi, zero, *real), real):
         torch.testing.assert_close(got, exp)
 
+    zero_field = torch.tensor([0])
+    one_w = torch.tensor([1.0])
+    zero_w = torch.tensor([0.0])
+    for got, exp in zip(merge_anchors(*real, zero_field, zero_field, zero_field, one_w, zero_w), real):
+        torch.testing.assert_close(got, exp)
+    for got, exp in zip(merge_anchors(zero_field, zero_field, zero_field, *real, zero_w, one_w), real):
+        torch.testing.assert_close(got, exp)
+
     a = (torch.tensor([0]), torch.tensor([0]), torch.tensor([0]))
     b = (torch.tensor([3]), torch.tensor([3]), torch.tensor([3]))
     c = (torch.tensor([8]), torch.tensor([8]), torch.tensor([8]))
