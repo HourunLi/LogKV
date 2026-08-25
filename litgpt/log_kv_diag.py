@@ -564,7 +564,7 @@ def slot_runs(slot_w: torch.Tensor, slot_valid: torch.Tensor | None = None) -> t
     of ``n`` slots of ``width`` covers a contiguous block of ``n * width`` exact
     tokens, so ``reshape(..., n, width)`` recovers the per-slot token spans without
     any scatter. ``slot_valid`` filters the fixed pooled-prefix capacity used by
-    the GPU layout.
+    the GPU layout; exact suffix slots remain valid.
 
     Requires ``slot_w`` identical across batch/group: with salience pins active
     the slots are scattered duplicates rather than one contiguous token run, so
@@ -575,29 +575,25 @@ def slot_runs(slot_w: torch.Tensor, slot_valid: torch.Tensor | None = None) -> t
         runs: list of ``(slot_offset, n_slots, width)`` in time order.
         total_tokens: sum of ``n_slots * width`` over all runs.
     """
+    if not torch.all(slot_w == slot_w[0, 0]):
+        raise ValueError(
+            "slot widths differ across batch/group — diagnostics require pin_size=0 "
+            "(salience pins scatter duplicate slots and break the contiguous "
+            "slot->token span mapping)"
+        )
+
     if slot_valid is not None:
         if not torch.all(slot_valid == slot_valid[0, 0]):
             raise ValueError("slot validity differs across batch/group — diagnostics require aligned slots")
+        pooled = slot_valid.size(-1)
         valid0 = slot_valid[0, 0]
-        slot_w = slot_w[..., :valid0.size(-1)]
-        if not torch.all(slot_w == slot_w[0, 0]):
-            raise ValueError(
-                "slot widths differ across batch/group — diagnostics require pin_size=0 "
-                "(salience pins scatter duplicate slots and break the contiguous "
-                "slot->token span mapping)"
-            )
-        widths_tensor = slot_w[0, 0, valid0]
-    else:
-        if not torch.all(slot_w == slot_w[0, 0]):
-            raise ValueError(
-                "slot widths differ across batch/group — diagnostics require pin_size=0 "
-                "(salience pins scatter duplicate slots and break the contiguous "
-                "slot->token span mapping)"
-            )
-        widths_tensor = slot_w[0, 0]
+        slot_w = torch.cat([slot_w[:, :, :pooled][:, :, valid0], slot_w[:, :, pooled:]], dim=2)
+
+    widths_tensor = slot_w[0, 0].round().to(torch.long)
     if widths_tensor.numel() == 0:
         return [], 0
-    widths = widths_tensor.round().to(torch.long).tolist()
+
+    widths = widths_tensor.tolist()
     runs: list[tuple[int, int, int]] = []
     total = 0
     i, s = 0, len(widths)
@@ -611,6 +607,29 @@ def slot_runs(slot_w: torch.Tensor, slot_valid: torch.Tensor | None = None) -> t
         total += n * w
         i = j
     return runs, total
+
+
+def _filter_valid_slot_prefix(
+    slot_valid: torch.Tensor | None,
+    *tensors: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, ...]:
+    """Drop invalid pooled-prefix capacity before oracle span math."""
+    if slot_valid is None:
+        return tensors
+    if not torch.all(slot_valid == slot_valid[0, 0]):
+        raise ValueError("slot validity differs across batch/group — diagnostics require aligned slots")
+
+    pooled = slot_valid.size(-1)
+    valid0 = slot_valid[0, 0]
+
+    def keep(t: torch.Tensor | None) -> torch.Tensor | None:
+        if t is None:
+            return None
+        if t.dim() == 4:
+            return torch.cat([t[:, :, :pooled, :][:, :, valid0, :], t[:, :, pooled:, :]], dim=2)
+        return torch.cat([t[:, :, :pooled][:, :, valid0], t[:, :, pooled:]], dim=2)
+
+    return tuple(keep(t) for t in tensors)
 
 
 # ======================================================================
@@ -1194,7 +1213,27 @@ def diag_block_attention(
             second_order_scale=prod_second_order_scale,
         )
         if mode in ("baseline", "baseline_1st_order") and DIAG.collect:
-            runs, total = slot_runs(slot_w, slot_valid)
+            (
+                diag_slot_k,
+                diag_slot_v,
+                diag_slot_w,
+                diag_slot_sigma_u,
+                diag_slot_sigma2,
+                diag_slot_gamma_a,
+                diag_slot_gamma_b,
+                diag_slot_gamma,
+            ) = _filter_valid_slot_prefix(
+                slot_valid,
+                slot_k,
+                slot_v,
+                slot_w,
+                slot_sigma_u,
+                slot_sigma2,
+                slot_gamma_a,
+                slot_gamma_b,
+                slot_gamma,
+            )
+            runs, total = slot_runs(diag_slot_w)
             if total != k_prefix.size(2):
                 raise ValueError(
                     f"slot span ({total}) != prefix length ({k_prefix.size(2)}): "
@@ -1205,9 +1244,9 @@ def diag_block_attention(
                 q=q,
                 k_prefix=k_prefix,
                 v_prefix=v_prefix,
-                slot_k=slot_k,
-                slot_v=slot_v,
-                slot_w=slot_w,
+                slot_k=diag_slot_k,
+                slot_v=diag_slot_v,
+                slot_w=diag_slot_w,
                 k_tail=k_tail,
                 v_tail=v_tail,
                 runs=runs,
@@ -1216,11 +1255,11 @@ def diag_block_attention(
                 layer=layer,
                 q_offset=q_offset,
                 seq_len=seq_len,
-                slot_sigma_u=slot_sigma_u,
-                slot_sigma2=slot_sigma2,
-                slot_gamma_a=slot_gamma_a,
-                slot_gamma_b=slot_gamma_b,
-                slot_gamma=slot_gamma,
+                slot_sigma_u=diag_slot_sigma_u,
+                slot_sigma2=diag_slot_sigma2,
+                slot_gamma_a=diag_slot_gamma_a,
+                slot_gamma_b=diag_slot_gamma_b,
+                slot_gamma=diag_slot_gamma,
                 second_order_scale=second_order_scale,
             )
         return out
@@ -1228,7 +1267,27 @@ def diag_block_attention(
     if mode == "dense":
         return _diag_dense(q, k_prefix, v_prefix, k_tail, v_tail, scale, layer, q_offset, seq_len)
 
-    runs, total = slot_runs(slot_w, slot_valid)
+    (
+        diag_slot_k,
+        diag_slot_v,
+        diag_slot_w,
+        diag_slot_sigma_u,
+        diag_slot_sigma2,
+        diag_slot_gamma_a,
+        diag_slot_gamma_b,
+        diag_slot_gamma,
+    ) = _filter_valid_slot_prefix(
+        slot_valid,
+        slot_k,
+        slot_v,
+        slot_w,
+        slot_sigma_u,
+        slot_sigma2,
+        slot_gamma_a,
+        slot_gamma_b,
+        slot_gamma,
+    )
+    runs, total = slot_runs(diag_slot_w)
     if total != k_prefix.size(2):
         raise ValueError(
             f"slot span ({total}) != prefix length ({k_prefix.size(2)}): "
@@ -1239,9 +1298,9 @@ def diag_block_attention(
         q=q,
         k_prefix=k_prefix,
         v_prefix=v_prefix,
-        slot_k=slot_k,
-        slot_v=slot_v,
-        slot_w=slot_w,
+        slot_k=diag_slot_k,
+        slot_v=diag_slot_v,
+        slot_w=diag_slot_w,
         k_tail=k_tail,
         v_tail=v_tail,
         runs=runs,
@@ -1250,11 +1309,11 @@ def diag_block_attention(
         layer=layer,
         q_offset=q_offset,
         seq_len=seq_len,
-        slot_sigma_u=slot_sigma_u,
-        slot_sigma2=slot_sigma2,
-        slot_gamma_a=slot_gamma_a,
-        slot_gamma_b=slot_gamma_b,
-        slot_gamma=slot_gamma,
+        slot_sigma_u=diag_slot_sigma_u,
+        slot_sigma2=diag_slot_sigma2,
+        slot_gamma_a=diag_slot_gamma_a,
+        slot_gamma_b=diag_slot_gamma_b,
+        slot_gamma=diag_slot_gamma,
         second_order_scale=second_order_scale,
     )
 
