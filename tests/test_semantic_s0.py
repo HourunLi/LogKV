@@ -301,23 +301,23 @@ def test_vanilla_logkv_compressed_entries_matches_real_cache(token_count: int, b
     # per-level groups using meta["level_counts"], which records entries in
     # the same level-by-level order they were appended in (entry width alone
     # cannot recover level assignment once carries land at different depths).
-    levels: list[list] = []
     cursor = 0
+    occupied_levels: set[int] = set()
     for level in sorted(int(lvl_str) for lvl_str in meta["level_counts"]):
         count = meta["level_counts"][str(level)]
-        levels.append(entries[cursor : cursor + count])
+        level_entries = entries[cursor : cursor + count]
         cursor += count
-
-    for level, level_entries in enumerate(levels):
-        real_count = int(cache.level_count[level].item())
+        occupied_levels.add(level)
+        real_count = int(cache.level_count[0, 0, 0, level].item())
         assert real_count == len(level_entries), f"level {level}: count mismatch"
-        real_w = getattr(cache, f"level_w_{level}")[0, 0, :real_count]
-        real_k = getattr(cache, f"level_k_{level}")[0, 0, :real_count, 0]
+        real_w = cache.level_w[0, 0, 0, level, :real_count]
+        real_k = cache.level_k[0, 0, 0, level, :real_count, 0]
         for slot_i, entry in enumerate(level_entries):
             assert real_w[slot_i].item() == pytest.approx(len(entry.members))
             assert real_k[slot_i].item() == pytest.approx(float(np.mean(entry.members)), abs=1e-4)
-    for level in range(len(levels), cache.max_levels):
-        assert int(cache.level_count[level].item()) == 0, f"unexpected occupied level {level}"
+    for level in range(cache.max_levels):
+        if level not in occupied_levels:
+            assert int(cache.level_count[0, 0, 0, level].item()) == 0, f"unexpected occupied level {level}"
 
 
 def test_semantic_ladder_overflow_folds_oldest_pair_one_at_a_time() -> None:

@@ -141,11 +141,13 @@ Scope / preconditions (enforced; also see ``diag_block_attention``):
     production training/eval keeps its exact numerics and performance.
 """
 
+from __future__ import annotations
+
 import contextlib
 
 import torch
 
-from litgpt.log_kv_cache import append_exact_tokens, log_kv_slot_attention
+from litgpt.log_kv_cache import CacheAttentionState, append_exact_tokens, log_kv_slot_attention
 
 _MODES = ("off", "baseline", "baseline_1st_order", "s_oracle", "v_oracle", "gamma_only", "exact", "dense")
 # Per-layer cap on the deterministic |scale·q·k| sample buffer backing the
@@ -613,6 +615,8 @@ def _production_block(
     slot_gamma_a: torch.Tensor | None = None,
     slot_gamma_b: torch.Tensor | None = None,
     slot_gamma: torch.Tensor | None = None,
+    slot_valid: torch.Tensor | None = None,
+    M_s: torch.Tensor | None = None,
     second_order_scale: float = 1.0,
 ) -> torch.Tensor:
     """Exactly the production block-prefill call — the ``baseline`` output.
@@ -621,30 +625,45 @@ def _production_block(
     argument order the model uses, so ``baseline`` reproduces production bit-for-bit
     (the zero-intrusion guarantee).
     """
-    appended = append_exact_tokens(
-        slot_k, slot_v, slot_w, k_tail, v_tail,
-        slot_sigma_u, slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma,
+    state = append_exact_tokens(
+        CacheAttentionState(
+            slot_k=slot_k,
+            slot_v=slot_v,
+            slot_w=slot_w,
+            slot_valid=slot_valid,
+            M_s=M_s,
+            slot_sigma_u=slot_sigma_u,
+            slot_sigma2=slot_sigma2,
+            slot_gamma_a=slot_gamma_a,
+            slot_gamma_b=slot_gamma_b,
+            slot_gamma=slot_gamma,
+        ),
+        k_tail,
+        v_tail,
     )
     if slot_sigma_u is None:
-        k_all, v_all, w_all = appended
         return log_kv_slot_attention(
-            q, k_all, v_all, w_all, scale=scale, lam=lam, causal_tail=k_tail.size(2),
+            q, state.slot_k, state.slot_v, state.slot_w,
+            scale=scale, lam=lam, causal_tail=k_tail.size(2),
+            slot_M=state.M_s,
+            slot_valid=state.slot_valid,
             second_order_scale=second_order_scale,
         )
-    k_all, v_all, w_all, sigma_u_all, sigma2_all, gamma_a_all, gamma_b_all, gamma_all = appended
     return log_kv_slot_attention(
         q,
-        k_all,
-        v_all,
-        w_all,
+        state.slot_k,
+        state.slot_v,
+        state.slot_w,
         scale=scale,
         lam=lam,
         causal_tail=k_tail.size(2),
-        slot_sigma_u=sigma_u_all,
-        slot_sigma2=sigma2_all,
-        slot_gamma_a=gamma_a_all,
-        slot_gamma_b=gamma_b_all,
-        slot_gamma=gamma_all,
+        slot_M=state.M_s,
+        slot_valid=state.slot_valid,
+        slot_sigma_u=state.slot_sigma_u,
+        slot_sigma2=state.slot_sigma2,
+        slot_gamma_a=state.slot_gamma_a,
+        slot_gamma_b=state.slot_gamma_b,
+        slot_gamma=state.slot_gamma,
         second_order_scale=second_order_scale,
     )
 
@@ -1097,6 +1116,8 @@ def diag_block_attention(
     slot_gamma_a: torch.Tensor | None = None,
     slot_gamma_b: torch.Tensor | None = None,
     slot_gamma: torch.Tensor | None = None,
+    slot_valid: torch.Tensor | None = None,
+    M_s: torch.Tensor | None = None,
     second_order_scale: float = 1.0,
 ) -> torch.Tensor:
     """Diagnostic replacement for one production block-prefill attention step.
@@ -1151,6 +1172,8 @@ def diag_block_attention(
             slot_gamma_a=slot_gamma_a,
             slot_gamma_b=slot_gamma_b,
             slot_gamma=slot_gamma,
+            slot_valid=slot_valid,
+            M_s=M_s,
             second_order_scale=prod_second_order_scale,
         )
         if mode in ("baseline", "baseline_1st_order") and DIAG.collect:
