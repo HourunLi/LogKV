@@ -2242,7 +2242,7 @@ class TestSecondOrderGate:
         for ell in range(cache.max_levels):
             for name in ("level_sigma_u", "level_sigma2", "level_gamma_a",
                          "level_gamma_b", "level_gamma"):
-                buf = getattr(cache, f"{name}_{ell}")
+                buf = getattr(cache, name)[:, :, 0, ell]
                 assert not buf.any(), f"{name}_{ell} was built despite a zero gate"
 
     def test_gate_zero_matches_stats_present_but_gated(self):
