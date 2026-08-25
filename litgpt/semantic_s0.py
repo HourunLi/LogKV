@@ -820,9 +820,9 @@ def _append_entry(levels: list[list[OfflineEntry]], entry: OfflineEntry, b_prime
 
     Level 0 accumulates single entries one at a time; once it reaches
     ``b_prime`` it hands the *whole* block up as one carry unit (matching
-    ``_add_compact_entry``'s ``if self._counts[0] >= self.B: ... _binary_carry``).
+    ``_add_compact_entry``'s ``if level_count[0] >= self.B: ... _binary_carry``).
     A level that is empty when a block arrives just absorbs it **unmerged**
-    (``_binary_carry``'s ``if self._counts[ell] == 0: self._set_level(...); return``
+    (``_binary_carry``'s ``if level_count[ell] == 0: self._set_level(...); return``
     -- no ``compact()`` call, entries keep whatever width they arrived with).
     Only a level that is *already holding a full block* merges the two
     ``b_prime``-wide blocks pairwise into one new ``b_prime``-wide block

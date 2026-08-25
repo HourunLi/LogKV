@@ -18,6 +18,7 @@ import torch
 
 from litgpt.config import Config
 from litgpt.log_kv_cache import (
+    CacheAttentionState,
     LogStructuredKVCache,
     append_exact_tokens,
     log_kv_slot_attention,
@@ -61,14 +62,14 @@ def _build_case(n_prefix: int, blk: int = 6, recent: int = 4, B: int = 4, seed: 
         cache.add_recent(k[:, :, s:e, :], v[:, :, s:e, :])
     assert cache.token_count == n_prefix
 
-    slot_k, slot_v, slot_w = cache.get_attention_state()
+    state = cache.get_attention_state()
     return {
         "q": q,
         "k_prefix": k[:, :, :n_prefix, :],
         "v_prefix": v[:, :, :n_prefix, :],
-        "slot_k": slot_k,
-        "slot_v": slot_v,
-        "slot_w": slot_w,
+        "slot_k": state.slot_k,
+        "slot_v": state.slot_v,
+        "slot_w": state.slot_w,
         "k_tail": k[:, :, n_prefix:total, :],
         "v_tail": v[:, :, n_prefix:total, :],
     }
@@ -117,11 +118,18 @@ class TestBaselineMatchesProduction:
         case = _build_case(n_prefix)
         out_base = _run("baseline", case)
 
-        k_all, v_all, w_all = append_exact_tokens(
-            case["slot_k"], case["slot_v"], case["slot_w"], case["k_tail"], case["v_tail"]
+        state = append_exact_tokens(
+            CacheAttentionState(case["slot_k"], case["slot_v"], case["slot_w"]),
+            case["k_tail"],
+            case["v_tail"],
         )
         out_prod = log_kv_slot_attention(
-            case["q"], k_all, v_all, w_all, scale=SCALE, causal_tail=case["k_tail"].size(2)
+            case["q"],
+            state.slot_k,
+            state.slot_v,
+            state.slot_w,
+            scale=SCALE,
+            causal_tail=case["k_tail"].size(2),
         )
         assert torch.equal(out_base, out_prod)
 

@@ -62,11 +62,20 @@ entry 存它覆盖范围内**真实成员**的边界与集中锚点，读出时�
 S0.0/S0.3/S0.6 分析工具链已落地。** 首批真实 dump 已给出三条结论：S0.0 支持继续
 走聚类路线；S0.3 证明 needle 隔离有稳定语义信号但还不能完整隔离整个 span；
 S0.6 说明 `lambda_rel=0.875` 的召回更高但 entry/fixed-3 成本明显更贵。当前最新
-进展是：**S0.3/S0.6 已补上 `K_max` + Ward clipped 探针，且 Stage-0 语义 ladder 的
-默认 `B′` 从旧 smoke-test 的 8 调到 128；S0.3 的主判据也从“小簇成员数 `≤B′`”
-改成“最终 replay 的 ladder entry 仍只有一个真实 token”。** 旧小簇隔离率仍输出，
-但只作为 proxy/解释项。下一步要用这个新版口径实跑 clipped gate 来决定
-`lambda_rel=1.0` 还是 `0.875` 能进入生产实现。Stage 1（生产实现）尚未开始。
+进展是：**S0.3/S0.6 已补上并实跑 `K_max` + Ward clipped 探针，且 Stage-0 语义
+ladder 的默认 `B′` 从旧 smoke-test 的 8 调到 128；S0.3 的主判据也从“小簇成员数
+`≤B′`”改成“最终 replay 的 ladder entry 仍只有一个真实 token”。** 旧小簇隔离率仍
+输出，但只作为 proxy/解释项。用这批数据做 `K_max_default = ceil(c log2 N)` 的
+32k 均值级代入后得到一个重要更正：**只按 `K_max_binding_rate` 或覆盖 unclipped
+`K_eff` 定 `c` 是过强、过保守的 binding-only 口径，不应直接写成生产默认。**
+`lambda_rel=1.0` 若只要求绑定率 <10%，需要 `K_max≈280`、`c≈19`；若要求覆盖
+unclipped 平均 `K_eff≈310`，需要 `c≈21`（加 10% 余量约 `c≈23`）。但
+`K_max=128` 虽仍有约 81% binding，S0.3 exact-entry 已经约 72.7%，接近 unclipped
+约 74.3%，说明频繁 Ward 不必然等于 needle 已损坏。最终 `c` 应按“needle 最终 entry
+宽度/压缩层级是否可接受 + S0.3 质量平台 + S0.6 成本”共同定；在当前有限扫描上，
+实际默认粗估应落在 `K_max≈64–128`，即 32k 下 `c≈4.3–8.5`，保守先取 `c≈8`
+比按 binding-only 取 `c≈19` 更合理。`K_eff` 覆盖只作为“完全避免 Ward”的诊断上界。
+Stage 1（生产实现）尚未开始。
 
 > **务必读清楚这句话字面的意思，不要被下面大段的伪代码/公式/`raise
 > ValueError(...)` 片段误导，也不要把"Stage 0 有代码了"误读成"设计已经在
@@ -94,14 +103,16 @@ S0.6 说明 `lambda_rel=0.875` 的召回更高但 entry/fixed-3 成本明显更�
 > `unused/semantic_stage0_dump.py` docstring 与 `docs/experiments.md`。
 
 **下一步（按优先级）**：
-1. **实跑 S0.3/S0.6 的 `K_max` + Ward clipped gate。** 这是当前最高优先级：同一批
-   dump 上扫 `lambda_rel={1.0,0.875}`、`g_max={inf,8192,4096}`、`k_max={unclipped,15,16,32,64,128}`。
+1. **解释已跑完的 S0.3/S0.6 `K_max` + Ward clipped gate，定下 `c≈6–8` 候选。**
+   同一批 dump 已扫 `lambda_rel={1.0,0.875}`、`g_max={inf,8192,4096}`、
+   `k_max={unclipped,15,16,32,64,128}`。
    S0.3 主看 `needle_token_exact_entry_rate`、`random_token_exact_entry_rate`、
    `token_exact_entry_lift`，再用 `needle_token_isolated_rate` / `span_any_token_isolated_rate`
    解释旧小簇 proxy，并同时看 Ward 是否触碰/合并 needle span、以及
    `K_max_binding_rate`；S0.6 看 fixed-3 物理宽度、`E[M]`、`entry_count_mean`、
    Ward merge 数和绑定率。命令与判定字段见 `docs/experiments.md` 的 S0.3/S0.6
-   决策门。
+   决策门。当前数据已经说明 binding-only `c≈19` 是保守上界，不是默认建议；粗估默认
+   先看 `c≈6–8` 这一档，再按 S0.6 成本裁掉过贵配置。
 2. **用这道 gate 选择进入真实实现的 `lambda_rel`。** 默认假设仍是 `lambda_rel=1.0`；
    只有当 `0.875` 的 needle 召回增益足以覆盖 S0.6 成本、且 `K_max` 绑定/needle Ward
    合并不失控，才把它升为主线。`g_max` 暂不作为核心旋钮，只保留 `inf` 和少量跨度
@@ -110,9 +121,12 @@ S0.6 说明 `lambda_rel=0.875` 的召回更高但 entry/fixed-3 成本明显更�
    S0.7（supersession 判定）还没写；S0.1 是 `litgpt/log_kv_position.py` 的纯 CPU
    单测，不读 dump；S0.8 需要 `cache_serial`/`cache_batch` 两份朴素 CPU 参考 cache，
    当前不能跑。
-4. **Stage 1 仍等待 gate 结果。** 若 S0.3/S0.6 clipped gate 通过，再进入 §5.18 第
-   3–6 步：多簇路由生产实现、段对齐填充、`op_log` 训练重放。开工前重读
-   `algorithm-spec.md` §5.19–§5.21 与 `docs/risks-and-open-questions.md` §11。
+4. **Stage 1 仍等待 clipped gate 的质量/成本裁决。** S0.3/S0.6 clipped 数据已经有了，
+   但不能只因 binding 高就把 `c` 抬到覆盖 `K_eff`；要先确认 `K_max=64/128` 一类更小
+   预算下，needle 的 exact-entry 是否已经接近平台，同时 S0.6 成本是否
+   还能接受。通过后再进入 §5.18 第 3–6 步：多簇路由生产实现、段对齐填充、`op_log`
+   训练重放。开工前重读 `algorithm-spec.md` §5.19–§5.21 与
+   `docs/risks-and-open-questions.md` §11。
 
 > **实际的第 0 步是 Stage 0 的 dump 脚本**（规格见 `experiments.md`）——它是上面第 1、2
 > 项全部结论的输入，是本项目写的第一段代码。**这一步（mechanism A / k/v 部分）
@@ -583,7 +597,17 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
 > 每次讨论产生突破或进展,在这里加一条,新的在最上面。只记"改变了什么结论/设计",
 > 不重复已经写进正文的细节——细节改到对应章节,这里留指针和一句话动机。
 
-- **2026-08-24（最新）｜Stage-0 语义 ladder 的默认 `B′` 从 8 调到 128，S0.3 主口径
+- **2026-08-25（最新）｜更正 `K_max_default` 的 `c` 校准口径：binding-only 只作
+  no-Ward 上界，不能当生产默认。** 使用 `stage0_dump/s0_3_kmax_ward.csv` /
+  `s0_6_kmax_ward_rel*.csv`，32k 下 `log2N=15`。`lambda_rel=1.0` 在
+  `g_max={inf,8192,4096}` 的 unclipped 平均新簇尝试数约 309–311；若强行要求
+  "绑定率 <10%"，需 `K_max≈279–281`，即 `c≈18.6–18.7`，这是保守上界。
+  但 `K_max=128` 虽仍有约 80.8–80.9% binding，exact-entry 已约 72.7%，接近
+  unclipped 的约 74.3%；`K_max=64` exact-entry 约 67.5%，约为 unclipped 的 91%。
+  所以当前生产粗估应按质量平台和成本取 `K_max≈64–128`，即 `c≈4.3–8.5`，优先
+  试 `c≈6–8`，而不是按覆盖 `K_eff`/压低 binding 取 `c≈19+`。
+
+- **2026-08-24｜Stage-0 语义 ladder 的默认 `B′` 从 8 调到 128，S0.3 主口径
   从“小簇代理”改成 exact-entry 隔离。** 动机：原 LogKV 在 32k 下有约
   `recent_size=1024` 的精确窗口和 `B=512` 的压缩前缀宽度；语义分簇后若
   `K_max≈16/32`，所有簇合计的第一层未压缩容量应在 1k–4k 量级，而 `B′=8`

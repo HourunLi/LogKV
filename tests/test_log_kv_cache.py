@@ -7,6 +7,7 @@ import torch
 
 from litgpt.config import Config
 from litgpt.log_kv_cache import (
+    CacheAttentionState,
     LogKVStreamTrainingAttention,
     LogStructuredKVCache,
     _pair_rank1_stats,
@@ -55,6 +56,14 @@ def add_full_kv_in_chunks(cache: LogStructuredKVCache, k: torch.Tensor, v: torch
         cache.add_recent(k[:, :, start:end, :], v[:, :, start:end, :])
 
 
+def level_count(cache: LogStructuredKVCache, ell: int) -> int:
+    return int(cache.level_count[0, 0, 0, ell].item())
+
+
+def has_compacted_level(cache: LogStructuredKVCache) -> bool:
+    return bool((cache.level_count > 0).any().item())
+
+
 def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredKVCache) -> None:
     """The full cache state (counters, recent window, all levels) must match bitwise."""
     assert a.token_count == b.token_count
@@ -63,19 +72,19 @@ def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredK
     assert torch.equal(a.recent_k[:, :, :rc], b.recent_k[:, :, :rc])
     assert torch.equal(a.recent_v[:, :, :rc], b.recent_v[:, :, :rc])
     assert torch.equal(a.level_count, b.level_count)
-    for ell in range(a.max_levels):
-        for name in (
-            "level_k_",
-            "level_v_",
-            "level_w_",
-            "level_imp_",
-            "level_sigma_u_",
-            "level_sigma2_",
-            "level_gamma_a_",
-            "level_gamma_b_",
-            "level_gamma_",
-        ):
-            assert torch.equal(getattr(a, f"{name}{ell}"), getattr(b, f"{name}{ell}")), f"{name}{ell} differ"
+    for name in (
+        "level_k",
+        "level_v",
+        "level_w",
+        "level_imp",
+        "level_sigma_u",
+        "level_sigma2",
+        "level_gamma_a",
+        "level_gamma_b",
+        "level_gamma",
+        "pad_mask",
+    ):
+        assert torch.equal(getattr(a, name), getattr(b, name)), f"{name} differ"
 
 
 # ---------------------------------------------------------------------------
@@ -114,24 +123,29 @@ class TestInit:
 
     def test_level_buffers_registered(self, small_cache):
         c = small_cache
-        for ell in range(c.max_levels):
-            assert hasattr(c, f"level_k_{ell}")
-            assert hasattr(c, f"level_v_{ell}")
-            assert hasattr(c, f"level_w_{ell}")
-            assert hasattr(c, f"level_imp_{ell}")
-            assert hasattr(c, f"level_sigma_u_{ell}")
-            assert hasattr(c, f"level_sigma2_{ell}")
-            assert hasattr(c, f"level_gamma_a_{ell}")
-            assert hasattr(c, f"level_gamma_b_{ell}")
-            assert hasattr(c, f"level_gamma_{ell}")
-        assert c.level_count.shape == (c.max_levels,)
+        assert c.K_max == 1
+        assert c.L_alloc == c.max_levels
+        assert c.B_prime == c.B
+        assert c.level_k.shape == (c.batch_size, c.n_groups, c.K_max, c.L_alloc, c.B_prime, c.k_dim)
+        assert c.level_v.shape == (c.batch_size, c.n_groups, c.K_max, c.L_alloc, c.B_prime, c.v_dim)
+        assert c.level_w.shape == (c.batch_size, c.n_groups, c.K_max, c.L_alloc, c.B_prime)
+        assert c.level_imp.shape == c.level_w.shape
+        assert c.level_sigma_u.shape == c.level_k.shape
+        assert c.level_sigma2.shape == c.level_w.shape
+        assert c.level_gamma_a.shape == c.level_k.shape
+        assert c.level_gamma_b.shape == c.level_v.shape
+        assert c.level_gamma.shape == c.level_w.shape
+        assert c.level_count.shape == (c.batch_size, c.n_groups, c.K_max, c.L_alloc)
+        assert c.level_count.dtype == torch.int16
+        assert c.pad_mask.shape == c.level_w.shape
+        assert not hasattr(c, "_counts")
         assert c.level_count.sum() == 0
 
     def test_initial_state_empty(self, small_cache):
         c = small_cache
         assert c.token_count == 0
         assert c.recent_count == 0
-        assert c.level_count[0].item() == 0
+        assert level_count(c, 0) == 0
         assert c.total_slots == 0
         assert c.total_tokens_covered == 0
 
@@ -144,8 +158,8 @@ class TestInit:
         """THE core complexity guarantee: total buffer storage must be
         O(recent_size + B * max_levels) — no term linear in max_seq_length.
         Closed form: recent_size*(k_dim+v_dim)*b*g
-                     + max_levels * (B*(3*k_dim+2*v_dim+4)*b*g + 1).
-        The "+4" scalar-per-slot group is level_w/sigma2/gamma/imp."""
+                     + max_levels * (B*(3*k_dim+2*v_dim+5)*b*g + b*g).
+        The "+5" scalar-per-slot group is level_w/sigma2/gamma/imp/pad_mask."""
         b, g, k_dim, v_dim, B, recent = 1, 2, 8, 8, 4, 8
         for max_seq in (1024, 65536, 1048576):
             c = LogStructuredKVCache(
@@ -155,7 +169,7 @@ class TestInit:
             total = sum(buf.numel() for buf in c.buffers())
             expected = (
                 recent * (k_dim + v_dim) * b * g
-                + c.max_levels * (B * (3 * k_dim + 2 * v_dim + 4) * b * g + 1)
+                + c.max_levels * (B * (3 * k_dim + 2 * v_dim + 5) * b * g + b * g)
             )
             assert total == expected, (
                 f"max_seq={max_seq}: buffer numel {total} != log-sized {expected} — "
@@ -320,6 +334,71 @@ class TestCompact:
         exp_cross = direct[7][..., None, None] * torch.einsum("bgsc,bgsd->bgscd", direct[6], direct[5])
         torch.testing.assert_close(got_cov, exp_cov, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(got_cross, exp_cross, atol=1e-5, rtol=1e-5)
+
+    def test_anchor_fields_are_optional_and_append_when_given(self):
+        """Omitting anchors reproduces the prior shape; giving them merges and appends."""
+        B, G, D = 1, 1, 1
+        k1 = torch.tensor([[[[1.0], [5.0]]]])
+        v1 = torch.tensor([[[[2.0], [6.0]]]])
+        w1 = torch.tensor([[[1.0, 3.0]]])
+        k2 = torch.tensor([[[[3.0], [7.0]]]])
+        v2 = torch.tensor([[[[4.0], [8.0]]]])
+        w2 = torch.tensor([[[3.0, 1.0]]])
+
+        no_anchors = LogStructuredKVCache.compact(k1, v1, w1, k2, v2, w2)
+        assert len(no_anchors) == 3
+
+        p_lo1 = torch.tensor([[[0, 10]]])
+        p_hi1 = torch.tensor([[[0, 11]]])
+        sum_wp1 = torch.tensor([[[0, 21]]], dtype=torch.int64)
+        p_lo2 = torch.tensor([[[20, 30]]])
+        p_hi2 = torch.tensor([[[20, 31]]])
+        sum_wp2 = torch.tensor([[[60, 61]]], dtype=torch.int64)
+
+        with_anchors = LogStructuredKVCache.compact(
+            k1, v1, w1, k2, v2, w2,
+            p_lo1=p_lo1, p_hi1=p_hi1, sum_wp1=sum_wp1,
+            p_lo2=p_lo2, p_hi2=p_hi2, sum_wp2=sum_wp2,
+        )
+        for got, exp in zip(with_anchors[:3], no_anchors):
+            torch.testing.assert_close(got, exp)
+        p_lo_out, p_hi_out, sum_wp_out = with_anchors[3:]
+        torch.testing.assert_close(p_lo_out, torch.tensor([[[0, 10]]]))
+        torch.testing.assert_close(p_hi_out, torch.tensor([[[20, 31]]]))
+        torch.testing.assert_close(sum_wp_out, torch.tensor([[[60, 82]]]))
+
+    def test_anchor_fields_append_after_imp_and_stats(self):
+        """Anchor tuple stays last regardless of the imp/rank-1-stats branches."""
+        torch.manual_seed(7)
+        B, G, k_dim, v_dim = 1, 1, 3, 2
+        k1, k2 = torch.randn(B, G, 2, k_dim), torch.randn(B, G, 2, k_dim)
+        v1, v2 = torch.randn(B, G, 2, v_dim), torch.randn(B, G, 2, v_dim)
+        w1, w2 = torch.full((B, G, 2), 2.0), torch.full((B, G, 2), 2.0)
+        left = LogStructuredKVCache._compact_tokens(k1, v1, with_stats=True)
+        right = LogStructuredKVCache._compact_tokens(k2, v2, with_stats=True)
+        p_lo = torch.zeros(B, G, 2, dtype=torch.int64)
+        p_hi = torch.ones(B, G, 2, dtype=torch.int64)
+        sum_wp = torch.ones(B, G, 2, dtype=torch.int64)
+
+        out = LogStructuredKVCache.compact(
+            left[0], left[1], left[2],
+            right[0], right[1], right[2],
+            left[3], left[4], left[5], left[6], left[7],
+            right[3], right[4], right[5], right[6], right[7],
+            p_lo1=p_lo, p_hi1=p_hi, sum_wp1=sum_wp,
+            p_lo2=p_lo, p_hi2=p_hi, sum_wp2=sum_wp,
+        )
+        assert len(out) == 11  # 8 stats fields + 3 anchor fields
+        torch.testing.assert_close(out[-3], torch.zeros(B, G, 2, dtype=torch.int64))
+        torch.testing.assert_close(out[-2], torch.ones(B, G, 2, dtype=torch.int64))
+        torch.testing.assert_close(out[-1], torch.full((B, G, 2), 2, dtype=torch.int64))
+
+    def test_anchor_fields_require_all_or_none(self):
+        B, G, D = 1, 1, 1
+        k1 = v1 = torch.zeros(B, G, 2, D)
+        w1 = torch.ones(B, G, 2)
+        with pytest.raises(ValueError, match="anchor"):
+            LogStructuredKVCache.compact(k1, v1, w1, k1, v1, w1, p_lo1=torch.zeros(B, G, 2, dtype=torch.int64))
 
 
 # ---------------------------------------------------------------------------
@@ -504,8 +583,8 @@ class TestImportancePooling:
         k = torch.randn(1, 1, 2, 8)
         v = torch.randn(1, 1, 2, 8)
         c.ingest_chunk(k, v)
-        torch.testing.assert_close(c.level_k_0[:, :, 0, :], k.mean(dim=2))
-        assert c.level_imp_0[:, :, 0].abs().sum().item() == 0.0
+        torch.testing.assert_close(c.level_k[:, :, 0, 0, 0, :], k.mean(dim=2))
+        assert c.level_imp[:, :, 0, 0, 0].abs().sum().item() == 0.0
 
     def test_ingest_chunk_importance_pooling_on(self):
         """importance_pooling=True should weight by key L2 norm, differing
@@ -522,10 +601,10 @@ class TestImportancePooling:
         imp = k.float().norm(dim=-1)  # (1,1,2)
         p = imp / imp.sum()
         expected_k = p[0, 0, 0] * k[0, 0, 0] + p[0, 0, 1] * k[0, 0, 1]
-        torch.testing.assert_close(c.level_k_0[0, 0, 0], expected_k)
-        assert c.level_w_0[0, 0, 0].item() == 2.0
-        torch.testing.assert_close(c.level_imp_0[0, 0, 0], imp.sum())
-        assert not torch.allclose(c.level_k_0[0, 0, 0], k.mean(dim=2)[0, 0])
+        torch.testing.assert_close(c.level_k[0, 0, 0, 0, 0], expected_k)
+        assert c.level_w[0, 0, 0, 0, 0].item() == 2.0
+        torch.testing.assert_close(c.level_imp[0, 0, 0, 0, 0], imp.sum())
+        assert not torch.allclose(c.level_k[0, 0, 0, 0, 0], k.mean(dim=2)[0, 0])
 
     def test_streaming_add_recent_importance_pooling_end_to_end(self):
         """The full add_recent() streaming path (through multiple binary
@@ -563,10 +642,10 @@ class TestImportancePooling:
         assert torch.equal(c_weighted.level_count, c_uniform.level_count)
         assert bool((c_weighted.level_count > 0).any())  # a carry actually fired
 
-        slot_k_u, _, slot_w_u = c_uniform.get_attention_state()
-        slot_k_w, _, slot_w_w = c_weighted.get_attention_state()
-        torch.testing.assert_close(slot_w_u, slot_w_w)  # w (count) identical
-        assert not torch.allclose(slot_k_u, slot_k_w)  # pooled content differs
+        state_u = c_uniform.get_attention_state()
+        state_w = c_weighted.get_attention_state()
+        torch.testing.assert_close(state_u.slot_w, state_w.slot_w)  # w (count) identical
+        assert not torch.allclose(state_u.slot_k, state_w.slot_k)  # pooled content differs
 
 
 class TestImportancePoolingLambda:
@@ -717,10 +796,10 @@ class TestImportancePoolingLambda:
         add_full_kv_in_chunks(c_uniform, k, v)
         add_full_kv_in_chunks(c_lambda0, k, v)
 
-        slot_k_u, _, slot_w_u = c_uniform.get_attention_state()
-        slot_k_l0, _, slot_w_l0 = c_lambda0.get_attention_state()
-        torch.testing.assert_close(slot_w_u, slot_w_l0)
-        torch.testing.assert_close(slot_k_u, slot_k_l0, atol=1e-5, rtol=1e-5)
+        state_u = c_uniform.get_attention_state()
+        state_l0 = c_lambda0.get_attention_state()
+        torch.testing.assert_close(state_u.slot_w, state_l0.slot_w)
+        torch.testing.assert_close(state_u.slot_k, state_l0.slot_k, atol=1e-5, rtol=1e-5)
 
     def test_streaming_lambda_half_between_uniform_and_full_importance(self):
         """A partial lambda's pooled slot content should sit strictly between
@@ -747,9 +826,9 @@ class TestImportancePoolingLambda:
             return c
 
         c0, chalf, c1 = build(0.0), build(0.5), build(1.0)
-        k0, _, _ = c0.get_attention_state()
-        khalf, _, _ = chalf.get_attention_state()
-        k1, _, _ = c1.get_attention_state()
+        k0 = c0.get_attention_state().slot_k
+        khalf = chalf.get_attention_state().slot_k
+        k1 = c1.get_attention_state().slot_k
 
         assert not torch.allclose(k0, k1)  # sanity: lambda actually matters here
         lo = torch.minimum(k0, k1)
@@ -796,8 +875,8 @@ class TestImportancePoolingTemperature:
         )
         c_default.ingest_chunk(k, v)
         c_temp1.ingest_chunk(k, v)
-        assert torch.equal(c_default.level_k_0, c_temp1.level_k_0)
-        assert torch.equal(c_default.level_imp_0, c_temp1.level_imp_0)
+        assert torch.equal(c_default.level_k, c_temp1.level_k)
+        assert torch.equal(c_default.level_imp, c_temp1.level_imp)
 
     def test_ingest_chunk_temperature_matches_manual_pow_of_key_norm(self):
         """ingest_chunk's internal imp = k.norm(dim=-1) ** temperature should
@@ -819,8 +898,8 @@ class TestImportancePoolingTemperature:
             importance_pooling=True, importance_pooling_temperature=temp,
         )
         c.ingest_chunk(k, v)
-        torch.testing.assert_close(c.level_k_0[:, :, 0, :], k_expected.squeeze(2))
-        torch.testing.assert_close(c.level_v_0[:, :, 0, :], v_expected.squeeze(2))
+        torch.testing.assert_close(c.level_k[:, :, 0, 0, 0, :], k_expected.squeeze(2))
+        torch.testing.assert_close(c.level_v[:, :, 0, 0, 0, :], v_expected.squeeze(2))
 
     def test_temperature_below_one_moves_toward_uniform(self):
         """A skewed raw importance ratio should become less skewed (closer to
@@ -864,9 +943,9 @@ class TestImportancePoolingTemperature:
         add_full_kv_in_chunks(c_uniform, k, v)
         c_raw, c_half = build(1.0), build(0.5)
 
-        k_uniform, _, _ = c_uniform.get_attention_state()
-        k_raw, _, _ = c_raw.get_attention_state()
-        k_half, _, _ = c_half.get_attention_state()
+        k_uniform = c_uniform.get_attention_state().slot_k
+        k_raw = c_raw.get_attention_state().slot_k
+        k_half = c_half.get_attention_state().slot_k
 
         assert not torch.allclose(k_uniform, k_raw)  # sanity: heuristic matters here
         lo = torch.minimum(k_uniform, k_raw)
@@ -882,7 +961,7 @@ class TestIngest:
 
         c.ingest_chunk(torch.randn(B, G, 2, D), torch.randn(B, G, 2, v_dim))
 
-        assert c.level_count[0].item() == 1
+        assert level_count(c, 0) == 1
         assert c.token_count == 2
         assert c.recent_count == 0
         assert c.total_slots == 1  # level 0 only
@@ -897,9 +976,9 @@ class TestIngest:
             c.ingest_chunk(torch.randn(B_batch, G, 2, D), torch.randn(B_batch, G, 2, v_dim))
 
         # After B=4 ingests, level 0 should carry to level 1
-        assert c.level_count[0].item() == 0
-        assert c.level_count[1].item() > 0
-        assert c.level_count[2].item() == 0
+        assert level_count(c, 0) == 0
+        assert level_count(c, 1) > 0
+        assert level_count(c, 2) == 0
         assert c.token_count == c.B * 2  # 4 * 2 = 8
         assert c.total_slots == c.B  # level 1 has B slots
 
@@ -918,15 +997,35 @@ class TestIngest:
         # Fill level 0 (B=2 ingests), then fill again -> carry to level 1
         for i in range(B_slots):
             c.ingest_chunk(torch.randn(1, 1, 2, D), torch.randn(1, 1, 2, v_dim))
-        assert c.level_count[1].item() > 0
-        assert c.level_count[0].item() == 0
+        assert level_count(c, 1) > 0
+        assert level_count(c, 0) == 0
 
         for i in range(B_slots):
             c.ingest_chunk(torch.randn(1, 1, 2, D), torch.randn(1, 1, 2, v_dim))
         # Now level 1 should be cleared, level 2 should be occupied
-        assert c.level_count[1].item() == 0
-        assert c.level_count[2].item() > 0
-        assert c.level_count[0].item() == 0
+        assert level_count(c, 1) == 0
+        assert level_count(c, 2) > 0
+        assert level_count(c, 0) == 0
+
+    def test_indexed_level_storage_survives_multiple_carries(self):
+        """Unified entry storage keeps counts/content correct across binary carry."""
+        c = LogStructuredKVCache(
+            (1, 1, 128, 1), (1, 1, 128, 1),
+            B=2,
+            recent_size=2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        for i in range(8):
+            values = torch.tensor([2.0 * i, 2.0 * i + 1.0]).view(1, 1, 2, 1)
+            c.ingest_chunk(values, values * 10.0)
+
+        assert c.level_count.shape == (1, 1, 1, c.L_alloc)
+        assert [level_count(c, ell) for ell in range(4)] == [0, 0, 0, 2]
+        torch.testing.assert_close(c.level_w[0, 0, 0, 3, :2], torch.tensor([8.0, 8.0]))
+        torch.testing.assert_close(c.level_k[0, 0, 0, 3, :2, 0], torch.tensor([3.5, 11.5]))
+        torch.testing.assert_close(c.level_v[0, 0, 0, 3, :2, 0], torch.tensor([35.0, 115.0]))
+        assert not c.pad_mask[0, 0, 0, 3, :2].any()
 
 
 # ---------------------------------------------------------------------------
@@ -970,7 +1069,7 @@ class TestExplicitCacheUpdates:
         # So: 4 flushes -> 1 carry to level 1. Recent has 2 tokens.
         # Tokens: [0,1] flush, [2,3] flush, [4,5] flush, [6,7] flush -> 4 compact entries
         # -> carry to level 1. [8,9] stays in recent (last chunk, not flushed).
-        assert c.level_count[1].item() > 0
+        assert level_count(c, 1) > 0
         assert c.recent_count == 2  # last chunk stays
         assert c.token_count == T
 
@@ -1021,10 +1120,11 @@ class TestExplicitCacheUpdates:
         add_full_kv_in_chunks(c, k[:, :, 1:, :], v[:, :, 1:, :], chunk_size=2)
 
         assert c.token_count == 3
-        assert c.level_count[0].item() == 1
+        assert level_count(c, 0) == 1
         assert c.recent_count == 1
 
-        slot_k, slot_v, slot_w = c.get_attention_state()
+        state = c.get_attention_state()
+        slot_k, slot_v, slot_w = state.slot_k, state.slot_v, state.slot_w
         # slot 0 = mean of tokens 0-1, slot 1 = exact token 2 (w=1)
         torch.testing.assert_close(slot_k[:, :, 0, :], k[:, :, :2, :].mean(dim=2))
         torch.testing.assert_close(slot_k[:, :, 1, :], k[:, :, 2, :])
@@ -1043,7 +1143,7 @@ class TestExplicitCacheUpdates:
             add_full_kv_in_chunks(c, k, v, chunk_size=1)
 
         assert c.recent_count == t
-        assert c.level_count[0].item() == 0
+        assert level_count(c, 0) == 0
         assert c.token_count == t
 
         k = torch.randn(B, G, 1, k_dim)
@@ -1051,7 +1151,7 @@ class TestExplicitCacheUpdates:
         add_full_kv_in_chunks(c, k, v, chunk_size=1)
 
         assert c.recent_count == 1
-        assert c.level_count[0].item() == 1
+        assert level_count(c, 0) == 1
         assert c.token_count == t + 1
 
 
@@ -1062,20 +1162,23 @@ class TestExplicitCacheUpdates:
 class TestGetAttentionState:
     def test_empty_cache_state(self, small_cache):
         """Empty cache should return zero-size tensors."""
-        slot_k, slot_v, slot_w = small_cache.get_attention_state()
-        assert slot_k.size(2) == 0
-        assert slot_v.size(2) == 0
-        assert slot_w.size(2) == 0
+        state = small_cache.get_attention_state()
+        assert isinstance(state, CacheAttentionState)
+        assert state.slot_k.size(2) == 0
+        assert state.slot_v.size(2) == 0
+        assert state.slot_w.size(2) == 0
+        assert state.slot_valid is None
+        assert state.M_s is None
 
     def test_state_after_ingest(self, small_cache):
         """After ingest, one compact slot of weight 2, no recent tokens."""
         c = small_cache
         c.ingest_chunk(torch.randn(1, 2, 2, 8), torch.randn(1, 2, 2, 8))
 
-        slot_k, slot_v, slot_w = c.get_attention_state()
+        state = c.get_attention_state()
 
-        assert slot_k.size(2) == 1
-        assert slot_w[0, 0, 0].item() == 2.0
+        assert state.slot_k.size(2) == 1
+        assert state.slot_w[0, 0, 0].item() == 2.0
 
     def test_state_with_rank1_stats(self, small_cache):
         """with_stats=True should append zero stats for exact recent tokens."""
@@ -1084,25 +1187,16 @@ class TestGetAttentionState:
         v = torch.randn(1, 2, 3, 8)
         add_full_kv_in_chunks(c, k, v, chunk_size=1)
 
-        (
-            slot_k,
-            slot_v,
-            slot_w,
-            sigma_u,
-            sigma2,
-            gamma_a,
-            gamma_b,
-            gamma,
-        ) = c.get_attention_state(with_stats=True)
+        state = c.get_attention_state(with_stats=True)
 
-        assert slot_k.shape == sigma_u.shape == gamma_a.shape
-        assert slot_v.shape == gamma_b.shape
-        assert slot_w.shape == sigma2.shape == gamma.shape
-        assert slot_w[0, 0].tolist() == [2.0, 1.0]
-        assert sigma2[0, 0, 0] > 0.0
-        assert gamma[0, 0, 0] >= 0.0
-        assert sigma2[0, 0, 1] == 0.0
-        assert gamma[0, 0, 1] == 0.0
+        assert state.slot_k.shape == state.slot_sigma_u.shape == state.slot_gamma_a.shape
+        assert state.slot_v.shape == state.slot_gamma_b.shape
+        assert state.slot_w.shape == state.slot_sigma2.shape == state.slot_gamma.shape
+        assert state.slot_w[0, 0].tolist() == [2.0, 1.0]
+        assert state.slot_sigma2[0, 0, 0] > 0.0
+        assert state.slot_gamma[0, 0, 0] >= 0.0
+        assert state.slot_sigma2[0, 0, 1] == 0.0
+        assert state.slot_gamma[0, 0, 1] == 0.0
 
     def test_state_after_prefill(self, small_cache):
         """After prefill, compact slots + recent w=1 tokens should be present."""
@@ -1115,13 +1209,13 @@ class TestGetAttentionState:
         v = torch.randn(B, G, T, k_dim)
         add_full_kv_in_chunks(c, k, v)
 
-        slot_k, slot_v, slot_w = c.get_attention_state()
+        state = c.get_attention_state()
 
         # 4 compact entries (after carry to level 1) + 1 recent token
-        assert slot_k.size(2) == c.B + 1
-        torch.testing.assert_close(slot_w[0, 0], torch.tensor([2.0, 2.0, 2.0, 2.0, 1.0]))
+        assert state.slot_k.size(2) == c.B + 1
+        torch.testing.assert_close(state.slot_w[0, 0], torch.tensor([2.0, 2.0, 2.0, 2.0, 1.0]))
         # Weights must account for every committed token
-        assert slot_w[0, 0].sum().item() == T
+        assert state.slot_w[0, 0].sum().item() == T
 
     def test_slot_exactness_weighted_mean(self, small_cache):
         """THE merge-exactness invariant: every slot's key/value equals the
@@ -1137,7 +1231,8 @@ class TestGetAttentionState:
         v = torch.randn(B, G, T, k_dim)
         add_full_kv_in_chunks(c, k, v)
 
-        slot_k, slot_v, slot_w = c.get_attention_state()
+        state = c.get_attention_state()
+        slot_k, slot_v, slot_w = state.slot_k, state.slot_v, state.slot_w
         w = slot_w[0, 0]
         assert w.sum().item() == T  # all tokens accounted for
 
@@ -1313,6 +1408,64 @@ class TestSlotAttention:
         torch.testing.assert_close(out_lam0, out_unweighted)
         assert not torch.allclose(out_biased, out_lam0)
 
+    def test_slot_m_none_reproduces_prior_mass_bias(self):
+        """Omitting slot_M must reproduce the exact lam*log(w) formula."""
+        B, G, nh, k_dim = 1, 2, 2, 8
+        q = torch.randn(B, nh, 1, k_dim)
+        slot_k, slot_v, slot_w = self._make_state(n_compact=2, n_recent=1, G=G)
+
+        out_default = log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale=0.3)
+        out_m_none = log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale=0.3, slot_M=None)
+
+        torch.testing.assert_close(out_default, out_m_none)
+
+    def test_slot_m_matches_manual_mass_bias(self):
+        """slot_M given must match lam*log(w) - log(M), unconditionally on lam."""
+        B, G, nh, k_dim = 1, 2, 4, 8  # nh != G -> GQA branch
+        q = torch.randn(B, nh, 1, k_dim)
+        slot_k, slot_v, slot_w = self._make_state(n_compact=2, n_recent=1, G=G)
+        S = slot_w.size(-1)
+        slot_M = torch.tensor([[1, 3, 2]] * G, dtype=torch.float32).unsqueeze(0)
+        assert slot_M.shape == (B, G, S)
+
+        for lam in (0.0, 0.5, 1.0):
+            out = log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale=0.3, lam=lam, slot_M=slot_M)
+
+            k_exp = slot_k.repeat_interleave(nh // G, dim=1)
+            v_exp = slot_v.repeat_interleave(nh // G, dim=1)
+            bias = (lam * slot_w.log() - slot_M.log()).repeat_interleave(nh // G, dim=1)
+            scores = torch.matmul(q, k_exp.mT) * 0.3 + bias.unsqueeze(-2)
+            expected = torch.matmul(torch.softmax(scores, dim=-1), v_exp)
+
+            torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+    def test_slot_valid_masks_invalid_pooled_slots(self):
+        """Invalid pooled slots must draw zero softmax mass, MHA and GQA alike."""
+        for nh in (2, 4):  # nh==G (MHA) and nh!=G (GQA)
+            B, G, k_dim = 1, 2, 8
+            q = torch.randn(B, nh, 1, k_dim)
+            slot_k, slot_v, slot_w = self._make_state(n_compact=2, n_recent=1, G=G, k_dim=k_dim, v_dim=k_dim)
+            slot_valid = torch.tensor([[True, False]] * G).unsqueeze(0)  # mask the 2nd of 2 pooled slots
+
+            out = log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale=0.3, slot_valid=slot_valid)
+
+            k_exp = slot_k.repeat_interleave(nh // G, dim=1)
+            v_exp = slot_v.repeat_interleave(nh // G, dim=1)
+            scores = torch.matmul(q, k_exp.mT) * 0.3 + slot_w.log().repeat_interleave(nh // G, dim=1).unsqueeze(-2)
+            scores[..., 1] = float("-inf")
+            expected = torch.matmul(torch.softmax(scores, dim=-1), v_exp)
+
+            torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+    def test_slot_valid_all_invalid_row_raises(self):
+        B, G, nh, k_dim = 1, 2, 2, 8
+        q = torch.randn(B, nh, 1, k_dim)
+        slot_k, slot_v, slot_w = self._make_state(n_compact=2, n_recent=0, G=G)
+        slot_valid = torch.zeros(B, G, 2, dtype=torch.bool)
+
+        with pytest.raises(ValueError, match="no valid slot"):
+            log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale=0.3, slot_valid=slot_valid)
+
     def test_rank1_score_correction_affects_softmax_mass(self):
         """Sigma stats add the second-order score term before softmax."""
         q = torch.tensor([[[[1.0, 0.0]]]])  # (B=1, nh=1, T=1, D=2)
@@ -1375,12 +1528,12 @@ class TestSlotAttention:
         k_new = torch.randn(B, G, 2, k_dim)
         v_new = torch.randn(B, G, 2, v_dim)
 
-        k_all, v_all, w_all = append_exact_tokens(slot_k, slot_v, slot_w, k_new, v_new)
+        out = append_exact_tokens(CacheAttentionState(slot_k, slot_v, slot_w), k_new, v_new)
 
-        assert k_all.size(2) == 5
-        torch.testing.assert_close(k_all[:, :, 3:, :], k_new)
-        torch.testing.assert_close(v_all[:, :, 3:, :], v_new)
-        torch.testing.assert_close(w_all[0, 0], torch.tensor([2.0, 2.0, 1.0, 1.0, 1.0]))
+        assert out.slot_k.size(2) == 5
+        torch.testing.assert_close(out.slot_k[:, :, 3:, :], k_new)
+        torch.testing.assert_close(out.slot_v[:, :, 3:, :], v_new)
+        torch.testing.assert_close(out.slot_w[0, 0], torch.tensor([2.0, 2.0, 1.0, 1.0, 1.0]))
 
     def test_append_exact_tokens_with_rank1_stats(self):
         """Appended exact tokens should receive zero second-order stats."""
@@ -1397,20 +1550,59 @@ class TestSlotAttention:
         v_new = torch.randn(B, G, 3, v_dim)
 
         out = append_exact_tokens(
-            slot_k, slot_v, slot_w, k_new, v_new,
-            sigma_u, sigma2, gamma_a, gamma_b, gamma,
+            CacheAttentionState(
+                slot_k=slot_k,
+                slot_v=slot_v,
+                slot_w=slot_w,
+                slot_sigma_u=sigma_u,
+                slot_sigma2=sigma2,
+                slot_gamma_a=gamma_a,
+                slot_gamma_b=gamma_b,
+                slot_gamma=gamma,
+            ),
+            k_new,
+            v_new,
         )
 
-        assert len(out) == 8
-        assert out[3].size(2) == 5
-        torch.testing.assert_close(out[3][:, :, :2, :], sigma_u)
-        torch.testing.assert_close(out[4][:, :, :2], sigma2)
-        torch.testing.assert_close(out[5][:, :, :2, :], gamma_a)
-        torch.testing.assert_close(out[6][:, :, :2, :], gamma_b)
-        torch.testing.assert_close(out[7][:, :, :2], gamma)
-        torch.testing.assert_close(out[3][:, :, 2:, :], torch.zeros_like(k_new))
-        torch.testing.assert_close(out[4][:, :, 2:], torch.zeros(B, G, 3))
-        torch.testing.assert_close(out[6][:, :, 2:, :], torch.zeros_like(v_new))
+        assert len(out) == 10
+        assert out.slot_sigma_u.size(2) == 5
+        torch.testing.assert_close(out.slot_sigma_u[:, :, :2, :], sigma_u)
+        torch.testing.assert_close(out.slot_sigma2[:, :, :2], sigma2)
+        torch.testing.assert_close(out.slot_gamma_a[:, :, :2, :], gamma_a)
+        torch.testing.assert_close(out.slot_gamma_b[:, :, :2, :], gamma_b)
+        torch.testing.assert_close(out.slot_gamma[:, :, :2], gamma)
+        torch.testing.assert_close(out.slot_sigma_u[:, :, 2:, :], torch.zeros_like(k_new))
+        torch.testing.assert_close(out.slot_sigma2[:, :, 2:], torch.zeros(B, G, 3))
+        torch.testing.assert_close(out.slot_gamma_b[:, :, 2:, :], torch.zeros_like(v_new))
+
+    def test_append_exact_tokens_preserves_prefix_anchor_fields(self):
+        slot_k = torch.zeros(1, 1, 2, 1)
+        slot_v = torch.tensor([[[[0.0], [10.0]]]])
+        slot_w = torch.tensor([[[2.0, 2.0]]])
+        state = CacheAttentionState(
+            slot_k,
+            slot_v,
+            slot_w,
+            slot_valid=torch.tensor([[[True, False]]]),
+            M_s=torch.tensor([[[1, 2]]]),
+        )
+
+        out = append_exact_tokens(state, torch.zeros(1, 1, 1, 1), torch.tensor([[[[100.0]]]]))
+
+        assert torch.equal(out.slot_valid, state.slot_valid)
+        assert torch.equal(out.M_s, state.M_s)
+        assert out.slot_w.size(-1) == 3
+        y = log_kv_slot_attention(
+            torch.zeros(1, 1, 1, 1),
+            out.slot_k,
+            out.slot_v,
+            out.slot_w,
+            scale=1.0,
+            lam=0.0,
+            slot_M=out.M_s,
+            slot_valid=out.slot_valid,
+        )
+        torch.testing.assert_close(y, torch.tensor([[[[50.0]]]]))
 
 
 # ---------------------------------------------------------------------------
@@ -1423,7 +1615,7 @@ class TestReset:
         # Put some data in
         c.ingest_chunk(torch.randn(1, 2, 2, 8), torch.randn(1, 2, 2, 8))
         assert c.token_count > 0
-        assert c.level_count[0].item() > 0
+        assert level_count(c, 0) > 0
 
         c.reset_parameters()
 
@@ -1433,7 +1625,7 @@ class TestReset:
         assert c.total_slots == 0
         assert c.total_tokens_covered == 0
         assert c.recent_k.abs().sum() == 0
-        assert getattr(c, "level_k_0").abs().sum() == 0
+        assert c.level_k.abs().sum() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1473,10 +1665,10 @@ class TestIntegration:
 
         # Verify we can compute attention with the final state
         nh = 4
-        slot_k, slot_v, slot_w = c.get_attention_state()
-        assert slot_w[0, 0].sum().item() == T_prefill + 3
+        state = c.get_attention_state()
+        assert state.slot_w[0, 0].sum().item() == T_prefill + 3
         q = torch.randn(B_batch, nh, 1, k_dim)
-        out = log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale=0.1)
+        out = log_kv_slot_attention(q, state.slot_k, state.slot_v, state.slot_w, scale=0.1)
         assert out.shape == (B_batch, nh, 1, v_dim)
         assert not torch.isnan(out).any()
 
@@ -1500,14 +1692,14 @@ class TestIntegration:
         k = base_k.repeat_interleave(2, dim=2)  # pairs of identical tokens
         v = base_v.repeat_interleave(2, dim=2)
         add_full_kv_in_chunks(c, k, v)  # 2-chunks align with the pairs
-        assert c.level_count[0].item() == 3
+        assert level_count(c, 0) == 3
         assert c.recent_count == 2
 
         scale = 1.0 / math.sqrt(k_dim)
         q = torch.randn(B_batch, nh, 1, k_dim)
 
-        slot_k, slot_v, slot_w = c.get_attention_state()
-        out_slot = log_kv_slot_attention(q, slot_k, slot_v, slot_w, scale=scale)
+        state = c.get_attention_state()
+        out_slot = log_kv_slot_attention(q, state.slot_k, state.slot_v, state.slot_w, scale=scale)
 
         # Dense attention over all T tokens
         q_per_kv = nh // G
@@ -1539,9 +1731,9 @@ class TestIntegration:
                 torch.randn(B_batch, G, 2, v_dim),
             )
 
-        assert c.level_count[2].item() > 0
-        assert c.level_count[0].item() == 0
-        assert c.level_count[1].item() == 0
+        assert level_count(c, 2) > 0
+        assert level_count(c, 0) == 0
+        assert level_count(c, 1) == 0
         assert c.token_count == 4096
 
 
@@ -1598,7 +1790,7 @@ class TestAttentionStreamingBoundaries:
         assert out.shape == (1, 1, attn.config.n_embd)
         assert attn._log_kv_pending is None
         assert cache.token_count == 4
-        assert cache.level_count[0].item() == 1
+        assert level_count(cache, 0) == 1
         assert cache.recent_count == 2
 
     def test_streaming_chunk_consumes_pending_before_new_pairs(self):
@@ -1616,7 +1808,7 @@ class TestAttentionStreamingBoundaries:
 
         assert attn._log_kv_pending is None
         assert cache.token_count == 6
-        assert cache.level_count[0].item() == 2
+        assert level_count(cache, 0) == 2
         assert cache.recent_count == 2
 
 
@@ -2054,10 +2246,8 @@ class TestSecondOrderGate:
             c_skipped.add_recent(k, v)
 
         # The two caches really do differ in whether the statistics were built.
-        assert any(getattr(c_built, f"level_sigma2_{e}").any() for e in range(c_built.max_levels))
-        assert not any(
-            getattr(c_skipped, f"level_sigma2_{e}").any() for e in range(c_skipped.max_levels)
-        )
+        assert c_built.level_sigma2.any()
+        assert not c_skipped.level_sigma2.any()
 
         q = torch.randn(1, 4, 4, kd)
         kb = torch.randn(1, 2, 4, kd)
@@ -2090,7 +2280,7 @@ class TestSecondOrderGate:
         a = self._make_attention(1.0)
         q, k, v = self._inputs(T, seed=7)
         a._log_kv_train_lowmem_forward(q, k, v, B=1, T=T)
-        assert any(c > 0 for c in a.kv_cache._counts), "need a non-empty level for this test to mean anything"
+        assert has_compacted_level(a.kv_cache), "need a non-empty level for this test to mean anything"
         with pytest.raises(RuntimeError, match="cannot change `second_order`"):
             a.kv_cache.second_order = False
         # Refused, not partially applied.
@@ -2136,17 +2326,19 @@ class TestSecondOrderGate:
 
         assert torch.equal(run(preset=False), run(preset=True))
 
-    def test_host_count_mirror_tracks_device_buffer(self):
-        """The streaming path reads level counts from the host mirror instead of
-        syncing on the device tensor; the two must never drift."""
+    def test_level_count_is_indexed_device_tensor_without_host_mirror(self):
+        """Stage 1 storage keeps level counts only in the indexed device tensor."""
         attn = self._make_attention(1.0)
         cache = attn.kv_cache
         T = 40
         q, k, v = self._inputs(T, seed=17)
         attn._log_kv_train_lowmem_forward(q, k, v, B=1, T=T)
-        assert cache._counts == cache.level_count.tolist()
+        assert not hasattr(cache, "_counts")
+        assert cache.level_count.shape == (cache.batch_size, cache.n_groups, cache.K_max, cache.L_alloc)
+        assert cache.level_count.dtype == torch.int16
+        assert has_compacted_level(cache)
         cache.reset_parameters()
-        assert cache._counts == cache.level_count.tolist() == [0] * cache.max_levels
+        assert cache.level_count.sum().item() == 0
 
     def _built_cache(self, second_order=True):
         c = LogStructuredKVCache(
@@ -2159,7 +2351,7 @@ class TestSecondOrderGate:
         c = self._built_cache(second_order=True)
         for _ in range(8):
             c.add_recent(torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8))
-        assert any(c._counts) or c.recent_count > 0
+        assert has_compacted_level(c) or c.recent_count > 0
         c.second_order = True  # no-op: same value, must never raise regardless of cache state
         assert c.second_order is True
 
@@ -2169,7 +2361,7 @@ class TestSecondOrderGate:
         stats regime to straddle, so switching must still be allowed."""
         c = self._built_cache(second_order=True)
         c.add_recent(torch.randn(1, 2, 2, 8), torch.randn(1, 2, 2, 8))
-        assert not any(c._counts), "test setup needs recent-only state, no compacted levels"
+        assert not has_compacted_level(c), "test setup needs recent-only state, no compacted levels"
         c.second_order = False  # must not raise
         assert c.second_order is False
 
@@ -2178,7 +2370,7 @@ class TestSecondOrderGate:
             c = self._built_cache(second_order=start)
             for _ in range(8):  # enough to fill level 0 (B=4) at least once
                 c.add_recent(torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8))
-            assert any(c._counts), "test setup needs a populated level"
+            assert has_compacted_level(c), "test setup needs a populated level"
             with pytest.raises(RuntimeError, match="cannot change `second_order`"):
                 c.second_order = not start
 
@@ -2266,9 +2458,9 @@ class TestSaliencePinning:
             assert torch.equal(cache.pin_k[0, g, j], k[0, g, self.NEEDLE])
             assert torch.equal(cache.pin_v[0, g, j], v[0, g, self.NEEDLE])
         # Pins surface in the attention state as extra exact w=1 slots.
-        sk, _, sw = cache.get_attention_state()
-        assert sk.size(2) == cache.total_slots
-        assert int((sw[0, 0] == 1).sum()) == cache.pin_count + cache.recent_count
+        state = cache.get_attention_state()
+        assert state.slot_k.size(2) == cache.total_slots
+        assert int((state.slot_w[0, 0] == 1).sum()) == cache.pin_count + cache.recent_count
 
     def test_hierarchy_trajectory_unchanged_by_pinning(self):
         torch.manual_seed(0)
@@ -2456,7 +2648,7 @@ class TestLogKVDtypeReconcile:
 
         # Buffers were reconciled to the activation dtype.
         assert cache.recent_k.dtype == torch.bfloat16
-        assert getattr(cache, "level_k_0").dtype == torch.bfloat16
+        assert cache.level_k.dtype == torch.bfloat16
 
         idx_next = torch.randint(0, model.config.padded_vocab_size, (1, 1))
         logits = model(idx_next, torch.tensor([5]))
@@ -2471,7 +2663,7 @@ class TestLogKVDtypeReconcile:
         buf_before = cache.recent_k
         cache._convert_dtype(torch.bfloat16)  # already bf16 -> must be a no-op
         assert cache.recent_k is buf_before  # no new allocation
-        assert cache.level_count.dtype == torch.long  # counts stay integer
+        assert cache.level_count.dtype == torch.int16  # counts stay indexed integer tensor
 
 
 # ---------------------------------------------------------------------------

@@ -55,7 +55,8 @@ Stage 0 的全部结论都建立在这份 dump 上，所以它排在**任何生�
 > S0.0/S0.4/S0.5/S0.2 口径①由 `SweepAccumulator`/`route_dpmeans_segments`
 > 覆盖；S0.3 是 `unused/semantic_s0_needle_isolation.py`；S0.6 是
 > `unused/semantic_s0_anchor_dedup.py`。S0.3/S0.6 已完成首批真实 dump 实跑，
-> 并已补上 `K_max` + Ward clipped 探针；下一步是实跑 clipped gate。
+> 并已补上且跑完 `K_max` + Ward clipped 探针；下一步是用同一批数据裁决
+> `c≈6–8` 候选是否能被 S0.6 成本接受。
 > S0.7 的 supersession 判定逻辑还没写；S0.8 仍缺上述两份 CPU 参考 cache。
 
 **两套机制，不是一个 hook——`attn_mass_by_dist` 在原来那个 hook 点算不出来。**
@@ -244,7 +245,7 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   > segment 时会通过 `gamma` 衰减改变后续 centroid 更新，所以 cluster_count
   > 可有轻微变化；但实测影响远小于 `lambda_rel`。
   >
-  > **下一轮 gate（已实现，待实跑）**：S0.3 必须补 `K_max` + Ward clipped
+  > **clipped gate（已实跑，待裁决）**：S0.3 已补 `K_max` + Ward clipped
   > 口径。核心字段是 `needle_token_exact_entry_rate`、
   > `random_token_exact_entry_rate`、`token_exact_entry_lift`、
   > `K_max_binding_rate`、`needle_token_isolated_rate`、
@@ -252,6 +253,12 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   > `needle_cluster_merged_by_ward_rate`（列名以 CSV 实际输出为准）。如果
   > `lambda_rel=0.875` 的高召回主要来自大量新簇，但在默认附近的 `K_max=15/16`
   > 或 `K_max=32` 下高频绑定、Ward 反复触碰 needle 小簇，它不能进入生产主线。
+  > 当前 32k 粗估：若只按 binding-only/no-Ward 口径，要把 `lambda_rel=1.0`
+  > 的绑定率压到 <10%，需 `K_max≈280`，即 `c≈19`；覆盖 unclipped 平均
+  > `K_eff≈310` 需 `c≈21`。但这不是生产默认判据：`K_max=128` 虽仍约 81%
+  > binding，exact-entry 已约 72.7%，接近 unclipped 的约 74.3%；`K_max=64`
+  > 约 67.5%。因此实际默认先粗估在 `K_max≈64–128`，即 `c≈4.3–8.5`，
+  > 优先试 `c≈6–8`，再用 S0.6 成本裁决。
 - **S0.4**：key 方差应显著低于现有位置槽；**若 value 方差没有同步下降**，说明读出侧
   仍是 smear，收益要打对折，需要考虑按 `[k;v]` 联合聚类或簇内二次分裂。
 - **S0.6（更正：不再是"预测会不会超过 vanilla"的决策门，那件事已经确定，
@@ -284,15 +291,16 @@ for query_block in chunks(q_roped, block_size):          # q_roped 在本模型�
   > 约 72.5–72.8%，但 S0.6 成本约 1.45–1.5× 于 `lambda_rel=1.0`）。`l_block`
   > 不宜过大，尤其 `l_block=2/3` 会显著增加 pad entry 和 fixed3 宽度。
   >
-  > **下一轮 gate（已实现，待实跑）**：S0.6 同样必须带 `K_max`。除 `E[M]` 外，
+  > **clipped gate（已实跑，待裁决）**：S0.6 同样必须带 `K_max`。除 `E[M]` 外，
   > 必须同时报告 `entry_count_mean`、`fixed3_anchor_count_mean`、
   > `current_scheme_physical_slot_count_mean_ratio_vs_vanilla_full`、
   > `ward_merge_count_mean`、`K_max_binding_rate` 和
   > `gather_savings_fraction_vs_fixed3`。
   > 选择配置时不能只按最低 `E[M]` 排名；`E[M]` 低但 entry 数暴涨，仍然是更贵的
-  > 配置。
+  > 配置。`c≈19` 只是 binding-only/no-Ward 上界；实际候选先看 `c≈6–8` 是否
+  > 已经在 needle 质量上接近平台，并用 S0.6 成本确认是否还能保住内存/计算故事。
 
-  推荐的 clipped gate 命令（worker 数按机器物理核心和实际吞吐调整，CPU 负载型任务
+  clipped gate 复现命令（worker 数按机器物理核心和实际吞吐调整，CPU 负载型任务
   通常先用 64 比盲目开满更稳）：
 
   ```bash

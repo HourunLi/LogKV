@@ -237,13 +237,11 @@ def _cache_slot_layout(
     cursor = 0
 
     max_levels = int(getattr(cache, "max_levels", 0) or 0)
-    counts = getattr(cache, "_counts", [0] * max_levels)
     for level in range(max_levels - 1, -1, -1):
-        count = int(counts[level]) if level < len(counts) else 0
+        count = int(cache.level_count[batch_i, group_i, 0, level].item())
         if count <= 0:
             continue
-        level_w = getattr(cache, f"level_w_{level}")
-        widths = level_w[batch_i, group_i, :count].detach().to("cpu").tolist()
+        widths = cache.level_w[batch_i, group_i, 0, level, :count].detach().to("cpu").tolist()
         for slot_i, width_value in enumerate(widths):
             width = int(round(float(width_value)))
             used_start = cursor

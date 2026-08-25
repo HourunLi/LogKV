@@ -40,14 +40,17 @@ Memory:  O(recent_size + B·log(N/2)) slots — no Θ(N) term.
 Compute: O(recent_size + B·log(N/2)) per query — no Θ(N) term.
 """
 
+from __future__ import annotations
+
 import math
-from typing import NoReturn
+from typing import NamedTuple, NoReturn
 
 import torch
 import torch.nn as nn
 from torch.autograd.function import once_differentiable
 
 from litgpt.log_kv_pin_score_diag import DIAG as LOG_KV_PIN_SCORE_DIAG
+from litgpt.log_kv_position import anchor_mass_bias, merge_anchors
 
 
 _RANK1_EPS = 1e-12
@@ -63,6 +66,19 @@ _RANK1_EPS = 1e-12
 # error over an exact eigh, measured on the near-degenerate case that converges
 # slowest). TestRank1Approximation pins the resulting quality.
 _RANK1_SQUARINGS = 8
+
+
+class CacheAttentionState(NamedTuple):
+    slot_k: torch.Tensor
+    slot_v: torch.Tensor
+    slot_w: torch.Tensor
+    slot_valid: torch.Tensor | None = None
+    M_s: torch.Tensor | None = None
+    slot_sigma_u: torch.Tensor | None = None
+    slot_sigma2: torch.Tensor | None = None
+    slot_gamma_a: torch.Tensor | None = None
+    slot_gamma_b: torch.Tensor | None = None
+    slot_gamma: torch.Tensor | None = None
 
 
 def _normalize(x: torch.Tensor, eps: float = _RANK1_EPS) -> tuple[torch.Tensor, torch.Tensor]:
@@ -291,6 +307,7 @@ class LogStructuredKVCache(nn.Module):
         self.k_dim = k_dim
         self.v_dim = v_dim
         self.B = B
+        self.K_max = 1
         self.recent_size = recent_size if recent_size > 0 else 2
         # Explicit raise (not assert): must survive `python -O`.
         if self.recent_size < 2:
@@ -311,6 +328,8 @@ class LogStructuredKVCache(nn.Module):
         # +1 for the write level (level 0). The formula gives the number of carry
         # levels needed; total levels = carry + 1 write level.
         self.max_levels = max(2, math.ceil(math.log2(max((max_seq_length + 1) / denom, 1))) + 1)
+        self.L_alloc = self.max_levels
+        self.B_prime = B
 
         # Total tokens ever committed (scalar bookkeeping only — replaces the
         # former Θ(N) per-token position-key buffer).
@@ -329,80 +348,69 @@ class LogStructuredKVCache(nn.Module):
         )
         self.recent_count: int = 0
 
-        # ---- Hierarchical levels: B slots each (k, v, w) ----
-        # Level 0: partially fillable (0 to B entries), written one entry at a time.
-        # Level 1+: all-or-nothing (0 or B entries), written via binary carry.
-        for ell in range(self.max_levels):
-            self.register_buffer(
-                f"level_k_{ell}",
-                torch.zeros(batch_size, n_groups, B, k_dim, device=device, dtype=dtype),
-                persistent=False,
-            )
-            self.register_buffer(
-                f"level_v_{ell}",
-                torch.zeros(batch_size, n_groups, B, v_dim, device=device, dtype=dtype),
-                persistent=False,
-            )
-            self.register_buffer(
-                f"level_w_{ell}",
-                torch.zeros(batch_size, n_groups, B, device=device, dtype=dtype),
-                persistent=False,
-            )
-            # Cumulative importance mass per slot (only meaningful when
-            # ``importance_pooling`` is True; stays zero and unused
-            # otherwise). Always fp32, independent of the activation dtype:
-            # it only ever feeds merge-fraction ratios, never a matmul with
-            # k/v, so it does not need to track the activation dtype the way
-            # ``level_w_{ell}`` does, and fp32 avoids precision loss on
-            # importance ratios that bf16's ~3 decimal digits could blur.
-            self.register_buffer(
-                f"level_imp_{ell}",
-                torch.zeros(batch_size, n_groups, B, device=device, dtype=torch.float32),
-                persistent=False,
-            )
-            # Rank-1 key covariance:
-            #   Sigma_s ~= sigma2_s * sigma_u_s sigma_u_s^T
-            self.register_buffer(
-                f"level_sigma_u_{ell}",
-                torch.zeros(batch_size, n_groups, B, k_dim, device=device, dtype=dtype),
-                persistent=False,
-            )
-            self.register_buffer(
-                f"level_sigma2_{ell}",
-                torch.zeros(batch_size, n_groups, B, device=device, dtype=dtype),
-                persistent=False,
-            )
-            # Rank-1 value-key cross covariance:
-            #   Gamma_s ~= gamma_s * gamma_b_s gamma_a_s^T
-            # where gamma_a lives in key/query space and gamma_b in value space.
-            self.register_buffer(
-                f"level_gamma_a_{ell}",
-                torch.zeros(batch_size, n_groups, B, k_dim, device=device, dtype=dtype),
-                persistent=False,
-            )
-            self.register_buffer(
-                f"level_gamma_b_{ell}",
-                torch.zeros(batch_size, n_groups, B, v_dim, device=device, dtype=dtype),
-                persistent=False,
-            )
-            self.register_buffer(
-                f"level_gamma_{ell}",
-                torch.zeros(batch_size, n_groups, B, device=device, dtype=dtype),
-                persistent=False,
-            )
+        # ---- Hierarchical entries: (B, G, K_max, L_alloc, B', ·) ----
+        # K_max=1 is the current single-cluster path; the indexed layout is the
+        # Stage 1 storage contract that later semantic routing will populate.
         self.register_buffer(
-            "level_count",
-            torch.zeros(self.max_levels, dtype=torch.long, device=device),
+            "level_k",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, k_dim, device=device, dtype=dtype),
             persistent=False,
         )
-        # Host-side mirror of ``level_count``. Every control-flow decision in the
-        # streaming path (how many slots a level holds, whether a carry fires)
-        # reads a level count, and reading the device tensor means a
-        # device-to-host sync per read — O(max_levels) stalls per streaming
-        # chunk, per layer, on both the forward stream and the backward replay.
-        # The mirror keeps those decisions on the host; the buffer stays
-        # authoritative for state_dict/tests and is written (never read) in step.
-        self._counts: list[int] = [0] * self.max_levels
+        self.register_buffer(
+            "level_v",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, v_dim, device=device, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "level_w",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, device=device, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "level_imp",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, device=device, dtype=torch.float32),
+            persistent=False,
+        )
+        # Rank-1 key covariance:
+        #   Sigma_s ~= sigma2_s * sigma_u_s sigma_u_s^T
+        self.register_buffer(
+            "level_sigma_u",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, k_dim, device=device, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "level_sigma2",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, device=device, dtype=dtype),
+            persistent=False,
+        )
+        # Rank-1 value-key cross covariance:
+        #   Gamma_s ~= gamma_s * gamma_b_s gamma_a_s^T
+        # where gamma_a lives in key/query space and gamma_b in value space.
+        self.register_buffer(
+            "level_gamma_a",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, k_dim, device=device, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "level_gamma_b",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, v_dim, device=device, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "level_gamma",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, device=device, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "level_count",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, dtype=torch.int16, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "pad_mask",
+            torch.zeros(batch_size, n_groups, self.K_max, self.L_alloc, B, dtype=torch.bool, device=device),
+            persistent=False,
+        )
 
         # When False, compaction skips the rank-1 second-order statistics
         # entirely (they stay zero) and the levels behave like the first-order
@@ -471,7 +479,7 @@ class LogStructuredKVCache(nn.Module):
     @second_order.setter
     def second_order(self, value: bool) -> None:
         value = bool(value)
-        if value != self._second_order and any(c > 0 for c in self._counts):
+        if value != self._second_order and bool((self.level_count > 0).any().item()):
             raise RuntimeError(
                 f"LogStructuredKVCache: cannot change `second_order` "
                 f"({self._second_order} -> {value}) while a compacted level "
@@ -510,26 +518,30 @@ class LogStructuredKVCache(nn.Module):
     # Level accessors
     # ------------------------------------------------------------------
 
+    def _level_count(self, ell: int) -> int:
+        # ponytail: K_max=1 bridge; replace with masked (B,G,K) carry when multi-cluster routing lands.
+        return int(self.level_count[0, 0, 0, ell].item())
+
     def _get_level(self, ell: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
-            getattr(self, f"level_k_{ell}"),
-            getattr(self, f"level_v_{ell}"),
-            getattr(self, f"level_w_{ell}"),
+            self.level_k[:, :, 0, ell],
+            self.level_v[:, :, 0, ell],
+            self.level_w[:, :, 0, ell],
         )
 
     def _get_level_stats(
         self, ell: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
-            getattr(self, f"level_sigma_u_{ell}"),
-            getattr(self, f"level_sigma2_{ell}"),
-            getattr(self, f"level_gamma_a_{ell}"),
-            getattr(self, f"level_gamma_b_{ell}"),
-            getattr(self, f"level_gamma_{ell}"),
+            self.level_sigma_u[:, :, 0, ell],
+            self.level_sigma2[:, :, 0, ell],
+            self.level_gamma_a[:, :, 0, ell],
+            self.level_gamma_b[:, :, 0, ell],
+            self.level_gamma[:, :, 0, ell],
         )
 
     def _get_level_imp(self, ell: int) -> torch.Tensor:
-        return getattr(self, f"level_imp_{ell}")
+        return self.level_imp[:, :, 0, ell]
 
     def _set_level(
         self,
@@ -544,40 +556,40 @@ class LogStructuredKVCache(nn.Module):
         gamma: torch.Tensor | None = None,
         imp: torch.Tensor | None = None,
     ) -> None:
-        getattr(self, f"level_k_{ell}").copy_(k)
-        getattr(self, f"level_v_{ell}").copy_(v)
-        getattr(self, f"level_w_{ell}").copy_(w)
+        self.level_k[:, :, 0, ell].copy_(k)
+        self.level_v[:, :, 0, ell].copy_(v)
+        self.level_w[:, :, 0, ell].copy_(w)
         if sigma_u is None:
-            getattr(self, f"level_sigma_u_{ell}").zero_()
-            getattr(self, f"level_sigma2_{ell}").zero_()
-            getattr(self, f"level_gamma_a_{ell}").zero_()
-            getattr(self, f"level_gamma_b_{ell}").zero_()
-            getattr(self, f"level_gamma_{ell}").zero_()
+            self.level_sigma_u[:, :, 0, ell].zero_()
+            self.level_sigma2[:, :, 0, ell].zero_()
+            self.level_gamma_a[:, :, 0, ell].zero_()
+            self.level_gamma_b[:, :, 0, ell].zero_()
+            self.level_gamma[:, :, 0, ell].zero_()
         else:
-            getattr(self, f"level_sigma_u_{ell}").copy_(sigma_u)
-            getattr(self, f"level_sigma2_{ell}").copy_(sigma2)
-            getattr(self, f"level_gamma_a_{ell}").copy_(gamma_a)
-            getattr(self, f"level_gamma_b_{ell}").copy_(gamma_b)
-            getattr(self, f"level_gamma_{ell}").copy_(gamma)
+            self.level_sigma_u[:, :, 0, ell].copy_(sigma_u)
+            self.level_sigma2[:, :, 0, ell].copy_(sigma2)
+            self.level_gamma_a[:, :, 0, ell].copy_(gamma_a)
+            self.level_gamma_b[:, :, 0, ell].copy_(gamma_b)
+            self.level_gamma[:, :, 0, ell].copy_(gamma)
         if imp is None:
-            getattr(self, f"level_imp_{ell}").zero_()
+            self.level_imp[:, :, 0, ell].zero_()
         else:
-            getattr(self, f"level_imp_{ell}").copy_(imp)
-        self.level_count[ell] = self.B
-        self._counts[ell] = self.B
+            self.level_imp[:, :, 0, ell].copy_(imp)
+        self.level_count[:, :, 0, ell] = self.B
+        self.pad_mask[:, :, 0, ell].zero_()
 
     def _clear_level(self, ell: int) -> None:
-        getattr(self, f"level_k_{ell}").zero_()
-        getattr(self, f"level_v_{ell}").zero_()
-        getattr(self, f"level_w_{ell}").zero_()
-        getattr(self, f"level_imp_{ell}").zero_()
-        getattr(self, f"level_sigma_u_{ell}").zero_()
-        getattr(self, f"level_sigma2_{ell}").zero_()
-        getattr(self, f"level_gamma_a_{ell}").zero_()
-        getattr(self, f"level_gamma_b_{ell}").zero_()
-        getattr(self, f"level_gamma_{ell}").zero_()
-        self.level_count[ell] = 0
-        self._counts[ell] = 0
+        self.level_k[:, :, 0, ell].zero_()
+        self.level_v[:, :, 0, ell].zero_()
+        self.level_w[:, :, 0, ell].zero_()
+        self.level_imp[:, :, 0, ell].zero_()
+        self.level_sigma_u[:, :, 0, ell].zero_()
+        self.level_sigma2[:, :, 0, ell].zero_()
+        self.level_gamma_a[:, :, 0, ell].zero_()
+        self.level_gamma_b[:, :, 0, ell].zero_()
+        self.level_gamma[:, :, 0, ell].zero_()
+        self.level_count[:, :, 0, ell] = 0
+        self.pad_mask[:, :, 0, ell].zero_()
 
     # ------------------------------------------------------------------
     # Compact: compress tokens -> 1 entry via mean pooling (2:1 by default)
@@ -681,6 +693,12 @@ class LogStructuredKVCache(nn.Module):
         imp1: torch.Tensor | None = None,
         imp2: torch.Tensor | None = None,
         imp_lambda: float = 1.0,
+        p_lo1: torch.Tensor | None = None,
+        p_hi1: torch.Tensor | None = None,
+        sum_wp1: torch.Tensor | None = None,
+        p_lo2: torch.Tensor | None = None,
+        p_hi2: torch.Tensor | None = None,
+        sum_wp2: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Merge two B-slot blocks into one B-slot block.
 
@@ -708,6 +726,12 @@ class LogStructuredKVCache(nn.Module):
         ``1.0`` (default) is pure importance (unchanged expression, bit-identical
         to the pre-``imp_lambda`` code), ``0.0`` is numerically equivalent to the
         count-weighted path.
+
+        ``p_lo*``/``p_hi*``/``sum_wp*`` are optional per-slot semantic-cluster
+        anchor fields (see ``log_kv_position.merge_anchors``); when given for
+        both inputs, the merged ``(p_lo, p_hi, sum_wp)`` is appended as a
+        trailing 3-tuple, independent of the ``imp``/rank-1-stats branches.
+        Omitting them reproduces the exact prior return shape.
         """
         k_cat = torch.cat([k1, k2], dim=-2)  # (B, G, 2B, D)
         v_cat = torch.cat([v1, v2], dim=-2)
@@ -738,8 +762,18 @@ class LogStructuredKVCache(nn.Module):
 
         k_out = alpha * ka + (1 - alpha) * kb
         v_out = alpha * va + (1 - alpha) * vb
+
+        has_anchors = p_lo1 is not None
+        if has_anchors:
+            if any(x is None for x in (p_hi1, sum_wp1, p_lo2, p_hi2, sum_wp2)):
+                raise ValueError("compact() requires either all anchor fields or none")
+            anchors_out = merge_anchors(p_lo1, p_hi1, sum_wp1, p_lo2, p_hi2, sum_wp2)
+
+        def _with_anchors(out: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+            return out + anchors_out if has_anchors else out
+
         if sigma_u1 is None:
-            return (k_out, v_out, w_total) if not has_imp else (k_out, v_out, w_total, imp_total)
+            return _with_anchors((k_out, v_out, w_total) if not has_imp else (k_out, v_out, w_total, imp_total))
 
         if any(x is None for x in (
             sigma2_1, gamma_a1, gamma_b1, gamma1,
@@ -813,7 +847,7 @@ class LogStructuredKVCache(nn.Module):
             gamma_b.to(v_out.dtype),
             gamma.to(k_out.dtype),
         )
-        return stats_out if not has_imp else stats_out + (imp_total,)
+        return _with_anchors(stats_out if not has_imp else stats_out + (imp_total,))
 
     # ------------------------------------------------------------------
     # Add compact entry to level 0; carry to level 1+ when full
@@ -832,32 +866,32 @@ class LogStructuredKVCache(nn.Module):
         imp_entry: torch.Tensor | None = None,
     ) -> None:
         """Add one compact entry to level 0. If level 0 is full, binary carry to levels 1+."""
-        idx = self._counts[0]
-        getattr(self, "level_k_0")[:, :, idx, :] = k_entry
-        getattr(self, "level_v_0")[:, :, idx, :] = v_entry
-        getattr(self, "level_w_0")[:, :, idx] = w_entry
+        idx = self._level_count(0)
+        self.level_k[:, :, 0, 0, idx, :] = k_entry
+        self.level_v[:, :, 0, 0, idx, :] = v_entry
+        self.level_w[:, :, 0, 0, idx] = w_entry
         if sigma_u_entry is None:
             # Zero the slot in place rather than materializing zero tensors to
             # copy from: this runs per compacted entry.
-            getattr(self, "level_sigma_u_0")[:, :, idx, :].zero_()
-            getattr(self, "level_sigma2_0")[:, :, idx].zero_()
-            getattr(self, "level_gamma_a_0")[:, :, idx, :].zero_()
-            getattr(self, "level_gamma_b_0")[:, :, idx, :].zero_()
-            getattr(self, "level_gamma_0")[:, :, idx].zero_()
+            self.level_sigma_u[:, :, 0, 0, idx, :].zero_()
+            self.level_sigma2[:, :, 0, 0, idx].zero_()
+            self.level_gamma_a[:, :, 0, 0, idx, :].zero_()
+            self.level_gamma_b[:, :, 0, 0, idx, :].zero_()
+            self.level_gamma[:, :, 0, 0, idx].zero_()
         else:
-            getattr(self, "level_sigma_u_0")[:, :, idx, :] = sigma_u_entry
-            getattr(self, "level_sigma2_0")[:, :, idx] = sigma2_entry
-            getattr(self, "level_gamma_a_0")[:, :, idx, :] = gamma_a_entry
-            getattr(self, "level_gamma_b_0")[:, :, idx, :] = gamma_b_entry
-            getattr(self, "level_gamma_0")[:, :, idx] = gamma_entry
+            self.level_sigma_u[:, :, 0, 0, idx, :] = sigma_u_entry
+            self.level_sigma2[:, :, 0, 0, idx] = sigma2_entry
+            self.level_gamma_a[:, :, 0, 0, idx, :] = gamma_a_entry
+            self.level_gamma_b[:, :, 0, 0, idx, :] = gamma_b_entry
+            self.level_gamma[:, :, 0, 0, idx] = gamma_entry
         if imp_entry is None:
-            getattr(self, "level_imp_0")[:, :, idx].zero_()
+            self.level_imp[:, :, 0, 0, idx].zero_()
         else:
-            getattr(self, "level_imp_0")[:, :, idx] = imp_entry
-        self.level_count[0] = idx + 1
-        self._counts[0] = idx + 1
+            self.level_imp[:, :, 0, 0, idx] = imp_entry
+        self.level_count[:, :, 0, 0] = idx + 1
+        self.pad_mask[:, :, 0, 0, idx] = False
 
-        if self._counts[0] >= self.B:
+        if idx + 1 >= self.B:
             lk, lv, lw = self._get_level(0)
             limp = self._get_level_imp(0).clone() if imp_entry is not None else None
             if self.second_order:
@@ -892,7 +926,7 @@ class LogStructuredKVCache(nn.Module):
         new_ga, new_gb, new_gm = block_gamma_a, block_gamma_b, block_gamma
         new_imp = block_imp
         for ell in range(1, self.max_levels):
-            if self._counts[ell] == 0:
+            if self._level_count(ell) == 0:
                 self._set_level(ell, new_k, new_v, new_w, new_su, new_s2, new_ga, new_gb, new_gm, imp=new_imp)
                 return
             ek, ev, ew = self._get_level(ell)
@@ -1061,33 +1095,33 @@ class LogStructuredKVCache(nn.Module):
         f = pk.size(2)
         off = 0
         while off < f:
-            idx = self._counts[0]
+            idx = self._level_count(0)
             take = min(self.B - idx, f - off)
-            getattr(self, "level_k_0")[:, :, idx:idx + take, :] = pk[:, :, off:off + take, :]
-            getattr(self, "level_v_0")[:, :, idx:idx + take, :] = pv[:, :, off:off + take, :]
-            getattr(self, "level_w_0")[:, :, idx:idx + take] = pw[:, :, off:off + take]
+            self.level_k[:, :, 0, 0, idx:idx + take, :] = pk[:, :, off:off + take, :]
+            self.level_v[:, :, 0, 0, idx:idx + take, :] = pv[:, :, off:off + take, :]
+            self.level_w[:, :, 0, 0, idx:idx + take] = pw[:, :, off:off + take]
             if psu is None:
                 # Zero in place instead of materializing zero tensors to copy
                 # from: this runs on every window flush.
-                getattr(self, "level_sigma_u_0")[:, :, idx:idx + take, :].zero_()
-                getattr(self, "level_sigma2_0")[:, :, idx:idx + take].zero_()
-                getattr(self, "level_gamma_a_0")[:, :, idx:idx + take, :].zero_()
-                getattr(self, "level_gamma_b_0")[:, :, idx:idx + take, :].zero_()
-                getattr(self, "level_gamma_0")[:, :, idx:idx + take].zero_()
+                self.level_sigma_u[:, :, 0, 0, idx:idx + take, :].zero_()
+                self.level_sigma2[:, :, 0, 0, idx:idx + take].zero_()
+                self.level_gamma_a[:, :, 0, 0, idx:idx + take, :].zero_()
+                self.level_gamma_b[:, :, 0, 0, idx:idx + take, :].zero_()
+                self.level_gamma[:, :, 0, 0, idx:idx + take].zero_()
             else:
-                getattr(self, "level_sigma_u_0")[:, :, idx:idx + take, :] = psu[:, :, off:off + take, :]
-                getattr(self, "level_sigma2_0")[:, :, idx:idx + take] = ps2[:, :, off:off + take]
-                getattr(self, "level_gamma_a_0")[:, :, idx:idx + take, :] = pga[:, :, off:off + take, :]
-                getattr(self, "level_gamma_b_0")[:, :, idx:idx + take, :] = pgb[:, :, off:off + take, :]
-                getattr(self, "level_gamma_0")[:, :, idx:idx + take] = pgm[:, :, off:off + take]
+                self.level_sigma_u[:, :, 0, 0, idx:idx + take, :] = psu[:, :, off:off + take, :]
+                self.level_sigma2[:, :, 0, 0, idx:idx + take] = ps2[:, :, off:off + take]
+                self.level_gamma_a[:, :, 0, 0, idx:idx + take, :] = pga[:, :, off:off + take, :]
+                self.level_gamma_b[:, :, 0, 0, idx:idx + take, :] = pgb[:, :, off:off + take, :]
+                self.level_gamma[:, :, 0, 0, idx:idx + take] = pgm[:, :, off:off + take]
             if pimp is None:
-                getattr(self, "level_imp_0")[:, :, idx:idx + take].zero_()
+                self.level_imp[:, :, 0, 0, idx:idx + take].zero_()
             else:
-                getattr(self, "level_imp_0")[:, :, idx:idx + take] = pimp[:, :, off:off + take]
-            self.level_count[0] = idx + take
-            self._counts[0] = idx + take
+                self.level_imp[:, :, 0, 0, idx:idx + take] = pimp[:, :, off:off + take]
+            self.level_count[:, :, 0, 0] = idx + take
+            self.pad_mask[:, :, 0, 0, idx:idx + take] = False
             off += take
-            if self._counts[0] >= self.B:
+            if idx + take >= self.B:
                 lk, lv, lw = self._get_level(0)
                 limp = self._get_level_imp(0).clone() if pimp is not None else None
                 if self.second_order:
@@ -1243,7 +1277,7 @@ class LogStructuredKVCache(nn.Module):
     # Build attention state: slot-granular, O(recent + B*log N) entries
     # ------------------------------------------------------------------
 
-    def get_attention_state(self, with_stats: bool = False) -> tuple[torch.Tensor, ...]:
+    def get_attention_state(self, with_stats: bool = False) -> CacheAttentionState:
         """Assemble the cache state for ``log_kv_slot_attention``.
 
         Returns:
@@ -1252,7 +1286,7 @@ class LogStructuredKVCache(nn.Module):
                     the recent-window tokens as exact w=1 slots.
             slot_v: (B, G, n_slots, v_dim)
             slot_w: (B, G, n_slots) — token count per slot (1 for recent).
-            If ``with_stats=True``, also returns:
+            Returns a ``CacheAttentionState``. If ``with_stats=True``, also fills:
             slot_sigma_u / slot_sigma2: rank-1 key covariance stats;
             slot_gamma_a / slot_gamma_b / slot_gamma: rank-1 value-key cross
                 covariance stats. Exact recent and pinned tokens have zero stats.
@@ -1275,11 +1309,9 @@ class LogStructuredKVCache(nn.Module):
         gamma_b_parts: list[torch.Tensor] = []
         gamma_parts: list[torch.Tensor] = []
 
-        # Compact levels: oldest (highest level) first, down to level 0. Counts
-        # come from the host mirror — reading the device tensor here would sync
-        # once per level, per streaming chunk, per layer.
+        # Compact levels: oldest (highest level) first, down to level 0.
         for ell in range(self.max_levels - 1, -1, -1):
-            count = self._counts[ell]
+            count = self._level_count(ell)
             if count > 0:
                 lk, lv, lw = self._get_level(ell)
                 k_parts.append(lk[:, :, :count, :])
@@ -1340,32 +1372,32 @@ class LogStructuredKVCache(nn.Module):
             slot_v = torch.cat(v_parts, dim=-2)
             slot_w = torch.cat(w_parts, dim=-1)
             if not with_stats:
-                return slot_k, slot_v, slot_w
-            return (
-                slot_k,
-                slot_v,
-                slot_w,
-                torch.cat(sigma_u_parts, dim=-2),
-                torch.cat(sigma2_parts, dim=-1),
-                torch.cat(gamma_a_parts, dim=-2),
-                torch.cat(gamma_b_parts, dim=-2),
-                torch.cat(gamma_parts, dim=-1),
+                return CacheAttentionState(slot_k, slot_v, slot_w)
+            return CacheAttentionState(
+                slot_k=slot_k,
+                slot_v=slot_v,
+                slot_w=slot_w,
+                slot_sigma_u=torch.cat(sigma_u_parts, dim=-2),
+                slot_sigma2=torch.cat(sigma2_parts, dim=-1),
+                slot_gamma_a=torch.cat(gamma_a_parts, dim=-2),
+                slot_gamma_b=torch.cat(gamma_b_parts, dim=-2),
+                slot_gamma=torch.cat(gamma_parts, dim=-1),
             )
 
         slot_k = self.recent_k[:, :, :0, :]
         slot_v = self.recent_v[:, :, :0, :]
-        slot_w = getattr(self, "level_w_0")[:, :, :0]
+        slot_w = self.level_w[:, :, 0, 0, :0]
         if not with_stats:
-            return slot_k, slot_v, slot_w
-        return (
-            slot_k,
-            slot_v,
-            slot_w,
-            self.recent_k[:, :, :0, :],
-            slot_w,
-            self.recent_k[:, :, :0, :],
-            self.recent_v[:, :, :0, :],
-            slot_w,
+            return CacheAttentionState(slot_k, slot_v, slot_w)
+        return CacheAttentionState(
+            slot_k=slot_k,
+            slot_v=slot_v,
+            slot_w=slot_w,
+            slot_sigma_u=self.recent_k[:, :, :0, :],
+            slot_sigma2=slot_w,
+            slot_gamma_a=self.recent_k[:, :, :0, :],
+            slot_gamma_b=self.recent_v[:, :, :0, :],
+            slot_gamma=slot_w,
         )
 
     # ------------------------------------------------------------------
@@ -1383,12 +1415,9 @@ class LogStructuredKVCache(nn.Module):
 
         Idempotent and cheap: a no-op once the buffers already match, so it is
         safe to call on every forward (mirrors ``KVCache.forward``'s reconcile).
-        ``level_count`` stays ``long`` and is deliberately untouched. Compaction
-        weights are always powers of two (uniform 2:1), hence exact in bf16/fp16,
-        so converting ``level_w`` does not corrupt token counts. ``level_imp``
-        is also deliberately untouched: it always stays fp32 (see ``__init__``)
-        since it never participates in a cat/matmul against activations, only
-        fraction computations in ``compact()``.
+        ``level_count``/``pad_mask`` stay integer/bool and are deliberately
+        untouched. ``level_w``/``level_imp`` stay fp32 per the indexed storage
+        contract: they feed scalar merge/bias math, not activation matmuls.
         """
         if self.recent_k.dtype == dtype:
             return
@@ -1396,15 +1425,13 @@ class LogStructuredKVCache(nn.Module):
         self.recent_v = self.recent_v.to(dtype)
         self.pin_k = self.pin_k.to(dtype)
         self.pin_v = self.pin_v.to(dtype)
-        for ell in range(self.max_levels):
-            setattr(self, f"level_k_{ell}", getattr(self, f"level_k_{ell}").to(dtype))
-            setattr(self, f"level_v_{ell}", getattr(self, f"level_v_{ell}").to(dtype))
-            setattr(self, f"level_w_{ell}", getattr(self, f"level_w_{ell}").to(dtype))
-            setattr(self, f"level_sigma_u_{ell}", getattr(self, f"level_sigma_u_{ell}").to(dtype))
-            setattr(self, f"level_sigma2_{ell}", getattr(self, f"level_sigma2_{ell}").to(dtype))
-            setattr(self, f"level_gamma_a_{ell}", getattr(self, f"level_gamma_a_{ell}").to(dtype))
-            setattr(self, f"level_gamma_b_{ell}", getattr(self, f"level_gamma_b_{ell}").to(dtype))
-            setattr(self, f"level_gamma_{ell}", getattr(self, f"level_gamma_{ell}").to(dtype))
+        self.level_k = self.level_k.to(dtype)
+        self.level_v = self.level_v.to(dtype)
+        self.level_sigma_u = self.level_sigma_u.to(dtype)
+        self.level_sigma2 = self.level_sigma2.to(dtype)
+        self.level_gamma_a = self.level_gamma_a.to(dtype)
+        self.level_gamma_b = self.level_gamma_b.to(dtype)
+        self.level_gamma = self.level_gamma.to(dtype)
 
     def reset_parameters(self) -> None:
         """Reset all buffers to zero."""
@@ -1415,12 +1442,21 @@ class LogStructuredKVCache(nn.Module):
         self.pin_k.zero_()
         self.pin_v.zero_()
         self.pin_count = 0
-        for ell in range(self.max_levels):
-            self._clear_level(ell)
+        self.level_k.zero_()
+        self.level_v.zero_()
+        self.level_w.zero_()
+        self.level_imp.zero_()
+        self.level_sigma_u.zero_()
+        self.level_sigma2.zero_()
+        self.level_gamma_a.zero_()
+        self.level_gamma_b.zero_()
+        self.level_gamma.zero_()
+        self.level_count.zero_()
+        self.pad_mask.zero_()
 
     @property
     def total_slots(self) -> int:
-        return self.recent_count + self.pin_count + sum(self._counts)
+        return self.recent_count + self.pin_count + int(self.level_count[0, 0, 0].sum().item())
 
     @property
     def total_tokens_covered(self) -> int:
@@ -1433,45 +1469,51 @@ class LogStructuredKVCache(nn.Module):
 
 
 def append_exact_tokens(
-    slot_k: torch.Tensor,   # (B, G, S, k_dim)
-    slot_v: torch.Tensor,   # (B, G, S, v_dim)
-    slot_w: torch.Tensor,   # (B, G, S)
+    state: CacheAttentionState,
     k_new: torch.Tensor,    # (B, G, n, k_dim) exact tokens, appended in time order
     v_new: torch.Tensor,    # (B, G, n, v_dim)
-    slot_sigma_u: torch.Tensor | None = None,
-    slot_sigma2: torch.Tensor | None = None,
-    slot_gamma_a: torch.Tensor | None = None,
-    slot_gamma_b: torch.Tensor | None = None,
-    slot_gamma: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, ...]:
+) -> CacheAttentionState:
     """Append exact per-token entries (w=1 slots) after the cached slots.
 
     Used by the attention layer to make the current chunk (and any pending
     token) visible to attention BEFORE it is committed to the cache. Gradient
-    flows through ``k_new``/``v_new``; the ones-weights are constants. If slot
-    rank-1 stats are provided, the appended exact tokens receive zero
-    covariance / cross-covariance stats.
+    flows through ``k_new``/``v_new``; the ones-weights are constants.
+    ``slot_valid``/``M_s`` cover only the pooled prefix and are passed through.
+    If slot rank-1 stats are provided, appended exact tokens receive zero stats.
     """
     n_new = k_new.size(2)
-    ones = slot_w.new_ones(slot_w.size(0), slot_w.size(1), n_new)
-    k_all = torch.cat([slot_k, k_new], dim=2)
-    v_all = torch.cat([slot_v, v_new], dim=2)
-    w_all = torch.cat([slot_w, ones], dim=-1)
-    if slot_sigma_u is None:
-        return k_all, v_all, w_all
+    ones = state.slot_w.new_ones(state.slot_w.size(0), state.slot_w.size(1), n_new)
+    k_all = torch.cat([state.slot_k, k_new], dim=2)
+    v_all = torch.cat([state.slot_v, v_new], dim=2)
+    w_all = torch.cat([state.slot_w, ones], dim=-1)
+    if state.slot_sigma_u is None:
+        if any(x is not None for x in (state.slot_sigma2, state.slot_gamma_a, state.slot_gamma_b, state.slot_gamma)):
+            raise ValueError("append_exact_tokens() requires either all rank-1 stats or none")
+        return state._replace(slot_k=k_all, slot_v=v_all, slot_w=w_all)
 
-    if any(x is None for x in (slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma)):
+    if any(x is None for x in (state.slot_sigma2, state.slot_gamma_a, state.slot_gamma_b, state.slot_gamma)):
         raise ValueError("append_exact_tokens() requires either all rank-1 stats or none")
-    return (
-        k_all,
-        v_all,
-        w_all,
-        torch.cat([slot_sigma_u, torch.zeros_like(k_new)], dim=2),
-        torch.cat([slot_sigma2, torch.zeros_like(ones)], dim=-1),
-        torch.cat([slot_gamma_a, torch.zeros_like(k_new)], dim=2),
-        torch.cat([slot_gamma_b, torch.zeros_like(v_new)], dim=2),
-        torch.cat([slot_gamma, torch.zeros_like(ones)], dim=-1),
+    return state._replace(
+        slot_k=k_all,
+        slot_v=v_all,
+        slot_w=w_all,
+        slot_sigma_u=torch.cat([state.slot_sigma_u, torch.zeros_like(k_new)], dim=2),
+        slot_sigma2=torch.cat([state.slot_sigma2, torch.zeros_like(ones)], dim=-1),
+        slot_gamma_a=torch.cat([state.slot_gamma_a, torch.zeros_like(k_new)], dim=2),
+        slot_gamma_b=torch.cat([state.slot_gamma_b, torch.zeros_like(v_new)], dim=2),
+        slot_gamma=torch.cat([state.slot_gamma, torch.zeros_like(ones)], dim=-1),
     )
+
+
+def _slot_mass_bias(slot_w: torch.Tensor, slot_M: torch.Tensor | None, lam: float) -> torch.Tensor | None:
+    if slot_M is None:
+        return lam * slot_w.to(torch.float32).log() if lam != 0.0 else None
+    if slot_M.size(-1) > slot_w.size(-1):
+        raise ValueError("slot_M cannot be wider than slot_w")
+    bias = lam * slot_w.to(torch.float32).log() if lam != 0.0 else torch.zeros_like(slot_w, dtype=torch.float32)
+    s_m = slot_M.size(-1)
+    bias[..., :s_m] = anchor_mass_bias(slot_w[..., :s_m], slot_M, lam)
+    return bias
 
 
 def log_kv_slot_attention(
@@ -1483,6 +1525,8 @@ def log_kv_slot_attention(
     mask: torch.Tensor | None = None,  # (T_q, S) bool, True = attend
     lam: float = 1.0,
     causal_tail: int = 0,
+    slot_M: torch.Tensor | None = None,       # (B, G, S) distinct-anchor count per slot
+    slot_valid: torch.Tensor | None = None,   # (B, G, S_pooled) bool; pooled-prefix only
     slot_sigma_u: torch.Tensor | None = None,  # (B, G, S, k_dim)
     slot_sigma2: torch.Tensor | None = None,   # (B, G, S)
     slot_gamma_a: torch.Tensor | None = None,  # (B, G, S, k_dim)
@@ -1517,7 +1561,10 @@ def log_kv_slot_attention(
     Preconditions (enforced by construction in the callers):
       - ``slot_w`` entries are >= 1 (log is finite);
       - every ``mask`` row has at least one True (softmax row is finite) —
-        chunk-causal masks always allow the diagonal.
+        chunk-causal masks always allow the diagonal;
+      - if ``slot_valid`` is given, every row must keep >= 1 valid slot after
+        all masking — checked at runtime (raises) since this one isn't
+        guaranteed by construction the way ``mask``/``causal_tail`` are.
 
     Args:
         q: (B, nh, T_q, k_dim)
@@ -1534,6 +1581,17 @@ def log_kv_slot_attention(
             hatch (tests); the model uses ``causal_tail`` instead. None (and
             causal_tail == 0) = attend all.
         lam: weight of the log-multiplicity mass bias (default 1.0)
+        slot_M: distinct-anchor count per slot (see ``log_kv_position.
+            dedup_anchors``). When given, the mass bias becomes
+            ``lam*log(w) - log(M)`` (the ``-log(M)`` term is unconditional,
+            not gated by ``lam``) so anchor-expanded entries don't leak
+            ``M``-fold extra softmax mass. None reproduces the exact prior
+            ``lam*log(w)`` formula.
+        slot_valid: (B, G, S_pooled) bool, True = real anchor. Covers only
+            the pooled-entry prefix of the slot axis (S_pooled <= S); the
+            exact/in-flight suffix is never invalid by construction. Masked
+            slots get score -inf, same as ``mask``/``causal_tail`` but
+            orthogonal to both (can combine with either).
         causal_tail: if > 0, the LAST ``causal_tail`` slots are the in-flight
             chunk appended behind the frozen cache state (see
             ``append_exact_tokens``); they are masked causally against the
@@ -1622,14 +1680,20 @@ def log_kv_slot_attention(
                 * sigma_dot.square()
                 * slot_sigma2.to(torch.float32)[:, :, None, None, :]
             )
-        if lam != 0.0:
-            # slot_w >= 1 by construction; guarded via lam gate so lam=0 can
-            # never produce 0 * log(0) = NaN even on malformed input.
-            scores.add_(lam * slot_w.to(torch.float32).log()[:, :, None, None, :])
+        mass_bias = _slot_mass_bias(slot_w, slot_M, lam)
+        if mass_bias is not None:
+            scores.add_(mass_bias[:, :, None, None, :])
         if mask is not None:
             scores.masked_fill_(~mask.view(1, 1, 1, T_q, S), float("-inf"))
         elif causal_tail:
             scores[..., S - causal_tail:].masked_fill_(tail_blocked, float("-inf"))
+        if slot_valid is not None:
+            s_pooled = slot_valid.size(-1)
+            scores[..., :s_pooled].masked_fill_(
+                (~slot_valid)[:, :, None, None, :], float("-inf")
+            )
+            if not torch.isfinite(scores).any(dim=-1).all():
+                raise ValueError("log_kv_slot_attention(): a query row has no valid slot")
         attn = torch.softmax(scores, dim=-1).to(q.dtype)     # (B, nkv, rf, T_q, S)
         if pin_score_diag_active:
             LOG_KV_PIN_SCORE_DIAG.record(
@@ -1674,14 +1738,18 @@ def log_kv_slot_attention(
             * sigma_dot.square()
             * slot_sigma2.to(torch.float32).unsqueeze(-2)
         )
-    if lam != 0.0:
-        # slot_w >= 1 by construction; guarded via lam gate so lam=0 can never
-        # produce 0 * log(0) = NaN even on malformed input.
-        scores.add_(lam * slot_w.to(torch.float32).log().unsqueeze(-2))
+    mass_bias = _slot_mass_bias(slot_w, slot_M, lam)
+    if mass_bias is not None:
+        scores.add_(mass_bias.unsqueeze(-2))
     if mask is not None:
         scores.masked_fill_(~mask.view(1, 1, T_q, S), float("-inf"))
     elif causal_tail:
         scores[..., S - causal_tail:].masked_fill_(tail_blocked, float("-inf"))
+    if slot_valid is not None:
+        s_pooled = slot_valid.size(-1)
+        scores[..., :s_pooled].masked_fill_((~slot_valid).unsqueeze(-2), float("-inf"))
+        if not torch.isfinite(scores).any(dim=-1).all():
+            raise ValueError("log_kv_slot_attention(): a query row has no valid slot")
     attn = torch.softmax(scores, dim=-1).to(q.dtype)  # (B, nh, T_q, S)
     if pin_score_diag_active:
         LOG_KV_PIN_SCORE_DIAG.record(
@@ -1735,45 +1803,26 @@ def log_kv_chunk_attention(
     second-order path multiplied by zero.
     """
     if second_order_scale == 0.0:
-        slot_k, slot_v, slot_w = cache.get_attention_state(with_stats=False)
-        k_all, v_all, w_all = append_exact_tokens(slot_k, slot_v, slot_w, k_b, v_b)
+        state = append_exact_tokens(cache.get_attention_state(with_stats=False), k_b, v_b)
         return log_kv_slot_attention(
-            q_b, k_all, v_all, w_all,
+            q_b, state.slot_k, state.slot_v, state.slot_w,
             scale=scale,
             causal_tail=q_b.size(2),
+            slot_M=state.M_s,
+            slot_valid=state.slot_valid,
         )
-    (
-        slot_k,
-        slot_v,
-        slot_w,
-        slot_sigma_u,
-        slot_sigma2,
-        slot_gamma_a,
-        slot_gamma_b,
-        slot_gamma,
-    ) = cache.get_attention_state(with_stats=True)
-    (
-        k_all,
-        v_all,
-        w_all,
-        sigma_u_all,
-        sigma2_all,
-        gamma_a_all,
-        gamma_b_all,
-        gamma_all,
-    ) = append_exact_tokens(
-        slot_k, slot_v, slot_w, k_b, v_b,
-        slot_sigma_u, slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma,
-    )
+    state = append_exact_tokens(cache.get_attention_state(with_stats=True), k_b, v_b)
     return log_kv_slot_attention(
-        q_b, k_all, v_all, w_all,
+        q_b, state.slot_k, state.slot_v, state.slot_w,
         scale=scale,
         causal_tail=q_b.size(2),
-        slot_sigma_u=sigma_u_all,
-        slot_sigma2=sigma2_all,
-        slot_gamma_a=gamma_a_all,
-        slot_gamma_b=gamma_b_all,
-        slot_gamma=gamma_all,
+        slot_M=state.M_s,
+        slot_valid=state.slot_valid,
+        slot_sigma_u=state.slot_sigma_u,
+        slot_sigma2=state.slot_sigma2,
+        slot_gamma_a=state.slot_gamma_a,
+        slot_gamma_b=state.slot_gamma_b,
+        slot_gamma=state.slot_gamma,
         second_order_scale=second_order_scale,
     )
 
