@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import os
 import json
@@ -12,6 +14,43 @@ import yaml
 from litgpt.tokenizer import Tokenizer
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 import shutil
+
+
+def load_log_kv_semantic_s_h(path: str | os.PathLike | None, n_layer: int, n_groups: int) -> torch.Tensor | None:
+    """Load SemanticLogKV key-scale calibration as ``(n_layer, n_groups)`` fp32."""
+    if path in (None, ""):
+        return None
+    p = os.path.expandvars(os.path.expanduser(os.fspath(path)))
+    if p.endswith((".pt", ".pth")):
+        obj = torch.load(p, map_location="cpu")
+    else:
+        with open(p, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+
+    if isinstance(obj, dict) and "key_scale" in obj:
+        rows = []
+        for layer in range(int(n_layer)):
+            try:
+                rows.append(obj["key_scale"][str(layer)]["s_h"])
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"{p}: missing key_scale[{layer!r}]['s_h']") from exc
+        t = torch.as_tensor(rows, dtype=torch.float32)
+    else:
+        if isinstance(obj, dict):
+            obj = obj.get("semantic_s_h", obj.get("s_h"))
+        if obj is None:
+            raise ValueError(f"{p}: expected Stage0 manifest key_scale or s_h/semantic_s_h tensor data")
+        t = torch.as_tensor(obj, dtype=torch.float32)
+
+    if t.dim() == 1:
+        if t.numel() != n_groups:
+            raise ValueError(f"{p}: s_h shape {tuple(t.shape)} does not match n_groups={n_groups}")
+        t = t.unsqueeze(0).expand(n_layer, -1).contiguous()
+    elif tuple(t.shape) != (n_layer, n_groups):
+        raise ValueError(f"{p}: s_h shape {tuple(t.shape)} does not match ({n_layer}, {n_groups})")
+    if not bool(torch.isfinite(t).all()) or not bool((t > 0).all()):
+        raise ValueError(f"{p}: s_h must be finite and > 0")
+    return t.contiguous()
 
 
 def convert_and_replace_fsdp_ckpt(ckpt_root: str):

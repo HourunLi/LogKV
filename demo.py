@@ -545,6 +545,15 @@ def main(
     # normalization (1.0 = unchanged, < 1.0 dampens outlier tokens).
     # See LogStructuredKVCache.
     log_kv_importance_pooling_temperature: float = 1.0,
+    log_kv_semantic_clusters: bool = False,
+    log_kv_cluster_k_max: int = 1,
+    log_kv_cluster_lambda_rel: float = 1.0,
+    log_kv_seg_eta: float = 1.0,
+    log_kv_seg_g0: float = 2048.0,
+    log_kv_seg_gap_max: float | None = None,
+    log_kv_seg_block_level: int = 0,
+    log_kv_seg_forget: float = 0.5,
+    log_kv_semantic_s_h_path: str | None = None,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -625,6 +634,16 @@ def main(
     log_kv_importance_pooling_temperature = float(
         _o("log_kv_importance_pooling_temperature", log_kv_importance_pooling_temperature)
     )
+    log_kv_semantic_clusters = bool(_o("log_kv_semantic_clusters", log_kv_semantic_clusters))
+    log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
+    log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
+    log_kv_seg_eta = float(_o("log_kv_seg_eta", log_kv_seg_eta))
+    log_kv_seg_g0 = float(_o("log_kv_seg_g0", log_kv_seg_g0))
+    log_kv_seg_gap_max = _o("log_kv_seg_gap_max", log_kv_seg_gap_max)
+    log_kv_seg_gap_max = None if log_kv_seg_gap_max is None else float(log_kv_seg_gap_max)
+    log_kv_seg_block_level = int(_o("log_kv_seg_block_level", log_kv_seg_block_level))
+    log_kv_seg_forget = float(_o("log_kv_seg_forget", log_kv_seg_forget))
+    log_kv_semantic_s_h_path = _o("log_kv_semantic_s_h_path", log_kv_semantic_s_h_path)
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
@@ -783,6 +802,15 @@ def main(
             log_kv_importance_pooling=log_kv_importance_pooling,
             log_kv_importance_pooling_lambda=log_kv_importance_pooling_lambda,
             log_kv_importance_pooling_temperature=log_kv_importance_pooling_temperature,
+            log_kv_semantic_clusters=log_kv_semantic_clusters,
+            log_kv_cluster_k_max=log_kv_cluster_k_max,
+            log_kv_cluster_lambda_rel=log_kv_cluster_lambda_rel,
+            log_kv_seg_eta=log_kv_seg_eta,
+            log_kv_seg_g0=log_kv_seg_g0,
+            log_kv_seg_gap_max=log_kv_seg_gap_max,
+            log_kv_seg_block_level=log_kv_seg_block_level,
+            log_kv_seg_forget=log_kv_seg_forget,
+            log_kv_semantic_s_h_path=log_kv_semantic_s_h_path,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -889,6 +917,15 @@ def main(
     initial_pin_train_max, initial_pin_train_prob = get_log_kv_pin_train_schedule(
         global_step, log_kv_pin_train_warmup_steps, log_kv_pin_train_max, log_kv_pin_train_prob
     )
+    semantic_s_h = (
+        load_log_kv_semantic_s_h(
+            log_kv_semantic_s_h_path,
+            n_layer=config_obj.n_layer,
+            n_groups=config_obj.n_query_groups,
+        )
+        if log_kv_semantic_clusters
+        else None
+    )
 
     # Always simulate the logKV compressed-KV streaming attention during
     # training — this script only supports the logKV adaptation route.
@@ -909,6 +946,15 @@ def main(
         importance_pooling=log_kv_importance_pooling,
         importance_pooling_lambda=log_kv_importance_pooling_lambda,
         importance_pooling_temperature=log_kv_importance_pooling_temperature,
+        semantic_clusters=log_kv_semantic_clusters,
+        cluster_k_max=log_kv_cluster_k_max,
+        cluster_lambda_rel=log_kv_cluster_lambda_rel,
+        seg_eta=log_kv_seg_eta,
+        seg_g0=log_kv_seg_g0,
+        seg_gap_max=log_kv_seg_gap_max,
+        seg_block_level=log_kv_seg_block_level,
+        seg_forget=log_kv_seg_forget,
+        semantic_s_h=semantic_s_h,
     )
     fabric.print(
         f"logKV training ENABLED: B={log_kv_B}, "
@@ -923,7 +969,11 @@ def main(
         f"warmup_steps={log_kv_pin_train_warmup_steps}), "
         f"blocks/seq={math.ceil(context_length / max(log_kv_train_block, 1))}, "
         f"importance_pooling={log_kv_importance_pooling} "
-        f"(lambda={log_kv_importance_pooling_lambda}, temperature={log_kv_importance_pooling_temperature})"
+        f"(lambda={log_kv_importance_pooling_lambda}, temperature={log_kv_importance_pooling_temperature}), "
+        f"semantic={log_kv_semantic_clusters} "
+        f"(K={log_kv_cluster_k_max}, lambda_rel={log_kv_cluster_lambda_rel}, "
+        f"g_max={log_kv_seg_gap_max}, l_block={log_kv_seg_block_level}, "
+        f"s_h={log_kv_semantic_s_h_path})"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))

@@ -17,9 +17,17 @@ def merge_anchors(
     lo2: torch.Tensor,
     hi2: torch.Tensor,
     sum_wp2: torch.Tensor,
+    w1: torch.Tensor | None = None,
+    w2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Merge anchor metadata; exact and associative."""
-    return torch.minimum(lo1, lo2), torch.maximum(hi1, hi2), sum_wp1.long() + sum_wp2.long()
+    if w1 is None or w2 is None:
+        return torch.minimum(lo1, lo2), torch.maximum(hi1, hi2), sum_wp1.long() + sum_wp2.long()
+    real1 = w1 > 0
+    real2 = w2 > 0
+    lo = torch.where(real1 & real2, torch.minimum(lo1, lo2), torch.where(real1, lo1, lo2))
+    hi = torch.where(real1 & real2, torch.maximum(hi1, hi2), torch.where(real1, hi1, hi2))
+    return lo.long(), hi.long(), sum_wp1.long() + sum_wp2.long()
 
 
 def mid_anchor(lo: torch.Tensor, hi: torch.Tensor, sum_wp: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -28,9 +36,12 @@ def mid_anchor(lo: torch.Tensor, hi: torch.Tensor, sum_wp: torch.Tensor, w: torc
     Callers must filter ``w == 0`` pad/dead entries before using the returned
     position for RoPE lookup. ``dedup_anchors`` handles that sanitization.
     """
+    real = w > 0
+    safe_lo = torch.where(real, lo.long(), torch.zeros_like(lo.long()))
+    safe_hi = torch.where(real, hi.long(), torch.zeros_like(hi.long()))
     ww = w.long().clamp_min(1)
     mid = torch.div(2 * sum_wp.long() + ww, 2 * ww, rounding_mode="floor")
-    return torch.clamp(mid, lo.long(), hi.long())
+    return torch.clamp(mid, safe_lo, safe_hi)
 
 
 def dedup_anchors(

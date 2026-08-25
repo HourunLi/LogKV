@@ -1,7 +1,7 @@
 # SemanticLogKV 算法规格与实现方案
 
-> 精简版。本文是设计规格，不代表生产路径已经实现。当前代码只落地了 Stage 0 的离线
-> dump/分析工具；`log_kv_semantic_clusters`、多簇 cache、`op_log` 重放等仍未进生产。
+> 精简版。本文是设计规格；`log_kv_semantic_clusters` 生产路径已按 §5.18 落地在默认关闭
+> 的开关后。当前路线跳过 S0.8 CPU reference，直接维护 GPU/torch cache 实现。
 
 ## 5. 算法规格与实现方案
 
@@ -267,7 +267,7 @@ Function 后梯度返回 `None`，沿用现有 stop-gradient-through-cache 训�
 
 0. Stage 0 dump/分析：机制 A 已完成，机制 B 未完成。
 1. `log_kv_position.py` + 纯 CPU 单测。
-2. `cache_serial` / `cache_batch` 两份朴素 CPU 参考实现，供 S0.8。
+2. `cache_serial` / `cache_batch` 两份朴素 CPU 参考实现，供 S0.8。（当前路线跳过。）
 3. `CacheAttentionState` 和 `log_kv_slot_attention` 接口迁移。
 4. `K_max=1` 单簇路径。
 5. 多簇路由生产向量化。
@@ -286,6 +286,10 @@ Function 后梯度返回 `None`，沿用现有 stop-gradient-through-cache 训�
 8. `s_h` 离线标定并写进 eval metadata。
 9. `level_w/w` 不能用 fp16/bf16 存大计数。
 10. 生产前重算预算，不沿用旧表。
+11. 语义路由的批量实现全程不能有 host-device 同步（`.item()`、CUDA 上的
+    `nonzero()`/布尔索引）；判定阶段（`_semantic_existing_assignments`）已经是纯张量运算，
+    但 `_semantic_join_or_segment`/`_semantic_join`/`_semantic_new_cluster` 这条 Phase 1
+    写入路径每次调用仍有多次 `.item()`，比算法复杂度本身更致命。
 
 ### 5.20 复用边界
 
@@ -313,3 +317,52 @@ Function 后梯度返回 `None`，沿用现有 stop-gradient-through-cache 训�
 3. `s_h` 标定文件格式和 metadata 字段。
 4. S0.8 可接受阈值和失败后的取舍。
 5. 是否把 Γ 的 delta-rule 构造纳入 v1；默认不纳入，除非 S0.7 触发。
+
+### 5.22 CPT 训练路径
+
+CPT 不走“dense 训练、semantic LogKV 推理”。训练路径继续基于
+`LogKVStreamTrainingAttention`：forward 流式构建 semantic cache，backward 重置 cache
+后重放 forward 记录的操作。
+
+必须拆清两层串行：
+
+- chunk/flush batch 之间按 token index 从左到右推进。这和现有 LogKV 一样，不能消掉。
+- flush batch 内不能逐 token 全串行。默认实现必须走 §5.4 三阶段：Phase 1 批量处理
+  direct token，Phase 3a 立刻批量更新这些 direct token 的 metadata，然后 Phase 2 只
+  串行处理 orphan 组，并把 Phase 3b 内联到每个 orphan 主操作之后。
+
+训练和推理共享同一个 `route_and_flush_batch(..., record_op_log: bool)`。本地 op 缓冲
+始终构建，用来驱动 Phase 3a/3b 和 ladder 写入；只有 `record_op_log=True` 时，才把本地
+缓冲追加进持久 `op_log`。训练入口传 `True`，推理入口传 `False`。
+
+实现顺序约束：
+
+1. flush 调度只由绝对 token index 和 `flush_granularity` 决定，不能依赖
+   `train_block`、prefill 分块或 batch 内样本内容。
+2. Phase 1 先冻结 `centroid/p_hi_c/current_segment/alive` 快照，矩阵化计算 `D/S`；
+   `alive_mask` 排除空簇，`direct_mask` 只允许 `s*[t] <= λ_new` 的 token 落地。
+3. Phase 1 的物理 ladder 写入和 Phase 3a metadata 更新必须在 Phase 2 开始前完成；
+   Ward 合并必须看到包含本批 direct token 的最新状态。
+4. Phase 2 不把 orphan 重新并入既有簇，只在 orphan 集合内部做小 DP-means；`K_max`
+   满时先按 `ward_mask` 选择合法合并对，再 `WARD_MERGE`，随后紧邻 `NEW_CLUSTER`。
+5. `op_log` 的线性顺序是“Phase 1 direct 组，然后 Phase 2 orphan 组”，不是原始 token
+   顺序；每条消费 token 的主操作必须显式带 `token_idx`。
+6. 同一逻辑簇内的主操作必须保持真实到达顺序；`PAD_INSERT` 紧邻并先于它服务的
+   `NEW_SEGMENT`，`WARD_MERGE` 紧邻并先于它服务的 `NEW_CLUSTER`。
+7. attention 读出仍必须使用 `slot_valid/M_s` 和 `causal_tail` mask。mask 是正确性边界，
+   不是可选优化。
+8. backward 只读 `op_log[:op_log_len]` 重放，不重算 centroid、不重算路由、不依赖
+   forward 结束后 cache 里残留的状态。
+9. Phase 1 把多个 direct token 写入同一簇 ladder（可能触发多级 carry）时，数值累积和
+   结构决策要分开处理：carry 满足结合律，等价于给二进制计数器批量加 K，可以用平衡归并树
+   在 O(log K) 深度算完，不需要逐 token 循环（参考 `_flush_pairs` 对按位置路径的批量
+   flush 写法）；只有 `NEW_CLUSTER`/`NEW_SEGMENT`/Ward 配对选择这类改变簇集合本身的决策
+   必须留在 Phase 2。判定阶段（`_semantic_existing_assignments`）已经这样矩阵化了，Phase 1
+   的 ladder 写入这一半还没有。
+
+速度闸门：完整 CPT 前先补一个合成 microbenchmark，固定层数、KV group、batch 和
+`flush_granularity`，扫描 orphan 比例与 `K_max` binding 率，分别报告 Phase 1、Phase 2、
+Phase 3、`op_log` commit、backward replay 的 wall-clock。若 Phase 2 时间接近随 `T`
+线性增长，先修批量路由或缩小候选配置，不进入完整 CPT。当前 `_semantic_route_three_phase`
+的判定阶段已矩阵化，但 Phase 1 的 ladder 写入还是逐 token；闸门要在 §5.19 第 11 条（消
+同步）和上面第 9 条（批量写入）都做完后跑才有参考价值。
