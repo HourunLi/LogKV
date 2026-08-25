@@ -3,10 +3,6 @@
 > 本文件是 `semanticLogKV` 分支的**入口文档**，记录"语义簇 + 簇级抽象位置"这条压缩
 > 方案的动机、核心设计和变更历史。**每次讨论出现突破或进展，都要写回文档**（变更
 > 记录一律加到本文件 §14，细节改到对应章节所在的文件），不要另开新文档。
->
-> 原 `logKV`/`claude/semantic-cluster-log-compression-8ai32a` 分支上的 CLAUDE.md 是
-> 另一条独立技术路线（位置分桶 + rank-1 二阶修正 + pin 机制）的进展存档，与本分支
-> 无关，不在这里维护——那条线的结论只在 §1、§10 里作为背景锚点和教训引用。
 
 ## 文档地图
 
@@ -606,6 +602,18 @@ CompressKV 报告：LongBench 用 19% 预算保住 99% 满 cache 性能、3% 预
   unclipped 的约 74.3%；`K_max=64` exact-entry 约 67.5%，约为 unclipped 的 91%。
   所以当前生产粗估应按质量平台和成本取 `K_max≈64–128`，即 `c≈4.3–8.5`，优先
   试 `c≈6–8`，而不是按覆盖 `K_eff`/压低 binding 取 `c≈19+`。
+- **2026-08-25（最新）｜新增 `risks-and-open-questions.md` §12-I：CPT 训练
+  wall-clock 开销的摊还上界（`E[K]`）与最坏情形（`O(T)`）要分开看，目前没有
+  任何吞吐测量计划。** 动机：讨论"语义路由是串行的，会不会让 CPT 比普通
+  transformer 训练慢很多"时，梳理出两件此前没被分开讲过的事——① §5.4/§11-B
+  的 `E[K]` 摊还论证解决的只是复杂度阶数，`§5.21-2` 的 `OP_max` 推导早已承认
+  `WARD_MERGE` 最坏情形是 `O(T)`（`K_max` 持续绑定时），CLAUDE.md §4 只论证过
+  这种最坏情形对**内存**安全，从未论证过对**训练速度**是否同样安全；② 即使
+  停在期望情形，复杂度阶数低不等于 wall-clock 可忽略（Python 循环 + GPU
+  kernel 调用的同步开销是独立于阶数的实现细节）。翻查 `experiments.md`
+  Stage 0–3 协议确认没有任何吞吐/wall-clock 测量项。列为新的未决问题，建议
+  Stage 1 落地时补一项合成 microbenchmark（固定层数/KV group/batch，扫描
+  orphan 比例，不需要等完整 CPT）。
 
 - **2026-08-24｜Stage-0 语义 ladder 的默认 `B′` 从 8 调到 128，S0.3 主口径
   从“小簇代理”改成 exact-entry 隔离。** 动机：原 LogKV 在 32k 下有约
