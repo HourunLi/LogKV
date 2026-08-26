@@ -317,6 +317,7 @@ class LogStructuredKVCache(nn.Module):
         seg_block_level: int = 0,
         seg_forget: float = 0.5,
         semantic_s_h: torch.Tensor | float | None = None,
+        semantic_flush_granularity: int = 2,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
         rope_n_elem: int | None = None,
@@ -381,6 +382,12 @@ class LogStructuredKVCache(nn.Module):
             self.seg_forget = float(seg_forget)
             if not 0.0 <= self.seg_forget <= 1.0:
                 raise ValueError(f"seg_forget must be in [0,1], got {seg_forget}")
+            self.semantic_flush_granularity = int(semantic_flush_granularity)
+            if not 1 <= self.semantic_flush_granularity <= self.recent_size:
+                raise ValueError(
+                    "semantic_flush_granularity must be in [1, recent_size], got "
+                    f"{semantic_flush_granularity} for recent_size={self.recent_size}"
+                )
             self.rope_n_elem = int(rope_n_elem)
             self.register_buffer("cos_cache", cos_cache.to(device=device), persistent=False)
             self.register_buffer("sin_cache", sin_cache.to(device=device), persistent=False)
@@ -394,6 +401,7 @@ class LogStructuredKVCache(nn.Module):
             self.seg_gap_max = math.inf
             self.seg_block_level = 0
             self.seg_forget = 1.0
+            self.semantic_flush_granularity = 2
             self.rope_n_elem = None
             self.cos_cache = None
             self.sin_cache = None
@@ -405,7 +413,6 @@ class LogStructuredKVCache(nn.Module):
         self.L_alloc = self.max_levels
         self.B_prime = B
         self.recent_capacity = self.recent_size * 2 if self.semantic_clusters else self.recent_size
-        self.semantic_flush_granularity = 2
 
         # Total tokens ever committed (scalar bookkeeping only — replaces the
         # former Θ(N) per-token position-key buffer).

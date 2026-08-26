@@ -372,6 +372,7 @@ class GPT(nn.Module):
         seg_block_level: int = 0,
         seg_forget: float = 0.5,
         semantic_s_h: torch.Tensor | float | None = None,
+        semantic_flush_granularity: int = 2,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -460,6 +461,7 @@ class GPT(nn.Module):
                 seg_block_level=seg_block_level,
                 seg_forget=seg_forget,
                 semantic_s_h=block_s_h,
+                semantic_flush_granularity=semantic_flush_granularity,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -546,6 +548,7 @@ class GPT(nn.Module):
         seg_block_level: int = 0,
         seg_forget: float = 0.5,
         semantic_s_h: torch.Tensor | float | None = None,
+        semantic_flush_granularity: int = 2,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -628,6 +631,7 @@ class GPT(nn.Module):
                 seg_block_level=seg_block_level,
                 seg_forget=seg_forget,
                 semantic_s_h=block_s_h,
+                semantic_flush_granularity=semantic_flush_granularity,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -1601,6 +1605,7 @@ class CausalSelfAttention(nn.Module):
         seg_block_level: int = 0,
         seg_forget: float = 0.5,
         semantic_s_h: torch.Tensor | float | None = None,
+        semantic_flush_granularity: int = 2,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
     ) -> "LogStructuredKVCache":
@@ -1657,6 +1662,7 @@ class CausalSelfAttention(nn.Module):
             seg_block_level=seg_block_level,
             seg_forget=seg_forget,
             semantic_s_h=semantic_s_h,
+            semantic_flush_granularity=semantic_flush_granularity,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,
