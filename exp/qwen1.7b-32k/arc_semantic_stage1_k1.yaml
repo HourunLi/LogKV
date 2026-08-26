@@ -25,7 +25,7 @@ tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/
 
 log_kv_B: 512
 log_kv_recent_size: 1024
-log_kv_train_block: 16384
+log_kv_train_block: 1024
 log_kv_prefill_block: 1024
 log_kv_second_order_scale: 0.2
 log_kv_second_order_warmup_steps: 100
