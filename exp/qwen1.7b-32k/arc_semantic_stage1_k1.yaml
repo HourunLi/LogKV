@@ -1,29 +1,27 @@
-# Base config for Qwen3-1.7B 32K SemanticLogKV Stage 1.
-arch_name: "Qwen/Qwen3-1.7B-Base"
-context_length: 32768
-expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-k64
+config: base.yaml
+
+expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-k1
+
+ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
 
 global_batch_size: 128
 micro_batch_size: 1
 max_steps: 1500
+warmup_steps: 0
 learning_rate: 5e-5
+min_lr: 5e-5
 weight_decay: 0.1
 num_devices: 8
-warmup_steps: 0
-min_lr: 5e-5
-entropy_chunk_size: 128
 
-dataset_name: "prolong"
-dataset_dir: "data"
 data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
 save_interval: 200
-save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k64
-merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_semantic_stage1_k64
+save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k1
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_semantic_stage1_k1
 
 enable_tensorboard: true
-tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k-semantic-stage1-k64
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k-semantic-stage1-k1
 
 log_kv_B: 512
 log_kv_recent_size: 1024
@@ -34,7 +32,7 @@ log_kv_second_order_warmup_steps: 100
 log_kv_pin_size: 0
 
 log_kv_semantic_clusters: true
-log_kv_cluster_k_max: 64
+log_kv_cluster_k_max: 1
 log_kv_cluster_lambda_rel: 1.0
 log_kv_seg_eta: 1.0
 log_kv_seg_g0: 2048.0

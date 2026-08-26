@@ -166,6 +166,16 @@ emit("LOG_KV_PIN", cfg.get("log_kv_pin_size", 0))
 emit("LOG_KV_PIN_OBS", cfg.get("log_kv_pin_obs_window", 64))
 emit("LOG_KV_PIN_MIN_DIST", cfg.get("log_kv_pin_min_distance", 0))
 emit("LOG_KV_SECOND_ORDER_SCALE", cfg.get("log_kv_second_order_scale", 1.0))
+emit("LOG_KV_SEMANTIC", str(bool(cfg.get("log_kv_semantic_clusters", False))).lower())
+emit("LOG_KV_CLUSTER_K_MAX", cfg.get("log_kv_cluster_k_max", 1))
+emit("LOG_KV_CLUSTER_LAMBDA_REL", cfg.get("log_kv_cluster_lambda_rel", 1.0))
+emit("LOG_KV_SEG_ETA", cfg.get("log_kv_seg_eta", 1.0))
+emit("LOG_KV_SEG_G0", cfg.get("log_kv_seg_g0", 2048.0))
+emit("LOG_KV_SEG_GAP_MAX", cfg.get("log_kv_seg_gap_max"))
+emit("LOG_KV_SEG_BLOCK_LEVEL", cfg.get("log_kv_seg_block_level", 0))
+emit("LOG_KV_SEG_FORGET", cfg.get("log_kv_seg_forget", 0.5))
+emit("LOG_KV_SEMANTIC_S_H_PATH", cfg.get("log_kv_semantic_s_h_path"))
+emit("LOG_KV_SEMANTIC_FLUSH_GRANULARITY", cfg.get("log_kv_semantic_flush_granularity", 2))
 emit("MAX_STEPS", max_steps)
 emit("NUM_EPOCHS", num_epochs)
 emit("TOKENIZER_CANDIDATES", ":".join(candidates))
@@ -276,6 +286,24 @@ LOG_KV_ARG_LIST=(--log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}
 if [ -n "${LOG_KV_SECOND_ORDER_SCALE}" ]; then
     LOG_KV_ARG_LIST+=(--log_kv_second_order_scale "${LOG_KV_SECOND_ORDER_SCALE}")
 fi
+if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
+    LOG_KV_ARG_LIST+=(
+        --log_kv_semantic_clusters true
+        --log_kv_cluster_k_max "${LOG_KV_CLUSTER_K_MAX}"
+        --log_kv_cluster_lambda_rel "${LOG_KV_CLUSTER_LAMBDA_REL}"
+        --log_kv_seg_eta "${LOG_KV_SEG_ETA}"
+        --log_kv_seg_g0 "${LOG_KV_SEG_G0}"
+        --log_kv_seg_block_level "${LOG_KV_SEG_BLOCK_LEVEL}"
+        --log_kv_seg_forget "${LOG_KV_SEG_FORGET}"
+        --log_kv_semantic_flush_granularity "${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}"
+    )
+    if [ -n "${LOG_KV_SEG_GAP_MAX}" ]; then
+        LOG_KV_ARG_LIST+=(--log_kv_seg_gap_max "${LOG_KV_SEG_GAP_MAX}")
+    fi
+    if [ -n "${LOG_KV_SEMANTIC_S_H_PATH}" ]; then
+        LOG_KV_ARG_LIST+=(--log_kv_semantic_s_h_path "${LOG_KV_SEMANTIC_S_H_PATH}")
+    fi
+fi
 DIAG_ARGS=${DIAG_ARGS:-}
 TOKENIZER_ARGS=""
 if [ -n "${TOKENIZER_SOURCE}" ]; then
@@ -288,7 +316,7 @@ fi
 
 echo "Checkpoint: ${SAVE_DIR}"
 echo "Output dir: ${EVAL_OUTPUT_DIR}"
-echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}"
+echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY})"
 if [ -n "${DIAG_ARGS}" ]; then
     echo "Extra eval args: ${DIAG_ARGS}"
 fi

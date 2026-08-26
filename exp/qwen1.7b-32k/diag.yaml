@@ -1,5 +1,5 @@
 # ==========================================
-# logKV 分支 · Qwen3-1.7B · 32K · Phase 0 诊断评测配置
+# SemanticLogKV Stage1 · Qwen3-1.7B · 32K 诊断评测配置
 # 用途：D2（score/value 归因）、D3（逐层率失真）、D5（peakiness）三张诊断图
 # 的数据来源。见 litgpt/log_kv_diag.py 模块文档 + tests/test_log_kv_diag.py。
 #
@@ -34,11 +34,8 @@
 #       --benchmark niah_single_1 --log_kv_diag_mode dense
 # ==========================================
 
-# ── 评测对象：与 exp/qwen1.7b-32k/arc.yaml 训出的 checkpoint 对齐 ──
-# pin_size 只影响推理期缓存配置、不改权重（训练期 _log_kv_train_lowmem_forward
-# 从不选钉——见 log_kv_select_pins 的 defer_last_single 门控），所以 arc/pin
-# 两个训练变体的 checkpoint 对诊断来说是等价的，选 arc 的产物即可。
-checkpoint_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV
+# ── 评测对象：与 Stage1 CPT checkpoint 对齐 ──
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k64
 tokenizer_dir: null
 
 # ── 只跑一小批样本：几十条足够画出 D2/D3/D5 的图，不需要跑全量 benchmark ──
@@ -49,7 +46,7 @@ benchmark: null
 metadata: null
 
 # ── 结果输出 ──
-output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV/diag
+output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k64/diag
 
 # ── logKV（须与训练 YAML 中的取值一致，pin 除外）──
 # null（不是 512）：同下面 log_kv_second_order_scale 的理由——写死非 null 会让
@@ -68,6 +65,16 @@ log_kv_prefill_block: 1024
 # 时直接报错拒绝，这里显式设成 0 而不是继承训练 YAML 的 256。
 log_kv_pin_size: 0
 log_kv_pin_obs_window: 64
+log_kv_semantic_clusters: true
+log_kv_cluster_k_max: 64
+log_kv_cluster_lambda_rel: 1.0
+log_kv_seg_eta: 1.0
+log_kv_seg_g0: 2048.0
+log_kv_seg_gap_max: null
+log_kv_seg_block_level: 0
+log_kv_seg_forget: 0.5
+log_kv_semantic_s_h_path: null
+log_kv_semantic_flush_granularity: 1024
 
 # ── 诊断开关：留空，每次调用用 --log_kv_diag_mode 传 ──
 # 取值：baseline | s_oracle | v_oracle | exact | dense

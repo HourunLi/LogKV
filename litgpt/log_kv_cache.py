@@ -1227,11 +1227,14 @@ class LogStructuredKVCache(nn.Module):
         *,
         record: bool,
     ) -> None:
+        if self.seg_gap_max == math.inf:
+            self._semantic_join(b, g, c, 0, token_idx, k_raw, v, pos, record=record)
+            return
         gap = int(pos.item()) - int(self.p_hi_c[b, g, c].item())
-        if self.seg_gap_max != math.inf and gap > self.seg_gap_max:
+        if gap > self.seg_gap_max:
             self._semantic_new_segment(b, g, c, token_idx, k_raw, v, pos, record=record)
-        else:
-            self._semantic_join(b, g, c, int(self.current_segment[b, g, c].item()), token_idx, k_raw, v, pos, record=record)
+            return
+        self._semantic_join(b, g, c, int(self.current_segment[b, g, c].item()), token_idx, k_raw, v, pos, record=record)
 
     def _semantic_route_k1_batch(
         self,
@@ -1267,23 +1270,30 @@ class LogStructuredKVCache(nn.Module):
 
         winner, _s_winner, direct = self._semantic_existing_assignments(k_raw, positions)
 
-        # Phase 1: frozen-centroid direct assignments, grouped by logical cluster.
+        # Phase 1: frozen-centroid direct assignments, processed in chronological
+        # order per (batch, group). Different clusters' state updates never
+        # interact within Phase 1 (Ward merges are Phase 2 only), and this keeps
+        # each cluster's own members in their original relative order, so this
+        # is bit-identical to the old "sweep every cluster id, gather its
+        # members" grouping -- without the O(K_max) nonzero() sweep per flush,
+        # which dominates wall-clock when flush batches are small relative to
+        # K_max (see docs/algorithm-spec.md §5.19 item 11).
         for b in range(k_raw.size(0)):
             for g in range(k_raw.size(1)):
-                for c in range(self.K_max):
-                    idx = torch.nonzero(direct[b, g] & (winner[b, g] == c), as_tuple=False).flatten()
-                    for i in idx.tolist():
-                        pos = positions[b, i]
-                        self._semantic_join_or_segment(
-                            b,
-                            g,
-                            c,
-                            int(pos.item()),
-                            k_raw[b, g, i],
-                            v[b, g, i],
-                            pos,
-                            record=record,
-                        )
+                idx = torch.nonzero(direct[b, g], as_tuple=False).flatten()
+                for i in idx.tolist():
+                    pos = positions[b, i]
+                    c = int(winner[b, g, i].item())
+                    self._semantic_join_or_segment(
+                        b,
+                        g,
+                        c,
+                        int(pos.item()),
+                        k_raw[b, g, i],
+                        v[b, g, i],
+                        pos,
+                        record=record,
+                    )
 
         # Phase 2: only novelty orphans are allowed to bind to orphan-created clusters.
         for b in range(k_raw.size(0)):

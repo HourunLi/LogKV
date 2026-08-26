@@ -86,9 +86,26 @@ fi
 
 echo "🔍 正在从 $CONFIG_FILE 中提取配置..."
 
-# 🌟 核心魔法：使用 Python 一行流提取 yaml 里的 save_path
-# 假设你的 yaml 里写的键名叫 save_path。如果是其他的，把下面单引号里的名字改掉
-RAW_SAVE_DIR=$(python -c "import yaml; print(yaml.safe_load(open('${CONFIG_FILE}'))['save_path'])")
+# 支持 `config:` 继承；arc.yaml 这类薄入口本身不再重复写 save_path。
+RAW_SAVE_DIR=$(python - "${CONFIG_FILE}" <<'EOF'
+import os
+import sys
+
+import yaml
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if "config" in cfg:
+        base = load(os.path.join(os.path.dirname(path), cfg.pop("config")))
+        cfg = {**base, **cfg}
+    return cfg
+
+
+print(load(sys.argv[1]).get("save_path"))
+EOF
+)
 eval SAVE_DIR="\"${RAW_SAVE_DIR}\""
 
 # 安全检查：如果没提取到，立刻报错退出
@@ -104,7 +121,7 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 # 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
 # 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS LOG_KV_PIN_MIN_DIST LOG_KV_SECOND_ORDER_SCALE SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS LOG_KV_PIN_MIN_DIST LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import os
 import sys
 
@@ -139,6 +156,8 @@ for d in (tokenizer_dir, resume_dir, ckpt_dir, os.path.join("checkpoints", arch_
     if d and d not in candidates:
         candidates.append(d)
 
+semantic_s_h_path = cfg.get("log_kv_semantic_s_h_path")
+seg_gap_max = cfg.get("log_kv_seg_gap_max")
 print(
     cfg.get("log_kv_B", 512),
     cfg.get("log_kv_recent_size", 1024),
@@ -147,6 +166,16 @@ print(
     cfg.get("log_kv_pin_obs_window", 64),
     cfg.get("log_kv_pin_min_distance", 0),
     cfg.get("log_kv_second_order_scale", 1.0),
+    str(bool(cfg.get("log_kv_semantic_clusters", False))).lower(),
+    cfg.get("log_kv_cluster_k_max", 1),
+    cfg.get("log_kv_cluster_lambda_rel", 1.0),
+    cfg.get("log_kv_seg_eta", 1.0),
+    cfg.get("log_kv_seg_g0", 2048.0),
+    "__none__" if seg_gap_max is None else seg_gap_max,
+    cfg.get("log_kv_seg_block_level", 0),
+    cfg.get("log_kv_seg_forget", 0.5),
+    "__none__" if semantic_s_h_path is None else semantic_s_h_path,
+    cfg.get("log_kv_semantic_flush_granularity", 2),
     str(bool(cfg.get("save_ckpt", False))).lower(),
     max_steps,
     num_epochs,
@@ -154,6 +183,18 @@ print(
 )
 EOF
 )"
+
+if [ "${LOG_KV_SEMANTIC}" != "true" ]; then
+    echo "❌ 致命错误：${CONFIG_FILE} 没有开启 log_kv_semantic_clusters=true。"
+    echo "   当前分支只允许 Stage1 SemanticLogKV CPT，避免误跑旧 LogKV。"
+    exit 1
+fi
+
+if [ "${LOG_KV_PIN}" != "0" ]; then
+    echo "❌ 致命错误：${CONFIG_FILE} 设置了 log_kv_pin_size=${LOG_KV_PIN}。"
+    echo "   当前 Stage1 CPT 默认禁用 pin，请设为 0。"
+    exit 1
+fi
 
 checkpoint_exists() {
     [ -f "$1" ] || { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
@@ -263,6 +304,15 @@ for RAW_TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
 done
 
 LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_pin_size ${LOG_KV_PIN} --log_kv_pin_obs_window ${LOG_KV_PIN_OBS} --log_kv_pin_min_distance ${LOG_KV_PIN_MIN_DIST} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
+if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
+    LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}"
+    if [ "${LOG_KV_SEG_GAP_MAX}" != "__none__" ]; then
+        LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_seg_gap_max ${LOG_KV_SEG_GAP_MAX}"
+    fi
+    if [ "${LOG_KV_SEMANTIC_S_H_PATH}" != "__none__" ]; then
+        LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_s_h_path ${LOG_KV_SEMANTIC_S_H_PATH}"
+    fi
+fi
 DIAG_ARGS=${DIAG_ARGS:-}
 TOKENIZER_ARGS=""
 if [ -n "${TOKENIZER_SOURCE}" ]; then
@@ -272,7 +322,7 @@ else
     echo "⚠️ 未在候选目录中找到 tokenizer.json/tokenizer.model: ${TOKENIZER_CANDIDATES}"
     echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
 fi
-echo "🧩 logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}"
+echo "🧩 logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY})"
 if [ -n "${DIAG_ARGS}" ]; then
     echo "🧪 extra eval args: ${DIAG_ARGS}"
 fi
