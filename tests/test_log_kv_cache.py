@@ -78,6 +78,7 @@ def make_semantic_cache(
     seg_gap_max: float | None = None,
     seg_block_level: int = 0,
     semantic_s_h: torch.Tensor | float | None = 1.0,
+    semantic_flush_granularity: int = 2,
 ) -> LogStructuredKVCache:
     cos, sin = build_rope_cache(max_seq_length, k_dim)
     return LogStructuredKVCache(
@@ -93,6 +94,7 @@ def make_semantic_cache(
         seg_gap_max=seg_gap_max,
         seg_block_level=seg_block_level,
         semantic_s_h=semantic_s_h,
+        semantic_flush_granularity=semantic_flush_granularity,
         cos_cache=cos,
         sin_cache=sin,
         rope_n_elem=k_dim,
@@ -1442,6 +1444,19 @@ class TestSemanticLogKV:
         for start in range(0, 8, 4):
             end = start + 4
             b.add_recent(k_raw[:, :, start:end], v[:, :, start:end], k_raw=k_raw[:, :, start:end], input_pos=torch.arange(start, end))
+
+        assert_cache_states_bit_identical(a, b)
+
+    def test_semantic_flush_granularity_keeps_kmax1_state(self):
+        torch.manual_seed(321)
+        a = make_semantic_cache(K_max=1, n_groups=1, B=4, recent_size=4)
+        b = make_semantic_cache(K_max=1, n_groups=1, B=4, recent_size=4, semantic_flush_granularity=4)
+        k_raw = torch.randn(1, 1, 8, 8)
+        v = torch.randn(1, 1, 8, 8)
+
+        for cache in (a, b):
+            cache.add_recent(k_raw[:, :, :4], v[:, :, :4], k_raw=k_raw[:, :, :4], input_pos=torch.arange(4))
+            cache.add_recent(k_raw[:, :, 4:], v[:, :, 4:], k_raw=k_raw[:, :, 4:], input_pos=torch.arange(4, 8))
 
         assert_cache_states_bit_identical(a, b)
 

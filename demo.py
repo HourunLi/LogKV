@@ -554,6 +554,7 @@ def main(
     log_kv_seg_block_level: int = 0,
     log_kv_seg_forget: float = 0.5,
     log_kv_semantic_s_h_path: str | None = None,
+    log_kv_semantic_flush_granularity: int = 2,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -644,6 +645,9 @@ def main(
     log_kv_seg_block_level = int(_o("log_kv_seg_block_level", log_kv_seg_block_level))
     log_kv_seg_forget = float(_o("log_kv_seg_forget", log_kv_seg_forget))
     log_kv_semantic_s_h_path = _o("log_kv_semantic_s_h_path", log_kv_semantic_s_h_path)
+    log_kv_semantic_flush_granularity = int(
+        _o("log_kv_semantic_flush_granularity", log_kv_semantic_flush_granularity)
+    )
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
@@ -811,6 +815,7 @@ def main(
             log_kv_seg_block_level=log_kv_seg_block_level,
             log_kv_seg_forget=log_kv_seg_forget,
             log_kv_semantic_s_h_path=log_kv_semantic_s_h_path,
+            log_kv_semantic_flush_granularity=log_kv_semantic_flush_granularity,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -955,6 +960,7 @@ def main(
         seg_block_level=log_kv_seg_block_level,
         seg_forget=log_kv_seg_forget,
         semantic_s_h=semantic_s_h,
+        semantic_flush_granularity=log_kv_semantic_flush_granularity,
     )
     fabric.print(
         f"logKV training ENABLED: B={log_kv_B}, "
@@ -973,6 +979,7 @@ def main(
         f"semantic={log_kv_semantic_clusters} "
         f"(K={log_kv_cluster_k_max}, lambda_rel={log_kv_cluster_lambda_rel}, "
         f"g_max={log_kv_seg_gap_max}, l_block={log_kv_seg_block_level}, "
+        f"flush={log_kv_semantic_flush_granularity}, "
         f"s_h={log_kv_semantic_s_h_path})"
     )
 

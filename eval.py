@@ -528,6 +528,7 @@ class LogKVLM(LM):
         log_kv_seg_block_level: int = 0,
         log_kv_seg_forget: float = 0.5,
         log_kv_semantic_s_h_path: str | None = None,
+        log_kv_semantic_flush_granularity: int = 2,
         tokenizer_dir: str | None = None,
         pin_diag_recorder: PinDiagRecorder | None = None,
     ):
@@ -554,6 +555,7 @@ class LogKVLM(LM):
         self.log_kv_seg_block_level = int(log_kv_seg_block_level)
         self.log_kv_seg_forget = float(log_kv_seg_forget)
         self.log_kv_semantic_s_h_path = log_kv_semantic_s_h_path
+        self.log_kv_semantic_flush_granularity = int(log_kv_semantic_flush_granularity)
         self.pin_diag_recorder = pin_diag_recorder
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
@@ -675,6 +677,7 @@ class LogKVLM(LM):
             seg_block_level=self.log_kv_seg_block_level,
             seg_forget=self.log_kv_seg_forget,
             semantic_s_h=self.log_kv_semantic_s_h,
+            semantic_flush_granularity=self.log_kv_semantic_flush_granularity,
         )
         self._eval_cache_ready = True
 
@@ -1047,6 +1050,7 @@ def main(
     log_kv_seg_block_level: int = 0,
     log_kv_seg_forget: float = 0.5,
     log_kv_semantic_s_h_path: str | None = None,
+    log_kv_semantic_flush_granularity: int = 2,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1143,6 +1147,9 @@ def main(
     log_kv_seg_block_level = int(_o("log_kv_seg_block_level", log_kv_seg_block_level))
     log_kv_seg_forget = float(_o("log_kv_seg_forget", log_kv_seg_forget))
     log_kv_semantic_s_h_path = _o("log_kv_semantic_s_h_path", log_kv_semantic_s_h_path)
+    log_kv_semantic_flush_granularity = int(
+        _o("log_kv_semantic_flush_granularity", log_kv_semantic_flush_granularity)
+    )
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
     limit = _o("limit", limit)
     log_kv_diag_mode = _o("log_kv_diag_mode", log_kv_diag_mode)
@@ -1262,6 +1269,7 @@ def main(
                 f"semantic: {log_kv_semantic_clusters} "
                 f"(K={log_kv_cluster_k_max}, lambda_rel={log_kv_cluster_lambda_rel}, "
                 f"g_max={log_kv_seg_gap_max}, l_block={log_kv_seg_block_level}, "
+                f"flush={log_kv_semantic_flush_granularity}, "
                 f"s_h={log_kv_semantic_s_h_path})"
             )
         if diag_active:
@@ -1317,6 +1325,7 @@ def main(
             log_kv_seg_block_level=log_kv_seg_block_level,
             log_kv_seg_forget=log_kv_seg_forget,
             log_kv_semantic_s_h_path=log_kv_semantic_s_h_path,
+            log_kv_semantic_flush_granularity=log_kv_semantic_flush_granularity,
             tokenizer_dir=tokenizer_dir,
             pin_diag_recorder=pin_diag_recorder,
         )
@@ -1423,6 +1432,7 @@ def main(
                         "log_kv_seg_block_level": log_kv_seg_block_level,
                         "log_kv_seg_forget": log_kv_seg_forget,
                         "log_kv_semantic_s_h_path": log_kv_semantic_s_h_path,
+                        "log_kv_semantic_flush_granularity": log_kv_semantic_flush_granularity,
                         "radius": log_kv_pin_diag_radius,
                         "max_samples": log_kv_pin_diag_max_samples,
                         "include_indices": log_kv_pin_diag_include_indices,
@@ -1466,6 +1476,7 @@ def main(
                         "log_kv_seg_block_level": log_kv_seg_block_level,
                         "log_kv_seg_forget": log_kv_seg_forget,
                         "log_kv_semantic_s_h_path": log_kv_semantic_s_h_path,
+                        "log_kv_semantic_flush_granularity": log_kv_semantic_flush_granularity,
                         "window_from_end": log_kv_pin_score_diag_window_from_end,
                     },
                     "pin_score_diag": pin_score_diag_summary,
@@ -1516,6 +1527,7 @@ def main(
                     "log_kv_seg_block_level": log_kv_seg_block_level,
                     "log_kv_seg_forget": log_kv_seg_forget,
                     "log_kv_semantic_s_h_path": log_kv_semantic_s_h_path,
+                    "log_kv_semantic_flush_granularity": log_kv_semantic_flush_granularity,
                     "results": results,
                 }
 
