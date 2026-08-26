@@ -98,7 +98,7 @@ python unused/semantic_s0_analyze.py '<out_dir>/*.json' --csv <out_dir>/summary.
 按 `algorithm-spec.md` §5.18 顺序落地。默认关闭时必须保持现有数值行为；接口 breaking
 迁移（`CacheAttentionState`）要和所有调用点同一改动完成。
 
-### Stage 2 - eval-time 探测
+### Stage 2 - eval-time 探测（归档，可选）
 
 新结构对旧 CPT 权重可能分布外，先看形状，不看绝对分数。
 
@@ -108,19 +108,17 @@ python unused/semantic_s0_analyze.py '<out_dir>/*.json' --csv <out_dir>/summary.
 | B: 纯语义 | `η=0, g_max=inf`，隔离时序分段贡献 |
 | C: 主实验 | 使用 Stage 0 选出的 `lambda_rel/K_max:B′/g_max/ℓ_block` |
 
-示例：
+当前执行口径：不再先跑 smoke/eval-time 探测，直接开 Stage1 K64 CPT。
 
 ```bash
-DIAG_ARGS="--log_kv_semantic_clusters true --log_kv_cluster_k_max 16 \
-  --log_kv_cluster_lambda_rel 1.0 --log_kv_seg_gap_max 4096 \
-  --log_kv_seg_block_level 1" \
-    bash majob.sh exp/qwen1.7b-32k/arc_warmup.yaml
+bash majob.sh exp/qwen1.7b-32k/arc.yaml
 ```
 
 ### Stage 3 - CPT
 
-Stage 2 有信号后再训练。v1 没有新的连续标量需要 warmup；若纳入 Γ delta-rule，沿用
-`second_order_scale` 的谨慎 warmup 思路。
+当前默认就是 Stage1 K64 CPT；K_max=1 只保留为显式正确性基线，不作为速度入口。
+v1 没有新的连续标量需要 warmup；若纳入 Γ delta-rule，沿用 `second_order_scale`
+的谨慎 warmup 思路。
 
 ## 7. 消融表
 

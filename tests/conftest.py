@@ -1,5 +1,7 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
+from __future__ import annotations
+
 import gc
 import os
 import shutil

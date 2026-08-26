@@ -1,46 +1,45 @@
-# ==========================================
-# Base config for Qwen3-1.7B with 32K context (logKV branch)
-# ==========================================
+# Base config for Qwen3-1.7B 32K SemanticLogKV Stage 1.
 arch_name: "Qwen/Qwen3-1.7B-Base"
 context_length: 32768
+expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-k64
 
-# Training hyperparams
 global_batch_size: 128
-micro_batch_size: 2
-max_steps: 300
-learning_rate: 2e-5
+micro_batch_size: 1
+max_steps: 1500
+learning_rate: 5e-5
 weight_decay: 0.1
-num_devices: 1
-warmup_steps: 5
-min_lr: 2e-6
+num_devices: 8
+warmup_steps: 0
+min_lr: 5e-5
 entropy_chunk_size: 128
 
-# Data & IO
-dataset_name: "debug"
+dataset_name: "prolong"
 dataset_dir: "data"
-data_dir: "data"
+data_dir: /workspace/longcontext/prolong/data
 num_workers: 16
-# 必须为 true：majob.sh 流水线在训练后固定评测 save_path，
-# save_ckpt: false 时不会写任何 checkpoint（含 tokenizer 文件），eval 必然失败。
 save_ckpt: true
-save_path: "./ckpt/qwen1.7b-32k-debug"
+save_interval: 200
+save_path: /workspace/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k64
+merged_state_staging_dir: /workspace/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_semantic_stage1_k64
 
-# TensorBoard
 enable_tensorboard: true
-tensorboard_root: "./tb"
+tensorboard_root: /workspace/${MY_REAL_NAME-default}/tb-32k-semantic-stage1-k64
 
-# Log-structured KV cache (uniform 2:1 compaction)
 log_kv_B: 512
 log_kv_recent_size: 1024
-log_kv_train_block: 1024
+log_kv_train_block: 16384
 log_kv_prefill_block: 1024
+log_kv_second_order_scale: 0.2
+log_kv_second_order_warmup_steps: 100
+log_kv_pin_size: 0
 
-# 显著性钉扎（SnapKV 式观察窗；仅评测推理用，训练不受影响，随 run_eval/majob
-# 转发给 eval.py）。prefill 时 prompt 末尾 obs_window 个 query 给全前缀打分，
-# 每个 KV 组各钉 pin_size 个 token 为精确槽，免于被 mean-pool 稀释——
-# 针对捞针（NIAH）类任务。0 = 关闭。
-log_kv_pin_size: 256
-log_kv_pin_obs_window: 64
-log_kv_pin_min_distance: 64
-
-
+log_kv_semantic_clusters: true
+log_kv_cluster_k_max: 64
+log_kv_cluster_lambda_rel: 1.0
+log_kv_seg_eta: 1.0
+log_kv_seg_g0: 2048.0
+log_kv_seg_gap_max: null
+log_kv_seg_block_level: 0
+log_kv_seg_forget: 0.5
+log_kv_semantic_s_h_path: null
+log_kv_semantic_flush_granularity: 1024

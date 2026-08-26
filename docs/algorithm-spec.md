@@ -290,6 +290,18 @@ Function 后梯度返回 `None`，沿用现有 stop-gradient-through-cache 训�
     `nonzero()`/布尔索引）；判定阶段（`_semantic_existing_assignments`）已经是纯张量运算，
     但 `_semantic_join_or_segment`/`_semantic_join`/`_semantic_new_cluster` 这条 Phase 1
     写入路径每次调用仍有多次 `.item()`，比算法复杂度本身更致命。
+12. 把 `centroid`/`n_eff` 这类 running mean 从逐 token 顺序累加改成整批
+    sum/count 一次性计算，在实数运算上和原来等价，但浮点不满足结合律，最后一位
+    bit 会和顺序累加不一样——实测跑出过 `centroid` mismatch（构造一批同一 flush
+    内多个 token 落进同一簇的 case 即可复现）。`route_and_flush_batch` 的
+    `replay_op_log` 分支处理 `JOIN` 时调用的还是逐 token 的
+    `_semantic_join`/`_semantic_update_member_metadata`；只批量化 forward、
+    不同步改 replay，forward 用来算 attention 读出的值和 backward 重放后的值就
+    会产生真实（虽然量级很小）的偏差，破坏 §11.A 说的"backward 只读 op_log
+    重放，不重算"这个前提。同样的风险对 ladder entry 的 mean-merge（`compact()`）
+    也成立。要批量化任何 mean-merge 状态，必须让 forward 和 replay 用同一套批量
+    计算顺序，不能只改一半——这比看起来更容易踩坑，验证时必须包含
+    op_log-replay 往返比对，不能只比 forward 后的终态。
 
 ### 5.20 复用边界
 
