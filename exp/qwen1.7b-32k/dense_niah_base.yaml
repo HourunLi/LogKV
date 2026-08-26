@@ -1,8 +1,6 @@
 # ==========================================
 # Dense（未压缩）attention baseline · 未经 CPT 的原始 Qwen3-1.7B-Base
-# 配合 arc_warmup.yaml + DIAG_ARGS="--log_kv_dense_mode true --log_kv_pin_size 0"
-# 跑出的 CPT-dense 结果对比，回答"CPT 本身有没有在稠密注意力下把长上下文
-# 检索能力练出来"。
+# 原始 dense baseline，用来和 Stage1 CPT 后的 dense/logKV 结果对比。
 #
 # 用法（eval-only，不经 majob.sh）:
 #   bash eval.sh exp/qwen1.7b-32k/dense_niah_base.yaml none niah_single_1,niah_single_2,niah_single_3
