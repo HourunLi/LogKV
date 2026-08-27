@@ -167,6 +167,9 @@ position = p_needle 上的标准 RoPE
 最坏情况下内容不可压缩，`K_max` 绑定触发 Ward 合并，结构退化成“少数大簇 + 位置序
 ladder”。这是有界内存的质量降级，不是 OOM。
 
+新增的 capacity-aware routing / hard cap 是对上面默认立场的修正：不再只被动接受
+大簇塌缩，而是在路由和 Ward 合并时提前干预；默认关闭，方便和旧基线对比。
+
 ## 9. 相关工作定位
 
 | 工作 | 区别 |
