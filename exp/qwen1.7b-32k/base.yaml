@@ -28,7 +28,7 @@ save_path: /workspace/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-stage1-k64
 merged_state_staging_dir: /workspace/ckpt-logKV/_fsdp_staging_semantic_stage1_k64
 
 
-log_kv_B: 512
+log_kv_B: 1014
 log_kv_recent_size: 1024
 log_kv_train_block: 1024
 log_kv_prefill_block: 1024
