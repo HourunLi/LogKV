@@ -1,6 +1,6 @@
 config: base.yaml
 
-expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-k1
+expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-k1-b512
 
 ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
 
@@ -17,11 +17,11 @@ data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/
 num_workers: 16
 save_ckpt: true
 save_interval: 200
-save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k1
-merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_semantic_stage1_k1
+save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k1-b512
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_semantic_stage1_k1_b512
 
 enable_tensorboard: true
-tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k-semantic-stage1-k1
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k-semantic-stage1-k1-b512
 
 log_kv_B: 512
 log_kv_recent_size: 1024
