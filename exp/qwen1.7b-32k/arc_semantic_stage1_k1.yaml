@@ -1,6 +1,6 @@
 config: base.yaml
 
-expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-k1
+expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-k1-b512
 
 ckpt_dir: /workspace/checkpoints/Qwen/Qwen3-1.7B-Base/
 
@@ -17,8 +17,8 @@ data_dir: /workspace/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
 save_interval: 200
-save_path: /workspace/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-stage1-k1
-merged_state_staging_dir: /workspace/ckpt-logKV/_fsdp_staging_semantic_stage1_k1
+save_path: /workspace/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-stage1-k1-b512
+merged_state_staging_dir: /workspace/ckpt-logKV/_fsdp_staging_semantic_stage1_k1_b512
 
 enable_tensorboard: true
 tensorboard_root: /workspace/tb-32k-semantic-stage1-k1
