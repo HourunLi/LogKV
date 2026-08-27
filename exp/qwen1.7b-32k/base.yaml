@@ -48,3 +48,10 @@ log_kv_semantic_s_h_path: null
 log_kv_semantic_flush_granularity: 1024
 log_kv_semantic_capacity_beta: 0.0
 log_kv_semantic_capacity_hard_cap_mult: 0.0
+
+# eval 覆盖：训练仍是 K_max=1（这份 base.yaml 上面那套值），eval 切到真实语义
+# 聚类。majob.sh 里 K_max/B' 只通过乘积决定预算，两个必须一起给——见下面
+# semantic budget 那道硬拦截。B=128 是 K=16 时验证过的安全值（S≈43008，约
+# 1.31×N），不是随便抄训练的 B。
+eval_log_kv_cluster_k_max: 16
+eval_log_kv_B: 128
