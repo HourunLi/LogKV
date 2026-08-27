@@ -35,7 +35,7 @@
 # ==========================================
 
 # ── 评测对象：与 Stage1 CPT checkpoint 对齐 ──
-checkpoint_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k64
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k64
 tokenizer_dir: null
 
 # ── 只跑一小批样本：几十条足够画出 D2/D3/D5 的图，不需要跑全量 benchmark ──
@@ -46,7 +46,7 @@ benchmark: null
 metadata: null
 
 # ── 结果输出 ──
-output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k64/diag
+output_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-k64/diag
 
 # ── logKV（须与训练 YAML 中的取值一致，pin 除外）──
 # null（不是 512）：同下面 log_kv_second_order_scale 的理由——写死非 null 会让

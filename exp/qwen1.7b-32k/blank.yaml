@@ -17,11 +17,11 @@ data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/
 num_workers: 16
 save_ckpt: true
 save_interval: 10000
-save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-long
-merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_semantic_stage1_long
+save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-long
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/_fsdp_staging_semantic_stage1_long
 
 enable_tensorboard: true
-tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k-semantic-stage1-long
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic-stage1-long
 
 log_kv_B: 512
 log_kv_recent_size: 1024
