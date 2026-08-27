@@ -373,6 +373,8 @@ class GPT(nn.Module):
         seg_forget: float = 0.5,
         semantic_s_h: torch.Tensor | float | None = None,
         semantic_flush_granularity: int = 2,
+        semantic_capacity_beta: float = 0.0,
+        semantic_capacity_hard_cap_mult: float = 0.0,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -462,6 +464,8 @@ class GPT(nn.Module):
                 seg_forget=seg_forget,
                 semantic_s_h=block_s_h,
                 semantic_flush_granularity=semantic_flush_granularity,
+                semantic_capacity_beta=semantic_capacity_beta,
+                semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -549,6 +553,8 @@ class GPT(nn.Module):
         seg_forget: float = 0.5,
         semantic_s_h: torch.Tensor | float | None = None,
         semantic_flush_granularity: int = 2,
+        semantic_capacity_beta: float = 0.0,
+        semantic_capacity_hard_cap_mult: float = 0.0,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -632,6 +638,8 @@ class GPT(nn.Module):
                 seg_forget=seg_forget,
                 semantic_s_h=block_s_h,
                 semantic_flush_granularity=semantic_flush_granularity,
+                semantic_capacity_beta=semantic_capacity_beta,
+                semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -1606,6 +1614,8 @@ class CausalSelfAttention(nn.Module):
         seg_forget: float = 0.5,
         semantic_s_h: torch.Tensor | float | None = None,
         semantic_flush_granularity: int = 2,
+        semantic_capacity_beta: float = 0.0,
+        semantic_capacity_hard_cap_mult: float = 0.0,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
     ) -> "LogStructuredKVCache":
@@ -1663,6 +1673,8 @@ class CausalSelfAttention(nn.Module):
             seg_forget=seg_forget,
             semantic_s_h=semantic_s_h,
             semantic_flush_granularity=semantic_flush_granularity,
+            semantic_capacity_beta=semantic_capacity_beta,
+            semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,
