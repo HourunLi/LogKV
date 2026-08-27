@@ -43,7 +43,7 @@ Compute: O(recent_size + B·log(N/2)) per query — no Θ(N) term.
 from __future__ import annotations
 
 import math
-from typing import NamedTuple, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
 import torch
 import torch.nn as nn
@@ -318,6 +318,8 @@ class LogStructuredKVCache(nn.Module):
         seg_forget: float = 0.5,
         semantic_s_h: torch.Tensor | float | None = None,
         semantic_flush_granularity: int = 2,
+        semantic_capacity_beta: float = 0.0,
+        semantic_capacity_hard_cap_mult: float = 0.0,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
         rope_n_elem: int | None = None,
@@ -388,6 +390,18 @@ class LogStructuredKVCache(nn.Module):
                     "semantic_flush_granularity must be in [1, recent_size], got "
                     f"{semantic_flush_granularity} for recent_size={self.recent_size}"
                 )
+            self.semantic_capacity_beta = float(semantic_capacity_beta)
+            if not (math.isfinite(self.semantic_capacity_beta) and self.semantic_capacity_beta >= 0.0):
+                raise ValueError(f"semantic_capacity_beta must be finite >= 0, got {semantic_capacity_beta}")
+            self.semantic_capacity_hard_cap_mult = float(semantic_capacity_hard_cap_mult)
+            if not (
+                math.isfinite(self.semantic_capacity_hard_cap_mult)
+                and self.semantic_capacity_hard_cap_mult >= 0.0
+            ):
+                raise ValueError(
+                    "semantic_capacity_hard_cap_mult must be finite >= 0, got "
+                    f"{semantic_capacity_hard_cap_mult}"
+                )
             self.rope_n_elem = int(rope_n_elem)
             self.register_buffer("cos_cache", cos_cache.to(device=device), persistent=False)
             self.register_buffer("sin_cache", sin_cache.to(device=device), persistent=False)
@@ -402,6 +416,8 @@ class LogStructuredKVCache(nn.Module):
             self.seg_block_level = 0
             self.seg_forget = 1.0
             self.semantic_flush_granularity = 2
+            self.semantic_capacity_beta = 0.0
+            self.semantic_capacity_hard_cap_mult = 0.0
             self.rope_n_elem = None
             self.cos_cache = None
             self.sin_cache = None
@@ -1117,6 +1133,18 @@ class LogStructuredKVCache(nn.Module):
             entries.extend(self._semantic_slot_entry(b, g, c, ell, idx) for idx in range(count))
         return sorted(entries, key=lambda entry: int(entry[11].item()))
 
+    def _semantic_capacity_target(self) -> float:
+        return max(float(self.max_seq_length) / max(self.K_max, 1), 1.0)
+
+    def _semantic_hard_cap(self) -> float:
+        if self.semantic_capacity_hard_cap_mult <= 0.0:
+            return math.inf
+        return self._semantic_capacity_target() * self.semantic_capacity_hard_cap_mult
+
+    def _semantic_can_accept(self, b: int, g: int, c: int, extra: int = 1) -> bool:
+        cap = self._semantic_hard_cap()
+        return cap == math.inf or float(self.n_total[b, g, c].item() + extra) <= cap
+
     def _semantic_ward_pair(self, b: int, g: int) -> tuple[int, int]:
         alive = self.alive[b, g]
         idx = torch.nonzero(alive, as_tuple=False).flatten()
@@ -1128,6 +1156,11 @@ class LogStructuredKVCache(nn.Module):
         dist2 = diff.square().sum(dim=-1)
         cost = (n[:, None] * n[None, :] / (n[:, None] + n[None, :]).clamp_min(1.0)) * dist2
         cost.fill_diagonal_(float("inf"))
+        cap = self._semantic_hard_cap()
+        if cap != math.inf:
+            capped = cost.masked_fill((n[:, None] + n[None, :]) > cap, float("inf"))
+            if bool(torch.isfinite(capped).any().item()):
+                cost = capped
         flat = int(cost.flatten().argmin().item())
         i = flat // idx.numel()
         j = flat % idx.numel()
@@ -1201,11 +1234,22 @@ class LogStructuredKVCache(nn.Module):
         gap = (positions[:, None, :, None].to(self.p_hi_c.dtype) - self.p_hi_c[: k_raw.size(0), : k_raw.size(1)].unsqueeze(2))
         gap = gap.float().clamp_min(0.0)
         temporal = self.seg_eta * (gap / (gap + self.seg_g0))
-        cost = (semantic + temporal).masked_fill(~live.unsqueeze(2), float("inf"))
+        cost = semantic + temporal
+        if self.semantic_capacity_beta > 0.0:
+            target = self._semantic_capacity_target()
+            load = self.n_total[: k_raw.size(0), : k_raw.size(1)].float() / target
+            over = (load - 1.0).clamp_min(0.0)
+            penalty = self.semantic_capacity_beta * self.s_h[: k_raw.size(0), : k_raw.size(1)].unsqueeze(-1) * over.square()
+            cost = cost + penalty.unsqueeze(2)
+        cost = cost.masked_fill(~live.unsqueeze(2), float("inf"))
         winner = cost.argmin(dim=-1)
         s_winner = semantic.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
         has_alive = live.any(dim=-1).unsqueeze(-1)
         direct = has_alive & (s_winner <= self.cluster_lambda_rel * self.s_h[: k_raw.size(0), : k_raw.size(1)].unsqueeze(-1))
+        cap = self._semantic_hard_cap()
+        if cap != math.inf:
+            n_winner = self.n_total[: k_raw.size(0), : k_raw.size(1)].gather(-1, winner).float()
+            direct = direct & ((n_winner + 1.0) <= cap)
         return winner, s_winner, direct
 
     def _semantic_replay_token_offset(self, positions: torch.Tensor, b: int, token_idx: int) -> int:
@@ -1284,6 +1328,9 @@ class LogStructuredKVCache(nn.Module):
                 for i in idx.tolist():
                     pos = positions[b, i]
                     c = int(winner[b, g, i].item())
+                    if not self._semantic_can_accept(b, g, c):
+                        direct[b, g, i] = False
+                        continue
                     self._semantic_join_or_segment(
                         b,
                         g,
@@ -1304,10 +1351,14 @@ class LogStructuredKVCache(nn.Module):
                     pos = positions[b, i]
                     token_idx = int(pos.item())
                     if batch_clusters:
-                        cand = torch.tensor(batch_clusters, device=self.alive.device, dtype=torch.long)
+                        accept_clusters = [c for c in batch_clusters if self._semantic_can_accept(b, g, c)]
+                        cand = torch.tensor(accept_clusters, device=self.alive.device, dtype=torch.long)
+                    else:
+                        cand = self.alive.new_empty(0, dtype=torch.long)
+                    if cand.numel() > 0:
                         dist = (self.centroid[b, g, cand] - k_raw[b, g, i].float()).square().sum(dim=-1)
                         j = int(dist.argmin().item())
-                        c = int(batch_clusters[j])
+                        c = int(cand[j].item())
                         if bool((dist[j] <= self.cluster_lambda_rel * self.s_h[b, g]).item()):
                             self._semantic_join_or_segment(
                                 b, g, c, token_idx, k_raw[b, g, i], v[b, g, i], pos, record=record
@@ -2465,6 +2516,35 @@ class LogStructuredKVCache(nn.Module):
     def total_tokens_covered(self) -> int:
         return self.token_count
 
+    def semantic_cluster_stats(self) -> dict[str, Any]:
+        if not self.semantic_clusters:
+            return {"semantic_clusters": False}
+        with torch.no_grad():
+            alive = self.alive.detach()
+            n = self.n_total.detach().to(torch.float32)
+            target = self._semantic_capacity_target()
+            live_counts = alive.sum(dim=-1).to(torch.float32)
+            max_tokens = n.masked_fill(~alive, 0).max(dim=-1).values
+            live_n = n[alive]
+            ratios = max_tokens / target
+            top_counts = self.level_count[..., -1].detach().to(torch.float32)
+            top_live = top_counts.masked_fill(~alive, 0)
+            return {
+                "semantic_clusters": True,
+                "target_tokens_per_cluster": target,
+                "K_max_binding_rate": float((live_counts >= self.K_max).to(torch.float32).mean().item()),
+                "live_clusters_mean": float(live_counts.mean().item()),
+                "live_clusters_min": int(live_counts.min().item()),
+                "live_clusters_max": int(live_counts.max().item()),
+                "max_cluster_tokens_mean": float(max_tokens.mean().item()),
+                "max_cluster_tokens_max": int(max_tokens.max().item()),
+                "max_cluster_tokens_over_target_mean": float(ratios.mean().item()),
+                "max_cluster_tokens_over_target_max": float(ratios.max().item()),
+                "live_cluster_tokens_mean": float(live_n.mean().item()) if live_n.numel() else 0.0,
+                "top_level_live_slots": int(top_live.sum().item()),
+                "top_level_full_clusters": int(((top_counts >= self.B) & alive).sum().item()),
+            }
+
 
 # ======================================================================
 # Slot attention: merged-position slots + log-multiplicity mass bias
@@ -2695,7 +2775,9 @@ def log_kv_slot_attention(
             scores[..., :s_pooled].masked_fill_(
                 (~slot_valid)[:, :, None, None, :], float("-inf")
             )
-            if not torch.isfinite(scores).any(dim=-1).all():
+            # Avoid materializing an S-sized bool tensor; masked rows have
+            # max=-inf, valid rows have a finite max.
+            if not torch.isfinite(scores.amax(dim=-1)).all():
                 raise ValueError("log_kv_slot_attention(): a query row has no valid slot")
         attn = torch.softmax(scores, dim=-1).to(q.dtype)     # (B, nkv, rf, T_q, S)
         if pin_score_diag_active:
@@ -2751,7 +2833,8 @@ def log_kv_slot_attention(
     if slot_valid is not None:
         s_pooled = slot_valid.size(-1)
         scores[..., :s_pooled].masked_fill_((~slot_valid).unsqueeze(-2), float("-inf"))
-        if not torch.isfinite(scores).any(dim=-1).all():
+        # Same check as isfinite(scores).any(dim=-1), without an S-sized bool tensor.
+        if not torch.isfinite(scores.amax(dim=-1)).all():
             raise ValueError("log_kv_slot_attention(): a query row has no valid slot")
     attn = torch.softmax(scores, dim=-1).to(q.dtype)  # (B, nh, T_q, S)
     if pin_score_diag_active:

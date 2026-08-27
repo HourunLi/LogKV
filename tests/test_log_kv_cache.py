@@ -79,6 +79,8 @@ def make_semantic_cache(
     seg_block_level: int = 0,
     semantic_s_h: torch.Tensor | float | None = 1.0,
     semantic_flush_granularity: int = 2,
+    semantic_capacity_beta: float = 0.0,
+    semantic_capacity_hard_cap_mult: float = 0.0,
 ) -> LogStructuredKVCache:
     cos, sin = build_rope_cache(max_seq_length, k_dim)
     return LogStructuredKVCache(
@@ -95,6 +97,8 @@ def make_semantic_cache(
         seg_block_level=seg_block_level,
         semantic_s_h=semantic_s_h,
         semantic_flush_granularity=semantic_flush_granularity,
+        semantic_capacity_beta=semantic_capacity_beta,
+        semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
         cos_cache=cos,
         sin_cache=sin,
         rope_n_elem=k_dim,
@@ -1430,6 +1434,62 @@ class TestSemanticLogKV:
         c._semantic_ward_merge(0, 0, 0, 1, record=False)
 
         assert int(c.level0_phase[0, 0, 0].item()) == expected
+
+    def test_capacity_penalty_prefers_less_loaded_cluster(self):
+        c = make_semantic_cache(K_max=2, n_groups=1, max_seq_length=8, cluster_lambda_rel=10.0, semantic_capacity_beta=10.0)
+        c.alive[0, 0, :2] = True
+        c.centroid[0, 0, 0].zero_()
+        c.centroid[0, 0, 1].zero_()
+        c.centroid[0, 0, 1, 0] = 0.5
+        c.n_total[0, 0] = torch.tensor([8, 0], dtype=torch.int32)
+        c.p_hi_c[0, 0] = torch.tensor([0, 0])
+
+        winner, s_winner, direct = c._semantic_existing_assignments(
+            torch.zeros(1, 1, 1, 8),
+            torch.tensor([[1]]),
+        )
+
+        assert int(winner[0, 0, 0].item()) == 1
+        assert bool(direct[0, 0, 0].item())
+        assert s_winner[0, 0, 0].item() == pytest.approx(0.25)
+
+    def test_hard_cap_forces_split_before_joining_overfull_cluster(self):
+        c = make_semantic_cache(
+            K_max=2,
+            n_groups=1,
+            max_seq_length=8,
+            cluster_lambda_rel=10.0,
+            semantic_capacity_hard_cap_mult=1.0,
+        )
+        c.alive[0, 0, 0] = True
+        c.centroid[0, 0, 0].zero_()
+        c.n_eff[0, 0, 0] = 4.0
+        c.n_total[0, 0, 0] = 4
+        c.p_hi_c[0, 0, 0] = 3
+
+        c.route_and_flush_batch(torch.zeros(1, 1, 1, 8), torch.randn(1, 1, 1, 8), torch.tensor([4]))
+
+        assert int(c.n_total[0, 0, 0].item()) == 4
+        assert bool(c.alive[0, 0, 1].item())
+        assert int(c.n_total[0, 0, 1].item()) == 1
+
+    def test_ward_pair_avoids_merges_over_hard_cap_when_possible(self):
+        c = make_semantic_cache(K_max=3, n_groups=1, max_seq_length=12, semantic_capacity_hard_cap_mult=1.0)
+        c.alive[0, 0, :3] = True
+        c.n_total[0, 0] = torch.tensor([4, 1, 1], dtype=torch.int32)
+        c.centroid[0, 0].zero_()
+        c.centroid[0, 0, 1, 0] = 0.01
+        c.centroid[0, 0, 2, 0] = 10.0
+
+        assert c._semantic_ward_pair(0, 0) == (1, 2)
+
+    def test_ward_pair_falls_back_when_every_merge_exceeds_hard_cap(self):
+        c = make_semantic_cache(K_max=2, n_groups=1, max_seq_length=8, semantic_capacity_hard_cap_mult=1.0)
+        c.alive[0, 0, :2] = True
+        c.n_total[0, 0] = torch.tensor([4, 4], dtype=torch.int32)
+        c.centroid[0, 0].zero_()
+
+        assert c._semantic_ward_pair(0, 0) == (0, 1)
 
     def test_semantic_flush_schedule_is_independent_of_commit_chunking(self):
         torch.manual_seed(123)
