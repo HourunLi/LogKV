@@ -3042,7 +3042,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         # this makes the invariant local and future-proof).
         with torch.no_grad():
             cache.reset_parameters()
-            if cache.semantic_clusters:
+            needs_op_log = cache.semantic_clusters and cache.K_max > 1
+            if needs_op_log:
                 cache.begin_op_log()
             # Own the flag rather than trusting the caller, and set it AFTER
             # the reset above so the cache is always empty when this runs (the
@@ -3078,10 +3079,10 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                     k[:, :, start:end],
                     v[:, :, start:end],
                     k_raw=commit_k_raw[:, :, start:end] if cache.semantic_clusters else None,
-                    record_op_log=cache.semantic_clusters,
+                    record_op_log=needs_op_log,
                 )
                 start = end
-        op_log, op_log_len = cache.take_op_log()
+        op_log, op_log_len = cache.take_op_log() if needs_op_log else (None, None)
         if k_raw is None:
             ctx.save_for_backward(q, k, v)
         else:
@@ -3093,6 +3094,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.pin_inject_start = pin_inject_start
         ctx.pin_positions = pin_positions
         ctx.has_k_raw = k_raw is not None
+        ctx.needs_op_log = needs_op_log
         ctx.op_log = op_log
         ctx.op_log_len = op_log_len
         return torch.cat(outputs, dim=2)  # (B, nh, T, v_dim)
@@ -3112,6 +3114,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         second_order_scale = ctx.second_order_scale
         pin_inject_start = ctx.pin_inject_start
         pin_positions = ctx.pin_positions
+        needs_op_log = ctx.needs_op_log
         T = q.size(2)
         # Blocks partition [0, T) and each position's grad comes from exactly
         # its own block, so the empty buffers are fully overwritten.
@@ -3144,8 +3147,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                     k[:, :, start:end],
                     v[:, :, start:end],
                     k_raw=k_raw[:, :, start:end] if cache.semantic_clusters else None,
-                    replay_op_log=ctx.op_log if cache.semantic_clusters else None,
-                    replay_op_log_len=ctx.op_log_len if cache.semantic_clusters else None,
+                    replay_op_log=ctx.op_log if needs_op_log else None,
+                    replay_op_log_len=ctx.op_log_len if needs_op_log else None,
                 )
             start = end
         grad_inputs = (dq, dk, dv, None, None, None, None)

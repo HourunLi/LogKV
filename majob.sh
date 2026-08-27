@@ -121,7 +121,8 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 # 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
 # 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS LOG_KV_PIN_MIN_DIST LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS LOG_KV_PIN_MIN_DIST LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT EVAL_LOG_KV_B EVAL_LOG_KV_RECENT EVAL_LOG_KV_PREFILL EVAL_LOG_KV_PIN EVAL_LOG_KV_PIN_OBS EVAL_LOG_KV_PIN_MIN_DIST EVAL_LOG_KV_SECOND_ORDER_SCALE EVAL_LOG_KV_SEMANTIC EVAL_LOG_KV_CLUSTER_K_MAX EVAL_LOG_KV_CLUSTER_LAMBDA_REL EVAL_LOG_KV_SEG_ETA EVAL_LOG_KV_SEG_G0 EVAL_LOG_KV_SEG_GAP_MAX EVAL_LOG_KV_SEG_BLOCK_LEVEL EVAL_LOG_KV_SEG_FORGET EVAL_LOG_KV_SEMANTIC_S_H_PATH EVAL_LOG_KV_SEMANTIC_FLUSH_GRANULARITY EVAL_LOG_KV_SEMANTIC_CAPACITY_BETA EVAL_LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S EVAL_L_ALLOC EVAL_PERSISTENT EVAL_S BUDGET_FOOTGUN SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+import math
 import os
 import sys
 
@@ -158,6 +159,47 @@ for d in (tokenizer_dir, resume_dir, ckpt_dir, os.path.join("checkpoints", arch_
 
 semantic_s_h_path = cfg.get("log_kv_semantic_s_h_path")
 seg_gap_max = cfg.get("log_kv_seg_gap_max")
+
+
+def ev(name, default):
+    """Eval-time value for a log_kv_* field: 'eval_<name>' in the YAML wins
+    when present, otherwise falls back to the training value 'name' (which
+    itself falls back to `default`). This is how one YAML expresses two
+    parameter sets -- e.g. train at log_kv_cluster_k_max: 1 but set
+    eval_log_kv_cluster_k_max: 16 to evaluate the same checkpoint under real
+    semantic clustering -- without training and eval ever being able to
+    silently diverge from what the config file says."""
+    return cfg.get(f"eval_{name}", cfg.get(name, default))
+
+
+def semantic_budget(k_max, b_prime, n):
+    """L_alloc/persistent-entries/readout-S for a (K_max, B') pair -- same
+    formula as LogStructuredKVCache.__init__'s semantic branch
+    (docs/algorithm-spec.md §5.12). K_max and B' only matter through their
+    product, so overriding one without the other is easy to get silently
+    wrong (see the warning below)."""
+    k_max = max(int(k_max), 1)
+    b_prime = max(int(b_prime), 1)
+    l_alloc = max(2, math.ceil(math.log2(n / max(k_max * b_prime, 1) + 1.0)) + 2)
+    persistent = k_max * l_alloc * b_prime
+    return l_alloc, persistent, persistent * 3
+
+
+context_length = int(float(cfg.get("context_length") or cfg.get("max_seq_length") or 32768))
+train_k, train_b = int(cfg.get("log_kv_cluster_k_max", 1)), int(cfg.get("log_kv_B", 512))
+eval_k, eval_b = int(ev("log_kv_cluster_k_max", 1)), int(ev("log_kv_B", 512))
+train_l_alloc, train_persistent, train_s = semantic_budget(train_k, train_b, context_length)
+eval_l_alloc, eval_persistent, eval_s = semantic_budget(eval_k, eval_b, context_length)
+# The footgun this guards against: overriding K_max for eval without also
+# overriding B' silently reuses whatever B' training happens to use --
+# harmless if training's B' was sized for training's K_max, actively
+# dangerous otherwise (K_max and B' only matter through their product; see
+# docs/algorithm-spec.md §5.12 and §5.19 item 10 -- "K_max 覆盖时必须同步重算
+# L_alloc", "生产前重算预算，不沿用旧表").
+k_overridden_b_not = (eval_k != train_k) and (eval_b == train_b) and (f"eval_log_kv_B" not in cfg)
+
+eval_seg_gap_max = ev("log_kv_seg_gap_max", None)
+eval_s_h_path = ev("log_kv_semantic_s_h_path", None)
 print(
     cfg.get("log_kv_B", 512),
     cfg.get("log_kv_recent_size", 1024),
@@ -176,6 +218,34 @@ print(
     cfg.get("log_kv_seg_forget", 0.5),
     "__none__" if semantic_s_h_path is None else semantic_s_h_path,
     cfg.get("log_kv_semantic_flush_granularity", 2),
+    cfg.get("log_kv_semantic_capacity_beta", 0.0),
+    cfg.get("log_kv_semantic_capacity_hard_cap_mult", 0.0),
+    ev("log_kv_B", 512),
+    ev("log_kv_recent_size", 1024),
+    ev("log_kv_prefill_block", 256),
+    ev("log_kv_pin_size", 0),
+    ev("log_kv_pin_obs_window", 64),
+    ev("log_kv_pin_min_distance", 0),
+    ev("log_kv_second_order_scale", 1.0),
+    str(bool(ev("log_kv_semantic_clusters", False))).lower(),
+    ev("log_kv_cluster_k_max", 1),
+    ev("log_kv_cluster_lambda_rel", 1.0),
+    ev("log_kv_seg_eta", 1.0),
+    ev("log_kv_seg_g0", 2048.0),
+    "__none__" if eval_seg_gap_max is None else eval_seg_gap_max,
+    ev("log_kv_seg_block_level", 0),
+    ev("log_kv_seg_forget", 0.5),
+    "__none__" if eval_s_h_path is None else eval_s_h_path,
+    ev("log_kv_semantic_flush_granularity", 2),
+    ev("log_kv_semantic_capacity_beta", 0.0),
+    ev("log_kv_semantic_capacity_hard_cap_mult", 0.0),
+    train_l_alloc,
+    train_persistent,
+    train_s,
+    eval_l_alloc,
+    eval_persistent,
+    eval_s,
+    str(k_overridden_b_not).lower(),
     str(bool(cfg.get("save_ckpt", False))).lower(),
     max_steps,
     num_epochs,
@@ -305,7 +375,7 @@ done
 
 LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_pin_size ${LOG_KV_PIN} --log_kv_pin_obs_window ${LOG_KV_PIN_OBS} --log_kv_pin_min_distance ${LOG_KV_PIN_MIN_DIST} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
 if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
-    LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}"
+    LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_capacity_beta ${LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT}"
     if [ "${LOG_KV_SEG_GAP_MAX}" != "__none__" ]; then
         LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_seg_gap_max ${LOG_KV_SEG_GAP_MAX}"
     fi
@@ -313,6 +383,23 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
         LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_s_h_path ${LOG_KV_SEMANTIC_S_H_PATH}"
     fi
 fi
+
+# eval 用的 log_kv 参数：YAML 里同名字段前面加 eval_ 前缀就是 eval 专属覆盖
+# （比如 log_kv_cluster_k_max: 1 训练、eval_log_kv_cluster_k_max: 16 评测），
+# 不写 eval_ 版本就跟训练完全一致。两套值都来自同一个 CONFIG_FILE，在前面
+# python 提取阶段就算好了（见 ev() 函数），这里只是照 LOG_KV_ARGS 同样的拼法
+# 再拼一遍，不依赖调用时的 shell 环境变量。
+EVAL_LOG_KV_ARGS="--log_kv_B ${EVAL_LOG_KV_B} --log_kv_recent_size ${EVAL_LOG_KV_RECENT} --log_kv_prefill_block ${EVAL_LOG_KV_PREFILL} --log_kv_pin_size ${EVAL_LOG_KV_PIN} --log_kv_pin_obs_window ${EVAL_LOG_KV_PIN_OBS} --log_kv_pin_min_distance ${EVAL_LOG_KV_PIN_MIN_DIST} --log_kv_second_order_scale ${EVAL_LOG_KV_SECOND_ORDER_SCALE}"
+if [ "${EVAL_LOG_KV_SEMANTIC}" = "true" ]; then
+    EVAL_LOG_KV_ARGS="${EVAL_LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${EVAL_LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${EVAL_LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${EVAL_LOG_KV_SEG_ETA} --log_kv_seg_g0 ${EVAL_LOG_KV_SEG_G0} --log_kv_seg_block_level ${EVAL_LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${EVAL_LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${EVAL_LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_capacity_beta ${EVAL_LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${EVAL_LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT}"
+    if [ "${EVAL_LOG_KV_SEG_GAP_MAX}" != "__none__" ]; then
+        EVAL_LOG_KV_ARGS="${EVAL_LOG_KV_ARGS} --log_kv_seg_gap_max ${EVAL_LOG_KV_SEG_GAP_MAX}"
+    fi
+    if [ "${EVAL_LOG_KV_SEMANTIC_S_H_PATH}" != "__none__" ]; then
+        EVAL_LOG_KV_ARGS="${EVAL_LOG_KV_ARGS} --log_kv_semantic_s_h_path ${EVAL_LOG_KV_SEMANTIC_S_H_PATH}"
+    fi
+fi
+
 DIAG_ARGS=${DIAG_ARGS:-}
 TOKENIZER_ARGS=""
 if [ -n "${TOKENIZER_SOURCE}" ]; then
@@ -322,7 +409,21 @@ else
     echo "⚠️ 未在候选目录中找到 tokenizer.json/tokenizer.model: ${TOKENIZER_CANDIDATES}"
     echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
 fi
-echo "🧩 logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY})"
+echo "🧩 logKV train config: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, capacity_beta=${LOG_KV_SEMANTIC_CAPACITY_BETA}, hard_cap_mult=${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT})"
+# K_max/B' 只通过乘积影响预算（docs/algorithm-spec.md §5.12），改一个不改另一个
+# 很容易配出一个没人算过的 S；训练/eval 用的组合都打印出来，别等 OOM 才发现。
+echo "🧮 semantic budget: train K=${LOG_KV_CLUSTER_K_MAX},B=${LOG_KV_B} -> L_alloc=${TRAIN_L_ALLOC}, persistent_entries=${TRAIN_PERSISTENT}, readout_S=${TRAIN_S}"
+echo "🧮 semantic budget: eval  K=${EVAL_LOG_KV_CLUSTER_K_MAX},B=${EVAL_LOG_KV_B} -> L_alloc=${EVAL_L_ALLOC}, persistent_entries=${EVAL_PERSISTENT}, readout_S=${EVAL_S}"
+if [ "${BUDGET_FOOTGUN}" = "true" ]; then
+    echo "❌ 致命错误：eval_log_kv_cluster_k_max(${EVAL_LOG_KV_CLUSTER_K_MAX}) 和训练 K_max(${LOG_KV_CLUSTER_K_MAX}) 不一样，"
+    echo "   但没有单独设 eval_log_kv_B，eval 静默沿用了训练的 B=${LOG_KV_B}，算出来 readout_S=${EVAL_S}。"
+    echo "   K_max 和 B' 只通过乘积决定预算，换 K_max 必须同时想清楚 B' 该多大，不能隐式继承训练值。"
+    echo "   请在 YAML 里显式加一行 eval_log_kv_B: <值>（哪怕就是想沿用当前这个数字，也要写出来确认是有意为之）。"
+    exit 1
+fi
+if [ "${EVAL_LOG_KV_ARGS}" != "${LOG_KV_ARGS}" ]; then
+    echo "🧩 logKV eval args OVERRIDDEN (differs from training): ${EVAL_LOG_KV_ARGS}"
+fi
 if [ -n "${DIAG_ARGS}" ]; then
     echo "🧪 extra eval args: ${DIAG_ARGS}"
 fi
@@ -462,7 +563,7 @@ if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
         --checkpoint_dir ${SAVE_DIR} \
         --benchmark ${BENCHMARKS} \
         --output_path "${EVAL_OUTPUT_DIR}" \
-        ${LOG_KV_ARGS} \
+        ${EVAL_LOG_KV_ARGS} \
         ${DIAG_ARGS} \
         ${TOKENIZER_ARGS}
 
@@ -487,7 +588,7 @@ if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
         --benchmark ${NIAH_BENCHMARKS} \
         --metadata "${META}" \
         --output_path "${EVAL_OUTPUT_DIR}" \
-        ${LOG_KV_ARGS} \
+        ${EVAL_LOG_KV_ARGS} \
         ${DIAG_ARGS} \
         ${TOKENIZER_ARGS}
 
