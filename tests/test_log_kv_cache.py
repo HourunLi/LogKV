@@ -208,7 +208,7 @@ class TestInit:
         assert c.level_count.shape == (c.batch_size, c.n_groups, c.K_max, c.L_alloc)
         assert c.level_count.dtype == torch.int16
         assert c.pad_mask.shape == c.level_w.shape
-        assert not hasattr(c, "_counts")
+        assert c._counts == [0] * c.L_alloc
         assert c.level_count.sum() == 0
 
     def test_semantic_layout_and_cluster_metadata(self):
@@ -1248,14 +1248,13 @@ class TestExplicitCacheUpdates:
 
 class TestGetAttentionState:
     def test_empty_cache_state(self, small_cache):
-        """Empty cache returns the fixed pooled prefix, fully masked invalid."""
+        """Empty non-semantic cache returns no slots."""
         state = small_cache.get_attention_state()
         assert isinstance(state, CacheAttentionState)
-        assert state.slot_k.size(2) == small_cache.L_alloc * small_cache.B_prime
-        assert state.slot_v.size(2) == small_cache.L_alloc * small_cache.B_prime
-        assert state.slot_w.size(2) == small_cache.L_alloc * small_cache.B_prime
-        assert state.slot_valid.shape == (small_cache.batch_size, small_cache.n_groups, state.slot_w.size(2))
-        assert not state.slot_valid.any()
+        assert state.slot_k.size(2) == 0
+        assert state.slot_v.size(2) == 0
+        assert state.slot_w.size(2) == 0
+        assert state.slot_valid is None
         assert state.M_s is None
 
     def test_state_after_ingest(self, small_cache):
@@ -1266,7 +1265,7 @@ class TestGetAttentionState:
         state = c.get_attention_state()
         _slot_k, _slot_v, slot_w = real_state_tensors(state)
 
-        assert int(state.slot_valid.sum().item()) == c.n_groups
+        assert state.slot_valid is None
         assert slot_w.size(2) == 1
         assert slot_w[0, 0, 0].item() == 2.0
 
@@ -1283,15 +1282,11 @@ class TestGetAttentionState:
         assert state.slot_v.shape == state.slot_gamma_b.shape
         assert state.slot_w.shape == state.slot_sigma2.shape == state.slot_gamma.shape
         _slot_k, _slot_v, slot_w = real_state_tensors(state)
-        pooled = state.slot_valid.size(-1)
-        valid0 = state.slot_valid[0, 0]
-        sigma2 = torch.cat([state.slot_sigma2[:, :, :pooled][:, :, valid0], state.slot_sigma2[:, :, pooled:]], dim=2)
-        gamma = torch.cat([state.slot_gamma[:, :, :pooled][:, :, valid0], state.slot_gamma[:, :, pooled:]], dim=2)
         assert slot_w[0, 0].tolist() == [2.0, 1.0]
-        assert sigma2[0, 0, 0] > 0.0
-        assert gamma[0, 0, 0] >= 0.0
-        assert sigma2[0, 0, 1] == 0.0
-        assert gamma[0, 0, 1] == 0.0
+        assert state.slot_sigma2[0, 0, 0] > 0.0
+        assert state.slot_gamma[0, 0, 0] >= 0.0
+        assert state.slot_sigma2[0, 0, 1] == 0.0
+        assert state.slot_gamma[0, 0, 1] == 0.0
 
     def test_state_after_prefill(self, small_cache):
         """After prefill, compact slots + recent w=1 tokens should be present."""
@@ -1358,6 +1353,7 @@ class TestSemanticLogKV:
         assert c.token_count == 5
         assert c.recent_count == 1
         assert int(c.level_count[0, 0, 0, 0].item()) == 4
+        assert c._semantic_counts[0][0][0][0] == 4
         torch.testing.assert_close(c.level_w[0, 0, 0, 0, :4], torch.ones(4))
         torch.testing.assert_close(c.level_p_lo[0, 0, 0, 0, :4], torch.tensor([0, 1, 2, 3]))
         torch.testing.assert_close(c.level_p_hi[0, 0, 0, 0, :4], torch.tensor([0, 1, 2, 3]))
@@ -1371,6 +1367,16 @@ class TestSemanticLogKV:
         assert slot_w[0, 0].tolist() == [1.0, 1.0, 1.0, 1.0, 1.0]
         assert int(state.slot_valid[0, 0].sum().item()) == 4
         assert torch.equal(state.M_s[0, 0][state.slot_valid[0, 0]], torch.ones(4, dtype=torch.long))
+
+        c.reset_parameters()
+        assert int(c.level_count.sum().item()) == 0
+        assert all(
+            count == 0
+            for b_counts in c._semantic_counts
+            for g_counts in b_counts
+            for c_counts in g_counts
+            for count in c_counts
+        )
 
     def test_new_segment_inserts_zero_pad_before_boundary_token(self):
         c = make_semantic_cache(K_max=1, n_groups=1, seg_gap_max=0.0, seg_block_level=1)
@@ -1411,8 +1417,16 @@ class TestSemanticLogKV:
         assert op_log is not None
         assert op_log_len is not None
         assert op_log_len[0, 0] >= 6
+        assert len(c._last_op_log_host[0][0]) == int(op_log_len[0, 0].item())
 
-        r.route_and_flush_batch(k_raw, v, pos, replay_op_log=op_log, replay_op_log_len=op_log_len)
+        r.route_and_flush_batch(
+            k_raw,
+            v,
+            pos,
+            replay_op_log=op_log,
+            replay_op_log_len=op_log_len,
+            replay_op_log_host=c._last_op_log_host,
+        )
 
         assert_cache_states_bit_identical(c, r)
 
@@ -2606,19 +2620,20 @@ class TestSecondOrderGate:
 
         assert torch.equal(run(preset=False), run(preset=True))
 
-    def test_level_count_is_indexed_device_tensor_without_host_mirror(self):
-        """Stage 1 storage keeps level counts only in the indexed device tensor."""
+    def test_nonsemantic_level_count_keeps_host_mirror(self):
+        """The hot non-semantic path keeps host counts to avoid per-chunk device sync."""
         attn = self._make_attention(1.0)
         cache = attn.kv_cache
         T = 40
         q, k, v = self._inputs(T, seed=17)
         attn._log_kv_train_lowmem_forward(q, k, v, B=1, T=T)
-        assert not hasattr(cache, "_counts")
+        assert cache._counts == [level_count(cache, ell) for ell in range(cache.L_alloc)]
         assert cache.level_count.shape == (cache.batch_size, cache.n_groups, cache.K_max, cache.L_alloc)
         assert cache.level_count.dtype == torch.int16
         assert has_compacted_level(cache)
         cache.reset_parameters()
         assert cache.level_count.sum().item() == 0
+        assert cache._counts == [0] * cache.L_alloc
 
     def _built_cache(self, second_order=True):
         c = LogStructuredKVCache(

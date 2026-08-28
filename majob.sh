@@ -57,7 +57,9 @@ EVAL_MASTER_PORT=${EVAL_MASTER_PORT:-$((MASTER_PORT + 1))}
 NIAH_MASTER_PORT=${NIAH_MASTER_PORT:-$((MASTER_PORT + 2))}
 export LITGPT_EXPECTED_WORLD_SIZE=${LITGPT_EXPECTED_WORLD_SIZE:-$((NUM_NODES * GPUS_PER_NODE))}
 
-pip install tensorboard
+if ! python -c "import tensorboard" >/dev/null 2>&1; then
+    python -m pip install "tensorboard>=2.14"
+fi
 echo "🌍 正在启动多机多卡训练: Node ${NODE_RANK} / ${NUM_NODES}"
 echo "🧮 期望 world size: ${LITGPT_EXPECTED_WORLD_SIZE} (= ${NUM_NODES} nodes × ${GPUS_PER_NODE} gpus)"
 echo "🔗 Train rendezvous: ${MASTER_ADDR}:${TRAIN_MASTER_PORT}"

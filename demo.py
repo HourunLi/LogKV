@@ -974,10 +974,12 @@ def main(
         semantic_capacity_beta=log_kv_semantic_capacity_beta,
         semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
     )
+    effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
         f"logKV training ENABLED: B={log_kv_B}, "
         f"recent_size={log_kv_recent_size}, "
-        f"train_block={log_kv_train_block}, "
+        f"train_block={log_kv_train_block} "
+        f"(effective={effective_log_kv_train_block}), "
         f"second_order_scale={initial_second_order_scale:.4f} "
         f"(target={log_kv_second_order_scale:.4f}, "
         f"warmup_steps={log_kv_second_order_warmup_steps}), "
@@ -985,7 +987,7 @@ def main(
         f"(target_max={log_kv_pin_train_max}, "
         f"target_prob={log_kv_pin_train_prob:.3f}, "
         f"warmup_steps={log_kv_pin_train_warmup_steps}), "
-        f"blocks/seq={math.ceil(context_length / max(log_kv_train_block, 1))}, "
+        f"blocks/seq={math.ceil(context_length / effective_log_kv_train_block)}, "
         f"importance_pooling={log_kv_importance_pooling} "
         f"(lambda={log_kv_importance_pooling_lambda}, temperature={log_kv_importance_pooling_temperature}), "
         f"semantic={log_kv_semantic_clusters} "
