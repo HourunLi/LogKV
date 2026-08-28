@@ -2610,6 +2610,12 @@ def log_kv_slot_attention(
     causal_tail: int = 0,
     slot_M: torch.Tensor | None = None,       # (B, G, S) distinct-anchor count per slot
     slot_valid: torch.Tensor | None = None,   # (B, G, S_pooled) bool; pooled-prefix only
+    check_valid: bool = True,   # raise if a masked query row has no valid slot;
+                                 # costs a host sync (.all() -> Python bool) per
+                                 # call, so hot-path callers that can prove by
+                                 # construction (via causal_tail) that the
+                                 # appended exact suffix always keeps >= 1 valid
+                                 # slot pass False. Masking itself always runs.
     slot_sigma_u: torch.Tensor | None = None,  # (B, G, S, k_dim)
     slot_sigma2: torch.Tensor | None = None,   # (B, G, S)
     slot_gamma_a: torch.Tensor | None = None,  # (B, G, S, k_dim)
@@ -2777,7 +2783,7 @@ def log_kv_slot_attention(
             )
             # Avoid materializing an S-sized bool tensor; masked rows have
             # max=-inf, valid rows have a finite max.
-            if not torch.isfinite(scores.amax(dim=-1)).all():
+            if check_valid and not torch.isfinite(scores.amax(dim=-1)).all():
                 raise ValueError("log_kv_slot_attention(): a query row has no valid slot")
         attn = torch.softmax(scores, dim=-1).to(q.dtype)     # (B, nkv, rf, T_q, S)
         if pin_score_diag_active:
@@ -2834,7 +2840,7 @@ def log_kv_slot_attention(
         s_pooled = slot_valid.size(-1)
         scores[..., :s_pooled].masked_fill_((~slot_valid).unsqueeze(-2), float("-inf"))
         # Same check as isfinite(scores).any(dim=-1), without an S-sized bool tensor.
-        if not torch.isfinite(scores.amax(dim=-1)).all():
+        if check_valid and not torch.isfinite(scores.amax(dim=-1)).all():
             raise ValueError("log_kv_slot_attention(): a query row has no valid slot")
     attn = torch.softmax(scores, dim=-1).to(q.dtype)  # (B, nh, T_q, S)
     if pin_score_diag_active:
@@ -2896,6 +2902,13 @@ def log_kv_chunk_attention(
             causal_tail=q_b.size(2),
             slot_M=state.M_s,
             slot_valid=state.slot_valid,
+            # causal_tail=q_b.size(2) > 0 appends the real current chunk as an
+            # exact w=1 suffix outside slot_valid's pooled-prefix range, so
+            # every query row keeps its own (diagonal) token as a valid slot
+            # by construction -- the row-has-no-valid-slot case this guards
+            # against cannot happen here. Skips a per-call host sync that
+            # otherwise fires on every chunk, every layer, every step.
+            check_valid=False,
         )
     state = append_exact_tokens(cache.get_attention_state(with_stats=True), k_b, v_b)
     return log_kv_slot_attention(
@@ -2904,6 +2917,7 @@ def log_kv_chunk_attention(
         causal_tail=q_b.size(2),
         slot_M=state.M_s,
         slot_valid=state.slot_valid,
+        check_valid=False,  # see check_valid=False comment above
         slot_sigma_u=state.slot_sigma_u,
         slot_sigma2=state.slot_sigma2,
         slot_gamma_a=state.slot_gamma_a,
