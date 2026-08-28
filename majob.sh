@@ -254,11 +254,10 @@ print(
 EOF
 )"
 
-if [ "${LOG_KV_SEMANTIC}" != "true" ]; then
-    echo "❌ 致命错误：${CONFIG_FILE} 没有开启 log_kv_semantic_clusters=true。"
-    echo "   当前分支只允许 Stage1 SemanticLogKV CPT，避免误跑旧 LogKV。"
-    exit 1
-fi
+# log_kv_semantic_clusters=false 训练现在是有意的过渡路径：真实语义 K64 CPT
+# 单 step 要半小时以上，在 Phase 1 逐 token 路由同步问题（docs/algorithm-spec.md
+# §5.22 point 9、§5.19 第 11 条）修好前不可用。训练走非语义不影响 eval——eval
+# 端用 eval_log_kv_semantic_clusters 单独切回真实语义聚类（见下面 ev()）。
 
 if [ "${LOG_KV_PIN}" != "0" ]; then
     echo "❌ 致命错误：${CONFIG_FILE} 设置了 log_kv_pin_size=${LOG_KV_PIN}。"
