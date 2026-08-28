@@ -1329,6 +1329,11 @@ class CausalSelfAttention(nn.Module):
                 scale=scale,
                 slot_M=state.M_s,
                 slot_valid=state.slot_valid,
+                # k_b alone (let alone pk+k_b) always has >= 1 token, appended
+                # outside slot_valid's pooled-prefix range and fully unmasked
+                # here -> the row always keeps a valid slot. Skips a per-call
+                # host sync that otherwise fires on every decode step.
+                check_valid=False,
                 slot_sigma_u=state.slot_sigma_u,
                 slot_sigma2=state.slot_sigma2,
                 slot_gamma_a=state.slot_gamma_a,
@@ -1440,6 +1445,7 @@ class CausalSelfAttention(nn.Module):
                         causal_tail=blk,
                         slot_M=state.M_s,
                         slot_valid=state.slot_valid,
+                        check_valid=False,  # causal_tail=blk > 0 keeps >= 1 valid slot; see log_kv_chunk_attention
                         slot_sigma_u=state.slot_sigma_u,
                         slot_sigma2=state.slot_sigma2,
                         slot_gamma_a=state.slot_gamma_a,
@@ -1500,6 +1506,7 @@ class CausalSelfAttention(nn.Module):
                 causal_tail=actual_t,
                 slot_M=state.M_s,
                 slot_valid=state.slot_valid,
+                check_valid=False,  # causal_tail=actual_t > 0 keeps >= 1 valid slot; see log_kv_chunk_attention
                 slot_sigma_u=state.slot_sigma_u,
                 slot_sigma2=state.slot_sigma2,
                 slot_gamma_a=state.slot_gamma_a,
