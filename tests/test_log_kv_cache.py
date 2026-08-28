@@ -1475,11 +1475,11 @@ class TestSemanticLogKV:
             cluster_lambda_rel=10.0,
             semantic_capacity_hard_cap_mult=1.0,
         )
-        c.alive[0, 0, 0] = True
+        c._set_semantic_alive(0, 0, 0, True)
         c.centroid[0, 0, 0].zero_()
         c.n_eff[0, 0, 0] = 4.0
-        c.n_total[0, 0, 0] = 4
-        c.p_hi_c[0, 0, 0] = 3
+        c._set_semantic_n_total(0, 0, 0, 4)
+        c._set_semantic_p_hi(0, 0, 0, 3)
 
         c.route_and_flush_batch(torch.zeros(1, 1, 1, 8), torch.randn(1, 1, 1, 8), torch.tensor([4]))
 
@@ -1489,8 +1489,9 @@ class TestSemanticLogKV:
 
     def test_ward_pair_avoids_merges_over_hard_cap_when_possible(self):
         c = make_semantic_cache(K_max=3, n_groups=1, max_seq_length=12, semantic_capacity_hard_cap_mult=1.0)
-        c.alive[0, 0, :3] = True
-        c.n_total[0, 0] = torch.tensor([4, 1, 1], dtype=torch.int32)
+        for c_idx, n in enumerate([4, 1, 1]):
+            c._set_semantic_alive(0, 0, c_idx, True)
+            c._set_semantic_n_total(0, 0, c_idx, n)
         c.centroid[0, 0].zero_()
         c.centroid[0, 0, 1, 0] = 0.01
         c.centroid[0, 0, 2, 0] = 10.0
@@ -1499,8 +1500,9 @@ class TestSemanticLogKV:
 
     def test_ward_pair_falls_back_when_every_merge_exceeds_hard_cap(self):
         c = make_semantic_cache(K_max=2, n_groups=1, max_seq_length=8, semantic_capacity_hard_cap_mult=1.0)
-        c.alive[0, 0, :2] = True
-        c.n_total[0, 0] = torch.tensor([4, 4], dtype=torch.int32)
+        for c_idx in range(2):
+            c._set_semantic_alive(0, 0, c_idx, True)
+            c._set_semantic_n_total(0, 0, c_idx, 4)
         c.centroid[0, 0].zero_()
 
         assert c._semantic_ward_pair(0, 0) == (0, 1)

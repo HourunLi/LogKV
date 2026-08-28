@@ -3015,7 +3015,7 @@ def log_kv_slot_attention(
             # see the MHA branch for why fp32 here bought nothing but cost the
             # tensor cores.
             gamma_dot = torch.matmul(qg, slot_gamma_a.unsqueeze(2).mT)
-            gamma_weight = attn * gamma_dot * slot_gamma[:, :, None, None, :]
+            gamma_weight = (attn * gamma_dot * slot_gamma[:, :, None, None, :]).to(slot_gamma_b.dtype)
             corr = torch.matmul(gamma_weight, slot_gamma_b.unsqueeze(2))
             out = out + corr * (second_order_scale * scale)
         return out.reshape(B, nh, T_q, v_dim)
@@ -3074,7 +3074,7 @@ def log_kv_slot_attention(
         # rounded to the activation dtype, and matmul accumulates in fp32
         # regardless — while running a same-shaped matmul off the tensor cores.
         gamma_dot = torch.matmul(q, slot_gamma_a.mT)
-        gamma_weight = attn * gamma_dot * slot_gamma.unsqueeze(-2)
+        gamma_weight = (attn * gamma_dot * slot_gamma.unsqueeze(-2)).to(slot_gamma_b.dtype)
         corr = torch.matmul(gamma_weight, slot_gamma_b)
         out = out + corr * (second_order_scale * scale)
     return out
