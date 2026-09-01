@@ -1813,6 +1813,34 @@ class TestSlotAttention:
 
         torch.testing.assert_close(out, torch.tensor([[[[0.0, 3.0]]]]))
 
+    def test_rank1_value_correction_accepts_bf16_gamma_b_with_fp32_gamma(self):
+        """Gamma's scalar slot factor is fp32; gamma_b follows the activation dtype."""
+        B, G, nh, T_q, S, D, Dv = 1, 2, 4, 1, 3, 8, 8
+        q = torch.randn(B, nh, T_q, D, dtype=torch.bfloat16)
+        slot_k = torch.randn(B, G, S, D, dtype=torch.bfloat16)
+        slot_v = torch.randn(B, G, S, Dv, dtype=torch.bfloat16)
+        slot_w = torch.ones(B, G, S)
+        sigma_u = torch.zeros_like(slot_k)
+        sigma2 = torch.zeros(B, G, S)
+        gamma_a = torch.randn(B, G, S, D, dtype=torch.bfloat16)
+        gamma_b = torch.randn(B, G, S, Dv, dtype=torch.bfloat16)
+        gamma = torch.ones(B, G, S)
+
+        out = log_kv_slot_attention(
+            q,
+            slot_k,
+            slot_v,
+            slot_w,
+            scale=0.5,
+            slot_sigma_u=sigma_u,
+            slot_sigma2=sigma2,
+            slot_gamma_a=gamma_a,
+            slot_gamma_b=gamma_b,
+            slot_gamma=gamma,
+        )
+
+        assert out.dtype == torch.bfloat16
+
     def test_append_exact_tokens(self):
         """Helper must append w=1 entries after the cached slots, in order."""
         B, G, k_dim, v_dim = 1, 2, 8, 8
