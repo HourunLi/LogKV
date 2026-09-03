@@ -1859,7 +1859,7 @@ class LogStructuredKVCache(nn.Module):
             return None
         return candidates[best]
 
-    def _semantic_tree_ward_pair(self, clusters: list[_SemanticTreeCluster]) -> tuple[int, int]:
+    def _semantic_tree_ward_cost(self, clusters: list[_SemanticTreeCluster]) -> torch.Tensor:
         if len(clusters) < 2:
             raise RuntimeError("semantic chunk tree Ward merge needs at least two clusters")
         mu = torch.stack([c.centroid for c in clusters])
@@ -1872,6 +1872,33 @@ class LogStructuredKVCache(nn.Module):
             capped = cost.masked_fill((n[:, None] + n[None, :]) > cap, float("inf"))
             if bool(torch.isfinite(capped).any().item()):
                 cost = capped
+        return cost
+
+    def _semantic_tree_ward_pairs(
+        self,
+        clusters: list[_SemanticTreeCluster],
+        max_pairs: int,
+    ) -> list[tuple[int, int]]:
+        cost = self._semantic_tree_ward_cost(clusters)
+        n = len(clusters)
+        cost = cost.masked_fill(~torch.triu(torch.ones(n, n, device=cost.device, dtype=torch.bool), diagonal=1), float("inf"))
+        flat_cost = cost.flatten()
+        order = flat_cost.argsort().detach().cpu().tolist()
+        pairs: list[tuple[int, int]] = []
+        used: set[int] = set()
+        for flat in order:
+            if len(pairs) >= max_pairs or not math.isfinite(float(flat_cost[flat].item())):
+                break
+            i, j = flat // n, flat % n
+            if i in used or j in used:
+                continue
+            pairs.append((i, j))
+            used.add(i)
+            used.add(j)
+        return pairs
+
+    def _semantic_tree_ward_pair(self, clusters: list[_SemanticTreeCluster]) -> tuple[int, int]:
+        cost = self._semantic_tree_ward_cost(clusters)
         flat = int(cost.flatten().argmin().item())
         i, j = flat // len(clusters), flat % len(clusters)
         return (i, j) if i < j else (j, i)
@@ -1882,9 +1909,12 @@ class LogStructuredKVCache(nn.Module):
     ) -> list[_SemanticTreeCluster]:
         clusters = list(clusters)
         while len(clusters) > self.K_max:
-            i, j = self._semantic_tree_ward_pair(clusters)
-            clusters[i] = self._semantic_tree_merge_node(clusters[i], clusters[j])
-            del clusters[j]
+            pairs = self._semantic_tree_ward_pairs(clusters, len(clusters) - self.K_max)
+            if not pairs:
+                pairs = [self._semantic_tree_ward_pair(clusters)]
+            merged = {i: self._semantic_tree_merge_node(clusters[i], clusters[j]) for i, j in pairs}
+            dropped = {j for _i, j in pairs}
+            clusters = [merged.get(i, node) for i, node in enumerate(clusters) if i not in dropped]
         return clusters
 
     def _semantic_tree_merge_sets(
@@ -1926,28 +1956,38 @@ class LogStructuredKVCache(nn.Module):
         end: int,
         positions_host: list[list[int]],
     ) -> list[_SemanticTreeCluster]:
+        n = end - start
+        if n <= 0:
+            return []
+        x = k_raw[b, g, start:end].float()
+        norm = x.square().sum(dim=-1)
+        dist = (norm[:, None] + norm[None, :] - 2.0 * (x @ x.T)).clamp_min(0.0)
+        reach = dist <= self._semantic_tree_threshold(b, g)
+        # ponytail: dense T_block^2 closure; switch to sparse/union-find only if large chunks make this hot.
+        for _ in range(max(1, math.ceil(math.log2(max(n, 2))))):
+            reach = (reach.float() @ reach.float()) > 0
+        labels = torch.where(
+            reach,
+            torch.arange(n, device=x.device, dtype=torch.long).view(1, n),
+            torch.full((n, n), n, device=x.device, dtype=torch.long),
+        ).min(dim=1).values
         clusters: list[_SemanticTreeCluster] = []
-        for i in range(start, end):
-            node = _SemanticTreeCluster(
-                k_raw[b, g, i].float().clone(),
-                1,
-                positions_host[b][i],
-                (),
-                (i,),
-            )
-            if clusters:
-                candidates = [j for j, current in enumerate(clusters) if self._semantic_tree_can_merge(current, node)]
-                if candidates:
-                    best = self._semantic_tree_best_candidate(b, g, clusters, candidates, node)
-                    if best is not None:
-                        clusters[best] = self._semantic_tree_merge_node(clusters[best], node)
-                        continue
-            if len(clusters) >= self.K_max:
-                a, z = self._semantic_tree_ward_pair(clusters)
-                clusters[a] = self._semantic_tree_merge_node(clusters[a], clusters[z])
-                del clusters[z]
-            clusters.append(node)
-        return clusters
+        cap = self._semantic_hard_cap()
+        max_local = n if cap == math.inf else max(1, int(math.floor(cap)))
+        for label in labels.unique(sorted=True).detach().cpu().tolist():
+            idx = torch.nonzero(labels == int(label), as_tuple=False).flatten()
+            for part in idx.split(max_local):
+                offsets = tuple(start + int(i) for i in part.detach().cpu().tolist())
+                clusters.append(
+                    _SemanticTreeCluster(
+                        x.index_select(0, part).mean(dim=0).clone(),
+                        len(offsets),
+                        max(positions_host[b][i] for i in offsets),
+                        (),
+                        offsets,
+                    )
+                )
+        return self._semantic_tree_reduce_to_budget(clusters)
 
     def _semantic_join_offsets_batch(
         self,
