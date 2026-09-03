@@ -1520,6 +1520,18 @@ class TestSemanticLogKV:
             for idx in live
         ) == [(0, 2), (1, 3)]
 
+    def test_semantic_chunk_tree_local_chunk_uses_noncausal_components(self):
+        c = make_semantic_cache(
+            K_max=4, n_groups=1, recent_size=8, cluster_lambda_rel=0.25, semantic_cluster_chunk_size=3
+        )
+        k_raw = torch.zeros(1, 1, 3, 8)
+        k_raw[0, 0, :, 0] = torch.tensor([0.0, 10.0, 0.1])
+
+        clusters = c._semantic_tree_local_chunks(0, 0, k_raw, 0, 3, [[0, 1, 2]])
+
+        assert sorted(node.tokens for node in clusters) == [(0, 2), (1,)]
+        assert sorted(round(float(node.centroid[0].item()), 2) for node in clusters) == [0.05, 10.0]
+
     def test_tree_candidate_ranking_uses_temporal_tiebreak(self):
         # algorithm-spec.md §5.3: eta only reorders candidates, it must not
         # affect the accept/reject threshold. Two candidates tied on semantic
@@ -1592,6 +1604,16 @@ class TestSemanticLogKV:
         assert len(live) <= 2  # K_max respected even though the first chunk
                                # alone holds 3 mutually distant tokens
         assert sum(int(c.n_total[0, 0, idx].item()) for idx in live) == 4  # no tokens lost
+
+    def test_semantic_chunk_tree_ward_selects_multiple_disjoint_pairs(self):
+        c = make_semantic_cache(K_max=3, n_groups=1)
+        clusters = []
+        for i, x in enumerate([0.0, 0.1, 10.0, 10.1, 100.0]):
+            vec = torch.zeros(8)
+            vec[0] = x
+            clusters.append(_SemanticTreeCluster(vec, 1, i, (), (i,)))
+
+        assert c._semantic_tree_ward_pairs(clusters, 2) == [(0, 1), (2, 3)]
 
     def test_op_log_replay_rebuilds_multicluster_state(self):
         c = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=2, cluster_lambda_rel=0.25, seg_gap_max=8.0)
