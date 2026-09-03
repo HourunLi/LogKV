@@ -555,6 +555,7 @@ def main(
     log_kv_seg_forget: float = 0.5,
     log_kv_semantic_s_h_path: str | None = None,
     log_kv_semantic_flush_granularity: int = 2,
+    log_kv_semantic_cluster_chunk_size: int = 0,
     log_kv_semantic_capacity_beta: float = 0.0,
     log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
     # ── Eval ──
@@ -649,6 +650,9 @@ def main(
     log_kv_semantic_s_h_path = _o("log_kv_semantic_s_h_path", log_kv_semantic_s_h_path)
     log_kv_semantic_flush_granularity = int(
         _o("log_kv_semantic_flush_granularity", log_kv_semantic_flush_granularity)
+    )
+    log_kv_semantic_cluster_chunk_size = int(
+        _o("log_kv_semantic_cluster_chunk_size", log_kv_semantic_cluster_chunk_size)
     )
     log_kv_semantic_capacity_beta = float(
         _o("log_kv_semantic_capacity_beta", log_kv_semantic_capacity_beta)
@@ -824,6 +828,7 @@ def main(
             log_kv_seg_forget=log_kv_seg_forget,
             log_kv_semantic_s_h_path=log_kv_semantic_s_h_path,
             log_kv_semantic_flush_granularity=log_kv_semantic_flush_granularity,
+            log_kv_semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
             log_kv_semantic_capacity_beta=log_kv_semantic_capacity_beta,
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
             tokenizer_dir=tokenizer_dir,
@@ -971,6 +976,7 @@ def main(
         seg_forget=log_kv_seg_forget,
         semantic_s_h=semantic_s_h,
         semantic_flush_granularity=log_kv_semantic_flush_granularity,
+        semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
         semantic_capacity_beta=log_kv_semantic_capacity_beta,
         semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
     )
@@ -993,7 +999,7 @@ def main(
         f"semantic={log_kv_semantic_clusters} "
         f"(K={log_kv_cluster_k_max}, lambda_rel={log_kv_cluster_lambda_rel}, "
         f"g_max={log_kv_seg_gap_max}, l_block={log_kv_seg_block_level}, "
-        f"flush={log_kv_semantic_flush_granularity}, "
+        f"flush={log_kv_semantic_flush_granularity}, tree_chunk={log_kv_semantic_cluster_chunk_size}, "
         f"s_h={log_kv_semantic_s_h_path}, "
         f"capacity_beta={log_kv_semantic_capacity_beta}, "
         f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult})"

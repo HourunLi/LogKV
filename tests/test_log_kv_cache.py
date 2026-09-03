@@ -13,6 +13,7 @@ from litgpt.log_kv_cache import (
     _pair_rank1_stats,
     _rank1_cross_from_factors,
     _rank1_psd_from_factors,
+    _SemanticTreeCluster,
     append_exact_tokens,
     log_kv_chunk_attention,
     log_kv_slot_attention,
@@ -79,6 +80,7 @@ def make_semantic_cache(
     seg_block_level: int = 0,
     semantic_s_h: torch.Tensor | float | None = 1.0,
     semantic_flush_granularity: int = 2,
+    semantic_cluster_chunk_size: int = 0,
     semantic_capacity_beta: float = 0.0,
     semantic_capacity_hard_cap_mult: float = 0.0,
 ) -> LogStructuredKVCache:
@@ -97,6 +99,7 @@ def make_semantic_cache(
         seg_block_level=seg_block_level,
         semantic_s_h=semantic_s_h,
         semantic_flush_granularity=semantic_flush_granularity,
+        semantic_cluster_chunk_size=semantic_cluster_chunk_size,
         semantic_capacity_beta=semantic_capacity_beta,
         semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
         cos_cache=cos,
@@ -146,8 +149,6 @@ def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredK
             "level_p_hi",
             "level_sum_wp",
             "level_order",
-            "centroid",
-            "n_eff",
             "n_total",
             "p_hi_c",
             "current_segment",
@@ -155,6 +156,13 @@ def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredK
             "alive",
         ):
             assert torch.equal(getattr(a, name), getattr(b, name)), f"{name} differ"
+        # centroid/n_eff go through the batched closed-form update in
+        # _semantic_join_batch, which is mathematically but not bit-identical
+        # to the old per-token recurrence (sub-ULP rounding that varies with
+        # run size / flush granularity) -- tolerance compare like the other
+        # centroid/n_eff checks in this file.
+        torch.testing.assert_close(a.centroid, b.centroid, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(a.n_eff, b.n_eff)
 
 
 # ---------------------------------------------------------------------------
@@ -1396,6 +1404,195 @@ class TestSemanticLogKV:
         assert state.slot_valid is not None
         assert int(state.slot_valid[0, 0].sum().item()) == 2
 
+    def test_semantic_attention_state_gathers_only_valid_pooled_slots(self):
+        c = make_semantic_cache(K_max=1, n_groups=1, seg_gap_max=0.0, seg_block_level=1)
+        c.route_and_flush_batch(torch.randn(1, 1, 2, 8), torch.randn(1, 1, 2, 8), torch.tensor([0, 3]))
+
+        state = c.get_attention_state(with_stats=True)
+
+        assert state.slot_valid is not None
+        assert state.slot_k.size(2) == 2
+        assert state.slot_v.size(2) == 2
+        assert state.slot_w.size(2) == 2
+        assert state.slot_sigma_u.size(2) == 2
+        assert bool(state.slot_valid.all().item())
+
+    def test_direct_phase_batches_same_cluster_like_sequential_join(self):
+        torch.manual_seed(42)
+        seq = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=8, cluster_lambda_rel=1e9)
+        batched = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=8, cluster_lambda_rel=1e9)
+        k0 = torch.randn(8)
+        v0 = torch.randn(8)
+        for cache in (seq, batched):
+            cache._semantic_new_cluster(0, 0, 0, 0, k0, v0, torch.tensor(0), record=False)
+        k_raw = torch.randn(1, 1, 8, 8)
+        v = torch.randn(1, 1, 8, 8)
+        pos = torch.arange(1, 9)
+
+        for i in range(8):
+            seq._semantic_join_or_segment(0, 0, 0, int(pos[i]), k_raw[0, 0, i], v[0, 0, i], pos[i], record=False)
+        batched.route_and_flush_batch(k_raw, v, pos)
+
+        for name in (
+            "level_k",
+            "level_v",
+            "level_w",
+            "level_sigma_u",
+            "level_sigma2",
+            "level_gamma_a",
+            "level_gamma_b",
+            "level_gamma",
+            "level_p_lo",
+            "level_p_hi",
+            "level_sum_wp",
+            "level_order",
+            "pad_mask",
+            "level_count",
+            "n_total",
+            "p_hi_c",
+            "current_segment",
+            "level0_phase",
+            "alive",
+        ):
+            assert torch.equal(getattr(seq, name), getattr(batched, name)), f"{name} differ"
+        torch.testing.assert_close(seq.centroid, batched.centroid, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(seq.n_eff, batched.n_eff)
+
+    def test_kmax1_batch_route_matches_single_token_route_with_segments(self):
+        torch.manual_seed(7)
+        seq = make_semantic_cache(K_max=1, n_groups=1, B=3, recent_size=8, seg_gap_max=3.0, seg_block_level=1)
+        batched = make_semantic_cache(K_max=1, n_groups=1, B=3, recent_size=8, seg_gap_max=3.0, seg_block_level=1)
+        pos = torch.tensor([0, 1, 2, 8, 9, 16, 17, 18])
+        k_raw = torch.randn(1, 1, pos.numel(), 8)
+        v = torch.randn(1, 1, pos.numel(), 8)
+
+        for i in range(pos.numel()):
+            seq.route_and_flush_batch(k_raw[:, :, i:i + 1], v[:, :, i:i + 1], pos[i:i + 1])
+        batched.route_and_flush_batch(k_raw, v, pos)
+
+        for name in (
+            "level_k",
+            "level_v",
+            "level_w",
+            "level_sigma_u",
+            "level_sigma2",
+            "level_gamma_a",
+            "level_gamma_b",
+            "level_gamma",
+            "level_p_lo",
+            "level_p_hi",
+            "level_sum_wp",
+            "level_order",
+            "pad_mask",
+            "level_count",
+            "n_total",
+            "p_hi_c",
+            "current_segment",
+            "level0_phase",
+            "alive",
+        ):
+            assert torch.equal(getattr(seq, name), getattr(batched, name)), f"{name} differ"
+        torch.testing.assert_close(seq.centroid, batched.centroid, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(seq.n_eff, batched.n_eff)
+
+    def test_semantic_chunk_tree_merges_near_local_clusters_across_chunks(self):
+        c = make_semantic_cache(
+            K_max=4,
+            n_groups=1,
+            B=4,
+            recent_size=8,
+            cluster_lambda_rel=0.25,
+            semantic_flush_granularity=4,
+            semantic_cluster_chunk_size=2,
+        )
+        k_raw = torch.zeros(1, 1, 4, 8)
+        k_raw[0, 0, :, 0] = torch.tensor([0.0, 10.0, 0.1, 10.1])
+        v = torch.randn(1, 1, 4, 8)
+
+        c.route_and_flush_batch(k_raw, v, torch.arange(4))
+
+        live = torch.nonzero(c.alive[0, 0], as_tuple=False).flatten().tolist()
+        assert len(live) == 2
+        assert sorted(int(c.n_total[0, 0, idx].item()) for idx in live) == [2, 2]
+        assert sorted(round(float(c.centroid[0, 0, idx, 0].item()), 2) for idx in live) == [0.05, 10.05]
+        assert sorted(
+            (int(c.level_p_lo[0, 0, idx, 0, 0].item()), int(c.level_p_lo[0, 0, idx, 0, 1].item()))
+            for idx in live
+        ) == [(0, 2), (1, 3)]
+
+    def test_tree_candidate_ranking_uses_temporal_tiebreak(self):
+        # algorithm-spec.md §5.3: eta only reorders candidates, it must not
+        # affect the accept/reject threshold. Two candidates tied on semantic
+        # distance (0.01 either way) but far apart in p_hi -- the temporally
+        # closer one must win.
+        c = make_semantic_cache(K_max=4, n_groups=1, cluster_lambda_rel=1.0)
+        older = torch.zeros(8)
+        recent = torch.zeros(8)
+        recent[0] = 0.2
+        pool = [
+            _SemanticTreeCluster(older, 1, 0, (0,), ()),
+            _SemanticTreeCluster(recent, 1, 100, (1,), ()),
+        ]
+        node_vec = torch.zeros(8)
+        node_vec[0] = 0.1
+        node = _SemanticTreeCluster(node_vec, 1, 101, (), (0,))
+
+        best = c._semantic_tree_best_candidate(0, 0, pool, [0, 1], node)
+        assert best == 1
+
+    def test_tree_candidate_ranking_uses_capacity_penalty(self):
+        c = make_semantic_cache(K_max=4, n_groups=1, cluster_lambda_rel=1.0, semantic_capacity_beta=1.0)
+        target = c._semantic_capacity_target()
+        pool = [
+            _SemanticTreeCluster(torch.zeros(8), 1, 0, (0,), ()),
+            _SemanticTreeCluster(torch.zeros(8), int(target * 3), 0, (1,), ()),
+        ]
+        node = _SemanticTreeCluster(torch.zeros(8), 1, 0, (), (0,))
+
+        # Identical centroid and p_hi for both candidates -> semantic and
+        # temporal terms are tied at 0; only the capacity penalty differs.
+        best = c._semantic_tree_best_candidate(0, 0, pool, [0, 1], node)
+        assert best == 0
+
+    def test_semantic_chunk_tree_consolidates_existing_clusters_via_ward_reduce(self):
+        c = make_semantic_cache(
+            K_max=2, n_groups=1, B=4, recent_size=8,
+            cluster_lambda_rel=0.25, semantic_cluster_chunk_size=2,
+        )
+        k0 = torch.zeros(8)
+        k1 = torch.zeros(8)
+        k1[0] = 0.01
+        c._semantic_new_cluster(0, 0, 0, 0, k0, torch.randn(8), torch.tensor(0), record=False)
+        c._semantic_new_cluster(0, 0, 1, 1, k1, torch.randn(8), torch.tensor(1), record=False)
+
+        k_raw = torch.zeros(1, 1, 4, 8)
+        k_raw[0, 0, :, 0] = 100.0  # far from both existing clusters
+        v = torch.randn(1, 1, 4, 8)
+        c.route_and_flush_batch(k_raw, v, torch.arange(2, 6))
+
+        live = torch.nonzero(c.alive[0, 0], as_tuple=False).flatten().tolist()
+        assert len(live) == 2  # K_max respected: the two close existing clusters merged
+        n_totals = sorted(int(c.n_total[0, 0, idx].item()) for idx in live)
+        assert n_totals == [2, 4]
+        merged_idx = [idx for idx in live if int(c.n_total[0, 0, idx].item()) == 2][0]
+        assert round(float(c.centroid[0, 0, merged_idx, 0].item()), 4) == 0.005
+
+    def test_semantic_chunk_tree_local_ward_merge_when_chunk_exceeds_k_max(self):
+        c = make_semantic_cache(
+            K_max=2, n_groups=1, B=4, recent_size=8,
+            cluster_lambda_rel=0.25, semantic_cluster_chunk_size=3,
+        )
+        k_raw = torch.zeros(1, 1, 4, 8)
+        k_raw[0, 0, :, 0] = torch.tensor([0.0, 100.0, 200.0, -100.0])
+        v = torch.randn(1, 1, 4, 8)
+
+        c.route_and_flush_batch(k_raw, v, torch.arange(4))
+
+        live = torch.nonzero(c.alive[0, 0], as_tuple=False).flatten().tolist()
+        assert len(live) <= 2  # K_max respected even though the first chunk
+                               # alone holds 3 mutually distant tokens
+        assert sum(int(c.n_total[0, 0, idx].item()) for idx in live) == 4  # no tokens lost
+
     def test_op_log_replay_rebuilds_multicluster_state(self):
         c = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=2, cluster_lambda_rel=0.25, seg_gap_max=8.0)
         r = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=2, cluster_lambda_rel=0.25, seg_gap_max=8.0)
@@ -1506,6 +1703,21 @@ class TestSemanticLogKV:
         c.centroid[0, 0].zero_()
 
         assert c._semantic_ward_pair(0, 0) == (0, 1)
+
+    def test_ward_cost_incremental_update_matches_full_rebuild(self):
+        c = make_semantic_cache(K_max=3, n_groups=1, B=3)
+        for idx, offset in enumerate([0.0, 1.0, 4.0]):
+            k = torch.zeros(8)
+            k[0] = offset
+            c._semantic_new_cluster(0, 0, idx, idx, k, torch.randn(8), torch.tensor(idx), record=False)
+        assert c._semantic_ward_pair(0, 0) == (0, 1)
+
+        c._semantic_ward_merge(0, 0, 0, 1, record=False)
+        incremental = c.ward_cost.clone()
+        c._semantic_ward_dirty[0][0] = True
+        c._semantic_rebuild_ward_cost(0, 0)
+
+        torch.testing.assert_close(incremental, c.ward_cost, atol=1e-6, rtol=1e-6)
 
     def test_semantic_flush_schedule_is_independent_of_commit_chunking(self):
         torch.manual_seed(123)

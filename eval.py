@@ -529,6 +529,7 @@ class LogKVLM(LM):
         log_kv_seg_forget: float = 0.5,
         log_kv_semantic_s_h_path: str | None = None,
         log_kv_semantic_flush_granularity: int = 2,
+        log_kv_semantic_cluster_chunk_size: int = 0,
         log_kv_semantic_capacity_beta: float = 0.0,
         log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
         tokenizer_dir: str | None = None,
@@ -558,6 +559,7 @@ class LogKVLM(LM):
         self.log_kv_seg_forget = float(log_kv_seg_forget)
         self.log_kv_semantic_s_h_path = log_kv_semantic_s_h_path
         self.log_kv_semantic_flush_granularity = int(log_kv_semantic_flush_granularity)
+        self.log_kv_semantic_cluster_chunk_size = int(log_kv_semantic_cluster_chunk_size)
         self.log_kv_semantic_capacity_beta = float(log_kv_semantic_capacity_beta)
         self.log_kv_semantic_capacity_hard_cap_mult = float(log_kv_semantic_capacity_hard_cap_mult)
         self.pin_diag_recorder = pin_diag_recorder
@@ -682,6 +684,7 @@ class LogKVLM(LM):
             seg_forget=self.log_kv_seg_forget,
             semantic_s_h=self.log_kv_semantic_s_h,
             semantic_flush_granularity=self.log_kv_semantic_flush_granularity,
+            semantic_cluster_chunk_size=self.log_kv_semantic_cluster_chunk_size,
             semantic_capacity_beta=self.log_kv_semantic_capacity_beta,
             semantic_capacity_hard_cap_mult=self.log_kv_semantic_capacity_hard_cap_mult,
         )
@@ -1057,6 +1060,7 @@ def main(
     log_kv_seg_forget: float = 0.5,
     log_kv_semantic_s_h_path: str | None = None,
     log_kv_semantic_flush_granularity: int = 2,
+    log_kv_semantic_cluster_chunk_size: int = 0,
     log_kv_semantic_capacity_beta: float = 0.0,
     log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
@@ -1157,6 +1161,9 @@ def main(
     log_kv_semantic_s_h_path = _o("log_kv_semantic_s_h_path", log_kv_semantic_s_h_path)
     log_kv_semantic_flush_granularity = int(
         _o("log_kv_semantic_flush_granularity", log_kv_semantic_flush_granularity)
+    )
+    log_kv_semantic_cluster_chunk_size = int(
+        _o("log_kv_semantic_cluster_chunk_size", log_kv_semantic_cluster_chunk_size)
     )
     log_kv_semantic_capacity_beta = float(
         _o("log_kv_semantic_capacity_beta", log_kv_semantic_capacity_beta)
@@ -1283,7 +1290,7 @@ def main(
                 f"semantic: {log_kv_semantic_clusters} "
                 f"(K={log_kv_cluster_k_max}, lambda_rel={log_kv_cluster_lambda_rel}, "
                 f"g_max={log_kv_seg_gap_max}, l_block={log_kv_seg_block_level}, "
-                f"flush={log_kv_semantic_flush_granularity}, "
+                f"flush={log_kv_semantic_flush_granularity}, tree_chunk={log_kv_semantic_cluster_chunk_size}, "
                 f"s_h={log_kv_semantic_s_h_path}, "
                 f"capacity_beta={log_kv_semantic_capacity_beta}, "
                 f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult})"
@@ -1342,6 +1349,7 @@ def main(
             log_kv_seg_forget=log_kv_seg_forget,
             log_kv_semantic_s_h_path=log_kv_semantic_s_h_path,
             log_kv_semantic_flush_granularity=log_kv_semantic_flush_granularity,
+            log_kv_semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
             log_kv_semantic_capacity_beta=log_kv_semantic_capacity_beta,
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
             tokenizer_dir=tokenizer_dir,
@@ -1451,6 +1459,7 @@ def main(
                         "log_kv_seg_forget": log_kv_seg_forget,
                         "log_kv_semantic_s_h_path": log_kv_semantic_s_h_path,
                         "log_kv_semantic_flush_granularity": log_kv_semantic_flush_granularity,
+                        "log_kv_semantic_cluster_chunk_size": log_kv_semantic_cluster_chunk_size,
                         "log_kv_semantic_capacity_beta": log_kv_semantic_capacity_beta,
                         "log_kv_semantic_capacity_hard_cap_mult": log_kv_semantic_capacity_hard_cap_mult,
                         "radius": log_kv_pin_diag_radius,
@@ -1497,6 +1506,7 @@ def main(
                         "log_kv_seg_forget": log_kv_seg_forget,
                         "log_kv_semantic_s_h_path": log_kv_semantic_s_h_path,
                         "log_kv_semantic_flush_granularity": log_kv_semantic_flush_granularity,
+                        "log_kv_semantic_cluster_chunk_size": log_kv_semantic_cluster_chunk_size,
                         "log_kv_semantic_capacity_beta": log_kv_semantic_capacity_beta,
                         "log_kv_semantic_capacity_hard_cap_mult": log_kv_semantic_capacity_hard_cap_mult,
                         "window_from_end": log_kv_pin_score_diag_window_from_end,
@@ -1550,6 +1560,7 @@ def main(
                     "log_kv_seg_forget": log_kv_seg_forget,
                     "log_kv_semantic_s_h_path": log_kv_semantic_s_h_path,
                     "log_kv_semantic_flush_granularity": log_kv_semantic_flush_granularity,
+                    "log_kv_semantic_cluster_chunk_size": log_kv_semantic_cluster_chunk_size,
                     "log_kv_semantic_capacity_beta": log_kv_semantic_capacity_beta,
                     "log_kv_semantic_capacity_hard_cap_mult": log_kv_semantic_capacity_hard_cap_mult,
                     "results": results,
