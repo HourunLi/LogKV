@@ -34,8 +34,8 @@ log_kv_seg_block_level: 0
 log_kv_seg_forget: 0.5
 log_kv_semantic_s_h_path: null
 log_kv_semantic_flush_granularity: 1024
-log_kv_semantic_capacity_beta: 0.0
-log_kv_semantic_capacity_hard_cap_mult: 0.0
+log_kv_semantic_capacity_beta: 0
+log_kv_semantic_capacity_hard_cap_mult: 0
 
 
 # eval 覆盖：训练仍是 K_max=1（这份 base.yaml 上面那套值），eval 切到真实语义
