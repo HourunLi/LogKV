@@ -87,6 +87,7 @@ def _make_cache(args: argparse.Namespace, k_max: int, device: torch.device) -> L
         seg_gap_max=args.seg_gap_max,
         seg_block_level=args.seg_block_level,
         semantic_flush_granularity=args.semantic_flush_granularity,
+        semantic_cluster_chunk_size=args.semantic_cluster_chunk_size,
         semantic_s_h=1.0,
         cos_cache=cos,
         sin_cache=sin,
@@ -190,6 +191,7 @@ def main() -> None:
     p.add_argument("--B", type=int, default=32)
     p.add_argument("--recent-size", type=int, default=128)
     p.add_argument("--semantic-flush-granularity", type=int, default=2)
+    p.add_argument("--semantic-cluster-chunk-size", type=int, default=0)
     p.add_argument("--k-max", default="1,2,4")
     p.add_argument("--orphan-ratios", default="0,0.1,0.5,1")
     p.add_argument("--repeat", type=int, default=5)
