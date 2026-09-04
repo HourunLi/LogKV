@@ -33,3 +33,4 @@ tensorboard_root: "./tb"
 # Level 1+:    B entries, each = 2 entries from prev level merged
 log_kv_B: 512
 log_kv_recent_size: 1024
+log_kv_train_block: 1024

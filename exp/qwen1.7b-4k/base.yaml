@@ -35,7 +35,7 @@ log_kv_second_order_warmup_steps: 100
 log_kv_pin_size: 0
 
 log_kv_semantic_clusters: true
-log_kv_cluster_k_max: 64
+log_kv_cluster_k_max: 16
 log_kv_cluster_lambda_rel: 1.0
 log_kv_seg_eta: 1.0
 log_kv_seg_g0: 2048.0
