@@ -1,0 +1,63 @@
+arch_name: "Qwen/Qwen3-1.7B-Base"
+context_length: 32768
+expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-hash-k16
+
+ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+
+global_batch_size: 128
+micro_batch_size: 1
+max_steps: 3000
+learning_rate: 5e-5
+weight_decay: 0.1
+num_devices: 8
+warmup_steps: 0
+min_lr: 5e-5
+entropy_chunk_size: 128
+
+dataset_name: "prolong"
+dataset_dir: "data"
+data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
+num_workers: 16
+save_ckpt: true
+save_interval: 200
+save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-stage1-hash-k16
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/_fsdp_staging_semantic_stage1_hash_k16
+
+enable_tensorboard: true
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic-stage1-hash-k16
+
+log_kv_B: 128
+log_kv_recent_size: 1024
+log_kv_train_block: 1024
+log_kv_prefill_block: 1024
+log_kv_second_order_scale: 0.2
+log_kv_second_order_warmup_steps: 100
+log_kv_pin_size: 0
+
+log_kv_semantic_clusters: true
+log_kv_cluster_k_max: 16 # log 32k = 15；要和下面 hash anchor 文件的 K 维度对上
+log_kv_cluster_lambda_rel: 1.0
+log_kv_seg_eta: 1.0
+log_kv_seg_g0: 2048.0
+log_kv_seg_gap_max: null
+log_kv_seg_block_level: 0
+log_kv_seg_forget: 0.5
+log_kv_semantic_s_h_path: null
+log_kv_semantic_flush_granularity: 1024
+log_kv_semantic_capacity_beta: 0.0
+log_kv_semantic_capacity_hard_cap_mult: 0.0
+
+# chunk-tree 和 hash routing 目前互斥：两个都打开时 route_and_flush_batch 里
+# hash 分支排在前面且直接 return，chunk-tree 会被静默跳过、没有任何报错。这里
+# 保持关闭，不要顺手打开。
+log_kv_semantic_cluster_chunk_size: 0
+
+# hash routing：anchor 文件还没生成，先留 null——直接用这份 yaml 跑，效果等价于
+# 普通的 K16 语义聚类训练（arc_semantic_stage1_k16.yaml），不会报错。生成 anchor
+# 文件之后，要么把下面两行改掉，要么在命令行追加覆盖：
+#   python demo.py --config exp/qwen1.7b-32k/arc_semantic_stage1_hash_k16.yaml \
+#     --log_kv_semantic_hash_routing --log_kv_semantic_hash_anchor_path <path>
+# anchor 文件形状要求 (n_layer, n_query_groups, log_kv_cluster_k_max, head_size)，
+# 见 utils.py:load_log_kv_semantic_hash_anchors。
+log_kv_semantic_hash_routing: false
+log_kv_semantic_hash_anchor_path: null
