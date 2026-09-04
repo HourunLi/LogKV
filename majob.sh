@@ -123,7 +123,7 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 # 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
 # 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_PIN LOG_KV_PIN_OBS LOG_KV_PIN_MIN_DIST LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT EVAL_LOG_KV_B EVAL_LOG_KV_RECENT EVAL_LOG_KV_PREFILL EVAL_LOG_KV_PIN EVAL_LOG_KV_PIN_OBS EVAL_LOG_KV_PIN_MIN_DIST EVAL_LOG_KV_SECOND_ORDER_SCALE EVAL_LOG_KV_SEMANTIC EVAL_LOG_KV_CLUSTER_K_MAX EVAL_LOG_KV_CLUSTER_LAMBDA_REL EVAL_LOG_KV_SEG_ETA EVAL_LOG_KV_SEG_G0 EVAL_LOG_KV_SEG_GAP_MAX EVAL_LOG_KV_SEG_BLOCK_LEVEL EVAL_LOG_KV_SEG_FORGET EVAL_LOG_KV_SEMANTIC_S_H_PATH EVAL_LOG_KV_SEMANTIC_FLUSH_GRANULARITY EVAL_LOG_KV_SEMANTIC_CAPACITY_BETA EVAL_LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S EVAL_L_ALLOC EVAL_PERSISTENT EVAL_S BUDGET_FOOTGUN SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT EVAL_LOG_KV_B EVAL_LOG_KV_RECENT EVAL_LOG_KV_PREFILL EVAL_LOG_KV_SECOND_ORDER_SCALE EVAL_LOG_KV_SEMANTIC EVAL_LOG_KV_CLUSTER_K_MAX EVAL_LOG_KV_CLUSTER_LAMBDA_REL EVAL_LOG_KV_SEG_ETA EVAL_LOG_KV_SEG_G0 EVAL_LOG_KV_SEG_GAP_MAX EVAL_LOG_KV_SEG_BLOCK_LEVEL EVAL_LOG_KV_SEG_FORGET EVAL_LOG_KV_SEMANTIC_S_H_PATH EVAL_LOG_KV_SEMANTIC_FLUSH_GRANULARITY EVAL_LOG_KV_SEMANTIC_CAPACITY_BETA EVAL_LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S EVAL_L_ALLOC EVAL_PERSISTENT EVAL_S BUDGET_FOOTGUN SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import math
 import os
 import sys
@@ -206,9 +206,6 @@ print(
     cfg.get("log_kv_B", 512),
     cfg.get("log_kv_recent_size", 1024),
     cfg.get("log_kv_prefill_block", 256),
-    cfg.get("log_kv_pin_size", 0),
-    cfg.get("log_kv_pin_obs_window", 64),
-    cfg.get("log_kv_pin_min_distance", 0),
     cfg.get("log_kv_second_order_scale", 1.0),
     str(bool(cfg.get("log_kv_semantic_clusters", False))).lower(),
     cfg.get("log_kv_cluster_k_max", 1),
@@ -225,9 +222,6 @@ print(
     ev("log_kv_B", 512),
     ev("log_kv_recent_size", 1024),
     ev("log_kv_prefill_block", 256),
-    ev("log_kv_pin_size", 0),
-    ev("log_kv_pin_obs_window", 64),
-    ev("log_kv_pin_min_distance", 0),
     ev("log_kv_second_order_scale", 1.0),
     str(bool(ev("log_kv_semantic_clusters", False))).lower(),
     ev("log_kv_cluster_k_max", 1),
@@ -260,12 +254,6 @@ EOF
 # 单 step 要半小时以上，在 Phase 1 逐 token 路由同步问题（docs/algorithm-spec.md
 # §5.22 point 9、§5.19 第 11 条）修好前不可用。训练走非语义不影响 eval——eval
 # 端用 eval_log_kv_semantic_clusters 单独切回真实语义聚类（见下面 ev()）。
-
-if [ "${LOG_KV_PIN}" != "0" ]; then
-    echo "❌ 致命错误：${CONFIG_FILE} 设置了 log_kv_pin_size=${LOG_KV_PIN}。"
-    echo "   当前 Stage1 CPT 默认禁用 pin，请设为 0。"
-    exit 1
-fi
 
 checkpoint_exists() {
     [ -f "$1" ] || { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
@@ -374,7 +362,7 @@ for RAW_TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
     fi
 done
 
-LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_pin_size ${LOG_KV_PIN} --log_kv_pin_obs_window ${LOG_KV_PIN_OBS} --log_kv_pin_min_distance ${LOG_KV_PIN_MIN_DIST} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
+LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
 if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
     LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_capacity_beta ${LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT}"
     if [ "${LOG_KV_SEG_GAP_MAX}" != "__none__" ]; then
@@ -390,7 +378,7 @@ fi
 # 不写 eval_ 版本就跟训练完全一致。两套值都来自同一个 CONFIG_FILE，在前面
 # python 提取阶段就算好了（见 ev() 函数），这里只是照 LOG_KV_ARGS 同样的拼法
 # 再拼一遍，不依赖调用时的 shell 环境变量。
-EVAL_LOG_KV_ARGS="--log_kv_B ${EVAL_LOG_KV_B} --log_kv_recent_size ${EVAL_LOG_KV_RECENT} --log_kv_prefill_block ${EVAL_LOG_KV_PREFILL} --log_kv_pin_size ${EVAL_LOG_KV_PIN} --log_kv_pin_obs_window ${EVAL_LOG_KV_PIN_OBS} --log_kv_pin_min_distance ${EVAL_LOG_KV_PIN_MIN_DIST} --log_kv_second_order_scale ${EVAL_LOG_KV_SECOND_ORDER_SCALE}"
+EVAL_LOG_KV_ARGS="--log_kv_B ${EVAL_LOG_KV_B} --log_kv_recent_size ${EVAL_LOG_KV_RECENT} --log_kv_prefill_block ${EVAL_LOG_KV_PREFILL} --log_kv_second_order_scale ${EVAL_LOG_KV_SECOND_ORDER_SCALE}"
 if [ "${EVAL_LOG_KV_SEMANTIC}" = "true" ]; then
     EVAL_LOG_KV_ARGS="${EVAL_LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${EVAL_LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${EVAL_LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${EVAL_LOG_KV_SEG_ETA} --log_kv_seg_g0 ${EVAL_LOG_KV_SEG_G0} --log_kv_seg_block_level ${EVAL_LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${EVAL_LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${EVAL_LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_capacity_beta ${EVAL_LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${EVAL_LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT}"
     if [ "${EVAL_LOG_KV_SEG_GAP_MAX}" != "__none__" ]; then
@@ -410,7 +398,7 @@ else
     echo "⚠️ 未在候选目录中找到 tokenizer.json/tokenizer.model: ${TOKENIZER_CANDIDATES}"
     echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
 fi
-echo "🧩 logKV train config: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, capacity_beta=${LOG_KV_SEMANTIC_CAPACITY_BETA}, hard_cap_mult=${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT})"
+echo "🧩 logKV train config: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, capacity_beta=${LOG_KV_SEMANTIC_CAPACITY_BETA}, hard_cap_mult=${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT})"
 # K_max/B' 只通过乘积影响预算（docs/algorithm-spec.md §5.12），改一个不改另一个
 # 很容易配出一个没人算过的 S；训练/eval 用的组合都打印出来，别等 OOM 才发现。
 echo "🧮 semantic budget: train K=${LOG_KV_CLUSTER_K_MAX},B=${LOG_KV_B} -> L_alloc=${TRAIN_L_ALLOC}, persistent_entries=${TRAIN_PERSISTENT}, readout_S=${TRAIN_S}"
@@ -533,7 +521,7 @@ echo "✅ [Node ${NODE_RANK}] 所有 ${NUM_NODES} 个节点已就绪，启动评
 sleep 30
 
 # 拼接 benchmark 列表（避免换行空格被解析进 task 名）。支持用环境变量覆盖；
-# BENCHMARKS=none 可跳过主评测，只跑 NIAH/pin 诊断。
+# BENCHMARKS=none 可跳过主评测，只跑 NIAH 诊断。
 DEFAULT_BENCHMARKS="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa,longbench_dureader,longbench_gov_report,longbench_hotpotqa"

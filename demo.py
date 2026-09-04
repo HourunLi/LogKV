@@ -315,28 +315,6 @@ def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     return min_lr + coeff * (max_lr - min_lr)
 
 
-def get_log_kv_pin_train_schedule(
-    current_step: int,
-    warmup_steps: int,
-    target_max: int,
-    target_prob: float,
-) -> tuple[int, float]:
-    """Linear warmup for training-time random LogKV pin injection."""
-    warmup_steps = int(warmup_steps)
-    target_max = int(target_max)
-    target_prob = float(target_prob)
-    if warmup_steps < 0:
-        raise ValueError(f"log_kv_pin_train_warmup_steps must be non-negative, got {warmup_steps}")
-    if target_max < 0:
-        raise ValueError(f"log_kv_pin_train_max must be non-negative, got {target_max}")
-    if not math.isfinite(target_prob) or not 0.0 <= target_prob <= 1.0:
-        raise ValueError(f"log_kv_pin_train_prob must be in [0, 1], got {target_prob}")
-    if warmup_steps == 0:
-        return target_max, target_prob
-    ratio = min(max(int(current_step), 0) / warmup_steps, 1.0)
-    return int(math.floor(target_max * ratio)), target_prob * ratio
-
-
 def build_train_dataset(
     *,
     context_length: int,
@@ -510,21 +488,6 @@ def main(
     # only, does not affect training). 2 = strict 2-token streaming semantics;
     # larger = faster prefill with a bounded, block-size-limited deviation.
     log_kv_prefill_block: int = 256,
-    # Eval-time salience pinning (SnapKV-style, inference only; forwarded to
-    # eval.py). At prefill the trailing pin_obs_window queries (the question at
-    # the prompt tail) score the whole prefix; the top pin_size tokens per KV
-    # group are kept as exact w=1 slots alongside the pooled hierarchy, so a
-    # distant needle survives mean-pool dilution. 0 = off.
-    log_kv_pin_size: int = 0,
-    log_kv_pin_obs_window: int = 64,
-    # Eval-time NMS spacing for salience pins. 0/1 keeps the original top-k path.
-    log_kv_pin_min_distance: int = 0,
-    # Training-time random exact-pin injection. Independent from eval-time
-    # salience pins: this teaches the model to consume mixed exact+compressed
-    # states without running the expensive salience selector during CPT.
-    log_kv_pin_train_max: int = 0,
-    log_kv_pin_train_prob: float = 0.0,
-    log_kv_pin_train_warmup_steps: int = 0,
     # Coupled gate for score-side Sigma and value-side Gamma corrections. The
     # CPT path warms this from 0 to the target value to avoid an immediate
     # attention-distribution jump at step 0. Set
@@ -619,14 +582,6 @@ def main(
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_train_block = _o("log_kv_train_block", log_kv_train_block)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
-    log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
-    log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
-    log_kv_pin_min_distance = int(_o("log_kv_pin_min_distance", log_kv_pin_min_distance))
-    log_kv_pin_train_max = int(_o("log_kv_pin_train_max", log_kv_pin_train_max))
-    log_kv_pin_train_prob = float(_o("log_kv_pin_train_prob", log_kv_pin_train_prob))
-    log_kv_pin_train_warmup_steps = int(
-        _o("log_kv_pin_train_warmup_steps", log_kv_pin_train_warmup_steps)
-    )
     log_kv_second_order_scale = _o("log_kv_second_order_scale", log_kv_second_order_scale)
     log_kv_second_order_warmup_steps = _o(
         "log_kv_second_order_warmup_steps", log_kv_second_order_warmup_steps
@@ -668,9 +623,6 @@ def main(
     # Validate early, before launching a long distributed job.
     get_log_kv_second_order_scale(
         0, log_kv_second_order_warmup_steps, log_kv_second_order_scale
-    )
-    get_log_kv_pin_train_schedule(
-        0, log_kv_pin_train_warmup_steps, log_kv_pin_train_max, log_kv_pin_train_prob
     )
 
     # Fail fast: run_eval="after"/"both" evaluates save_path, which is only
@@ -811,9 +763,6 @@ def main(
             log_kv_B=log_kv_B,
             log_kv_recent_size=log_kv_recent_size,
             log_kv_prefill_block=log_kv_prefill_block,
-            log_kv_pin_size=log_kv_pin_size,
-            log_kv_pin_obs_window=log_kv_pin_obs_window,
-            log_kv_pin_min_distance=log_kv_pin_min_distance,
             log_kv_second_order_scale=log_kv_second_order_scale,
             log_kv_importance_pooling=log_kv_importance_pooling,
             log_kv_importance_pooling_lambda=log_kv_importance_pooling_lambda,
@@ -934,9 +883,6 @@ def main(
     initial_second_order_scale = get_log_kv_second_order_scale(
         global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
     )
-    initial_pin_train_max, initial_pin_train_prob = get_log_kv_pin_train_schedule(
-        global_step, log_kv_pin_train_warmup_steps, log_kv_pin_train_max, log_kv_pin_train_prob
-    )
     semantic_s_h = (
         load_log_kv_semantic_s_h(
             log_kv_semantic_s_h_path,
@@ -960,9 +906,6 @@ def main(
         recent_size=log_kv_recent_size,
         train_block=log_kv_train_block,
         second_order_scale=initial_second_order_scale,
-        pin_size=log_kv_pin_train_max,
-        pin_train_max=initial_pin_train_max,
-        pin_train_prob=initial_pin_train_prob,
         importance_pooling=log_kv_importance_pooling,
         importance_pooling_lambda=log_kv_importance_pooling_lambda,
         importance_pooling_temperature=log_kv_importance_pooling_temperature,
@@ -989,10 +932,6 @@ def main(
         f"second_order_scale={initial_second_order_scale:.4f} "
         f"(target={log_kv_second_order_scale:.4f}, "
         f"warmup_steps={log_kv_second_order_warmup_steps}), "
-        f"pin_train={initial_pin_train_max}@p{initial_pin_train_prob:.3f} "
-        f"(target_max={log_kv_pin_train_max}, "
-        f"target_prob={log_kv_pin_train_prob:.3f}, "
-        f"warmup_steps={log_kv_pin_train_warmup_steps}), "
         f"blocks/seq={math.ceil(context_length / effective_log_kv_train_block)}, "
         f"importance_pooling={log_kv_importance_pooling} "
         f"(lambda={log_kv_importance_pooling_lambda}, temperature={log_kv_importance_pooling_temperature}), "
@@ -1038,11 +977,7 @@ def main(
         current_second_order_scale = get_log_kv_second_order_scale(
             global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
         )
-        current_pin_train_max, current_pin_train_prob = get_log_kv_pin_train_schedule(
-            global_step, log_kv_pin_train_warmup_steps, log_kv_pin_train_max, log_kv_pin_train_prob
-        )
         model.set_log_kv_second_order_scale(current_second_order_scale)
-        model.set_log_kv_pin_training(current_pin_train_max, current_pin_train_prob)
 
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             # Routes through _log_kv_train_lowmem_forward (training_log_kv is on
@@ -1076,24 +1011,17 @@ def main(
             metrics_txt = " | ".join(f"{k}: {v:.4f}" for k, v in sorted(avgs.items()))
             if metrics_txt:
                 metrics_txt = metrics_txt + " | "
-            pin_train_txt = ""
-            if log_kv_pin_train_max > 0 or log_kv_pin_train_prob > 0.0:
-                pin_train_txt = f"pin_train: {current_pin_train_max}@p{current_pin_train_prob:.3f} | "
             fabric.print(
                 f"[{now.strftime('%H:%M:%S')}] "
                 f"Epoch {data_epoch} | Step {global_step + 1} | "
                 f"{metrics_txt}"
                 f"2nd_scale: {current_second_order_scale:.4f} | "
-                f"{pin_train_txt}"
                 f"Time: {step_time:.2f}s"
             )
             for name, val in avgs.items():
                 fabric.log(f"train/{name}", val, step=global_step + 1)
             fabric.log("train/learning_rate", current_lr, step=global_step + 1)
             fabric.log("train/log_kv_second_order_scale", current_second_order_scale, step=global_step + 1)
-            if log_kv_pin_train_max > 0 or log_kv_pin_train_prob > 0.0:
-                fabric.log("train/log_kv_pin_train_max", current_pin_train_max, step=global_step + 1)
-                fabric.log("train/log_kv_pin_train_prob", current_pin_train_prob, step=global_step + 1)
 
             step_stats.reset()
             global_step += 1

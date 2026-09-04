@@ -301,12 +301,6 @@ from lm_eval import evaluator
 from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
-from litgpt.log_kv_pin_diag import PinDiagRecorder
-from litgpt.log_kv_pin_score_diag import (
-    DIAG as LOG_KV_PIN_SCORE_DIAG,
-    merge_pin_score_diag_states,
-    pin_score_diag_mode,
-)
 from litgpt.ruler_patch import apply_patch
 apply_patch()
 
@@ -500,7 +494,7 @@ class LogKVLM(LM):
     exact recent tokens or compressed slots, and slot attention scores one logit
     per slot with the log(w) mass bias. With ``log_kv_dense_mode=True``, the same
     request/scoring code builds the native full KV cache instead, so attention is
-    ordinary causal dense attention with no LogKV slots, pins, or corrections.
+    ordinary causal dense attention with no LogKV slots or corrections.
     """
 
     def __init__(
@@ -511,9 +505,6 @@ class LogKVLM(LM):
         log_kv_B: int = 512,
         log_kv_recent_size: int = 1024,
         log_kv_prefill_block: int = 256,
-        log_kv_pin_size: int = 0,
-        log_kv_pin_obs_window: int = 64,
-        log_kv_pin_min_distance: int = 0,
         log_kv_second_order_scale: float = 1.0,
         log_kv_dense_mode: bool = False,
         log_kv_importance_pooling: bool = False,
@@ -533,7 +524,6 @@ class LogKVLM(LM):
         log_kv_semantic_capacity_beta: float = 0.0,
         log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
         tokenizer_dir: str | None = None,
-        pin_diag_recorder: PinDiagRecorder | None = None,
     ):
         super().__init__()
         self._device = device
@@ -541,9 +531,6 @@ class LogKVLM(LM):
         self.log_kv_B = log_kv_B
         self.log_kv_recent_size = log_kv_recent_size
         self.log_kv_prefill_block = log_kv_prefill_block
-        self.log_kv_pin_size = log_kv_pin_size
-        self.log_kv_pin_obs_window = log_kv_pin_obs_window
-        self.log_kv_pin_min_distance = int(log_kv_pin_min_distance)
         self.log_kv_second_order_scale = float(log_kv_second_order_scale)
         self.log_kv_dense_mode = bool(log_kv_dense_mode)
         self.log_kv_importance_pooling = bool(log_kv_importance_pooling)
@@ -562,7 +549,6 @@ class LogKVLM(LM):
         self.log_kv_semantic_cluster_chunk_size = int(log_kv_semantic_cluster_chunk_size)
         self.log_kv_semantic_capacity_beta = float(log_kv_semantic_capacity_beta)
         self.log_kv_semantic_capacity_hard_cap_mult = float(log_kv_semantic_capacity_hard_cap_mult)
-        self.pin_diag_recorder = pin_diag_recorder
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -664,12 +650,6 @@ class LogKVLM(LM):
             B=self.log_kv_B,
             recent_size=max(2, min(self.log_kv_recent_size, max_seq_length)),
             prefill_block=self.log_kv_prefill_block,
-            # 显著性钉扎（SnapKV 式观察窗）：0 = 关闭。针对捞针类任务——
-            # prompt 末尾的问题在 prefill 时给全前缀打分，top-P token 以
-            # 精确槽形态钉在层级之外，免于被 mean-pool 稀释。
-            pin_size=self.log_kv_pin_size,
-            pin_obs_window=self.log_kv_pin_obs_window,
-            pin_min_distance=self.log_kv_pin_min_distance,
             second_order_scale=self.log_kv_second_order_scale,
             importance_pooling=self.log_kv_importance_pooling,
             importance_pooling_lambda=self.log_kv_importance_pooling_lambda,
@@ -878,7 +858,6 @@ class LogKVLM(LM):
                 # 🧩 长上下文生成使用所选 cache（LogKV slot cache 或 dense KV）。
                 # 建一次、按请求原地重置，不逐样本重分配 — 见 _set_eval_cache。
                 self._set_eval_cache()
-                LOG_KV_PIN_SCORE_DIAG.set_sample_context(sample_id)
                 try:
                     t0 = time.perf_counter()
                     out = litgpt_generate(
@@ -890,21 +869,8 @@ class LogKVLM(LM):
                         top_p=top_p,
                         eos_id=self.tokenizer.eos_id,
                     )
-                    if self.pin_diag_recorder is not None:
-                        self.pin_diag_recorder.record(
-                            model=self.model,
-                            tokenizer=self.tokenizer,
-                            prompt=prompt,
-                            sample_id=sample_id,
-                            doc=getattr(req, "doc", None),
-                            request=req,
-                            prompt_token_offset=prompt_token_offset,
-                            original_prompt_tokens=original_prompt_tokens,
-                            used_prompt_tokens=prompt_len,
-                        )
                     t1 = time.perf_counter()
                 finally:
-                    LOG_KV_PIN_SCORE_DIAG.clear_sample_context()
                     self._reset_eval_cache()
 
             # 截取新生成的部分并解码
@@ -1022,14 +988,6 @@ def main(
     # 流式语义（用于 A/B 验证近似偏差）；越大越快，偏差上界 = 块内 query 比严格
     # 流式多看到 < block 个未压缩 token（缓存状态轨迹两者严格一致）。
     log_kv_prefill_block: int = 256,
-    # 显著性钉扎（SnapKV 式观察窗，推理专用）：prefill 时 prompt 末尾
-    # obs_window 个 query 给全前缀打分，每个 KV 组各钉 pin_size 个 token 为
-    # 精确 w=1 槽（层级照常池化，缓存轨迹不变）。0 = 关闭。捞针类任务的关键。
-    log_kv_pin_size: int = 0,
-    log_kv_pin_obs_window: int = 64,
-    # NMS 式 pin 空间分散约束。0/1 = 旧 top-k；>1 时每个 KV group 内相邻 pin
-    # 至少间隔这么多 token，不够时用剩余高分点回填以保持 pin 数量。
-    log_kv_pin_min_distance: int = 0,
     # Must match the CPT target scale, not the warm-up intermediate value.
     # 0.0 reproduces the first-order LogKV eval path; 1.0 enables full
     # Sigma/Gamma second-order corrections.
@@ -1071,7 +1029,6 @@ def main(
     # ── 🧩 logKV 诊断（score/value oracle 归因网格；见 litgpt.log_kv_diag）──
     # None/"off" = 不诊断（默认，零开销）。其余取值：
     # baseline/s_oracle/v_oracle/gamma_only/exact/dense —— 见 log_kv_diag 模块文档。
-    # 要求 log_kv_pin_size == 0（诊断假定槽连续覆盖精确前缀，钉扎会打破这一点）。
     log_kv_diag_mode: str | None = None,
     # 诊断汇总 JSON 的落盘目录；缺省时退回 output_path。
     log_kv_diag_output: str | None = None,
@@ -1095,18 +1052,6 @@ def main(
     # 典型 sweep：{7, 14, 21, 27, None}（配合已有的 exact_from_layer 分层消融
     # 结果来选阈值）。
     log_kv_diag_second_order_max_layer: int | None = None,
-    # ── 🧩 logKV pin 诊断：比较 _log_kv_pin_indices 与 NIAH needle token span ──
-    # None = 关闭。开启后只记录 generate_until 请求（NIAH/RULER 属于这个路径），
-    # 不改变模型输出；建议配合 --benchmark niah_single_1 --limit 4 单卡先跑。
-    log_kv_pin_diag_output: str | None = None,
-    log_kv_pin_diag_radius: int = 16,
-    log_kv_pin_diag_max_samples: int | None = None,
-    log_kv_pin_diag_include_indices: bool = False,
-    # ── 🧩 logKV pin score/mass 旁路诊断：比较 pooled vs pin 的最终 softmax mass ──
-    # None = 关闭。不同于 log_kv_diag.py，这套不做 slot->token span 映射，
-    # 因此可以在 pin_size>0 时使用。
-    log_kv_pin_score_diag_output: str | None = None,
-    log_kv_pin_score_diag_window_from_end: int = 512,
     # ── 🧩 logKV：YAML config ──
     config: str | None = None,
 ):
@@ -1138,9 +1083,6 @@ def main(
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
-    log_kv_pin_size = _o("log_kv_pin_size", log_kv_pin_size)
-    log_kv_pin_obs_window = _o("log_kv_pin_obs_window", log_kv_pin_obs_window)
-    log_kv_pin_min_distance = int(_o("log_kv_pin_min_distance", log_kv_pin_min_distance))
     log_kv_second_order_scale = float(_o("log_kv_second_order_scale", log_kv_second_order_scale))
     log_kv_importance_pooling = bool(_o("log_kv_importance_pooling", log_kv_importance_pooling))
     log_kv_importance_pooling_lambda = float(
@@ -1185,16 +1127,6 @@ def main(
     log_kv_diag_second_order_max_layer = _o(
         "log_kv_diag_second_order_max_layer", log_kv_diag_second_order_max_layer
     )
-    log_kv_pin_diag_output = _o("log_kv_pin_diag_output", log_kv_pin_diag_output)
-    log_kv_pin_diag_radius = _o("log_kv_pin_diag_radius", log_kv_pin_diag_radius)
-    log_kv_pin_diag_max_samples = _o("log_kv_pin_diag_max_samples", log_kv_pin_diag_max_samples)
-    log_kv_pin_diag_include_indices = _o(
-        "log_kv_pin_diag_include_indices", log_kv_pin_diag_include_indices
-    )
-    log_kv_pin_score_diag_output = _o("log_kv_pin_score_diag_output", log_kv_pin_score_diag_output)
-    log_kv_pin_score_diag_window_from_end = int(
-        _o("log_kv_pin_score_diag_window_from_end", log_kv_pin_score_diag_window_from_end)
-    )
 
     local_rank = _local_rank()
     world_size = _world_size()
@@ -1218,56 +1150,11 @@ def main(
     device = f"cuda:{local_rank}"
 
     diag_active = log_kv_diag_mode not in (None, "off")
-    pin_diag_recorder = (
-        PinDiagRecorder(
-            radius=log_kv_pin_diag_radius,
-            max_samples=log_kv_pin_diag_max_samples,
-            include_indices=log_kv_pin_diag_include_indices,
-        )
-        if log_kv_pin_diag_output is not None
-        else None
-    )
-    pin_score_diag_active = log_kv_pin_score_diag_output is not None
     if log_kv_dense_mode:
         if diag_active:
             raise ValueError(
                 "log_kv_dense_mode=True is incompatible with log_kv_diag_mode: "
                 "LogKV diagnostics require LogStructuredKVCache slots."
-            )
-        if log_kv_pin_diag_output is not None:
-            raise ValueError(
-                "log_kv_dense_mode=True is incompatible with log_kv_pin_diag_output: "
-                "dense mode never runs _log_kv_select_pins(), so pin diagnostics would be empty."
-            )
-        if pin_score_diag_active:
-            raise ValueError(
-                "log_kv_dense_mode=True is incompatible with log_kv_pin_score_diag_output: "
-                "pin score diagnostics require LogStructuredKVCache salience pins."
-            )
-        if int(log_kv_pin_size) != 0:
-            raise ValueError(
-                "log_kv_dense_mode=True requires log_kv_pin_size=0: salience pins are a LogKV-only feature."
-            )
-    if diag_active and log_kv_pin_size != 0:
-        raise ValueError(
-            f"log_kv_diag_mode={log_kv_diag_mode!r} requires log_kv_pin_size=0: "
-            "salience pins scatter duplicate slots and break the diagnostic "
-            "slot->token span mapping (see litgpt.log_kv_diag)."
-        )
-    if pin_score_diag_active:
-        if diag_active:
-            raise ValueError(
-                "log_kv_pin_score_diag_output is incompatible with log_kv_diag_mode: "
-                "the oracle diagnostic requires pin_size=0, while pin score diagnostics require pins."
-            )
-        if int(log_kv_pin_size) <= 0:
-            raise ValueError(
-                "log_kv_pin_score_diag_output requires log_kv_pin_size > 0; otherwise there are no pin slots."
-            )
-        if log_kv_pin_score_diag_window_from_end <= 0:
-            raise ValueError(
-                "log_kv_pin_score_diag_window_from_end must be positive, "
-                f"got {log_kv_pin_score_diag_window_from_end}"
             )
 
     # 多节点时用全局 rank==0（每个节点都有一个 local_rank 0，用它会重复打印）
@@ -1276,13 +1163,12 @@ def main(
         if log_kv_dense_mode:
             print(
                 "🧩 dense 标准 KV 注意力 | 使用 GPT.set_kv_cache() 原生 causal attention；"
-                "忽略 log_kv_B/recent_size/prefill_block/pin/second_order_scale 等 LogKV 参数"
+                "忽略 log_kv_B/recent_size/prefill_block/second_order_scale 等 LogKV 参数"
             )
         else:
             print(
                 f"🧩 logKV 压缩注意力 | B: {log_kv_B} | recent_size: {log_kv_recent_size} | "
-                f"prefill_block: {log_kv_prefill_block} | pin: {log_kv_pin_size} "
-                f"(obs {log_kv_pin_obs_window}, min_dist {log_kv_pin_min_distance}) | "
+                f"prefill_block: {log_kv_prefill_block} | "
                 f"second_order_scale: {log_kv_second_order_scale} | "
                 f"importance_pooling: {log_kv_importance_pooling} "
                 f"(lambda={log_kv_importance_pooling_lambda}, "
@@ -1304,18 +1190,6 @@ def main(
                 f"second_order_max_layer: {log_kv_diag_second_order_max_layer} | "
                 "每 rank 各自累积统计量，不跨 rank 聚合"
             )
-        if pin_diag_recorder is not None:
-            print(
-                f"📍 pin 诊断开启: output={log_kv_pin_diag_output} | "
-                f"radius={log_kv_pin_diag_radius} | max_samples={log_kv_pin_diag_max_samples} | "
-                f"include_indices={log_kv_pin_diag_include_indices}"
-            )
-        if pin_score_diag_active:
-            print(
-                f"📊 pin score/mass 诊断开启: output={log_kv_pin_score_diag_output} | "
-                f"window_from_end={log_kv_pin_score_diag_window_from_end} | "
-                "只统计 fresh prefill 尾部 query 的 pooled vs pin 槽"
-            )
 
     # eval_done：所有 rank 都跑完了 simple_evaluate（即全部集合通信都已结束）。
     # 只有这时收尾 barrier 才是安全的；某个 rank 中途抛异常时必须跳过 barrier，
@@ -1331,9 +1205,6 @@ def main(
             log_kv_B=log_kv_B,
             log_kv_recent_size=log_kv_recent_size,
             log_kv_prefill_block=log_kv_prefill_block,
-            log_kv_pin_size=log_kv_pin_size,
-            log_kv_pin_obs_window=log_kv_pin_obs_window,
-            log_kv_pin_min_distance=log_kv_pin_min_distance,
             log_kv_second_order_scale=log_kv_second_order_scale,
             log_kv_dense_mode=log_kv_dense_mode,
             log_kv_importance_pooling=log_kv_importance_pooling,
@@ -1353,7 +1224,6 @@ def main(
             log_kv_semantic_capacity_beta=log_kv_semantic_capacity_beta,
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
             tokenizer_dir=tokenizer_dir,
-            pin_diag_recorder=pin_diag_recorder,
         )
         if world_size > 1:
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
@@ -1366,11 +1236,6 @@ def main(
                 second_order_max_width=log_kv_diag_second_order_max_width,
                 second_order_max_layer=log_kv_diag_second_order_max_layer,
             ) if diag_active else contextlib.nullcontext()
-        ), (
-            pin_score_diag_mode(
-                pin_score_diag_active,
-                window_from_end=log_kv_pin_score_diag_window_from_end,
-            ) if pin_score_diag_active else contextlib.nullcontext()
         ):
             results = evaluator.simple_evaluate(
                 model=lm_model,
@@ -1381,20 +1246,6 @@ def main(
                 limit=limit,
             )
         eval_done = True
-
-        if pin_diag_recorder is not None and _dist_ready():
-            gathered_pin_samples = [None for _ in range(_world_size())]
-            dist.all_gather_object(gathered_pin_samples, pin_diag_recorder.samples)
-            pin_diag_recorder.merge_samples(gathered_pin_samples)
-
-        pin_score_diag_summary = None
-        if pin_score_diag_active:
-            if _dist_ready():
-                gathered_pin_score_states = [None for _ in range(_world_size())]
-                dist.all_gather_object(gathered_pin_score_states, LOG_KV_PIN_SCORE_DIAG.state_dict())
-                pin_score_diag_summary = merge_pin_score_diag_states(gathered_pin_score_states)
-            else:
-                pin_score_diag_summary = LOG_KV_PIN_SCORE_DIAG.summary()
 
         # 落盘阶段：只有 rank 0 写文件（建目录、写 json/csv/xlsx）。其它 rank 什么都
         # 不做，直接到下面的 barrier 等 rank 0 写完 —— 各 rank 同时往共享盘写同名文件
@@ -1427,95 +1278,6 @@ def main(
                 with open(diag_file, "w", encoding="utf-8") as f:
                     json.dump(LOG_KV_DIAG.summary(), f, indent=2, ensure_ascii=False)
                 print(f"🔬 诊断汇总已保存到: {diag_file}")
-
-            if pin_diag_recorder is not None:
-                pin_base = Path(log_kv_pin_diag_output).expanduser()
-                if pin_base.suffix.lower() == ".json":
-                    pin_file = pin_base
-                else:
-                    pin_base.mkdir(parents=True, exist_ok=True)
-                    ckpt_name = Path(checkpoint_dir).name
-                    pin_file = pin_base / f"pin_diag_{ckpt_name}_{benchmark.replace(',', '+')}_{ts}.json"
-                pin_file.parent.mkdir(parents=True, exist_ok=True)
-                pin_payload = {
-                    "timestamp": ts,
-                    "benchmark": benchmark,
-                    "checkpoint_dir": checkpoint_dir,
-                    "config": {
-                        "log_kv_B": log_kv_B,
-                        "log_kv_recent_size": log_kv_recent_size,
-                        "log_kv_prefill_block": log_kv_prefill_block,
-                        "log_kv_pin_size": log_kv_pin_size,
-                        "log_kv_pin_obs_window": log_kv_pin_obs_window,
-                        "log_kv_pin_min_distance": log_kv_pin_min_distance,
-                        "log_kv_second_order_scale": log_kv_second_order_scale,
-                        "log_kv_semantic_clusters": log_kv_semantic_clusters,
-                        "log_kv_cluster_k_max": log_kv_cluster_k_max,
-                        "log_kv_cluster_lambda_rel": log_kv_cluster_lambda_rel,
-                        "log_kv_seg_eta": log_kv_seg_eta,
-                        "log_kv_seg_g0": log_kv_seg_g0,
-                        "log_kv_seg_gap_max": log_kv_seg_gap_max,
-                        "log_kv_seg_block_level": log_kv_seg_block_level,
-                        "log_kv_seg_forget": log_kv_seg_forget,
-                        "log_kv_semantic_s_h_path": log_kv_semantic_s_h_path,
-                        "log_kv_semantic_flush_granularity": log_kv_semantic_flush_granularity,
-                        "log_kv_semantic_cluster_chunk_size": log_kv_semantic_cluster_chunk_size,
-                        "log_kv_semantic_capacity_beta": log_kv_semantic_capacity_beta,
-                        "log_kv_semantic_capacity_hard_cap_mult": log_kv_semantic_capacity_hard_cap_mult,
-                        "radius": log_kv_pin_diag_radius,
-                        "max_samples": log_kv_pin_diag_max_samples,
-                        "include_indices": log_kv_pin_diag_include_indices,
-                    },
-                    "pin_diag": pin_diag_recorder.summary(),
-                }
-                with open(pin_file, "w", encoding="utf-8") as f:
-                    json.dump(pin_payload, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
-                print(f"📍 pin 诊断已保存到: {pin_file}")
-
-            if pin_score_diag_active:
-                pin_score_base = Path(log_kv_pin_score_diag_output).expanduser()
-                if pin_score_base.suffix.lower() == ".json":
-                    pin_score_file = pin_score_base
-                else:
-                    pin_score_base.mkdir(parents=True, exist_ok=True)
-                    ckpt_name = Path(checkpoint_dir).name
-                    pin_score_file = (
-                        pin_score_base
-                        / f"pin_score_diag_{ckpt_name}_{benchmark.replace(',', '+')}_{ts}.json"
-                    )
-                pin_score_file.parent.mkdir(parents=True, exist_ok=True)
-                pin_score_payload = {
-                    "timestamp": ts,
-                    "benchmark": benchmark,
-                    "checkpoint_dir": checkpoint_dir,
-                    "config": {
-                        "log_kv_B": log_kv_B,
-                        "log_kv_recent_size": log_kv_recent_size,
-                        "log_kv_prefill_block": log_kv_prefill_block,
-                        "log_kv_pin_size": log_kv_pin_size,
-                        "log_kv_pin_obs_window": log_kv_pin_obs_window,
-                        "log_kv_pin_min_distance": log_kv_pin_min_distance,
-                        "log_kv_second_order_scale": log_kv_second_order_scale,
-                        "log_kv_semantic_clusters": log_kv_semantic_clusters,
-                        "log_kv_cluster_k_max": log_kv_cluster_k_max,
-                        "log_kv_cluster_lambda_rel": log_kv_cluster_lambda_rel,
-                        "log_kv_seg_eta": log_kv_seg_eta,
-                        "log_kv_seg_g0": log_kv_seg_g0,
-                        "log_kv_seg_gap_max": log_kv_seg_gap_max,
-                        "log_kv_seg_block_level": log_kv_seg_block_level,
-                        "log_kv_seg_forget": log_kv_seg_forget,
-                        "log_kv_semantic_s_h_path": log_kv_semantic_s_h_path,
-                        "log_kv_semantic_flush_granularity": log_kv_semantic_flush_granularity,
-                        "log_kv_semantic_cluster_chunk_size": log_kv_semantic_cluster_chunk_size,
-                        "log_kv_semantic_capacity_beta": log_kv_semantic_capacity_beta,
-                        "log_kv_semantic_capacity_hard_cap_mult": log_kv_semantic_capacity_hard_cap_mult,
-                        "window_from_end": log_kv_pin_score_diag_window_from_end,
-                    },
-                    "pin_score_diag": pin_score_diag_summary,
-                }
-                with open(pin_score_file, "w", encoding="utf-8") as f:
-                    json.dump(pin_score_payload, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
-                print(f"📊 pin score/mass 诊断已保存到: {pin_score_file}")
 
             # 🌟 第一步：立即保存原始 results 对象，便于后续恢复
             results_cache_file = Path("eval_results_cache.json")

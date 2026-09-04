@@ -131,11 +131,10 @@ mode they were collected under:
     deterministic sample buffer, with the pool size ``n``.
 
 Scope / preconditions (enforced; also see ``diag_block_attention``):
-  * Diagnostics run with ``pin_size == 0`` and on a FRESH prefill only. The
-    slot→token span mapping assumes every slot covers a contiguous, time-ordered
-    run of the exact prefix tokens (``get_attention_state`` invariant). Salience
-    pins break that (scattered duplicates), and a decode continuation / pending
-    tail breaks ``token_count == len(prefix)``. Both are rejected.
+  * Diagnostics run on a FRESH prefill only. The slot→token span mapping assumes
+    every slot covers a contiguous, time-ordered run of the exact prefix tokens
+    (``get_attention_state`` invariant). A decode continuation / pending tail
+    breaks ``token_count == len(prefix)`` and is rejected.
   * ``mode == "off"`` (default) is fully inert: ``diag_block_attention`` is never
     reached from ``model.py`` unless a ``diag_mode(...)`` context is active, so
     production training/eval keeps its exact numerics and performance.
@@ -566,10 +565,8 @@ def slot_runs(slot_w: torch.Tensor, slot_valid: torch.Tensor | None = None) -> t
     any scatter. ``slot_valid`` filters the fixed pooled-prefix capacity used by
     the GPU layout; exact suffix slots remain valid.
 
-    Requires ``slot_w`` identical across batch/group: with salience pins active
-    the slots are scattered duplicates rather than one contiguous token run, so
-    the mapping is invalid (see ``diag_block_attention`` — diagnostics need
-    ``pin_size == 0``).
+    Requires ``slot_w`` identical across batch/group; otherwise there is no
+    single contiguous slot→token mapping shared by the diagnostic batch.
 
     Returns:
         runs: list of ``(slot_offset, n_slots, width)`` in time order.
@@ -577,9 +574,8 @@ def slot_runs(slot_w: torch.Tensor, slot_valid: torch.Tensor | None = None) -> t
     """
     if not torch.all(slot_w == slot_w[0, 0]):
         raise ValueError(
-            "slot widths differ across batch/group — diagnostics require pin_size=0 "
-            "(salience pins scatter duplicate slots and break the contiguous "
-            "slot->token span mapping)"
+            "slot widths differ across batch/group — diagnostics require one "
+            "contiguous slot->token span mapping shared by the diagnostic batch"
         )
 
     if slot_valid is not None:
@@ -1174,9 +1170,6 @@ def diag_block_attention(
       * fresh prefill only — ``k_prefix`` must equal the tokens the slots cover,
         i.e. ``cache.token_count == start`` with no decode continuation / pending
         tail. Not valid during decode.
-      * ``pin_size == 0`` — salience pins scatter duplicate slots and break the
-        contiguous slot→token mapping (rejected by ``slot_runs`` /the token-count
-        check below).
 
     Returns (B, nh, T_q, Dv), matching the production output shape.
     """
@@ -1237,7 +1230,7 @@ def diag_block_attention(
             if total != k_prefix.size(2):
                 raise ValueError(
                     f"slot span ({total}) != prefix length ({k_prefix.size(2)}): "
-                    "diagnostics require a fresh prefill with pin_size=0"
+                    "diagnostics require a fresh prefill with contiguous slots"
                 )
             _diag_slot_core(
                 mode=mode,
@@ -1291,7 +1284,7 @@ def diag_block_attention(
     if total != k_prefix.size(2):
         raise ValueError(
             f"slot span ({total}) != prefix length ({k_prefix.size(2)}): "
-            "diagnostics require a fresh prefill with pin_size=0"
+            "diagnostics require a fresh prefill with contiguous slots"
         )
     return _diag_slot_core(
         mode=mode,

@@ -32,7 +32,6 @@ log_kv_train_block: 1024
 log_kv_prefill_block: 1024
 log_kv_second_order_scale: 0.2
 log_kv_second_order_warmup_steps: 100
-log_kv_pin_size: 0
 
 log_kv_semantic_clusters: true
 log_kv_cluster_k_max: 16 # log 32k = 15

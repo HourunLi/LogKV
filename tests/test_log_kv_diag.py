@@ -199,10 +199,10 @@ class TestStatsPerLevel:
         assert summ["peakiness"] and summ["peakiness"][0]["r2_max"] > 0.0
 
     def test_slot_runs_rejects_inconsistent_widths(self):
-        # Simulate a pin-contaminated / per-group-divergent width vector.
+        # Simulate a per-group-divergent width vector.
         slot_w = torch.ones(1, N_GROUPS, 5)
         slot_w[0, 1, 2] = 4.0
-        with pytest.raises(ValueError, match="pin_size"):
+        with pytest.raises(ValueError, match="contiguous"):
             slot_runs(slot_w)
 
 

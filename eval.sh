@@ -167,9 +167,6 @@ emit("CONFIG_BENCHMARKS", benchmark)
 emit("LOG_KV_B", value_or("log_kv_B", 512))
 emit("LOG_KV_RECENT", value_or("log_kv_recent_size", 1024))
 emit("LOG_KV_PREFILL", value_or("log_kv_prefill_block", 256))
-emit("LOG_KV_PIN", value_or("log_kv_pin_size", 0))
-emit("LOG_KV_PIN_OBS", value_or("log_kv_pin_obs_window", 64))
-emit("LOG_KV_PIN_MIN_DIST", value_or("log_kv_pin_min_distance", 0))
 emit("LOG_KV_SECOND_ORDER_SCALE", value_or("log_kv_second_order_scale", 1.0))
 emit("LOG_KV_SEMANTIC", str(bool(cfg.get("log_kv_semantic_clusters", False))).lower())
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
@@ -287,7 +284,7 @@ for TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
     fi
 done
 
-LOG_KV_ARG_LIST=(--log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}" --log_kv_pin_size "${LOG_KV_PIN}" --log_kv_pin_obs_window "${LOG_KV_PIN_OBS}" --log_kv_pin_min_distance "${LOG_KV_PIN_MIN_DIST}")
+LOG_KV_ARG_LIST=(--log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}")
 if [ -n "${LOG_KV_SECOND_ORDER_SCALE}" ]; then
     LOG_KV_ARG_LIST+=(--log_kv_second_order_scale "${LOG_KV_SECOND_ORDER_SCALE}")
 fi
@@ -321,7 +318,7 @@ fi
 
 echo "Checkpoint: ${SAVE_DIR}"
 echo "Output dir: ${EVAL_OUTPUT_DIR}"
-echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, pin=${LOG_KV_PIN} (obs ${LOG_KV_PIN_OBS}, min_dist ${LOG_KV_PIN_MIN_DIST}), second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY})"
+echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY})"
 if [ -n "${DIAG_ARGS}" ]; then
     echo "Extra eval args: ${DIAG_ARGS}"
 fi
