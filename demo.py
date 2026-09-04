@@ -558,6 +558,8 @@ def main(
     log_kv_semantic_cluster_chunk_size: int = 0,
     log_kv_semantic_capacity_beta: float = 0.0,
     log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
+    log_kv_semantic_hash_routing: bool = False,
+    log_kv_semantic_hash_anchor_path: str | None = None,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -660,6 +662,8 @@ def main(
     log_kv_semantic_capacity_hard_cap_mult = float(
         _o("log_kv_semantic_capacity_hard_cap_mult", log_kv_semantic_capacity_hard_cap_mult)
     )
+    log_kv_semantic_hash_routing = bool(_o("log_kv_semantic_hash_routing", log_kv_semantic_hash_routing))
+    log_kv_semantic_hash_anchor_path = _o("log_kv_semantic_hash_anchor_path", log_kv_semantic_hash_anchor_path)
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
@@ -831,6 +835,8 @@ def main(
             log_kv_semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
             log_kv_semantic_capacity_beta=log_kv_semantic_capacity_beta,
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
+            log_kv_semantic_hash_routing=log_kv_semantic_hash_routing,
+            log_kv_semantic_hash_anchor_path=log_kv_semantic_hash_anchor_path,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -946,6 +952,17 @@ def main(
         if log_kv_semantic_clusters
         else None
     )
+    semantic_hash_anchors = (
+        load_log_kv_semantic_hash_anchors(
+            log_kv_semantic_hash_anchor_path,
+            n_layer=config_obj.n_layer,
+            n_groups=config_obj.n_query_groups,
+            k_max=log_kv_cluster_k_max,
+            k_dim=config_obj.head_size,
+        )
+        if log_kv_semantic_clusters and log_kv_semantic_hash_routing
+        else None
+    )
 
     # Always simulate the logKV compressed-KV streaming attention during
     # training — this script only supports the logKV adaptation route.
@@ -979,6 +996,8 @@ def main(
         semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
         semantic_capacity_beta=log_kv_semantic_capacity_beta,
         semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
+        semantic_hash_routing=log_kv_semantic_hash_routing,
+        semantic_hash_anchors=semantic_hash_anchors,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
@@ -1002,7 +1021,9 @@ def main(
         f"flush={log_kv_semantic_flush_granularity}, tree_chunk={log_kv_semantic_cluster_chunk_size}, "
         f"s_h={log_kv_semantic_s_h_path}, "
         f"capacity_beta={log_kv_semantic_capacity_beta}, "
-        f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult})"
+        f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
+        f"hash={log_kv_semantic_hash_routing}, "
+        f"hash_anchor={log_kv_semantic_hash_anchor_path})"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))

@@ -330,6 +330,8 @@ class LogStructuredKVCache(nn.Module):
         semantic_cluster_chunk_size: int = 0,
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
+        semantic_hash_routing: bool = False,
+        semantic_hash_anchors: torch.Tensor | None = None,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
         rope_n_elem: int | None = None,
@@ -418,6 +420,7 @@ class LogStructuredKVCache(nn.Module):
                     "semantic_capacity_hard_cap_mult must be finite >= 0, got "
                     f"{semantic_capacity_hard_cap_mult}"
                 )
+            self.semantic_hash_routing = bool(semantic_hash_routing)
             self.rope_n_elem = int(rope_n_elem)
             self.register_buffer("cos_cache", cos_cache.to(device=device), persistent=False)
             self.register_buffer("sin_cache", sin_cache.to(device=device), persistent=False)
@@ -435,6 +438,7 @@ class LogStructuredKVCache(nn.Module):
             self.semantic_cluster_chunk_size = 0
             self.semantic_capacity_beta = 0.0
             self.semantic_capacity_hard_cap_mult = 0.0
+            self.semantic_hash_routing = False
             self.rope_n_elem = None
             self.cos_cache = None
             self.sin_cache = None
@@ -657,6 +661,31 @@ class LogStructuredKVCache(nn.Module):
                 raise ValueError("semantic_s_h must be finite and > 0")
             self.register_buffer("s_h", s_h, persistent=False)
             self._semantic_s_h_host: list[list[float]] = s_h.detach().cpu().tolist()
+            if self.semantic_hash_routing:
+                if semantic_hash_anchors is None:
+                    raise ValueError("semantic_hash_routing=True requires semantic_hash_anchors")
+                anchors = semantic_hash_anchors.to(device=device, dtype=torch.float32)
+                if anchors.dim() == 2:
+                    anchors = anchors.unsqueeze(0).unsqueeze(0).expand(batch_size, n_groups, -1, -1).contiguous()
+                elif anchors.dim() == 3:
+                    anchors = anchors.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous()
+                elif anchors.dim() != 4:
+                    raise ValueError(
+                        "semantic_hash_anchors must have shape (K,D), (G,K,D), or (B,G,K,D), "
+                        f"got {tuple(anchors.shape)}"
+                    )
+                if tuple(anchors.shape) != (batch_size, n_groups, self.K_max, k_dim):
+                    raise ValueError(
+                        "semantic_hash_anchors shape "
+                        f"{tuple(anchors.shape)} does not match ({batch_size}, {n_groups}, {self.K_max}, {k_dim})"
+                    )
+                if not bool(torch.isfinite(anchors).all().item()):
+                    raise ValueError("semantic_hash_anchors must be finite")
+                self.register_buffer("hash_anchors", anchors, persistent=False)
+            else:
+                self.hash_anchors = None
+            self._semantic_hash_total_tokens = 0
+            self._semantic_hash_fast_tokens = 0
             self.op_log: torch.Tensor | None = None
             self.op_log_len: torch.Tensor | None = None
 
@@ -1696,6 +1725,67 @@ class LogStructuredKVCache(nn.Module):
             direct = direct & ((n_winner + 1.0) <= cap)
         return winner, s_winner, direct
 
+    def _semantic_hash_assignments(self, k_raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.hash_anchors is None:
+            raise RuntimeError("semantic hash routing requires hash_anchors")
+        anchors = self.hash_anchors[: k_raw.size(0), : k_raw.size(1)].float()
+        x = k_raw.float()
+        dist = (
+            x.square().sum(dim=-1, keepdim=True)
+            + anchors.square().sum(dim=-1).unsqueeze(2)
+            - 2.0 * torch.einsum("bgtd,bgkd->bgtk", x, anchors)
+        ).clamp_min(0.0)
+        winner = dist.argmin(dim=-1)
+        d_winner = dist.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+        threshold = self.cluster_lambda_rel * self.s_h[: k_raw.size(0), : k_raw.size(1)].unsqueeze(-1)
+        return winner, d_winner, d_winner <= threshold
+
+    def _semantic_activate_hash_bucket(self, b: int, g: int, c: int) -> bool:
+        if self._semantic_alive[b][g][c]:
+            dist = (self.centroid[b, g, c] - self.hash_anchors[b, g, c]).float().square().sum()
+            return float(dist.item()) <= self.cluster_lambda_rel * self._semantic_s_h_host[b][g]
+        self._semantic_clear_cluster(b, g, c)
+        self._set_semantic_alive(b, g, c, True)
+        self.centroid[b, g, c].copy_(self.hash_anchors[b, g, c])
+        self.n_eff[b, g, c].zero_()
+        return True
+
+    def _semantic_route_hash_fast(
+        self,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        positions_host: list[list[int]],
+        winner: torch.Tensor,
+        fast: torch.Tensor,
+    ) -> torch.Tensor:
+        accepted = fast.clone()
+        accepted_count = 0
+        for b in range(k_raw.size(0)):
+            for g in range(k_raw.size(1)):
+                for c in range(self.K_max):
+                    idx = torch.nonzero(accepted[b, g] & (winner[b, g] == c), as_tuple=False).flatten()
+                    if idx.numel() == 0:
+                        continue
+                    offsets: list[int] = []
+                    for n in range(idx.numel()):
+                        i = int(idx[n].item())
+                        if self._semantic_can_accept(b, g, c, len(offsets) + 1):
+                            offsets.append(i)
+                        else:
+                            accepted[b, g, i] = False
+                    if not offsets:
+                        continue
+                    if not self._semantic_activate_hash_bucket(b, g, c):
+                        for i in offsets:
+                            accepted[b, g, i] = False
+                        continue
+                    self._semantic_join_offsets_batch(b, g, c, tuple(offsets), k_raw, v, positions, positions_host)
+                    accepted_count += len(offsets)
+        self._semantic_hash_total_tokens += int(k_raw.size(0) * k_raw.size(1) * k_raw.size(2))
+        self._semantic_hash_fast_tokens += accepted_count
+        return accepted
+
     def _semantic_replay_token_offset(self, positions: torch.Tensor, b: int, token_idx: int) -> int:
         hit = torch.nonzero(positions[b] == token_idx, as_tuple=False).flatten()
         if hit.numel() != 1:
@@ -1742,11 +1832,20 @@ class LogStructuredKVCache(nn.Module):
         positions_host: list[list[int]],
         *,
         record: bool,
+        route_mask: torch.Tensor | None = None,
     ) -> None:
         for b in range(k_raw.size(0)):
             for g in range(k_raw.size(1)):
+                idx = (
+                    torch.nonzero(route_mask[b, g], as_tuple=False).flatten()
+                    if route_mask is not None
+                    else torch.arange(k_raw.size(2), device=k_raw.device)
+                )
+                if idx.numel() == 0:
+                    continue
                 if record:
-                    for i in range(k_raw.size(2)):
+                    for n in range(idx.numel()):
+                        i = int(idx[n].item())
                         pos = positions[b, i]
                         token_idx = positions_host[b][i]
                         if not self._semantic_alive[b][g][0]:
@@ -1757,12 +1856,12 @@ class LogStructuredKVCache(nn.Module):
                             )
                     continue
 
-                start = 0
                 if not self._semantic_alive[b][g][0]:
+                    first = int(idx[0].item())
                     self._semantic_new_cluster(
-                        b, g, 0, positions_host[b][0], k_raw[b, g, 0], v[b, g, 0], positions[b, 0], record=False
+                        b, g, 0, positions_host[b][first], k_raw[b, g, first], v[b, g, first], positions[b, first], record=False
                     )
-                    start = 1
+                    idx = idx[1:]
 
                 run: list[int] = []
                 run_tokens: list[int] = []
@@ -1790,7 +1889,8 @@ class LogStructuredKVCache(nn.Module):
                     run_new_segment = False
 
                 prev_hi = self._semantic_p_hi_c[b][g][0]
-                for i in range(start, k_raw.size(2)):
+                for n in range(idx.numel()):
+                    i = int(idx[n].item())
                     token_idx = positions_host[b][i]
                     starts_segment = self.seg_gap_max != math.inf and token_idx - prev_hi > self.seg_gap_max
                     if starts_segment:
@@ -2119,12 +2219,17 @@ class LogStructuredKVCache(nn.Module):
         positions_host: list[list[int]],
         *,
         record: bool,
+        route_mask: torch.Tensor | None = None,
     ) -> None:
         if self.K_max == 1:
-            self._semantic_route_k1_batch(k_raw, v, positions, positions_host, record=record)
+            self._semantic_route_k1_batch(k_raw, v, positions, positions_host, record=record, route_mask=route_mask)
             return
 
         winner, _s_winner, direct = self._semantic_existing_assignments(k_raw, positions)
+        if route_mask is None:
+            route_mask = torch.ones_like(direct, dtype=torch.bool)
+        else:
+            direct = direct & route_mask
 
         # Phase 1: frozen-centroid direct assignments. Normal inference batches
         # same-target runs into the semantic ladder; op-log recording keeps the
@@ -2200,7 +2305,7 @@ class LogStructuredKVCache(nn.Module):
         for b in range(k_raw.size(0)):
             for g in range(k_raw.size(1)):
                 batch_clusters: list[int] = []
-                idx = torch.nonzero(~direct[b, g], as_tuple=False).flatten()
+                idx = torch.nonzero(route_mask[b, g] & ~direct[b, g], as_tuple=False).flatten()
                 for n in range(idx.numel()):
                     i = int(idx[n].item())
                     pos = positions[b, i]
@@ -2231,6 +2336,22 @@ class LogStructuredKVCache(nn.Module):
                     self._semantic_new_cluster(b, g, c, token_idx, k_raw[b, g, i], v[b, g, i], pos, record=record)
                     batch_clusters.append(c)
 
+    def _semantic_route_hash(
+        self,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        positions_host: list[list[int]],
+        *,
+        record: bool,
+    ) -> None:
+        winner, _d_winner, fast = self._semantic_hash_assignments(k_raw)
+        accepted = self._semantic_route_hash_fast(k_raw, v, positions, positions_host, winner, fast)
+        slow = ~accepted
+        if bool(slow.any().item()):
+            # ponytail: masked slow path uses the scalar three-phase route; add masked chunk-tree only if slow batches are hot.
+            self._semantic_route_three_phase(k_raw, v, positions, positions_host, record=record, route_mask=slow)
+
     def route_and_flush_batch(
         self,
         k_raw: torch.Tensor,
@@ -2254,6 +2375,10 @@ class LogStructuredKVCache(nn.Module):
         if replay_op_log is not None:
             if replay_op_log_len is None:
                 raise ValueError("replay_op_log_len is required with replay_op_log")
+            route_mask = None
+            if self.semantic_hash_routing:
+                winner, _d_winner, fast = self._semantic_hash_assignments(k_raw)
+                route_mask = ~self._semantic_route_hash_fast(k_raw, v, positions, positions_host, winner, fast)
             if replay_op_log_host is not None:
                 if getattr(self, "_op_replay_cursor_host", None) is None:
                     self._op_replay_cursor_host = [
@@ -2265,8 +2390,9 @@ class LogStructuredKVCache(nn.Module):
                 )
             for b in range(k_raw.size(0)):
                 for g in range(k_raw.size(1)):
+                    tokens_needed = int(route_mask[b, g].sum().item()) if route_mask is not None else k_raw.size(2)
                     consumed = 0
-                    while consumed < k_raw.size(2):
+                    while consumed < tokens_needed:
                         if replay_op_log_host is not None:
                             cursor = self._op_replay_cursor_host[b][g]
                             if cursor >= len(replay_op_log_host[b][g]):
@@ -2286,6 +2412,8 @@ class LogStructuredKVCache(nn.Module):
                             self._semantic_ward_merge(b, g, a, b_arg, record=False)
                         else:
                             i = self._semantic_replay_token_offset_host(positions_host, b, c_arg)
+                            if route_mask is not None and not bool(route_mask[b, g, i].item()):
+                                raise RuntimeError(f"semantic hash replay log referenced fast token {c_arg}")
                             pos = positions[b, i]
                             if op == LOG_KV_OP_NEW_CLUSTER:
                                 self._semantic_new_cluster(b, g, a, c_arg, k_raw[b, g, i], v[b, g, i], pos, record=False)
@@ -2301,10 +2429,14 @@ class LogStructuredKVCache(nn.Module):
                             else:
                                 raise ValueError(f"unknown semantic LogKV op {op}")
                             consumed += 1
-                    if consumed != k_raw.size(2):
+                    if consumed != tokens_needed:
                         raise RuntimeError(
-                            f"semantic LogKV replay consumed {consumed}/{k_raw.size(2)} tokens for batch={b}, group={g}"
+                            f"semantic LogKV replay consumed {consumed}/{tokens_needed} tokens for batch={b}, group={g}"
                         )
+            return
+
+        if self.semantic_hash_routing:
+            self._semantic_route_hash(k_raw, v, positions, positions_host, record=record_op_log)
             return
 
         if (
@@ -3461,6 +3593,8 @@ class LogStructuredKVCache(nn.Module):
             self.op_log_len = None
             self._op_replay_cursor = None
             self._op_replay_cursor_host = None
+            self._semantic_hash_total_tokens = 0
+            self._semantic_hash_fast_tokens = 0
 
     @property
     def total_slots(self) -> int:
@@ -3491,7 +3625,7 @@ class LogStructuredKVCache(nn.Module):
             ratios = max_tokens / target
             top_counts = self.level_count[..., -1].detach().to(torch.float32)
             top_live = top_counts.masked_fill(~alive, 0)
-            return {
+            out = {
                 "semantic_clusters": True,
                 "target_tokens_per_cluster": target,
                 "K_max_binding_rate": float((live_counts >= self.K_max).to(torch.float32).mean().item()),
@@ -3506,6 +3640,19 @@ class LogStructuredKVCache(nn.Module):
                 "top_level_live_slots": int(top_live.sum().item()),
                 "top_level_full_clusters": int(((top_counts >= self.B) & alive).sum().item()),
             }
+            if self.semantic_hash_routing:
+                total = self._semantic_hash_total_tokens
+                fast_rate = self._semantic_hash_fast_tokens / total if total else 0.0
+                out.update(
+                    {
+                        "semantic_hash_routing": True,
+                        "semantic_hash_fast_tokens": self._semantic_hash_fast_tokens,
+                        "semantic_hash_total_tokens": total,
+                        "semantic_hash_fast_rate": fast_rate,
+                        "semantic_hash_slow_rate": 1.0 - fast_rate if total else 0.0,
+                    }
+                )
+            return out
 
 
 # ======================================================================

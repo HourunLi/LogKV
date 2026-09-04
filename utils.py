@@ -53,6 +53,68 @@ def load_log_kv_semantic_s_h(path: str | os.PathLike | None, n_layer: int, n_gro
     return t.contiguous()
 
 
+def load_log_kv_semantic_hash_anchors(
+    path: str | os.PathLike | None,
+    *,
+    n_layer: int,
+    n_groups: int,
+    k_max: int,
+    k_dim: int,
+) -> torch.Tensor | None:
+    """Load fixed hash anchors as ``(n_layer, n_groups, k_max, k_dim)`` fp32."""
+    if path in (None, ""):
+        return None
+    p = os.path.expandvars(os.path.expanduser(os.fspath(path)))
+    if p.endswith((".pt", ".pth")):
+        obj = torch.load(p, map_location="cpu")
+    elif p.endswith(".npy"):
+        obj = np.load(p)
+    elif p.endswith(".npz"):
+        data = np.load(p)
+        for key in ("semantic_hash_anchors", "hash_anchors", "anchors"):
+            if key in data:
+                obj = data[key]
+                break
+        else:
+            raise ValueError(f"{p}: expected one of semantic_hash_anchors/hash_anchors/anchors in npz")
+    else:
+        with open(p, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+
+    if isinstance(obj, dict):
+        for key in ("semantic_hash_anchors", "hash_anchors", "anchors"):
+            if key in obj:
+                obj = obj[key]
+                break
+    if isinstance(obj, dict):
+        rows = []
+        for layer in range(int(n_layer)):
+            try:
+                row = obj[str(layer)]
+                if isinstance(row, dict):
+                    row = row.get("anchors", row.get("centroids"))
+                rows.append(row)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"{p}: missing hash anchors for layer {layer}") from exc
+        obj = rows
+
+    t = torch.as_tensor(obj, dtype=torch.float32)
+    if t.dim() == 2:
+        t = t.unsqueeze(0).unsqueeze(0).expand(n_layer, n_groups, -1, -1).contiguous()
+    elif t.dim() == 3:
+        if t.size(0) == n_groups:
+            t = t.unsqueeze(0).expand(n_layer, -1, -1, -1).contiguous()
+        elif t.size(0) == n_layer and n_groups == 1:
+            t = t.unsqueeze(1).contiguous()
+        else:
+            raise ValueError(f"{p}: hash anchors shape {tuple(t.shape)} cannot map to ({n_layer}, {n_groups}, {k_max}, {k_dim})")
+    if tuple(t.shape) != (n_layer, n_groups, k_max, k_dim):
+        raise ValueError(f"{p}: hash anchors shape {tuple(t.shape)} does not match ({n_layer}, {n_groups}, {k_max}, {k_dim})")
+    if not bool(torch.isfinite(t).all()):
+        raise ValueError(f"{p}: hash anchors must be finite")
+    return t.contiguous()
+
+
 def convert_and_replace_fsdp_ckpt(ckpt_root: str):
     """
     将指定目录下的 FSDP/DCP checkpoint 转换为单文件，并使用 shutil 自动完成文件替换。
