@@ -17,10 +17,10 @@
 
 ## 2. 和前面质量问题的关系
 
-此前 LogKV 这条线已经遇到过两个质量问题：
+此前 LogKV 这条线已经遇到过质量问题：
 
 1. 朴素均值池化在长程检索上损失很大，NIAH 这类任务掉得明显。
-2. 二阶修正有正收益，但 pin 在当前训练/推理分布下是负收益。
+2. 二阶修正有正收益，但还不足以补回全部长程检索损失。
 
 这些是“模型能不能用好压缩 cache”的问题。当前这份文档记录的是另一类更靠底层的问题：
 
@@ -31,7 +31,7 @@
 二者有关，但不是同一个瓶颈：
 
 - checkpoint / CPT 可以改善模型适应压缩后的表示。
-- pin 选择、二阶修正、`s_h` 标定会影响语义簇质量。
+- 二阶修正、`s_h` 标定会影响语义簇质量。
 - 但在线路由、slot 写入、attention state 物化、manual attention matmul 的成本，必须靠
   runtime 实现和配置定尺解决。
 
@@ -361,7 +361,6 @@ log_kv_B: 128
 log_kv_recent_size: 1024
 log_kv_second_order_scale: 0.2
 log_kv_prefill_block: 128
-log_kv_pin_size: 0
 log_kv_semantic_clusters: true
 log_kv_cluster_k_max: 64
 log_kv_semantic_s_h_path: null

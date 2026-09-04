@@ -23,7 +23,6 @@
 语义簇模式必须拒绝：
 
 - `importance_pooling=True`
-- `pin_size>0` 或训练期 pin 注入参数非零
 - `rope_interleave=True`（当前锚点旋转只覆盖 split-half RoPE）
 - `MultiheadLatentAttention`（本方案假设显式 per-KV-group `k/v`）
 

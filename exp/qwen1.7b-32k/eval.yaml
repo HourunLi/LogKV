@@ -23,7 +23,6 @@ log_kv_B: 512
 log_kv_recent_size: 1024
 log_kv_second_order_scale: 0.2
 log_kv_prefill_block: 128
-log_kv_pin_size: 0
 log_kv_semantic_clusters: true
 log_kv_cluster_k_max: 16
 log_kv_cluster_lambda_rel: 1.0

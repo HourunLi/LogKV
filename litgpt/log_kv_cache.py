@@ -43,14 +43,12 @@ Compute: O(recent_size + B·log(N/2)) per query — no Θ(N) term.
 from __future__ import annotations
 
 import math
-import random
 from typing import Any, NamedTuple, NoReturn
 
 import torch
 import torch.nn as nn
 from torch.autograd.function import once_differentiable
 
-from litgpt.log_kv_pin_score_diag import DIAG as LOG_KV_PIN_SCORE_DIAG
 from litgpt.log_kv_position import (
     anchor_mass_bias,
     dedup_anchors,
@@ -313,7 +311,6 @@ class LogStructuredKVCache(nn.Module):
         recent_size: int = 0,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-        pin_size: int = 0,
         importance_pooling: bool = False,
         importance_pooling_lambda: float = 1.0,
         importance_pooling_temperature: float = 1.0,
@@ -357,8 +354,6 @@ class LogStructuredKVCache(nn.Module):
             raise ValueError(f"recent_size ({self.recent_size}) must be >= 2")
         if self.semantic_clusters and importance_pooling:
             raise ValueError("semantic LogKV rejects importance_pooling=True")
-        if self.semantic_clusters and pin_size > 0:
-            raise ValueError("semantic LogKV rejects salience pinning; set pin_size=0")
         self.importance_pooling = bool(importance_pooling)
         self.importance_pooling_lambda = float(importance_pooling_lambda)
         if not 0.0 <= self.importance_pooling_lambda <= 1.0:
@@ -669,32 +664,6 @@ class LogStructuredKVCache(nn.Module):
         # here since a fresh cache has nothing for the guard to protect.
         self._second_order: bool = True
 
-        # ---- Salience pins: up to pin_size exact tokens kept OUTSIDE the
-        # hierarchy (SnapKV-style observation-window selection at prefill; see
-        # CausalSelfAttention._log_kv_select_pins). Rationale: uniform mean-
-        # pooling dilutes a distant low-redundancy fact (a "needle") by 1/w, and
-        # retrospective salience cannot save it — but at prefill time the
-        # query IS in the prompt tail, so the trailing observation window can
-        # score the whole prefix and pin what it will need before compaction
-        # buries it. Pinned tokens are DUPLICATES: the hierarchy still pools
-        # them (state trajectory is bit-identical with pins on or off), the pin
-        # buffer just re-exposes them as exact w=1 slots. The double-counted
-        # softmax mass is one token out of the covering slot's w — negligible.
-        # pin_size=0 disables everything (buffers stay empty). Memory stays
-        # O(recent + pin + B*logN).
-        self.pin_size = pin_size
-        self.register_buffer(
-            "pin_k",
-            torch.zeros(batch_size, n_groups, pin_size, self.slot_k_dim, device=device, dtype=dtype),
-            persistent=False,
-        )
-        self.register_buffer(
-            "pin_v",
-            torch.zeros(batch_size, n_groups, pin_size, v_dim, device=device, dtype=dtype),
-            persistent=False,
-        )
-        self.pin_count: int = 0
-
     # ------------------------------------------------------------------
     # Second-order gate (guarded: cannot change regime on a live cache)
     # ------------------------------------------------------------------
@@ -736,31 +705,6 @@ class LogStructuredKVCache(nn.Module):
                 "regimes in place is unsafe."
             )
         self._second_order = value
-
-    # ------------------------------------------------------------------
-    # Salience pins
-    # ------------------------------------------------------------------
-
-    def set_pinned(self, k_sel: torch.Tensor, v_sel: torch.Tensor) -> None:
-        """Install the pinned exact tokens (post-RoPE K/V), replacing any prior set.
-
-        Args:
-            k_sel: (batch, n_groups, n_pin, k_dim), n_pin <= pin_size. Each
-                group carries its own selection (GQA groups score independently).
-            v_sel: (batch, n_groups, n_pin, v_dim)
-        """
-        n_pin = k_sel.size(2)
-        # Explicit raises (not asserts): must survive `python -O`.
-        if n_pin > self.pin_size:
-            raise ValueError(f"n_pin ({n_pin}) exceeds pin_size ({self.pin_size})")
-        if v_sel.size(2) != n_pin:
-            raise ValueError(f"k_sel/v_sel pin counts differ: {n_pin} vs {v_sel.size(2)}")
-        self.pin_k[:, :, :n_pin, :] = k_sel
-        self.pin_v[:, :, :n_pin, :] = v_sel
-        if n_pin < self.pin_count:
-            self.pin_k[:, :, n_pin:self.pin_count, :].zero_()
-            self.pin_v[:, :, n_pin:self.pin_count, :].zero_()
-        self.pin_count = n_pin
 
     # ------------------------------------------------------------------
     # Level accessors
@@ -3240,24 +3184,16 @@ class LogStructuredKVCache(nn.Module):
         Returns:
             slot_k: (B, G, n_slots, k_dim) — time-ordered slot keys: compact
                     levels oldest (highest level) first down to level 0, then
-                    exact pin/recent slots.
+                    exact recent slots.
             slot_v: (B, G, n_slots, v_dim)
-            slot_w: (B, G, n_slots) — token count per slot (1 for recent/exact
-                    pins).
+            slot_w: (B, G, n_slots) — token count per slot (1 for recent).
             Non-semantic caches concatenate only real slots and leave
             ``slot_valid=None``. Semantic caches use a fixed anchor layout and
             return ``slot_valid`` for empty anchors. If ``with_stats=True``,
             also fills:
             slot_sigma_u / slot_sigma2: rank-1 key covariance stats;
             slot_gamma_a / slot_gamma_b / slot_gamma: rank-1 value-key cross
-                covariance stats. Exact recent and pinned tokens have zero stats.
-
-        Non-semantic pooled slots cover contiguous, time-ordered spans. With
-        salience pins active (pin_count > 0) that contiguity invariant no
-        longer holds past the pooled prefix: pins are
-        scattered duplicates of tokens the hierarchy also covers. Attention
-        itself is order-agnostic over the state (the whole state is fully
-        visible; only the appended in-flight chunk is causal).
+                covariance stats. Exact recent tokens have zero stats.
         """
         if self.semantic_clusters:
             return self._semantic_attention_state(with_stats=with_stats)
@@ -3287,28 +3223,6 @@ class LogStructuredKVCache(nn.Module):
                 gamma_a_parts.append(lga[:, :, :count, :])
                 gamma_b_parts.append(lgb[:, :, :count, :])
                 gamma_parts.append(lgm[:, :, :count])
-
-        # Salience pins: exact w=1 duplicates from the compressed region,
-        # placed between the levels and the recent window (they are older than
-        # everything in recent by construction).
-        if self.pin_count > 0:
-            k_parts.append(self.pin_k[:, :, :self.pin_count, :])
-            v_parts.append(self.pin_v[:, :, :self.pin_count, :])
-            w_parts.append(
-                self.level_w.new_ones(self.batch_size, self.n_groups, self.pin_count)
-            )
-            if with_stats:
-                sigma_u_parts.append(self.pin_k[:, :, :self.pin_count, :].new_zeros(
-                    self.batch_size, self.n_groups, self.pin_count, self.k_dim
-                ))
-                sigma2_parts.append(self.pin_k.new_zeros(self.batch_size, self.n_groups, self.pin_count))
-                gamma_a_parts.append(self.pin_k[:, :, :self.pin_count, :].new_zeros(
-                    self.batch_size, self.n_groups, self.pin_count, self.k_dim
-                ))
-                gamma_b_parts.append(self.pin_v[:, :, :self.pin_count, :].new_zeros(
-                    self.batch_size, self.n_groups, self.pin_count, self.v_dim
-                ))
-                gamma_parts.append(self.pin_k.new_zeros(self.batch_size, self.n_groups, self.pin_count))
 
         # Recent window: exact tokens, weight 1 each
         if self.recent_count > 0:
@@ -3394,8 +3308,6 @@ class LogStructuredKVCache(nn.Module):
         self.recent_v = self.recent_v.to(dtype)
         if self.semantic_clusters:
             self.recent_k_raw = self.recent_k_raw.to(dtype)
-        self.pin_k = self.pin_k.to(dtype)
-        self.pin_v = self.pin_v.to(dtype)
         self.level_k = self.level_k.to(dtype)
         self.level_v = self.level_v.to(dtype)
         self.level_sigma_u = self.level_sigma_u.to(dtype)
@@ -3415,9 +3327,6 @@ class LogStructuredKVCache(nn.Module):
             for row in self._recent_pos_host:
                 row[:] = [0] * self.recent_capacity
         self.recent_count = 0
-        self.pin_k.zero_()
-        self.pin_v.zero_()
-        self.pin_count = 0
         self.level_k.zero_()
         self.level_v.zero_()
         self.level_w.zero_()
@@ -3465,14 +3374,14 @@ class LogStructuredKVCache(nn.Module):
     @property
     def total_slots(self) -> int:
         if hasattr(self, "_counts"):
-            return self.recent_count + self.pin_count + sum(self._counts)
+            return self.recent_count + sum(self._counts)
         if hasattr(self, "_semantic_counts"):
-            return self.recent_count + self.pin_count + sum(
+            return self.recent_count + sum(
                 count
                 for c_counts in self._semantic_counts[0][0]
                 for count in c_counts
             )
-        return self.recent_count + self.pin_count + int(self.level_count[0, 0].sum().item())
+        return self.recent_count + int(self.level_count[0, 0].sum().item())
 
     @property
     def total_tokens_covered(self) -> int:
@@ -3584,11 +3493,6 @@ def log_kv_slot_attention(
     slot_gamma_b: torch.Tensor | None = None,  # (B, G, S, v_dim)
     slot_gamma: torch.Tensor | None = None,    # (B, G, S)
     second_order_scale: float = 1.0,
-    pin_slot_range: tuple[int, int] | None = None,
-    pooled_slot_range: tuple[int, int] | None = None,
-    pin_score_diag_layer: int | None = None,
-    pin_score_diag_q_offset: int = 0,
-    pin_score_diag_q_slice: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Slot-granular attention over merged-position entries.
 
@@ -3666,13 +3570,6 @@ def log_kv_slot_attention(
     if has_rank1_stats and any(x is None for x in (slot_sigma2, slot_gamma_a, slot_gamma_b, slot_gamma)):
         raise ValueError("log_kv_slot_attention() requires either all rank-1 stats or none")
     use_rank1_stats = has_rank1_stats and second_order_scale != 0.0
-    pin_score_diag_active = (
-        LOG_KV_PIN_SCORE_DIAG.enabled
-        and pin_slot_range is not None
-        and pooled_slot_range is not None
-        and pin_score_diag_layer is not None
-        and pin_score_diag_q_slice is not None
-    )
 
     if causal_tail:
         # Explicit raises (not asserts): survive `python -O`.
@@ -3714,16 +3611,6 @@ def log_kv_slot_attention(
         scores = torch.matmul(qg, slot_k.unsqueeze(2).mT)    # (B, nkv, rf, T_q, S)
         scores = scores.to(torch.float32)
         scores.mul_(scale)
-        dot_stats = (
-            LOG_KV_PIN_SCORE_DIAG.capture_score_stats(
-                scores,
-                q_slice=pin_score_diag_q_slice,
-                pin_slot_range=pin_slot_range,
-                pooled_slot_range=pooled_slot_range,
-            )
-            if pin_score_diag_active
-            else None
-        )
         if use_rank1_stats:
             sigma_dot = torch.matmul(qg, slot_sigma_u.unsqueeze(2).mT).to(torch.float32)
             scores.add_(
@@ -3748,18 +3635,6 @@ def log_kv_slot_attention(
             if check_valid and not torch.isfinite(scores.amax(dim=-1)).all():
                 raise ValueError("log_kv_slot_attention(): a query row has no valid slot")
         attn = torch.softmax(scores, dim=-1).to(q.dtype)     # (B, nkv, rf, T_q, S)
-        if pin_score_diag_active:
-            LOG_KV_PIN_SCORE_DIAG.record(
-                layer=int(pin_score_diag_layer),
-                branch="gqa",
-                q_offset=int(pin_score_diag_q_offset),
-                q_slice=pin_score_diag_q_slice,
-                pin_slot_range=pin_slot_range,
-                pooled_slot_range=pooled_slot_range,
-                dot_stats=dot_stats,
-                final_scores=scores,
-                attn=attn,
-            )
         out = torch.matmul(attn, slot_v.unsqueeze(2))        # (B, nkv, rf, T_q, v_dim)
         if use_rank1_stats:
             # Activation dtype, matching the ``attn @ slot_v`` matmul above —
@@ -3774,16 +3649,6 @@ def log_kv_slot_attention(
     # MHA (nh == nkv): one logit per slot, no head expansion needed.
     scores = torch.matmul(q, slot_k.mT).to(torch.float32)  # (B, nh, T_q, S)
     scores.mul_(scale)
-    dot_stats = (
-        LOG_KV_PIN_SCORE_DIAG.capture_score_stats(
-            scores,
-            q_slice=pin_score_diag_q_slice,
-            pin_slot_range=pin_slot_range,
-            pooled_slot_range=pooled_slot_range,
-        )
-        if pin_score_diag_active
-        else None
-    )
     if use_rank1_stats:
         sigma_dot = torch.matmul(q, slot_sigma_u.mT).to(torch.float32)
         scores.add_(
@@ -3805,18 +3670,6 @@ def log_kv_slot_attention(
         if check_valid and not torch.isfinite(scores.amax(dim=-1)).all():
             raise ValueError("log_kv_slot_attention(): a query row has no valid slot")
     attn = torch.softmax(scores, dim=-1).to(q.dtype)  # (B, nh, T_q, S)
-    if pin_score_diag_active:
-        LOG_KV_PIN_SCORE_DIAG.record(
-            layer=int(pin_score_diag_layer),
-            branch="mha",
-            q_offset=int(pin_score_diag_q_offset),
-            q_slice=pin_score_diag_q_slice,
-            pin_slot_range=pin_slot_range,
-            pooled_slot_range=pooled_slot_range,
-            dot_stats=dot_stats,
-            final_scores=scores,
-            attn=attn,
-        )
     out = torch.matmul(attn, slot_v)                  # (B, nh, T_q, v_dim)
     if use_rank1_stats:
         # Value read-out correction in the activation dtype, matching the
@@ -3889,63 +3742,6 @@ def log_kv_chunk_attention(
     )
 
 
-def _sample_training_pin_positions(
-    k: torch.Tensor,
-    cache: LogStructuredKVCache,
-    T: int,
-    train_block: int,
-    pin_train_max: int,
-    pin_train_prob: float,
-) -> tuple[int, torch.Tensor | None]:
-    """Sample one chunk-boundary injection point and random historical pins."""
-    pin_train_max = min(int(pin_train_max), cache.pin_size)
-    pin_train_prob = float(pin_train_prob)
-    if cache.pin_size <= 0 or pin_train_max <= 0 or pin_train_prob <= 0.0:
-        return -1, None
-    if T <= train_block:
-        return -1, None
-    if random.random() >= pin_train_prob:
-        return -1, None
-
-    # Loop starts are 0, train_block, 2*train_block, ... < T. Injection must
-    # happen at a nonzero start so the pins are drawn from already-streamed K/V.
-    n_inject_points = (T - 1) // train_block
-    if n_inject_points <= 0:
-        return -1, None
-    inject_start = random.randint(1, n_inject_points) * train_block
-    max_pin = min(pin_train_max, inject_start)
-    if max_pin <= 0:
-        return -1, None
-
-    # Random dose in [0, max_pin] so the model still sees pin-free forwards even
-    # when the injection Bernoulli fires.
-    n_pin = random.randint(0, max_pin)
-    if n_pin <= 0:
-        return -1, None
-
-    # Per batch/KV-group sampling without replacement. ``topk`` over random
-    # scores is cheap at the target batch/group sizes and keeps every group free
-    # to receive a different random pin set, matching eval-time per-group pins.
-    rand = torch.rand(k.size(0), k.size(1), inject_start, device=k.device)
-    positions = rand.topk(n_pin, dim=-1).indices.sort(dim=-1).values
-    return inject_start, positions
-
-
-def _install_training_pins(
-    cache: LogStructuredKVCache,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    positions: torch.Tensor | None,
-) -> None:
-    """Install detached exact K/V pins selected from the full sequence tensors."""
-    if positions is None or positions.numel() == 0:
-        return
-    positions = positions.to(device=k.device, dtype=torch.long)
-    k_sel = torch.gather(k, 2, positions.unsqueeze(-1).expand(-1, -1, -1, k.size(-1))).detach()
-    v_sel = torch.gather(v, 2, positions.unsqueeze(-1).expand(-1, -1, -1, v.size(-1))).detach()
-    cache.set_pinned(k_sel, v_sel)
-
-
 class LogKVStreamTrainingAttention(torch.autograd.Function):
     """Constant-in-T-times-S memory autograd for logKV streaming training.
 
@@ -3987,21 +3783,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, cache, scale, train_block, second_order_scale, *pin_args):
-        k_raw = None
-        if pin_args and torch.is_tensor(pin_args[-1]):
-            k_raw = pin_args[-1]
-            pin_args = pin_args[:-1]
-        if len(pin_args) > 2:
-            raise TypeError(
-                "LogKVStreamTrainingAttention accepts at most two pin args: "
-                "pin_train_max and pin_train_prob, plus optional trailing k_raw"
-            )
-        ctx._num_inputs = 7 + len(pin_args) + (1 if k_raw is not None else 0)
-        pin_train_max = int(pin_args[0]) if len(pin_args) >= 1 else 0
-        pin_train_prob = float(pin_args[1]) if len(pin_args) >= 2 else 0.0
-        if cache.semantic_clusters and (pin_train_max > 0 or pin_train_prob > 0.0):
-            raise ValueError("semantic LogKV rejects training pin injection")
+    def forward(ctx, q, k, v, cache, scale, train_block, second_order_scale, k_raw=None):
         commit_k_raw = k if k_raw is None else k_raw
 
         T = q.size(2)
@@ -4035,13 +3817,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             # Deriving it here from the gate keeps the pair consistent no
             # matter who calls.
             cache.second_order = second_order_scale != 0.0
-            pin_inject_start, pin_positions = _sample_training_pin_positions(
-                k, cache, T, train_block, pin_train_max, pin_train_prob
-            )
             start = 0
             while start < T:  # mirrored in backward() — keep in sync
-                if start == pin_inject_start:
-                    _install_training_pins(cache, k, v, pin_positions)
                 end = min(start + train_block, T)
                 outputs.append(
                     log_kv_chunk_attention(
@@ -4068,8 +3845,6 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.scale = scale
         ctx.train_block = train_block
         ctx.second_order_scale = second_order_scale
-        ctx.pin_inject_start = pin_inject_start
-        ctx.pin_positions = pin_positions
         ctx.has_k_raw = k_raw is not None
         ctx.needs_op_log = needs_op_log
         ctx.op_log = op_log
@@ -4090,8 +3865,6 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         scale = ctx.scale
         train_block = ctx.train_block
         second_order_scale = ctx.second_order_scale
-        pin_inject_start = ctx.pin_inject_start
-        pin_positions = ctx.pin_positions
         needs_op_log = ctx.needs_op_log
         T = q.size(2)
         # Blocks partition [0, T) and each position's grad comes from exactly
@@ -4107,9 +3880,6 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         cache.second_order = second_order_scale != 0.0
         start = 0
         while start < T:  # mirrors forward() — keep in sync
-            if start == pin_inject_start:
-                with torch.no_grad():
-                    _install_training_pins(cache, k, v, pin_positions)
             end = min(start + train_block, T)
             q_b = q[:, :, start:end].detach().requires_grad_(True)
             k_b = k[:, :, start:end].detach().requires_grad_(True)
@@ -4132,5 +3902,5 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             start = end
         grad_inputs = (dq, dk, dv, None, None, None, None)
         if ctx.has_k_raw:
-            return grad_inputs + (None,) * (ctx._num_inputs - len(grad_inputs) - 1) + (None,)
-        return grad_inputs + (None,) * (ctx._num_inputs - len(grad_inputs))
+            return grad_inputs + (None,)
+        return grad_inputs

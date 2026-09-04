@@ -16,7 +16,6 @@ output_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/dense_niah_
 # dense 模式下 log_kv_B/recent_size/prefill_block/second_order_scale 等参数
 # 全部被忽略（eval.py 启动横幅会打印这一点），只有这两个字段有意义：
 log_kv_dense_mode: true
-log_kv_pin_size: 0
 
 # niah_* 任务需要 metadata 才能拿到 tokenizer 路径和测试长度。
 metadata:

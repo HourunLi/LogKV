@@ -53,8 +53,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from litgpt.config import Config  # noqa: E402
-from litgpt.log_kv_pin_diag import find_needle_spans  # noqa: E402
 from litgpt.model import GPT, CausalSelfAttention  # noqa: E402
+from litgpt.needle_spans import find_needle_spans  # noqa: E402
 from litgpt.semantic_s0 import RunningKeyScale, Stage0DumpRecorder, parse_int_list  # noqa: E402
 from litgpt.tokenizer import Tokenizer  # noqa: E402
 

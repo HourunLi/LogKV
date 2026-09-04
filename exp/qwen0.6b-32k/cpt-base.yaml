@@ -30,9 +30,3 @@ log_kv_recent_size: 1024
 log_kv_train_block: 1024
 log_kv_second_order_scale: 1.0
 log_kv_second_order_warmup_steps: 10
-
-# 显著性钉扎（SnapKV 式观察窗；仅评测推理用，训练不受影响，随 run_eval/majob
-# 转发给 eval.py）。捞针类任务的关键：prefill 时 prompt 末尾 obs_window 个
-# query 给全前缀打分，每组钉 pin_size 个 token 为精确槽。0 = 关闭。
-log_kv_pin_size: 256
-log_kv_pin_obs_window: 64
