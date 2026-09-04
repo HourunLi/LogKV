@@ -6,19 +6,14 @@
 
 ## 1. 一句话结论
 
-当前最大问题不是 checkpoint，也不是训练还没有收敛，而是 **SemanticLogKV 的运行时 cache
-构建方式太重**：
+当前最大问题不是 checkpoint，也不是训练还没有收敛，而是 **SemanticLogKV 的运行时 cache构建方式太重**：
 
 1. 路由判定有一部分已经矩阵化并行。
-2. 但 token 真正写入语义簇、更新簇状态、写 slot、Fenwick ladder 进位合并，仍然是逐
-   token Python 循环。
-3. 读出 attention state 时又按 `K_max * L_alloc * B_prime` 的矩形布局全量物化，并把每个
-   entry 展成最多 3 个 anchor slot，很多无效 slot 也先参与大 matmul，再被 mask。
-4. 当前评测配置 `K_max=64, B_prime=128, prefill_block=128, second_order_scale=0.2` 会把
-   读出宽度和 fp32 score buffer 放大到比 32K dense 更重的量级。
+2. 但 token 真正写入语义簇、更新簇状态、写 slot、Fenwick ladder 进位合并，仍然是逐token Python 循环。
+3. 读出 attention state 时又按 `K_max * L_alloc * B_prime` 的矩形布局全量物化，并把每个entry 展成最多 3 个 anchor slot，很多无效 slot 也先参与大 matmul，再被 mask。
+4. 当前评测配置 `K_max=64, B_prime=128, prefill_block=128, second_order_scale=0.2` 会把读出宽度和 fp32 score buffer 放大到比 32K dense 更重的量级。
 
-所以“训练完了，只推理”并不能自动快。每条新 prompt 的语义簇都要在线构建，checkpoint
-只保存模型权重，不会预先保存未知输入的语义簇结构。
+所以“训练完了，只推理”并不能自动快。每条新 prompt 的语义簇都要在线构建，checkpoint只保存模型权重，不会预先保存未知输入的语义簇结构。
 
 ## 2. 和前面质量问题的关系
 
@@ -60,8 +55,7 @@ Attention.forward
 - `litgpt/model.py:1372-1465`：prefill 按 `log_kv_prefill_block` 分块，每块先读 cache
   state 做 attention，再 `cache.add_recent(...)` 写入 cache。
 
-这意味着长 prompt 的 prefill 不是一次 dense FlashAttention 完事，而是每层、每个 prefill
-block 都要反复：
+这意味着长 prompt 的 prefill 不是一次 dense FlashAttention 完事，而是每层、每个 prefill block 都要反复：
 
 ```text
 get_attention_state
@@ -157,15 +151,16 @@ token。训练配置里如果 `recent_size=4096, flush_granularity=1024, train_b
 
 ## 6. 现在到底哪些是并行的
 
-| 环节 | 当前是否并行 | 说明 |
-|---|---|---|
-| `_semantic_existing_assignments` 路由判定 | 是 | GPU tensor 计算整批 token 到 live clusters 的距离和 winner/direct。 |
-| Phase 1 direct token 筛选 | 半并行 | winner/direct 来自并行结果，但随后转 CPU list。 |
-| Phase 1 direct 写入已有簇 | 否 | Python 逐 token 调 `_semantic_join_or_segment`，每个 token 单独写 ladder。 |
-| Phase 2 orphan 处理 | 基本否 | 新簇、加入本批新簇、Ward merge 都有顺序依赖。 |
-| Phase 3 metadata 更新 | 否 | 当前内联在每个 token 的 join/new_cluster/new_segment 里。 |
-| `_semantic_attention_state` 物化 | GPU tensor 操作 | 算子本身并行，但矩形全量物化，算得太多。 |
-| `log_kv_slot_attention` | GPU matmul | matmul 并行，但 slot 数过大，且不是 FlashAttention。 |
+
+| 环节                                      | 当前是否并行    | 说明                                                                      |
+| ----------------------------------------- | --------------- | ------------------------------------------------------------------------- |
+| `_semantic_existing_assignments` 路由判定 | 是              | GPU tensor 计算整批 token 到 live clusters 的距离和 winner/direct。       |
+| Phase 1 direct token 筛选                 | 半并行          | winner/direct 来自并行结果，但随后转 CPU list。                           |
+| Phase 1 direct 写入已有簇                 | 否              | Python 逐 token 调`_semantic_join_or_segment`，每个 token 单独写 ladder。 |
+| Phase 2 orphan 处理                       | 基本否          | 新簇、加入本批新簇、Ward merge 都有顺序依赖。                             |
+| Phase 3 metadata 更新                     | 否              | 当前内联在每个 token 的 join/new_cluster/new_segment 里。                 |
+| `_semantic_attention_state` 物化          | GPU tensor 操作 | 算子本身并行，但矩形全量物化，算得太多。                                  |
+| `log_kv_slot_attention`                   | GPU matmul      | matmul 并行，但 slot 数过大，且不是 FlashAttention。                      |
 
 最短判断：
 
@@ -381,12 +376,13 @@ L_alloc = ceil(log2(max_seq_length / (K_max * B_prime) + 1)) + 2
 
 几组预算直觉：
 
-| 配置 | L_alloc | raw entries `K*L*B` | fixed-3 anchors | 加 recent 后读出 slot |
-|---|---:|---:|---:|---:|
-| K=64, B=128 | 5 | 40,960 | 122,880 | 约 123,904 |
-| K=16, B=128 | 7 | 14,336 | 43,008 | 约 44,032 |
-| K=8, B=128 | 8 | 8,192 | 24,576 | 约 25,600 |
-| K=1, B=512 | 9 | 4,608 | 13,824 | 约 17,920 |
+
+| 配置        | L_alloc | raw entries`K*L*B` | fixed-3 anchors | 加 recent 后读出 slot |
+| ----------- | ------: | -----------------: | --------------: | --------------------: |
+| K=64, B=128 |       5 |             40,960 |         122,880 |            约 123,904 |
+| K=16, B=128 |       7 |             14,336 |          43,008 |             约 44,032 |
+| K=8, B=128  |       8 |              8,192 |          24,576 |             约 25,600 |
+| K=1, B=512  |       9 |              4,608 |          13,824 |             约 17,920 |
 
 上表中 K64/K16/K8 按 `recent_size=1024` 估算；K1/B512 对应训练侧常见的
 `recent_size=4096`，所以加 recent 后约 17,920。

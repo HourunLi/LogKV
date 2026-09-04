@@ -28,16 +28,16 @@ save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32
 merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/_fsdp_staging_semantic_stage1_k64
 
 
-log_kv_B: 1024
-log_kv_recent_size: 4096
-log_kv_train_block: 16384
+log_kv_B: 512
+log_kv_recent_size: 1024
+log_kv_train_block: 1024
 log_kv_prefill_block: 1024
 log_kv_second_order_scale: 0.2
 log_kv_second_order_warmup_steps: 100
 log_kv_pin_size: 0
 
 log_kv_semantic_clusters: true
-log_kv_cluster_k_max: 1
+log_kv_cluster_k_max: 16
 log_kv_cluster_lambda_rel: 1.0
 log_kv_seg_eta: 1.0
 log_kv_seg_g0: 2048.0
@@ -49,9 +49,6 @@ log_kv_semantic_flush_granularity: 1024
 log_kv_semantic_capacity_beta: 0.0
 log_kv_semantic_capacity_hard_cap_mult: 0.0
 
-# eval 覆盖：训练仍是 K_max=1（这份 base.yaml 上面那套值），eval 切到真实语义
-# 聚类。majob.sh 里 K_max/B' 只通过乘积决定预算，两个必须一起给——见下面
-# semantic budget 那道硬拦截。B=128 是 K=16 时验证过的安全值（S≈43008，约
-# 1.31×N），不是随便抄训练的 B。
+# eval 覆盖：majob.sh 里 K_max/B' 只通过乘积决定预算，两个必须一起给。
 eval_log_kv_cluster_k_max: 16
-eval_log_kv_B: 128
+eval_log_kv_B: 512
