@@ -83,6 +83,8 @@ def make_semantic_cache(
     semantic_cluster_chunk_size: int = 0,
     semantic_capacity_beta: float = 0.0,
     semantic_capacity_hard_cap_mult: float = 0.0,
+    semantic_hash_routing: bool = False,
+    semantic_hash_anchors: torch.Tensor | None = None,
 ) -> LogStructuredKVCache:
     cos, sin = build_rope_cache(max_seq_length, k_dim)
     return LogStructuredKVCache(
@@ -102,6 +104,8 @@ def make_semantic_cache(
         semantic_cluster_chunk_size=semantic_cluster_chunk_size,
         semantic_capacity_beta=semantic_capacity_beta,
         semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
+        semantic_hash_routing=semantic_hash_routing,
+        semantic_hash_anchors=semantic_hash_anchors,
         cos_cache=cos,
         sin_cache=sin,
         rope_n_elem=k_dim,
@@ -1769,6 +1773,125 @@ class TestSemanticLogKV:
             cache.add_recent(k_raw[:, :, 4:], v[:, :, 4:], k_raw=k_raw[:, :, 4:], input_pos=torch.arange(4, 8))
 
         assert_cache_states_bit_identical(a, b)
+
+    def test_hash_routing_fast_tokens_use_fixed_anchor_buckets_without_op_log(self):
+        anchors = torch.zeros(1, 2, 8)
+        anchors[0, 1, 0] = 10.0
+        c = make_semantic_cache(
+            K_max=2,
+            n_groups=1,
+            semantic_s_h=1.0,
+            semantic_hash_routing=True,
+            semantic_hash_anchors=anchors,
+        )
+        k_raw = torch.zeros(1, 1, 3, 8)
+        k_raw[0, 0, :, 0] = torch.tensor([0.1, 10.2, 0.2])
+        v = torch.randn(1, 1, 3, 8)
+
+        c.begin_op_log()
+        c.route_and_flush_batch(k_raw, v, torch.arange(3), record_op_log=True)
+        op_log, op_log_len = c.take_op_log()
+
+        assert op_log is not None
+        assert int(op_log_len[0, 0].item()) == 0
+        assert c._semantic_n_total[0][0] == [2, 1]
+        assert c.semantic_cluster_stats()["semantic_hash_fast_rate"] == 1.0
+
+    def test_hash_routing_replay_logs_only_slow_tokens(self):
+        anchors = torch.zeros(1, 3, 8)
+        anchors[0, 1, 0] = 10.0
+        c = make_semantic_cache(
+            K_max=3,
+            n_groups=1,
+            B=3,
+            semantic_s_h=1.0,
+            semantic_hash_routing=True,
+            semantic_hash_anchors=anchors,
+        )
+        r = make_semantic_cache(
+            K_max=3,
+            n_groups=1,
+            B=3,
+            semantic_s_h=1.0,
+            semantic_hash_routing=True,
+            semantic_hash_anchors=anchors,
+        )
+        k_raw = torch.zeros(1, 1, 3, 8)
+        k_raw[0, 0, :, 0] = torch.tensor([0.1, 100.0, 10.1])
+        v = torch.randn(1, 1, 3, 8)
+        pos = torch.arange(3)
+
+        c.begin_op_log()
+        c.route_and_flush_batch(k_raw, v, pos, record_op_log=True)
+        op_log, op_log_len = c.take_op_log()
+        assert op_log is not None
+        assert op_log_len is not None
+        assert int(op_log_len[0, 0].item()) == 1
+
+        r.route_and_flush_batch(
+            k_raw,
+            v,
+            pos,
+            replay_op_log=op_log,
+            replay_op_log_len=op_log_len,
+            replay_op_log_host=c._last_op_log_host,
+        )
+
+        assert_cache_states_bit_identical(c, r)
+        assert c.semantic_cluster_stats()["semantic_hash_slow_rate"] == pytest.approx(1.0 / 3.0)
+
+    def test_hash_routing_hard_cap_spills_overflow_to_slow_path(self):
+        anchors = torch.zeros(1, 2, 8)
+        anchors[0, 1, 0] = 10.0
+        c = make_semantic_cache(
+            K_max=2,
+            n_groups=1,
+            max_seq_length=4,
+            semantic_s_h=1.0,
+            semantic_capacity_hard_cap_mult=1.0,
+            semantic_hash_routing=True,
+            semantic_hash_anchors=anchors,
+        )
+        k_raw = torch.zeros(1, 1, 3, 8)
+        k_raw[0, 0, :, 0] = torch.tensor([0.1, 0.2, 0.3])
+        v = torch.randn(1, 1, 3, 8)
+
+        c.route_and_flush_batch(k_raw, v, torch.arange(3))
+
+        assert c._semantic_n_total[0][0] == [2, 1]
+        assert c.semantic_cluster_stats()["semantic_hash_fast_rate"] == pytest.approx(2.0 / 3.0)
+
+    def test_hash_routing_spills_when_anchor_bucket_was_repurposed_by_slow_path(self):
+        anchors = torch.zeros(1, 2, 8)
+        anchors[0, 1, 0] = 100.0
+        c = make_semantic_cache(
+            K_max=2,
+            n_groups=1,
+            B=4,
+            semantic_s_h=1.0,
+            cluster_lambda_rel=0.25,
+            semantic_hash_routing=True,
+            semantic_hash_anchors=anchors,
+        )
+
+        v = torch.randn(1, 1, 1, 8)
+        def route(x0: float, pos: int) -> None:
+            k_raw = torch.zeros(1, 1, 1, 8)
+            k_raw[0, 0, 0, 0] = x0
+            c.route_and_flush_batch(k_raw, v, torch.tensor([pos]))
+
+        route(0.0, 0)
+        route(100.0, 1)
+        route(500.0, 2)
+
+        assert c._semantic_n_total[0][0] == [2, 1]
+        torch.testing.assert_close(c.centroid[0, 0, :, 0], torch.tensor([50.0, 500.0]))
+
+        route(100.1, 3)
+
+        assert c._semantic_n_total[0][0] == [3, 1]
+        assert float(c.centroid[0, 0, 1, 0].item()) == pytest.approx(100.1)
+        assert c.semantic_cluster_stats()["semantic_hash_fast_tokens"] == 2
 
 
 # ---------------------------------------------------------------------------

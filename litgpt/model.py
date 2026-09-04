@@ -376,6 +376,8 @@ class GPT(nn.Module):
         semantic_cluster_chunk_size: int = 0,
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
+        semantic_hash_routing: bool = False,
+        semantic_hash_anchors: torch.Tensor | None = None,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -444,11 +446,23 @@ class GPT(nn.Module):
                 raise ValueError(
                     f"semantic_s_h with 2 dims must be (n_layer, n_query_groups), got {tuple(semantic_s_h.shape)}"
                 )
+            if semantic_hash_routing and semantic_hash_anchors is None:
+                raise ValueError("semantic_hash_routing=True requires semantic_hash_anchors")
+            if torch.is_tensor(semantic_hash_anchors) and semantic_hash_anchors.dim() == 4 and semantic_hash_anchors.size(0) != self.config.n_layer:
+                raise ValueError(
+                    "semantic_hash_anchors with 4 dims must be "
+                    f"(n_layer, n_query_groups, cluster_k_max, head_size), got {tuple(semantic_hash_anchors.shape)}"
+                )
 
         for block_idx, block in enumerate(self.transformer.h):
             cos_cache = self.cos[..., self.config.rope_indices[block_idx]] if semantic_clusters and self.config.rope_indices is not None else self.cos
             sin_cache = self.sin[..., self.config.rope_indices[block_idx]] if semantic_clusters and self.config.rope_indices is not None else self.sin
             block_s_h = semantic_s_h[block_idx] if torch.is_tensor(semantic_s_h) and semantic_s_h.dim() == 2 else semantic_s_h
+            block_hash_anchors = (
+                semantic_hash_anchors[block_idx]
+                if torch.is_tensor(semantic_hash_anchors) and semantic_hash_anchors.dim() == 4
+                else semantic_hash_anchors
+            )
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size, pin_size=pin_size,
@@ -468,6 +482,8 @@ class GPT(nn.Module):
                 semantic_cluster_chunk_size=semantic_cluster_chunk_size,
                 semantic_capacity_beta=semantic_capacity_beta,
                 semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
+                semantic_hash_routing=semantic_hash_routing,
+                semantic_hash_anchors=block_hash_anchors,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -558,6 +574,8 @@ class GPT(nn.Module):
         semantic_cluster_chunk_size: int = 0,
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
+        semantic_hash_routing: bool = False,
+        semantic_hash_anchors: torch.Tensor | None = None,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -612,6 +630,13 @@ class GPT(nn.Module):
                 raise ValueError(
                     f"semantic_s_h with 2 dims must be (n_layer, n_query_groups), got {tuple(semantic_s_h.shape)}"
                 )
+            if semantic_hash_routing and semantic_hash_anchors is None:
+                raise ValueError("semantic_hash_routing=True requires semantic_hash_anchors")
+            if torch.is_tensor(semantic_hash_anchors) and semantic_hash_anchors.dim() == 4 and semantic_hash_anchors.size(0) != self.config.n_layer:
+                raise ValueError(
+                    "semantic_hash_anchors with 4 dims must be "
+                    f"(n_layer, n_query_groups, cluster_k_max, head_size), got {tuple(semantic_hash_anchors.shape)}"
+                )
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
         if max_seq_length is None:
@@ -625,6 +650,11 @@ class GPT(nn.Module):
             cos_cache = self.cos[..., self.config.rope_indices[block_idx]] if semantic_clusters and self.config.rope_indices is not None else self.cos
             sin_cache = self.sin[..., self.config.rope_indices[block_idx]] if semantic_clusters and self.config.rope_indices is not None else self.sin
             block_s_h = semantic_s_h[block_idx] if torch.is_tensor(semantic_s_h) and semantic_s_h.dim() == 2 else semantic_s_h
+            block_hash_anchors = (
+                semantic_hash_anchors[block_idx]
+                if torch.is_tensor(semantic_hash_anchors) and semantic_hash_anchors.dim() == 4
+                else semantic_hash_anchors
+            )
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size, pin_size=pin_size,
@@ -644,6 +674,8 @@ class GPT(nn.Module):
                 semantic_cluster_chunk_size=semantic_cluster_chunk_size,
                 semantic_capacity_beta=semantic_capacity_beta,
                 semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
+                semantic_hash_routing=semantic_hash_routing,
+                semantic_hash_anchors=block_hash_anchors,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -1628,6 +1660,8 @@ class CausalSelfAttention(nn.Module):
         semantic_cluster_chunk_size: int = 0,
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
+        semantic_hash_routing: bool = False,
+        semantic_hash_anchors: torch.Tensor | None = None,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
     ) -> "LogStructuredKVCache":
@@ -1688,6 +1722,8 @@ class CausalSelfAttention(nn.Module):
             semantic_cluster_chunk_size=semantic_cluster_chunk_size,
             semantic_capacity_beta=semantic_capacity_beta,
             semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
+            semantic_hash_routing=semantic_hash_routing,
+            semantic_hash_anchors=semantic_hash_anchors,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,
