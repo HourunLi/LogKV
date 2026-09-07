@@ -1065,6 +1065,12 @@ def main(
         _yaml = _coerce_yaml_sci_floats(
             expand_env_vars(_load_yaml_config(os.path.join(os.getcwd(), config), checkpoint_dir) or {})
         )
+        _banned = sorted(_k for _k in _yaml if _k.startswith("eval_log_kv_"))
+        if _banned:
+            raise ValueError(
+                "eval_log_kv_* YAML keys are no longer supported; use log_kv_* for the single eval LogKV config. "
+                f"Remove: {', '.join(_banned)}"
+            )
         _valid = set(inspect.signature(main).parameters)
         for _k in _yaml:
             if _k != "config" and _k not in _valid:
