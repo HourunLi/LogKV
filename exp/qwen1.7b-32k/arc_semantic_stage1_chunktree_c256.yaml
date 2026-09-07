@@ -1,0 +1,17 @@
+config: base.yaml
+
+expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-chunktree-c256
+save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-stage1-chunktree-c256
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/_fsdp_staging_semantic_stage1_chunktree_c256
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic-stage1-chunktree-c256
+
+log_kv_semantic_clusters: true
+log_kv_cluster_k_max: 16
+log_kv_B: 512
+log_kv_recent_size: 1024
+log_kv_train_block: 1024
+log_kv_prefill_block: 1024
+log_kv_second_order_scale: 0.2
+log_kv_second_order_warmup_steps: 100
+log_kv_semantic_flush_granularity: 1024
+log_kv_semantic_cluster_chunk_size: 256

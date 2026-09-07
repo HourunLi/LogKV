@@ -1204,16 +1204,42 @@ class LogStructuredKVCache(nn.Module):
         return self.op_log[:, :, :max_len].clone(), self.op_log_len.clone()
 
     def _record_op(self, b: int, g: int, op: int, a: int, b_arg: int, c_arg: int) -> None:
+        self._record_ops(b, g, [(op, a, b_arg, c_arg)])
+
+    def _record_ops(self, b: int, g: int, rows: list[tuple[int, int, int, int]]) -> None:
         if getattr(self, "op_log", None) is None or getattr(self, "op_log_len", None) is None:
             return
+        if not rows:
+            return
         idx = self._op_log_len_host[b][g] if hasattr(self, "_op_log_len_host") else int(self.op_log_len[b, g].item())
-        if idx >= self.op_log.size(2):
+        end = idx + len(rows)
+        if end > self.op_log.size(2):
             raise RuntimeError("semantic LogKV op_log overflow")
-        self.op_log[b, g, idx] = torch.tensor((op, a, b_arg, c_arg), device=self.op_log.device, dtype=torch.int32)
-        self.op_log_len[b, g] = idx + 1
+        self.op_log[b, g, idx:end] = torch.tensor(rows, device=self.op_log.device, dtype=torch.int32)
+        self.op_log_len[b, g] = end
         if hasattr(self, "_op_log_len_host"):
-            self._op_log_host[b][g].append((int(op), int(a), int(b_arg), int(c_arg)))
-            self._op_log_len_host[b][g] = idx + 1
+            self._op_log_host[b][g].extend((int(op), int(a), int(b_arg), int(c_arg)) for op, a, b_arg, c_arg in rows)
+            self._op_log_len_host[b][g] = end
+
+    def _record_semantic_join_run(
+        self,
+        b: int,
+        g: int,
+        c: int,
+        segment: int,
+        token_indices: list[int],
+        *,
+        new_segment: bool,
+    ) -> None:
+        if not token_indices:
+            return
+        rows: list[tuple[int, int, int, int]] = []
+        start = 0
+        if new_segment:
+            rows.append((LOG_KV_OP_NEW_SEGMENT, c, int(segment), int(token_indices[0])))
+            start = 1
+        rows.extend((LOG_KV_OP_JOIN, c, int(segment), int(token_idx)) for token_idx in token_indices[start:])
+        self._record_ops(b, g, rows)
 
     def _semantic_entry_from_token(
         self,
@@ -1798,8 +1824,10 @@ class LogStructuredKVCache(nn.Module):
             n = torch.tensor([pool[i].n_total for i in candidates], device=mu.device, dtype=torch.float32)
             over = (n / target - 1.0).clamp_min(0.0)
             cost = cost + self.semantic_capacity_beta * self._semantic_s_h_host[b][g] * over.square()
-        best = int(cost.argmin().item())
-        if float(semantic[best].item()) > self._semantic_tree_threshold(b, g):
+        best_idx = cost.argmin()
+        best_f, best_semantic = torch.stack([best_idx.double(), semantic[best_idx].double()]).tolist()
+        best = int(best_f)
+        if best_semantic > self._semantic_tree_threshold(b, g):
             return None
         return candidates[best]
 
@@ -1828,10 +1856,11 @@ class LogStructuredKVCache(nn.Module):
         cost = cost.masked_fill(~torch.triu(torch.ones(n, n, device=cost.device, dtype=torch.bool), diagonal=1), float("inf"))
         flat_cost = cost.flatten()
         order = flat_cost.argsort().detach().cpu().tolist()
+        flat_cost_host = flat_cost.detach().cpu().tolist()
         pairs: list[tuple[int, int]] = []
         used: set[int] = set()
         for flat in order:
-            if len(pairs) >= max_pairs or not math.isfinite(float(flat_cost[flat].item())):
+            if len(pairs) >= max_pairs or not math.isfinite(flat_cost_host[flat]):
                 break
             i, j = flat // n, flat % n
             if i in used or j in used:
@@ -1933,6 +1962,81 @@ class LogStructuredKVCache(nn.Module):
                 )
         return self._semantic_tree_reduce_to_budget(clusters)
 
+    def _semantic_tree_local_chunks_batched(
+        self,
+        b: int,
+        g: int,
+        k_raw: torch.Tensor,
+        chunk_size: int,
+        positions_host: list[list[int]],
+    ) -> list[list[_SemanticTreeCluster]]:
+        """Batched equivalent of calling ``_semantic_tree_local_chunks`` once per
+        ``chunk_size``-token slice of ``k_raw[b, g]``: the O(chunk_size^2) distance
+        + reachability-closure math (1932-1938 in the per-chunk version) runs once
+        across all chunks via ``bmm`` instead of once per chunk via a Python loop,
+        and the label tensor is pulled to host in a single ``.tolist()`` instead of
+        one sync per connected component per chunk. The final per-component
+        centroid is still ``index_select(...).mean(dim=0)`` on the same underlying
+        values in the same order as the per-chunk version, so it stays bit-identical
+        -- only the (correctness-irrelevant-until-threshold-adjacent) distance
+        computation changes kernel. Emission order (chunk asc, label asc, index
+        asc, ``max_local``-sized splits) matches the per-chunk version exactly,
+        since ``_semantic_tree_merge_sets`` consumes nodes greedily in that order.
+        """
+        total = k_raw.size(2)
+        if total <= 0:
+            return []
+        n_chunks = math.ceil(total / chunk_size)
+        pad = n_chunks * chunk_size - total
+        x = k_raw[b, g].float()
+        if pad > 0:
+            x = torch.cat([x, x.new_zeros(pad, x.size(-1))], dim=0)
+        xs = x.view(n_chunks, chunk_size, x.size(-1))
+
+        norm = xs.square().sum(dim=-1)
+        dist = (norm[:, :, None] + norm[:, None, :] - 2.0 * torch.bmm(xs, xs.transpose(1, 2))).clamp_min(0.0)
+        reach = dist <= self._semantic_tree_threshold(b, g)
+        if pad > 0:
+            valid = torch.ones(n_chunks, chunk_size, dtype=torch.bool, device=x.device)
+            valid[-1, chunk_size - pad:] = False
+            reach = reach & (valid[:, :, None] & valid[:, None, :])
+        rounds = max(1, math.ceil(math.log2(max(chunk_size, 2))))
+        for _ in range(rounds):
+            reach = torch.bmm(reach.float(), reach.float()) > 0
+        idx_row = torch.arange(chunk_size, device=x.device, dtype=torch.long).view(1, 1, chunk_size)
+        sentinel = torch.full((n_chunks, chunk_size, chunk_size), chunk_size, device=x.device, dtype=torch.long)
+        labels = torch.where(reach, idx_row.expand_as(sentinel), sentinel).min(dim=2).values
+        labels_host = labels.tolist()
+
+        cap = self._semantic_hard_cap()
+        max_local = chunk_size if cap == math.inf else max(1, int(math.floor(cap)))
+
+        result: list[list[_SemanticTreeCluster]] = []
+        for c in range(n_chunks):
+            start = c * chunk_size
+            real_n = min(chunk_size, total - start)
+            groups: dict[int, list[int]] = {}
+            for i in range(real_n):
+                groups.setdefault(labels_host[c][i], []).append(i)
+            clusters: list[_SemanticTreeCluster] = []
+            for label in sorted(groups):
+                members = groups[label]
+                for lo in range(0, len(members), max_local):
+                    part = members[lo:lo + max_local]
+                    offsets = tuple(start + i for i in part)
+                    part_idx = torch.tensor(part, device=x.device, dtype=torch.long)
+                    clusters.append(
+                        _SemanticTreeCluster(
+                            xs[c].index_select(0, part_idx).mean(dim=0).clone(),
+                            len(offsets),
+                            max(positions_host[b][i] for i in offsets),
+                            (),
+                            offsets,
+                        )
+                    )
+            result.append(self._semantic_tree_reduce_to_budget(clusters))
+        return result
+
     def _semantic_join_offsets_batch(
         self,
         b: int,
@@ -1943,6 +2047,8 @@ class LogStructuredKVCache(nn.Module):
         v: torch.Tensor,
         positions: torch.Tensor,
         positions_host: list[list[int]],
+        *,
+        record: bool = False,
     ) -> None:
         ordered = sorted(offsets, key=lambda i: positions_host[b][i])
         run: list[int] = []
@@ -1967,6 +2073,8 @@ class LogStructuredKVCache(nn.Module):
                 positions[b].index_select(0, run_idx),
                 new_segment=run_new_segment,
             )
+            if record:
+                self._record_semantic_join_run(b, g, c, run_segment, run_tokens, new_segment=run_new_segment)
             run = []
             run_tokens = []
             run_new_segment = False
@@ -1978,7 +2086,7 @@ class LogStructuredKVCache(nn.Module):
                 flush_run()
                 align = 1 << self.seg_block_level
                 pad_count = 0 if self.seg_block_level == 0 else (-self._semantic_level0_phase[b][g][c]) % align
-                self._semantic_insert_pad(b, g, c, pad_count, record=False)
+                self._semantic_insert_pad(b, g, c, pad_count, record=record)
                 run_segment = self._semantic_current_segment[b][g][c] + 1
                 run_new_segment = True
             elif not run:
@@ -1998,6 +2106,8 @@ class LogStructuredKVCache(nn.Module):
         v: torch.Tensor,
         positions: torch.Tensor,
         positions_host: list[list[int]],
+        *,
+        record: bool = False,
     ) -> None:
         local_only: list[_SemanticTreeCluster] = []
         for node in clusters:
@@ -2007,10 +2117,10 @@ class LogStructuredKVCache(nn.Module):
                 continue
             keep = existing[0]
             for free in existing[1:]:
-                self._semantic_ward_merge(b, g, min(keep, free), max(keep, free), record=False)
+                self._semantic_ward_merge(b, g, min(keep, free), max(keep, free), record=record)
                 keep = min(keep, free)
             if node.tokens:
-                self._semantic_join_offsets_batch(b, g, keep, node.tokens, k_raw, v, positions, positions_host)
+                self._semantic_join_offsets_batch(b, g, keep, node.tokens, k_raw, v, positions, positions_host, record=record)
 
         for node in local_only:
             tokens = tuple(sorted(node.tokens, key=lambda i: positions_host[b][i]))
@@ -2019,17 +2129,17 @@ class LogStructuredKVCache(nn.Module):
             free_idx = self._semantic_free_clusters(b, g)
             if not free_idx:
                 keep, free = self._semantic_ward_pair(b, g)
-                self._semantic_ward_merge(b, g, keep, free, record=False)
+                self._semantic_ward_merge(b, g, keep, free, record=record)
                 target = free
             else:
                 target = free_idx[0]
             first, rest = tokens[0], tokens[1:]
             self._semantic_new_cluster(
                 b, g, target, positions_host[b][first], k_raw[b, g, first], v[b, g, first], positions[b, first],
-                record=False,
+                record=record,
             )
             if rest:
-                self._semantic_join_offsets_batch(b, g, target, rest, k_raw, v, positions, positions_host)
+                self._semantic_join_offsets_batch(b, g, target, rest, k_raw, v, positions, positions_host, record=record)
 
     def _semantic_route_chunk_tree(
         self,
@@ -2037,14 +2147,14 @@ class LogStructuredKVCache(nn.Module):
         v: torch.Tensor,
         positions: torch.Tensor,
         positions_host: list[list[int]],
+        *,
+        record: bool = False,
     ) -> None:
         chunk_size = self.semantic_cluster_chunk_size
         for b in range(k_raw.size(0)):
             for g in range(k_raw.size(1)):
                 sets = [self._semantic_tree_existing_set(b, g)]
-                for start in range(0, k_raw.size(2), chunk_size):
-                    end = min(start + chunk_size, k_raw.size(2))
-                    sets.append(self._semantic_tree_local_chunks(b, g, k_raw, start, end, positions_host))
+                sets.extend(self._semantic_tree_local_chunks_batched(b, g, k_raw, chunk_size, positions_host))
                 while len(sets) > 1:
                     merged: list[list[_SemanticTreeCluster]] = []
                     for i in range(0, len(sets), 2):
@@ -2053,7 +2163,9 @@ class LogStructuredKVCache(nn.Module):
                         else:
                             merged.append(self._semantic_tree_merge_sets(b, g, sets[i], sets[i + 1]))
                     sets = merged
-                self._semantic_apply_tree_clusters(b, g, sets[0] if sets else [], k_raw, v, positions, positions_host)
+                self._semantic_apply_tree_clusters(
+                    b, g, sets[0] if sets else [], k_raw, v, positions, positions_host, record=record
+                )
 
     def _semantic_route_three_phase(
         self,
@@ -2070,28 +2182,15 @@ class LogStructuredKVCache(nn.Module):
 
         winner, _s_winner, direct = self._semantic_existing_assignments(k_raw, positions)
 
-        # Phase 1: frozen-centroid direct assignments. Normal inference batches
-        # same-target runs into the semantic ladder; op-log recording keeps the
-        # old scalar path so backward replay stays bit-identical.
+        # Phase 1: frozen-centroid direct assignments. Same-target runs batch
+        # into the semantic ladder; op-log rows are emitted for replay.
         for b in range(k_raw.size(0)):
             for g in range(k_raw.size(1)):
-                if record:
-                    idx = torch.nonzero(direct[b, g], as_tuple=False).flatten()
-                    for n in range(idx.numel()):
-                        i = int(idx[n].item())
-                        c = int(winner[b, g, i].item())
-                        if not self._semantic_can_accept(b, g, c):
-                            direct[b, g, i] = False
-                            continue
-                        self._semantic_join_or_segment(
-                            b, g, c, positions_host[b][i], k_raw[b, g, i], v[b, g, i], positions[b, i], record=True
-                        )
-                    continue
-
                 for c in range(self.K_max):
                     idx = torch.nonzero(direct[b, g] & (winner[b, g] == c), as_tuple=False).flatten()
                     if idx.numel() == 0:
                         continue
+                    idx_list = idx.detach().cpu().tolist()
                     run: list[int] = []
                     run_tokens: list[int] = []
                     run_segment = self._semantic_current_segment[b][g][c] if self.seg_gap_max != math.inf else 0
@@ -2114,12 +2213,15 @@ class LogStructuredKVCache(nn.Module):
                             positions[b].index_select(0, run_idx),
                             new_segment=run_new_segment,
                         )
+                        if record:
+                            self._record_semantic_join_run(
+                                b, g, c, run_segment, run_tokens, new_segment=run_new_segment
+                            )
                         run = []
                         run_tokens = []
                         run_new_segment = False
 
-                    for n in range(idx.numel()):
-                        i = int(idx[n].item())
+                    for i in idx_list:
                         if not self._semantic_can_accept(b, g, c, len(run) + 1):
                             direct[b, g, i] = False
                             continue
@@ -2129,7 +2231,7 @@ class LogStructuredKVCache(nn.Module):
                             flush_run()
                             align = 1 << self.seg_block_level
                             pad_count = 0 if self.seg_block_level == 0 else (-self._semantic_level0_phase[b][g][c]) % align
-                            self._semantic_insert_pad(b, g, c, pad_count, record=False)
+                            self._semantic_insert_pad(b, g, c, pad_count, record=record)
                             run_segment = self._semantic_current_segment[b][g][c] + 1
                             run_new_segment = True
                         elif not run:
@@ -2252,11 +2354,10 @@ class LogStructuredKVCache(nn.Module):
             return
 
         if (
-            not record_op_log
-            and self.K_max > 1
-            and 0 < self.semantic_cluster_chunk_size < k_raw.size(2)
+            self.K_max > 1
+            and self.semantic_cluster_chunk_size > 0
         ):
-            self._semantic_route_chunk_tree(k_raw, v, positions, positions_host)
+            self._semantic_route_chunk_tree(k_raw, v, positions, positions_host, record=record_op_log)
             return
 
         self._semantic_route_three_phase(k_raw, v, positions, positions_host, record=record_op_log)

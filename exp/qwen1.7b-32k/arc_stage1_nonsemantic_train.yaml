@@ -1,11 +1,4 @@
-# 过渡 baseline：训练关闭语义聚类（跑纯 LogKV 向量化路径，速度不受
-# 逐 token 路由同步问题拖累），eval 端单独切回真实语义聚类（K=16, B=128，
-# 沿用 base.yaml 里已验证过的 eval_log_kv_* 组合）。
-#
-# 背景：真实语义 K64 CPT 单 step 半小时以上，不可接受；根因见
-# docs/algorithm-spec.md §5.22 point 9 / §5.19 第 11 条（Phase 1 ladder 写入
-# 逐 token + host-device 同步）。在那条路修好前，用这份 config 先跑非语义
-# 训练打基线，不代表放弃真实语义 CPT。
+# 非语义 baseline：训练和评测都关闭语义聚类，避免再出现 train/eval 两套 LogKV 架构。
 config: base.yaml
 
 expid: qwen1.7b-32k-cpt-logKV-nonsemantic-train
@@ -15,7 +8,3 @@ merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-lo
 tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-nonsemantic-train
 
 log_kv_semantic_clusters: false
-
-# base.yaml 的 eval_log_kv_* 默认会跟着训练值走（ev() 的 fallback），训练一旦
-# 关掉语义聚类，eval 必须显式钉住，否则 eval 会跟着静默切成非语义。
-eval_log_kv_semantic_clusters: true

@@ -8,6 +8,10 @@ import torch
 from litgpt.config import Config
 from litgpt.log_kv_cache import (
     CacheAttentionState,
+    LOG_KV_OP_JOIN,
+    LOG_KV_OP_NEW_SEGMENT,
+    LOG_KV_OP_PAD_INSERT,
+    LOG_KV_OP_WARD_MERGE,
     LogKVStreamTrainingAttention,
     LogStructuredKVCache,
     _pair_rank1_stats,
@@ -1458,6 +1462,51 @@ class TestSemanticLogKV:
         torch.testing.assert_close(seq.centroid, batched.centroid, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(seq.n_eff, batched.n_eff)
 
+    def test_recorded_direct_phase_batches_and_replays_same_state(self):
+        torch.manual_seed(43)
+        expected = make_semantic_cache(
+            K_max=2, n_groups=1, B=3, recent_size=8, cluster_lambda_rel=1e9, seg_gap_max=3.0, seg_block_level=1
+        )
+        recorded = make_semantic_cache(
+            K_max=2, n_groups=1, B=3, recent_size=8, cluster_lambda_rel=1e9, seg_gap_max=3.0, seg_block_level=1
+        )
+        replay = make_semantic_cache(
+            K_max=2, n_groups=1, B=3, recent_size=8, cluster_lambda_rel=1e9, seg_gap_max=3.0, seg_block_level=1
+        )
+        k0 = torch.randn(8)
+        v0 = torch.randn(8)
+        for cache in (expected, recorded, replay):
+            cache._semantic_new_cluster(0, 0, 0, 0, k0, v0, torch.tensor(0), record=False)
+        k_raw = torch.randn(1, 1, 4, 8)
+        v = torch.randn(1, 1, 4, 8)
+        pos = torch.tensor([1, 2, 8, 9])
+
+        expected.route_and_flush_batch(k_raw, v, pos)
+        recorded.begin_op_log()
+        recorded.route_and_flush_batch(k_raw, v, pos, record_op_log=True)
+        op_log, op_log_len = recorded.take_op_log()
+        assert op_log is not None
+        assert op_log_len is not None
+
+        replay.route_and_flush_batch(
+            k_raw,
+            v,
+            pos,
+            replay_op_log=op_log,
+            replay_op_log_len=op_log_len,
+            replay_op_log_host=recorded._last_op_log_host,
+        )
+
+        assert [op for op, *_ in recorded._last_op_log_host[0][0]] == [
+            LOG_KV_OP_JOIN,
+            LOG_KV_OP_JOIN,
+            LOG_KV_OP_PAD_INSERT,
+            LOG_KV_OP_NEW_SEGMENT,
+            LOG_KV_OP_JOIN,
+        ]
+        assert_cache_states_bit_identical(expected, recorded)
+        assert_cache_states_bit_identical(recorded, replay)
+
     def test_kmax1_batch_route_matches_single_token_route_with_segments(self):
         torch.manual_seed(7)
         seq = make_semantic_cache(K_max=1, n_groups=1, B=3, recent_size=8, seg_gap_max=3.0, seg_block_level=1)
@@ -1532,6 +1581,61 @@ class TestSemanticLogKV:
         assert sorted(node.tokens for node in clusters) == [(0, 2), (1,)]
         assert sorted(round(float(node.centroid[0].item()), 2) for node in clusters) == [0.05, 10.0]
 
+    def test_semantic_tree_local_chunks_batched_matches_per_chunk_reference(self):
+        c = make_semantic_cache(
+            K_max=16, n_groups=1, recent_size=8, cluster_lambda_rel=0.25, semantic_cluster_chunk_size=3
+        )
+        torch.manual_seed(11)
+        k_raw = torch.randn(1, 1, 7, 8)  # chunk_size=3 over 7 tokens -> chunks of 3, 3, 1 (exercises padding)
+        positions_host = [[0, 1, 2, 3, 4, 5, 6]]
+        chunk_size = 3
+
+        expected = [
+            c._semantic_tree_local_chunks(0, 0, k_raw, start, min(start + chunk_size, 7), positions_host)
+            for start in range(0, 7, chunk_size)
+        ]
+        actual = c._semantic_tree_local_chunks_batched(0, 0, k_raw, chunk_size, positions_host)
+
+        assert len(actual) == len(expected)
+        for exp_chunk, act_chunk in zip(expected, actual):
+            assert [node.tokens for node in act_chunk] == [node.tokens for node in exp_chunk]
+            assert [node.existing for node in act_chunk] == [node.existing for node in exp_chunk]
+            assert [node.p_hi for node in act_chunk] == [node.p_hi for node in exp_chunk]
+            assert [node.n_total for node in act_chunk] == [node.n_total for node in exp_chunk]
+            for exp_node, act_node in zip(exp_chunk, act_chunk):
+                assert torch.equal(act_node.centroid, exp_node.centroid)
+
+    def test_semantic_tree_local_chunks_batched_matches_reference_near_threshold(self):
+        # Boundary-adjacent stress test: the other equivalence test uses generic
+        # random data, which can't catch a batched-vs-per-chunk distance-kernel
+        # difference flipping a reach()/argmin decision right at the threshold.
+        # Cluster tokens around a few centers spaced ~sqrt(threshold) apart so
+        # many pairwise distances land close to the cluster_lambda_rel * s_h
+        # cutoff, across several seeds.
+        c = make_semantic_cache(
+            K_max=16, n_groups=1, recent_size=8, cluster_lambda_rel=0.25, semantic_cluster_chunk_size=5
+        )
+        threshold = c._semantic_tree_threshold(0, 0)
+        spacing = math.sqrt(threshold)
+        chunk_size = 5
+        n = 11
+        positions_host = [list(range(n))]
+        for seed in range(8):
+            torch.manual_seed(seed)
+            centers = torch.randint(0, 3, (n,)).float() * spacing
+            k_raw = torch.zeros(1, 1, n, 8)
+            k_raw[0, 0, :, 0] = centers + 0.5 * spacing * torch.randn(n)
+
+            expected = [
+                c._semantic_tree_local_chunks(0, 0, k_raw, start, min(start + chunk_size, n), positions_host)
+                for start in range(0, n, chunk_size)
+            ]
+            actual = c._semantic_tree_local_chunks_batched(0, 0, k_raw, chunk_size, positions_host)
+
+            assert len(actual) == len(expected), f"seed={seed}"
+            for exp_chunk, act_chunk in zip(expected, actual):
+                assert [node.tokens for node in act_chunk] == [node.tokens for node in exp_chunk], f"seed={seed}"
+
     def test_tree_candidate_ranking_uses_temporal_tiebreak(self):
         # algorithm-spec.md §5.3: eta only reorders candidates, it must not
         # affect the accept/reject threshold. Two candidates tied on semantic
@@ -1604,6 +1708,51 @@ class TestSemanticLogKV:
         assert len(live) <= 2  # K_max respected even though the first chunk
                                # alone holds 3 mutually distant tokens
         assert sum(int(c.n_total[0, 0, idx].item()) for idx in live) == 4  # no tokens lost
+
+    def test_semantic_chunk_tree_records_and_replays_same_state(self):
+        expected = make_semantic_cache(
+            K_max=2, n_groups=1, B=4, recent_size=8, cluster_lambda_rel=0.25, semantic_cluster_chunk_size=2
+        )
+        recorded = make_semantic_cache(
+            K_max=2, n_groups=1, B=4, recent_size=8, cluster_lambda_rel=0.25, semantic_cluster_chunk_size=2
+        )
+        replay = make_semantic_cache(
+            K_max=2, n_groups=1, B=4, recent_size=8, cluster_lambda_rel=0.25, semantic_cluster_chunk_size=2
+        )
+        k0 = torch.zeros(8)
+        k1 = torch.zeros(8)
+        k1[0] = 0.01
+        v0 = torch.arange(8, dtype=torch.float32)
+        v1 = v0 + 10.0
+        for cache in (expected, recorded, replay):
+            cache._semantic_new_cluster(0, 0, 0, 0, k0, v0, torch.tensor(0), record=False)
+            cache._semantic_new_cluster(0, 0, 1, 1, k1, v1, torch.tensor(1), record=False)
+
+        k_raw = torch.zeros(1, 1, 2, 8)
+        k_raw[0, 0, :, 0] = torch.tensor([100.0, 100.1])
+        v = torch.arange(16, dtype=torch.float32).view(1, 1, 2, 8)
+        pos = torch.tensor([2, 3])
+
+        expected.route_and_flush_batch(k_raw, v, pos)
+        recorded.begin_op_log()
+        recorded.route_and_flush_batch(k_raw, v, pos, record_op_log=True)
+        op_log, op_log_len = recorded.take_op_log()
+        assert op_log is not None
+        assert op_log_len is not None
+        assert len(recorded._last_op_log_host[0][0]) == int(op_log_len[0, 0].item())
+        assert any(op == LOG_KV_OP_WARD_MERGE for op, *_ in recorded._last_op_log_host[0][0])
+
+        replay.route_and_flush_batch(
+            k_raw,
+            v,
+            pos,
+            replay_op_log=op_log,
+            replay_op_log_len=op_log_len,
+            replay_op_log_host=recorded._last_op_log_host,
+        )
+
+        assert_cache_states_bit_identical(expected, recorded)
+        assert_cache_states_bit_identical(recorded, replay)
 
     def test_semantic_chunk_tree_ward_selects_multiple_disjoint_pairs(self):
         c = make_semantic_cache(K_max=3, n_groups=1)
