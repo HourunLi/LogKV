@@ -1,3 +1,5 @@
+# chunk-tree 路由，K_max=16/B=512 与 arc_semantic_stage1_threephase.yaml 完全一致，
+# 只有 log_kv_semantic_cluster_chunk_size 一行不同，两份配置配对做 A/B 对照。
 config: base.yaml
 
 expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-chunktree-c256
