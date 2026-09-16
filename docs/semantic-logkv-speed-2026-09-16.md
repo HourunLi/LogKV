@@ -53,6 +53,39 @@ checkpoint 后约 123 万。
 `unused/semantic_logkv_microbench.py` 在目标配置（K=8, B=64, T=1024, 8192 ops）下：
 route 41.8 / 51.4 / 92.0 ms，replay 39.7 / 42.4 / 87.1 ms（orphan 0 / 0.1 / 1）。
 
+## 回归与修正（目标 GPU 上 10 min/step -> 30 min/step）
+
+第一版批量化在目标机上把 step 从 10 分钟拖到 30 分钟。原因是**优化指标选错了**：
+我用 CPU 上的 aten op 数当目标，那个指标看不见 GPU 上最贵的两件事。
+
+**1. 主机侧索引构建（主因）。** 批量 ladder 把每层的 gather/scatter 索引用 Python
+`list.extend(range(...))` 攒出来，再 `torch.tensor(list, device=cuda)`。后者在 CUDA 上
+是 pageable 内存的阻塞式 H2D 拷贝，而列表构建本身在 GPU 上一点也不会变快：
+
+| | 每次 route 的 list->tensor | 搬运的 int 数 |
+|---|---:|---:|
+| 改之前 705eba90 | 128 次 | 8,192 |
+| 第一版批量化 | 32 次 | **94,469** |
+| 现在（numpy 修复后） | **5 次** | **5** |
+
+9.4 万个 int 走 `torch.tensor(list)` 是每次 route 约 4.3 ms 的纯主机开销，
+折算每 optimizer step 约 **180 秒**。改成 numpy 建（索引全是连续 range 的拼接，
+`np.concatenate([np.arange(...)])` 快约 35 倍）并且每层只做一次传输后，这项归零。
+本机 CPU 上同配置 route 也从 46.7 ms 降到 15.8 ms。
+
+由 `TestSemanticRouterHostCost` 守住：一次 flush 经 `torch.tensor(list)` 的元素数
+必须远小于 token 数。
+
+**2. `activation_checkpointing: false` 是个地雷，已从 yaml 撤掉。** 按 Qwen3-1.7B
+实测口径（n_layer=28, n_embd=2048, intermediate=6144, bf16），32k 下关掉 Block 级
+checkpoint 需要保留的激活是 micro_batch_size=1 约 **49 GB**、=4 约 **196 GB**，
+H200 单卡才 141 GB。当初写这条时doc 里标了"必须在目标 GPU 上先看显存"，
+但不该直接写进入口 yaml。
+
+`arc_semantic_fast.yaml` 现在退回成**纯代码路径 A/B**：尺寸、二阶、AC 全部继承
+threephase 基线，只有路由实现不同，和已知的 10 min/step 基线只差一个变量。
+`log_kv_B: 64` / `log_kv_second_order_scale: 0.0` 作为可选档留在注释里，逐个单独试。
+
 ## 配置：K=16/B=512 在 32k 下是负压缩
 
 | K | B | L | live entries | 最坏 anchor slots |

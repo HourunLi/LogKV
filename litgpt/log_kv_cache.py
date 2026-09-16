@@ -46,6 +46,7 @@ import contextlib
 import math
 from typing import Any, NamedTuple, NoReturn
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.autograd.function import once_differentiable
@@ -261,6 +262,17 @@ def _pair_rank1_stats(
     gamma = dk_norm * dv_norm * cross
     gamma_a = sigma_u
     return sigma_u, sigma2, gamma_a, gamma_b, gamma
+
+
+_EMPTY_INDEX = np.empty(0, dtype=np.int64)
+
+
+def _spans_to_index_array(spans: list[tuple[int, int]]) -> np.ndarray:
+    """Concatenate half-open ``[start, stop)`` ranges into one int64 array."""
+    parts = [np.arange(start, stop, dtype=np.int64) for start, stop in spans if stop > start]
+    if not parts:
+        return _EMPTY_INDEX
+    return parts[0] if len(parts) == 1 else np.concatenate(parts)
 
 
 class LogStructuredKVCache(nn.Module):
@@ -1154,6 +1166,31 @@ class LogStructuredKVCache(nn.Module):
             )
             self._set_semantic_level_count(b, g, c, ell, self.B)
 
+    def _semantic_index_tensors(
+        self, device: torch.device, *span_lists: list[tuple[int, int]]
+    ) -> list[torch.Tensor]:
+        """Build several range-derived index tensors with ONE host->device copy.
+
+        ``torch.tensor(<python list>, device="cuda")`` is a blocking pageable
+        transfer, and building the list costs more on the host than the kernels
+        it feeds save. Every index here is a concatenation of contiguous ranges,
+        so numpy builds them ~35x faster and they travel together.
+        """
+        arrays = [_spans_to_index_array(spans) for spans in span_lists]
+        sizes = [int(a.size) for a in arrays]
+        total = sum(sizes)
+        if total == 0:
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return [empty] * len(arrays)
+        flat = torch.from_numpy(np.concatenate(arrays) if len(arrays) > 1 else arrays[0])
+        flat = flat.to(device, copy=False)
+        out: list[torch.Tensor] = []
+        off = 0
+        for n in sizes:
+            out.append(flat[off:off + n])
+            off += n
+        return out
+
     def _semantic_append_entries_batched(
         self,
         lanes: list[tuple[int, int, int]],
@@ -1169,7 +1206,8 @@ class LogStructuredKVCache(nn.Module):
 
         The per-level index arithmetic runs on the host against the
         `_semantic_counts` mirror, which is already the authority for these
-        counts, so none of it costs a device sync.
+        counts, so none of it costs a device sync. Indices are accumulated as
+        ranges and moved once per level (see `_semantic_index_tensors`).
         """
         active = [i for i in range(len(lanes)) if counts[i] > 0]
         if not active:
@@ -1184,19 +1222,18 @@ class LogStructuredKVCache(nn.Module):
             spans[i] = (off, n)
             off += n
 
-        def _idx(rows: list[int]) -> torch.Tensor:
-            return torch.tensor(rows, device=dev, dtype=torch.long)
-
         for ell in range(self.L_alloc):
             if not active:
                 return
             top = ell == self.L_alloc - 1
-            fill_src: list[int] = []
-            fill_dst: list[int] = []
-            store_rows: list[int] = []
-            stage_rows: list[int] = []
-            surv_dst: list[int] = []
-            clear_dst: list[int] = []
+            fill_src: list[tuple[int, int]] = []
+            fill_dst: list[tuple[int, int]] = []
+            store_rows: list[tuple[int, int]] = []
+            stage_rows: list[tuple[int, int]] = []
+            surv_dst: list[tuple[int, int]] = []
+            clear_dst: list[tuple[int, int]] = []
+            n_store = 0
+            n_stage = 0
             recs: list[tuple[int, int, int, int]] = []  # (st_off, sg_off, m, n_pair_rows)
             overflow_top: list[tuple[int, int, int]] = []  # (lane_i, start, count)
             carry_counts: list[tuple[int, int]] = []
@@ -1209,8 +1246,8 @@ class LogStructuredKVCache(nn.Module):
                 base = bases[i] + ell * self.B
                 take = min(self.B - cnt, m)
                 if take:
-                    fill_src.extend(range(s, s + take))
-                    fill_dst.extend(range(base + cnt, base + cnt + take))
+                    fill_src.append((s, s + take))
+                    fill_dst.append((base + cnt, base + cnt + take))
                     cnt += take
                     s += take
                     m -= take
@@ -1223,20 +1260,41 @@ class LogStructuredKVCache(nn.Module):
                 carry_n = (m + 1) // 2
                 n_pair_rows = 2 * carry_n
                 n_surv = self.B + m - n_pair_rows
-                recs.append((len(store_rows), len(stage_rows), m, n_pair_rows))
-                store_rows.extend(range(base, base + self.B))
-                stage_rows.extend(range(s, s + m))
-                surv_dst.extend(range(base, base + n_surv))
+                recs.append((n_store, n_stage, m, n_pair_rows))
+                store_rows.append((base, base + self.B))
+                n_store += self.B
+                stage_rows.append((s, s + m))
+                n_stage += m
+                surv_dst.append((base, base + n_surv))
                 if n_surv < self.B:
-                    clear_dst.extend(range(base + n_surv, base + self.B))
+                    clear_dst.append((base + n_surv, base + self.B))
                 self._set_semantic_level_count(b, g, c, ell, n_surv)
                 carry_counts.append((i, carry_n))
                 next_active.append(i)
 
+            # The pool is [gathered storage rows] ++ [gathered staging rows], so
+            # staging positions shift by the total storage row count.
+            pair_idx: list[tuple[int, int]] = []
+            surv_idx: list[tuple[int, int]] = []
+            for st_off, sg_off, m, n_pair_rows in recs:
+                ps = min(self.B, n_pair_rows)
+                pair_idx.append((st_off, st_off + ps))
+                if n_pair_rows > ps:
+                    begin = n_store + sg_off
+                    pair_idx.append((begin, begin + n_pair_rows - ps))
+                if ps < self.B:
+                    surv_idx.append((st_off + ps, st_off + self.B))
+                begin = n_store + sg_off + max(0, n_pair_rows - self.B)
+                surv_idx.append((begin, n_store + sg_off + m))
+
+            fs, fd, si, gi, pi, vi, sd, cd = self._semantic_index_tensors(
+                dev, fill_src, fill_dst, store_rows, stage_rows,
+                pair_idx, surv_idx, surv_dst, clear_dst,
+            )
+
             # Fill first: an overflowing lane's pooled rows include the slots this
             # very step just topped up.
-            if fill_dst:
-                fs, fd = _idx(fill_src), _idx(fill_dst)
+            if fd.numel():
                 for f, x in zip(fields, stage):
                     f.index_copy_(0, fd, x.index_select(0, fs).to(f.dtype))
 
@@ -1249,32 +1307,14 @@ class LogStructuredKVCache(nn.Module):
             if not recs:
                 return
 
-            n_store = len(store_rows)
-            pair_idx: list[int] = []
-            surv_idx: list[int] = []
-            for st_off, sg_off, m, n_pair_rows in recs:
-                ps = min(self.B, n_pair_rows)
-                pair_idx.extend(range(st_off, st_off + ps))
-                if n_pair_rows > ps:
-                    start = n_store + sg_off
-                    pair_idx.extend(range(start, start + n_pair_rows - ps))
-                if ps < self.B:
-                    surv_idx.extend(range(st_off + ps, st_off + self.B))
-                start = n_store + sg_off + max(0, n_pair_rows - self.B)
-                surv_idx.extend(range(start, n_store + sg_off + m))
-
-            si, gi = _idx(store_rows), _idx(stage_rows)
             pool = tuple(
                 torch.cat([f.index_select(0, si), x.index_select(0, gi).to(f.dtype)], dim=0)
                 for f, x in zip(fields, stage)
             )
-            pi, vi = _idx(pair_idx), _idx(surv_idx)
             carry = self._semantic_merge_block_pairs(tuple(x.index_select(0, pi) for x in pool))
-            sd = _idx(surv_dst)
             for f, x in zip(fields, pool):
                 f.index_copy_(0, sd, x.index_select(0, vi))
-            if clear_dst:
-                cd = _idx(clear_dst)
+            if cd.numel():
                 for f in fields:
                     f.index_fill_(0, cd, 0)
 
@@ -2345,9 +2385,22 @@ class LogStructuredKVCache(nn.Module):
         for b, g, ops in pending_ops:
             self._record_ops(b, g, ops)
 
-        at = torch.tensor(blk_tok_at, device=dev, dtype=torch.long)
-        src = torch.tensor(blk_tok_src, device=dev, dtype=torch.long)
-        psrc = torch.tensor(blk_pos_src, device=dev, dtype=torch.long)
+        # These four are irregular (not plain ranges), but they still travel as a
+        # single int64 block: on CUDA each separate `torch.tensor(list)` would be
+        # its own blocking pageable copy.
+        n_tok = len(blk_tok_at)
+        packed = np.empty(3 * n_tok + len(order_vals) + len(run_ids), dtype=np.int64)
+        packed[:n_tok] = blk_tok_at
+        packed[n_tok:2 * n_tok] = blk_tok_src
+        packed[2 * n_tok:3 * n_tok] = blk_pos_src
+        packed[3 * n_tok:3 * n_tok + len(order_vals)] = order_vals
+        packed[3 * n_tok + len(order_vals):] = run_ids
+        packed_t = torch.from_numpy(packed).to(dev, copy=False)
+        at = packed_t[:n_tok]
+        src = packed_t[n_tok:2 * n_tok]
+        psrc = packed_t[2 * n_tok:3 * n_tok]
+        order_t = packed_t[3 * n_tok:3 * n_tok + len(order_vals)]
+        run_ids_t = packed_t[3 * n_tok + len(order_vals):]
         k_sel = k_flat.index_select(0, src).detach()
         v_sel = v_flat.index_select(0, src).detach()
         p_sel = pos_flat.index_select(0, psrc).to(torch.int64)
@@ -2366,7 +2419,7 @@ class LogStructuredKVCache(nn.Module):
             self.level_p_lo.new_zeros(total).index_copy_(0, at, p_sel),
             self.level_p_hi.new_zeros(total).index_copy_(0, at, p_sel),
             self.level_sum_wp.new_zeros(total).index_copy_(0, at, p_sel),
-            torch.tensor(order_vals, device=dev, dtype=torch.int64),
+            order_t,
             self.pad_mask.new_ones(total).index_fill_(0, at, False),
         )
         self._semantic_append_entries_batched(lanes, lane_counts, block)
@@ -2375,7 +2428,7 @@ class LogStructuredKVCache(nn.Module):
         # scatter per run ordinal (production configs have a single run per lane).
         n_runs = len(runs)
         run_sums = k_sel.new_zeros(n_runs, self.k_dim).float()
-        run_sums.index_add_(0, torch.tensor(run_ids, device=dev, dtype=torch.long), k_sel.float())
+        run_sums.index_add_(0, run_ids_t, k_sel.float())
         centroid_flat = self.centroid.view(-1, self.k_dim)
         n_eff_flat = self.n_eff.view(-1)
         max_ordinal = max(r[0] for r in runs) + 1
@@ -2383,12 +2436,17 @@ class LogStructuredKVCache(nn.Module):
             sel = [j for j, r in enumerate(runs) if r[0] == ordinal]
             if not sel:
                 continue
-            ci = torch.tensor([runs[j][1] for j in sel], device=dev, dtype=torch.long)
-            n = torch.tensor([float(runs[j][2]) for j in sel], device=dev, dtype=torch.float32)
-            forget = torch.tensor(
-                [self.seg_forget if runs[j][3] else 1.0 for j in sel], device=dev, dtype=torch.float32
-            )
-            sums = run_sums.index_select(0, torch.tensor(sel, device=dev, dtype=torch.long))
+            idx_pack = np.empty(2 * len(sel), dtype=np.int64)
+            idx_pack[:len(sel)] = [runs[j][1] for j in sel]
+            idx_pack[len(sel):] = sel
+            idx_t = torch.from_numpy(idx_pack).to(dev, copy=False)
+            ci, sel_t = idx_t[:len(sel)], idx_t[len(sel):]
+            f_pack = np.empty(2 * len(sel), dtype=np.float32)
+            f_pack[:len(sel)] = [float(runs[j][2]) for j in sel]
+            f_pack[len(sel):] = [self.seg_forget if runs[j][3] else 1.0 for j in sel]
+            f_t = torch.from_numpy(f_pack).to(dev, copy=False)
+            n, forget = f_t[:len(sel)], f_t[len(sel):]
+            sums = run_sums.index_select(0, sel_t)
             pre = n_eff_flat.index_select(0, ci) * forget
             denom = pre + n
             mu = centroid_flat.index_select(0, ci)
