@@ -675,7 +675,8 @@ def main(
     cuda_preflight()
     fabric = L.Fabric(
         accelerator="cuda",
-        devices=num_devices,
+        # torchrun has already chosen the per-node process count; YAML cannot resize it.
+        devices=int(os.environ.get("LOCAL_WORLD_SIZE", num_devices)),
         num_nodes=int(os.environ.get("GROUP_WORLD_SIZE", 1)),
         strategy=strategy,
         precision="bf16-true",
