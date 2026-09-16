@@ -1,0 +1,23 @@
+# 快路径入口：批量 ladder 写入 + 批量 orphan 路由（无 per-orphan Ward merge）。
+# 相对 threephase 基线改动的是尺寸和二阶开关，路由算法由代码默认的快路径提供。
+#
+# 为什么 B 从 512 降到 64：K=16/B=512 在 32k 下存 18432 个 entry、最多 38912 个
+# anchor slot，比 dense 的 32768 还大 —— 压缩率是负的。K=8/B=64 是 3080 个 entry、
+# 最多 8216 个 slot。
+config: arc_semantic_stage1_threephase.yaml
+
+expid: qwen1.7b-32k-cpt-logKV-semantic-fast
+save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/_fsdp_staging_semantic_fast
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic-fast
+
+log_kv_cluster_k_max: 8
+log_kv_B: 64
+# 一阶读出：省掉 5 份 payload gather 和 QΣ / QΓ 两组矩阵乘。
+log_kv_second_order_scale: 0.0
+# LogKV 训练自己就靠 streaming + replay 控激活显存，Block 级 checkpoint 会把整条
+# 路由前向重跑一遍（而且那一遍的 op_log 被丢弃）。关掉 = 每层少一次路由。
+# 目标 GPU 上先确认显存再固化。
+activation_checkpointing: false
+# 走旧路由（每 orphan 一次 Ward merge）只用于 A/B 对照，默认 false。
+log_kv_semantic_legacy_route: null

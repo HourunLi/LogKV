@@ -369,6 +369,7 @@ class GPT(nn.Module):
         semantic_cluster_chunk_size: int = 0,
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
+        semantic_legacy_route: bool = False,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -449,6 +450,7 @@ class GPT(nn.Module):
                 semantic_cluster_chunk_size=semantic_cluster_chunk_size,
                 semantic_capacity_beta=semantic_capacity_beta,
                 semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
+                semantic_legacy_route=semantic_legacy_route,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -511,6 +513,7 @@ class GPT(nn.Module):
         semantic_cluster_chunk_size: int = 0,
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
+        semantic_legacy_route: bool = False,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -579,6 +582,7 @@ class GPT(nn.Module):
                 semantic_cluster_chunk_size=semantic_cluster_chunk_size,
                 semantic_capacity_beta=semantic_capacity_beta,
                 semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
+                semantic_legacy_route=semantic_legacy_route,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -1382,6 +1386,7 @@ class CausalSelfAttention(nn.Module):
         semantic_cluster_chunk_size: int = 0,
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
+        semantic_legacy_route: bool = False,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
     ) -> "LogStructuredKVCache":
@@ -1442,6 +1447,7 @@ class CausalSelfAttention(nn.Module):
             semantic_cluster_chunk_size=semantic_cluster_chunk_size,
             semantic_capacity_beta=semantic_capacity_beta,
             semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
+            semantic_legacy_route=semantic_legacy_route,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,

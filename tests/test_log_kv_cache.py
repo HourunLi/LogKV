@@ -9,6 +9,7 @@ from litgpt.config import Config
 from litgpt.log_kv_cache import (
     CacheAttentionState,
     LOG_KV_OP_JOIN,
+    LOG_KV_OP_NEW_CLUSTER,
     LOG_KV_OP_NEW_SEGMENT,
     LOG_KV_OP_PAD_INSERT,
     LOG_KV_OP_WARD_MERGE,
@@ -87,6 +88,7 @@ def make_semantic_cache(
     semantic_cluster_chunk_size: int = 0,
     semantic_capacity_beta: float = 0.0,
     semantic_capacity_hard_cap_mult: float = 0.0,
+    semantic_legacy_route: bool = False,
 ) -> LogStructuredKVCache:
     cos, sin = build_rope_cache(max_seq_length, k_dim)
     return LogStructuredKVCache(
@@ -106,6 +108,7 @@ def make_semantic_cache(
         semantic_cluster_chunk_size=semantic_cluster_chunk_size,
         semantic_capacity_beta=semantic_capacity_beta,
         semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
+        semantic_legacy_route=semantic_legacy_route,
         cos_cache=cos,
         sin_cache=sin,
         rope_n_elem=k_dim,
@@ -161,7 +164,7 @@ def assert_cache_states_bit_identical(a: LogStructuredKVCache, b: LogStructuredK
         ):
             assert torch.equal(getattr(a, name), getattr(b, name)), f"{name} differ"
         # centroid/n_eff go through the batched closed-form update in
-        # _semantic_join_batch, which is mathematically but not bit-identical
+        # _semantic_apply_join_plan, which is mathematically but not bit-identical
         # to the old per-token recurrence (sub-ULP rounding that varies with
         # run size / flush granularity) -- tolerance compare like the other
         # centroid/n_eff checks in this file.
@@ -1353,6 +1356,95 @@ class TestGetAttentionState:
 # ---------------------------------------------------------------------------
 
 class TestSemanticLogKV:
+    @pytest.mark.parametrize("second_order_scale", [0.0, 0.2])
+    def test_batched_replay_matches_training_outputs_and_gradients(self, second_order_scale):
+        torch.manual_seed(90)
+        inputs = [torch.randn(1, h, 40, 8) for h in (2, 1, 1)]
+        loss_weight = torch.randn(1, 2, 40, 8)
+        results = []
+        for replay in (False, True):
+            cache = make_semantic_cache(
+                K_max=3, n_groups=1, B=3, recent_size=8, semantic_flush_granularity=8,
+                cluster_lambda_rel=0.2, seg_gap_max=3.0, seg_block_level=2,
+            )
+            cache.second_order = second_order_scale != 0.0
+            q, k, v = [x.clone().requires_grad_() for x in inputs]
+            if replay:
+                y = LogKVStreamTrainingAttention.apply(q, k, v, cache, 8 ** -0.5, 8, second_order_scale, k)
+            else:
+                chunks = []
+                for start in range(0, 40, 8):
+                    kb, vb = k[:, :, start:start + 8], v[:, :, start:start + 8]
+                    chunks.append(log_kv_chunk_attention(
+                        cache, q[:, :, start:start + 8], kb, vb, 8 ** -0.5, second_order_scale
+                    ))
+                    with torch.no_grad():
+                        cache.add_recent(kb, vb, k_raw=kb)
+                y = torch.cat(chunks, dim=2)
+            (y * loss_weight).sum().backward()
+            results.append((y.detach(), q.grad, k.grad, v.grad))
+        for reference, actual in zip(*results):
+            torch.testing.assert_close(reference, actual, atol=2e-5, rtol=2e-5)
+
+    @pytest.mark.parametrize("with_stats", [False, True])
+    def test_ward_rebuild_uses_blocks_and_preserves_mass(self, monkeypatch, with_stats):
+        torch.manual_seed(91)
+        cache = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=8)
+        cache.second_order = with_stats
+        keys, values = torch.randn(24, 8), torch.randn(24, 8)
+        positions = torch.arange(24)
+        for c in range(2):
+            cache._semantic_new_cluster(0, 0, c, c, keys[c], values[c], torch.tensor(c), record=False)
+            cache._semantic_commit_joins(
+                [(0, 0, c, tuple(range(c + 2, 24, 2)))],
+                keys.view(1, 1, 24, 8), values.view(1, 1, 24, 8), positions.view(1, 24),
+                [[int(x) for x in positions.tolist()]],
+            )
+
+        def scalar_path(*args, **kwargs):
+            raise AssertionError("Ward rebuild must not read or append individual slots")
+
+        monkeypatch.setattr(cache, "_semantic_slot_entry", scalar_path)
+        monkeypatch.setattr(cache, "_semantic_append_entry", scalar_path)
+        cache._semantic_ward_merge(0, 0, 0, 1, record=False)
+        w = cache.level_w[0, 0, 0]
+        assert w.sum().item() == 24
+        torch.testing.assert_close((cache.level_k[0, 0, 0] * w[..., None]).sum((0, 1)), keys.sum(0))
+        torch.testing.assert_close((cache.level_v[0, 0, 0] * w[..., None]).sum((0, 1)), values.sum(0))
+        assert not cache._semantic_alive[0][0][1]
+
+    @pytest.mark.parametrize("host_log", [False, True])
+    def test_replay_batches_joins_and_stops_at_flush_boundary(self, monkeypatch, host_log):
+        torch.manual_seed(92)
+        source = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=8, cluster_lambda_rel=1e9)
+        replay = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=8, cluster_lambda_rel=1e9)
+        keys, values = torch.randn(1, 1, 17, 8), torch.randn(1, 1, 17, 8)
+        for cache in (source, replay):
+            cache._semantic_new_cluster(0, 0, 0, 0, keys[0, 0, 0], values[0, 0, 0], torch.tensor(0), record=False)
+        source.begin_op_log()
+        for start in (1, 9):
+            source.route_and_flush_batch(
+                keys[:, :, start:start + 8], values[:, :, start:start + 8],
+                torch.arange(start, start + 8), record_op_log=True,
+            )
+        log, lengths = source.take_op_log()
+        calls = []
+        commit = replay._semantic_commit_runs
+
+        def counted_commit(records, *args, **kwargs):
+            calls.extend(len(r[5]) for r in records)
+            return commit(records, *args, **kwargs)
+
+        monkeypatch.setattr(replay, "_semantic_commit_runs", counted_commit)
+        for start in (1, 9):
+            replay.route_and_flush_batch(
+                keys[:, :, start:start + 8], values[:, :, start:start + 8], torch.arange(start, start + 8),
+                replay_op_log=log, replay_op_log_len=lengths,
+                replay_op_log_host=source._last_op_log_host if host_log else None,
+            )
+        assert calls == [8, 8]
+        assert_cache_states_bit_identical(source, replay)
+
     def test_kmax1_flushes_single_token_entries_and_materializes_anchors(self):
         torch.manual_seed(0)
         c = make_semantic_cache(K_max=1, recent_size=2)
@@ -1784,7 +1876,10 @@ class TestSemanticLogKV:
         op_log, op_log_len = c.take_op_log()
         assert op_log is not None
         assert op_log_len is not None
-        assert op_log_len[0, 0] >= 6
+        # The point is that the log really describes multi-cluster state; the
+        # exact row count depends on how many joins the router batches.
+        assert sum(row[0] == LOG_KV_OP_NEW_CLUSTER for row in c._last_op_log_host[0][0]) >= 2
+        assert all(c._semantic_alive[0][0])
         assert len(c._last_op_log_host[0][0]) == int(op_log_len[0, 0].item())
 
         r.route_and_flush_batch(
@@ -1797,6 +1892,24 @@ class TestSemanticLogKV:
         )
 
         assert_cache_states_bit_identical(c, r)
+
+    def test_op_log_replay_rejects_duplicate_positions_host(self):
+        c = make_semantic_cache(K_max=2, n_groups=1, B=3, recent_size=2)
+        k_raw = torch.zeros(1, 1, 2, 8)
+        v = torch.zeros(1, 1, 2, 8)
+        pos = torch.tensor([7, 7])
+        op_log = torch.tensor([[[[LOG_KV_OP_NEW_CLUSTER, 0, 0, 7]]]], dtype=torch.int32)
+        op_log_len = torch.tensor([[1]], dtype=torch.int32)
+
+        with pytest.raises(RuntimeError, match="duplicate token ids"):
+            c.route_and_flush_batch(
+                k_raw,
+                v,
+                pos,
+                positions_host=[[7, 7]],
+                replay_op_log=op_log,
+                replay_op_log_len=op_log_len,
+            )
 
     def test_ward_merge_rebuild_phase_tracks_replayed_entries(self):
         c = make_semantic_cache(K_max=2, n_groups=1, B=2, recent_size=2, seg_block_level=2)
@@ -1834,6 +1947,51 @@ class TestSemanticLogKV:
         assert int(winner[0, 0, 0].item()) == 1
         assert bool(direct[0, 0, 0].item())
         assert s_winner[0, 0, 0].item() == pytest.approx(0.25)
+
+    def test_existing_assignments_matmul_matches_diff_reference_near_threshold(self):
+        c = make_semantic_cache(batch_size=2, n_groups=2, K_max=4, max_seq_length=16, cluster_lambda_rel=0.25)
+        c.alive[:2, :2, :4] = True
+        c.n_total[:2, :2, :4] = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+        c.p_hi_c[:2, :2, :4] = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        positions = torch.tensor([[4, 5, 6, 7, 8, 9], [9, 8, 7, 6, 5, 4]], dtype=torch.int64)
+
+        def reference(k_raw: torch.Tensor):
+            live = c.alive[: k_raw.size(0), : k_raw.size(1)]
+            diff = k_raw.float().unsqueeze(3) - c.centroid[: k_raw.size(0), : k_raw.size(1)].unsqueeze(2)
+            semantic = diff.square().sum(dim=-1)
+            gap = (
+                positions[:, None, :, None].to(c.p_hi_c.dtype)
+                - c.p_hi_c[: k_raw.size(0), : k_raw.size(1)].unsqueeze(2)
+            )
+            gap = gap.float().clamp_min(0.0)
+            cost = semantic + c.seg_eta * (gap / (gap + c.seg_g0))
+            cost = cost.masked_fill(~live.unsqueeze(2), float("inf"))
+            winner = cost.argmin(dim=-1)
+            s_winner = semantic.gather(-1, winner.unsqueeze(-1)).squeeze(-1)
+            direct = live.any(dim=-1).unsqueeze(-1) & (
+                s_winner <= c.cluster_lambda_rel * c.s_h[: k_raw.size(0), : k_raw.size(1)].unsqueeze(-1)
+            )
+            return winner, s_winner, direct
+
+        threshold = c.cluster_lambda_rel * float(c.s_h[0, 0].item())
+        for seed in range(8):
+            torch.manual_seed(seed)
+            c.centroid[:2, :2, :4].normal_(0.0, 0.25)
+            target = torch.randint(0, 4, (2, 2, positions.size(1)))
+            k_raw = torch.empty(2, 2, positions.size(1), 8)
+            direction = torch.randn_like(k_raw)
+            direction = direction / direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            radius = math.sqrt(threshold) * (0.9 + 0.2 * torch.rand(2, 2, positions.size(1)))
+            for b in range(2):
+                for g in range(2):
+                    k_raw[b, g] = c.centroid[b, g, target[b, g]] + direction[b, g] * radius[b, g].unsqueeze(-1)
+
+            exp_winner, exp_s_winner, exp_direct = reference(k_raw)
+            winner, s_winner, direct = c._semantic_existing_assignments(k_raw, positions)
+
+            assert torch.equal(winner, exp_winner), f"seed={seed}"
+            assert torch.equal(direct, exp_direct), f"seed={seed}"
+            torch.testing.assert_close(s_winner, exp_s_winner, atol=1e-5, rtol=1e-5)
 
     def test_hard_cap_forces_split_before_joining_overfull_cluster(self):
         c = make_semantic_cache(
@@ -3313,3 +3471,237 @@ class TestLogKVMatchesDense:
 
         streamed = torch.cat(out, dim=1)
         torch.testing.assert_close(streamed, dense, atol=1e-4, rtol=1e-4)
+
+
+class TestSemanticRoutingCost:
+    """Guards the batched router: a flush's op count must stay small AND must
+    not grow with batch * groups * K_max. Those are the two properties that make
+    the GPU path launch-bound-cheap; wall time on CPU does not show them.
+    """
+
+    @staticmethod
+    def _count_ops(cache, k_raw, v, pos, positions_host):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        class Counter(TorchDispatchMode):
+            def __init__(self):
+                self.n = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                self.n += 1
+                return func(*args, **(kwargs or {}))
+
+        counter = Counter()
+        with counter:
+            cache.route_and_flush_batch(k_raw, v, pos, positions_host=positions_host)
+        return counter.n
+
+    def _direct_flush(self, *, n_groups, K_max, legacy=False, tokens=256):
+        torch.manual_seed(0)
+        cache = make_semantic_cache(
+            n_groups=n_groups, K_max=K_max, B=16, max_seq_length=4096, recent_size=tokens,
+            semantic_flush_granularity=tokens, semantic_legacy_route=legacy,
+        )
+        proto = torch.zeros(K_max, 8)
+        proto[:, 0] = torch.arange(K_max).float() * 10.0
+        proto[:, 1] = 1.0
+        zero_v = torch.zeros(8)
+        for g in range(n_groups):
+            for c in range(K_max):
+                cache._semantic_new_cluster(
+                    0, g, c, -K_max + c, proto[c], zero_v, torch.tensor(c), record=False
+                )
+        k_raw = torch.empty(1, n_groups, tokens, 8)
+        for i in range(tokens):
+            k_raw[:, :, i] = proto[i % K_max] + 0.01 * torch.randn(1, n_groups, 8)
+        v = torch.randn(1, n_groups, tokens, 8)
+        pos = torch.arange(tokens)
+        return cache, k_raw, v, pos, [list(range(tokens))]
+
+    def test_flush_op_count_is_bounded(self):
+        ops = self._count_ops(*self._direct_flush(n_groups=8, K_max=8))
+        assert ops < 3000, f"routing a single flush took {ops} aten calls"
+
+    def test_flush_op_count_does_not_scale_with_lanes(self):
+        few = self._count_ops(*self._direct_flush(n_groups=4, K_max=8))
+        many = self._count_ops(*self._direct_flush(n_groups=16, K_max=8))
+        # 4x the lanes must not meaningfully move the op count; if it does, some
+        # path went back to indexing per (batch, group, cluster).
+        assert many <= few * 1.2, f"op count scaled with lanes: {few} -> {many}"
+
+    def test_saturated_clusters_do_not_ward_merge_per_orphan(self, monkeypatch):
+        """Every cluster slot live + all-novel tokens used to cost one full
+        two-cluster ladder rebuild per token."""
+        cache, k_raw, v, pos, ph = self._direct_flush(n_groups=2, K_max=4, tokens=64)
+        k_raw = torch.zeros_like(k_raw)
+        k_raw[:, :, :, 0] = 1000.0 + torch.arange(k_raw.size(2)).float() * 100.0
+        merges = []
+        real = cache._semantic_ward_merge
+        monkeypatch.setattr(
+            cache, "_semantic_ward_merge",
+            lambda *a, **kw: (merges.append(a), real(*a, **kw))[1],
+        )
+        cache.route_and_flush_batch(k_raw, v, pos, positions_host=ph)
+        assert merges == []
+        assert sum(cache._semantic_n_total[0][0]) >= k_raw.size(2)
+
+
+class TestSemanticFastRouteEquivalence:
+    """The fast router changes orphan placement and nothing else.
+
+    With no orphans every decision is frozen-centroid, so fast and legacy must
+    agree bitwise -- that is what pins the batched ladder append. Once orphans
+    appear the two legitimately diverge, and what must hold instead is that the
+    op log still reproduces the fast path's own state exactly.
+    """
+
+    CONFIGS = {
+        "plain": {},
+        "segment_pad": {"seg_gap_max": 8.0, "seg_block_level": 1},
+        "hard_cap": {"semantic_capacity_hard_cap_mult": 0.5, "semantic_capacity_beta": 0.3},
+        "k_max_1": {"K_max": 1},
+        "chunk_tree": {"semantic_cluster_chunk_size": 4},
+    }
+
+    @pytest.mark.parametrize("preseed", [False, True])
+    @pytest.mark.parametrize("host_log", [False, True])
+    def test_assignments_commit_in_time_order(self, preseed, host_log):
+        caches = [make_semantic_cache(
+            batch_size=2, n_groups=2, K_max=2, B=3, recent_size=8,
+            cluster_lambda_rel=0.01, seg_gap_max=2.0, seg_block_level=1,
+        ) for _ in range(2)]
+        for cache in caches:
+            cache.second_order = True
+            if preseed:
+                for b in range(2):
+                    for g in range(2):
+                        for c, value in enumerate((0.0, 100.0)):
+                            key = torch.zeros(8)
+                            key[0] = value
+                            cache._semantic_new_cluster(
+                                b, g, c, c, key, key, torch.tensor(c), record=False
+                            )
+        source, replay = caches
+        keys = torch.zeros(2, 2, 4, 8)
+        # Cold start picks a late seed; warm start mixes early orphans with
+        # later direct members of the same existing cluster.
+        keys[..., 0] = torch.tensor([10.0, 0.0, 10.0, 0.0] if preseed else [1.0, 2.0, 3.0, 4.0])
+        values = keys + 1
+        positions = torch.tensor([4, 5, 9, 10])
+        source.begin_op_log()
+        source.route_and_flush_batch(keys, values, positions, record_op_log=True)
+        log, lengths = source.take_op_log()
+
+        for b in range(2):
+            for g in range(2):
+                for c in source._semantic_live_clusters(b, g):
+                    tokens = [token for op, cluster, _, token in source._last_op_log_host[b][g]
+                              if cluster == c and op in (LOG_KV_OP_NEW_CLUSTER, LOG_KV_OP_NEW_SEGMENT, LOG_KV_OP_JOIN)]
+                    assert tokens == sorted(tokens)
+                    entries = source._semantic_collect_entries(b, g, c)
+                    spans = [(int(e[8]), int(e[9])) for e in entries if float(e[2]) > 0]
+                    assert all(left[1] < right[0] for left, right in zip(spans, spans[1:]))
+                    assert source._semantic_p_hi_c[b][g][c] == max(hi for _, hi in spans)
+        replay.route_and_flush_batch(
+            keys, values, positions, replay_op_log=log, replay_op_log_len=lengths,
+            replay_op_log_host=source._last_op_log_host if host_log else None,
+        )
+        assert_cache_states_bit_identical(source, replay)
+
+    @pytest.mark.parametrize("case", ["orphans", "direct_and_orphans", "identical_seeds", "overflow"])
+    def test_orphans_reserve_capacity_before_commit(self, case):
+        cache = make_semantic_cache(
+            K_max=2, n_groups=1, B=3, max_seq_length=16, recent_size=8,
+            cluster_lambda_rel=0.01, semantic_capacity_hard_cap_mult=0.5,
+        )
+        initial = 0 if case == "identical_seeds" else 2
+        if initial:
+            for c, value in enumerate((0.0, 100.0)):
+                key = torch.zeros(8)
+                key[0] = value
+                cache._semantic_new_cluster(0, 0, c, c, key, key, torch.tensor(c), record=False)
+        n = 8 if case == "overflow" else 6 if case == "identical_seeds" else 4
+        keys = torch.zeros(1, 1, n, 8)
+        keys[..., 0] = 10.0
+        if case == "direct_and_orphans":
+            keys[0, 0, 1, 0] = 0.0
+        cache.begin_op_log()
+        cache.route_and_flush_batch(keys, keys, torch.arange(2, n + 2), record_op_log=True)
+        counts = cache._semantic_n_total[0][0]
+        assert sum(counts) == initial + n
+        assert cache.level_w.sum().item() == initial + n
+        if case == "overflow":
+            assert min(counts) >= 4  # Exceed only after every cluster is full.
+        else:
+            assert counts == [4, 2]
+        assert all(op != LOG_KV_OP_WARD_MERGE for op, *_ in cache._op_log_host[0][0])
+
+    @staticmethod
+    def _cache(cfg, *, legacy, second_order):
+        base = dict(n_groups=2, K_max=4, B=4, recent_size=8, max_seq_length=256,
+                    semantic_flush_granularity=8)
+        base.update(cfg)
+        cache = make_semantic_cache(semantic_legacy_route=legacy, **base)
+        cache.second_order = second_order
+        # Seed every slot so the no-orphan case really has no orphans: with
+        # nothing alive the first tokens take the novelty path, which is exactly
+        # the part the two routers are allowed to disagree on.
+        zero_v = torch.zeros(cache.v_dim)
+        for g in range(cache.n_groups):
+            for c in range(cache.K_max):
+                proto = torch.zeros(cache.k_dim)
+                proto[0] = float(c) * 10.0
+                cache._semantic_new_cluster(
+                    0, g, c, -cache.K_max + c, proto, zero_v, torch.tensor(c), record=False
+                )
+        return cache
+
+    @staticmethod
+    def _drive(cache, *, orphans, record, replay=None, steps=5, tokens=8):
+        torch.manual_seed(11)
+        if record:
+            cache.begin_op_log()
+        for step in range(steps):
+            k_raw = torch.randn(1, cache.n_groups, tokens, cache.k_dim)
+            if not orphans:
+                # Park every key on a seeded centroid so the frozen-centroid test
+                # accepts all of them and the novelty path never runs.
+                k_raw *= 1e-3
+                for i in range(tokens):
+                    k_raw[:, :, i, 0] += float(i % cache.K_max) * 10.0
+            v = torch.randn(1, cache.n_groups, tokens, cache.v_dim)
+            pos = torch.arange(step * tokens, (step + 1) * tokens)
+            ph = [[int(x) for x in pos.tolist()]]
+            if replay is None:
+                cache.route_and_flush_batch(k_raw, v, pos, positions_host=ph, record_op_log=record)
+            else:
+                log, lengths, host = replay
+                cache.route_and_flush_batch(
+                    k_raw, v, pos, positions_host=ph,
+                    replay_op_log=log, replay_op_log_len=lengths, replay_op_log_host=host,
+                )
+        return cache
+
+    @pytest.mark.parametrize("name", sorted(CONFIGS))
+    @pytest.mark.parametrize("second_order", [False, True])
+    def test_matches_legacy_when_no_orphans(self, name, second_order):
+        cfg = self.CONFIGS[name]
+        fast = self._drive(self._cache(cfg, legacy=False, second_order=second_order),
+                           orphans=False, record=True)
+        legacy = self._drive(self._cache(cfg, legacy=True, second_order=second_order),
+                             orphans=False, record=True)
+        assert_cache_states_bit_identical(legacy, fast)
+        assert legacy._op_log_host == fast._op_log_host
+
+    @pytest.mark.parametrize("name", sorted(CONFIGS))
+    @pytest.mark.parametrize("host_log", [False, True])
+    def test_replay_reproduces_forward_with_orphans(self, name, host_log):
+        cfg = self.CONFIGS[name]
+        fwd = self._drive(self._cache(cfg, legacy=False, second_order=True),
+                          orphans=True, record=True)
+        log, lengths = fwd.take_op_log()
+        replayed = self._drive(
+            self._cache(cfg, legacy=False, second_order=True), orphans=True, record=False,
+            replay=(log, lengths, fwd._last_op_log_host if host_log else None),
+        )
+        assert_cache_states_bit_identical(fwd, replayed)
