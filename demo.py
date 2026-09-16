@@ -32,6 +32,7 @@ from datetime import datetime
 from litgpt import Config
 from litgpt.model import GPT
 from litgpt.utils import chunked_cross_entropy, get_log_kv_second_order_scale, load_checkpoint
+from litgpt.log_kv_cache import logkv_take_host_stats
 import random
 import numpy as np
 from lightning.fabric.loggers import TensorBoardLogger
@@ -1038,13 +1039,25 @@ def main(
             metrics_txt = " | ".join(f"{k}: {v:.4f}" for k, v in sorted(avgs.items()))
             if metrics_txt:
                 metrics_txt = metrics_txt + " | "
+            # Host seconds inside the LogKV cache. A step that is slow because the
+            # CPU cannot keep the GPU fed shows up here; one that is slow for
+            # GPU reasons does not. Cheap enough to always report.
+            kv = logkv_take_host_stats()
+            kv_txt = (
+                f"logKV_host: route {kv['route_s']:.1f}s/{int(kv['route_n'])} "
+                f"+ attn_state {kv['attn_s']:.1f}s/{int(kv['attn_n'])} "
+                f"= {100.0 * (kv['route_s'] + kv['attn_s']) / max(step_time, 1e-9):.0f}% | "
+            )
             fabric.print(
                 f"[{now.strftime('%H:%M:%S')}] "
                 f"Epoch {data_epoch} | Step {global_step + 1} | "
                 f"{metrics_txt}"
                 f"2nd_scale: {current_second_order_scale:.4f} | "
+                f"{kv_txt}"
                 f"Time: {step_time:.2f}s"
             )
+            fabric.log("train/logkv_host_route_s", kv["route_s"], step=global_step + 1)
+            fabric.log("train/logkv_host_attn_state_s", kv["attn_s"], step=global_step + 1)
             for name, val in avgs.items():
                 fabric.log(f"train/{name}", val, step=global_step + 1)
             fabric.log("train/learning_rate", current_lr, step=global_step + 1)
