@@ -44,12 +44,17 @@ from __future__ import annotations
 
 import contextlib
 import math
+import time
 from typing import Any, NamedTuple, NoReturn
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
+from torch.backends.cuda import SDPAParams, can_use_flash_attention
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import causal_lower_right
 
 from litgpt.log_kv_position import (
     anchor_mass_bias,
@@ -265,6 +270,21 @@ def _pair_rank1_stats(
 
 
 _EMPTY_INDEX = np.empty(0, dtype=np.int64)
+
+# Host wall-clock spent inside the LogKV cache, so a slow step can be attributed
+# instead of guessed at. These are CPU-side timings on purpose: the failure mode
+# this catches is the host failing to keep the GPU fed (index building, syncs),
+# which a CUDA-event timer would hide. Two perf_counter() calls per invocation
+# are noise next to the millisecond-scale work they bracket.
+LOGKV_HOST_STATS: dict[str, float] = {"route_s": 0.0, "route_n": 0, "attn_s": 0.0, "attn_n": 0}
+
+
+def logkv_take_host_stats() -> dict[str, float]:
+    """Read and reset the host-time counters (call once per training step)."""
+    out = dict(LOGKV_HOST_STATS)
+    LOGKV_HOST_STATS.update({"route_s": 0.0, "route_n": 0, "attn_s": 0.0, "attn_n": 0})
+    return out
+
 
 
 def _spans_to_index_array(spans: list[tuple[int, int]]) -> np.ndarray:
@@ -2727,7 +2747,15 @@ class LogStructuredKVCache(nn.Module):
                 jobs.append((b, g, c, tuple(ordered)))
         self._semantic_commit_joins(jobs, k_raw, v, positions, positions_host, record=record)
 
-    def route_and_flush_batch(
+    def route_and_flush_batch(self, *args, **kwargs) -> None:
+        _t0 = time.perf_counter()
+        try:
+            return self._route_and_flush_batch(*args, **kwargs)
+        finally:
+            LOGKV_HOST_STATS["route_s"] += time.perf_counter() - _t0
+            LOGKV_HOST_STATS["route_n"] += 1
+
+    def _route_and_flush_batch(
         self,
         k_raw: torch.Tensor,
         v: torch.Tensor,
@@ -3775,6 +3803,14 @@ class LogStructuredKVCache(nn.Module):
         )
 
     def get_attention_state(self, with_stats: bool = False) -> CacheAttentionState:
+        _t0 = time.perf_counter()
+        try:
+            return self._get_attention_state(with_stats=with_stats)
+        finally:
+            LOGKV_HOST_STATS["attn_s"] += time.perf_counter() - _t0
+            LOGKV_HOST_STATS["attn_n"] += 1
+
+    def _get_attention_state(self, with_stats: bool = False) -> CacheAttentionState:
         """Assemble the cache state for ``log_kv_slot_attention``.
 
         Returns:
@@ -4066,6 +4102,67 @@ def _slot_mass_bias(slot_w: torch.Tensor, slot_M: torch.Tensor | None, lam: floa
     return bias
 
 
+def _slot_sdpa_inputs(q, slot_k, slot_v, slot_w, slot_M, slot_valid, scale, lam):
+    """Encode the slot bias as one extra dot-product coordinate (no Q x S mask).
+
+    scale * [q, 1/scale] @ [k, bias].T = scale*q@k.T + bias.
+    Padding Q/K/V to the same multiple of eight keeps Flash SDPA eligible.
+    """
+    dim = ((max(q.size(-1) + 1, slot_v.size(-1)) + 7) // 8) * 8
+    bias = _slot_mass_bias(slot_w, slot_M, lam)
+    if bias is None:
+        bias = torch.zeros_like(slot_w, dtype=torch.float32)
+    if slot_valid is not None:
+        valid = F.pad(slot_valid, (0, slot_k.size(2) - slot_valid.size(-1)), value=True)
+        # Invalid pooled slots can contain arbitrary payload. Zero them before
+        # the dot product, so their content cannot overcome the mask sentinel.
+        slot_k = slot_k.masked_fill(~valid.unsqueeze(-1), 0)
+        slot_v = slot_v.masked_fill(~valid.unsqueeze(-1), 0)
+        # ponytail: finite masking avoids inf*0 in Flash backward's augmented
+        # coordinate; -10000 underflows for normal model logits. Use a packed
+        # variable-length kernel if arbitrary extreme logits must be supported.
+        bias = bias.masked_fill(~valid, -10000.0)
+    q_aug = F.pad(q, (0, dim - q.size(-1)))
+    q_aug[..., q.size(-1)] = 1.0 / scale
+    k_aug = F.pad(slot_k, (0, dim - slot_k.size(-1)))
+    k_aug[..., q.size(-1)] = bias.to(q.dtype)
+    v_aug = F.pad(slot_v, (0, dim - slot_v.size(-1)))
+    return q_aug, k_aug, v_aug
+
+
+def _slot_flash_attention(q, slot_k, slot_v, slot_w, scale, lam, causal_tail, slot_M, slot_valid, check_valid):
+    """Return None when Flash cannot serve this call; never silently run SDPA math."""
+    if (
+        q.device.type != "cuda" or q.dtype not in (torch.float16, torch.bfloat16)
+        or slot_k.dtype != q.dtype or slot_v.dtype != q.dtype
+        or not math.isfinite(scale) or not 1e-3 <= scale <= 1.0
+        or q.size(-1) != slot_k.size(-1) or q.size(1) % slot_k.size(1)
+        # Keep the no-grad forward eligible for backward on consumer GPUs too.
+        or max(q.size(-1) + 1, slot_v.size(-1)) > 192
+        or q.size(2) == 0 or causal_tail > slot_k.size(2)
+    ):
+        return None
+    if slot_valid is not None:
+        if slot_valid.size(-1) > slot_k.size(2) - causal_tail:
+            return None  # The fast mask assumes the causal tail is all valid.
+        if check_valid and slot_valid.size(-1) == slot_k.size(2) and not slot_valid.any(dim=-1).all():
+            raise ValueError("log_kv_slot_attention(): a query row has no valid slot")
+        if not check_valid and slot_valid.size(-1) == slot_k.size(2):
+            return None  # No guaranteed visible exact suffix; preserve legacy all-masked behavior.
+    q_aug, k_aug, v_aug = _slot_sdpa_inputs(q, slot_k, slot_v, slot_w, slot_M, slot_valid, scale, lam)
+    gqa = q.size(1) != slot_k.size(1)
+    # LOWER_RIGHT's dispatcher checks the same unmasked parameters internally.
+    params = SDPAParams(q_aug, k_aug, v_aug, None, 0.0, False, gqa)
+    if not can_use_flash_attention(params):
+        return None
+    causal_bias = causal_lower_right(q.size(2), slot_k.size(2)) if causal_tail else None
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        out = F.scaled_dot_product_attention(
+            q_aug, k_aug, v_aug, attn_mask=causal_bias, dropout_p=0.0, scale=scale, enable_gqa=gqa,
+        )
+    return out[..., :slot_v.size(-1)]
+
+
 def log_kv_slot_attention(
     q: torch.Tensor,        # (B, nh, T_q, k_dim) full post-RoPE queries
     slot_k: torch.Tensor,   # (B, G, S, k_dim) merged slot keys (position included)
@@ -4176,6 +4273,15 @@ def log_kv_slot_attention(
                 f"causal_tail ({causal_tail}) must equal T_q ({T_q}): the tail entries "
                 "are the appended in-flight chunk, aligned one-to-one with the queries"
             )
+
+    if second_order_scale == 0.0 and mask is None:
+        out = _slot_flash_attention(
+            q, slot_k, slot_v, slot_w, scale, lam, causal_tail, slot_M, slot_valid, check_valid,
+        )
+        if out is not None:
+            return out
+
+    if causal_tail:
         # (T_q, T_q) bool, True above the diagonal = blocked. Tiny (chunk-sized,
         # not S-sized) and the only allocation masking costs on this path.
         tail_blocked = torch.ones(T_q, causal_tail, dtype=torch.bool, device=q.device).triu_(1)
@@ -4320,6 +4426,7 @@ def log_kv_chunk_attention(
             # against cannot happen here. Skips a per-call host sync that
             # otherwise fires on every chunk, every layer, every step.
             check_valid=False,
+            second_order_scale=0.0,
         )
     state = append_exact_tokens(cache.get_attention_state(with_stats=True), k_b, v_b)
     return log_kv_slot_attention(

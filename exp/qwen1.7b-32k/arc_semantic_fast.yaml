@@ -1,6 +1,5 @@
 # 纯代码路径 A/B：尺寸、二阶、activation checkpoint 全部继承 threephase 基线，
-# 只有路由实现不同（批量 ladder 写入 + 批量 orphan 路由）。
-# 这样和你已知的 10 分钟/step 基线只差一个变量。
+# 只有路由实现不同。和你已知的 10 分钟/step 基线只差一个变量，先拿这版确认不慢。
 config: arc_semantic_stage1_threephase.yaml
 
 expid: qwen1.7b-32k-cpt-logKV-semantic-fast
@@ -11,17 +10,25 @@ tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic
 # 走旧路由（每 orphan 一次 Ward merge）只用于 A/B 对照，默认 false。
 log_kv_semantic_legacy_route: null
 
-# ── 以下是可选的激进档，确认上面这版不慢于基线之后再单独一个个试 ──
+# ── 尺寸档 ──
+# 本机 CPU host 时间，塞进 8k token 后的稳态，每次调用（route + attn_state）：
 #
-# log_kv_B: 64
-#   32k 下 entry 数 18432 -> 3080，anchor slot 38912 -> 8216，attention 明显变小。
-#   代价：L_alloc 从 5 涨到 9，ladder 每次 route 的层循环多跑 1.8 倍
-#   （本机 CPU 实测 route 15.8ms -> 32.0ms）。attention 省的多还是 ladder 亏的多，
-#   必须在目标 GPU 上测才知道。
+#   K=16 B=512 二阶0.2  167.6 + 342.1 = 509.7 ms   entries 77824   <- 当前基线
+#   K=16 B=512 二阶0    103.2 + 128.2 = 231.3 ms   entries 77824
+#   K=16 B= 64 二阶0     70.3 +  79.9 = 150.2 ms   entries 28416
+#   K= 8 B= 64 二阶0     69.3 +  67.1 = 136.4 ms   entries 17984
+#   K= 8 B= 32 二阶0     60.4 +  35.5 =  95.9 ms   entries 10816   <- 比基线省 5.3x
 #
-# log_kv_second_order_scale: 0.0
-#   省掉 5 份 payload gather 和 QΣ / QΓ 两组矩阵乘。这是精度改动，单独 A/B。
+# 注意这是 host 时间；GPU 上 attn_state 里的 gather 会快很多，但 entries 数直接决定
+# attention 矩阵宽度，方向是一致的。训练日志里的 `logKV_host:` 字段可以直接看到
+# 这两项在你真实 step 里各占多少，按那个来调，别按这张表。
 #
-# activation_checkpointing: false
-#   【不要在 32k 开】按 Qwen3-1.7B 实测口径：micro_batch_size=1 需保留约 49 GB
-#   激活，=4 需要约 196 GB。H200 单卡才 141 GB。只有在短上下文/小 batch 才可能用。
+# 想提速就逐个放开（每次只开一个，看 logKV_host 和 step 时间）：
+#
+# log_kv_second_order_scale: 0.0     # 收益最大；精度改动
+# log_kv_B: 64                        # entries 77824 -> 28416
+# log_kv_cluster_k_max: 8             # 配 B=64 -> 17984
+#
+# 【不要在 32k 开】activation_checkpointing: false
+#   Qwen3-1.7B 32k 下需保留激活：micro_batch_size=1 约 49 GB，=4 约 196 GB。
+#   H200 单卡 141 GB。这是我上一版埋进 yaml 的错误，已撤。
