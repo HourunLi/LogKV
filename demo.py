@@ -521,6 +521,10 @@ def main(
     log_kv_semantic_cluster_chunk_size: int = 0,
     log_kv_semantic_capacity_beta: float = 0.0,
     log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
+    # Opt in to the pre-batching router: one Ward merge per orphan and a
+    # per-cluster ladder walk. Kept for A/B against the fast path only.
+    log_kv_semantic_legacy_route: bool = False,
+    activation_checkpointing: bool = True,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -621,6 +625,10 @@ def main(
     log_kv_semantic_capacity_hard_cap_mult = float(
         _o("log_kv_semantic_capacity_hard_cap_mult", log_kv_semantic_capacity_hard_cap_mult)
     )
+    log_kv_semantic_legacy_route = bool(
+        _o("log_kv_semantic_legacy_route", log_kv_semantic_legacy_route)
+    )
+    activation_checkpointing = bool(_o("activation_checkpointing", activation_checkpointing))
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
@@ -656,7 +664,10 @@ def main(
             sharding_strategy="SHARD_GRAD_OP",
             state_dict_type="full",
             auto_wrap_policy={Block},
-            activation_checkpointing_policy={Block},
+            # LogKV training already streams and replays to bound activation
+            # memory, so Block-level checkpointing re-runs the whole router for
+            # memory it mostly already has. Off = one fewer routing pass/layer.
+            activation_checkpointing_policy={Block} if activation_checkpointing else None,
             timeout=timedelta(days=3650),
         )
     # Surface a driver/runtime mismatch here, as a readable error, before the
@@ -786,6 +797,7 @@ def main(
             log_kv_semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
             log_kv_semantic_capacity_beta=log_kv_semantic_capacity_beta,
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
+            log_kv_semantic_legacy_route=log_kv_semantic_legacy_route,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -928,6 +940,7 @@ def main(
         semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
         semantic_capacity_beta=log_kv_semantic_capacity_beta,
         semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
+        semantic_legacy_route=log_kv_semantic_legacy_route,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
@@ -947,7 +960,8 @@ def main(
         f"flush={log_kv_semantic_flush_granularity}, tree_chunk={log_kv_semantic_cluster_chunk_size}, "
         f"s_h={log_kv_semantic_s_h_path}, "
         f"capacity_beta={log_kv_semantic_capacity_beta}, "
-        f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult})"
+        f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
+        f"legacy_route={log_kv_semantic_legacy_route})"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))

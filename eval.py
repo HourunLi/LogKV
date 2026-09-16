@@ -523,6 +523,7 @@ class LogKVLM(LM):
         log_kv_semantic_cluster_chunk_size: int = 0,
         log_kv_semantic_capacity_beta: float = 0.0,
         log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
+        log_kv_semantic_legacy_route: bool = False,
         tokenizer_dir: str | None = None,
     ):
         super().__init__()
@@ -549,6 +550,7 @@ class LogKVLM(LM):
         self.log_kv_semantic_cluster_chunk_size = int(log_kv_semantic_cluster_chunk_size)
         self.log_kv_semantic_capacity_beta = float(log_kv_semantic_capacity_beta)
         self.log_kv_semantic_capacity_hard_cap_mult = float(log_kv_semantic_capacity_hard_cap_mult)
+        self.log_kv_semantic_legacy_route = bool(log_kv_semantic_legacy_route)
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -667,6 +669,7 @@ class LogKVLM(LM):
             semantic_cluster_chunk_size=self.log_kv_semantic_cluster_chunk_size,
             semantic_capacity_beta=self.log_kv_semantic_capacity_beta,
             semantic_capacity_hard_cap_mult=self.log_kv_semantic_capacity_hard_cap_mult,
+            semantic_legacy_route=self.log_kv_semantic_legacy_route,
         )
         self._eval_cache_ready = True
 
@@ -1021,6 +1024,7 @@ def main(
     log_kv_semantic_cluster_chunk_size: int = 0,
     log_kv_semantic_capacity_beta: float = 0.0,
     log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
+    log_kv_semantic_legacy_route: bool = False,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1119,6 +1123,9 @@ def main(
     log_kv_semantic_capacity_hard_cap_mult = float(
         _o("log_kv_semantic_capacity_hard_cap_mult", log_kv_semantic_capacity_hard_cap_mult)
     )
+    log_kv_semantic_legacy_route = bool(
+        _o("log_kv_semantic_legacy_route", log_kv_semantic_legacy_route)
+    )
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
     limit = _o("limit", limit)
     log_kv_diag_mode = _o("log_kv_diag_mode", log_kv_diag_mode)
@@ -1185,7 +1192,8 @@ def main(
                 f"flush={log_kv_semantic_flush_granularity}, tree_chunk={log_kv_semantic_cluster_chunk_size}, "
                 f"s_h={log_kv_semantic_s_h_path}, "
                 f"capacity_beta={log_kv_semantic_capacity_beta}, "
-                f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult})"
+                f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
+                f"legacy_route={log_kv_semantic_legacy_route})"
             )
         if diag_active:
             print(
@@ -1229,6 +1237,7 @@ def main(
             log_kv_semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
             log_kv_semantic_capacity_beta=log_kv_semantic_capacity_beta,
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
+            log_kv_semantic_legacy_route=log_kv_semantic_legacy_route,
             tokenizer_dir=tokenizer_dir,
         )
         if world_size > 1:
@@ -1331,6 +1340,7 @@ def main(
                     "log_kv_semantic_cluster_chunk_size": log_kv_semantic_cluster_chunk_size,
                     "log_kv_semantic_capacity_beta": log_kv_semantic_capacity_beta,
                     "log_kv_semantic_capacity_hard_cap_mult": log_kv_semantic_capacity_hard_cap_mult,
+                    "log_kv_semantic_legacy_route": log_kv_semantic_legacy_route,
                     "results": results,
                 }
 

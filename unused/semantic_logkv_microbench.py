@@ -99,7 +99,9 @@ def _make_cache(args: argparse.Namespace, k_max: int, device: torch.device) -> L
 
 def _prototypes(k_max: int, dim: int, device: torch.device) -> torch.Tensor:
     proto = torch.zeros(k_max, dim, device=device)
-    proto[:, 0] = torch.arange(k_max, device=device).float() * 100.0
+    # Keep direct distances above fp32 cancellation noise in the norm/dot
+    # distance formula; widely separated 100x prototypes create false orphans.
+    proto[:, 0] = torch.arange(k_max, device=device).float() * 10.0
     if dim > 1:
         proto[:, 1] = 1.0
     return proto
@@ -140,6 +142,7 @@ def _median(xs: list[float]) -> float:
 
 
 def _bench_case(args: argparse.Namespace, case: Case, device: torch.device) -> dict[str, float]:
+    torch.manual_seed(args.seed)
     k, v, pos = _inputs(args, case.k_max, case.orphan_ratio, device)
     route_ms: list[float] = []
     record_ms: list[float] = []
@@ -157,12 +160,16 @@ def _bench_case(args: argparse.Namespace, case: Case, device: torch.device) -> d
         _seed_full_clusters(cache, _prototypes(case.k_max, args.dim, device))
         cache.begin_op_log()
         record = _time_ms(device, lambda: cache.route_and_flush_batch(k, v, pos, record_op_log=True))
-        clone = _time_ms(device, lambda: cache.take_op_log())
-        op_log, op_log_len = cache.take_op_log()
+        snapshot = []
+        clone = _time_ms(device, lambda: snapshot.append(cache.take_op_log()))
+        op_log, op_log_len = snapshot[0]
 
         replay_cache = _make_cache(args, case.k_max, device)
         _seed_full_clusters(replay_cache, _prototypes(case.k_max, args.dim, device))
-        replay = _time_ms(device, lambda: replay_cache.route_and_flush_batch(k, v, pos, replay_op_log=op_log, replay_op_log_len=op_log_len))
+        replay = _time_ms(device, lambda: replay_cache.route_and_flush_batch(
+            k, v, pos, replay_op_log=op_log, replay_op_log_len=op_log_len,
+            replay_op_log_host=cache._last_op_log_host,
+        ))
 
         if rep >= args.warmup:
             route_ms.append(route)
@@ -183,6 +190,7 @@ def _bench_case(args: argparse.Namespace, case: Case, device: torch.device) -> d
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--device", default=None)
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--groups", type=int, default=8)
     p.add_argument("--tokens", type=int, default=64)

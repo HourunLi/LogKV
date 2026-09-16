@@ -81,7 +81,7 @@ def next_token(
     input_pos_maxp1: int | None = None,
     **sample_kwargs: dict[str, Any],
 ) -> torch.Tensor:
-    logits = model(x, input_pos, input_pos_maxp1=input_pos_maxp1)
+    logits = model(x, input_pos, input_pos_maxp1=input_pos_maxp1, lm_head_start=x.size(1) - 1)
     _next = sample(logits, **sample_kwargs).to(dtype=torch.int64)
     return _next
 
@@ -115,7 +115,7 @@ def batched_next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, kwa
     _kwargs = kwargs if isinstance(kwargs, list) else [kwargs] * x.size(0)
 
     # Run the model on the batch.
-    logits_stack = model(x, input_pos)
+    logits_stack = model(x, input_pos, lm_head_start=x.size(1) - 1)
 
     # Unbind the logits stack into a list of logits.
     logits_list = [logits_stack] if logits_stack.ndim == 1 else logits_stack.unbind(0)

@@ -19,6 +19,45 @@ from litgpt.utils import _RunIf
 warnings.filterwarnings("ignore")
 
 
+class _LmHeadStartRecorder:
+    def __init__(self, vocab_size: int = 5):
+        self.calls = []
+        self.vocab_size = vocab_size
+
+    def __call__(self, x, input_pos, input_pos_maxp1=None, lm_head_start=None):
+        self.calls.append((input_pos_maxp1, lm_head_start))
+        logits = torch.zeros(x.size(0), x.size(1) - lm_head_start, self.vocab_size, device=x.device)
+        logits[..., 2] = 1.0
+        return logits
+
+
+def test_next_token_requests_only_last_lm_head_position():
+    model = _LmHeadStartRecorder()
+    token = next_token(
+        model,
+        torch.arange(4),
+        torch.ones(1, 4, dtype=torch.long),
+        input_pos_maxp1=4,
+        temperature=0.0,
+    )
+
+    assert model.calls == [(4, 3)]
+    assert token.item() == 2
+
+
+def test_batched_next_token_requests_only_last_lm_head_position():
+    model = _LmHeadStartRecorder()
+    tokens = batched_next_token(
+        model,
+        torch.arange(4),
+        torch.ones(2, 4, dtype=torch.long),
+        {"temperature": 0.0},
+    )
+
+    assert model.calls == [(None, 3)]
+    assert tokens.tolist() == [[2], [2]]
+
+
 def create_llm(tmp_path, batch_size, max_seq_length, device) -> tuple[LLM, GPT]:
     L.seed_everything(42)
 
