@@ -164,8 +164,8 @@ bash majob.sh exp/qwen1.7b-32k/arc_semantic_fast.yaml
 
 `log_kv_second_order_scale: 0.0` 时，共享的 `log_kv_slot_attention` 自动尝试 CUDA
 bf16/fp16 Flash SDPA，训练前向、backward replay 和推理均可使用，无需安装 flash-attn。
-当前 fast YAML 的该参数仅出现在注释中：实际运行需在所用 YAML 显式设为 0.0，
-不能因文件名包含 fast 就认为二阶已经关闭。
+当前 fast YAML 已显式设置 `log_kv_second_order_scale: 0.0`；其他 YAML 若仍为 0.2，
+会继续走二阶手写 attention 路径。
 
 用附加维度编码 `lambda*log(w)-log(M)`，Q/K/V 补齐到相同的 8 倍数维度；128 维输入
 变为 136 维。非方形 `causal_lower_right(Tq, S)` 保持历史 prefix 全可见、当前 tail
