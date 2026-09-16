@@ -18,6 +18,6 @@ log_kv_second_order_scale: 0.0
 # LogKV 训练自己就靠 streaming + replay 控激活显存，Block 级 checkpoint 会把整条
 # 路由前向重跑一遍（而且那一遍的 op_log 被丢弃）。关掉 = 每层少一次路由。
 # 目标 GPU 上先确认显存再固化。
-activation_checkpointing: false
+activation_checkpointing: true
 # 走旧路由（每 orphan 一次 Ward merge）只用于 A/B 对照，默认 false。
 log_kv_semantic_legacy_route: null
