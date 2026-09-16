@@ -1,5 +1,5 @@
-# 纯代码路径 A/B：尺寸、二阶、activation checkpoint 全部继承 threephase 基线，
-# 只有路由实现不同。和你已知的 10 分钟/step 基线只差一个变量，先拿这版确认不慢。
+# 快路由 + 一阶 Flash SDPA 配置。显式关闭二阶修正，否则会继承基线的 0.2，
+# `log_kv_slot_attention` 将继续走手写 score/softmax 路径。
 config: arc_semantic_stage1_threephase.yaml
 
 expid: qwen1.7b-32k-cpt-logKV-semantic-fast
@@ -9,6 +9,7 @@ tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic
 
 # 走旧路由（每 orphan 一次 Ward merge）只用于 A/B 对照，默认 false。
 log_kv_semantic_legacy_route: null
+log_kv_second_order_scale: 0.0
 
 # ── 尺寸档 ──
 # 本机 CPU host 时间，塞进 8k token 后的稳态，每次调用（route + attn_state）：
@@ -25,7 +26,7 @@ log_kv_semantic_legacy_route: null
 #
 # 想提速就逐个放开（每次只开一个，看 logKV_host 和 step 时间）：
 #
-# log_kv_second_order_scale: 0.0     # 收益最大；精度改动
+# log_kv_second_order_scale 已在上方固定为 0.0，以启用一阶 Flash SDPA。
 # log_kv_B: 64                        # entries 77824 -> 28416
 # log_kv_cluster_k_max: 8             # 配 B=64 -> 17984
 #
