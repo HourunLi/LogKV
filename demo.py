@@ -403,7 +403,13 @@ def _load_yaml_config(yaml_path: str, model_dir: str) -> dict:
     """
     yaml_path = os.path.normpath(os.path.expanduser(yaml_path))
     if not os.path.isfile(yaml_path):
-        return {}
+        # A silent {} here used to mean every setting fell back to its
+        # hardcoded default (0.6B arch, relative checkpoints/ path, ...)
+        # with no warning that the config never loaded at all.
+        raise FileNotFoundError(
+            f"config file not found: {yaml_path!r} (resolved from cwd {os.getcwd()!r}); "
+            "check the --config path and the working directory it's run from."
+        )
 
     with open(yaml_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)

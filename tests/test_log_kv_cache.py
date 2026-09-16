@@ -3705,3 +3705,50 @@ class TestSemanticFastRouteEquivalence:
             replay=(log, lengths, fwd._last_op_log_host if host_log else None),
         )
         assert_cache_states_bit_identical(fwd, replayed)
+
+
+class TestSemanticRouterHostCost:
+    """Guards the host side of the batched router.
+
+    Op count alone is the wrong target: the first batched version cut aten calls
+    ~19x but moved ~94k ints per flush into Python lists fed to
+    `torch.tensor(...)`, which on CUDA is a blocking pageable copy and on the
+    host costs more than the kernels it saves. Routing must build its indices
+    with numpy and keep list->tensor conversions negligible.
+    """
+
+    def test_route_does_not_build_large_index_lists(self, monkeypatch):
+        torch.manual_seed(0)
+        n_groups, K_max, tokens = 8, 8, 256
+        cache = make_semantic_cache(
+            n_groups=n_groups, K_max=K_max, B=16, max_seq_length=4096,
+            recent_size=tokens, semantic_flush_granularity=tokens,
+        )
+        proto = torch.zeros(K_max, 8)
+        proto[:, 0] = torch.arange(K_max).float() * 10.0
+        proto[:, 1] = 1.0
+        zero_v = torch.zeros(8)
+        for g in range(n_groups):
+            for c in range(K_max):
+                cache._semantic_new_cluster(
+                    0, g, c, -K_max + c, proto[c], zero_v, torch.tensor(c), record=False
+                )
+        k_raw = torch.empty(1, n_groups, tokens, 8)
+        for i in range(tokens):
+            k_raw[:, :, i] = proto[i % K_max] + 0.01 * torch.randn(1, n_groups, 8)
+        v = torch.randn(1, n_groups, tokens, 8)
+        pos = torch.arange(tokens)
+
+        moved = {"elems": 0}
+        real = torch.tensor
+
+        def counting_tensor(data, *args, **kwargs):
+            if isinstance(data, (list, tuple)):
+                moved["elems"] += len(data)
+            return real(data, *args, **kwargs)
+
+        monkeypatch.setattr(torch, "tensor", counting_tensor)
+        cache.route_and_flush_batch(k_raw, v, pos, positions_host=[list(range(tokens))])
+        # Anything near the token count means an index array is being built as a
+        # Python list again.
+        assert moved["elems"] < tokens, f"{moved['elems']} ints went through torch.tensor(list)"
