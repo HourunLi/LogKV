@@ -86,6 +86,37 @@ H200 单卡才 141 GB。当初写这条时doc 里标了"必须在目标 GPU 上�
 threephase 基线，只有路由实现不同，和已知的 10 min/step 基线只差一个变量。
 `log_kv_B: 64` / `log_kv_second_order_scale: 0.0` 作为可选档留在注释里，逐个单独试。
 
+## 每 step 的 host 时间分项（新增）
+
+两轮盲猜之后加的：`LOGKV_HOST_STATS` 累计 `route_and_flush_batch` 和
+`get_attention_state` 的**主机**墙钟时间，demo.py 每个 step 打印并写进 tensorboard：
+
+```
+... | logKV_host: route 12.3s/868 + attn_state 45.6s/896 = 31% | Time: 187.4s
+```
+
+刻意用 CPU 时间而不是 CUDA event：要抓的失效模式就是"主机喂不饱 GPU"
+（索引构建、同步），CUDA 计时器反而看不见。每次调用两个 `perf_counter()`，
+相对毫秒级的被测区间可忽略。
+
+本机 CPU、塞进 8k token 后的稳态，每次调用：
+
+| 配置 | route | attn_state | 合计 | entries |
+|---|---:|---:|---:|---:|
+| K=16 B=512 二阶0.2 | 167.6 ms | 342.1 ms | 509.7 ms | 77,824 |
+| K=16 B=512 二阶0 | 103.2 ms | 128.2 ms | 231.3 ms | 77,824 |
+| K=16 B=64 二阶0 | 70.3 ms | 79.9 ms | 150.2 ms | 28,416 |
+| K=8 B=64 二阶0 | 69.3 ms | 67.1 ms | 136.4 ms | 17,984 |
+| K=8 B=32 二阶0 | 60.4 ms | 35.5 ms | 95.9 ms | 10,816 |
+
+两点修正之前文档里的说法：
+
+- **`get_attention_state` 比路由更贵**（当前基线下 342 vs 168 ms）。之前整轮优化都
+  只盯着 route，方向就偏了。
+- **B=512 -> 64 在稳态下让 route 变快而不是变慢**（103 -> 70 ms）。早先"B=64 慢 2 倍"
+  的结论是在低占用率下测的：稳态时 B=512 每次 append 要搬 512 行 x 13 个字段，
+  B=64 只搬 64 行。
+
 ## 配置：K=16/B=512 在 32k 下是负压缩
 
 | K | B | L | live entries | 最坏 anchor slots |
@@ -121,10 +152,40 @@ bash majob.sh exp/qwen1.7b-32k/arc_semantic_fast.yaml
 
 ## 仍然值得做的
 
-1. **attention 仍是显式 score/softmax 路径**，且 `get_attention_state` 每个 chunk 重建
-   一次（每层每遍 32 次）。一阶下可以考虑融合，但要保住 `log(w)`、anchor 去重和
-   causal/valid mask。
+1. **二阶 attention 仍是显式 score/softmax 路径**；一阶现已接入下述 Flash SDPA。
+   `get_attention_state` 仍会在每个 chunk 重建，slot gather/anchor materialization
+   的开销不由 Flash 解决。
 2. **LM head 与交叉熵**：`demo.py` 先生成完整 logits 再分块算 CE，`entropy_chunk_size=128`
    带来很多小调用。
 3. **chunk-tree 路径没有批量化**，仍走 `_semantic_ward_merge` 和逐 node 提交；当前入口
    用三阶段路由（`semantic_cluster_chunk_size: 0`），没动它。
+
+## 一阶 Flash SDPA 接入
+
+`log_kv_second_order_scale: 0.0` 时，共享的 `log_kv_slot_attention` 自动尝试 CUDA
+bf16/fp16 Flash SDPA，训练前向、backward replay 和推理均可使用，无需安装 flash-attn。
+当前 fast YAML 的该参数仅出现在注释中：实际运行需在所用 YAML 显式设为 0.0，
+不能因文件名包含 fast 就认为二阶已经关闭。
+
+用附加维度编码 `lambda*log(w)-log(M)`，Q/K/V 补齐到相同的 8 倍数维度；128 维输入
+变为 136 维。非方形 `causal_lower_right(Tq, S)` 保持历史 prefix 全可见、当前 tail
+因果可见。无效槽先将 K/V 清零，再用有限偏置 -10000 屏蔽，以避免扩维 backward 的
+inf*0；这对正常模型 logits 下溢为零，不承诺任意极端 logits 下等同于 -inf。
+偏置和附加 query 常量会量化到激活 dtype，因此不再逐位等于原来的 fp32 bias 路径。
+
+快路径先用 `can_use_flash_attention` 检查，再限定 `SDPBackend.FLASH_ATTENTION`，
+不会静默转到 SDPA math。CPU、fp32、二阶非零、自定义通用 mask、扩维后超过 192 维、
+scale 不在 [0.001, 1] 或当前 GPU 不支持时回退原实现。运行时 OOM 等错误不会被吞掉。
+cache 状态 replay 仍然保留；减少的是每块 attention 的完整 score/probability 张量。
+
+本机验证：11 项新测试通过（fp32/bf16/fp16 的输出、Q/K/V 梯度、因果隔离、屏蔽槽零
+梯度、K=8 streaming replay 与旧路径对照），171 项隔离缓存测试通过。
+本机无 CUDA，4 项真实 Flash 前后向测试跳过，尚无 GPU 吞吐或峰值显存结论。
+目标 GPU 上运行：
+
+```bash
+python -m pytest tests/test_log_kv_flash.py -v -rs
+```
+
+其中 CUDA 用例会检查 profiler 确实出现 Flash forward/backward 算子；若显示 skipped，
+需查看跳过原因，不能将其当作 Flash 验证通过。
