@@ -673,9 +673,9 @@ def main(
             sharding_strategy="SHARD_GRAD_OP",
             state_dict_type="full",
             auto_wrap_policy={Block},
-            # Attention already bounds its activations with streaming replay.
-            # Checkpoint only the MLP to avoid a second routing forward.
-            activation_checkpointing_policy={config_obj.mlp_class} if activation_checkpointing else None,
+            # Streaming replay bounds attention's inner graph, but Q/K/V,
+            # RMSNorm and projection activations still accumulate across layers.
+            activation_checkpointing_policy={Block} if activation_checkpointing else None,
             timeout=timedelta(days=3650),
         )
     # Surface a driver/runtime mismatch here, as a readable error, before the
