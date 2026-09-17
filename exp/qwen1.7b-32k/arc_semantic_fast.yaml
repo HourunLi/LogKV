@@ -10,28 +10,15 @@ tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic
 # 走旧路由（每 orphan 一次 Ward merge）只用于 A/B 对照，默认 false。
 log_kv_semantic_legacy_route: null
 log_kv_second_order_scale: 0.0
+log_kv_semantic_anchor_mode: mid  # 单中心 anchor；multi 恢复 lo/mid/hi
+log_kv_semantic_pack_backend: auto  # CUDA 优先 Triton；torch 可用于数值/性能 A/B
 log_kv_B: 64
 log_kv_cluster_k_max: 8
 activation_checkpointing: true  # 整个 Block 重算，避免 norm/QKV/投影激活跨层累积
 entropy_chunk_size: 1024  # LM-head + CE 每次处理的 token 数，避免全序列 logits
 
-# ── 尺寸档 ──
-# 本机 CPU host 时间，塞进 8k token 后的稳态，每次调用（route + attn_state）：
-#
-#   K=16 B=512 二阶0.2  167.6 + 342.1 = 509.7 ms   entries 77824   <- 当前基线
-#   K=16 B=512 二阶0    103.2 + 128.2 = 231.3 ms   entries 77824
-#   K=16 B= 64 二阶0     70.3 +  79.9 = 150.2 ms   entries 28416
-#   K= 8 B= 64 二阶0     69.3 +  67.1 = 136.4 ms   entries 17984
-#   K= 8 B= 32 二阶0     60.4 +  35.5 =  95.9 ms   entries 10816   <- 比基线省 5.3x
-#
-# 注意这是 host 时间；GPU 上 attn_state 里的 gather 会快很多，但 entries 数直接决定
-# attention 矩阵宽度，方向是一致的。训练日志里的 `logKV_host:` 字段可以直接看到
-# 这两项在你真实 step 里各占多少，按那个来调，别按这张表。
-#
-# 想提速就逐个放开（每次只开一个，看 logKV_host 和 step 时间）：
-#
-# log_kv_second_order_scale 已在上方固定为 0.0，以启用一阶 Flash SDPA。
-#
-# 【不要在 32k 开】activation_checkpointing: false
-#   Qwen3-1.7B 32k 下需保留激活：micro_batch_size=1 约 49 GB，=4 约 196 GB。
-#   H200 单卡 141 GB。这是我上一版埋进 yaml 的错误，已撤。
+# multi 恢复旧的 lo/mid/hi；mid 会改变位置近似，训练和评测必须使用同一配置。
+# pack_backend: torch / triton 可比较相同 mid 数学定义下的实现；auto 在 CUDA 优先 Triton。
+# A800 上先运行 tests/test_log_kv_pack.py，再运行 unused/benchmark_log_kv_pack.py。
+# 基准脚本会报告真实 slot 数、lane padding、准备时间、forward/backward 和显存峰值。
+# 保留整个 Block 的 activation checkpoint；不要因输入打包省显存而直接关闭。

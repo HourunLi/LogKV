@@ -531,6 +531,8 @@ def main(
     # Opt in to the pre-batching router: one Ward merge per orphan and a
     # per-cluster ladder walk. Kept for A/B against the fast path only.
     log_kv_semantic_legacy_route: bool = False,
+    log_kv_semantic_anchor_mode: str = "multi",
+    log_kv_semantic_pack_backend: str = "auto",
     activation_checkpointing: bool = True,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
@@ -611,6 +613,8 @@ def main(
         _o("log_kv_importance_pooling_temperature", log_kv_importance_pooling_temperature)
     )
     log_kv_semantic_clusters = bool(_o("log_kv_semantic_clusters", log_kv_semantic_clusters))
+    log_kv_semantic_anchor_mode = _o("log_kv_semantic_anchor_mode", log_kv_semantic_anchor_mode)
+    log_kv_semantic_pack_backend = _o("log_kv_semantic_pack_backend", log_kv_semantic_pack_backend)
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
     log_kv_seg_eta = float(_o("log_kv_seg_eta", log_kv_seg_eta))
@@ -804,6 +808,8 @@ def main(
             log_kv_semantic_capacity_beta=log_kv_semantic_capacity_beta,
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
             log_kv_semantic_legacy_route=log_kv_semantic_legacy_route,
+            log_kv_semantic_anchor_mode=log_kv_semantic_anchor_mode,
+            log_kv_semantic_pack_backend=log_kv_semantic_pack_backend,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -948,6 +954,8 @@ def main(
         semantic_capacity_beta=log_kv_semantic_capacity_beta,
         semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
         semantic_legacy_route=log_kv_semantic_legacy_route,
+        semantic_anchor_mode=log_kv_semantic_anchor_mode,
+        semantic_pack_backend=log_kv_semantic_pack_backend,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
@@ -968,7 +976,8 @@ def main(
         f"s_h={log_kv_semantic_s_h_path}, "
         f"capacity_beta={log_kv_semantic_capacity_beta}, "
         f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
-        f"legacy_route={log_kv_semantic_legacy_route})"
+        f"legacy_route={log_kv_semantic_legacy_route}, "
+        f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend})"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
