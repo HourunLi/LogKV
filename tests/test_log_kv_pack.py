@@ -18,12 +18,12 @@ import litgpt.log_kv_cache as kv
 import litgpt.log_kv_pack as packing
 
 
-def _cache(dtype=torch.float32, device="cpu", dim=16, rope=None, populated=True, cos_dtype=torch.float32):
+def _cache(dtype=torch.float32, device="cpu", dim=16, rope=None, populated=True, cos_dtype=torch.float32, batch=2):
     rope = dim if rope is None else rope
     phases = torch.outer(torch.arange(128, device=device).float(),
                          10000 ** (-torch.arange(0, rope, 2, device=device).float() / max(rope, 1))).repeat(1, 2)
     cache = kv.LogStructuredKVCache(
-        (2, 2, 128, dim), (2, 2, 128, dim), B=4, recent_size=8,
+        (batch, 2, 128, dim), (batch, 2, 128, dim), B=4, recent_size=8,
         dtype=dtype, device=torch.device(device), semantic_clusters=True, cluster_k_max=8,
         semantic_anchor_mode="mid", semantic_pack_backend="torch", semantic_flush_granularity=4,
         allocate_second_order=False, rope_n_elem=rope,
@@ -295,3 +295,48 @@ def test_cuda_triton_streaming_replay_bf16():
     actual = run("triton")
     for a, b in zip(actual, expected):
         torch.testing.assert_close(a, b, atol=.025, rtol=.025)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Triton")
+def test_cuda_triton_reuses_kernel_across_prompt_strides():
+    from litgpt.log_kv_pack_triton import _pack
+
+    cache = _cache(torch.bfloat16, "cuda", dim=128)
+    plan = cache._semantic_attention_plan()
+    compiled = []
+    run = _pack.run
+
+    def record(*args, **kwargs):
+        kernel = run(*args, **kwargs)
+        compiled.append(kernel)
+        return kernel
+
+    # A short chunk sliced from full-prompt K and transposed projection V.
+    with patch.object(_pack, "run", side_effect=record):
+        for length in (17, 33, 65):
+            k = torch.randn(2, 2, length, 128, device="cuda", dtype=torch.bfloat16)[:, :, :3]
+            v = torch.randn(2, length, 2, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)[:, :, :3]
+            actual = packing.pack_mid_kv(cache, plan, k, v, 136, backend="triton")
+            expected = packing.pack_mid_kv(cache, plan, k, v, 136, backend="torch")
+            for a, b in zip(actual, expected):
+                torch.testing.assert_close(a, b, atol=.02, rtol=.02)
+    assert len(compiled) == 3 and compiled[0] is not None
+    assert all(kernel is compiled[0] for kernel in compiled)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Triton")
+def test_cuda_triton_current_offsets_beyond_int32():
+    # Only six rows are touched, but their backing storage spans just over 4 GiB.
+    if torch.cuda.mem_get_info()[0] < 5 * 2**30:
+        pytest.skip("requires 5 GiB free for a real >int32 element-offset check")
+    cache = _cache(torch.bfloat16, "cuda", populated=False, batch=3)
+    stride = 2**30 + 128  # Fits int32, while batch 2's offset does not.
+    storage = torch.empty(2 * stride + 32, device="cuda", dtype=torch.bfloat16)
+    k = storage.as_strided((3, 2, 1, 16), (stride, 16, 16, 1))
+    expected = torch.randn(3, 2, 1, 16, device="cuda", dtype=k.dtype)
+    k.copy_(expected)
+    ka, va = packing.pack_mid_kv(cache, cache._semantic_attention_plan(), k, k, 24, backend="triton")
+    torch.testing.assert_close(ka[..., :16], expected, atol=0, rtol=0)
+    torch.testing.assert_close(va[..., :16], expected, atol=0, rtol=0)
+    assert torch.count_nonzero(ka[..., 16:]) == 0
+    assert torch.count_nonzero(va[..., 16:]) == 0
