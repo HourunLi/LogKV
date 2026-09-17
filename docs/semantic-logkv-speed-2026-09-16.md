@@ -11,6 +11,12 @@
   norm、Q/K/V 和投影激活跨层保留；流式 attention replay 并不能替代 Block checkpoint，
   长序列训练可能在 RMSNorm 的 `x * x` 分配时 OOM。代价是 backward 多一次 Block
   重算（含 routing），保留一阶 buffer、Flash 和分块 loss 的优化。
+- 随后的 CheckpointError 报告中，int64 槽索引从 `[1,8,5554]` 变为
+  `[1,8,5549]`，说明重算的语义槽布局发生变化。质心更新原来的 CUDA `index_add_`
+  可能以不同顺序累加，浮点舍入差异会影响后续离散路由。现改为按连续 run 的长度
+  使用 `torch.segment_reduce` 固定顺序求和，forward/replay 共用，保留完整 Block
+  checkpoint 及 metadata 校验。该修改消除了一处已知的非确定性来源；目标 GPU 上
+  是否完全消除用户报错仍需复跑确认。
 - Flash 输入先 padding，再在新 tensor 上原地清除无效位置，避免 K/V 各多一份中间副本。
 - semantic forward 保存轻量 anchor 索引供 backward 使用，省去 replay 的排序和计数同步。
   只存索引、anchor 位置、multiplicity、有效性，不存各 chunk 的 K/V；通过 autograd 的
@@ -22,6 +28,12 @@
 2026-09-17 修复验证：`tests/test_log_kv_speed.py` 在 Python 3.12 / torch 2.7 CPU 上
 18 项通过，覆盖 Block checkpoint 的 fp32/bf16 loss、梯度、二阶 warmup，以及前向
 不保留各层 Q/K/V 四维激活。未在目标 GPU 上验证整步峰值显存或多卡 FSDP。
+
+质心求和修复后：`test_log_kv_speed.py`、`test_log_kv_cache.py`、`test_log_kv_flash.py`
+共 242 项通过，7 项 CUDA 检查因本机无 CUDA 跳过。新增强消去输入的固定累加顺序
+检查，并让 Block checkpoint 的输出/梯度/warmup 检查支持 CUDA。
+分段求和依据 [PyTorch CUDA 实现](https://github.com/pytorch/pytorch/blob/v2.7.0/aten/src/ATen/native/cuda/SegmentReduce.cu)：
+二维输入的每个 run/channel 按 token 顺序累加，不使用浮点原子加法。
 
 此前加速验证：新增输出/梯度、bf16、一阶无统计存储、单 ladder / K=8 / legacy / chunk-tree replay、
 MLP 重算次数及二阶 warmup 检查。缓存、模型接线、新增优化及 Flash 三个测试文件共

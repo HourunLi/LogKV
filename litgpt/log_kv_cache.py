@@ -2235,7 +2235,6 @@ class LogStructuredKVCache(nn.Module):
         blk_tok_src: list[int] = []     # row within k_flat / v_flat
         blk_pos_src: list[int] = []     # row within pos_flat
         order_vals: list[int] = []
-        run_ids: list[int] = []
         runs: list[list] = []  # mutable [ordinal, cluster_flat, n, new_segment]
         pending_ops: list[tuple[int, int, list[tuple[int, int, int, int]]]] = []
         total = 0
@@ -2304,7 +2303,6 @@ class LogStructuredKVCache(nn.Module):
                 blk_tok_src.append(kv_base + i)
                 blk_pos_src.append(pos_base + i)
                 order_vals.append(phase)
-                run_ids.append(open_id)
                 total += 1
                 phase += 1
                 open_run.append(i)
@@ -2322,7 +2320,7 @@ class LogStructuredKVCache(nn.Module):
 
         self._semantic_apply_join_plan(
             lanes, lane_counts, blk_tok_at, blk_tok_src, blk_pos_src, order_vals,
-            run_ids, runs, pending_ops, total, k_flat, v_flat, pos_flat,
+            runs, pending_ops, total, k_flat, v_flat, pos_flat,
         )
 
 
@@ -2351,7 +2349,6 @@ class LogStructuredKVCache(nn.Module):
         blk_tok_src: list[int] = []
         blk_pos_src: list[int] = []
         order_vals: list[int] = []
-        run_ids: list[int] = []
         runs: list[list] = []
         total = 0
         for b, g, c, segment, new_segment, tokens in records:
@@ -2359,14 +2356,12 @@ class LogStructuredKVCache(nn.Module):
             phase = self._semantic_level0_phase[b][g][c]
             kv_base = (b * n_groups + g) * T
             pos_base = b * T
-            run_id = len(runs)
             runs.append([0, (b * n_groups + g) * self.K_max + c, len(offsets), new_segment])
             for i in offsets:
                 blk_tok_at.append(total)
                 blk_tok_src.append(kv_base + i)
                 blk_pos_src.append(pos_base + i)
                 order_vals.append(phase)
-                run_ids.append(run_id)
                 total += 1
                 phase += 1
             lanes.append((b, g, c))
@@ -2378,7 +2373,7 @@ class LogStructuredKVCache(nn.Module):
                 self._set_semantic_current_segment(b, g, c, segment)
         self._semantic_apply_join_plan(
             lanes, lane_counts, blk_tok_at, blk_tok_src, blk_pos_src, order_vals,
-            run_ids, runs, [], total,
+            runs, [], total,
             k_raw.reshape(-1, k_raw.size(-1)), v.reshape(-1, v.size(-1)), positions.reshape(-1),
         )
 
@@ -2390,7 +2385,6 @@ class LogStructuredKVCache(nn.Module):
         blk_tok_src: list[int],
         blk_pos_src: list[int],
         order_vals: list[int],
-        run_ids: list[int],
         runs: list[list],
         pending_ops: list[tuple[int, int, list[tuple[int, int, int, int]]]],
         total: int,
@@ -2413,18 +2407,18 @@ class LogStructuredKVCache(nn.Module):
         # single int64 block: on CUDA each separate `torch.tensor(list)` would be
         # its own blocking pageable copy.
         n_tok = len(blk_tok_at)
-        packed = np.empty(3 * n_tok + len(order_vals) + len(run_ids), dtype=np.int64)
+        packed = np.empty(3 * n_tok + len(order_vals) + len(runs), dtype=np.int64)
         packed[:n_tok] = blk_tok_at
         packed[n_tok:2 * n_tok] = blk_tok_src
         packed[2 * n_tok:3 * n_tok] = blk_pos_src
         packed[3 * n_tok:3 * n_tok + len(order_vals)] = order_vals
-        packed[3 * n_tok + len(order_vals):] = run_ids
+        packed[3 * n_tok + len(order_vals):] = [r[2] for r in runs]
         packed_t = torch.from_numpy(packed).to(dev, copy=False)
         at = packed_t[:n_tok]
         src = packed_t[n_tok:2 * n_tok]
         psrc = packed_t[2 * n_tok:3 * n_tok]
         order_t = packed_t[3 * n_tok:3 * n_tok + len(order_vals)]
-        run_ids_t = packed_t[3 * n_tok + len(order_vals):]
+        run_lengths = packed_t[3 * n_tok + len(order_vals):]
         k_sel = k_flat.index_select(0, src).detach()
         v_sel = v_flat.index_select(0, src).detach()
         p_sel = pos_flat.index_select(0, psrc).to(torch.int64)
@@ -2444,11 +2438,11 @@ class LogStructuredKVCache(nn.Module):
         )
         self._semantic_append_entries_batched(lanes, lane_counts, block)
 
-        # Batched centroid / n_eff: one segment-sum over every run, then one
-        # scatter per run ordinal (production configs have a single run per lane).
-        n_runs = len(runs)
-        run_sums = k_sel.new_zeros(n_runs, self.k_dim).float()
-        run_sums.index_add_(0, run_ids_t, k_sel.float())
+        # Tokens are contiguous in run order. CUDA index_add_ uses unordered
+        # atomic sums: centroid roundoff can change routing and slot shapes on
+        # Block checkpoint recompute. Reduce each run in a fixed order instead.
+        # Lengths come from the same host plan as k_sel, so skip GPU validation syncs.
+        run_sums = torch.segment_reduce(k_sel.float(), "sum", lengths=run_lengths, unsafe=True)
         centroid_flat = self.centroid.view(-1, self.k_dim)
         n_eff_flat = self.n_eff.view(-1)
         max_ordinal = max(r[0] for r in runs) + 1
