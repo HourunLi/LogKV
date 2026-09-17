@@ -7,8 +7,10 @@
 
 - 永久一阶训练和推理不分配五份 Sigma/Gamma buffer，路由、合并、replay 也不搬运它们。
   训练入口按最终 scale 决定分配；零到非零 warmup 保留统计量存储。
-- `demo.py` 的 FSDP checkpoint 只包 MLP，Block 的 FSDP 分片边界不变。
-  attention 仍执行自身的 backward replay，但不再因整个 Block checkpoint 多跑一次 routing。
+- 2026-09-17：`demo.py` 的 FSDP checkpoint 恢复包整个 Block。只包 MLP 会让
+  norm、Q/K/V 和投影激活跨层保留；流式 attention replay 并不能替代 Block checkpoint，
+  长序列训练可能在 RMSNorm 的 `x * x` 分配时 OOM。代价是 backward 多一次 Block
+  重算（含 routing），保留一阶 buffer、Flash 和分块 loss 的优化。
 - Flash 输入先 padding，再在新 tensor 上原地清除无效位置，避免 K/V 各多一份中间副本。
 - semantic forward 保存轻量 anchor 索引供 backward 使用，省去 replay 的排序和计数同步。
   只存索引、anchor 位置、multiplicity、有效性，不存各 chunk 的 K/V；通过 autograd 的
@@ -17,7 +19,11 @@
   返回标量 loss，`demo.py` 已接入。不生成完整序列 logits 或 logits 列表；CE 用 fp32 累加，
   支持 softcap、bias 和 -100 标签。1024 是展平后的 token 数，0 表示不分块。
 
-验证：新增输出/梯度、bf16、一阶无统计存储、单 ladder / K=8 / legacy / chunk-tree replay、
+2026-09-17 修复验证：`tests/test_log_kv_speed.py` 在 Python 3.12 / torch 2.7 CPU 上
+18 项通过，覆盖 Block checkpoint 的 fp32/bf16 loss、梯度、二阶 warmup，以及前向
+不保留各层 Q/K/V 四维激活。未在目标 GPU 上验证整步峰值显存或多卡 FSDP。
+
+此前加速验证：新增输出/梯度、bf16、一阶无统计存储、单 ladder / K=8 / legacy / chunk-tree replay、
 MLP 重算次数及二阶 warmup 检查。缓存、模型接线、新增优化及 Flash 三个测试文件共
 240 项通过，4 项真实 CUDA 检查因本机无 CUDA 跳过。与本轮修改前 HEAD 对照，
 scale=0 和 0.2 的合成 semantic stream 输出、梯度和 attention state 逐位一致。

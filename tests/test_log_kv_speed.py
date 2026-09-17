@@ -95,18 +95,20 @@ def test_chunked_head_loss_and_gradients(dtype, softcap, all_ignored):
         torch.testing.assert_close(a, b, atol=tol, rtol=tol)
 
 
-def test_model_loss_with_mlp_checkpoint_and_warmup():
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_model_loss_with_block_checkpoint_and_warmup(dtype):
     from collections import Counter
     from copy import deepcopy
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing
     from litgpt.config import Config
-    from litgpt.model import GPT
+    from litgpt.model import Block, GPT
 
     torch.manual_seed(8)
     config = Config(n_layer=2, n_embd=32, n_head=4, n_query_groups=2, block_size=32,
                     vocab_size=31, padding_multiple=1, intermediate_size=64,
-                    mlp_class_name="LLaMAMLP", parallel_residual=False)
-    reference = GPT(config)
+                    mlp_class_name="LLaMAMLP", parallel_residual=False,
+                    norm_class_name="RMSNorm", norm_qk=True)
+    reference = GPT(config).to(dtype=dtype)
     actual = deepcopy(reference)
     for model in (reference, actual):
         model.enable_log_kv_training(
@@ -124,22 +126,34 @@ def test_model_loss_with_mlp_checkpoint_and_warmup():
     for block in actual.transformer.h:
         block.attn.register_forward_pre_hook(count("attention"))
         block.mlp.register_forward_pre_hook(count("mlp"))
-    apply_activation_checkpointing(actual, check_fn=lambda module: isinstance(module, config.mlp_class))
+    apply_activation_checkpointing(actual, check_fn=lambda module: isinstance(module, Block))
     inputs = torch.randint(31, (1, 24))
     targets = torch.randint(31, inputs.shape)
     targets[:, :3] = -100
     logits = reference(inputs)
     expected = F.cross_entropy(logits.float().reshape(-1, 31), targets.reshape(-1))
     expected.backward()
-    loss = actual(inputs, targets=targets, loss_chunk_size=7)
+    saved_shapes = []
+
+    def save(x):
+        saved_shapes.append(tuple(x.shape))
+        return x
+
+    with torch.autograd.graph.saved_tensors_hooks(save, lambda x: x):
+        loss = actual(inputs, targets=targets, loss_chunk_size=7)
+    # Whole-block checkpointing must discard the per-layer Q/K/V and QK-norm
+    # activations; MLP-only checkpointing retains these 4-D tensors.
+    assert not any(len(shape) == 4 for shape in saved_shapes)
     loss.backward()
     torch.testing.assert_close(loss, expected)
     for a, b in zip(actual.parameters(), reference.parameters()):
-        torch.testing.assert_close(a.grad, b.grad, atol=2e-6, rtol=2e-5)
-    assert counts == {"attention": 2, "mlp": 4}
+        tol = 0.02 if dtype == torch.bfloat16 else 2e-6
+        torch.testing.assert_close(a.grad, b.grad, atol=tol, rtol=10 * tol)
+    assert counts == {"attention": 4, "mlp": 4}
 
     # Warmup callers explicitly allocate for their nonzero target while starting at zero.
-    warmup = GPT(config)
+    warmup = GPT(config).to(dtype=dtype)
+    apply_activation_checkpointing(warmup, check_fn=lambda module: isinstance(module, Block))
     warmup.enable_log_kv_training(batch_size=1, B=3, recent_size=4, train_block=4,
                                   second_order_scale=0., allocate_second_order=True)
     warmup(inputs).sum().backward()
