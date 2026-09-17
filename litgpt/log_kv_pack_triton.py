@@ -9,21 +9,25 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["P", "R", "T", "OCAP", "START"])
+@triton.jit(do_not_specialize=[
+    "P", "R", "T", "OCAP", "START",
+    "CKB", "CKG", "CKT", "CKD", "CVB", "CVG", "CVT", "CVD",
+])
 def _pack(
     LK, LV, W, IDX, POS, VALID, COS, SIN, RK, RV, CK, CV, OK, OV,
     N: tl.constexpr, P, R, T, START,
     DK: tl.constexpr, DV: tl.constexpr, DR: tl.constexpr, DA: tl.constexpr,
     GROUPS: tl.constexpr, RCAP: tl.constexpr, OCAP,
-    CKB: tl.constexpr, CKG: tl.constexpr, CKT: tl.constexpr, CKD: tl.constexpr,
-    CVB: tl.constexpr, CVG: tl.constexpr, CVT: tl.constexpr, CVD: tl.constexpr,
+    CKB, CKG, CKT, CKD,
+    CVB, CVG, CVT, CVD,
     COS0: tl.constexpr, COS1: tl.constexpr, SIN0: tl.constexpr, SIN1: tl.constexpr,
     ROPE_FP32: tl.constexpr,
     BT: tl.constexpr, BD: tl.constexpr,
 ):
-    lane = tl.program_id(0)
-    s = START + tl.program_id(1) * BT + tl.arange(0, BT)
-    d = tl.arange(0, BD)
+    # Promote before multiplication: large batch/sequence strides can exceed int32.
+    lane = tl.program_id(0).to(tl.int64)
+    s = START + tl.program_id(1).to(tl.int64) * BT + tl.arange(0, BT)
+    d = tl.arange(0, BD).to(tl.int64)
     live = s < P + R + T
     in_pool = live & (s < P)
     ix = tl.load(IDX + lane * P + s, in_pool, 0)
