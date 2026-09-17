@@ -31,7 +31,7 @@ import lightning as L
 from datetime import datetime
 from litgpt import Config
 from litgpt.model import GPT
-from litgpt.utils import chunked_cross_entropy, get_log_kv_second_order_scale, load_checkpoint
+from litgpt.utils import get_log_kv_second_order_scale, load_checkpoint
 from litgpt.log_kv_cache import logkv_take_host_stats
 import random
 import numpy as np
@@ -662,6 +662,8 @@ def main(
     loggers = [tb_logger] if enable_tensorboard else []
 
     # 2. Fabric setup
+    config_obj = Config.from_name(arch_name)
+    config_obj.block_size = context_length
     use_fsdp = context_length > 4096
     print("Use FSDP:", use_fsdp)
     if not use_fsdp:
@@ -671,10 +673,9 @@ def main(
             sharding_strategy="SHARD_GRAD_OP",
             state_dict_type="full",
             auto_wrap_policy={Block},
-            # LogKV training already streams and replays to bound activation
-            # memory, so Block-level checkpointing re-runs the whole router for
-            # memory it mostly already has. Off = one fewer routing pass/layer.
-            activation_checkpointing_policy={Block} if activation_checkpointing else None,
+            # Attention already bounds its activations with streaming replay.
+            # Checkpoint only the MLP to avoid a second routing forward.
+            activation_checkpointing_policy={config_obj.mlp_class} if activation_checkpointing else None,
             timeout=timedelta(days=3650),
         )
     # Surface a driver/runtime mismatch here, as a readable error, before the
@@ -701,9 +702,6 @@ def main(
         + ("" if save_ckpt else " | ⚠️ save_ckpt=False：本次训练不会写任何 checkpoint")
     )
 
-    config_obj = Config.from_name(arch_name)
-    assert config_obj is not None
-    config_obj.block_size = context_length
     fabric.print(f"Model config initialized: {config_obj.name}")
 
     with fabric.init_module(empty_init=True):
@@ -932,6 +930,7 @@ def main(
         recent_size=log_kv_recent_size,
         train_block=log_kv_train_block,
         second_order_scale=initial_second_order_scale,
+        allocate_second_order=log_kv_second_order_scale != 0.0,
         importance_pooling=log_kv_importance_pooling,
         importance_pooling_lambda=log_kv_importance_pooling_lambda,
         importance_pooling_temperature=log_kv_importance_pooling_temperature,
@@ -1014,8 +1013,7 @@ def main(
             # low-memory Function streams the forward without a graph and
             # replays block-by-block in backward, so per-layer activation
             # memory is O(T + train_block*S) instead of the naive O(T/2*S).
-            logits = model(inputs)
-            loss = chunked_cross_entropy(logits, targets, chunk_size=entropy_chunk_size)
+            loss = model(inputs, targets=targets, loss_chunk_size=entropy_chunk_size)
             # Feed the per-micro-batch loss into the step aggregator; without this
             # step_stats.averages() is always empty and neither the console line
             # nor TensorBoard ever shows the training loss.
