@@ -1,5 +1,35 @@
 # SemanticLogKV 加速（2026-09-16）
 
+## Flash SDPA 后续优化（最新实现）
+
+本节覆盖下方历史配置描述。`arc_semantic_fast.yaml` 显式采用 K=8、B=64、
+`second_order_scale=0`、`activation_checkpointing=true`、`entropy_chunk_size=1024`。
+
+- 永久一阶训练和推理不分配五份 Sigma/Gamma buffer，路由、合并、replay 也不搬运它们。
+  训练入口按最终 scale 决定分配；零到非零 warmup 保留统计量存储。
+- `demo.py` 的 FSDP checkpoint 只包 MLP，Block 的 FSDP 分片边界不变。
+  attention 仍执行自身的 backward replay，但不再因整个 Block checkpoint 多跑一次 routing。
+- Flash 输入先 padding，再在新 tensor 上原地清除无效位置，避免 K/V 各多一份中间副本。
+- semantic forward 保存轻量 anchor 索引供 backward 使用，省去 replay 的排序和计数同步。
+  只存索引、anchor 位置、multiplicity、有效性，不存各 chunk 的 K/V；通过 autograd 的
+  saved tensors 管理生命周期。代价是额外的 `O(chunks × pooled_slots)` 整数元数据。
+- `GPT.forward(targets=..., loss_chunk_size=...)` 将 LM-head 与 CE 一起分块 checkpoint，
+  返回标量 loss，`demo.py` 已接入。不生成完整序列 logits 或 logits 列表；CE 用 fp32 累加，
+  支持 softcap、bias 和 -100 标签。1024 是展平后的 token 数，0 表示不分块。
+
+验证：新增输出/梯度、bf16、一阶无统计存储、单 ladder / K=8 / legacy / chunk-tree replay、
+MLP 重算次数及二阶 warmup 检查。缓存、模型接线、新增优化及 Flash 三个测试文件共
+240 项通过，4 项真实 CUDA 检查因本机无 CUDA 跳过。与本轮修改前 HEAD 对照，
+scale=0 和 0.2 的合成 semantic stream 输出、梯度和 attention state 逐位一致。
+本机 Python 3.9 / torch 2.6，模型检查用源码加载并延迟类型注解，绕开不可用的
+Lightning 导入；未运行完整依赖环境或多卡 FSDP。
+
+固定 batch=1、groups=8、dim=128、32K、K=8、B=64、recent=2048、bf16，按已分配
+buffer 字节数计算，单层缓存（不含共享 RoPE）由 70.65 MiB 降到 43.51 MiB。
+CPU 单线程、缓存已有 8192 token 时，状态构建中位数 60.12 ms，复用 plan 后 56.78 ms；
+该位置一份 plan 为 857.4 KiB。以上不是 GPU tokens/s 或整步峰值显存结果，
+真实 Flash/FSDP 速度、显存和 B=64 的下游精度仍需在目标机测量。
+
 ## 上一轮改动的复核结论：没有 bug
 
 把 `HEAD` 版 `litgpt/log_kv_cache.py` exec 成独立模块与工作区版逐项对照（plain /

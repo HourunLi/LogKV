@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from typing_extensions import Self
 
 from litgpt.config import Config
+from litgpt.chunked_loss import chunked_linear_cross_entropy
 from litgpt.log_kv_cache import (
     LogKVStreamTrainingAttention,
     LogStructuredKVCache,
@@ -96,6 +97,8 @@ class GPT(nn.Module):
         input_pos_maxp1: int | None = None,
         lm_head_chunk_size: int = 0,
         lm_head_start: int | None = None,
+        targets: torch.Tensor | None = None,
+        loss_chunk_size: int = 128,
     ) -> torch.Tensor | list[torch.Tensor]:
         """
         If `input_pos` is provided, the KV cache uses K and V vectors for
@@ -123,6 +126,10 @@ class GPT(nn.Module):
                 context the full-sequence logit tensor is ~10 GB (bf16), while
                 the sliced one is `cont_len x vocab`. `None` keeps the full
                 output (generation, training).
+            targets: Optional, already aligned labels of shape `(B, T)`; -100
+                is ignored. Returns a scalar mean loss instead of logits.
+            loss_chunk_size: Flattened tokens per projection/loss checkpoint.
+                Used with targets; zero processes all tokens in one chunk.
 
         Returns:
             Logit outputs, shape `(B, T, config.padded_vocab_size)`. If
@@ -132,6 +139,8 @@ class GPT(nn.Module):
             dimension is `T - lm_head_start` instead of `T`.
 
         """
+        if targets is not None and (targets.shape != idx.shape or lm_head_start is not None or input_pos is not None):
+            raise ValueError("training targets must match idx and require unsliced, uncached model output")
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -195,6 +204,11 @@ class GPT(nn.Module):
             # on the full sequence, so cache state / attention are unaffected.
             x = x[:, lm_head_start:]
         x = self.transformer.ln_f(x)
+        if targets is not None:
+            return chunked_linear_cross_entropy(
+                x, self.lm_head.weight, targets, self.lm_head.bias,
+                chunk_size=loss_chunk_size, softcap=self.config.final_logit_softcapping,
+            )
         clamp_head = (
             partial(do_softcapping, thresh=self.config.final_logit_softcapping)
             if self.config.final_logit_softcapping is not None
@@ -434,6 +448,7 @@ class GPT(nn.Module):
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size,
+                allocate_second_order=second_order_scale != 0.0,
                 importance_pooling=importance_pooling,
                 importance_pooling_lambda=importance_pooling_lambda,
                 importance_pooling_temperature=importance_pooling_temperature,
@@ -514,6 +529,7 @@ class GPT(nn.Module):
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
+        allocate_second_order: bool = True,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -531,6 +547,9 @@ class GPT(nn.Module):
         ``second_order_scale`` is a single coupled gate for the score-side
         Sigma correction and value-side Gamma correction. Use 0.0 for the old
         first-order objective and warm it to 1.0 during CPT.
+
+        Set ``allocate_second_order=False`` only for a permanently zero gate.
+        Warmup from zero to a nonzero target must leave storage enabled.
 
         ``importance_pooling`` is a deterministic function of k (no new
         learnable params), computed identically in training and inference, so
@@ -566,6 +585,7 @@ class GPT(nn.Module):
             block.attn.kv_cache = block.attn.build_log_kv_cache(
                 batch_size, max_seq_length, rope_cache_length, device, dtype,
                 B=B, recent_size=recent_size,
+                allocate_second_order=allocate_second_order,
                 importance_pooling=importance_pooling,
                 importance_pooling_lambda=importance_pooling_lambda,
                 importance_pooling_temperature=importance_pooling_temperature,
@@ -1100,7 +1120,7 @@ class CausalSelfAttention(nn.Module):
             v_b = v[:, :, :1, :]
 
             state = append_exact_tokens(
-                cache.get_attention_state(with_stats=True),
+                cache.get_attention_state(with_stats=cache.second_order),
                 torch.cat([pk, k_b], dim=2),
                 torch.cat([pv, v_b], dim=2),
             )
@@ -1164,7 +1184,7 @@ class CausalSelfAttention(nn.Module):
                 defer_tail = block_end == T and blk % 2 == 1
                 commit_end = block_end - 1 if defer_tail else block_end
 
-                state = cache.get_attention_state(with_stats=True)
+                state = cache.get_attention_state(with_stats=cache.second_order)
 
                 # Diagnostic branch (score/value oracle grid; see log_kv_diag).
                 # Inert unless a diag_mode(...) context set LOG_KV_DIAG.enabled.
@@ -1251,7 +1271,7 @@ class CausalSelfAttention(nn.Module):
 
             # Cache state: [compact slots] + [sliding window from prev chunks].
             # Both are detached — only the current chunk carries gradient.
-            state = cache.get_attention_state(with_stats=True)
+            state = cache.get_attention_state(with_stats=cache.second_order)
 
             # Append current chunk (with gradient) as exact w=1 slots.
             state = append_exact_tokens(state, k_b, v_b)
@@ -1389,6 +1409,7 @@ class CausalSelfAttention(nn.Module):
         semantic_legacy_route: bool = False,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
+        allocate_second_order: bool = True,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1451,6 +1472,7 @@ class CausalSelfAttention(nn.Module):
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,
+            allocate_second_order=allocate_second_order,
         )
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:

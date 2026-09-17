@@ -10,6 +10,10 @@ tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic
 # 走旧路由（每 orphan 一次 Ward merge）只用于 A/B 对照，默认 false。
 log_kv_semantic_legacy_route: null
 log_kv_second_order_scale: 0.0
+log_kv_B: 64
+log_kv_cluster_k_max: 8
+activation_checkpointing: true  # MLP 重算；attention 使用自身的流式 replay
+entropy_chunk_size: 1024  # LM-head + CE 每次处理的 token 数，避免全序列 logits
 
 # ── 尺寸档 ──
 # 本机 CPU host 时间，塞进 8k token 后的稳态，每次调用（route + attn_state）：
@@ -27,8 +31,6 @@ log_kv_second_order_scale: 0.0
 # 想提速就逐个放开（每次只开一个，看 logKV_host 和 step 时间）：
 #
 # log_kv_second_order_scale 已在上方固定为 0.0，以启用一阶 Flash SDPA。
-# log_kv_B: 64                        # entries 77824 -> 28416
-# log_kv_cluster_k_max: 8             # 配 B=64 -> 17984
 #
 # 【不要在 32k 开】activation_checkpointing: false
 #   Qwen3-1.7B 32k 下需保留激活：micro_batch_size=1 约 49 GB，=4 约 196 GB。
