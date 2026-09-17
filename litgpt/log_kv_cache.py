@@ -361,6 +361,8 @@ class LogStructuredKVCache(nn.Module):
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
+        semantic_anchor_mode: str = "multi",
+        semantic_pack_backend: str = "auto",
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
         rope_n_elem: int | None = None,
@@ -379,6 +381,13 @@ class LogStructuredKVCache(nn.Module):
         self.B = B
         self.allocate_second_order = bool(allocate_second_order)
         self.semantic_clusters = bool(semantic_clusters)
+        if semantic_anchor_mode not in ("mid", "multi"):
+            raise ValueError("semantic_anchor_mode must be 'mid' or 'multi'")
+        if semantic_pack_backend not in ("auto", "torch", "triton"):
+            raise ValueError("semantic_pack_backend must be 'auto', 'torch', or 'triton'")
+        self.semantic_anchor_mode = semantic_anchor_mode
+        self.semantic_pack_backend = semantic_pack_backend
+        self._mid_decode_state = None
         self.K_max = int(cluster_k_max) if self.semantic_clusters else 1
         if self.K_max < 1:
             raise ValueError(f"cluster_k_max must be >= 1, got {cluster_k_max}")
@@ -1241,6 +1250,7 @@ class LogStructuredKVCache(nn.Module):
         counts, so none of it costs a device sync. Indices are accumulated as
         ranges and moved once per level (see `_semantic_index_tensors`).
         """
+        self._mid_decode_state = None
         active = [i for i in range(len(lanes)) if counts[i] > 0]
         if not active:
             return
@@ -1409,6 +1419,7 @@ class LogStructuredKVCache(nn.Module):
             ell += 1
 
     def _semantic_clear_cluster(self, b: int, g: int, c: int) -> None:
+        self._mid_decode_state = None
         self.level_k[b, g, c].zero_()
         self.level_v[b, g, c].zero_()
         self.level_w[b, g, c].zero_()
@@ -2742,6 +2753,7 @@ class LogStructuredKVCache(nn.Module):
         self._semantic_commit_joins(jobs, k_raw, v, positions, positions_host, record=record)
 
     def route_and_flush_batch(self, *args, **kwargs) -> None:
+        self._mid_decode_state = None
         _t0 = time.perf_counter()
         try:
             return self._route_and_flush_batch(*args, **kwargs)
@@ -3673,6 +3685,8 @@ class LogStructuredKVCache(nn.Module):
 
     def _semantic_attention_plan(self):
         """Immutable slot indices and anchor metadata; no K/V payload is retained."""
+        if self.semantic_anchor_mode == "mid":
+            return self._semantic_mid_attention_plan()
         shape = (self.batch_size, self.n_groups, -1)
         entry_w = self.level_w.flip(3).reshape(shape)
         p_lo = self.level_p_lo.flip(3).reshape(shape)
@@ -3692,6 +3706,42 @@ class LogStructuredKVCache(nn.Module):
         M_s = torch.gather(M, 2, entry_idx)
         slot_valid = torch.arange(pooled_slots, device=flat_valid.device).view(1, 1, -1) < valid_count.unsqueeze(-1)
         return physical_idx, anchor_sel, M_s, slot_valid
+
+    def _semantic_mid_attention_plan(self):
+        """Enumerate occupied ranges from host counts; no sort, flip, or CUDA scalar read.
+
+        Midpoints of positive-weight entries already lie inside [lo, hi], so
+        this path never reads either endpoint. Segment-alignment pads remain
+        masked inside occupied ranges; there are none in the fast configuration.
+        """
+        spans = []
+        for batch in self._semantic_counts:
+            for groups in batch:
+                spans.append([
+                    (c * self.L_alloc * self.B_prime + ell * self.B_prime, count)
+                    for c, levels in enumerate(groups)
+                    for ell in range(self.L_alloc - 1, -1, -1)
+                    if (count := levels[ell]) > 0
+                ])
+        sizes = [sum(n for _, n in row) for row in spans]
+        width = max(sizes, default=0)
+        indices = np.full((len(spans), width), -1, dtype=np.int64)
+        for lane, row in enumerate(spans):
+            offset = 0
+            for start, n in row:
+                indices[lane, offset:offset + n] = np.arange(start, start + n)
+                offset += n
+        shape = (self.batch_size, self.n_groups, width)
+        physical_idx = torch.from_numpy(indices).to(self.level_w.device).view(shape)
+        occupied = physical_idx >= 0
+        physical_idx = physical_idx.clamp_min(0)
+        weights = self.level_w.flatten(2).gather(2, physical_idx)
+        sums = self.level_sum_wp.flatten(2).gather(2, physical_idx)
+        valid = occupied & (weights > 0)
+        ww = weights.long().clamp_min(1)
+        anchors = torch.div(2 * sums + ww, 2 * ww, rounding_mode="floor")
+        anchors = anchors.masked_fill(~valid, 0)
+        return physical_idx, anchors, torch.ones_like(anchors), valid
 
     def _semantic_attention_state(self, with_stats: bool = False, plan=None) -> CacheAttentionState:
         assert self.rope_n_elem is not None
@@ -3906,6 +3956,11 @@ class LogStructuredKVCache(nn.Module):
     # Utilities
     # ------------------------------------------------------------------
 
+    def _apply(self, fn, recurse=True):
+        self._mid_decode_state = None
+        self._mid_flash_support = None
+        return super()._apply(fn, recurse=recurse)
+
     def _convert_dtype(self, dtype: torch.dtype) -> None:
         """Reconcile all data buffers with the activation dtype.
 
@@ -3923,6 +3978,7 @@ class LogStructuredKVCache(nn.Module):
         """
         if self.recent_k.dtype == dtype:
             return
+        self._mid_decode_state = None
         self.recent_k = self.recent_k.to(dtype)
         self.recent_v = self.recent_v.to(dtype)
         if self.semantic_clusters:
@@ -3938,6 +3994,7 @@ class LogStructuredKVCache(nn.Module):
 
     def reset_parameters(self) -> None:
         """Reset all buffers to zero."""
+        self._mid_decode_state = None
         self.token_count = 0
         self.recent_k.zero_()
         self.recent_v.zero_()
@@ -4380,6 +4437,81 @@ def log_kv_slot_attention(
 # ======================================================================
 
 
+def _mid_flash_supported(cache, q, k, v, scale):
+    if (not q.is_cuda or q.dtype not in (torch.float16, torch.bfloat16)
+            or k.dtype != q.dtype or v.dtype != q.dtype
+            or not math.isfinite(scale) or not 1e-3 <= scale <= 1.0
+            or q.size(-1) != k.size(-1) or q.size(1) % k.size(1)
+            or max(q.size(-1) + 1, v.size(-1)) > 192
+            or cache.slot_k_dim != cache.k_dim or cache.cos_cache.size(1) != cache.rope_n_elem
+            or cache.cos_cache.dtype not in (torch.float32, q.dtype)
+            or cache.sin_cache.dtype != cache.cos_cache.dtype):
+        return False
+    dim = ((max(q.size(-1) + 1, v.size(-1)) + 7) // 8) * 8
+    key = (q.device, q.dtype, q.size(0), q.size(1), k.size(1), dim)
+    saved = getattr(cache, "_mid_flash_support", None)
+    if saved is None or saved[0] != key:
+        # Probe backend eligibility once per layout, before materializing a prefix.
+        qa = q.new_empty(q.size(0), q.size(1), 1, dim)
+        ka = k.new_empty(k.size(0), k.size(1), 1, dim)
+        supported = can_use_flash_attention(SDPAParams(qa, ka, ka, None, 0.0, False, q.size(1) != k.size(1)))
+        cache._mid_flash_support = (key, supported)
+    return cache._mid_flash_support[1]
+
+
+def _packed_flash_attention(q, k, v, scale, causal_tail, v_dim):
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=causal_lower_right(q.size(2), k.size(2)) if causal_tail else None,
+            dropout_p=0.0, scale=scale, enable_gqa=q.size(1) != k.size(1),
+        )
+    return out[..., :v_dim]
+
+
+def _rope_cache_key(tensor):
+    # Inference-mode tensors have no version counter; replacement still changes id.
+    try:
+        version = tensor._version
+    except RuntimeError:
+        version = None
+    return id(tensor), version
+
+
+def _mid_chunk_attention(cache, q, k, v, scale, causal_tail, plan, reuse_prefix):
+    if not _mid_flash_supported(cache, q, k, v, scale):
+        return None
+    from litgpt.log_kv_pack import pack_mid_kv
+
+    t0 = time.perf_counter()
+    try:
+        dim = ((max(q.size(-1) + 1, v.size(-1)) + 7) // 8) * 8
+        buffers, skip_pooled, recent_start = None, False, 0
+        # A mutable workspace is safe only for immediate inference consumption.
+        reuse = reuse_prefix and not torch.is_grad_enabled() and q.size(2) <= 2 and not k.requires_grad and not v.requires_grad
+        if reuse:
+            key = (k.device, k.dtype, dim, cache.semantic_pack_backend,
+                   _rope_cache_key(cache.cos_cache), _rope_cache_key(cache.sin_cache))
+            saved = cache._mid_decode_state
+            if saved is not None and saved[0] == key:
+                _, plan, buffers, recent_start = saved
+                skip_pooled = True
+            else:
+                plan = cache._semantic_attention_plan() if plan is None else plan
+                capacity = plan[0].size(-1) + cache.recent_size + max(2, k.size(2))
+                buffers = (k.new_empty(*k.shape[:2], capacity, dim), v.new_empty(*v.shape[:2], capacity, dim))
+        else:
+            plan = cache._semantic_attention_plan() if plan is None else plan
+        ka, va = pack_mid_kv(cache, plan, k, v, dim, buffers=buffers, skip_pooled=skip_pooled, recent_start=recent_start)
+        if reuse:
+            cache._mid_decode_state = (key, plan, buffers, cache.recent_count)
+        qa = F.pad(q, (0, dim - q.size(-1)))
+        qa[..., q.size(-1)] = 1.0 / scale
+    finally:
+        LOGKV_HOST_STATS["attn_s"] += time.perf_counter() - t0
+        LOGKV_HOST_STATS["attn_n"] += 1
+    return _packed_flash_attention(qa, ka, va, scale, causal_tail, v.size(-1))
+
+
 def log_kv_chunk_attention(
     cache: LogStructuredKVCache,
     q_b: torch.Tensor,   # (B, nh, t, k_dim) current-chunk queries, post-RoPE
@@ -4388,6 +4520,9 @@ def log_kv_chunk_attention(
     scale: float,
     second_order_scale: float = 1.0,
     attention_plan=None,
+    *,
+    causal_tail: int | None = None,
+    reuse_prefix: bool = False,
 ) -> torch.Tensor:
     """One streaming attention step, WITHOUT committing the chunk.
 
@@ -4401,12 +4536,19 @@ def log_kv_chunk_attention(
     zero gate costs exactly the first-order path rather than the full
     second-order path multiplied by zero.
     """
+    causal_tail = q_b.size(2) if causal_tail is None else causal_tail
+    if causal_tail and causal_tail != q_b.size(2):
+        raise ValueError("causal_tail must equal query length or be zero")
+    if second_order_scale == 0.0 and cache.semantic_clusters and cache.semantic_anchor_mode == "mid":
+        out = _mid_chunk_attention(cache, q_b, k_b, v_b, scale, causal_tail, attention_plan, reuse_prefix)
+        if out is not None:
+            return out
     if second_order_scale == 0.0:
         state = append_exact_tokens(cache.get_attention_state(with_stats=False, plan=attention_plan), k_b, v_b)
         return log_kv_slot_attention(
             q_b, state.slot_k, state.slot_v, state.slot_w,
             scale=scale,
-            causal_tail=q_b.size(2),
+            causal_tail=causal_tail,
             slot_M=state.M_s,
             slot_valid=state.slot_valid,
             # causal_tail=q_b.size(2) > 0 appends the real current chunk as an
@@ -4422,7 +4564,7 @@ def log_kv_chunk_attention(
     return log_kv_slot_attention(
         q_b, state.slot_k, state.slot_v, state.slot_w,
         scale=scale,
-        causal_tail=q_b.size(2),
+        causal_tail=causal_tail,
         slot_M=state.M_s,
         slot_valid=state.slot_valid,
         check_valid=False,  # see check_valid=False comment above
@@ -4550,6 +4692,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.scale = scale
         ctx.train_block = train_block
         ctx.second_order_scale = second_order_scale
+        ctx.semantic_anchor_mode = cache.semantic_anchor_mode
         ctx.has_k_raw = k_raw is not None
         ctx.needs_op_log = needs_op_log
         ctx.op_log = op_log
@@ -4567,6 +4710,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             q, k, v = saved[:3]
             k_raw = k
         cache = ctx.cache
+        if cache.semantic_anchor_mode != ctx.semantic_anchor_mode:
+            raise RuntimeError("semantic_anchor_mode changed between forward and backward")
         scale = ctx.scale
         train_block = ctx.train_block
         second_order_scale = ctx.second_order_scale

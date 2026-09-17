@@ -9,11 +9,13 @@ import pytest
 
 
 @pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
+@pytest.mark.parametrize("anchor_mode,pack_backend", [("mid", "triton"), ("multi", "torch")])
 @pytest.mark.parametrize("setting, expected", [("true", "true"), ("false", "false"), ("null", "false"), (None, "false")])
-def test_legacy_route_reaches_eval_arguments(tmp_path, script, setting, expected):
+def test_legacy_route_reaches_eval_arguments(tmp_path, script, setting, expected, anchor_mode, pack_backend):
     parent = tmp_path / "base.yaml"
     parent.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\n"
-                      "log_kv_cluster_k_max: 8\nlog_kv_B: 64\n")
+                      "log_kv_cluster_k_max: 8\nlog_kv_B: 64\n"
+                      f"log_kv_semantic_anchor_mode: {anchor_mode}\nlog_kv_semantic_pack_backend: {pack_backend}\n")
     if setting is not None:
         parent.write_text(parent.read_text() + f"log_kv_semantic_legacy_route: {setting}\n")
     config = tmp_path / "run.yaml"
@@ -47,3 +49,5 @@ def test_legacy_route_reaches_eval_arguments(tmp_path, script, setting, expected
     # Also catch shifts in majob's positional read list after adding a field.
     assert args[args.index("--log_kv_cluster_k_max") + 1] == "8"
     assert args[args.index("--log_kv_B") + 1] == "64"
+    assert args[args.index("--log_kv_semantic_anchor_mode") + 1] == anchor_mode
+    assert args[args.index("--log_kv_semantic_pack_backend") + 1] == pack_backend
