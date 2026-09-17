@@ -95,8 +95,11 @@ def test_chunked_head_loss_and_gradients(dtype, softcap, all_ignored):
         torch.testing.assert_close(a, b, atol=tol, rtol=tol)
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_model_loss_with_block_checkpoint_and_warmup(dtype):
+def test_model_loss_with_block_checkpoint_and_warmup(dtype, device):
     from collections import Counter
     from copy import deepcopy
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing
@@ -108,11 +111,11 @@ def test_model_loss_with_block_checkpoint_and_warmup(dtype):
                     vocab_size=31, padding_multiple=1, intermediate_size=64,
                     mlp_class_name="LLaMAMLP", parallel_residual=False,
                     norm_class_name="RMSNorm", norm_qk=True)
-    reference = GPT(config).to(dtype=dtype)
+    reference = GPT(config).to(device=device, dtype=dtype)
     actual = deepcopy(reference)
     for model in (reference, actual):
         model.enable_log_kv_training(
-            batch_size=1, B=3, recent_size=4, train_block=4, second_order_scale=0.,
+            batch_size=1, B=3, recent_size=4, train_block=4, second_order_scale=0., device=device,
             allocate_second_order=False, semantic_clusters=True, cluster_k_max=8,
             semantic_flush_granularity=4,
         )
@@ -127,8 +130,8 @@ def test_model_loss_with_block_checkpoint_and_warmup(dtype):
         block.attn.register_forward_pre_hook(count("attention"))
         block.mlp.register_forward_pre_hook(count("mlp"))
     apply_activation_checkpointing(actual, check_fn=lambda module: isinstance(module, Block))
-    inputs = torch.randint(31, (1, 24))
-    targets = torch.randint(31, inputs.shape)
+    inputs = torch.randint(31, (1, 24), device=device)
+    targets = torch.randint(31, inputs.shape, device=device)
     targets[:, :3] = -100
     logits = reference(inputs)
     expected = F.cross_entropy(logits.float().reshape(-1, 31), targets.reshape(-1))
@@ -152,11 +155,44 @@ def test_model_loss_with_block_checkpoint_and_warmup(dtype):
     assert counts == {"attention": 4, "mlp": 4}
 
     # Warmup callers explicitly allocate for their nonzero target while starting at zero.
-    warmup = GPT(config).to(dtype=dtype)
+    warmup = GPT(config).to(device=device, dtype=dtype)
     apply_activation_checkpointing(warmup, check_fn=lambda module: isinstance(module, Block))
     warmup.enable_log_kv_training(batch_size=1, B=3, recent_size=4, train_block=4,
-                                  second_order_scale=0., allocate_second_order=True)
+                                  second_order_scale=0., allocate_second_order=True, device=device)
     warmup(inputs).sum().backward()
     warmup.set_log_kv_second_order_scale(0.2)
     warmup(inputs).sum().backward()
     assert all(block.attn.kv_cache.second_order for block in warmup.transformer.h)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+)])
+def test_semantic_centroid_sum_has_fixed_token_order(device):
+    # Cancellation makes an unordered CUDA atomic sum observably different
+    # from the fixed token order used by both routing and checkpoint recompute.
+    n = 1024
+    values = torch.tensor([2.**24, 1., -(2.**24), 1.]).repeat(n // 4)
+    expected = torch.tensor(0.)
+    for value in values:
+        expected = expected + value
+    keys = values.to(device).view(1, 1, n, 1).expand(1, 2, n, 4).contiguous()
+    cache = LogStructuredKVCache(
+        keys.shape, keys.shape, B=16, recent_size=4, device=device,
+        semantic_clusters=True, cluster_k_max=2, allocate_second_order=False,
+        semantic_flush_granularity=4, rope_n_elem=4,
+        cos_cache=torch.ones(n + 1, 4, device=device), sin_cache=torch.zeros(n + 1, 4, device=device),
+    )
+    positions = torch.arange(1, n + 1, device=device).unsqueeze(0)
+    positions_host = positions.cpu().tolist()
+    jobs = [(0, g, g, tuple(range(n))) for g in range(2)]
+    for _ in range(3):
+        cache.reset_parameters()
+        for g in range(2):
+            zero = keys.new_zeros(4)
+            cache._semantic_new_cluster(0, g, g, 0, zero, zero, positions.new_zeros(()), record=False)
+        cache._semantic_commit_joins(jobs, keys, keys, positions, positions_host)
+        for g in range(2):
+            torch.testing.assert_close(
+                cache.centroid[0, g, g], (expected / (n + 1)).to(device).expand(4), atol=0, rtol=0,
+            )
