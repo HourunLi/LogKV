@@ -140,3 +140,31 @@ def test_update_diagnostic_keeps_centroid_error_details(corrupt):
             backend.centroid(k, mu, ne, meta, 0, 1)
         assert calls["centroid"] == 1
     assert backend.centroid is update  # instrumentation does not leak into timing
+
+
+@CUDA
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dim", [128, 256])
+def test_centroid_feature_warps_read_same_old_count(dtype, dim):
+    backend = kv._triton_updates()
+    assert backend is not None
+    nr, length = 32, 292
+    # Production failure: a late feature warp used 4106 instead of 3814,
+    # because another warp had already stored 3814 + 292 into the shared NE.
+    k = torch.zeros(nr, length, dim, device="cuda", dtype=dtype)
+    k[:, 0, :] = 162.806640625
+    k = k.view(-1, dim)
+    mu = torch.full((nr, dim), .5797467827796936, device="cuda")
+    ne = torch.full((nr,), 3814., device="cuda")
+    expected_mu, expected_ne = mu.clone(), ne.clone()
+    rows = torch.arange(nr, device="cuda")
+    lengths = torch.full_like(rows, length)
+    meta = torch.stack((rows, rows, rows * length, lengths, torch.full_like(rows, 1065353216)))
+    sums = torch.segment_reduce(k.float(), "sum", lengths=lengths, unsafe=True)
+    for _ in range(32):
+        denom = expected_ne + length
+        expected_mu = (expected_ne[:, None] * expected_mu + sums) / denom[:, None]
+        expected_ne = denom
+        backend.centroid(k, mu, ne, meta, 0, nr)
+        torch.testing.assert_close(mu, expected_mu, atol=0, rtol=0)
+        torch.testing.assert_close(ne, expected_ne, atol=0, rtol=0)

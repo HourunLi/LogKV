@@ -129,6 +129,9 @@ def _centroid(K, MU, NE, META, NR, START, D: tl.constexpr, BD: tl.constexpr):
     mu = tl.load(MU + cluster * D + d, d < D, 0)
     value = tl.where(pre > 0, tl.div_rn(pre * mu + acc, denom), tl.div_rn(acc, n))
     tl.store(MU + cluster * D + d, value, d < D)
+    # NE is shared by all feature warps. A fast warp must not overwrite it
+    # while another warp is still loading the old count after its sum loop.
+    tl.debug_barrier()
     tl.store(NE + cluster, denom)
 
 

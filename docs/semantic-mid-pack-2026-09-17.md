@@ -335,3 +335,18 @@ python unused/benchmark_log_kv_updates.py --iters 10
 计时排除缓存恢复及首次编译；首轮会检查缓存状态和 route op-log 逐位一致。
 结果是单层单 flush 的合成负载，最后仍以原命令连续完整 step 的 `Time`、`route`
 和 `replay` 为准。
+
+### A800 centroid 竞态修复
+
+32K 基准捕获的首个 centroid 差异并非普通舍入误差：旧计数 3814、新增 292，
+参考输出为 0.57816875；将更新后的 4106 再作为旧计数代入，恰好得到失败输出
+0.5782735。不同 feature warp 在求和后读取同一 `n_eff`，较快的 warp 可能先写回，
+使较慢 warp 使用更新后的计数。`_centroid` 在写 `n_eff` 前增加块内屏障，确保
+所有 feature warp 完成旧状态的读取与计算。该屏障不涉及 CPU 或跨 kernel 同步。
+新增 D=128/256、fp32/bf16、连续 32 次更新的 GPU 回归；目标 A800 验证仍需运行：
+
+```bash
+python -m pytest -q tests/test_log_kv_updates.py
+python unused/benchmark_log_kv_updates.py --diagnose
+python unused/benchmark_log_kv_updates.py --iters 10
+```
