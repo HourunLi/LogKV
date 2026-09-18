@@ -2220,17 +2220,12 @@ class LogStructuredKVCache(nn.Module):
     ) -> None:
         T = k_raw.size(2)
         n_groups = k_raw.size(1)
-        k_flat = k_raw.reshape(-1, k_raw.size(-1))
-        v_flat = v.reshape(-1, v.size(-1))
-        pos_flat = positions.reshape(-1)
-        dev = k_flat.device
         seg_on = self.seg_gap_max != math.inf
 
         lanes: list[tuple[int, int, int]] = []
         lane_counts: list[int] = []
         blk_tok_at: list[int] = []      # row within the staging block
-        blk_tok_src: list[int] = []     # row within k_flat / v_flat
-        blk_pos_src: list[int] = []     # row within pos_flat
+        blk_tok_src: list[int] = []     # logical (batch, group, token) row
         order_vals: list[int] = []
         runs: list[list] = []  # mutable [ordinal, cluster_flat, n, new_segment]
         pending_ops: list[tuple[int, int, list[tuple[int, int, int, int]]]] = []
@@ -2244,7 +2239,6 @@ class LogStructuredKVCache(nn.Module):
             seg_cur = self._semantic_current_segment[b][g][c]
             prev_hi = self._semantic_p_hi_c[b][g][c]
             kv_base = (b * n_groups + g) * T
-            pos_base = b * T
             cluster_flat = (b * n_groups + g) * self.K_max + c
             lane_start = total
             ops: list[tuple[int, int, int, int]] = []
@@ -2298,7 +2292,6 @@ class LogStructuredKVCache(nn.Module):
                     runs.append([lane_ordinal, cluster_flat, 0, open_new])
                 blk_tok_at.append(total)
                 blk_tok_src.append(kv_base + i)
-                blk_pos_src.append(pos_base + i)
                 order_vals.append(phase)
                 total += 1
                 phase += 1
@@ -2316,8 +2309,8 @@ class LogStructuredKVCache(nn.Module):
                 pending_ops.append((b, g, ops))
 
         self._semantic_apply_join_plan(
-            lanes, lane_counts, blk_tok_at, blk_tok_src, blk_pos_src, order_vals,
-            runs, pending_ops, total, k_flat, v_flat, pos_flat,
+            lanes, lane_counts, blk_tok_at, blk_tok_src, order_vals,
+            runs, pending_ops, total, k_raw, v, positions,
         )
 
 
@@ -2344,7 +2337,6 @@ class LogStructuredKVCache(nn.Module):
         lane_counts: list[int] = []
         blk_tok_at: list[int] = []
         blk_tok_src: list[int] = []
-        blk_pos_src: list[int] = []
         order_vals: list[int] = []
         runs: list[list] = []
         total = 0
@@ -2352,12 +2344,10 @@ class LogStructuredKVCache(nn.Module):
             offsets = [offset_by_token[b][int(t)] for t in tokens]
             phase = self._semantic_level0_phase[b][g][c]
             kv_base = (b * n_groups + g) * T
-            pos_base = b * T
             runs.append([0, (b * n_groups + g) * self.K_max + c, len(offsets), new_segment])
             for i in offsets:
                 blk_tok_at.append(total)
                 blk_tok_src.append(kv_base + i)
-                blk_pos_src.append(pos_base + i)
                 order_vals.append(phase)
                 total += 1
                 phase += 1
@@ -2369,9 +2359,8 @@ class LogStructuredKVCache(nn.Module):
             if new_segment:
                 self._set_semantic_current_segment(b, g, c, segment)
         self._semantic_apply_join_plan(
-            lanes, lane_counts, blk_tok_at, blk_tok_src, blk_pos_src, order_vals,
-            runs, [], total,
-            k_raw.reshape(-1, k_raw.size(-1)), v.reshape(-1, v.size(-1)), positions.reshape(-1),
+            lanes, lane_counts, blk_tok_at, blk_tok_src, order_vals,
+            runs, [], total, k_raw, v, positions,
         )
 
     def _semantic_apply_join_plan(
@@ -2380,58 +2369,67 @@ class LogStructuredKVCache(nn.Module):
         lane_counts: list[int],
         blk_tok_at: list[int],
         blk_tok_src: list[int],
-        blk_pos_src: list[int],
         order_vals: list[int],
         runs: list[list],
         pending_ops: list[tuple[int, int, list[tuple[int, int, int, int]]]],
         total: int,
-        k_flat: torch.Tensor,
-        v_flat: torch.Tensor,
-        pos_flat: torch.Tensor,
+        k_raw: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
     ) -> None:
         """Materialize one staging block for every lane and commit it.
 
         Shared by forward routing and op-log replay: the two differ only in how
         the plan is derived, never in how it lands.
         """
-        dev = k_flat.device
+        dev = k_raw.device
         if not lanes:
             return
         for b, g, ops in pending_ops:
             self._record_ops(b, g, ops)
 
-        # These four are irregular (not plain ranges), but they still travel as a
-        # single int64 block: on CUDA each separate `torch.tensor(list)` would be
-        # its own blocking pageable copy.
+        # Convert logical rows to coordinates on the host and upload once.
+        # Gathering directly from strided chunk views avoids a full K/V copy
+        # that reshape(-1, D) would require before selecting the actual rows.
         n_tok = len(blk_tok_at)
-        packed = np.empty(3 * n_tok + len(order_vals) + len(runs), dtype=np.int64)
+        src = np.asarray(blk_tok_src, dtype=np.int64)
+        lane, token = np.divmod(src, k_raw.size(2))
+        batch, group = np.divmod(lane, k_raw.size(1))
+        packed = np.empty(4 * n_tok + len(order_vals) + len(runs), dtype=np.int64)
         packed[:n_tok] = blk_tok_at
-        packed[n_tok:2 * n_tok] = blk_tok_src
-        packed[2 * n_tok:3 * n_tok] = blk_pos_src
-        packed[3 * n_tok:3 * n_tok + len(order_vals)] = order_vals
-        packed[3 * n_tok + len(order_vals):] = [r[2] for r in runs]
+        packed[n_tok:2 * n_tok] = batch
+        packed[2 * n_tok:3 * n_tok] = group
+        packed[3 * n_tok:4 * n_tok] = token
+        packed[4 * n_tok:4 * n_tok + len(order_vals)] = order_vals
+        packed[4 * n_tok + len(order_vals):] = [r[2] for r in runs]
         packed_t = torch.from_numpy(packed).to(dev, copy=False)
         at = packed_t[:n_tok]
-        src = packed_t[n_tok:2 * n_tok]
-        psrc = packed_t[2 * n_tok:3 * n_tok]
-        order_t = packed_t[3 * n_tok:3 * n_tok + len(order_vals)]
-        run_lengths = packed_t[3 * n_tok + len(order_vals):]
-        k_sel = k_flat.index_select(0, src).detach()
-        v_sel = v_flat.index_select(0, src).detach()
-        p_sel = pos_flat.index_select(0, psrc).to(torch.int64)
+        bi, gi, ti = packed_t[n_tok:4 * n_tok].view(3, n_tok).unbind(0)
+        order_t = packed_t[4 * n_tok:4 * n_tok + len(order_vals)]
+        run_lengths = packed_t[4 * n_tok + len(order_vals):]
+        k_sel = k_raw.detach()[bi, gi, ti]
+        v_sel = v.detach()[bi, gi, ti]
+        p_sel = positions[bi, ti].to(torch.int64)
 
-        zeros_k = self.level_k.new_zeros(total, self.k_dim)
-        zeros_v = self.level_v.new_zeros(total, self.v_dim)
+        # Both planners append token rows in increasing staging order. With
+        # no pads, `at` is the identity: gathered payloads ARE the staging block.
+        # All staging fields are read-only until copied to separate cache fields.
+        if n_tok == total:
+            block_k, block_v, block_p = k_sel, v_sel, p_sel
+            block_w = self.level_w.new_ones(total)
+            block_pad = self.pad_mask.new_zeros(total)
+        else:
+            block_k = self.level_k.new_zeros(total, self.k_dim).index_copy_(0, at, k_sel)
+            block_v = self.level_v.new_zeros(total, self.v_dim).index_copy_(0, at, v_sel)
+            block_p = self.level_p_lo.new_zeros(total).index_copy_(0, at, p_sel)
+            block_w = self.level_w.new_zeros(total).index_fill_(0, at, 1.0)
+            block_pad = self.pad_mask.new_ones(total).index_fill_(0, at, False)
         block = (
-            zeros_k.index_copy(0, at, k_sel),
-            zeros_v.index_copy(0, at, v_sel),
-            self.level_w.new_zeros(total).index_fill_(0, at, 1.0),
-            *self._empty_stats(zeros_k, zeros_v),
-            self.level_p_lo.new_zeros(total).index_copy_(0, at, p_sel),
-            self.level_p_hi.new_zeros(total).index_copy_(0, at, p_sel),
-            self.level_sum_wp.new_zeros(total).index_copy_(0, at, p_sel),
+            block_k, block_v, block_w,
+            *self._empty_stats(block_k, block_v),
+            block_p, block_p, block_p,
             order_t,
-            self.pad_mask.new_ones(total).index_fill_(0, at, False),
+            block_pad,
         )
         self._semantic_append_entries_batched(lanes, lane_counts, block)
 
@@ -2666,64 +2664,84 @@ class LogStructuredKVCache(nn.Module):
         buckets = {(b, g, c): list(offsets) for b, g, c, offsets in direct_jobs}
         new_clusters: set[tuple[int, int, int]] = set()
         cap = self._semantic_hard_cap()
+        lanes = []
         for b in range(k_raw.size(0)):
             for g in range(k_raw.size(1)):
                 orph = sorted(orphans[b][g], key=lambda i: positions_host[b][i])
-                if not orph:
-                    continue
-                idx = torch.tensor(orph, device=k_raw.device, dtype=torch.long)
-                x = k_raw[b, g].index_select(0, idx).float()
-                free = self._semantic_free_clusters(b, g)
-                n_seed = min(len(free), len(orph))
-                seeds: dict[int, int] = {}
-                if n_seed:
-                    picked = [s_winner[b, g].index_select(0, idx).argmax()]
-                    dist = (x - x.index_select(0, picked[0].view(1))).square().sum(-1)
-                    for _ in range(n_seed - 1):
-                        # Distinct token seeds also use free capacity when keys
-                        # are identical (all unmasked distances are then zero).
-                        dist.index_fill_(0, picked[-1].view(1), -float("inf"))
-                        nxt = dist.argmax()
-                        picked.append(nxt)
-                        dist = torch.minimum(
-                            dist, (x - x.index_select(0, nxt.view(1))).square().sum(-1)
-                        )
-                    for c, t in zip(free, torch.stack(picked).cpu().tolist()):
-                        seeds[c] = orph[t]
-                        new_clusters.add((b, g, c))
-                        buckets[b, g, c] = [orph[t]]
-                seeded = set(seeds.values())
-                rest = [i for i in orph if i not in seeded]
-                if not rest:
-                    continue
-                cand = sorted(self._semantic_live_clusters(b, g) + list(seeds))
-                cand_idx = torch.tensor(cand, device=k_raw.device, dtype=torch.long)
-                mu = self.centroid[b, g].index_select(0, cand_idx)
-                if seeds:
-                    seed_rows = torch.tensor([cand.index(c) for c in seeds], device=k_raw.device)
-                    seed_src = torch.tensor(list(seeds.values()), device=k_raw.device)
-                    mu.index_copy_(0, seed_rows, k_raw[b, g].index_select(0, seed_src).float())
-                rest_idx = torch.tensor(rest, device=k_raw.device, dtype=torch.long)
-                xr = k_raw[b, g].index_select(0, rest_idx).float()
-                distances = torch.cdist(xr, mu)
-                if cap == math.inf:
-                    # Keep the usual uncapped path to one argmin/host transfer.
-                    nearest = distances.argmin(dim=-1).cpu().tolist()
-                    for i, j in zip(rest, nearest):
-                        buckets.setdefault((b, g, cand[j]), []).append(i)
-                else:
+                if orph:
+                    free = self._semantic_free_clusters(b, g)[:len(orph)]
+                    lanes.append((b, g, orph, free))
+
+        if lanes:
+            # Only orphan-bearing lanes participate. Padding is bounded by the
+            # flush size; no [lanes, tokens, clusters, head_dim] distance tensor.
+            width = max(len(orph) for _, _, orph, _ in lanes)
+            n_seed = max(len(free) for _, _, _, free in lanes)
+            offsets = np.full((len(lanes), width), -1, dtype=np.int64)
+            candidates = np.zeros((len(lanes), self.K_max), dtype=np.bool_)
+            seed_slots = []
+            for row, (b, g, orph, free) in enumerate(lanes):
+                offsets[row, :len(orph)] = orph
+                candidates[row, self._semantic_live_clusters(b, g) + free] = True
+                seed_slots.extend((row, c, j) for j, c in enumerate(free))
+            dev = k_raw.device
+            bg = torch.tensor([(b, g) for b, g, _, _ in lanes], device=dev)
+            bi, gi = bg.unbind(-1)
+            idx = torch.as_tensor(offsets, device=dev)
+            valid = idx >= 0
+            idx = idx.clamp_min(0)
+            x = k_raw[bi[:, None], gi[:, None], idx].float()
+            mu = self.centroid[bi, gi]  # advanced indexing owns this temporary
+            rows = torch.arange(len(lanes), device=dev)
+            picked = torch.empty((len(lanes), 0), device=dev, dtype=torch.long)
+            if n_seed:
+                novelty = s_winner[bi[:, None], gi[:, None], idx].masked_fill(~valid, -float("inf"))
+                nxt = novelty.argmax(-1)
+                picks = [nxt]
+                dist = (x - x[rows, nxt].unsqueeze(1)).square().sum(-1)
+                dist.masked_fill_(~valid, -float("inf"))
+                for _ in range(n_seed - 1):
+                    # Mask previous picks even for identical keys, so each
+                    # newly opened cluster reserves a distinct orphan token.
+                    dist.scatter_(1, nxt[:, None], -float("inf"))
+                    nxt = dist.argmax(-1)
+                    picks.append(nxt)
+                    dist = torch.minimum(dist, (x - x[rows, nxt].unsqueeze(1)).square().sum(-1))
+                picked = torch.stack(picks, dim=1)
+                sr, sc, sj = torch.tensor(seed_slots, device=dev).unbind(-1)
+                mu[sr, sc] = x[sr, picked[sr, sj]]
+
+            distances = torch.cdist(x, mu)
+            distances.masked_fill_(~torch.as_tensor(candidates, device=dev)[:, None, :], float("inf"))
+            choices = distances.argmin(-1) if cap == math.inf else distances.argsort(dim=-1, stable=True).flatten(1)
+            # One device-to-host transfer for ALL seeds and assignments. No
+            # device scalar extraction or host round trip inside a lane loop.
+            decisions = torch.cat((picked, choices), dim=1).cpu().tolist()
+            for row, (b, g, orph, free) in enumerate(lanes):
+                result = decisions[row]
+                seeded = set(result[:len(free)])
+                for c, t in zip(free, result):
+                    new_clusters.add((b, g, c))
+                    buckets[b, g, c] = [orph[t]]
+                if cap != math.inf:
                     room = {
                         c: max(0, int(cap) - self._semantic_n_total[b][g][c] - len(buckets.get((b, g, c), ())))
-                        for c in cand
+                        for c in self._semantic_live_clusters(b, g) + free
                     }
-                    ranked = distances.argsort(dim=-1, stable=True).cpu().tolist()
-                    for i, order in zip(rest, ranked):
+                for t, i in enumerate(orph):
+                    if t in seeded:
+                        continue
+                    if cap == math.inf:
+                        c = result[n_seed + t]
+                    else:
+                        start = n_seed + t * self.K_max
+                        order = result[start:start + self.K_max]
                         # ponytail: when all clusters are full, exceed the cap
                         # at the nearest one to preserve tokens; strict rejection
                         # would need a separate caller-visible overflow policy.
-                        c = next((cand[j] for j in order if room[cand[j]] > 0), cand[order[0]])
+                        c = next((c for c in order if room.get(c, 0) > 0), order[0])
                         room[c] -= 1
-                        buckets.setdefault((b, g, c), []).append(i)
+                    buckets.setdefault((b, g, c), []).append(i)
 
         jobs: list[tuple[int, int, int, tuple[int, ...]]] = []
         for (b, g, c), offsets in sorted(buckets.items()):

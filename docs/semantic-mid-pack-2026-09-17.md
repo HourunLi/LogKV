@@ -164,3 +164,77 @@ torchrun --standalone --nproc_per_node=2 -m pytest -q tests/test_log_kv_checkpoi
 第一条在 A800 上包含 bf16/Triton/Flash 前后向检查，双卡项在未使用 torchrun 时跳过；
 第二条实际运行 SHARD_GRAD_OP、Block checkpoint 和两次 micro-batch 梯度累积，
 核对各 rank 的损失、梯度及调用次数。之后使用原来的 8 卡训练命令测量完整 step。
+
+## 跨 lane 批量分配 orphan（2026-09-18）
+
+`_semantic_route_orphans_fast` 现在只收集有 orphan 的 lane，批量执行最远点选种和
+最近簇计算。种子与分配结果合并为一次 `.cpu().tolist()`，不再每个 lane 分别回传。
+临时输入按本次 flush 的最大 orphan 数补齐，距离张量为 `[活跃 lane, orphan, K]`，
+不生成额外带 head_dim 维度的四维距离张量。原有中心在整个 flush 内保持不变；
+临时种子不会提前修改真实 centroid。容量预留、满容量时保留 token、按时间提交和
+segment/pad/op-log 规则沿用原实现。
+
+第一轮 checkpoint 严格复用机制不变，无需修改 YAML 或训练命令；正在运行的进程
+继续使用已加载的代码，下次启动使用第二轮实现。route/replay 的调用次数不会因
+本轮再次减少，应比较相同配置下预热后的耗时。
+
+CPU 分配微测（K=8，所有簇已满，每 lane 47 个 orphan，D=8，排除 ladder 写入）：
+
+| lane 数 | 修改前 ATen 调用 | 修改后 ATen 调用 | 修改前/后结果回传次数 |
+|---|---:|---:|---:|
+| 8 | 152 | 27 | 8 / 1 |
+| 32 | 608 | 27 | 32 / 1 |
+
+这些是操作和 `.cpu()` 调用计数，不是 GPU 耗时或整步加速倍数。Phase 1 的结果回传、
+实际新建簇和 ladder 写入仍存在；本轮没有消除全部 routing 同步和写入开销。
+与修改前函数的 8 组混合 lane CPU 差分（fp32/bf16、容量开关、8/32 lane）分配一致。
+本地相关回归 302 passed、25 skipped；新增测试覆盖不等长 lane、空/满/部分占用的簇、
+相同 key、非连续输入、两条 replay 路径及分配操作数不随 lane 数增长。
+第二轮 CUDA 尚未在本机执行，在 A800 上运行：
+
+```bash
+python -m pytest -q tests/test_log_kv_orphans.py tests/test_log_kv_checkpoint.py
+torchrun --standalone --nproc_per_node=2 -m pytest -q tests/test_log_kv_checkpoint.py -k fsdp
+```
+
+第一轮的上述单卡和双卡检查此前已由用户在目标机报告通过；第二轮需要重新验证。
+
+## routing/replay 共用 staging 减少复制（2026-09-18）
+
+本轮仅实现两项已确认的优化：
+
+- 两个提交入口保留原始 K/V 和 positions 视图，将逻辑 token 索引在 CPU 转为
+  `(batch, group, token)` 坐标后一次上传，直接 gather。不再先 reshape 整块非连续
+  K/V；位置视图也无需先展平复制。坐标索引比原方案每个选中 token 多一个 int64，
+  用来避免 K/V payload 的整块副本，不增加跨 chunk 持久缓存。
+- 无 pad 时 gather 结果直接作为 staging；有 pad 时在新分配的零 buffer 上原地写入。
+  初始 p_lo/p_hi/sum_wp 相同，复用同一份只读位置张量，写入缓存时仍进入独立字段。
+  staging 在 ladder 写入/合并时只读，centroid 的求和输入和求和顺序不变。
+
+没有引入执行计划缓存，也未修改 op-log 解析、新建簇/pad 调度或合并算法。前两轮优化
+及严格 checkpoint 复用保留，训练命令和 YAML 不变。
+
+CPU 无 pad staging 微测（batch=4、groups=8、chunk=128、D=128，非连续 K/V 及
+展开的 positions；不含 ladder 写入和 centroid 更新）：
+
+| 指标 | 修改前 | 修改后 |
+|---|---:|---:|
+| ATen 调用 | 33 | 16 |
+| clone | 3 | 0 |
+| 非原地 index_copy | 2 | 0 |
+| 原地 index_copy_ | 3 | 0 |
+
+这不是完整 replay 或训练 step 的加速倍数。与修改前实现的实际两层 Block checkpoint
+差分中，mid/无 segment、multi/有 segment、二阶 0.2/有 segment 三个配置，在两次
+micro-batch 梯度累积后损失、全部参数梯度和 cache buffers 逐位一致。
+本地完整相关回归为 308 passed、29 skipped；新增测试还覆盖 fp32/bf16、非连续 K/V、
+共享位置视图、pad 零填充、staging 不被写坏、输入不被修改，以及输出/梯度一致性。
+本轮 CUDA 测试本机未执行，目标 A800 上运行：
+
+```bash
+python -m pytest -q tests/test_log_kv_staging.py tests/test_log_kv_orphans.py tests/test_log_kv_checkpoint.py
+torchrun --standalone --nproc_per_node=2 -m pytest -q tests/test_log_kv_checkpoint.py -k fsdp
+```
+
+然后用原配置观察稳定 step 的 `route` / `replay` 时间和 `Time`。本轮仅减少复制，
+预期调用次数与第一轮后相同，不应把调用次数不变误判为没有启用。
