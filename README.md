@@ -29,3 +29,51 @@ Traceback (most recent call last):
   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/testing/_comparison.py", line 1600, in assert_close
     raise error_metas[0].to_error(msg)
 AssertionError: centroid
+
+
+
+
+[ma-user semanticLogKV]$python unused/benchmark_log_kv_updates.py --diagnose
+{"device": "NVIDIA A800-SXM4-80GB", "sequence": 32768, "chunk": 2048, "batch": 4, "groups": 8, "dim": 128, "iters": 10, "diagnose": true, "torch": "2.11.0+cu128", "cuda": "12.8"}
+Traceback (most recent call last):
+  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 68, in checked_centroid
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0,
+  File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/testing/_comparison.py", line 1600, in assert_close
+    raise error_metas[0].to_error(msg)
+AssertionError: centroid update 1, ordinal offset=0, runs=256: centroid
+Tensor-likes are not equal!
+
+Mismatched elements: 1501 / 32768 (4.6%)
+Greatest absolute difference: 0.00010472536087036133 at index (105, 107)
+Greatest relative difference: 0.019903188571333885 at index (50, 105)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 195, in <module>
+    main()
+  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 146, in main
+    cache.route_and_flush_batch(k, v, pos, positions_host=host, record_op_log=True)
+  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2887, in route_and_flush_batch
+    return self._route_and_flush_batch(*args, **kwargs)
+  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2971, in _route_and_flush_batch
+    self._semantic_route_three_phase(k_raw, v, positions, positions_host, record=record_op_log)
+  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2653, in _semantic_route_three_phase
+    self._semantic_route_orphans_fast(
+  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2809, in _semantic_route_orphans_fast
+    self._semantic_commit_joins(jobs, k_raw, v, positions, positions_host, record=record)
+  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2246, in _semantic_commit_joins
+    self._semantic_commit_joins_inner(jobs, k_raw, v, positions, positions_host, record=record)
+  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2348, in _semantic_commit_joins_inner
+    self._semantic_apply_join_plan(
+  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2505, in _semantic_apply_join_plan
+    fused.centroid(k_sel, centroid_flat, n_eff_flat, metadata, start, count)
+  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 76, in checked_centroid
+    raise AssertionError(f"{exc}\nLargest-difference inputs: {json.dumps(values)}") from exc
+AssertionError: centroid update 1, ordinal offset=0, runs=256: centroid
+Tensor-likes are not equal!
+
+Mismatched elements: 1501 / 32768 (4.6%)
+Greatest absolute difference: 0.00010472536087036133 at index (105, 107)
+Greatest relative difference: 0.019903188571333885 at index (50, 105)
+Largest-difference inputs: {"cluster": 105, "dim": 107, "old_mu": 0.5797467827796936, "sum": 162.806640625, "pre": 3814.0, "n": 292.0, "numerator": 2373.9609375, "denom": 4106.0, "actual": 0.5782734751701355, "expected": 0.5781687498092651}
