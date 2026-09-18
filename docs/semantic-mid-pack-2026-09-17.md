@@ -81,8 +81,8 @@ checkpoint 和多卡通信也未改变。减少 anchor 主要降低物化结果�
 ## 完整训练 step 计时
 
 `demo.py` 每个 optimizer step 默认输出细分 `logKV_host`，汇总该步所有梯度累积的
-micro-batch。`route` 为前向/Block checkpoint 重算时的语义 routing + flush；`replay`
-为按 op-log 重建的 flush。`plan` 为 anchor 索引计划；`pack` 为输入物化；`attn_fwd`
+micro-batch。`route` 为执行路由决策的语义 routing + flush；`replay` 为按 op-log 重建
+的 flush（包括下述优化启用后的 Block checkpoint 重算）。`plan` 为 anchor 索引计划；`pack` 为输入物化；`attn_fwd`
 包括初次前向、checkpoint 重算及 backward 内部重新求 attention；`attn_bwd` 是当前
 chunk 的 attention/打包梯度计算。plan 的计时不再混入 pack，也不会在 replay 中重算。
 `route/replay` 只统计 semantic flush，单 ladder 的普通 cache 更新不在这两项内；K=1
@@ -114,3 +114,53 @@ TensorBoard 使用 `train/logkv_host_*_s`、`train/logkv_cuda_*_s`、
 `train/step_host_*_s`、`train/step_cuda_*_s`，并记录调用次数及 `logkv_cuda_profiled`。
 启用 TensorBoard 的方式沿用现有训练配置。首次 CUDA 编译可能污染首步，建议先看预热
 后的连续 step。测试入口为 `python -m pytest -q tests/test_log_kv_timing.py`。
+
+## Block checkpoint 复用首次 routing 记录
+
+`demo.py` 在 Fabric 完成模块包装后，为现有的 Block checkpoint 安装
+`log_kv_checkpoint.py` 中的 `context_fn`。在 FSDP、activation checkpoint 开启、
+semantic K>1 的训练配置下自动启用，无需修改当前 fast YAML。启动日志应出现：
+
+```text
+LogKV checkpoint routing replay: enabled for 28 Blocks (strict, no rerouting fallback)
+```
+
+每一次 checkpoint 调用的两个上下文共享自己的记录列表，独立于其他层和 micro-batch。
+首次 forward 正常 routing，将生成的 op-log 引用交给这次 checkpoint；重算通过该日志
+replay 并重建 ladder，不重新选择 cluster、不生成第二份日志。随后的 LogKV backward
+继续使用同一日志。保存的只有已有 op-log 的引用和调用元数据，没有额外保留 Q/K/V 或
+cache 快照；生命周期由 checkpoint 计算图管理，丢弃图即可释放记录，也支持 retain_graph
+后的再次 backward。当前是 non-reentrant checkpoint，原始 autograd ctx 仍保留，
+重算的作用是恢复 saved tensors，并非必须替换成一个新 ctx。
+
+这是严格路径：缺失日志、cache/输入形状/配置不匹配会报错，不会静默重新 routing。
+安装时检查每个 Block 都已包装，并拒绝 reentrant、自定义 checkpoint 函数/上下文及
+debug 模式。没有 activation checkpoint 时不需要这项复用；普通单 ladder/K=1 不启用。
+该接口针对当前 Fabric/PyTorch 包装方式，不支持通过 torch.compile 编译整个训练图。
+
+按用户此前同配置的调用次数，预计变化为：
+
+| 计数 | 原路径 | 启用复用 |
+|---|---:|---:|
+| route_n | 13440 | 6720 |
+| replay_n | 6720 | 13440 |
+| plan_n | 14336 | 14336 |
+| attn_fwd_n | 21504 | 21504 |
+| attn_bwd_n | 7168 | 7168 |
+
+重算仍需写入/合并 ladder、生成 plan、计算 attention，所以不会消除全部 checkpoint
+开销。此前约 240 秒/step 的收益估算尚未实测，需用稳定训练 step 验证。
+
+CPU 回归（本机 Python 3.9/torch 2.6，临时加载器兼容类型注解并跳过 checkpoint I/O
+依赖）为 296 passed、21 skipped；新增 CPU 测试包含实际 Block checkpoint、两次梯度
+累积、多份未反向的图、retain_graph、日志释放、严格错误处理，以及输出/梯度/cache
+一致性和 routing 次数减半。CUDA、双卡 FSDP 本机未执行。目标机验证：
+
+```bash
+python -m pytest -q tests/test_log_kv_checkpoint.py
+torchrun --standalone --nproc_per_node=2 -m pytest -q tests/test_log_kv_checkpoint.py -k fsdp
+```
+
+第一条在 A800 上包含 bf16/Triton/Flash 前后向检查，双卡项在未使用 torchrun 时跳过；
+第二条实际运行 SHARD_GRAD_OP、Block checkpoint 和两次 micro-batch 梯度累积，
+核对各 rank 的损失、梯度及调用次数。之后使用原来的 8 卡训练命令测量完整 step。
