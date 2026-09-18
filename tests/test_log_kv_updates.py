@@ -86,20 +86,25 @@ def test_fused_ladder_carry_survivors_and_clears(dtype, B, dim, vdim):
             torch.testing.assert_close(tensor, dict(expected.named_buffers())[name], atol=0, rtol=0, msg=name)
 
 
-@CUDA
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_fused_route_replay_output_and_gradients(dtype):
-    assert kv._triton_updates() is not None
+def test_fused_route_replay_output_and_gradients(dtype, device):
+    # The CPU case also validates this fixture when CUDA tests are skipped.
+    if device == "cuda":
+        assert kv._triton_updates() is not None
     torch.manual_seed(53)
-    q = torch.randn(2, 4, 96, 8, device="cuda", dtype=dtype, requires_grad=True)
-    k = torch.randn(2, 2, 128, 8, device="cuda", dtype=dtype)[:, :, 16:112].requires_grad_()
-    v = torch.randn(2, 128, 2, 8, device="cuda", dtype=dtype).transpose(1, 2)[:, :, 16:112].requires_grad_()
+    q = torch.randn(2, 4, 96, 8, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(2, 2, 128, 8, device=device, dtype=dtype)[:, :, 16:112].requires_grad_()
+    v = torch.randn(2, 128, 2, 8, device=device, dtype=dtype).transpose(1, 2)[:, :, 16:112].requires_grad_()
     upstream = torch.randn_like(q)
 
     def run():
-        cache = cache_for("cuda", dtype)
-        out = kv.LogKVStreamTrainingAttention.apply(q, k, v, cache, 8 ** -.5, 8, 0., k)
-        grad = torch.autograd.grad(out, (q, k, v), upstream)
+        cache = cache_for(device, dtype)
+        with patch.object(cache, "route_and_flush_batch", wraps=cache.route_and_flush_batch) as route:
+            out = kv.LogKVStreamTrainingAttention.apply(q, k, v, cache, 8 ** -.5, cache.recent_size, 0., k)
+            grad = torch.autograd.grad(out, (q, k, v), upstream)
+        assert any(call.kwargs.get("record_op_log") for call in route.call_args_list)
+        assert any(call.kwargs.get("replay_op_log") is not None for call in route.call_args_list)
         return (out, *grad), {name: t.clone() for name, t in cache.named_buffers()}
 
     with patch.object(kv, "_triton_updates", return_value=None):
