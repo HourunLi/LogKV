@@ -56,6 +56,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.bias import causal_lower_right
 
 from litgpt.log_kv_timing import HOST_STATS as LOGKV_HOST_STATS, logkv_take_host_stats, logkv_timed
+from litgpt.log_kv_checkpoint import checkpoint_record_routes, checkpoint_route_replay
 
 from litgpt.log_kv_position import (
     anchor_mass_bias,
@@ -4576,6 +4577,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
     Semantic replay additionally saves O(T/train_block*S) compact integer/bool
     anchor metadata, avoiding repeated sorting and device-to-host counts. It
     never retains the per-chunk K/V payload and releases plans after backward.
+    When a Block checkpoint has LogKV routing contexts installed, its recompute
+    reuses the original op-log instead of calculating routing decisions again.
     Cost: one extra streaming pass plus the per-block backwards.
 
     Correctness:
@@ -4613,6 +4616,12 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             raise ValueError(
                 f"logKV train_block ({train_block}) must be <= recent_size ({cache.recent_size})"
             )
+        signature = (
+            q.shape, k.shape, v.shape, q.dtype, k.dtype, v.dtype, q.device,
+            scale, train_block, second_order_scale, k_raw is not None,
+            cache.semantic_anchor_mode, cache.K_max, cache.B, cache.recent_size,
+        )
+        checkpoint_log = checkpoint_route_replay(cache, signature)
         outputs: list[torch.Tensor] = []
         attention_plans = []
         # Explicit no_grad: the memory guarantee of this whole scheme rests on
@@ -4621,7 +4630,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         with torch.no_grad():
             cache.reset_parameters()
             needs_op_log = cache.semantic_clusters and cache.K_max > 1
-            if needs_op_log:
+            if needs_op_log and checkpoint_log is None:
                 cache.begin_op_log()
             # Own the flag rather than trusting the caller, and set it AFTER
             # the reset above so the cache is always empty when this runs (the
@@ -4657,11 +4666,18 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                     k[:, :, start:end],
                     v[:, :, start:end],
                     k_raw=commit_k_raw[:, :, start:end] if cache.semantic_clusters else None,
-                    record_op_log=needs_op_log,
+                    record_op_log=needs_op_log and checkpoint_log is None,
+                    replay_op_log=checkpoint_log[0] if checkpoint_log is not None else None,
+                    replay_op_log_len=checkpoint_log[1] if checkpoint_log is not None else None,
+                    replay_op_log_host=checkpoint_log[2] if checkpoint_log is not None else None,
                 )
                 start = end
-        op_log, op_log_len = cache.take_op_log() if needs_op_log else (None, None)
-        op_log_host = getattr(cache, "_last_op_log_host", None) if needs_op_log else None
+        if checkpoint_log is None:
+            op_log, op_log_len = cache.take_op_log() if needs_op_log else (None, None)
+            op_log_host = getattr(cache, "_last_op_log_host", None) if needs_op_log else None
+            checkpoint_record_routes(cache, signature, (op_log, op_log_len, op_log_host))
+        else:
+            op_log, op_log_len, op_log_host = checkpoint_log
         # Use saved tensors so autograd releases plan storage after backward
         # (and still supports retain_graph), just like the saved Q/K/V.
         plan_tensors = [tensor for plan in attention_plans if plan is not None for tensor in plan]

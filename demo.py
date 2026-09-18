@@ -32,6 +32,7 @@ import lightning as L
 from datetime import datetime
 from litgpt import Config
 from litgpt.model import GPT
+from litgpt.log_kv_checkpoint import enable_logkv_checkpoint_replay
 from litgpt.utils import get_log_kv_second_order_scale, load_checkpoint
 from litgpt.log_kv_timing import (
     CACHE_STAGES, STEP_STAGES, logkv_begin_step, logkv_take_host_stats, logkv_timed,
@@ -738,6 +739,9 @@ def main(
         fabric.print("auto_resume=True is ignored because resume_dir is set; loading resume_dir as the weight source.")
 
     model = fabric.setup_module(model)
+    if use_fsdp and activation_checkpointing and log_kv_semantic_clusters and log_kv_cluster_k_max > 1:
+        checkpoint_blocks = enable_logkv_checkpoint_replay(model, Block)
+        fabric.print(f"LogKV checkpoint routing replay: enabled for {checkpoint_blocks} Blocks (strict, no rerouting fallback)")
 
     # ── Optimizer with weight decay groups ──
     decay_params = []
