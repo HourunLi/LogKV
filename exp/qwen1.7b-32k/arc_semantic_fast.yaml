@@ -12,6 +12,7 @@ log_kv_semantic_legacy_route: null
 log_kv_second_order_scale: 0.0
 log_kv_semantic_anchor_mode: mid  # 单中心 anchor；multi 恢复 lo/mid/hi
 log_kv_semantic_pack_backend: auto  # CUDA 优先 Triton；torch 可用于数值/性能 A/B
+log_kv_profile_steps: null  # 默认仅 host 计时；例如 [3, 4, 5] 开启指定完整 step 的 CUDA 计时
 log_kv_B: 64
 log_kv_cluster_k_max: 8
 activation_checkpointing: true  # 整个 Block 重算，避免 norm/QKV/投影激活跨层累积

@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import contextlib
 import math
-import time
 from typing import Any, NamedTuple, NoReturn
 
 import numpy as np
@@ -55,6 +54,8 @@ from torch.autograd.function import once_differentiable
 from torch.backends.cuda import SDPAParams, can_use_flash_attention
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.bias import causal_lower_right
+
+from litgpt.log_kv_timing import HOST_STATS as LOGKV_HOST_STATS, logkv_take_host_stats, logkv_timed
 
 from litgpt.log_kv_position import (
     anchor_mass_bias,
@@ -270,22 +271,6 @@ def _pair_rank1_stats(
 
 
 _EMPTY_INDEX = np.empty(0, dtype=np.int64)
-
-# Host wall-clock spent inside the LogKV cache, so a slow step can be attributed
-# instead of guessed at. These are CPU-side timings on purpose: the failure mode
-# this catches is the host failing to keep the GPU fed (index building, syncs),
-# which a CUDA-event timer would hide. Two perf_counter() calls per invocation
-# are noise next to the millisecond-scale work they bracket.
-LOGKV_HOST_STATS: dict[str, float] = {"route_s": 0.0, "route_n": 0, "attn_s": 0.0, "attn_n": 0}
-
-
-def logkv_take_host_stats() -> dict[str, float]:
-    """Read and reset the host-time counters (call once per training step)."""
-    out = dict(LOGKV_HOST_STATS)
-    LOGKV_HOST_STATS.update({"route_s": 0.0, "route_n": 0, "attn_s": 0.0, "attn_n": 0})
-    return out
-
-
 
 def _spans_to_index_array(spans: list[tuple[int, int]]) -> np.ndarray:
     """Concatenate half-open ``[start, stop)`` ranges into one int64 array."""
@@ -2754,12 +2739,9 @@ class LogStructuredKVCache(nn.Module):
 
     def route_and_flush_batch(self, *args, **kwargs) -> None:
         self._mid_decode_state = None
-        _t0 = time.perf_counter()
-        try:
+        replay = any(kwargs.get(name) is not None for name in ("replay_op_log", "replay_op_log_host"))
+        with logkv_timed("replay" if replay else "route"):
             return self._route_and_flush_batch(*args, **kwargs)
-        finally:
-            LOGKV_HOST_STATS["route_s"] += time.perf_counter() - _t0
-            LOGKV_HOST_STATS["route_n"] += 1
 
     def _route_and_flush_batch(
         self,
@@ -3683,6 +3665,7 @@ class LogStructuredKVCache(nn.Module):
     # Build attention state: slot-granular, O(recent + B*log N) entries
     # ------------------------------------------------------------------
 
+    @logkv_timed("plan")
     def _semantic_attention_plan(self):
         """Immutable slot indices and anchor metadata; no K/V payload is retained."""
         if self.semantic_anchor_mode == "mid":
@@ -3840,12 +3823,10 @@ class LogStructuredKVCache(nn.Module):
         )
 
     def get_attention_state(self, with_stats: bool = False, *, plan=None) -> CacheAttentionState:
-        _t0 = time.perf_counter()
-        try:
+        if self.semantic_clusters and plan is None:
+            plan = self._semantic_attention_plan()
+        with logkv_timed("pack"):
             return self._get_attention_state(with_stats=with_stats and self.allocate_second_order, plan=plan)
-        finally:
-            LOGKV_HOST_STATS["attn_s"] += time.perf_counter() - _t0
-            LOGKV_HOST_STATS["attn_n"] += 1
 
     def _get_attention_state(self, with_stats: bool = False, *, plan=None) -> CacheAttentionState:
         """Assemble the cache state for ``log_kv_slot_attention``.
@@ -4100,6 +4081,7 @@ class LogStructuredKVCache(nn.Module):
 # ======================================================================
 
 
+@logkv_timed("pack")
 def append_exact_tokens(
     state: CacheAttentionState,
     k_new: torch.Tensor,    # (B, G, n, k_dim) exact tokens, appended in time order
@@ -4209,6 +4191,7 @@ def _slot_flash_attention(q, slot_k, slot_v, slot_w, scale, lam, causal_tail, sl
     return out[..., :slot_v.size(-1)]
 
 
+@logkv_timed("attn_fwd")
 def log_kv_slot_attention(
     q: torch.Tensor,        # (B, nh, T_q, k_dim) full post-RoPE queries
     slot_k: torch.Tensor,   # (B, G, S, k_dim) merged slot keys (position included)
@@ -4459,6 +4442,7 @@ def _mid_flash_supported(cache, q, k, v, scale):
     return cache._mid_flash_support[1]
 
 
+@logkv_timed("attn_fwd")
 def _packed_flash_attention(q, k, v, scale, causal_tail, v_dim):
     with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
         out = F.scaled_dot_product_attention(
@@ -4482,33 +4466,30 @@ def _mid_chunk_attention(cache, q, k, v, scale, causal_tail, plan, reuse_prefix)
         return None
     from litgpt.log_kv_pack import pack_mid_kv
 
-    t0 = time.perf_counter()
-    try:
-        dim = ((max(q.size(-1) + 1, v.size(-1)) + 7) // 8) * 8
-        buffers, skip_pooled, recent_start = None, False, 0
-        # A mutable workspace is safe only for immediate inference consumption.
-        reuse = reuse_prefix and not torch.is_grad_enabled() and q.size(2) <= 2 and not k.requires_grad and not v.requires_grad
-        if reuse:
-            key = (k.device, k.dtype, dim, cache.semantic_pack_backend,
-                   _rope_cache_key(cache.cos_cache), _rope_cache_key(cache.sin_cache))
-            saved = cache._mid_decode_state
-            if saved is not None and saved[0] == key:
-                _, plan, buffers, recent_start = saved
-                skip_pooled = True
-            else:
-                plan = cache._semantic_attention_plan() if plan is None else plan
-                capacity = plan[0].size(-1) + cache.recent_size + max(2, k.size(2))
-                buffers = (k.new_empty(*k.shape[:2], capacity, dim), v.new_empty(*v.shape[:2], capacity, dim))
+    dim = ((max(q.size(-1) + 1, v.size(-1)) + 7) // 8) * 8
+    buffers, skip_pooled, recent_start = None, False, 0
+    # A mutable workspace is safe only for immediate inference consumption.
+    reuse = reuse_prefix and not torch.is_grad_enabled() and q.size(2) <= 2 and not k.requires_grad and not v.requires_grad
+    if reuse:
+        key = (k.device, k.dtype, dim, cache.semantic_pack_backend,
+               _rope_cache_key(cache.cos_cache), _rope_cache_key(cache.sin_cache))
+        saved = cache._mid_decode_state
+        if saved is not None and saved[0] == key:
+            _, plan, buffers, recent_start = saved
+            skip_pooled = True
         else:
             plan = cache._semantic_attention_plan() if plan is None else plan
+    else:
+        plan = cache._semantic_attention_plan() if plan is None else plan
+    with logkv_timed("pack"):
+        if reuse and buffers is None:
+            capacity = plan[0].size(-1) + cache.recent_size + max(2, k.size(2))
+            buffers = (k.new_empty(*k.shape[:2], capacity, dim), v.new_empty(*v.shape[:2], capacity, dim))
         ka, va = pack_mid_kv(cache, plan, k, v, dim, buffers=buffers, skip_pooled=skip_pooled, recent_start=recent_start)
         if reuse:
             cache._mid_decode_state = (key, plan, buffers, cache.recent_count)
         qa = F.pad(q, (0, dim - q.size(-1)))
         qa[..., q.size(-1)] = 1.0 / scale
-    finally:
-        LOGKV_HOST_STATS["attn_s"] += time.perf_counter() - t0
-        LOGKV_HOST_STATS["attn_n"] += 1
     return _packed_flash_attention(qa, ka, va, scale, causal_tail, v.size(-1))
 
 
@@ -4661,9 +4642,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                 end = min(start + train_block, T)
                 plan = None
                 if cache.semantic_clusters:
-                    plan_start = time.perf_counter()
                     plan = cache._semantic_attention_plan()
-                    LOGKV_HOST_STATS["attn_s"] += time.perf_counter() - plan_start
                 attention_plans.append(plan)
                 outputs.append(
                     log_kv_chunk_attention(
@@ -4740,7 +4719,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                     cache, q_b, k_b, v_b, scale, second_order_scale,
                     attention_plan=saved[plan_offset:plan_offset + 4] if ctx.has_attention_plans else None,
                 )
-            g_q, g_k, g_v = torch.autograd.grad(y_b, (q_b, k_b, v_b), grad_y[:, :, start:end])
+            with logkv_timed("attn_bwd"):
+                g_q, g_k, g_v = torch.autograd.grad(y_b, (q_b, k_b, v_b), grad_y[:, :, start:end])
             dq[:, :, start:end] = g_q
             dk[:, :, start:end] = g_k
             dv[:, :, start:end] = g_v

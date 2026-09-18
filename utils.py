@@ -178,15 +178,15 @@ def _coerce_cli_value(value: str, param: inspect.Parameter) -> Any:
     default = param.default
     annotation = "" if param.annotation is inspect.Parameter.empty else str(param.annotation)
 
+    # Container annotations such as list[int] also contain scalar type names.
+    if isinstance(default, (dict, list, tuple)) or "dict" in annotation or "list" in annotation or "tuple" in annotation:
+        return yaml.safe_load(value)
     if isinstance(default, bool) or "bool" in annotation:
         return _str_to_bool(value)
     if (isinstance(default, int) and not isinstance(default, bool)) or "int" in annotation:
         return int(value)
     if isinstance(default, float) or "float" in annotation:
         return float(value)
-    if isinstance(default, (dict, list, tuple)) or "dict" in annotation or "list" in annotation or "tuple" in annotation:
-        return yaml.safe_load(value)
-
     return value
 
 
