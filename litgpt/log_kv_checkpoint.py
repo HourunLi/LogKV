@@ -1,8 +1,9 @@
 """Bind routing logs to one non-reentrant Block checkpoint invocation.
 
 The checkpoint frame owns the records, not a layer-global queue. It retains no
-Q/K/V or cache snapshots; op-log tensors are shared with the original autograd
-context, together with CPU-only parsed replay schedules. Recompute contexts can
+full Q/K/V or ladder snapshots; op-log tensors are shared with the original
+context, together with CPU replay schedules. When enabled, a fifth record owns
+small input summaries and routing-state updates on their original device. Recompute contexts can
 be entered again for retain_graph backward.
 """
 

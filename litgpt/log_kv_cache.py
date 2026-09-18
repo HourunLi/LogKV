@@ -43,6 +43,7 @@ Compute: O(recent_size + B·log(N/2)) per query — no Θ(N) term.
 from __future__ import annotations
 
 import contextlib
+from copy import deepcopy
 import math
 from array import array
 from functools import lru_cache
@@ -103,6 +104,32 @@ class _SemanticReplayPlans:
             raise RuntimeError("semantic replay plans require an existing CPU op-log")
         self.host_log = tuple(tuple(tuple(map(tuple, lane)) for lane in batch) for batch in host_log)
         self.plans = {}
+
+
+class _SemanticReplayUpdates:
+    """One training invocation's CPU schedule and detached device updates.
+
+    Distinct from CPU-only _SemanticReplayPlans: these payloads intentionally
+    reuse this forward's K/V, never another input or inference invocation.
+    """
+
+    def __init__(self, flushes=None, tensors=None):
+        self.flushes = {} if flushes is None else flushes
+        self.tensors = [] if tensors is None else tensors
+
+    def wait(self, device):
+        if device.type == "cuda":
+            stream = torch.cuda.current_stream(device)
+            for record in self.flushes.values():
+                if record[-1] is not None:
+                    stream.wait_event(record[-1])
+
+    def save(self, tensor):
+        if tensor is None:
+            return None
+        index = len(self.tensors)
+        self.tensors.append(tensor.detach().clone())
+        return index
 
 
 class _SemanticTreeCluster(NamedTuple):
@@ -375,6 +402,9 @@ class LogStructuredKVCache(nn.Module):
         semantic_legacy_route: bool = False,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
+        semantic_centroid_backend: str = "sequential",
+        semantic_summary_size: int = 1,
+        semantic_replay_updates: bool = False,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
         rope_n_elem: int | None = None,
@@ -405,6 +435,21 @@ class LogStructuredKVCache(nn.Module):
             raise ValueError(f"cluster_k_max must be >= 1, got {cluster_k_max}")
         if self.semantic_clusters and self.B < 2:
             raise ValueError(f"semantic LogKV requires B >= 2, got {self.B}")
+        if semantic_centroid_backend not in ("sequential", "parallel"):
+            raise ValueError("semantic_centroid_backend must be sequential or parallel")
+        if isinstance(semantic_summary_size, bool) or int(semantic_summary_size) != semantic_summary_size or not 1 <= semantic_summary_size <= 256:
+            raise ValueError("semantic_summary_size must be an integer in [1, 256]")
+        self.semantic_centroid_backend = semantic_centroid_backend
+        self.semantic_summary_size = int(semantic_summary_size)
+        self.semantic_replay_updates = bool(semantic_replay_updates)
+        if self.semantic_summary_size > 1 or self.semantic_replay_updates:
+            if not self.semantic_clusters or self.K_max <= 1 or semantic_legacy_route or semantic_cluster_chunk_size:
+                raise ValueError("summary/update replay requires fast three-phase semantic routing with K > 1")
+        if self.semantic_summary_size > 1 and seg_gap_max is not None and math.isfinite(seg_gap_max):
+            raise ValueError("semantic summaries require seg_gap_max=None; segment alignment uses token entries")
+        self._active_updates = None
+        self._update_actions = None
+        self._replaying_updates = False
         self.recent_size = recent_size if recent_size > 0 else 2
         # Explicit raise (not assert): must survive `python -O`.
         if self.recent_size < 2:
@@ -755,6 +800,8 @@ class LogStructuredKVCache(nn.Module):
     @second_order.setter
     def second_order(self, value: bool) -> None:
         value = bool(value)
+        if value and self.semantic_summary_size > 1:
+            raise ValueError("semantic summaries require second_order_scale=0")
         if value != self._second_order and self._has_compacted_levels():
             raise RuntimeError(
                 f"LogStructuredKVCache: cannot change `second_order` "
@@ -1262,6 +1309,10 @@ class LogStructuredKVCache(nn.Module):
         counts, so none of it costs a device sync. Indices are accumulated as
         ranges and moved once per level (see `_semantic_index_tensors`).
         """
+        if self._update_actions is not None:
+            self._update_actions.append(("append", (tuple(lanes), tuple(counts)),
+                                         tuple(self._active_updates.save(x) for x in block)))
+
         self._mid_decode_state = None
         active = [i for i in range(len(lanes)) if counts[i] > 0]
         if not active:
@@ -1442,6 +1493,8 @@ class LogStructuredKVCache(nn.Module):
             ell += 1
 
     def _semantic_clear_cluster(self, b: int, g: int, c: int) -> None:
+        if self._update_actions is not None:
+            self._update_actions.append(("clear", (b, g, c), ()))
         self._mid_decode_state = None
         self.level_k[b, g, c].zero_()
         self.level_v[b, g, c].zero_()
@@ -2399,6 +2452,45 @@ class LogStructuredKVCache(nn.Module):
             runs, [], total, k_raw, v, positions,
         )
 
+    def _semantic_summarize_block(self, block, counts):
+        """Pool consecutive same-cluster tokens within this flush, never across lanes.
+
+        ponytail: tail groups are committed immediately; cross-flush pending
+        groups would add mutable inference state for little maintenance saving.
+        """
+        if self.semantic_summary_size == 1:
+            return block, counts
+        if self.second_order:
+            raise ValueError("semantic summaries currently require second_order_scale=0")
+        size = self.semantic_summary_size
+        starts, lengths, summary_counts = [], [], []
+        offset = 0
+        for count in counts:
+            summary_counts.append((count + size - 1) // size)
+            for begin in range(0, count, size):
+                starts.append(offset + begin)
+                lengths.append(min(size, count - begin))
+            offset += count
+        meta = torch.tensor([starts, lengths], device=block[0].device, dtype=torch.int64)
+        start, length = meta.unbind(0)
+        local = torch.arange(size, device=meta.device)
+        valid = local[None, :] < length[:, None]
+        index = (start[:, None] + local).clamp_max(offset - 1)
+        w = block[2][index] * valid
+        mass = w.sum(1)
+        denom = mass.clamp_min(1).unsqueeze(-1)
+        k = (block[0][index].float() * w[..., None]).sum(1) / denom
+        v = (block[1][index].float() * w[..., None]).sum(1) / denom
+        # Raw JOIN inputs have unit mass and no pads (validated at construction).
+        lo = block[8].index_select(0, start)
+        hi = block[9].index_select(0, start + length - 1)
+        sum_wp = (block[10][index] * valid).sum(1)
+        order = block[11].index_select(0, start)
+        k, v = k.to(block[0].dtype), v.to(block[1].dtype)
+        return (k, v, mass,
+                *self._empty_stats(k, v, mass), lo, hi, sum_wp, order,
+                torch.zeros_like(mass, dtype=torch.bool)), summary_counts
+
     def _semantic_apply_join_plan(
         self,
         lanes: list[tuple[int, int, int]],
@@ -2487,7 +2579,8 @@ class LogStructuredKVCache(nn.Module):
             order_t,
             block_pad,
         )
-        self._semantic_append_entries_batched(lanes, lane_counts, block)
+        block, append_counts = self._semantic_summarize_block(block, lane_counts)
+        self._semantic_append_entries_batched(lanes, append_counts, block)
 
         # Keep the increasing-token sum order: atomic/tree reductions can
         # perturb centroid routing. The CUDA loop fuses that sum with the update.
@@ -2502,7 +2595,10 @@ class LogStructuredKVCache(nn.Module):
             forgets = metadata[4].to(torch.int32).view(torch.float32)
         for _ordinal, start, count in ranges:
             if fused is not None:
-                fused.centroid(k_sel, centroid_flat, n_eff_flat, metadata, start, count)
+                if self.semantic_centroid_backend == "parallel":
+                    fused.centroid_parallel(k_sel, centroid_flat, n_eff_flat, metadata, start, count)
+                else:
+                    fused.centroid(k_sel, centroid_flat, n_eff_flat, metadata, start, count)
                 continue
             end = start + count
             ci, sel_t = metadata[0, start:end], metadata[1, start:end]
@@ -2880,11 +2976,92 @@ class LogStructuredKVCache(nn.Module):
             rounds.append((tuple(batch), tuple(specials)))
         return tuple(end_cursors), tuple(rounds)
 
+    @contextlib.contextmanager
+    def _semantic_update_context(self, updates, *, replay=False):
+        previous = self._active_updates, self._replaying_updates
+        self._active_updates, self._replaying_updates = updates, replay
+        try:
+            yield
+        finally:
+            self._active_updates, self._replaying_updates = previous
+
+    _UPDATE_DEVICE_FIELDS = ("centroid", "n_eff", "n_total", "p_hi_c", "current_segment",
+                             "level0_phase", "alive", "ward_cost")
+    _UPDATE_HOST_FIELDS = ("_semantic_alive", "_semantic_p_hi_c", "_semantic_current_segment",
+                           "_semantic_level0_phase", "_semantic_n_total", "_semantic_ward_dirty")
+
     def route_and_flush_batch(self, *args, **kwargs) -> None:
         self._mid_decode_state = None
         replay = any(kwargs.get(name) is not None for name in ("replay_op_log", "replay_op_log_host"))
         with logkv_timed("replay" if replay else "route"):
-            return self._route_and_flush_batch(*args, **kwargs)
+            updates = self._active_updates
+            if updates is None:
+                return self._route_and_flush_batch(*args, **kwargs)
+            k, v = args[:2]
+            host = kwargs.get("positions_host")
+            if host is None:
+                raise RuntimeError("update replay requires CPU flush positions; no device readback is allowed")
+            if len(host) != k.size(0) or any(len(row) != k.size(2) for row in host):
+                raise RuntimeError("update replay CPU positions do not match the flush shape")
+            key = tuple(tuple(row) for row in host)
+            signature = (k.shape, v.shape, k.dtype, v.dtype, k.device,
+                         self.semantic_summary_size, self.semantic_centroid_backend, self.second_order,
+                         self.K_max, self.B, self.L_alloc, self.recent_size, self.semantic_flush_granularity)
+            if self._replaying_updates:
+                if not replay or key not in updates.flushes:
+                    raise RuntimeError("missing semantic update record; rerouting is not allowed")
+                expected, actions, state, host_state, starts, ends, ready = updates.flushes[key]
+                cursor = getattr(self, "_op_replay_cursor_host", None)
+                if cursor is None:
+                    cursor = [[0] * self.n_groups for _ in range(self.batch_size)]
+                if cursor != starts:
+                    raise RuntimeError("semantic update replay flushes are out of order")
+                if signature != expected:
+                    raise RuntimeError("semantic update record does not match this flush/configuration")
+                if ready is not None:
+                    # Device-side wait only. No CPU synchronization or offload.
+                    stream = torch.cuda.current_stream(k.device)
+                    stream.wait_event(ready)
+                with self._semantic_deferred_scalars():
+                    for kind, metadata, indices in actions:
+                        if kind == "clear":
+                            self._semantic_clear_cluster(*metadata)
+                        else:
+                            block = tuple(updates.tensors[i] if i is not None else None for i in indices)
+                            if ready is not None:
+                                for tensor in block:
+                                    if tensor is not None:
+                                        tensor.record_stream(stream)
+                            self._semantic_append_entries_batched(*metadata, block)
+                for name, index in zip(self._UPDATE_DEVICE_FIELDS, state):
+                    tensor = updates.tensors[index]
+                    if ready is not None:
+                        tensor.record_stream(stream)
+                    getattr(self, name).copy_(tensor)
+                for name, value in zip(self._UPDATE_HOST_FIELDS, host_state):
+                    setattr(self, name, deepcopy(value))
+                self._op_replay_cursor_host = deepcopy(ends)
+                return
+            if replay or key in updates.flushes:
+                raise RuntimeError("duplicate or incorrectly bound semantic update recording")
+            if kwargs.get("record_op_log") and self.op_log is None:
+                self.begin_op_log()
+            if not kwargs.get("record_op_log"):
+                raise RuntimeError("semantic update recording requires record_op_log=True")
+            starts = deepcopy(self._op_log_len_host)
+            self._update_actions = []
+            try:
+                self._route_and_flush_batch(*args, **kwargs)
+                state = tuple(updates.save(getattr(self, name)) for name in self._UPDATE_DEVICE_FIELDS)
+                host_state = tuple(deepcopy(getattr(self, name)) for name in self._UPDATE_HOST_FIELDS)
+                ready = None
+                if k.is_cuda:
+                    ready = torch.cuda.Event()
+                    ready.record(torch.cuda.current_stream(k.device))
+                updates.flushes[key] = (signature, tuple(self._update_actions), state, host_state, starts,
+                                       deepcopy(self._op_log_len_host), ready)
+            finally:
+                self._update_actions = None
 
     def _route_and_flush_batch(
         self,
@@ -2901,6 +3078,8 @@ class LogStructuredKVCache(nn.Module):
     ) -> None:
         if not self.semantic_clusters:
             raise RuntimeError("route_and_flush_batch is only valid for semantic LogKV")
+        if self.semantic_summary_size > 1 and self.second_order:
+            raise ValueError("semantic summaries require second_order_scale=0")
         if replay_plans is not None and replay_op_log is None:
             raise RuntimeError("semantic replay plans require the matching op-log; rerouting is not allowed")
         if record_op_log and self.op_log is None:
@@ -4730,14 +4909,18 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             q.shape, k.shape, v.shape, q.dtype, k.dtype, v.dtype, q.device,
             scale, train_block, second_order_scale, k_raw is not None,
             cache.semantic_anchor_mode, cache.K_max, cache.B, cache.recent_size,
+            cache.semantic_summary_size, cache.semantic_centroid_backend, cache.semantic_replay_updates,
         )
         checkpoint_log = checkpoint_route_replay(cache, signature)
+        updates = (_SemanticReplayUpdates() if checkpoint_log is None else checkpoint_log[4]) if cache.semantic_replay_updates else None
         outputs: list[torch.Tensor] = []
         attention_plans = []
         # Explicit no_grad: the memory guarantee of this whole scheme rests on
         # this pass recording nothing (Function.forward already runs detached;
         # this makes the invariant local and future-proof).
         with torch.no_grad():
+            if updates is not None:
+                updates.wait(q.device)
             cache.reset_parameters()
             needs_op_log = cache.semantic_clusters and cache.K_max > 1
             if needs_op_log and checkpoint_log is None:
@@ -4772,16 +4955,17 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                         attention_plan=plan,
                     )
                 )
-                cache.add_recent(
-                    k[:, :, start:end],
-                    v[:, :, start:end],
-                    k_raw=commit_k_raw[:, :, start:end] if cache.semantic_clusters else None,
-                    record_op_log=needs_op_log and checkpoint_log is None,
-                    replay_op_log=checkpoint_log[0] if checkpoint_log is not None else None,
-                    replay_op_log_len=checkpoint_log[1] if checkpoint_log is not None else None,
-                    replay_op_log_host=checkpoint_log[2] if checkpoint_log is not None else None,
-                    replay_plans=checkpoint_log[3] if checkpoint_log is not None else None,
-                )
+                with cache._semantic_update_context(updates, replay=checkpoint_log is not None):
+                    cache.add_recent(
+                        k[:, :, start:end],
+                        v[:, :, start:end],
+                        k_raw=commit_k_raw[:, :, start:end] if cache.semantic_clusters else None,
+                        record_op_log=needs_op_log and checkpoint_log is None,
+                        replay_op_log=checkpoint_log[0] if checkpoint_log is not None else None,
+                        replay_op_log_len=checkpoint_log[1] if checkpoint_log is not None else None,
+                        replay_op_log_host=checkpoint_log[2] if checkpoint_log is not None else None,
+                        replay_plans=checkpoint_log[3] if checkpoint_log is not None else None,
+                    )
                 start = end
         if checkpoint_log is None:
             op_log, op_log_len = cache.take_op_log() if needs_op_log else (None, None)
@@ -4789,13 +4973,18 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             replay_plans = _SemanticReplayPlans(op_log_host) if needs_op_log else None
             if replay_plans is not None:
                 op_log_host = replay_plans.host_log
-            checkpoint_record_routes(cache, signature, (op_log, op_log_len, op_log_host, replay_plans))
+            record = (op_log, op_log_len, op_log_host, replay_plans)
+            checkpoint_record_routes(cache, signature, record + ((updates,) if updates is not None else ()))
         else:
-            op_log, op_log_len, op_log_host, replay_plans = checkpoint_log
+            op_log, op_log_len, op_log_host, replay_plans = checkpoint_log[:4]
         # Use saved tensors so autograd releases plan storage after backward
         # (and still supports retain_graph), just like the saved Q/K/V.
         plan_tensors = [tensor for plan in attention_plans if plan is not None for tensor in plan]
-        ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors)
+        ctx.update_tensor_offset = 3 + int(k_raw is not None) + len(plan_tensors)
+        ctx.update_flushes = updates.flushes if updates is not None else None
+        ctx.update_config = (cache.semantic_summary_size, cache.semantic_centroid_backend, cache.semantic_replay_updates)
+        ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors,
+                              *(updates.tensors if updates is not None else ()))
         ctx.has_attention_plans = cache.semantic_clusters
         ctx.cache = cache
         ctx.scale = scale
@@ -4820,6 +5009,10 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             q, k, v = saved[:3]
             k_raw = k
         cache = ctx.cache
+        if ctx.update_config != (cache.semantic_summary_size, cache.semantic_centroid_backend, cache.semantic_replay_updates):
+            raise RuntimeError("semantic update configuration changed between forward and backward")
+        updates = (_SemanticReplayUpdates(ctx.update_flushes, saved[ctx.update_tensor_offset:])
+                   if ctx.update_flushes is not None else None)
         if cache.semantic_anchor_mode != ctx.semantic_anchor_mode:
             raise RuntimeError("semantic_anchor_mode changed between forward and backward")
         scale = ctx.scale
@@ -4832,6 +5025,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
+        if updates is not None:
+            updates.wait(q.device)
         cache.reset_parameters()
         # Re-derive AFTER the reset, same reasoning and ordering as forward():
         # the replay must rebuild the cache exactly as forward built it, the
@@ -4855,7 +5050,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             dq[:, :, start:end] = g_q
             dk[:, :, start:end] = g_k
             dv[:, :, start:end] = g_v
-            with torch.no_grad():
+            with torch.no_grad(), cache._semantic_update_context(updates, replay=True):
                 cache.add_recent(
                     k[:, :, start:end],
                     v[:, :, start:end],

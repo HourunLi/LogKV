@@ -537,6 +537,9 @@ def main(
     log_kv_semantic_legacy_route: bool = False,
     log_kv_semantic_anchor_mode: str = "multi",
     log_kv_semantic_pack_backend: str = "auto",
+    log_kv_semantic_centroid_backend: str = "sequential",
+    log_kv_semantic_summary_size: int = 1,
+    log_kv_semantic_replay_updates: bool = False,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
     # ── Eval ──
@@ -620,6 +623,9 @@ def main(
     log_kv_semantic_clusters = bool(_o("log_kv_semantic_clusters", log_kv_semantic_clusters))
     log_kv_semantic_anchor_mode = _o("log_kv_semantic_anchor_mode", log_kv_semantic_anchor_mode)
     log_kv_semantic_pack_backend = _o("log_kv_semantic_pack_backend", log_kv_semantic_pack_backend)
+    log_kv_semantic_centroid_backend = _o("log_kv_semantic_centroid_backend", log_kv_semantic_centroid_backend)
+    log_kv_semantic_summary_size = int(_o("log_kv_semantic_summary_size", log_kv_semantic_summary_size))
+    log_kv_semantic_replay_updates = bool(_o("log_kv_semantic_replay_updates", log_kv_semantic_replay_updates))
     log_kv_profile_steps = _o("log_kv_profile_steps", log_kv_profile_steps)
     if log_kv_profile_steps is not None and (
         not isinstance(log_kv_profile_steps, (list, tuple))
@@ -825,6 +831,9 @@ def main(
             log_kv_semantic_legacy_route=log_kv_semantic_legacy_route,
             log_kv_semantic_anchor_mode=log_kv_semantic_anchor_mode,
             log_kv_semantic_pack_backend=log_kv_semantic_pack_backend,
+            log_kv_semantic_centroid_backend=log_kv_semantic_centroid_backend,
+            log_kv_semantic_summary_size=log_kv_semantic_summary_size,
+            log_kv_semantic_replay_updates=log_kv_semantic_replay_updates,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -971,6 +980,9 @@ def main(
         semantic_legacy_route=log_kv_semantic_legacy_route,
         semantic_anchor_mode=log_kv_semantic_anchor_mode,
         semantic_pack_backend=log_kv_semantic_pack_backend,
+        semantic_centroid_backend=log_kv_semantic_centroid_backend,
+        semantic_summary_size=log_kv_semantic_summary_size,
+        semantic_replay_updates=log_kv_semantic_replay_updates,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
@@ -992,7 +1004,9 @@ def main(
         f"capacity_beta={log_kv_semantic_capacity_beta}, "
         f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
         f"legacy_route={log_kv_semantic_legacy_route}, "
-        f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend})"
+        f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
+        f"centroid={log_kv_semantic_centroid_backend}, summary={log_kv_semantic_summary_size}, "
+        f"replay_updates={log_kv_semantic_replay_updates})"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
