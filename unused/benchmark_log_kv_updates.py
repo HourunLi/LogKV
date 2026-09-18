@@ -52,6 +52,7 @@ def diagnose_updates(backend):
         sums = torch.segment_reduce(k.float(), "sum", lengths=lengths, unsafe=True)
         end = start + count
         ci, sel = meta[0, start:end], meta[1, start:end]
+        assert ci.unique().numel() == count, "centroid ordinal contains duplicate cluster writers"
         n = meta[3, start:end].float()
         forget = meta[4, start:end].to(torch.int32).view(torch.float32)
         pre = ne.index_select(0, ci) * forget
