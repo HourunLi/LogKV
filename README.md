@@ -17,7 +17,6 @@ step_host (inclusive): data 1.280s | forward 470.406s | backward 483.723s | opti
 logKV_cuda: route 428.523s | replay 386.891s | plan 9.894s | pack 8.190s | attn_fwd 25.967s | attn_bwd 20.847s
 step_cuda (inclusive): forward 470.211s | backward 484.018s | optimizer 0.044s
 
-28 passed, 1 skipped, 15 warnings in 50.69s
 [ma-user semanticLogKV]$python unused/benchmark_log_kv_updates.py --iters 10
 {"device": "NVIDIA A800-SXM4-80GB", "sequence": 32768, "chunk": 2048, "batch": 4, "groups": 8, "dim": 128, "iters": 10, "torch": "2.11.0+cu128", "cuda": "12.8"}
 {"variant": "torch", "phase": "route", "median_ms": 202.086, "peak_extra_MiB": 247.12, "exact_state": true}
@@ -28,4 +27,5 @@ Traceback (most recent call last):
   File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 100, in main
     torch.testing.assert_close(dict(cache.named_buffers())[field], tensor, atol=0, rtol=0, msg=field)
   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/testing/_comparison.py", line 1600, in assert_close
-    raise error_metas[0].
+    raise error_metas[0].to_error(msg)
+AssertionError: centroid
