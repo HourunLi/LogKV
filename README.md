@@ -43,9 +43,9 @@ Traceback (most recent call last):
 AssertionError: centroid update 1, ordinal offset=0, runs=256: centroid
 Tensor-likes are not equal!
 
-Mismatched elements: 1501 / 32768 (4.6%)
-Greatest absolute difference: 0.00010472536087036133 at index (105, 107)
-Greatest relative difference: 0.019903188571333885 at index (50, 105)
+Mismatched elements: 1341 / 32768 (4.1%)
+Greatest absolute difference: 7.808208465576172e-05 at index (160, 41)
+Greatest relative difference: 0.07515373080968857 at index (60, 89)
 
 The above exception was the direct cause of the following exception:
 
@@ -73,7 +73,7 @@ Traceback (most recent call last):
 AssertionError: centroid update 1, ordinal offset=0, runs=256: centroid
 Tensor-likes are not equal!
 
-Mismatched elements: 1501 / 32768 (4.6%)
-Greatest absolute difference: 0.00010472536087036133 at index (105, 107)
-Greatest relative difference: 0.019903188571333885 at index (50, 105)
-Largest-difference inputs: {"cluster": 105, "dim": 107, "old_mu": 0.5797467827796936, "sum": 162.806640625, "pre": 3814.0, "n": 292.0, "numerator": 2373.9609375, "denom": 4106.0, "actual": 0.5782734751701355, "expected": 0.5781687498092651}
+Mismatched elements: 1341 / 32768 (4.1%)
+Greatest absolute difference: 7.808208465576172e-05 at index (160, 41)
+Greatest relative difference: 0.07515373080968857 at index (60, 89)
+Largest-difference inputs: {"cluster": 160, "dim": 41, "old_mu": 1.2907462120056152, "sum": 376.7734375, "pre": 3879.0, "n": 288.0, "numerator": 5383.578125, "denom": 4167.0, "actual": 1.291877269744873, "expected": 1.2919553518295288}
