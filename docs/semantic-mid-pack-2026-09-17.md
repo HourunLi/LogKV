@@ -77,3 +77,40 @@ pooled 宽度 5079→2049，完整宽度 5335→2305。它验证了 anchor 数�
 因为该项需要先用目标模型的实际长度差异判断收益。固定 ladder 容量、LM-head loss
 checkpoint 和多卡通信也未改变。减少 anchor 主要降低物化结果和 attention 的开销，
 不直接缩小底层固定 ladder buffer。
+
+## 完整训练 step 计时
+
+`demo.py` 每个 optimizer step 默认输出细分 `logKV_host`，汇总该步所有梯度累积的
+micro-batch。`route` 为前向/Block checkpoint 重算时的语义 routing + flush；`replay`
+为按 op-log 重建的 flush。`plan` 为 anchor 索引计划；`pack` 为输入物化；`attn_fwd`
+包括初次前向、checkpoint 重算及 backward 内部重新求 attention；`attn_bwd` 是当前
+chunk 的 attention/打包梯度计算。plan 的计时不再混入 pack，也不会在 replay 中重算。
+`route/replay` 只统计 semantic flush，单 ladder 的普通 cache 更新不在这两项内；K=1
+无 op-log 的直接写入仍计入 route。旧 fallback 的 attention 输入扩维仍计入 attn_fwd。
+
+另一行 `step_host (inclusive)` 汇总 data、整个模型 forward、整个模型 backward、
+optimizer。这些父级范围包含 LogKV 子项，不可把两行相加。forward 包含 loss.item()
+带来的等待；backward 包含 checkpoint 重算及 FSDP 等待。剩余时间不能直接解释成
+某一个 GPU 算子的耗时。`Time` 采用单调时钟，覆盖完整梯度累积和 optimizer 提交，
+排除步间日志/checkpoint 保存；普通 step 不为计时额外同步 CUDA，因此不是严格的
+GPU 完成时间，不能直接与此前含 checkpoint 保存的 Time 混用。
+
+默认 `log_kv_profile_steps: null` 不创建 CUDA events。需要采样时，在实际使用的 YAML
+设为下面的值，或保留 null 并在启动命令追加 `--log_kv_profile_steps '[3,4,5]'`：
+
+```yaml
+log_kv_profile_steps: [3, 4, 5]
+```
+
+编号从 1 开始，指日志中的全局 optimizer Step；恢复训练时也使用全局编号。选中 step
+额外输出 `logKV_cuda` 和 `step_cuda (inclusive)`，只在 step 结束统一 synchronize，
+不逐 chunk/阶段 synchronize。这是当前流上的 CUDA event 时间跨度，可能包含 GPU
+空闲、CPU 提交间隙和依赖/通信等待，不是 profiler 的纯 kernel 执行时间；其他 CUDA
+流的独立工作也不能由它精确归因。不能将 host 与 CUDA 时间相加。采样会增加 event
+记录、内存及同步开销，速度对照应同时保留相邻未采样 step。
+
+所有 rank 都采样，控制台与新增 TensorBoard 指标只记录 rank 0，不做跨 rank 求和。
+TensorBoard 使用 `train/logkv_host_*_s`、`train/logkv_cuda_*_s`、
+`train/step_host_*_s`、`train/step_cuda_*_s`，并记录调用次数及 `logkv_cuda_profiled`。
+启用 TensorBoard 的方式沿用现有训练配置。首次 CUDA 编译可能污染首步，建议先看预热
+后的连续 step。测试入口为 `python -m pytest -q tests/test_log_kv_timing.py`。

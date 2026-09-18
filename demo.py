@@ -23,6 +23,7 @@ import inspect
 import shutil
 import glob
 import tempfile
+import time
 from pathlib import Path
 import yaml
 from dataclasses import asdict
@@ -32,7 +33,9 @@ from datetime import datetime
 from litgpt import Config
 from litgpt.model import GPT
 from litgpt.utils import get_log_kv_second_order_scale, load_checkpoint
-from litgpt.log_kv_cache import logkv_take_host_stats
+from litgpt.log_kv_timing import (
+    CACHE_STAGES, STEP_STAGES, logkv_begin_step, logkv_take_host_stats, logkv_timed,
+)
 import random
 import numpy as np
 from lightning.fabric.loggers import TensorBoardLogger
@@ -533,6 +536,7 @@ def main(
     log_kv_semantic_legacy_route: bool = False,
     log_kv_semantic_anchor_mode: str = "multi",
     log_kv_semantic_pack_backend: str = "auto",
+    log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
@@ -615,6 +619,13 @@ def main(
     log_kv_semantic_clusters = bool(_o("log_kv_semantic_clusters", log_kv_semantic_clusters))
     log_kv_semantic_anchor_mode = _o("log_kv_semantic_anchor_mode", log_kv_semantic_anchor_mode)
     log_kv_semantic_pack_backend = _o("log_kv_semantic_pack_backend", log_kv_semantic_pack_backend)
+    log_kv_profile_steps = _o("log_kv_profile_steps", log_kv_profile_steps)
+    if log_kv_profile_steps is not None and (
+        not isinstance(log_kv_profile_steps, (list, tuple))
+        or any(type(step) is not int or step < 1 for step in log_kv_profile_steps)
+    ):
+        raise ValueError("log_kv_profile_steps must contain positive, one-based optimizer step numbers")
+    profile_steps = set(log_kv_profile_steps or [])
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
     log_kv_seg_eta = float(_o("log_kv_seg_eta", log_kv_seg_eta))
@@ -982,7 +993,12 @@ def main(
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
     optimizer.zero_grad(set_to_none=True)
-    step_start_time = datetime.now()
+    step_active = False
+    fabric.print(
+        f"LogKV timing: host counters every optimizer step; CUDA profile steps={sorted(profile_steps)}. "
+        "Console/TensorBoard timings are rank 0 only. CUDA spans include stream waits; "
+        "forward/backward totals contain the LogKV breakdown."
+    )
     step_stats = MicroStepMeanStats()
     if global_step > 0:
         fabric.print(f"Continuing from global_step={global_step}; target max_steps={max_steps}.")
@@ -996,8 +1012,15 @@ def main(
     loader_iter = iter(dataloader)
 
     while global_step < max_steps and not training_finished:
+        if not step_active:
+            step_start_time = time.perf_counter()
+            logkv_begin_step(profile_cuda=global_step + 1 in profile_steps, device=fabric.device)
+            step_active = True
         try:
-            train_data = next(loader_iter)
+            with logkv_timed("data", cuda=False):
+                train_data = next(loader_iter)
+                inputs = train_data[:, 0:context_length].contiguous().long()
+                targets = train_data[:, 1:context_length + 1].contiguous().long()
         except StopIteration:
             data_epoch += 1
             if data_epoch > num_epochs:
@@ -1006,8 +1029,6 @@ def main(
             loader_iter = iter(dataloader)
             continue
 
-        inputs = train_data[:, 0:context_length].contiguous().long()
-        targets = train_data[:, 1:context_length + 1].contiguous().long()
         is_accumulating = (micro_batch_idx + 1) % gradient_accumulation_steps != 0
         micro_batch_idx += 1
         current_second_order_scale = get_log_kv_second_order_scale(
@@ -1022,39 +1043,33 @@ def main(
             # low-memory Function streams the forward without a graph and
             # replays block-by-block in backward, so per-layer activation
             # memory is O(T + train_block*S) instead of the naive O(T/2*S).
-            loss = model(inputs, targets=targets, loss_chunk_size=entropy_chunk_size)
-            # Feed the per-micro-batch loss into the step aggregator; without this
-            # step_stats.averages() is always empty and neither the console line
-            # nor TensorBoard ever shows the training loss.
-            step_stats.accumulate(loss=loss.detach().item())
+            with logkv_timed("forward"):
+                loss = model(inputs, targets=targets, loss_chunk_size=entropy_chunk_size)
+                step_stats.accumulate(loss=loss.detach().item())
 
             loss = loss / gradient_accumulation_steps
-            fabric.backward(loss)
+            with logkv_timed("backward"):
+                fabric.backward(loss)
 
         if not is_accumulating:
             current_lr = get_lr(global_step, total_steps, warmup_steps, learning_rate, min_lr)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = current_lr
 
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            with logkv_timed("optimizer"):
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
+            kv = logkv_take_host_stats()  # CUDA synchronization only on selected steps.
+            step_time = time.perf_counter() - step_start_time
             now = datetime.now()
-            step_time = (now - step_start_time).total_seconds()
-            step_start_time = now
             avgs = step_stats.averages()
             metrics_txt = " | ".join(f"{k}: {v:.4f}" for k, v in sorted(avgs.items()))
             if metrics_txt:
                 metrics_txt = metrics_txt + " | "
-            # Host seconds inside the LogKV cache. A step that is slow because the
-            # CPU cannot keep the GPU fed shows up here; one that is slow for
-            # GPU reasons does not. Cheap enough to always report.
-            kv = logkv_take_host_stats()
-            kv_txt = (
-                f"logKV_host: route {kv['route_s']:.1f}s/{int(kv['route_n'])} "
-                f"+ attn_state {kv['attn_s']:.1f}s/{int(kv['attn_n'])} "
-                f"= {100.0 * (kv['route_s'] + kv['attn_s']) / max(step_time, 1e-9):.0f}% | "
-            )
+            kv_txt = "logKV_host: " + " + ".join(
+                f"{stage} {kv[stage + '_s']:.3f}s/{kv[stage + '_n']}" for stage in CACHE_STAGES
+            ) + " | "
             fabric.print(
                 f"[{now.strftime('%H:%M:%S')}] "
                 f"Epoch {data_epoch} | Step {global_step + 1} | "
@@ -1063,8 +1078,26 @@ def main(
                 f"{kv_txt}"
                 f"Time: {step_time:.2f}s"
             )
-            fabric.log("train/logkv_host_route_s", kv["route_s"], step=global_step + 1)
-            fabric.log("train/logkv_host_attn_state_s", kv["attn_s"], step=global_step + 1)
+            fabric.print("step_host (inclusive): " + " | ".join(
+                f"{stage} {kv[stage + '_s']:.3f}s" for stage in STEP_STAGES
+            ))
+            if kv["cuda_profiled"]:
+                fabric.print("logKV_cuda: " + " | ".join(
+                    f"{stage} {kv[stage + '_cuda_s']:.3f}s" for stage in CACHE_STAGES
+                ))
+                fabric.print("step_cuda (inclusive): " + " | ".join(
+                    f"{stage} {kv[stage + '_cuda_s']:.3f}s" for stage in STEP_STAGES if stage != "data"
+                ))
+            timing_metrics = {"train/step_host_s": step_time, "train/logkv_cuda_profiled": int(kv["cuda_profiled"])}
+            for stage in CACHE_STAGES + STEP_STAGES:
+                prefix = "logkv" if stage in CACHE_STAGES else "step"
+                timing_metrics[f"train/{prefix}_host_{stage}_s"] = kv[f"{stage}_s"]
+                timing_metrics[f"train/{prefix}_{stage}_calls"] = kv[f"{stage}_n"]
+                if kv["cuda_profiled"] and stage != "data":
+                    timing_metrics[f"train/{prefix}_cuda_{stage}_s"] = kv[f"{stage}_cuda_s"]
+            timing_metrics["train/logkv_host_attn_state_s"] = kv["attn_s"]
+            if fabric.global_rank == 0:
+                fabric.log_dict(timing_metrics, step=global_step + 1)
             for name, val in avgs.items():
                 fabric.log(f"train/{name}", val, step=global_step + 1)
             fabric.log("train/learning_rate", current_lr, step=global_step + 1)
@@ -1072,6 +1105,7 @@ def main(
 
             step_stats.reset()
             global_step += 1
+            step_active = False
 
             if global_step >= max_steps:
                 fabric.print(f"Reached max_steps={max_steps}. Training complete.")
@@ -1097,6 +1131,10 @@ def main(
                     atomic_model=True,
                 )
                 fabric.print(f"Latest checkpoint updated at {latest_save_path}")
+
+    # Discard an incomplete accumulation window before any final save/evaluation.
+    if step_active:
+        logkv_take_host_stats()
 
     # ── Final save ──
     if save_ckpt:
