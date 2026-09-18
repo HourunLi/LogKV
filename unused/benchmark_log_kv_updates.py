@@ -9,6 +9,7 @@ Compilation and cache restoration are excluded; this is not full-step throughput
 import argparse
 from contextlib import contextmanager
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import statistics
@@ -24,6 +25,9 @@ import litgpt.log_kv_cache as kv
 
 
 def assert_buffers(actual, expected, context):
+    for field in ("_semantic_counts", "_semantic_alive", "_semantic_p_hi_c",
+                  "_semantic_n_total", "_semantic_current_segment", "_semantic_level0_phase"):
+        assert getattr(actual, field) == getattr(expected, field), f"{context}: host mirror {field}"
     buffers = dict(actual.named_buffers())
     for field, tensor in expected.named_buffers():
         if not field.startswith("op_log"):
@@ -137,7 +141,10 @@ def main():
         log, lengths = expected.take_op_log()
         plans = kv._SemanticReplayPlans(expected._last_op_log_host)
     print(json.dumps({**vars(args), "torch": torch.__version__, "cuda": torch.version.cuda,
-                      "device": torch.cuda.get_device_name(dev) if dev.type == "cuda" else str(dev)}), flush=True)
+                      "device": torch.cuda.get_device_name(dev) if dev.type == "cuda" else str(dev),
+                      "updates_module": str(Path(fused.__file__).resolve()) if fused else None,
+                      "updates_sha256": hashlib.sha256(Path(fused.__file__).read_bytes()).hexdigest()[:16] if fused else None,
+                      "centroid_two_stage": hasattr(fused, "_centroid_commit")}), flush=True)
     if args.diagnose:
         with torch.no_grad(), diagnose_updates(fused) as calls:
             for phase in ("route", "replay"):
@@ -178,18 +185,19 @@ def main():
                     sync()
                     elapsed = (time.perf_counter() - start) * 1000
                 peak = torch.cuda.max_memory_allocated(dev) - baseline if dev.type == "cuda" else 0
-                if iteration == 0:
-                    assert_buffers(cache, expected, f"{name}/{phase}")
-                    if phase == "route":
-                        got_log, got_len = cache.take_op_log()
-                        torch.testing.assert_close(got_log, log, atol=0, rtol=0)
-                        torch.testing.assert_close(got_len, lengths, atol=0, rtol=0)
+                # Races can be intermittent: every warmup/measured result must
+                # pass, not only the first. Validation is outside the timed span.
+                assert_buffers(cache, expected, f"{name}/{phase}/iteration={iteration}")
+                if phase == "route":
+                    got_log, got_len = cache.take_op_log()
+                    torch.testing.assert_close(got_log, log, atol=0, rtol=0)
+                    torch.testing.assert_close(got_len, lengths, atol=0, rtol=0)
                 if iteration >= 3:
                     times.append(elapsed)
                     peaks.append(peak / 2**20)
                 del cache
             print(json.dumps({"variant": name, "phase": phase, "median_ms": round(statistics.median(times), 3),
-                              "peak_extra_MiB": round(max(peaks), 2), "exact_state": True}), flush=True)
+                              "peak_extra_MiB": round(max(peaks), 2), "exact_state": True, "checked_iterations": 3 + args.iters}), flush=True)
 
 
 if __name__ == "__main__":
