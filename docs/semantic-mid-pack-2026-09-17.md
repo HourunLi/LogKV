@@ -332,7 +332,7 @@ python unused/benchmark_log_kv_updates.py --iters 10
 维度、padding、非等权合并、跨层进位、顶层溢出、64 位位置以及输出/梯度。
 基准默认 batch=4、G=8、K=8、B=64、32K、chunk=2048、D=128，使用相同前缀状态，
 输出 `torch` / `triton` 的 route/replay 中位耗时和额外峰值显存。每项先预热三次，
-计时排除缓存恢复及首次编译；首轮会检查缓存状态和 route op-log 逐位一致。
+计时排除缓存恢复及首次编译；每轮（包含预热）都会在计时后检查缓存状态、CPU 镜像和 route op-log 逐位一致。
 结果是单层单 flush 的合成负载，最后仍以原命令连续完整 step 的 `Time`、`route`
 和 `replay` 为准。
 
@@ -359,3 +359,39 @@ python -m pytest -q tests/test_log_kv_updates.py
 python unused/benchmark_log_kv_updates.py --diagnose
 python unused/benchmark_log_kv_updates.py --iters 10
 ```
+
+
+### 深度复核与验证补强
+
+审查了融合算子的读写集合、64 位索引、carry 的 dtype 转换、centroid metadata
+排序、跨 ordinal 更新、CPU replay 计划和 checkpoint 记录生命周期。当前两阶段
+centroid 的计算 kernel 不写 MU/NE，提交 kernel 不读取旧 MU/NE；ladder 同样先
+读完旧槽，再写 survivor，调用点使用独立 staging。尚未发现新的生产逻辑错误；
+本机无法验证实际 CUDA 生成代码，因此不据此声称不存在 GPU 问题。
+
+本轮确认并修复的是基准验证漏洞：旧版仅第一轮校验，却给全部计时输出标记
+`exact_state=true`，会漏掉后续偶发错误。现在逐轮校验（在计时和峰值采样结束后），
+并校验 CPU 计数/cluster 镜像；新增“第二次预热故意破坏 n_eff”测试确认必须报错。
+输出添加 `checked_iterations`，以及实际加载的算子路径、源码指纹和
+`centroid_two_stage`，用于核对远端是否运行了对应实现。
+
+扩展检查包括：
+
+- B=2/3/64、fp32/bf16，随机不均匀追加与独立逐条追加路径逐位对照；权重守恒，
+  pool 的 pair/survivor 索引恰好覆盖全部行，写回与清零目标不重叠。
+- centroid 的 D=8/128、多 ordinal、非原顺序的 metadata、forget=0/0.3/1、
+  旧质量为零和抵消数值；严格比较保留。
+- GPU 用例在非默认 stream 上连续提交 32 次更新，中间不逐次同步；单独检查
+  计算 kernel 不修改旧状态，结束后比较完整结果。该用例本机跳过。
+
+本地完整回归 334 passed、55 skipped，随后新增的基准后续轮次破坏测试 1 passed；
+CPU 小规模基准逐轮校验也通过。目标机继续执行上方测试和 `--diagnose`，并可用
+NVIDIA memcheck 检查越界/非法访问：
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode 1 python -m pytest -q tests/test_log_kv_updates.py -k 'fused_ladder or centroid_feature'
+```
+
+此命令用于正确性检查，不用于计时。memcheck 不等于全局内存竞态的穷尽证明；
+NVIDIA 的 racecheck 主要针对 shared memory，也不能替代这里的逐位差分及状态隔离。
+工具范围见 [NVIDIA Compute Sanitizer 文档](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html)。

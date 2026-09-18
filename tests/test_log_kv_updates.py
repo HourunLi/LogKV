@@ -24,28 +24,31 @@ def cache_for(device, dtype, B=3, dim=8, groups=2, vdim=None):
 
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_centroid_metadata_preserves_run_order(device, dtype):
+@pytest.mark.parametrize("dim", [8, 128])
+@pytest.mark.parametrize("forget", [0., .3, 1.])
+def test_centroid_metadata_preserves_run_order(device, dtype, dim, forget):
     if device == "cuda":
         assert kv._triton_updates() is not None
-    cache = cache_for(device, dtype)
+    cache = cache_for(device, dtype, dim=dim)
+    cache.seg_forget = forget
     # Interleaved clusters, uneven runs, repeated updates, non-integral forget,
     # zero old mass, and cancellation distinguish sequential from tree sums.
     values = [2.**24, 1., -2.**24, 1., 2., 3., 4., 5., 6., 7., 8.]
-    k = torch.tensor(values, dtype=dtype, device=device).view(1, 1, -1, 1).expand(1, 1, -1, 8)
+    k = torch.tensor(values, dtype=dtype, device=device).view(1, 1, -1, 1).expand(1, 1, -1, dim)
     runs = [[0, 0, 4, False], [1, 0, 2, True], [0, 1, 3, False], [2, 0, 2, True]]
     cache.centroid.fill_(.125)
     cache.n_eff.flatten()[0] = 7.
-    expected_mu, expected_n = cache.centroid.clone().view(-1, 8), cache.n_eff.clone().flatten()
+    expected_mu, expected_n = cache.centroid.clone().view(-1, dim), cache.n_eff.clone().flatten()
     starts, start = [], 0
     for _, _, n, _ in runs:
         starts.append(start)
         start += n
     for j in sorted(range(len(runs)), key=lambda j: runs[j][0]):
         _, ci, n, new = runs[j]
-        acc = torch.zeros(8, device=device)
+        acc = torch.zeros(dim, device=device)
         for i in range(starts[j], starts[j] + n):
             acc = acc + k[0, 0, i].float()
-        pre = expected_n[ci] * (.3 if new else 1.)
+        pre = expected_n[ci] * (forget if new else 1.)
         denom = pre + n
         expected_mu[ci] = torch.where(pre > 0, (pre * expected_mu[ci] + acc) / denom, acc / n)
         expected_n[ci] = denom
@@ -54,7 +57,7 @@ def test_centroid_metadata_preserves_run_order(device, dtype):
         cache._semantic_apply_join_plan([(0, 0, 0)], [n], list(range(n)), list(range(n)),
                                         list(range(n)), runs, [], n, k, k,
                                         torch.arange(n, device=device).view(1, -1))
-    torch.testing.assert_close(cache.centroid.view(-1, 8), expected_mu, atol=0, rtol=0)
+    torch.testing.assert_close(cache.centroid.view(-1, dim), expected_mu, atol=0, rtol=0)
     torch.testing.assert_close(cache.n_eff.flatten(), expected_n, atol=0, rtol=0)
 
 
@@ -68,7 +71,7 @@ def test_fused_ladder_carry_survivors_and_clears(dtype, B, dim, vdim):
     expected = deepcopy(actual)
     lanes = [(0, 0, 0), (0, 1, 7), (1, 0, 3), (1, 1, 1)]
     # Several appends force mixed fills, cross-source pairs, survivor moves,
-    # multiple carry levels, and top overflow for the small B case.
+    # multiple carry levels; the B=64 case also reaches the allocated top level.
     for step in range(4):
         counts = [B + 1, 3 * B + step, 1, 0 if step == 0 else B - 1]
         n = sum(counts)
@@ -161,19 +164,89 @@ def test_centroid_feature_warps_read_same_old_count(dtype, dim):
     lengths = torch.full_like(rows, length)
     meta = torch.stack((rows, rows, rows * length, lengths, torch.full_like(rows, 1065353216)))
     sums = torch.segment_reduce(k.float(), "sum", lengths=lengths, unsafe=True)
-    for _ in range(32):
-        denom = expected_ne + length
-        expected_mu = (expected_ne[:, None] * expected_mu + sums) / denom[:, None]
-        expected_ne = denom
-        if _ == 0:
-            before_mu, before_ne = mu.clone(), ne.clone()
-            out_mu, out_ne = torch.empty_like(mu), torch.empty_like(ne)
-            backend._centroid[(nr,)](k, mu, ne, out_mu, out_ne, meta, nr, 0, dim, dim,
-                                     num_warps=4, enable_fp_fusion=False)
-            torch.testing.assert_close(mu, before_mu, atol=0, rtol=0)
-            torch.testing.assert_close(ne, before_ne, atol=0, rtol=0)
-            torch.testing.assert_close(out_mu, expected_mu, atol=0, rtol=0)
-            torch.testing.assert_close(out_ne, expected_ne, atol=0, rtol=0)
-        backend.centroid(k, mu, ne, meta, 0, nr)
-        torch.testing.assert_close(mu, expected_mu, atol=0, rtol=0)
-        torch.testing.assert_close(ne, expected_ne, atol=0, rtol=0)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(32):
+            denom = expected_ne + length
+            expected_mu = (expected_ne[:, None] * expected_mu + sums) / denom[:, None]
+            expected_ne = denom
+            if _ == 0:
+                before_mu, before_ne = mu.clone(), ne.clone()
+                out_mu, out_ne = torch.empty_like(mu), torch.empty_like(ne)
+                backend._centroid[(nr,)](k, mu, ne, out_mu, out_ne, meta, nr, 0, dim, dim,
+                                         num_warps=4, enable_fp_fusion=False)
+                torch.testing.assert_close(mu, before_mu, atol=0, rtol=0)
+                torch.testing.assert_close(ne, before_ne, atol=0, rtol=0)
+                torch.testing.assert_close(out_mu, expected_mu, atol=0, rtol=0)
+                torch.testing.assert_close(out_ne, expected_ne, atol=0, rtol=0)
+            backend.centroid(k, mu, ne, meta, 0, nr)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.testing.assert_close(mu, expected_mu, atol=0, rtol=0)
+    torch.testing.assert_close(ne, expected_ne, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("B", [2, 3, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype):
+    torch.manual_seed(713)
+    cache = cache_for("cpu", dtype, B=B)
+    reference = deepcopy(cache)
+    lanes = [(0, 0, 0), (0, 1, 7), (1, 0, 4), (1, 1, 1)]
+    make_indices = cache._semantic_index_tensors
+
+    def checked_indices(*args):
+        fs, fd, si, gi, pi, vi, sd, cd = result = make_indices(*args)
+        for index in (fs, fd, si, gi, sd, cd):
+            assert index.unique().numel() == index.numel()
+        assert pi.numel() % 2 == 0
+        # Each pool row participates in exactly one pair OR survives.
+        torch.testing.assert_close(torch.cat((pi, vi)).sort().values,
+                                   torch.arange(si.numel() + gi.numel()))
+        destinations = torch.cat((sd, cd))
+        assert destinations.unique().numel() == destinations.numel()
+        return result
+
+    mass = 0.
+    with patch.object(cache, "_semantic_index_tensors", side_effect=checked_indices):
+        for step in range(8):
+            counts = torch.randint(0, 3 * B + 3, (len(lanes),)).tolist()
+            n = sum(counts)
+            k, v = torch.randn(n, 8, dtype=dtype), torch.randn(n, 8, dtype=dtype)
+            w = torch.randint(0, 5, (n,)).float()
+            mass += float(w.sum())
+            pos = torch.arange(n) + 2**33 + 1000 * step
+            block = (k, v, w, None, None, None, None, None, pos, pos + 1, pos * w.long(), pos, w == 0)
+            cache._semantic_append_entries_batched(lanes, counts, block)
+            start = 0
+            for (b, g, c), count in zip(lanes, counts):
+                for i in range(start, start + count):
+                    reference._semantic_append_entry(b, g, c, tuple(x[i] if x is not None else None for x in block))
+                start += count
+            assert float(cache.level_w.sum()) == mass
+            assert cache._semantic_counts == reference._semantic_counts
+            for name, tensor in cache.named_buffers():
+                torch.testing.assert_close(tensor, dict(reference.named_buffers())[name], atol=0, rtol=0,
+                                           msg=lambda detail: f"B={B}, step={step}, {name}\n{detail}")
+
+
+def test_benchmark_checks_later_iterations(monkeypatch):
+    import sys
+    from unused import benchmark_log_kv_updates as benchmark
+
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--device", "cpu", "--sequence", "32", "--chunk", "8",
+                                      "--batch", "1", "--groups", "1", "--dim", "8", "--iters", "1"])
+    route = kv.LogStructuredKVCache.route_and_flush_batch
+    recorded = 0
+
+    def corrupt_second_warmup(cache, *args, **kwargs):
+        nonlocal recorded
+        route(cache, *args, **kwargs)
+        if kwargs.get("record_op_log"):
+            recorded += 1  # reference, first warmup, second warmup
+            if recorded == 3:
+                cache.n_eff[0, 0, 0] += 1
+
+    with patch.object(kv.LogStructuredKVCache, "route_and_flush_batch", corrupt_second_warmup):
+        with pytest.raises(AssertionError, match="torch/route/iteration=1: n_eff"):
+            benchmark.main()
