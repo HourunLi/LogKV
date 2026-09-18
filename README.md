@@ -17,6 +17,10 @@ step_host (inclusive): data 1.280s | forward 470.406s | backward 483.723s | opti
 logKV_cuda: route 428.523s | replay 386.891s | plan 9.894s | pack 8.190s | attn_fwd 25.967s | attn_bwd 20.847s
 step_cuda (inclusive): forward 470.211s | backward 484.018s | optimizer 0.044s
 
+[15:35:06] Epoch 1 | Step 3 | loss: 2.2133 | 2nd_scale: 0.0000 | logKV_host: route 400.085s/6720 + replay 265.211s/13440 + plan 10.770s/14336 + pack 8.309s/21504 + attn_fwd 4.204s/21504 + attn_bwd 2.735s/7168 | Time: 718.34s
+step_host (inclusive): data 0.007s | forward 426.796s | backward 291.448s | optimizer 0.003s
+
+
 [ma-user semanticLogKV]$python unused/benchmark_log_kv_updates.py --iters 10
 {"device": "NVIDIA A800-SXM4-80GB", "sequence": 32768, "chunk": 2048, "batch": 4, "groups": 8, "dim": 128, "iters": 10, "torch": "2.11.0+cu128", "cuda": "12.8"}
 {"variant": "torch", "phase": "route", "median_ms": 202.086, "peak_extra_MiB": 247.12, "exact_state": true}
