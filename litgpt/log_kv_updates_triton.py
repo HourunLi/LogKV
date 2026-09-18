@@ -111,7 +111,7 @@ def merge_scatter(fields, stage, si, gi, pi, vi, dst, clear):
 
 
 @triton.jit(do_not_specialize=["NR", "START"])
-def _centroid(K, MU, NE, OUT_MU, OUT_NE, META, NR, START, D: tl.constexpr, BD: tl.constexpr):
+def _centroid(K, MU, NE, OUT_MU, OUT_NE, META, NR, START, D: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr = 1):
     row = tl.program_id(0).to(tl.int64)
     r = START + row
     d = tl.arange(0, BD).to(tl.int64)
@@ -120,10 +120,17 @@ def _centroid(K, MU, NE, OUT_MU, OUT_NE, META, NR, START, D: tl.constexpr, BD: t
     length = tl.load(META + 3 * NR + r)
     forget = tl.load(META + 4 * NR + r).to(tl.int32).to(tl.float32, bitcast=True)
     acc = tl.full((BD,), 0., tl.float32)
-    # A tree reduction or atomic sum changes cancellation/rounding. Keep the
-    # same increasing-token accumulation order as torch.segment_reduce.
-    for i in range(length):
-        acc = acc + tl.load(K + (begin + i) * D + d, d < D, 0).to(tl.float32)
+    # BT=1 is the bit-exact reference. BT=32 parallelizes tokens as well as
+    # features; fixed tiles avoid atomics and preserve reproducible ordering.
+    if BT == 1:
+        for i in range(length):
+            acc = acc + tl.load(K + (begin + i) * D + d, d < D, 0).to(tl.float32)
+    else:
+        t = tl.arange(0, BT).to(tl.int64)
+        for i in range(0, length, BT):
+            values = tl.load(K + (begin + i + t[:, None]) * D + d[None, :],
+                             (i + t[:, None] < length) & (d[None, :] < D), 0).to(tl.float32)
+            acc = acc + tl.sum(values, axis=0)
     pre = tl.load(NE + cluster) * forget
     n = length.to(tl.float32)
     denom = pre + n
@@ -149,14 +156,18 @@ def _centroid_commit(MU, NE, OUT_MU, OUT_NE, META, START, COUNT,
     tl.store(NE + cluster, denom, live)
 
 
-def centroid(k, mu, n_eff, metadata, start, count):
+def centroid(k, mu, n_eff, metadata, start, count, *, token_tile=1):
     # Temporary storage is O(updated clusters * D), independent of token count.
     out_mu = mu.new_empty((count, k.size(1)))
     out_ne = n_eff.new_empty(count)
     bd = triton.next_power_of_2(k.size(1))
     _centroid[(count,)](k, mu, n_eff, out_mu, out_ne, metadata, metadata.size(1), start, k.size(1),
-                        bd, num_warps=4, enable_fp_fusion=False)
+                        bd, token_tile, num_warps=4, enable_fp_fusion=False)
     _centroid_commit[(triton.cdiv(count, 8),)](
         mu, n_eff, out_mu, out_ne, metadata, start, count, k.size(1), bd, 8,
         num_warps=4, enable_fp_fusion=False,
     )
+
+
+def centroid_parallel(k, mu, n_eff, metadata, start, count):
+    centroid(k, mu, n_eff, metadata, start, count, token_tile=32)

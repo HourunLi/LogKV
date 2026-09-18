@@ -385,6 +385,9 @@ class GPT(nn.Module):
         semantic_legacy_route: bool = False,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
+        semantic_centroid_backend: str = "sequential",
+        semantic_summary_size: int = 1,
+        semantic_replay_updates: bool = False,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -469,6 +472,9 @@ class GPT(nn.Module):
                 semantic_legacy_route=semantic_legacy_route,
                 semantic_anchor_mode=semantic_anchor_mode,
                 semantic_pack_backend=semantic_pack_backend,
+                semantic_centroid_backend=semantic_centroid_backend,
+                semantic_summary_size=semantic_summary_size,
+                semantic_replay_updates=semantic_replay_updates,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -535,6 +541,9 @@ class GPT(nn.Module):
         allocate_second_order: bool = True,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
+        semantic_centroid_backend: str = "sequential",
+        semantic_summary_size: int = 1,
+        semantic_replay_updates: bool = False,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -610,6 +619,9 @@ class GPT(nn.Module):
                 semantic_legacy_route=semantic_legacy_route,
                 semantic_anchor_mode=semantic_anchor_mode,
                 semantic_pack_backend=semantic_pack_backend,
+                semantic_centroid_backend=semantic_centroid_backend,
+                semantic_summary_size=semantic_summary_size,
+                semantic_replay_updates=semantic_replay_updates,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -1350,6 +1362,9 @@ class CausalSelfAttention(nn.Module):
         allocate_second_order: bool = True,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
+        semantic_centroid_backend: str = "sequential",
+        semantic_summary_size: int = 1,
+        semantic_replay_updates: bool = False,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1411,6 +1426,9 @@ class CausalSelfAttention(nn.Module):
             semantic_legacy_route=semantic_legacy_route,
             semantic_anchor_mode=semantic_anchor_mode,
             semantic_pack_backend=semantic_pack_backend,
+            semantic_centroid_backend=semantic_centroid_backend,
+            semantic_summary_size=semantic_summary_size,
+            semantic_replay_updates=semantic_replay_updates,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,

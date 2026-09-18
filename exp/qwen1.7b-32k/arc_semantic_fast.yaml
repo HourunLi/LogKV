@@ -23,3 +23,10 @@ entropy_chunk_size: 1024  # LM-head + CE 每次处理的 token 数，避免全�
 # A800 上先运行 tests/test_log_kv_pack.py，再运行 unused/benchmark_log_kv_pack.py。
 # 基准脚本会报告真实 slot 数、lane padding、准备时间、forward/backward 和显存峰值。
 # 保留整个 Block 的 activation checkpoint；不要因输入打包省显存而直接关闭。
+
+# 更新路径优化；summary_size=1 恢复逐 token 入 ladder。
+# 并行 centroid 允许舍入差异；每 8 个同簇 token 提前生成一个加权摘要。
+# replay_updates 仅训练保存摘要及路由状态，推理不保留历史更新记录。
+log_kv_semantic_centroid_backend: parallel
+log_kv_semantic_summary_size: 8
+log_kv_semantic_replay_updates: true

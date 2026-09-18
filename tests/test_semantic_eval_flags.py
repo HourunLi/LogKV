@@ -15,6 +15,9 @@ def test_legacy_route_reaches_eval_arguments(tmp_path, script, setting, expected
     parent = tmp_path / "base.yaml"
     parent.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\n"
                       "log_kv_cluster_k_max: 8\nlog_kv_B: 64\n"
+                      f"log_kv_semantic_centroid_backend: {'parallel' if anchor_mode == 'mid' else 'null'}\n"
+                      f"log_kv_semantic_summary_size: {'8' if anchor_mode == 'mid' else 'null'}\n"
+                      f"log_kv_semantic_replay_updates: {'true' if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_anchor_mode: {anchor_mode}\nlog_kv_semantic_pack_backend: {pack_backend}\n")
     if setting is not None:
         parent.write_text(parent.read_text() + f"log_kv_semantic_legacy_route: {setting}\n")
@@ -51,3 +54,7 @@ def test_legacy_route_reaches_eval_arguments(tmp_path, script, setting, expected
     assert args[args.index("--log_kv_B") + 1] == "64"
     assert args[args.index("--log_kv_semantic_anchor_mode") + 1] == anchor_mode
     assert args[args.index("--log_kv_semantic_pack_backend") + 1] == pack_backend
+
+    values = ("parallel", "8", "true") if anchor_mode == "mid" else ("sequential", "1", "false")
+    for name, value in zip(("centroid_backend", "summary_size", "replay_updates"), values):
+        assert args[args.index("--log_kv_semantic_" + name) + 1] == value

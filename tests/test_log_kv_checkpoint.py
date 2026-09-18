@@ -175,7 +175,8 @@ def test_reentrant_or_unwrapped_checkpoint_is_rejected():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA, bf16 and Triton")
 @pytest.mark.parametrize("distributed", [False, True], ids=["cuda", "fsdp"])
-def test_cuda_checkpoint_replay_with_flash(distributed):
+@pytest.mark.parametrize("summary_size", [1, 8])
+def test_cuda_checkpoint_replay_with_flash(distributed, summary_size):
     """Run the fsdp case with torchrun --nproc_per_node=2 -m pytest ... -k fsdp."""
     import torch.distributed as dist
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
@@ -208,6 +209,8 @@ def test_cuda_checkpoint_replay_with_flash(distributed):
                 batch_size=1, B=3, recent_size=4, train_block=4, second_order_scale=0.,
                 semantic_clusters=True, cluster_k_max=8, semantic_flush_granularity=4,
                 semantic_anchor_mode="mid", semantic_pack_backend="triton",
+                semantic_summary_size=summary_size, semantic_replay_updates=reuse and summary_size > 1,
+                semantic_centroid_backend="parallel" if summary_size > 1 else "sequential",
                 allocate_second_order=False, device=device, dtype=torch.bfloat16,
             )
             models.append(model)
