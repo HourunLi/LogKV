@@ -111,8 +111,9 @@ def merge_scatter(fields, stage, si, gi, pi, vi, dst, clear):
 
 
 @triton.jit(do_not_specialize=["NR", "START"])
-def _centroid(K, MU, NE, META, NR, START, D: tl.constexpr, BD: tl.constexpr):
-    r = START + tl.program_id(0).to(tl.int64)
+def _centroid(K, MU, NE, OUT_MU, OUT_NE, META, NR, START, D: tl.constexpr, BD: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    r = START + row
     d = tl.arange(0, BD).to(tl.int64)
     cluster = tl.load(META + r).to(tl.int64)
     begin = tl.load(META + 2 * NR + r).to(tl.int64)
@@ -128,13 +129,34 @@ def _centroid(K, MU, NE, META, NR, START, D: tl.constexpr, BD: tl.constexpr):
     denom = pre + n
     mu = tl.load(MU + cluster * D + d, d < D, 0)
     value = tl.where(pre > 0, tl.div_rn(pre * mu + acc, denom), tl.div_rn(acc, n))
-    tl.store(MU + cluster * D + d, value, d < D)
-    # NE is shared by all feature warps. A fast warp must not overwrite it
-    # while another warp is still loading the old count after its sum loop.
-    tl.debug_barrier()
-    tl.store(NE + cluster, denom)
+    # Input state is read-only throughout this launch. A separate launch
+    # commits outputs, so no warp/CTA can observe a partially updated count.
+    tl.store(OUT_MU + row * D + d, value, d < D)
+    tl.store(OUT_NE + row, denom)
+
+
+@triton.jit(do_not_specialize=["START", "COUNT"])
+def _centroid_commit(MU, NE, OUT_MU, OUT_NE, META, START, COUNT,
+                     D: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
+    d = tl.arange(0, BD).to(tl.int64)
+    live = row < COUNT
+    cluster = tl.load(META + START + row, live, 0).to(tl.int64)
+    mask = live[:, None] & (d < D)[None, :]
+    value = tl.load(OUT_MU + row[:, None] * D + d[None, :], mask, 0)
+    denom = tl.load(OUT_NE + row, live, 0)
+    tl.store(MU + cluster[:, None] * D + d[None, :], value, mask)
+    tl.store(NE + cluster, denom, live)
 
 
 def centroid(k, mu, n_eff, metadata, start, count):
-    _centroid[(count,)](k, mu, n_eff, metadata, metadata.size(1), start, k.size(1),
-                        triton.next_power_of_2(k.size(1)), num_warps=4, enable_fp_fusion=False)
+    # Temporary storage is O(updated clusters * D), independent of token count.
+    out_mu = mu.new_empty((count, k.size(1)))
+    out_ne = n_eff.new_empty(count)
+    bd = triton.next_power_of_2(k.size(1))
+    _centroid[(count,)](k, mu, n_eff, out_mu, out_ne, metadata, metadata.size(1), start, k.size(1),
+                        bd, num_warps=4, enable_fp_fusion=False)
+    _centroid_commit[(triton.cdiv(count, 8),)](
+        mu, n_eff, out_mu, out_ne, metadata, start, count, k.size(1), bd, 8,
+        num_warps=4, enable_fp_fusion=False,
+    )

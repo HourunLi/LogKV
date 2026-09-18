@@ -310,7 +310,7 @@ CUDA centroid 的 fp32 状态更新也自动使用融合路径。算子执行错
   顶层容量溢出仍使用原来的顺序处理。
 - **Centroid：** cluster 索引、原始 run 下标、token 起点、长度与 forget 位模式和
   staging 索引合成一次 CPU→GPU 上传。不同 segment ordinal 仍依次执行；每个
-  ordinal 用一个 kernel 完成逐 token 求和及 centroid/n_eff 更新。没有 atomic sum、
+  ordinal 用两个 kernel 完成逐 token 求和、计算新状态及统一写回。没有 atomic sum、
   树形 reduction、设备标量读回，也没有新增跨流或异步 CPU buffer 生命周期要求。
 - **数值：** 保留 staging 先转存储 dtype、carry K/V 使用 fp32 的行为，关闭融合
   乘加，使用 `tl.div_rn`；centroid 不改变 token 求和顺序。地址和位置运算使用 int64。
@@ -336,14 +336,23 @@ python unused/benchmark_log_kv_updates.py --iters 10
 结果是单层单 flush 的合成负载，最后仍以原命令连续完整 step 的 `Time`、`route`
 和 `replay` 为准。
 
-### A800 centroid 竞态修复
+### A800 centroid 原地更新修正
 
 32K 基准捕获的首个 centroid 差异并非普通舍入误差：旧计数 3814、新增 292，
 参考输出为 0.57816875；将更新后的 4106 再作为旧计数代入，恰好得到失败输出
-0.5782735。不同 feature warp 在求和后读取同一 `n_eff`，较快的 warp 可能先写回，
-使较慢 warp 使用更新后的计数。`_centroid` 在写 `n_eff` 前增加块内屏障，确保
-所有 feature warp 完成旧状态的读取与计算。该屏障不涉及 CPU 或跨 kernel 同步。
-新增 D=128/256、fp32/bf16、连续 32 次更新的 GPU 回归；目标 A800 验证仍需运行：
+0.5782735。首版在写计数前增加块内屏障，但 A800 复测仍失败：第二组数据把
+3879 替换为 4167 后，同样精确复现错误输出 1.291877269744873。因此不能把
+屏障版本视为已通过修复；具体生成代码中的读写调度尚未在本机检查。
+
+当前实现取消原地计算：`_centroid` 的 MU/NE 输入只读，将新均值及计数写入独立
+临时结果；随后 `_centroid_commit` 统一写回。这样计算阶段没有旧状态的写入者，
+不依赖块内屏障避免提前覆盖。每个 ordinal 两次 launch，256 个 cluster、D=128
+时结果缓冲的有效载荷为 129 KiB；没有新增 CPU 同步，保持原有逐 token 求和及
+ordinal 顺序。实际速度仍须 A800 重新测量。
+
+GPU 回归覆盖 256 个 cluster、D=128/256、fp32/bf16、连续 32 次更新，并直接
+检查第一阶段不改变旧 MU/NE。诊断模式额外验证一个 ordinal 内没有重复 cluster
+写入者。本地相关测试 17 passed、18 skipped；CUDA 路径本机仍无法运行。
 
 ```bash
 python -m pytest -q tests/test_log_kv_updates.py

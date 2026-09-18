@@ -148,9 +148,9 @@ def test_update_diagnostic_keeps_centroid_error_details(corrupt):
 def test_centroid_feature_warps_read_same_old_count(dtype, dim):
     backend = kv._triton_updates()
     assert backend is not None
-    nr, length = 32, 292
-    # Production failure: a late feature warp used 4106 instead of 3814,
-    # because another warp had already stored 3814 + 292 into the shared NE.
+    nr, length = 256, 292
+    # Production failure matched using 4106 instead of the old count 3814.
+    # Read-only computation must finish before any cluster state is committed.
     k = torch.zeros(nr, length, dim, device="cuda", dtype=dtype)
     k[:, 0, :] = 162.806640625
     k = k.view(-1, dim)
@@ -165,6 +165,15 @@ def test_centroid_feature_warps_read_same_old_count(dtype, dim):
         denom = expected_ne + length
         expected_mu = (expected_ne[:, None] * expected_mu + sums) / denom[:, None]
         expected_ne = denom
+        if _ == 0:
+            before_mu, before_ne = mu.clone(), ne.clone()
+            out_mu, out_ne = torch.empty_like(mu), torch.empty_like(ne)
+            backend._centroid[(nr,)](k, mu, ne, out_mu, out_ne, meta, nr, 0, dim, dim,
+                                     num_warps=4, enable_fp_fusion=False)
+            torch.testing.assert_close(mu, before_mu, atol=0, rtol=0)
+            torch.testing.assert_close(ne, before_ne, atol=0, rtol=0)
+            torch.testing.assert_close(out_mu, expected_mu, atol=0, rtol=0)
+            torch.testing.assert_close(out_ne, expected_ne, atol=0, rtol=0)
         backend.centroid(k, mu, ne, meta, 0, nr)
         torch.testing.assert_close(mu, expected_mu, atol=0, rtol=0)
         torch.testing.assert_close(ne, expected_ne, atol=0, rtol=0)
