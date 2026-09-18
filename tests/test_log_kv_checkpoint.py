@@ -63,7 +63,13 @@ def test_checkpoint_replay_matches_loss_gradients_and_halves_routing(scale, segm
         states = [(m.level_k.clone(), m.level_w.clone()) for m in model.modules() if isinstance(m, LogStructuredKVCache)]
         return losses, [p.grad.clone() for p in model.parameters()], states, logkv_take_host_stats()
 
-    before, after = run(reference), run(fast)
+    with patch.object(LogStructuredKVCache, "_semantic_build_replay_plan",
+                      wraps=LogStructuredKVCache._semantic_build_replay_plan) as parse:
+        before = run(reference)
+        old_parses = parse.call_count
+        parse.reset_mock()
+        after = run(fast)
+        new_parses = parse.call_count
     for a, b in zip(before[0] + before[1], after[0] + after[1]):
         torch.testing.assert_close(a, b, atol=2e-6, rtol=2e-5)
     for a, b in zip(before[2], after[2]):
@@ -72,6 +78,7 @@ def test_checkpoint_replay_matches_loss_gradients_and_halves_routing(scale, segm
     old, new = before[3], after[3]
     assert new["route_n"] > 0 and old["route_n"] == 2 * new["route_n"]
     assert new["replay_n"] == 2 * old["replay_n"]
+    assert old_parses == new_parses == old["replay_n"]  # second replay reuses each parsed flush
     assert new["plan_n"] == old["plan_n"]
     assert _route_pass.get() is None
 
@@ -128,6 +135,30 @@ def test_record_tensors_release_when_checkpoint_graph_is_discarded():
     gc.collect()
     assert all(ref() is None for ref in refs)
     assert _route_pass.get() is None
+
+
+def test_cpu_replay_plans_release_with_retained_checkpoint_graph():
+    import litgpt.log_kv_cache as cache_module
+
+    _, model = _models()
+    refs = []
+    original = cache_module._SemanticReplayPlans
+
+    def create(log):
+        plans = original(log)
+        refs.append(weakref.ref(plans))
+        return plans
+
+    with patch.object(cache_module, "_SemanticReplayPlans", create):
+        loss = model(torch.randint(41, (1, 24)), targets=torch.randint(41, (1, 24)), loss_chunk_size=7)
+        loss.backward(retain_graph=True)
+        assert len(refs) == 2 and all(ref().plans for ref in refs)
+        with patch.object(LogStructuredKVCache, "_semantic_build_replay_plan",
+                          side_effect=AssertionError("retained graph re-parsed a cached flush")):
+            loss.backward()
+    del loss
+    gc.collect()
+    assert all(ref() is None for ref in refs)
 
 
 def test_reentrant_or_unwrapped_checkpoint_is_rejected():

@@ -238,3 +238,100 @@ torchrun --standalone --nproc_per_node=2 -m pytest -q tests/test_log_kv_checkpoi
 
 然后用原配置观察稳定 step 的 `route` / `replay` 时间和 `Time`。本轮仅减少复制，
 预期调用次数与第一轮后相同，不应把调用次数不变误判为没有启用。
+
+## 复用 CPU replay 执行计划（2026-09-18）
+
+首次 forward 完成后，将现有 CPU op-log 冻结成不可变快照，为本次 autograd/checkpoint
+调用建立 `_SemanticReplayPlans`。首次 replay 按 flush 解析日志、建立 token→offset
+映射并安排 JOIN/特殊操作轮次；保存紧凑 `array('q')` token 下标、执行顺序、CPU
+位置快照和结束 cursor。后续 replay 通过起始 cursor 查找计划，核对完整 CPU 位置
+序列后直接执行，不再解析日志或重建 token 字典。实际 ladder 地址仍由当前状态计算，
+每次均读取当前调用的 K/V，合并顺序、centroid 更新和 op-log 语义不变。
+
+计划由原始 autograd ctx 和对应 checkpoint 记录共同持有，不挂在模型/cache 上，
+不同层和 micro-batch 不共用全局表。计划不包含任何 torch.Tensor、缓存引用或 GPU
+地址，丢弃计算图即可释放；retain_graph 后再次 backward 仍能复用。
+
+同步边界：
+
+- 计划构建、缓存键和一致性校验只访问 CPU 数据，不调用 `.cpu()`、`.item()` 或 CUDA
+  synchronize。启用计划后若缺少 CPU positions、日志身份不符或位置不匹配，明确报错，
+  不通过 GPU 读回来修补，也不重新 routing。
+- 执行所需索引仍在原来的 plan applier 中批量上传；使用原有复制及 CUDA 流顺序，
+  没有新增异步传输、固定页内存或跨流共享 buffer。
+- 这不表示整个 replay 已经零同步：现有 padding/顶层溢出的标量写入仍可能读取
+  `pad_mask.item()`；legacy Ward 路径也有原有读回。本轮没有改动这些执行路径。
+- 未启用计划的兼容调用仍支持只有设备 op-log 的旧接口；当前训练自动提供 CPU 日志
+  和位置，因此不需要那条读回路径。
+
+CPU 合成微测（batch=4、groups=8、K=8、sequence=32768、flush=2048，16 个 flush，
+均为 JOIN；排除全部 ladder 写入、GPU 上传和 attention，重复五次取中位数）：
+
+| 项目 | 时间/大小 |
+|---|---:|
+| 修改前每次解析、组织轮次 | 344.4 ms/层 |
+| 新路径首次建立计划 | 321.8 ms/层 |
+| 缓存命中后准备 | 2.9 ms/层 |
+| 首次冻结日志快照 | 19.5 ms/层 |
+| 缓存 token 下标 | 8 MiB/层 |
+| CPU 位置数组 | 1 MiB/层 |
+| 日志快照指针表 | 约 8 MiB/层 |
+
+主要额外存储约 17 MiB/层，28 层约 476 MiB，另有少量 Python 调度对象开销；这是该
+合成形状的 CPU 存储估算，不是实测 RSS，也不是新增 GPU 显存。真实大小取决于实际
+flush 数和 JOIN/segment 分布。此微测不能换算成完整 replay 或训练 step 的加速倍数。
+
+本地相关回归 312 passed、31 skipped；与修改前实现的三个实际 Block checkpoint
+配置（mid、multi/segment、二阶 0.2/segment）差分中，两次梯度累积后的损失、全部
+参数梯度和 cache buffers 逐位一致。新增测试验证解析次数不随第二次 replay 增长、
+retain_graph 复用/释放、日志和位置不匹配时报错、计划内无设备张量、构建/命中不读
+设备，以及复用时确实使用新的 K/V。GPU 本机未执行，目标机运行：
+
+```bash
+python -m pytest -q tests/test_log_kv_replay_plan.py tests/test_log_kv_checkpoint.py
+torchrun --standalone --nproc_per_node=2 -m pytest -q tests/test_log_kv_checkpoint.py -k fsdp
+```
+
+训练配置和命令不变；比较预热后 `replay` 与整步 `Time`，并观察目标机器的 CPU 内存。
+
+## 融合 ladder 与 centroid 更新（2026-09-18）
+
+新增 `litgpt/log_kv_updates_triton.py`，由 route/replay 共用的两个写入函数自动调用。
+现有一阶训练配置无需更改。CUDA、Triton 可用且关闭二阶存储时，连续 staging 的
+fp16/bf16/fp32 ladder 进入融合路径；CPU、二阶存储及其他布局保留 PyTorch 实现。
+CUDA centroid 的 fp32 状态更新也自动使用融合路径。算子执行错误会向上传播，
+不会捕获错误后偷偷重新执行。checkpoint 的严格 op-log 复用逻辑没有改变。
+
+- **Ladder：** 同时处理 K/V、weight、位置和 pad/order 字段。从旧槽和 staging
+  直接取配对数据，省去完整 pool 的 gather/cat 及配对 gather。正常层最多三个 launch：
+  fill、读取并合并、survivor 写回及清零；纯 fill 层一个 launch。
+  不能把跨 CTA 的读取和覆盖旧槽放在同一次 launch，否则 survivor 写入会破坏其他
+  CTA 尚未读取的旧值。因此保留 survivor 暂存，先读完，再在同一 CUDA stream 写回。
+  顶层容量溢出仍使用原来的顺序处理。
+- **Centroid：** cluster 索引、原始 run 下标、token 起点、长度与 forget 位模式和
+  staging 索引合成一次 CPU→GPU 上传。不同 segment ordinal 仍依次执行；每个
+  ordinal 用一个 kernel 完成逐 token 求和及 centroid/n_eff 更新。没有 atomic sum、
+  树形 reduction、设备标量读回，也没有新增跨流或异步 CPU buffer 生命周期要求。
+- **数值：** 保留 staging 先转存储 dtype、carry K/V 使用 fp32 的行为，关闭融合
+  乘加，使用 `tl.div_rn`；centroid 不改变 token 求和顺序。地址和位置运算使用 int64。
+  这些是实现约束，CUDA 逐位一致性仍须通过目标机测试确认。
+
+本地 CPU 回归：314 passed、41 skipped、1 warning；跳过项包含 CUDA/Triton/FSDP。
+CPU 小规模基准入口已跑通，route/replay 缓存状态与 reference 一致。本机无 CUDA，
+未编译运行新 Triton kernel，尚无 A800 加速倍数或显存实测结果。
+
+目标机先执行：
+
+```bash
+python -m pytest -q tests/test_log_kv_updates.py tests/test_log_kv_staging.py tests/test_log_kv_replay_plan.py tests/test_log_kv_checkpoint.py tests/test_log_kv_speed.py
+torchrun --standalone --nproc_per_node=2 -m pytest -q tests/test_log_kv_checkpoint.py -k fsdp
+python unused/benchmark_log_kv_updates.py --iters 10
+```
+
+新增差分测试覆盖顺序求和的抵消样例、forget、多 ordinal、bf16/fp16/fp32、不同 K/V
+维度、padding、非等权合并、跨层进位、顶层溢出、64 位位置以及输出/梯度。
+基准默认 batch=4、G=8、K=8、B=64、32K、chunk=2048、D=128，使用相同前缀状态，
+输出 `torch` / `triton` 的 route/replay 中位耗时和额外峰值显存。每项先预热三次，
+计时排除缓存恢复及首次编译；首轮会检查缓存状态和 route op-log 逐位一致。
+结果是单层单 flush 的合成负载，最后仍以原命令连续完整 step 的 `Time`、`route`
+和 `replay` 为准。

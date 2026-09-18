@@ -2,7 +2,8 @@
 
 The checkpoint frame owns the records, not a layer-global queue. It retains no
 Q/K/V or cache snapshots; op-log tensors are shared with the original autograd
-context. Recompute contexts can be entered again for retain_graph backward.
+context, together with CPU-only parsed replay schedules. Recompute contexts can
+be entered again for retain_graph backward.
 """
 
 from contextvars import ContextVar

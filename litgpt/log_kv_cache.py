@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import contextlib
 import math
+from array import array
+from functools import lru_cache
 from typing import Any, NamedTuple, NoReturn
 
 import numpy as np
@@ -87,6 +89,20 @@ LOG_KV_OP_NEW_SEGMENT = 1
 LOG_KV_OP_JOIN = 2
 LOG_KV_OP_WARD_MERGE = 3
 LOG_KV_OP_PAD_INSERT = 4
+
+
+class _SemanticReplayPlans:
+    """CPU-only plans owned by one autograd/checkpoint invocation, never a cache.
+
+    Freeze the host log so later caller mutations cannot invalidate a plan.
+    Both replay passes share this object; it retains no tensors or cache refs.
+    """
+
+    def __init__(self, host_log):
+        if host_log is None:
+            raise RuntimeError("semantic replay plans require an existing CPU op-log")
+        self.host_log = tuple(tuple(tuple(map(tuple, lane)) for lane in batch) for batch in host_log)
+        self.plans = {}
 
 
 class _SemanticTreeCluster(NamedTuple):
@@ -272,6 +288,16 @@ def _pair_rank1_stats(
 
 
 _EMPTY_INDEX = np.empty(0, dtype=np.int64)
+
+
+@lru_cache(maxsize=1)
+def _triton_updates():
+    try:
+        from litgpt import log_kv_updates_triton
+        return log_kv_updates_triton
+    except ImportError:
+        return None
+
 
 def _spans_to_index_array(spans: list[tuple[int, int]]) -> np.ndarray:
     """Concatenate half-open ``[start, stop)`` ranges into one int64 array."""
@@ -1227,9 +1253,9 @@ class LogStructuredKVCache(nn.Module):
         """Fenwick-append `block` into many (b, g, cluster) ladders at once.
 
         `block` holds the incoming entries of every lane back to back, `counts[i]`
-        rows for `lanes[i]`. Each level costs a fixed handful of gathers, one
-        `compact`, and a scatter -- no per-lane indexing chain -- so the op count
-        tracks L_alloc alone, not batch * groups * K_max.
+        rows for `lanes[i]`. CUDA first-order updates fuse field reads/merges
+        and field writes; other layouts use the batched PyTorch reference.
+        Work is scheduled per level, without a per-lane indexing chain.
 
         The per-level index arithmetic runs on the host against the
         `_semantic_counts` mirror, which is already the authority for these
@@ -1242,6 +1268,11 @@ class LogStructuredKVCache(nn.Module):
             return
         fields = self._semantic_flat_level_fields()
         dev = fields[0].device
+        fused = (_triton_updates() if dev.type == "cuda" and not self.allocate_second_order
+                 and fields[0].dtype in (torch.float16, torch.bfloat16, torch.float32)
+                 and fields[1].dtype in (torch.float16, torch.bfloat16, torch.float32)
+                 and fields[2].dtype == torch.float32
+                 and all(x is None or x.is_contiguous() for x in block) else None)
         bases = [self._semantic_lane_base(*lane) for lane in lanes]
         stage = block
         spans: dict[int, tuple[int, int]] = {}
@@ -1323,9 +1354,12 @@ class LogStructuredKVCache(nn.Module):
             # Fill first: an overflowing lane's pooled rows include the slots this
             # very step just topped up.
             if fd.numel():
-                for f, x in zip(fields, stage):
-                    if f is not None:
-                        f.index_copy_(0, fd, x.index_select(0, fs).to(f.dtype))
+                if fused is not None:
+                    fused.fill(fields, stage, fs, fd)
+                else:
+                    for f, x in zip(fields, stage):
+                        if f is not None:
+                            f.index_copy_(0, fd, x.index_select(0, fs).to(f.dtype))
 
             for i, s, m in overflow_top:
                 b, g, c = lanes[i]
@@ -1336,18 +1370,21 @@ class LogStructuredKVCache(nn.Module):
             if not recs:
                 return
 
-            pool = tuple(
-                torch.cat([f.index_select(0, si), x.index_select(0, gi).to(f.dtype)], dim=0) if f is not None else None
-                for f, x in zip(fields, stage)
-            )
-            carry = self._semantic_merge_block_pairs(tuple(x.index_select(0, pi) if x is not None else None for x in pool))
-            for f, x in zip(fields, pool):
-                if f is not None:
-                    f.index_copy_(0, sd, x.index_select(0, vi))
-            if cd.numel():
-                for f in fields:
+            if fused is not None:
+                carry = fused.merge_scatter(fields, stage, si, gi, pi, vi, sd, cd)
+            else:
+                pool = tuple(
+                    torch.cat([f.index_select(0, si), x.index_select(0, gi).to(f.dtype)], dim=0) if f is not None else None
+                    for f, x in zip(fields, stage)
+                )
+                carry = self._semantic_merge_block_pairs(tuple(x.index_select(0, pi) if x is not None else None for x in pool))
+                for f, x in zip(fields, pool):
                     if f is not None:
-                        f.index_fill_(0, cd, 0)
+                        f.index_copy_(0, sd, x.index_select(0, vi))
+                if cd.numel():
+                    for f in fields:
+                        if f is not None:
+                            f.index_fill_(0, cd, 0)
 
             stage = carry
             spans = {}
@@ -2316,11 +2353,11 @@ class LogStructuredKVCache(nn.Module):
 
     def _semantic_commit_runs(
         self,
-        records: list[tuple[int, int, int, int, bool, list[int]]],
+        records: list[tuple[int, int, int, int, bool, array]],
         k_raw: torch.Tensor,
         v: torch.Tensor,
         positions: torch.Tensor,
-        offset_by_token: list[dict[int, int]],
+        positions_host: list[list[int]],
     ) -> None:
         """Commit replayed runs -- explicit (cluster, segment) -- across lanes.
 
@@ -2340,8 +2377,7 @@ class LogStructuredKVCache(nn.Module):
         order_vals: list[int] = []
         runs: list[list] = []
         total = 0
-        for b, g, c, segment, new_segment, tokens in records:
-            offsets = [offset_by_token[b][int(t)] for t in tokens]
+        for b, g, c, segment, new_segment, offsets in records:
             phase = self._semantic_level0_phase[b][g][c]
             kv_base = (b * n_groups + g) * T
             runs.append([0, (b * n_groups + g) * self.K_max + c, len(offsets), new_segment])
@@ -2354,7 +2390,7 @@ class LogStructuredKVCache(nn.Module):
             lanes.append((b, g, c))
             lane_counts.append(len(offsets))
             self._set_semantic_level0_phase(b, g, c, phase)
-            self._set_semantic_p_hi(b, g, c, int(tokens[-1]))
+            self._set_semantic_p_hi(b, g, c, int(positions_host[b][offsets[-1]]))
             self._set_semantic_n_total(b, g, c, self._semantic_n_total[b][g][c] + len(offsets))
             if new_segment:
                 self._set_semantic_current_segment(b, g, c, segment)
@@ -2395,18 +2431,38 @@ class LogStructuredKVCache(nn.Module):
         src = np.asarray(blk_tok_src, dtype=np.int64)
         lane, token = np.divmod(src, k_raw.size(2))
         batch, group = np.divmod(lane, k_raw.size(1))
-        packed = np.empty(4 * n_tok + len(order_vals) + len(runs), dtype=np.int64)
+        # Include centroid metadata in the staging upload. Runs targeting the
+        # same cluster keep their ordinal order; no device-to-host inspection.
+        nr = len(runs)
+        starts = np.cumsum([0] + [r[2] for r in runs[:-1]], dtype=np.int64)
+        run_order = sorted(range(nr), key=lambda j: runs[j][0])
+        ranges = []
+        for offset, j in enumerate(run_order):
+            ordinal = runs[j][0]
+            if not ranges or ranges[-1][0] != ordinal:
+                ranges.append([ordinal, offset, 0])
+            ranges[-1][2] += 1
+        meta_offset = 4 * n_tok + len(order_vals) + nr
+        packed = np.empty(meta_offset + 5 * nr, dtype=np.int64)
         packed[:n_tok] = blk_tok_at
         packed[n_tok:2 * n_tok] = batch
         packed[2 * n_tok:3 * n_tok] = group
         packed[3 * n_tok:4 * n_tok] = token
         packed[4 * n_tok:4 * n_tok + len(order_vals)] = order_vals
-        packed[4 * n_tok + len(order_vals):] = [r[2] for r in runs]
+        packed[4 * n_tok + len(order_vals):meta_offset] = [r[2] for r in runs]
+        meta = packed[meta_offset:].reshape(5, nr)
+        meta[0] = [runs[j][1] for j in run_order]
+        meta[1] = run_order
+        meta[2] = starts[run_order]
+        meta[3] = [runs[j][2] for j in run_order]
+        meta[4] = np.asarray([self.seg_forget if runs[j][3] else 1.0 for j in run_order],
+                             dtype=np.float32).view(np.int32)
         packed_t = torch.from_numpy(packed).to(dev, copy=False)
         at = packed_t[:n_tok]
         bi, gi, ti = packed_t[n_tok:4 * n_tok].view(3, n_tok).unbind(0)
         order_t = packed_t[4 * n_tok:4 * n_tok + len(order_vals)]
-        run_lengths = packed_t[4 * n_tok + len(order_vals):]
+        run_lengths = packed_t[4 * n_tok + len(order_vals):meta_offset]
+        metadata = packed_t[meta_offset:].view(5, nr)
         k_sel = k_raw.detach()[bi, gi, ti]
         v_sel = v.detach()[bi, gi, ti]
         p_sel = positions[bi, ti].to(torch.int64)
@@ -2433,28 +2489,24 @@ class LogStructuredKVCache(nn.Module):
         )
         self._semantic_append_entries_batched(lanes, lane_counts, block)
 
-        # Tokens are contiguous in run order. CUDA index_add_ uses unordered
-        # atomic sums: centroid roundoff can change routing and slot shapes on
-        # Block checkpoint recompute. Reduce each run in a fixed order instead.
-        # Lengths come from the same host plan as k_sel, so skip GPU validation syncs.
-        run_sums = torch.segment_reduce(k_sel.float(), "sum", lengths=run_lengths, unsafe=True)
+        # Keep the increasing-token sum order: atomic/tree reductions can
+        # perturb centroid routing. The CUDA loop fuses that sum with the update.
         centroid_flat = self.centroid.view(-1, self.k_dim)
         n_eff_flat = self.n_eff.view(-1)
-        max_ordinal = max(r[0] for r in runs) + 1
-        for ordinal in range(max_ordinal):
-            sel = [j for j, r in enumerate(runs) if r[0] == ordinal]
-            if not sel:
+        fused = (_triton_updates() if dev.type == "cuda"
+                 and k_sel.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                 and centroid_flat.dtype == n_eff_flat.dtype == torch.float32 else None)
+        if fused is None:
+            run_sums = torch.segment_reduce(k_sel.float(), "sum", lengths=run_lengths, unsafe=True)
+            lengths = metadata[3].float()
+            forgets = metadata[4].to(torch.int32).view(torch.float32)
+        for _ordinal, start, count in ranges:
+            if fused is not None:
+                fused.centroid(k_sel, centroid_flat, n_eff_flat, metadata, start, count)
                 continue
-            idx_pack = np.empty(2 * len(sel), dtype=np.int64)
-            idx_pack[:len(sel)] = [runs[j][1] for j in sel]
-            idx_pack[len(sel):] = sel
-            idx_t = torch.from_numpy(idx_pack).to(dev, copy=False)
-            ci, sel_t = idx_t[:len(sel)], idx_t[len(sel):]
-            f_pack = np.empty(2 * len(sel), dtype=np.float32)
-            f_pack[:len(sel)] = [float(runs[j][2]) for j in sel]
-            f_pack[len(sel):] = [self.seg_forget if runs[j][3] else 1.0 for j in sel]
-            f_t = torch.from_numpy(f_pack).to(dev, copy=False)
-            n, forget = f_t[:len(sel)], f_t[len(sel):]
+            end = start + count
+            ci, sel_t = metadata[0, start:end], metadata[1, start:end]
+            n, forget = lengths[start:end], forgets[start:end]
             sums = run_sums.index_select(0, sel_t)
             pre = n_eff_flat.index_select(0, ci) * forget
             denom = pre + n
@@ -2756,6 +2808,78 @@ class LogStructuredKVCache(nn.Module):
                 jobs.append((b, g, c, tuple(ordered)))
         self._semantic_commit_joins(jobs, k_raw, v, positions, positions_host, record=record)
 
+    @staticmethod
+    def _semantic_build_replay_plan(host_log, cursors, positions_host, n_groups, n_tokens):
+        """Parse one flush on the CPU; offsets and rounds contain no GPU state."""
+        offset_by_token = []
+        for b, row in enumerate(positions_host):
+            offsets = {int(token): i for i, token in enumerate(row)}
+            if len(offsets) != len(row):
+                raise RuntimeError(f"semantic LogKV replay positions contain duplicate token ids for batch={b}: {row}")
+            offset_by_token.append(offsets)
+        lane_items = []
+        end_cursors = []
+        try:
+            for b in range(len(cursors)):
+                ends = []
+                for g in range(n_groups):
+                    consumed = 0
+                    rows = host_log[b][g]
+                    cursor = cursors[b][g]
+                    items = []
+                    while consumed < n_tokens and cursor < len(rows):
+                        op, cluster, arg, token = rows[cursor]
+                        cursor += 1
+                        if op == LOG_KV_OP_PAD_INSERT:
+                            items.append(("pad", cluster, token, None, None))
+                        elif op == LOG_KV_OP_WARD_MERGE:
+                            items.append(("ward", cluster, arg, None, None))
+                        elif op == LOG_KV_OP_NEW_CLUSTER:
+                            items.append(("new", cluster, token, offset_by_token[b][int(token)], None))
+                            consumed += 1
+                        elif op in (LOG_KV_OP_JOIN, LOG_KV_OP_NEW_SEGMENT):
+                            offsets = array("q", [offset_by_token[b][int(token)]])
+                            while cursor < len(rows) and consumed + len(offsets) < n_tokens:
+                                next_op, next_c, next_seg, token = rows[cursor]
+                                if next_op != LOG_KV_OP_JOIN or next_c != cluster or next_seg != arg:
+                                    break
+                                offsets.append(offset_by_token[b][int(token)])
+                                cursor += 1
+                            items.append(("join", cluster, arg, offsets, op == LOG_KV_OP_NEW_SEGMENT))
+                            consumed += len(offsets)
+                        else:
+                            raise ValueError(f"unknown semantic LogKV op {op}")
+                    if consumed != n_tokens:
+                        raise RuntimeError(
+                            f"semantic LogKV replay consumed {consumed}/{n_tokens} tokens for batch={b}, group={g}"
+                        )
+                    ends.append(cursor)
+                    lane_items.append((b, g, items))
+                end_cursors.append(tuple(ends))
+        except KeyError as exc:
+            raise RuntimeError(f"semantic LogKV replay token {exc.args[0]} not in current flush positions") from exc
+
+        # Preserve the existing schedule: joins for distinct clusters share a
+        # round; a structural operation is applied after that round's joins.
+        ptr = [0] * len(lane_items)
+        rounds = []
+        while any(ptr[l] < len(lane_items[l][2]) for l in range(len(lane_items))):
+            batch, specials = [], []
+            for l, (b, g, items) in enumerate(lane_items):
+                used = set()
+                while ptr[l] < len(items):
+                    kind, cluster, arg, offsets, new_segment = items[ptr[l]]
+                    if kind != "join" or cluster in used:
+                        break
+                    used.add(cluster)
+                    batch.append((b, g, cluster, arg, new_segment, offsets))
+                    ptr[l] += 1
+                if ptr[l] < len(items) and items[ptr[l]][0] != "join":
+                    specials.append((b, g, items[ptr[l]]))
+                    ptr[l] += 1
+            rounds.append((tuple(batch), tuple(specials)))
+        return tuple(end_cursors), tuple(rounds)
+
     def route_and_flush_batch(self, *args, **kwargs) -> None:
         self._mid_decode_state = None
         replay = any(kwargs.get(name) is not None for name in ("replay_op_log", "replay_op_log_host"))
@@ -2773,24 +2897,25 @@ class LogStructuredKVCache(nn.Module):
         replay_op_log: torch.Tensor | None = None,
         replay_op_log_len: torch.Tensor | None = None,
         replay_op_log_host: list[list[list[tuple[int, int, int, int]]]] | None = None,
+        replay_plans: _SemanticReplayPlans | None = None,
     ) -> None:
         if not self.semantic_clusters:
             raise RuntimeError("route_and_flush_batch is only valid for semantic LogKV")
+        if replay_plans is not None and replay_op_log is None:
+            raise RuntimeError("semantic replay plans require the matching op-log; rerouting is not allowed")
         if record_op_log and self.op_log is None:
             self.begin_op_log()
         if positions.dim() == 1:
             positions = positions.unsqueeze(0).expand(k_raw.size(0), -1)
         if positions_host is None:
+            if replay_plans is not None:
+                raise RuntimeError("semantic replay plans require CPU positions; device readback is not allowed")
             positions_host = [[int(x) for x in row] for row in positions.detach().cpu().tolist()]
         if replay_op_log is not None:
             if replay_op_log_len is None:
                 raise ValueError("replay_op_log_len is required with replay_op_log")
-            offset_by_token: list[dict[int, int]] = []
-            for b, row in enumerate(positions_host[: k_raw.size(0)]):
-                offsets = {int(token_idx): i for i, token_idx in enumerate(row)}
-                if len(offsets) != len(row):
-                    raise RuntimeError(f"semantic LogKV replay positions contain duplicate token ids for batch={b}: {row}")
-                offset_by_token.append(offsets)
+            if replay_plans is not None and replay_op_log_host is not replay_plans.host_log:
+                raise RuntimeError("semantic replay plan does not match the CPU op-log")
             if replay_op_log_host is None:
                 lengths = replay_op_log_len.cpu().tolist()
                 replay_op_log_host = [
@@ -2799,81 +2924,40 @@ class LogStructuredKVCache(nn.Module):
                 ]
             if getattr(self, "_op_replay_cursor_host", None) is None:
                 self._op_replay_cursor_host = [[0] * self.n_groups for _ in range(self.batch_size)]
-            # Pass 1 (host only): turn each lane's op rows into ordered work
-            # items. Lanes are independent, so pass 2 can apply item `r` of every
-            # lane together and let one batched append serve all of them.
-            lane_items: list[tuple[int, int, list[tuple]]] = []
-            for b in range(k_raw.size(0)):
-                for g in range(k_raw.size(1)):
-                    consumed = 0
-                    rows = replay_op_log_host[b][g]
-                    cursor = self._op_replay_cursor_host[b][g]
-                    items: list[tuple] = []
-                    while consumed < k_raw.size(2) and cursor < len(rows):
-                        op, a, b_arg, c_arg = rows[cursor]
-                        cursor += 1
-                        if op == LOG_KV_OP_PAD_INSERT:
-                            items.append(("pad", a, c_arg, None, None))
-                        elif op == LOG_KV_OP_WARD_MERGE:
-                            items.append(("ward", a, b_arg, None, None))
-                        elif op == LOG_KV_OP_NEW_CLUSTER:
-                            items.append(("new", a, c_arg, None, None))
-                            consumed += 1
-                        elif op in (LOG_KV_OP_JOIN, LOG_KV_OP_NEW_SEGMENT):
-                            tokens = [c_arg]
-                            # Stop at structural operations and flush boundaries.
-                            while cursor < len(rows) and consumed + len(tokens) < k_raw.size(2):
-                                next_op, next_c, next_seg, token = rows[cursor]
-                                if next_op != LOG_KV_OP_JOIN or next_c != a or next_seg != b_arg:
-                                    break
-                                tokens.append(token)
-                                cursor += 1
-                            items.append(("join", a, b_arg, tokens, op == LOG_KV_OP_NEW_SEGMENT))
-                            consumed += len(tokens)
-                        else:
-                            raise ValueError(f"unknown semantic LogKV op {op}")
-                    self._op_replay_cursor_host[b][g] = cursor
-                    if consumed != k_raw.size(2):
-                        raise RuntimeError(
-                            f"semantic LogKV replay consumed {consumed}/{k_raw.size(2)} tokens for batch={b}, group={g}"
-                        )
-                    lane_items.append((b, g, items))
-
-            # Pass 2: ordering constraints are per cluster, not per lane, so a
-            # round absorbs consecutive joins for as long as their clusters stay
-            # distinct -- phase 1's K per-cluster runs collapse into one append.
-            ptr = [0] * len(lane_items)
+            B, G, T = k_raw.shape[:3]
+            host_positions = positions_host[:B]
+            current_positions = np.array(host_positions, dtype=np.int64, copy=True)
+            if current_positions.shape != (B, T):
+                raise RuntimeError("semantic replay positions do not match the current flush shape")
+            if len(replay_op_log_host) != B or any(len(row) != G for row in replay_op_log_host):
+                raise RuntimeError("semantic replay log does not match the current batch/groups")
+            cursors = tuple(tuple(row[:G]) for row in self._op_replay_cursor_host[:B])
+            plan = replay_plans.plans.get(cursors) if replay_plans is not None else None
+            if plan is None:
+                ends, rounds = self._semantic_build_replay_plan(
+                    replay_op_log_host, cursors, host_positions, G, T
+                )
+                current_positions.setflags(write=False)
+                plan = (current_positions, ends, rounds)
+                if replay_plans is not None:
+                    replay_plans.plans[cursors] = plan
+            elif not np.array_equal(plan[0], current_positions):
+                raise RuntimeError("semantic replay plan does not match the current flush positions")
+            _, ends, rounds = plan
+            for b, row in enumerate(ends):
+                self._op_replay_cursor_host[b][:G] = row
             with self._semantic_deferred_scalars():
-                while any(ptr[l] < len(lane_items[l][2]) for l in range(len(lane_items))):
-                    batch: list[tuple[int, int, int, int, bool, list[int]]] = []
-                    specials: list[tuple] = []
-                    for l, (b, g, items) in enumerate(lane_items):
-                        used: set[int] = set()
-                        while ptr[l] < len(items):
-                            kind, a, arg, tokens, new_segment = items[ptr[l]]
-                            if kind != "join" or a in used:
-                                break
-                            used.add(a)
-                            batch.append((b, g, a, arg, new_segment, tokens))
-                            ptr[l] += 1
-                        if ptr[l] < len(items) and items[ptr[l]][0] != "join":
-                            specials.append((b, g, items[ptr[l]]))
-                            ptr[l] += 1
-                    try:
-                        self._semantic_commit_runs(batch, k_raw, v, positions, offset_by_token)
-                    except KeyError as exc:
-                        raise RuntimeError(
-                            f"semantic LogKV replay token {exc.args[0]} not in current flush positions"
-                        ) from exc
-                    for b, g, (kind, a, arg, _tokens, _new) in specials:
+                for batch, specials in rounds:
+                    self._semantic_commit_runs(batch, k_raw, v, positions, host_positions)
+                    for b, g, (kind, cluster, arg, offset, _new) in specials:
                         if kind == "pad":
-                            self._semantic_insert_pad(b, g, a, arg, record=False)
+                            self._semantic_insert_pad(b, g, cluster, arg, record=False)
                         elif kind == "ward":
-                            self._semantic_ward_merge(b, g, a, arg, record=False)
+                            self._semantic_ward_merge(b, g, cluster, arg, record=False)
                         else:
-                            i = offset_by_token[b][int(arg)]
                             self._semantic_new_cluster(
-                                b, g, a, int(arg), k_raw[b, g, i], v[b, g, i], positions[b, i], record=False
+                                b, g, cluster, int(arg), k_raw[b, g, offset], v[b, g, offset],
+                                positions[b, offset], record=False
                             )
             return
 
@@ -3373,6 +3457,7 @@ class LogStructuredKVCache(nn.Module):
         replay_op_log: torch.Tensor | None = None,
         replay_op_log_len: torch.Tensor | None = None,
         replay_op_log_host: list[list[list[tuple[int, int, int, int]]]] | None = None,
+        replay_plans: _SemanticReplayPlans | None = None,
     ) -> None:
         if flush_len <= 0:
             return
@@ -3392,6 +3477,7 @@ class LogStructuredKVCache(nn.Module):
                 replay_op_log=replay_op_log,
                 replay_op_log_len=replay_op_log_len,
                 replay_op_log_host=replay_op_log_host,
+                replay_plans=replay_plans,
             )
             remaining = self.recent_count - take
             if remaining > 0:
@@ -3421,6 +3507,7 @@ class LogStructuredKVCache(nn.Module):
         replay_op_log: torch.Tensor | None = None,
         replay_op_log_len: torch.Tensor | None = None,
         replay_op_log_host: list[list[list[tuple[int, int, int, int]]]] | None = None,
+        replay_plans: _SemanticReplayPlans | None = None,
     ) -> None:
         n = k_roped.size(2)
         if n > self.recent_size:
@@ -3452,6 +3539,7 @@ class LogStructuredKVCache(nn.Module):
                 replay_op_log=replay_op_log,
                 replay_op_log_len=replay_op_log_len,
                 replay_op_log_host=replay_op_log_host,
+                replay_plans=replay_plans,
             )
 
     def _append_level0(
@@ -3592,6 +3680,7 @@ class LogStructuredKVCache(nn.Module):
         replay_op_log: torch.Tensor | None = None,
         replay_op_log_len: torch.Tensor | None = None,
         replay_op_log_host: list[list[list[tuple[int, int, int, int]]]] | None = None,
+        replay_plans: _SemanticReplayPlans | None = None,
     ) -> None:
         """Add tokens to the sliding window. When the window overflows, the
         oldest 2 tokens are flushed (compacted) into level 0.
@@ -3608,6 +3697,7 @@ class LogStructuredKVCache(nn.Module):
                 replay_op_log=replay_op_log,
                 replay_op_log_len=replay_op_log_len,
                 replay_op_log_host=replay_op_log_host,
+                replay_plans=replay_plans,
             )
             return
         n = k.size(2)
@@ -4597,6 +4687,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
     never retains the per-chunk K/V payload and releases plans after backward.
     When a Block checkpoint has LogKV routing contexts installed, its recompute
     reuses the original op-log instead of calculating routing decisions again.
+    Both replay passes share CPU-only parsed schedules owned by this graph;
+    neither old K/V nor device addresses are retained in these schedules.
     Cost: one extra streaming pass plus the per-block backwards.
 
     Correctness:
@@ -4688,14 +4780,18 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                     replay_op_log=checkpoint_log[0] if checkpoint_log is not None else None,
                     replay_op_log_len=checkpoint_log[1] if checkpoint_log is not None else None,
                     replay_op_log_host=checkpoint_log[2] if checkpoint_log is not None else None,
+                    replay_plans=checkpoint_log[3] if checkpoint_log is not None else None,
                 )
                 start = end
         if checkpoint_log is None:
             op_log, op_log_len = cache.take_op_log() if needs_op_log else (None, None)
             op_log_host = getattr(cache, "_last_op_log_host", None) if needs_op_log else None
-            checkpoint_record_routes(cache, signature, (op_log, op_log_len, op_log_host))
+            replay_plans = _SemanticReplayPlans(op_log_host) if needs_op_log else None
+            if replay_plans is not None:
+                op_log_host = replay_plans.host_log
+            checkpoint_record_routes(cache, signature, (op_log, op_log_len, op_log_host, replay_plans))
         else:
-            op_log, op_log_len, op_log_host = checkpoint_log
+            op_log, op_log_len, op_log_host, replay_plans = checkpoint_log
         # Use saved tensors so autograd releases plan storage after backward
         # (and still supports retain_graph), just like the saved Q/K/V.
         plan_tensors = [tensor for plan in attention_plans if plan is not None for tensor in plan]
@@ -4711,6 +4807,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.op_log = op_log
         ctx.op_log_len = op_log_len
         ctx.op_log_host = op_log_host
+        ctx.replay_plans = replay_plans
         return torch.cat(outputs, dim=2)  # (B, nh, T, v_dim)
 
     @staticmethod
@@ -4766,6 +4863,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                     replay_op_log=ctx.op_log if needs_op_log else None,
                     replay_op_log_len=ctx.op_log_len if needs_op_log else None,
                     replay_op_log_host=ctx.op_log_host if needs_op_log else None,
+                    replay_plans=ctx.replay_plans if needs_op_log else None,
                 )
             start = end
         grad_inputs = (dq, dk, dv, None, None, None, None)
