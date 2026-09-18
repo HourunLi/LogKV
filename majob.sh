@@ -1,6 +1,11 @@
 #!/bin/bash
 # source /home/miniconda3/bin/activate megatron-lm-014
-source /home/ma-user/anaconda3/bin/activate torch218
+if ! source /home/ma-user/anaconda3/bin/activate torch218; then
+    echo "❌ 无法激活 torch218，停止执行，避免使用错误的 Python 环境。"
+    exit 1
+fi
+PYTHON_BIN=$(python -c 'import sys; print(sys.executable)') || exit 1
+echo "🐍 流水线 Python: ${PYTHON_BIN}"
 # DeepSeek 3Bv2 Sandwich Training Script with YAML Configuration
 # Optimized for H200 GPUs (141GB VRAM)
 
@@ -57,9 +62,6 @@ EVAL_MASTER_PORT=${EVAL_MASTER_PORT:-$((MASTER_PORT + 1))}
 NIAH_MASTER_PORT=${NIAH_MASTER_PORT:-$((MASTER_PORT + 2))}
 export LITGPT_EXPECTED_WORLD_SIZE=${LITGPT_EXPECTED_WORLD_SIZE:-$((NUM_NODES * GPUS_PER_NODE))}
 
-if ! python -c "import tensorboard" >/dev/null 2>&1; then
-    python -m pip install "tensorboard>=2.14"
-fi
 echo "🌍 正在启动多机多卡训练: Node ${NODE_RANK} / ${NUM_NODES}"
 echo "🧮 期望 world size: ${LITGPT_EXPECTED_WORLD_SIZE} (= ${NUM_NODES} nodes × ${GPUS_PER_NODE} gpus)"
 echo "🔗 Train rendezvous: ${MASTER_ADDR}:${TRAIN_MASTER_PORT}"
@@ -123,7 +125,7 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 # 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
 # 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_SUMMARY_SIZE LOG_KV_SEMANTIC_REPLAY_UPDATES TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_SUMMARY_SIZE LOG_KV_SEMANTIC_REPLAY_UPDATES ENABLE_TENSORBOARD TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import math
 import os
 import sys
@@ -208,6 +210,7 @@ print(
     cfg.get("log_kv_semantic_centroid_backend") or "sequential",
     1 if cfg.get("log_kv_semantic_summary_size") is None else cfg["log_kv_semantic_summary_size"],
     str(bool(cfg.get("log_kv_semantic_replay_updates", False))).lower(),
+    str(True if cfg.get("enable_tensorboard") is None else bool(cfg["enable_tensorboard"])).lower(),
     train_l_alloc,
     train_persistent,
     train_s,
@@ -223,6 +226,20 @@ if [ -z "${LOG_KV_B}" ]; then
     echo "❌ 致命错误：解析 ${CONFIG_FILE} 的 logKV 配置失败。"
     exit 1
 fi
+
+check_tensorboard() {
+    "${PYTHON_BIN}" - <<'PY_TENSORBOARD'
+from tempfile import TemporaryDirectory
+from lightning.fabric.loggers import TensorBoardLogger
+
+# Probe the actual Lightning backend, including writer initialization. Merely
+# importing tensorboard does not validate its package metadata/dependencies.
+with TemporaryDirectory(prefix="logkv-tensorboard-") as root:
+    logger = TensorBoardLogger(root_dir=root, name="preflight")
+    logger.experiment.add_scalar("preflight", 0, 0)
+    logger.experiment.close()
+PY_TENSORBOARD
+}
 
 checkpoint_exists() {
     [ -f "$1" ] || { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
@@ -393,17 +410,35 @@ else
     echo "⏩ checkpoint 状态：$(checkpoint_step_label)"
     echo "================================================="
 
-    torchrun \
+    if [ "${ENABLE_TENSORBOARD}" == "true" ]; then
+        if ! check_tensorboard >/dev/null 2>&1; then
+            echo "🔧 ${PYTHON_BIN} 的 Lightning TensorBoard 后端不可用，正在安装并复检..."
+            if ! "${PYTHON_BIN}" -m pip install "tensorboard>=2.14"; then
+                echo "❌ TensorBoard 安装失败，停止训练；也可在配置中显式设置 enable_tensorboard: false。"
+                exit 1
+            fi
+            if ! check_tensorboard; then
+                echo "❌ 安装后 Lightning TensorBoard 后端仍不可用，停止训练。Python: ${PYTHON_BIN}"
+                exit 1
+            fi
+        fi
+        echo "✅ Lightning TensorBoard 后端检查通过。Python: ${PYTHON_BIN}"
+    fi
+
+    "${PYTHON_BIN}" -m torch.distributed.run \
         --nnodes=${NUM_NODES} \
         --nproc_per_node=${GPUS_PER_NODE} \
         --node_rank=${NODE_RANK} \
         --master_addr=${MASTER_ADDR} \
         --master_port=${TRAIN_MASTER_PORT} \
-        demo.py --config ${CONFIG_FILE}
+        demo.py --config "${CONFIG_FILE}"
 
     TRAIN_STATUS=$?
     if [ $TRAIN_STATUS -ne 0 ]; then
-        echo "⚠️ [Node ${NODE_RANK}] 训练退出码非零 (Exit Code: $TRAIN_STATUS)，通常为 NCCL 正常销毁竞争，非实质错误。"
+        echo "❌ [Node ${NODE_RANK}] 训练失败 (Exit Code: ${TRAIN_STATUS})，停止流水线，不进入评测。"
+        echo "   请查看上方训练进程的第一个 Traceback；不能把非零退出码默认当作 NCCL 正常退出。"
+        echo "   ${SAVE_DIR} 是训练输出目录，缺少输出权重不代表训练从该目录加载。"
+        exit "${TRAIN_STATUS}"
     fi
 
     echo "🎉 [Node ${NODE_RANK}] 阶段一（训练）结束"
@@ -414,11 +449,12 @@ fi
 
 # ==============================================================================
 # 🌟 阶段一产物核验：save_ckpt: true 时训练必须产出权重。缺失说明训练中途
-# 崩溃/被杀（上面的非零退出码并不总是 NCCL 良性竞争）——在这里立刻失败，
+# 未完成保存，即使进程返回成功也在这里立刻失败，
 # 否则 eval 阶段只会报一个误导性的「加载 checkpoint 出错」。
 # ==============================================================================
 if [ "${SAVE_CKPT}" == "true" ] && ! checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
-    echo "❌ 致命错误：训练阶段结束，但 ${SAVE_DIR}/lit_model.pth 不存在（训练退出码见上方 ⚠️ 行）。"
+    echo "❌ 致命错误：训练进程返回成功，但输出权重 ${SAVE_DIR}/lit_model.pth 不存在。"
+    echo "   这是训练产物检查失败，不是初始模型加载路径；实际输入见训练日志中的 Training checkpoint source。"
     echo "   排查（在训练日志中从后往前找）："
     echo "   ➤ 无 'Reached max_steps' / 'Data exhausted' → 训练循环中途崩溃，向上翻最后一个 Traceback；"
     echo "   ➤ 有 'Training complete' 但无 'Saving final checkpoint' → 生效配置 save_ckpt 为 false；"
@@ -484,7 +520,7 @@ META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 81
 EVAL_OUTPUT_DIR="${SAVE_DIR}/evaluate"
 
 if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
-    torchrun \
+    "${PYTHON_BIN}" -m torch.distributed.run \
         --nnodes=${NUM_NODES} \
         --nproc_per_node=${GPUS_PER_NODE} \
         --node_rank=${NODE_RANK} \
@@ -508,7 +544,7 @@ else
 fi
 
 if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
-    torchrun \
+    "${PYTHON_BIN}" -m torch.distributed.run \
         --nnodes=${NUM_NODES} \
         --nproc_per_node=${GPUS_PER_NODE} \
         --node_rank=${NODE_RANK} \

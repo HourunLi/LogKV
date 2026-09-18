@@ -18,6 +18,7 @@ Architecture:
 """
 
 import os
+import sys
 import re
 import inspect
 import shutil
@@ -680,8 +681,17 @@ def main(
 
     # 1. Set seeds
     set_random_seeds(42)
-    tb_logger = TensorBoardLogger(root_dir=tensorboard_root, name=f"{expid}_{arch_name.replace('/', '-')}")
-    loggers = [tb_logger] if enable_tensorboard else []
+    print(f"Training Python: {sys.executable}")
+    loggers = []
+    if enable_tensorboard:
+        try:
+            loggers.append(TensorBoardLogger(root_dir=tensorboard_root, name=f"{expid}_{arch_name.replace('/', '-')}"))
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                f"TensorBoard logger initialization failed in {sys.executable}. "
+                f"Install the backend with: {sys.executable} -m pip install 'tensorboard>=2.14', "
+                "or explicitly set enable_tensorboard: false."
+            ) from exc
 
     # 2. Fabric setup
     config_obj = Config.from_name(arch_name)
@@ -726,9 +736,6 @@ def main(
 
     fabric.print(f"Model config initialized: {config_obj.name}")
 
-    with fabric.init_module(empty_init=True):
-        model = GPT(config_obj)
-
     checkpoint_dir = f"checkpoints/{arch_name}"
     if ckpt_dir is not None:
         checkpoint_dir = ckpt_dir
@@ -744,6 +751,19 @@ def main(
     elif resume_dir is not None and auto_resume:
         fabric.print("auto_resume=True is ignored because resume_dir is set; loading resume_dir as the weight source.")
 
+    selected_ckpt_path = resume_ckpt_path if resume_ckpt_path is not None else initial_ckpt_path
+    source_kind = "auto_resume" if resume_ckpt_path is not None else ("resume_dir" if resume_dir is not None else "ckpt_dir/base")
+    fabric.print(f"Training checkpoint source ({source_kind}): {selected_ckpt_path}")
+    fabric.print(f"Training checkpoint output: {_normal_path(save_path)}")
+    if not _checkpoint_exists(selected_ckpt_path):
+        raise FileNotFoundError(
+            f"Training input checkpoint ({source_kind}) does not exist or is empty: {selected_ckpt_path}. "
+            "Check ckpt_dir/resume_dir. save_path is the output directory; it is only selected "
+            "as an input when explicitly requested by resume_dir or when auto_resume finds a checkpoint."
+        )
+
+    with fabric.init_module(empty_init=True):
+        model = GPT(config_obj)
     model = fabric.setup_module(model)
     if use_fsdp and activation_checkpointing and log_kv_semantic_clusters and log_kv_cluster_k_max > 1:
         checkpoint_blocks = enable_logkv_checkpoint_replay(model, Block)
