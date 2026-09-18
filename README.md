@@ -1,5 +1,4 @@
-{"torch": "2.11.0+cu128", "cuda": "12.8", "device": "NVIDIA A800-SXM4-80GB", "sequence": 32768, "chunk": 2048, "groups": 8, "dim": 128}
-{"variant": "multi_reference", "pooled_width": 7772, "total_width": 11868, "pooled_padding_fraction": 0.0023803396809057853, "total_padding_fraction": 0.00155881361644759, "plan_ms": 0.736, "prepare_ms": 1.299, "forward_backward_ms": 10.402, "prepare_peak_MiB": 182.16, "forward_backward_peak_MiB": 274.27}
-{"variant": "mid_reference", "pooled_width": 2948, "total_width": 7044, "pooled_padding_fraction": 0.0015688602442334165, "total_padding_fraction": 0.000656587166382737, "plan_ms": 0.839, "prepare_ms": 0.77, "forward_backward_ms": 5.115, "prepare_peak_MiB": 70.66, "forward_backward_peak_MiB": 192.3}
-{"variant": "mid_torch", "pooled_width": 2948, "total_width": 7044, "pooled_padding_fraction": 0.0015688602442334165, "total_padding_fraction": 0.000656587166382737, "plan_ms": 0.841, "prepare_ms": 0.636, "forward_backward_ms": 4.875, "prepare_peak_MiB": 99.3, "forward_backward_peak_MiB": 192.19}
-{"variant": "mid_triton", "pooled_width": 2948, "total_width": 7044, "pooled_padding_fraction": 0.0015688602442334165, "total_padding_fraction": 0.000656587166382737, "plan_ms": 0.846, "prepare_ms": 0.257, "forward_backward_ms": 4.464, "prepare_peak_MiB": 37.74, "forward_backward_peak_MiB": 192.19}
+[09:09:41] Epoch 1 | Step 1 | loss: 2.1924 | 2nd_scale: 0.0000 | logKV_host: route 959.374s/13440 + replay 239.529s/6720 + plan 10.493s/14336 + pack 9.913s/21504 + attn_fwd 4.485s/21504 + attn_bwd 3.120s/7168 | Time: 1267.46s
+step_host (inclusive): data 0.834s | forward 500.778s | backward 765.070s | optimizer 0.049s
+logKV_cuda: route 923.892s | replay 198.154s | plan 10.140s | pack 8.699s | attn_fwd 26.852s | attn_bwd 21.366s
+step_cuda (inclusive): forward 500.627s | backward 765.390s | optimizer 0.045s
