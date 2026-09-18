@@ -114,3 +114,29 @@ def test_fused_route_replay_output_and_gradients(dtype, device):
         torch.testing.assert_close(a, b, atol=0, rtol=0)
     for name, t in actual_buffers.items():
         torch.testing.assert_close(t, buffers[name], atol=0, rtol=0, msg=name)
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_update_diagnostic_keeps_centroid_error_details(corrupt):
+    from types import SimpleNamespace
+    from unused.benchmark_log_kv_updates import diagnose_updates
+
+    def update(k, mu, ne, meta, start, count):
+        mu.copy_(torch.tensor([[2., 3.]]))
+        ne.fill_(2.)
+        if corrupt:
+            mu[0, 1] += .25
+
+    backend = SimpleNamespace(centroid=update)
+    # One run, two tokens, no previous centroid mass.
+    k = torch.tensor([[1., 2.], [3., 4.]])
+    meta = torch.tensor([[0], [0], [0], [2], [1065353216]])  # fp32 1.0 bits
+    mu, ne = torch.zeros(1, 2), torch.zeros(1)
+    with diagnose_updates(backend) as calls:
+        if corrupt:
+            with pytest.raises(AssertionError, match=r"centroid update 1[\s\S]*Mismatched elements"):
+                backend.centroid(k, mu, ne, meta, 0, 1)
+        else:
+            backend.centroid(k, mu, ne, meta, 0, 1)
+        assert calls["centroid"] == 1
+    assert backend.centroid is update  # instrumentation does not leak into timing

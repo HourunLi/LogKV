@@ -1,11 +1,13 @@
 """Same-state route/replay A/B, including host dispatch and device work.
 
 python unused/benchmark_log_kv_updates.py --iters 10
+First-mismatch diagnosis: python unused/benchmark_log_kv_updates.py --diagnose
 CPU smoke: --device cpu --sequence 128 --chunk 16 --batch 1 --groups 2 --dim 8 --iters 2
 Compilation and cache restoration are excluded; this is not full-step throughput.
 """
 
 import argparse
+from contextlib import contextmanager
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -20,6 +22,66 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import litgpt.log_kv_cache as kv
 
 
+
+def assert_buffers(actual, expected, context):
+    buffers = dict(actual.named_buffers())
+    for field, tensor in expected.named_buffers():
+        if not field.startswith("op_log"):
+            torch.testing.assert_close(buffers[field], tensor, atol=0, rtol=0,
+                                       msg=lambda detail: f"{context}: {field}\n{detail}")
+
+
+@contextmanager
+def diagnose_updates(backend):
+    """Untimed, immediate comparisons isolate the first faulty shared update."""
+    append = kv.LogStructuredKVCache._semantic_append_entries_batched
+    centroid = backend.centroid
+    calls = {"ladder": 0, "centroid": 0}
+
+    def checked_append(cache, lanes, counts, block):
+        reference = deepcopy(cache)
+        with patch.object(kv, "_triton_updates", return_value=None):
+            append(reference, lanes, counts, block)
+        append(cache, lanes, counts, block)
+        calls["ladder"] += 1
+        assert_buffers(cache, reference, f"ladder update {calls['ladder']}, counts={counts}")
+
+    def checked_centroid(k, mu, ne, meta, start, count):
+        # Reconstruct the original run order used by the PyTorch implementation.
+        lengths = meta[3].index_select(0, torch.argsort(meta[1]))
+        sums = torch.segment_reduce(k.float(), "sum", lengths=lengths, unsafe=True)
+        end = start + count
+        ci, sel = meta[0, start:end], meta[1, start:end]
+        n = meta[3, start:end].float()
+        forget = meta[4, start:end].to(torch.int32).view(torch.float32)
+        pre = ne.index_select(0, ci) * forget
+        denom = pre + n
+        sums = sums.index_select(0, sel)
+        old_mu = mu.index_select(0, ci)
+        numerator = pre[:, None] * old_mu + sums
+        expected = torch.where((pre > 0)[:, None], numerator / denom[:, None], sums / n[:, None])
+        centroid(k, mu, ne, meta, start, count)
+        calls["centroid"] += 1
+        label = f"centroid update {calls['centroid']}, ordinal offset={start}, runs={count}"
+        actual = mu.index_select(0, ci)
+        try:
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0,
+                                       msg=lambda detail: f"{label}: centroid\n{detail}")
+        except AssertionError as exc:
+            row, dim = divmod(int((actual - expected).abs().argmax().item()), k.size(1))
+            values = {"cluster": int(ci[row]), "dim": dim, "old_mu": float(old_mu[row, dim]),
+                      "sum": float(sums[row, dim]), "pre": float(pre[row]), "n": float(n[row]),
+                      "numerator": float(numerator[row, dim]), "denom": float(denom[row]),
+                      "actual": float(actual[row, dim]), "expected": float(expected[row, dim])}
+            raise AssertionError(f"{exc}\nLargest-difference inputs: {json.dumps(values)}") from exc
+        torch.testing.assert_close(ne.index_select(0, ci), denom, atol=0, rtol=0,
+                                   msg=lambda detail: f"{label}: n_eff\n{detail}")
+
+    with patch.object(kv.LogStructuredKVCache, "_semantic_append_entries_batched", checked_append), \
+         patch.object(backend, "centroid", checked_centroid):
+        yield calls
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--device", default="cuda")
@@ -29,6 +91,7 @@ def main():
     p.add_argument("--groups", type=int, default=8)
     p.add_argument("--dim", type=int, default=128)
     p.add_argument("--iters", type=int, default=10)
+    p.add_argument("--diagnose", action="store_true", help="check each ladder/centroid update; do not time")
     args = p.parse_args()
     if min(args.chunk, args.batch, args.groups, args.dim, args.iters) < 1 or args.sequence < 2 * args.chunk:
         p.error("require positive sizes/iters and sequence >= 2*chunk")
@@ -38,6 +101,8 @@ def main():
     fused = kv._triton_updates() if dev.type == "cuda" else None
     if dev.type == "cuda" and fused is None:
         raise RuntimeError("Triton unavailable; refusing to label a fallback as fused")
+    if args.diagnose and fused is None:
+        p.error("--diagnose requires CUDA/Triton")
     torch.manual_seed(54)
     torch.set_num_threads(1)
     dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
@@ -72,6 +137,24 @@ def main():
         plans = kv._SemanticReplayPlans(expected._last_op_log_host)
     print(json.dumps({**vars(args), "torch": torch.__version__, "cuda": torch.version.cuda,
                       "device": torch.cuda.get_device_name(dev) if dev.type == "cuda" else str(dev)}), flush=True)
+    if args.diagnose:
+        with torch.no_grad(), diagnose_updates(fused) as calls:
+            for phase in ("route", "replay"):
+                cache = deepcopy(base)
+                if phase == "route":
+                    cache.begin_op_log()
+                    cache.route_and_flush_batch(k, v, pos, positions_host=host, record_op_log=True)
+                else:
+                    cache.route_and_flush_batch(k, v, pos, positions_host=host, replay_op_log=log,
+                        replay_op_log_len=lengths, replay_op_log_host=plans.host_log, replay_plans=plans)
+                assert_buffers(cache, expected, f"diagnose/{phase}/final")
+                if phase == "route":
+                    got_log, got_len = cache.take_op_log()
+                    torch.testing.assert_close(got_log, log, atol=0, rtol=0)
+                    torch.testing.assert_close(got_len, lengths, atol=0, rtol=0)
+        assert calls["ladder"] and calls["centroid"], "diagnostic did not exercise both updates"
+        print(json.dumps({"diagnose": "passed", **calls}), flush=True)
+        return
     variants = [("torch", None)] + ([("triton", fused)] if fused is not None else [])
     for name, backend in variants:
         for phase in ("route", "replay"):
@@ -95,9 +178,7 @@ def main():
                     elapsed = (time.perf_counter() - start) * 1000
                 peak = torch.cuda.max_memory_allocated(dev) - baseline if dev.type == "cuda" else 0
                 if iteration == 0:
-                    for field, tensor in expected.named_buffers():
-                        if not field.startswith("op_log"):
-                            torch.testing.assert_close(dict(cache.named_buffers())[field], tensor, atol=0, rtol=0, msg=field)
+                    assert_buffers(cache, expected, f"{name}/{phase}")
                     if phase == "route":
                         got_log, got_len = cache.take_op_log()
                         torch.testing.assert_close(got_log, log, atol=0, rtol=0)
