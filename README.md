@@ -31,5 +31,38 @@ Traceback (most recent call last):
   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
     return launch_agent(self._config, self._entrypoint, list(args))
   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  [rank7]: Traceback (most recent call last):
+[rank7]:   File "/home/ma-user/modelarts/user-job-dir/semanticLogKV/demo.py", line 1210, in <module>
+[rank7]:     run_cli(main)
+[rank7]:   File "/home/ma-user/modelarts/user-job-dir/semanticLogKV/utils.py", line 225, in run_cli
+[rank7]:     return func(**kwargs)
+[rank7]:   File "/home/ma-user/modelarts/user-job-dir/semanticLogKV/utils.py", line 147, in wrapper
+[rank7]:     return func(*expanded_args, **expanded_kwargs)
+[rank7]:   File "/home/ma-user/modelarts/user-job-dir/semanticLogKV/demo.py", line 759, in main
+[rank7]:     raise FileNotFoundError(
+[rank7]: FileNotFoundError: Training input checkpoint (ckpt_dir/base) does not exist or is empty: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/lit_model.pth. Check ckpt_dir/resume_dir. save_path is the output directory; it is only selected as an input when explicitly requested by resume_dir or when auto_resume finds a checkpoint.
+
+
+
+
+
+
+
     raise ChildFailedError(
 torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
