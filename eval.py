@@ -220,6 +220,31 @@ class SafeJSONEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+def niah_sample_rows(results: dict) -> list[dict]:
+    """Flatten lm_eval's per-task samples dict (results["samples"], only
+    present when simple_evaluate(..., log_samples=True) was passed) into one
+    flat list of rows tagged with task_name, restricted to niah_* tasks.
+
+    Pure function, no I/O -- kept separate from the file-writing call site so
+    it's testable without a real eval run (see tests/test_niah_sample_rows.py).
+    Returns [] when results has no "samples" key (log_samples=False) or no
+    niah_* task among them, never raises on that -- absence just means
+    §7.3's per-sample record requirement wasn't asked for on this run.
+    """
+    samples_by_task = results.get("samples") if isinstance(results, dict) else None
+    if not samples_by_task:
+        return []
+    rows = []
+    for task_name, records in samples_by_task.items():
+        if not str(task_name).startswith("niah_"):
+            continue
+        for rec in records:
+            row = dict(rec) if isinstance(rec, dict) else {"raw": rec}
+            row["task_name"] = task_name
+            rows.append(row)
+    return rows
+
+
 def extract_results_to_csv(results: dict, benchmark: str, output_path: Path) -> None:
     """
     从 results 中提取各数据集的 acc 或 acc_norm 数值，输出为 CSV 文件。
@@ -1002,6 +1027,16 @@ def main(
     config_overrides: dict[str, Any] | None = None,
     output_path: str | None = None,
     metadata: dict[str, Any] | None = None,
+    # Mechanism-agnostic (not a log_kv_* param -- applies the same under
+    # log_kv_dense_mode / sink-window mode / LogKV mode). Forwarded verbatim
+    # to lm_eval's own `simple_evaluate(log_samples=...)`. Off by default
+    # (existing benchmark runs are unaffected, no output-size growth); the
+    # 32K Dense/SinkWindow/SemanticLogKV comparison's niah_* eval configs set
+    # this True so §7.3's "保存原始输出、标准答案和逐样本分数" requirement
+    # has real per-doc records to save, not just aggregate metrics -- see
+    # the per-task niah JSONL this writes below when the benchmark includes
+    # a niah_* task.
+    log_samples: bool = False,
     # ── 🧩 logKV / dense KV eval ──
     # true = 使用原生 O(N) 标准 KVCache 跑普通 causal dense attention；
     # false = 默认 LogKV 压缩注意力路径。dense 模式只用于手动基线对比。
@@ -1115,6 +1150,7 @@ def main(
     config_overrides = _o("config_overrides", config_overrides)
     output_path = _o("output_path", output_path)
     metadata = _o("metadata", metadata)
+    log_samples = bool(_o("log_samples", log_samples))
     log_kv_dense_mode = bool(_o("log_kv_dense_mode", log_kv_dense_mode))
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
@@ -1298,6 +1334,7 @@ def main(
                 batch_size=1,
                 metadata=metadata,
                 limit=limit,
+                log_samples=log_samples,
             )
         eval_done = True
 
@@ -1399,6 +1436,18 @@ def main(
                     with open(output_file, "w", encoding="utf-8") as f:
                         json.dump(json_output, f, indent=2, ensure_ascii=False, cls=SafeJSONEncoder)
                     print(f"✅ 完整结果已保存到: {output_file}")
+
+                    # niah_* 逐样本记录额外落一份扁平 JSONL，供
+                    # scripts/analyze_niah_visibility.py 直接消费（不用从
+                    # 嵌套的 results["samples"][task] 里现挖）。只有
+                    # log_samples=True 时 results 里才有 "samples" 这个键。
+                    rows = niah_sample_rows(results)
+                    if rows:
+                        niah_samples_file = output_file.with_name(f"{output_file.stem}_niah_samples.jsonl")
+                        with open(niah_samples_file, "w", encoding="utf-8") as nf:
+                            for row in rows:
+                                nf.write(json.dumps(row, ensure_ascii=False, cls=SafeJSONEncoder) + "\n")
+                        print(f"✅ niah 逐样本记录已保存到: {niah_samples_file}")
                 except Exception as e:
                     print(f"❌ 保存完整结果失败: {e}")
                     print(f"⚠️ 尝试备用方案...")

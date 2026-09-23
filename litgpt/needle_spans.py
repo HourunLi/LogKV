@@ -169,6 +169,11 @@ def find_needle_spans(
             if len(answer) < 6 and not _RULER_MAGIC_RE.search(sentence):
                 continue
             _add_span(spans, seen, left, right, "answer_sentence")
+            # Tight match, kept distinct from the sentence-expanded span above:
+            # visibility bucketing must key off where the answer *content*
+            # sits, not the sentence it's embedded in (a sentence can straddle
+            # a SinkWindow boundary while the answer substring itself does not).
+            _add_span(spans, seen, start, end, "answer_exact")
 
     out: list[NeedleSpan] = []
     for start, end, source in spans:
