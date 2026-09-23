@@ -18,7 +18,7 @@ entropy_chunk_size: 128
 dataset_name: "prolong"
 dataset_dir: "data"
 data_dir: /home/ma-user/work/bucket-pangu-green/lihourun/longcontext/prolong/data
-num_workers: 16
+num_workers: 0
 save_ckpt: true
 save_interval: 200
 

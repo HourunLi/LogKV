@@ -262,24 +262,24 @@ def extract_results_to_csv(results: dict, benchmark: str, output_path: Path) -> 
     except Exception as e:
         print(f"❌ 保存 CSV 失败: {e}")
 
-if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
-    print("设置环境变量...")
+# if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
+print("设置HF_DATASETS_CACHE环境变量...")
 
-    BASE = '/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache'
-    os.environ['HF_HOME'] = BASE
-    os.environ['HF_DATASETS_CACHE'] = f'{BASE}/hf_cache'
-    os.environ['HF_EVALUATE_CACHE'] = f'{BASE}/evaluate'
-    os.environ['HF_MODULES_CACHE'] = f'{BASE}/modules'
-    os.environ['HUGGINGFACE_HUB_CACHE'] = f'{BASE}/hub'
-    os.environ['HF_HUB_CACHE'] = f'{BASE}/hub'
-    os.environ['RULER_CACHE_DIR'] = f'{BASE}/ruler_cache'
-    os.environ['NLTK_DATA'] = f'{BASE}/nltk_data'
-    os.environ['HF_HUB_OFFLINE'] = '1'
-    os.environ['HF_DATASETS_OFFLINE'] = '1'
-    os.environ['HF_DATASETS_IN_MEMORY_MAX_SIZE'] = '0'
-    os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
-    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+BASE = '/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache'
+os.environ['HF_HOME'] = BASE
+os.environ['HF_DATASETS_CACHE'] = f'{BASE}/hf_cache'
+os.environ['HF_EVALUATE_CACHE'] = f'{BASE}/evaluate'
+os.environ['HF_MODULES_CACHE'] = f'{BASE}/modules'
+os.environ['HUGGINGFACE_HUB_CACHE'] = f'{BASE}/hub'
+os.environ['HF_HUB_CACHE'] = f'{BASE}/hub'
+os.environ['RULER_CACHE_DIR'] = f'{BASE}/ruler_cache'
+os.environ['NLTK_DATA'] = f'{BASE}/nltk_data'
+os.environ['HF_HUB_OFFLINE'] = '1'
+os.environ['HF_DATASETS_OFFLINE'] = '1'
+os.environ['HF_DATASETS_IN_MEMORY_MAX_SIZE'] = '0'
+os.environ['HF_DATASETS_TRUST_REMOTE_CODE'] = '1'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 
 # 每个 rank 各自独立加载一遍数据集，HF datasets 的 "Found the latest cached
 # dataset configuration ..." 日志和内部 tqdm 进度条会被重复打印 rank 份，
