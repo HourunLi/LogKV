@@ -2,6 +2,7 @@
 # `log_kv_slot_attention` 将继续走手写 score/softmax 路径。
 config: arc_semantic_stage1_threephase.yaml
 enable_tensorboard: false
+auto_resume: true  # 直接 torchrun 时也从 save_path 恢复模型、优化器和步数；无 checkpoint 则加载 ckpt_dir。
 
 expid: qwen1.7b-32k-cpt-logKV-semantic-fast
 save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast
