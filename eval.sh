@@ -16,6 +16,23 @@ if [ -f /home/ma-user/anaconda3/bin/activate ]; then
     source /home/ma-user/anaconda3/bin/activate torch218
 fi
 
+
+# Set caches before Python imports Hugging Face and freezes its cache paths.
+export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
+export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
+export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
+export HF_MODULES_CACHE="${HF_HOME}/modules"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
+export RULER_CACHE_DIR="${HF_HOME}/ruler_cache"
+export NLTK_DATA="${HF_HOME}/nltk_data"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export HF_DATASETS_IN_MEMORY_MAX_SIZE=0
+export HF_DATASETS_TRUST_REMOTE_CODE=1
+export TOKENIZERS_PARALLELISM=false
+export HF_ALLOW_CODE_EVAL=1
+
 export CUDA_DEVICE_MAX_CONNECTIONS=32
 export CUDNN_LOGERR_DBG=1
 export CUDNN_LOGDEST_DBG=stderr
