@@ -4,6 +4,8 @@ config: arc_semantic_stage1_threephase.yaml
 enable_tensorboard: false
 
 expid: qwen1.7b-32k-cpt-logKV-semantic-fast
+ckpt_dir: /workspace/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast/step_1200
+checkpoint_dir: /workspace/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast/step_1200
 save_path: /workspace/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast
 merged_state_staging_dir: /workspace/ckpt-logKV/_fsdp_staging_semantic_fast
 tensorboard_root: /workspace/tb-32k-semantic-fast
