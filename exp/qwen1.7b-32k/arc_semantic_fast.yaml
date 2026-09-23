@@ -4,9 +4,11 @@ config: arc_semantic_stage1_threephase.yaml
 enable_tensorboard: false
 
 expid: qwen1.7b-32k-cpt-logKV-semantic-fast
-save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast
-merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/_fsdp_staging_semantic_fast
-tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic-fast
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast/step_1200
+checkpoint_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast/step_1200
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_semantic_fast
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-semantic-fast
 
 # 走旧路由（每 orphan 一次 Ward merge）只用于 A/B 对照，默认 false。
 log_kv_semantic_legacy_route: null

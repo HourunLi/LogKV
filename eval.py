@@ -265,7 +265,7 @@ def extract_results_to_csv(results: dict, benchmark: str, output_path: Path) -> 
 if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
     print("设置环境变量...")
 
-    BASE = '/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache'
+    BASE = '/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache'
     os.environ['HF_HOME'] = BASE
     os.environ['HF_DATASETS_CACHE'] = f'{BASE}/hf_cache'
     os.environ['HF_EVALUATE_CACHE'] = f'{BASE}/evaluate'

@@ -2,5 +2,5 @@ config: diag.yaml
 
 benchmark: "niah_single_1,niah_single_2,niah_single_3"
 metadata:
-  pretrained: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+  pretrained: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
   max_seq_lengths: [32768]
