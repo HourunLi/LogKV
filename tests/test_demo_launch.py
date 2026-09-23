@@ -143,17 +143,22 @@ def test_training_checkpoint_source_is_not_implicit_save_path(tmp_path, auto, re
         exec(block, scope)
 
 
-@pytest.mark.parametrize('enabled', ['true', 'false'])
-def test_tensorboard_install_failure_stops_before_training(enabled):
+@pytest.mark.parametrize('enabled,healthy', [('true', False), ('true', True), ('false', False)])
+def test_tensorboard_preflight_preserves_error_without_installing(enabled, healthy):
     source = (ROOT / 'majob.sh').read_text()
     start = source.index('    if [ "${ENABLE_TENSORBOARD}" == "true" ]; then')
     end = source.index('    "${PYTHON_BIN}" -m torch.distributed.run', start)
-    shell = f'ENABLE_TENSORBOARD={enabled}\n' + '''
+    shell = f'ENABLE_TENSORBOARD={enabled}\nPROBE_STATUS={0 if healthy else 1}\n' + '''
 PYTHON_BIN=install_test
-check_tensorboard() { return 1; }
+check_tensorboard() {
+    if [ "$PROBE_STATUS" != 0 ]; then echo ORIGINAL_BACKEND_ERROR >&2; fi
+    return "$PROBE_STATUS"
+}
 install_test() { echo INSTALL_ATTEMPT; return 1; }
 ''' + source[start:end] + '\necho READY_FOR_TRAINING'
     result = subprocess.run(['bash', '-c', shell], capture_output=True, text=True)
-    assert result.returncode == (1 if enabled == 'true' else 0)
-    assert ('READY_FOR_TRAINING' in result.stdout) == (enabled == 'false')
-    assert ('INSTALL_ATTEMPT' in result.stdout) == (enabled == 'true')
+    failed = enabled == 'true' and not healthy
+    assert result.returncode == int(failed)
+    assert ('READY_FOR_TRAINING' in result.stdout) == (not failed)
+    assert 'INSTALL_ATTEMPT' not in result.stdout
+    assert ('ORIGINAL_BACKEND_ERROR' in result.stderr) == failed
