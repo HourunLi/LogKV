@@ -376,7 +376,7 @@ while [ "${CUR_COUNT}" -lt "${NUM_NODES}" ]; do
 done
 
 echo "All nodes are ready. Starting eval.py"
-sleep 30
+sleep 10
 
 DEFAULT_BENCHMARKS="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
