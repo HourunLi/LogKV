@@ -87,8 +87,10 @@ python scripts/calibrate_sinkwindow_w.py \
 
 把这一步定下来的 `window_size` 填进
 `exp/qwen1.7b-32k/sinkwindow_stage1_train.yaml`/`sinkwindow_stage1_eval.yaml`
-的 `sink_window_size` 字段（当前是占位值，训练前必须替换），然后**冻结**：
-S、W、SemanticLogKV 配置三者都不应该在三组训练启动之后再变。
+的 `log_kv_sink_window_window_size` 字段（两份文件都要改，值必须一致；当前是
+故意写成 `-1` 的占位值，训练前必须替换——忘了替换会在训练/评测一启动就报错，
+不会静默用错的窗口跑掉），然后**冻结**：S、W、SemanticLogKV 配置三者都不应该
+在三组训练启动之后再变。
 
 ## §四 导出固定的 NIAH 样本集
 
@@ -202,8 +204,8 @@ hash（比如训练日志里打印过，或者你自己单独记的）。
 | `litgpt/cache_accounting.py` | 通用字节统计（`structural_bytes`/`live_extra_bytes`，按 storage 去重） |
 | `litgpt/sinkwindow_cache.py` | SinkWindow cache 实现（sinkwindow 分支） |
 | `litgpt/model.py` | Dense/SinkWindow 的训练+推理接入 |
-| `demo.py` | resolved-config dump；Dense 训练路由（`log_kv_dense_mode`） |
-| `eval.py` | `log_samples` 开关 + niah 逐样本 JSONL 落盘；SinkWindow eval 接入（sinkwindow 分支） |
+| `demo.py` | resolved-config dump（基准分支）；Dense 训练路由 `log_kv_dense_mode`（dense 分支）；SinkWindow 训练路由 `log_kv_sink_window_mode`（sinkwindow 分支） |
+| `eval.py` | `log_samples` 开关 + niah 逐样本 JSONL 落盘（基准分支）；SinkWindow eval 接入 `log_kv_sink_window_mode`（sinkwindow 分支） |
 | `scripts/yaml_resolve.py` | 轻量 YAML `config:` 继承解析，供下面几个脚本共用 |
 | `scripts/measure_cache_bytes.py` | 见 §二 |
 | `scripts/calibrate_sinkwindow_w.py` | 见 §三（sinkwindow 分支） |
