@@ -285,6 +285,14 @@ os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 # dataset configuration ..." 日志和内部 tqdm 进度条会被重复打印 rank 份，
 # 跟评测本身的计算进度混在一起。这里关掉，只留下面每个 rank 自己的计算进度。
 os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
+import datasets.config as _hf_datasets_config
+import huggingface_hub.constants as _hf_hub_constants
+
+print(f"[{_rank_label()}] 环境变量 datasets: {os.environ.get('HF_DATASETS_CACHE')}", flush=True)
+print(f"[{_rank_label()}] 库实际使用 datasets: {_hf_datasets_config.HF_DATASETS_CACHE}", flush=True)
+print(f"[{_rank_label()}] 环境变量 hub: {os.environ.get('HF_HUB_CACHE')}", flush=True)
+print(f"[{_rank_label()}] 库实际使用 hub: {_hf_hub_constants.HF_HUB_CACHE}", flush=True)
+
 try:
     import datasets as _hf_datasets
     _hf_datasets.disable_progress_bars()
