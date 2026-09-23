@@ -4110,6 +4110,21 @@ class LogStructuredKVCache(nn.Module):
             slot_gamma=torch.cat(gamma_parts, dim=-1),
         )
 
+    def extra_live_tensors(self) -> list[torch.Tensor]:
+        """Live GPU tensors that are not ``register_buffer``s, for byte accounting.
+
+        ``_mid_decode_state`` (semantic_anchor_mode="mid" only) holds a packed
+        k/v decode workspace sized at first use from ``recent_count``/plan
+        shape, not from config alone — it is not a fixed function of the
+        cache's static configuration, so a caller must report it separately
+        from the structural/persistent byte count (see
+        ``litgpt/cache_accounting.py``), not fold it in.
+        """
+        if self._mid_decode_state is None:
+            return []
+        _, _, buffers, _ = self._mid_decode_state
+        return list(buffers)
+
     def get_attention_state(self, with_stats: bool = False, *, plan=None) -> CacheAttentionState:
         if self.semantic_clusters and plan is None:
             plan = self._semantic_attention_plan()

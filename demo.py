@@ -92,6 +92,26 @@ def _normal_path(path: str | os.PathLike) -> Path:
         return Path(os.path.abspath(p))
 
 
+def _dump_resolved_config(fabric: L.Fabric, save_path: str | os.PathLike, resolved: dict) -> None:
+    """Write the fully-*resolved* training config (YAML `config:` inheritance
+    and _o() overrides already applied -- YAML non-null > CLI > default) to
+    ``save_path/resolved_config.yaml``.
+
+    This repo's exp/*.yaml files have repeatedly drifted from their own
+    resolved field values (an expid/filename/comment claiming one K_max/B
+    while the actual field says another -- see the audit notes for the
+    Dense/SinkWindow/SemanticLogKV 32K comparison). Anything that later needs
+    to know what config a checkpoint actually trained under should read this
+    file, not the launch YAML or its comments.
+    """
+    save_dir = _normal_path(save_path)
+    if fabric.global_rank == 0:
+        os.makedirs(save_dir, exist_ok=True)
+        with open(save_dir / "resolved_config.yaml", "w", encoding="utf-8") as f:
+            yaml.dump(resolved, f, default_flow_style=False, sort_keys=True)
+    fabric.barrier()
+
+
 def _checkpoint_exists(path: Path) -> bool:
     # FSDP/DCP checkpoints may be directories named lit_model.pth; non-FSDP
     # checkpoints are regular files.
@@ -735,6 +755,14 @@ def main(
     )
 
     fabric.print(f"Model config initialized: {config_obj.name}")
+
+    # Snapshot every main() parameter's *resolved* value (post config:
+    # inheritance, post _o() override) before anything else can fail --
+    # lands on disk even if checkpoint loading or data loading crashes next,
+    # and self-updates if main() gains new parameters later instead of
+    # rotting the way a hand-written field list would.
+    _resolved_config = {k: v for k, v in locals().items() if k in inspect.signature(main).parameters}
+    _dump_resolved_config(fabric, save_path, _resolved_config)
 
     checkpoint_dir = f"checkpoints/{arch_name}"
     if ckpt_dir is not None:
