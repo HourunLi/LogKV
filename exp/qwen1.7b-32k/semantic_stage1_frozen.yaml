@@ -1,45 +1,33 @@
 # SemanticLogKV 分支 · 32K Dense/SinkWindow/SemanticLogKV 三组对照实验
 # ============================================================
-# 占位文件 -- 训练前必须确认，不能就这样直接开跑。见下方 TODO。
+# 已确认：SemanticLogKV 分支使用 arc_semantic_fast.yaml（用户 2026-09-23 确认）。
 #
-# 设计原因：没有直接把某个现成 arc_semantic_stage1_*.yaml 的内容复制/重定向
-# 进这里，是因为审计发现现成配置在"是否继承 base.yaml 的共同训练条件"这件事
-# 上并不统一，直接复制一份可能悄悄违反 §六 的共同训练条件要求：
+# 继承链：arc_semantic_fast.yaml -> arc_semantic_stage1_threephase.yaml ->
+# base.yaml。三级链条里任何一级都没有覆盖 global_batch_size/micro_batch_size/
+# max_steps，所以最终生效值就是 base.yaml 的 32 / 4 / 1500——严格满足 §六
+# "三组同条件训练"的要求，不需要额外的公平性限定说明。
 #
-#   文件                                   global_batch_size / micro_batch_size / max_steps   继承方式
-#   base.yaml（本文件的 config: 目标）      32 / 4 / 1500                                       --
-#   arc_semantic_stage1_threephase.yaml     32 / 4 / 1500（未覆盖，继承 base）                   config: base.yaml
-#   arc_semantic_stage1_chunktree_c256.yaml 32 / 4 / 1500（未覆盖，继承 base）                   config: base.yaml
-#   arc_semantic_fast.yaml                  32 / 4 / 1500（未覆盖，经 threephase 继承 base）      config: arc_semantic_stage1_threephase.yaml
-#   arc_semantic_stage1_k1.yaml             128 / 1 / 1500（覆盖了 batch，没覆盖 steps）          config: base.yaml
-#   arc_semantic_stage1_k16.yaml            128 / 1 / 3000（batch 和 steps 都不同，而且根本
-#                                            没有 config: 继承链，是完全独立的一份文件）           无继承，standalone
+# arc_semantic_fast.yaml 自己覆盖的语义超参数（相对 threephase 的差异）：
+#   - log_kv_second_order_scale: 0.0        （关掉二阶修正，纯一阶路径）
+#   - log_kv_semantic_anchor_mode: mid       （单中心 anchor，不是 lo/mid/hi 三锚点）
+#   - log_kv_B: 128                          （threephase 是 256）
+#   - log_kv_cluster_k_max: 8                （继承自 threephase，未再覆盖）
+#   - log_kv_semantic_centroid_backend: parallel
+#   - log_kv_semantic_summary_size: 8        （摘要更新路径，不是逐 token 入 ladder）
+#   - log_kv_semantic_replay_updates: true
 #
-# 也就是说只有 threephase / chunktree_c256 / fast 三份和 base.yaml 的共同训练
-# 条件一致；k1 / k16 两份如果直接拿来当 SemanticLogKV 分支用，会在 batch size
-# （从而有效 batch）和/或训练步数上打破"三组同条件训练"的前提。
+# 这几个选择对本实验其余工具的影响，审计时已经处理：
+#   - anchor_mode=mid 会用到 LogStructuredKVCache 的 mid-decode 瞬时 workspace
+#     （_mid_decode_state）——litgpt/cache_accounting.py 的 structural/live_extra
+#     两个数分开报正是为了这种情况；测试见
+#     tests/test_cache_accounting.py::test_extra_live_tensors_reports_mid_decode_workspace_separately_from_structural。
+#   - second_order_scale=0.0 意味着 level_sigma_*/level_gamma_* 这些二阶 buffer
+#     根本不会分配（不是分配了却是零）；测试见
+#     tests/test_cache_accounting.py::test_disabled_second_order_buffers_are_absent_not_zero_sized。
 #
-# 各份的语义超参数本身（这才是"哪份对应 0.946/0.204/0.172"要比对的东西）：
-#   threephase:      K_max=8,  B=256, recent_size=4096, chunk_size=0
-#   chunktree_c256:   K_max=16, B=512, recent_size=1024, chunk_size=256
-#   fast:             继承 threephase 再改：second_order_scale=0.0,
-#                     anchor_mode=mid, B=128, K_max=8, summary_size=8,
-#                     replay_updates=true（一阶、mid-anchor、摘要更新路径）
-#   k1（名不副实）:    K_max=16, B=512（文件名叫 k1，实际没设 k_max，继承的是 16）
-#   k16（batch/steps 都不同于 base）: K_max=16, B=512
-#
-# 本文件目前指向 base.yaml 本身的默认值（K_max=16, B=512, second_order_scale=0.2,
-# chunk_size=0，未开 mid-anchor/summary/replay）：这是仓库里"没有特别说明时"
-# 最基础的语义配置，且严格满足 §六 共同训练条件（因为就是 base.yaml 本身）。
-# 这只是本工具给出的可执行默认，不是对"哪份对应 0.946/0.204/0.172"的确认。
-#
-# TODO(confirm-before-training):
-#   1. 确认这五份里到底哪份（如果有）对应你之前跑出 0.946/0.204/0.172 的那次；
-#      如果是 k1/k16，需要先决定是保留它们的 batch/steps（这样就不再是
-#      "三组同条件训练"，需要在报告里明确注明这一限定），还是只搬它们的语义
-#      超参数、批量/步数仍按 base.yaml 走（这样更贴近 §六 但不再是"确认过
-#      有效"的那份原始配置）。
-#   2. 如果都不确定，也可以按 docs/algorithm-spec.md §5.21 的要求重新决定
-#      lambda_rel / K_max:B' / g_max / ℓ_block 的第一组生产候选，而不是照搬
-#      任何一份历史配置。
-config: base.yaml
+# 仓库里另外 4 份候选（k1/k16/chunktree_c256，以及 threephase 本身）不再需要
+# 单独比较——留在这里只作审计记录：k1.yaml 名不副实（没设 cluster_k_max，实际
+# 继承 base 的 16）；k16.yaml 完全不走 config: 继承，batch/steps
+# （128/1/3000）和 base.yaml 的 32/4/1500 都不一样，如果误用会悄悄打破三组
+# 同条件训练的前提。
+config: arc_semantic_fast.yaml
