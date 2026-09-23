@@ -411,16 +411,13 @@ else
     echo "================================================="
 
     if [ "${ENABLE_TENSORBOARD}" == "true" ]; then
-        if ! check_tensorboard >/dev/null 2>&1; then
-            echo "🔧 ${PYTHON_BIN} 的 Lightning TensorBoard 后端不可用，正在安装并复检..."
-            if ! "${PYTHON_BIN}" -m pip install "tensorboard>=2.14"; then
-                echo "❌ TensorBoard 安装失败，停止训练；也可在配置中显式设置 enable_tensorboard: false。"
-                exit 1
-            fi
-            if ! check_tensorboard; then
-                echo "❌ 安装后 Lightning TensorBoard 后端仍不可用，停止训练。Python: ${PYTHON_BIN}"
-                exit 1
-            fi
+        if ! check_tensorboard; then
+            echo "❌ Lightning TensorBoard 检查失败，停止训练。Python: ${PYTHON_BIN}" >&2
+            echo "   请查看上方原始 Traceback；启动脚本不会自动修改 Python 环境。" >&2
+            printf '   若确认为缺少 TensorBoard，请在训练环境中执行一次：%q -m pip install %q\n' "${PYTHON_BIN}" 'tensorboard>=2.14' >&2
+            echo "   若每次作业都会重建环境，请将依赖加入作业镜像或环境初始化步骤。" >&2
+            echo "   不需要 TensorBoard 时，可显式设置 enable_tensorboard: false。" >&2
+            exit 1
         fi
         echo "✅ Lightning TensorBoard 后端检查通过。Python: ${PYTHON_BIN}"
     fi
