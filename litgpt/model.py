@@ -24,6 +24,12 @@ from litgpt.log_kv_cache import (
 )
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_block_attention
 from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
+from litgpt.sinkwindow_cache import (
+    SinkWindowKVCache,
+    assert_input_pos_contiguous as assert_sink_window_input_pos_contiguous,
+    sink_window_chunk_attention,
+    sink_window_train_chunk_attention,
+)
 
 
 class GPT(nn.Module):
@@ -155,10 +161,17 @@ class GPT(nn.Module):
             if input_pos.dim() == 1:
                 cos = cos.unsqueeze(0)
                 sin = sin.unsqueeze(0)
-            all_log_kv_cache = all(
-                isinstance(block.attn.kv_cache, LogStructuredKVCache) for block in self.transformer.h
+            # LogStructuredKVCache and SinkWindowKVCache both build their own
+            # visibility mask internally per chunk (see log_kv_chunk_attention
+            # / sink_window_chunk_attention) and never consult `mask` at all --
+            # set_log_kv_cache()/set_sink_window_cache() both drop mask_cache
+            # to None for exactly this reason, so the `else` branch below
+            # (which requires a real mask_cache) must not run for them.
+            all_self_masking_cache = all(
+                isinstance(block.attn.kv_cache, (LogStructuredKVCache, SinkWindowKVCache))
+                for block in self.transformer.h
             )
-            if all_log_kv_cache:
+            if all_self_masking_cache:
                 mask = None
             else:
                 if self.mask_cache is None:
@@ -637,6 +650,65 @@ class GPT(nn.Module):
             block.attn.kv_cache = None
             block.attn._log_kv_pending = None
 
+    def set_sink_window_cache(
+        self,
+        batch_size: int,
+        sink_size: int,
+        window_size: int,
+        rope_cache_length: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        """Initialize SinkWindowKVCache for all attention layers (inference).
+
+        Storage: O(n_layer * (sink_size + window_size)), independent of
+        request length -- unlike set_kv_cache/set_log_kv_cache there is no
+        max_seq_length parameter to pass, since none is needed.
+        """
+        if rope_cache_length is None:
+            rope_cache_length = self.rope_cache_length()
+        for block in self.transformer.h:
+            block.attn.kv_cache = block.attn.build_sink_window_cache(
+                batch_size, sink_size, window_size, rope_cache_length, device, dtype,
+            )
+            block.attn._log_kv_pending = None
+        # Same reasoning as set_log_kv_cache: every block is on SinkWindowKVCache,
+        # GPT.forward's mask/mask_cache path is never consulted, so drop any
+        # stale O(N^2) mask_cache from a prior set_kv_cache call.
+        self.mask_cache = None
+
+    def reset_sink_window_cache(self) -> None:
+        """Reset every layer's SinkWindow cache state in place -- no
+        reallocation, same rationale as reset_log_kv_cache/reset_kv_cache.
+        """
+        for block in self.transformer.h:
+            cache = block.attn.kv_cache
+            if not isinstance(cache, SinkWindowKVCache):
+                raise TypeError("reset_sink_window_cache() requires set_sink_window_cache() to have been called first")
+            cache.reset_parameters()
+            block.attn._log_kv_pending = None
+
+    def enable_sink_window_training(
+        self,
+        sink_size: int,
+        window_size: int,
+        train_chunk_size: int | None = None,
+    ) -> None:
+        """Switch every attention layer into SinkWindow training mode (no
+        cache is built -- training operates on the already-materialized
+        full-sequence q/k/v, see CausalSelfAttention._sink_window_train_forward).
+        """
+        for block in self.transformer.h:
+            block.attn.training_sink_window = True
+            block.attn.sink_window_sink_size = int(sink_size)
+            block.attn.sink_window_window_size = int(window_size)
+            block.attn.sink_window_train_chunk_size = train_chunk_size
+
+    def disable_sink_window_training(self) -> None:
+        """Turn off SinkWindow training mode."""
+        for block in self.transformer.h:
+            block.attn.training_sink_window = False
+
 
 class Block(nn.Module):
     def __init__(
@@ -731,10 +803,21 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(config.head_size * config.n_head, config.n_embd, bias=config.bias)
         # disabled by default
-        self.kv_cache: KVCache | LogStructuredKVCache | None = None
+        self.kv_cache: KVCache | LogStructuredKVCache | SinkWindowKVCache | None = None
         # When True (training only), simulate the logKV streaming compaction
         # over the training sequence so the model learns to read compressed KV.
         self.training_log_kv: bool = False
+        # When True (training only), simulate SinkWindow (first sink_size +
+        # most recent window_size tokens) over the training sequence. See
+        # GPT.enable_sink_window_training(). At inference, dispatch is by
+        # isinstance(self.kv_cache, SinkWindowKVCache) instead -- no separate
+        # flag needed there, mirroring training_log_kv/LogStructuredKVCache.
+        self.training_sink_window: bool = False
+        self.sink_window_sink_size: int = 0
+        self.sink_window_window_size: int = 0
+        # Training-time chunk size for sink_window_train_chunk_attention;
+        # None means "use window_size" (that function's own default).
+        self.sink_window_train_chunk_size: int | None = None
         # LogKV inference: carry one trailing token across calls so commits stay
         # aligned to the training chunk size. Holds (k, v) — full post-RoPE key.
         self._log_kv_pending: tuple | None = None
@@ -883,9 +966,17 @@ class CausalSelfAttention(nn.Module):
         if self.training_log_kv and input_pos is None:
             return self._log_kv_train_lowmem_forward(q, k, v, B, T, k_raw=k_raw)
 
+        # SinkWindow training mode: same idea as LogKV's training_log_kv
+        # branch above, but no replay trick is needed -- see
+        # sink_window_train_chunk_attention's own docstring for why ordinary
+        # autograd over its chunked loop is already correct.
+        if self.training_sink_window and input_pos is None:
+            scale = self._sink_window_scale()
+            return self._sink_window_train_forward(q, k, v, B, T, scale=scale)
+
         # Apply kv-cache during inference.
         if input_pos is not None:
-            if not isinstance(self.kv_cache, (KVCache, LogStructuredKVCache)):
+            if not isinstance(self.kv_cache, (KVCache, LogStructuredKVCache, SinkWindowKVCache)):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
 
             if isinstance(self.kv_cache, LogStructuredKVCache):
@@ -896,6 +987,11 @@ class CausalSelfAttention(nn.Module):
                 return self._log_kv_training_forward(
                     q, k, v, B, T, reset_cache=False, defer_last_single=True, k_raw=k_raw, input_pos=input_pos
                 )
+
+            if isinstance(self.kv_cache, SinkWindowKVCache):
+                assert_sink_window_input_pos_contiguous(self.kv_cache, input_pos, T)
+                scale = self._sink_window_scale()
+                return self._sink_window_inference_forward(q, k, v, B, T, scale=scale)
 
             k, v = self.kv_cache(input_pos, k, v)
 
@@ -1270,6 +1366,74 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).reshape(B, T, head_size * n_head)
         return self.proj(y)
 
+    def _sink_window_scale(self) -> float:
+        """Same convention as scaled_dot_product_attention below -- YaRN's
+        mscale must be applied here too, not just the 1/sqrt(d) term.
+        """
+        scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or self.config.head_size)
+        return scale * self.mscale * self.mscale
+
+    def _sink_window_train_forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, B: int, T: int, *, scale: float
+    ) -> torch.Tensor:
+        """Training-mode SinkWindow: full sequence at once (q/k/v are already
+        post-RoPE, ungrouped GQA heads), chunked internally by
+        sink_window_train_chunk_attention to avoid an O(T^2) mask at 32K.
+        """
+        head_size = self.config.head_size
+        n_head = self.config.n_head
+        y = sink_window_train_chunk_attention(
+            q, k, v,
+            sink_size=self.sink_window_sink_size,
+            window_size=self.sink_window_window_size,
+            scale=scale,
+            chunk_size=self.sink_window_train_chunk_size,
+            enable_gqa=q.size(1) != k.size(1),
+        )
+        y = y.transpose(1, 2).reshape(B, T, head_size * n_head)
+        return self.proj(y)
+
+    def _sink_window_inference_forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, B: int, T: int, *, scale: float
+    ) -> torch.Tensor:
+        """Inference-mode SinkWindow (prefill and decode share this same
+        method -- both are just "attend to current chunk, then commit it").
+        q/k/v are post-RoPE, ungrouped GQA heads, (B, n_query_groups, T, hs).
+
+        Chunked internally at cache.window_size granularity (SinkWindowKVCache.
+        commit() rejects a single call larger than window_size -- see its own
+        docstring on why). A single top-level GPT.forward() call already
+        passes the whole prompt's q/k/v here (see eval.py's generate_until /
+        loglikelihood paths), so no separate chunked-prefill driver elsewhere
+        in the codebase is needed -- this loop IS the chunked prefill, exactly
+        mirroring how _log_kv_training_forward chunks internally via
+        log_kv_prefill_block.
+        """
+        cache: SinkWindowKVCache = self.kv_cache
+        head_size = self.config.head_size
+        n_head = self.config.n_head
+        chunk_size = max(1, cache.window_size)
+        outputs = []
+        for c0 in range(0, T, chunk_size):
+            c1 = min(c0 + chunk_size, T)
+            q_chunk = q[..., c0:c1, :]
+            k_chunk_new = k[..., c0:c1, :]
+            v_chunk_new = v[..., c0:c1, :]
+            frozen_k, frozen_v = cache.read_frozen()
+            out_chunk = sink_window_chunk_attention(
+                q_chunk, k_chunk_new, v_chunk_new, frozen_k, frozen_v,
+                scale=scale, enable_gqa=q.size(1) != k.size(1),
+            )
+            outputs.append(out_chunk)
+            # Commit AFTER attending -- the frozen read above must never
+            # include the chunk it's currently being used to score (see
+            # sinkwindow_cache.py's module docstring: this ordering is what
+            # makes "no mask needed against the frozen prefix" correct).
+            cache.commit(k_chunk_new, v_chunk_new)
+        y = torch.cat(outputs, dim=2)
+        y = y.transpose(1, 2).reshape(B, T, head_size * n_head)
+        return self.proj(y)
+
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -1434,6 +1598,39 @@ class CausalSelfAttention(nn.Module):
             rope_n_elem=rope_n_elem,
             allocate_second_order=allocate_second_order,
         )
+
+    def build_sink_window_cache(
+        self,
+        batch_size: int,
+        sink_size: int,
+        window_size: int,
+        rope_cache_length: int | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "SinkWindowKVCache":
+        """Build a SinkWindowKVCache with O(sink_size + window_size) storage
+        (not O(max_seq_length) -- unlike build_kv_cache/build_log_kv_cache,
+        no max_seq_length parameter exists here because none is needed).
+
+        Same k_dim derivation as build_kv_cache (SinkWindow stores standard
+        post-RoPE keys, not LogKV's pre-RoPE-plus-anchor storage).
+        """
+        v_shape = (batch_size, self.config.n_query_groups, window_size, self.config.head_size)
+        if rope_cache_length is None:
+            if self.config.rotary_percentage != 1.0:
+                raise TypeError(
+                    "Please pass the `rope_cache_length` parameter. "
+                    "Use `rope_cache_length=model.rope_cache_length()` to extract it automatically."
+                )
+            k_shape = v_shape
+        else:
+            k_shape = (
+                batch_size,
+                self.config.n_query_groups,
+                window_size,
+                rope_cache_length + self.config.head_size - self.config.rope_n_elem,
+            )
+        return SinkWindowKVCache(k_shape, v_shape, sink_size=sink_size, window_size=window_size, device=device, dtype=dtype)
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str, *args: Any, **kwargs: Any) -> None:
         """For compatibility with legacy checkpoints."""

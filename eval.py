@@ -538,6 +538,15 @@ class LogKVLM(LM):
         log_kv_prefill_block: int = 256,
         log_kv_second_order_scale: float = 1.0,
         log_kv_dense_mode: bool = False,
+        # SinkWindow baseline (32K Dense/SinkWindow/SemanticLogKV comparison):
+        # first sink_size + most recent window_size tokens, real storage
+        # recycling via SinkWindowKVCache. Mutually exclusive with
+        # log_kv_dense_mode and log_kv_semantic_clusters -- see the guard in
+        # main() below, mirroring the existing log_kv_dense_mode/
+        # log_kv_diag_mode incompatibility check.
+        log_kv_sink_window_mode: bool = False,
+        log_kv_sink_window_sink_size: int = 4,
+        log_kv_sink_window_window_size: int = 1024,
         log_kv_importance_pooling: bool = False,
         log_kv_importance_pooling_lambda: float = 1.0,
         log_kv_importance_pooling_temperature: float = 1.0,
@@ -570,6 +579,9 @@ class LogKVLM(LM):
         self.log_kv_prefill_block = log_kv_prefill_block
         self.log_kv_second_order_scale = float(log_kv_second_order_scale)
         self.log_kv_dense_mode = bool(log_kv_dense_mode)
+        self.log_kv_sink_window_mode = bool(log_kv_sink_window_mode)
+        self.log_kv_sink_window_sink_size = int(log_kv_sink_window_sink_size)
+        self.log_kv_sink_window_window_size = int(log_kv_sink_window_window_size)
         self.log_kv_importance_pooling = bool(log_kv_importance_pooling)
         self.log_kv_importance_pooling_lambda = float(log_kv_importance_pooling_lambda)
         self.log_kv_importance_pooling_temperature = float(log_kv_importance_pooling_temperature)
@@ -628,7 +640,11 @@ class LogKVLM(LM):
             else None
         )
 
-        mode_name = "dense 标准 KV 注意力" if self.log_kv_dense_mode else "logKV 压缩注意力"
+        mode_name = (
+            "dense 标准 KV 注意力" if self.log_kv_dense_mode
+            else f"SinkWindow (S={self.log_kv_sink_window_sink_size}, W={self.log_kv_sink_window_window_size})" if self.log_kv_sink_window_mode
+            else "logKV 压缩注意力"
+        )
         if is_master: print(f"🔧 正在初始化 Transformer ({mode_name})...")
         self.model = GPT(self.config).to(device).bfloat16()
 
@@ -685,6 +701,16 @@ class LogKVLM(LM):
             )
             self._eval_cache_ready = True
             return
+        if self.log_kv_sink_window_mode:
+            self.model.set_sink_window_cache(
+                batch_size=1,
+                sink_size=self.log_kv_sink_window_sink_size,
+                window_size=self.log_kv_sink_window_window_size,
+                device=self._device,
+                dtype=dtype,
+            )
+            self._eval_cache_ready = True
+            return
         self.model.set_log_kv_cache(
             batch_size=1,
             max_seq_length=max_seq_length,
@@ -722,6 +748,8 @@ class LogKVLM(LM):
     def _reset_eval_cache(self) -> None:
         if self.log_kv_dense_mode:
             self.model.reset_kv_cache()
+        elif self.log_kv_sink_window_mode:
+            self.model.reset_sink_window_cache()
         else:
             self.model.reset_log_kv_cache()
 
@@ -1041,6 +1069,12 @@ def main(
     # true = 使用原生 O(N) 标准 KVCache 跑普通 causal dense attention；
     # false = 默认 LogKV 压缩注意力路径。dense 模式只用于手动基线对比。
     log_kv_dense_mode: bool = False,
+    # SinkWindow baseline eval mode -- see LogKVLM's own docstring/params for
+    # what this builds (SinkWindowKVCache via GPT.set_sink_window_cache()).
+    # Mutually exclusive with log_kv_dense_mode/log_kv_semantic_clusters.
+    log_kv_sink_window_mode: bool = False,
+    log_kv_sink_window_sink_size: int = 4,
+    log_kv_sink_window_window_size: int = 1024,
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
     # prefill 分块大小：块内 query 共享块首冻结的 slot 状态。2 = 严格 2-token
@@ -1152,6 +1186,9 @@ def main(
     metadata = _o("metadata", metadata)
     log_samples = bool(_o("log_samples", log_samples))
     log_kv_dense_mode = bool(_o("log_kv_dense_mode", log_kv_dense_mode))
+    log_kv_sink_window_mode = bool(_o("log_kv_sink_window_mode", log_kv_sink_window_mode))
+    log_kv_sink_window_sink_size = int(_o("log_kv_sink_window_sink_size", log_kv_sink_window_sink_size))
+    log_kv_sink_window_window_size = int(_o("log_kv_sink_window_window_size", log_kv_sink_window_window_size))
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
@@ -1236,6 +1273,20 @@ def main(
                 "log_kv_dense_mode=True is incompatible with log_kv_diag_mode: "
                 "LogKV diagnostics require LogStructuredKVCache slots."
             )
+    if log_kv_sink_window_mode:
+        if diag_active:
+            raise ValueError(
+                "log_kv_sink_window_mode=True is incompatible with log_kv_diag_mode: "
+                "LogKV diagnostics require LogStructuredKVCache slots."
+            )
+        if log_kv_dense_mode:
+            raise ValueError("log_kv_sink_window_mode=True and log_kv_dense_mode=True are mutually exclusive.")
+        if log_kv_semantic_clusters:
+            raise ValueError(
+                "log_kv_sink_window_mode=True and log_kv_semantic_clusters=True are contradictory: "
+                "SinkWindow mode builds a SinkWindowKVCache, not a LogStructuredKVCache, so every "
+                "log_kv_semantic_* param would be silently ignored. Set log_kv_semantic_clusters: false."
+            )
 
     # 多节点时用全局 rank==0（每个节点都有一个 local_rank 0，用它会重复打印）
     if _is_main():
@@ -1244,6 +1295,13 @@ def main(
             print(
                 "🧩 dense 标准 KV 注意力 | 使用 GPT.set_kv_cache() 原生 causal attention；"
                 "忽略 log_kv_B/recent_size/prefill_block/second_order_scale 等 LogKV 参数"
+            )
+        elif log_kv_sink_window_mode:
+            print(
+                f"🧩 SinkWindow | sink_size={log_kv_sink_window_sink_size} | "
+                f"window_size={log_kv_sink_window_window_size} | "
+                "使用 GPT.set_sink_window_cache()；忽略 log_kv_B/recent_size/prefill_block/"
+                "second_order_scale 等 LogKV 参数"
             )
         else:
             print(
@@ -1291,6 +1349,9 @@ def main(
             log_kv_prefill_block=log_kv_prefill_block,
             log_kv_second_order_scale=log_kv_second_order_scale,
             log_kv_dense_mode=log_kv_dense_mode,
+            log_kv_sink_window_mode=log_kv_sink_window_mode,
+            log_kv_sink_window_sink_size=log_kv_sink_window_sink_size,
+            log_kv_sink_window_window_size=log_kv_sink_window_window_size,
             log_kv_importance_pooling=log_kv_importance_pooling,
             log_kv_importance_pooling_lambda=log_kv_importance_pooling_lambda,
             log_kv_importance_pooling_temperature=log_kv_importance_pooling_temperature,
@@ -1400,6 +1461,9 @@ def main(
                     "benchmark": benchmark,
                     "checkpoint_dir": checkpoint_dir,
                     "log_kv_dense_mode": log_kv_dense_mode,
+                    "log_kv_sink_window_mode": log_kv_sink_window_mode,
+                    "log_kv_sink_window_sink_size": log_kv_sink_window_sink_size,
+                    "log_kv_sink_window_window_size": log_kv_sink_window_window_size,
                     "log_kv_importance_pooling": log_kv_importance_pooling,
                     "log_kv_importance_pooling_lambda": log_kv_importance_pooling_lambda,
                     "log_kv_importance_pooling_temperature": log_kv_importance_pooling_temperature,
@@ -1566,6 +1630,9 @@ def output_from_cache(
             "benchmark": benchmark,
             "checkpoint_dir": checkpoint_dir,
             "log_kv_dense_mode": log_kv_dense_mode,
+            "log_kv_sink_window_mode": log_kv_sink_window_mode,
+            "log_kv_sink_window_sink_size": log_kv_sink_window_sink_size,
+            "log_kv_sink_window_window_size": log_kv_sink_window_window_size,
             "results": results,
         }
 
