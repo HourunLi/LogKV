@@ -402,9 +402,15 @@ def get_default_supported_precision(training: bool) -> str:
 
 def load_checkpoint(fabric: L.Fabric, model: nn.Module, checkpoint_path: Path, strict: bool = True) -> None:
     if isinstance(fabric.strategy, FSDPStrategy):
-        fabric.load_raw(checkpoint_path, model, strict=strict)
+        # Inspect keys lazily: training checkpoints wrap weights under "model".
+        # Sharded Fabric checkpoints are directories and always contain named state.
+        if checkpoint_path.is_dir() or "model" in lazy_load(checkpoint_path):
+            fabric.load(checkpoint_path, {"model": model}, strict=strict)
+        else:
+            fabric.load_raw(checkpoint_path, model, strict=strict)
     elif isinstance(fabric.strategy, ModelParallelStrategy):
         state_dict = torch.load(checkpoint_path, mmap=True)
+        state_dict = state_dict.get("model", state_dict)
         load_from_full_model_state_dict(
             model=model,
             full_sd=state_dict,
