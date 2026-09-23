@@ -1,83 +1,25 @@
-[09:09:41] Epoch 1 | Step 1 | loss: 2.1924 | 2nd_scale: 0.0000 | logKV_host: route 959.374s/13440 + replay 239.529s/6720 + plan 10.493s/14336 + pack 9.913s/21504 + attn_fwd 4.485s/21504 + attn_bwd 3.120s/7168 | Time: 1267.46s
-step_host (inclusive): data 0.834s | forward 500.778s | backward 765.070s | optimizer 0.049s
-logKV_cuda: route 923.892s | replay 198.154s | plan 10.140s | pack 8.699s | attn_fwd 26.852s | attn_bwd 21.366s
-step_cuda (inclusive): forward 500.627s | backward 765.390s | optimizer 0.045s
-
-
-
-[10:17:31] Epoch 1 | Step 1 | loss: 2.1924 | 2nd_scale: 0.0000 | logKV_host: route 480.193s/6720 + replay 474.553s/13440 + plan 11.624s/14336 + pack 8.023s/21504 + attn_fwd 4.130s/21504 + attn_bwd 2.988s/7168 | Time: 1027.36s
-step_host (inclusive): data 1.271s | forward 506.619s | backward 507.551s | optimizer 11.260s
-logKV_cuda: route 465.085s | replay 409.758s | plan 10.083s | pack 8.220s | attn_fwd 26.133s | attn_bwd 21.194s
-step_cuda (inclusive): forward 506.416s | backward 519.057s | optimizer 0.047s
-
-
-
- [11:02:07] Epoch 1 | Step 1 | loss: 2.1929 | 2nd_scale: 0.0000 | logKV_host: route 444.106s/6720 + replay 450.857s/13440 + plan 11.471s/14336 + pack 7.927s/21504 + attn_fwd 4.107s/21504 + attn_bwd 2.930s/7168 | Time: 956.12s
-step_host (inclusive): data 1.280s | forward 470.406s | backward 483.723s | optimizer 0.050s
-logKV_cuda: route 428.523s | replay 386.891s | plan 9.894s | pack 8.190s | attn_fwd 25.967s | attn_bwd 20.847s
-step_cuda (inclusive): forward 470.211s | backward 484.018s | optimizer 0.044s
-
-[15:35:06] Epoch 1 | Step 3 | loss: 2.2133 | 2nd_scale: 0.0000 | logKV_host: route 400.085s/6720 + replay 265.211s/13440 + plan 10.770s/14336 + pack 8.309s/21504 + attn_fwd 4.204s/21504 + attn_bwd 2.735s/7168 | Time: 718.34s
-step_host (inclusive): data 0.007s | forward 426.796s | backward 291.448s | optimizer 0.003s
-
-
-[ma-user semanticLogKV]$python unused/benchmark_log_kv_updates.py --iters 10
-{"device": "NVIDIA A800-SXM4-80GB", "sequence": 32768, "chunk": 2048, "batch": 4, "groups": 8, "dim": 128, "iters": 10, "torch": "2.11.0+cu128", "cuda": "12.8"}
-{"variant": "torch", "phase": "route", "median_ms": 202.086, "peak_extra_MiB": 247.12, "exact_state": true}
-{"variant": "torch", "phase": "replay", "median_ms": 50.829, "peak_extra_MiB": 210.99, "exact_state": true}
-Traceback (most recent call last):
-  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 114, in <module>
-    main()
-  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 100, in main
-    torch.testing.assert_close(dict(cache.named_buffers())[field], tensor, atol=0, rtol=0, msg=field)
-  File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/testing/_comparison.py", line 1600, in assert_close
-    raise error_metas[0].to_error(msg)
-AssertionError: centroid
-
-
-
-
-[ma-user semanticLogKV]$python unused/benchmark_log_kv_updates.py --diagnose
-{"device": "NVIDIA A800-SXM4-80GB", "sequence": 32768, "chunk": 2048, "batch": 4, "groups": 8, "dim": 128, "iters": 10, "diagnose": true, "torch": "2.11.0+cu128", "cuda": "12.8"}
-Traceback (most recent call last):
-  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 68, in checked_centroid
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0,
-  File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/testing/_comparison.py", line 1600, in assert_close
-    raise error_metas[0].to_error(msg)
-AssertionError: centroid update 1, ordinal offset=0, runs=256: centroid
-Tensor-likes are not equal!
-
-Mismatched elements: 1341 / 32768 (4.1%)
-Greatest absolute difference: 7.808208465576172e-05 at index (160, 41)
-Greatest relative difference: 0.07515373080968857 at index (60, 89)
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 195, in <module>
-    main()
-  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 146, in main
-    cache.route_and_flush_batch(k, v, pos, positions_host=host, record_op_log=True)
-  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2887, in route_and_flush_batch
-    return self._route_and_flush_batch(*args, **kwargs)
-  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2971, in _route_and_flush_batch
-    self._semantic_route_three_phase(k_raw, v, positions, positions_host, record=record_op_log)
-  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2653, in _semantic_route_three_phase
-    self._semantic_route_orphans_fast(
-  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2809, in _semantic_route_orphans_fast
-    self._semantic_commit_joins(jobs, k_raw, v, positions, positions_host, record=record)
-  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2246, in _semantic_commit_joins
-    self._semantic_commit_joins_inner(jobs, k_raw, v, positions, positions_host, record=record)
-  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2348, in _semantic_commit_joins_inner
-    self._semantic_apply_join_plan(
-  File "/data/lihourun/semanticLogKV/litgpt/log_kv_cache.py", line 2505, in _semantic_apply_join_plan
-    fused.centroid(k_sel, centroid_flat, n_eff_flat, metadata, start, count)
-  File "/data/lihourun/semanticLogKV/unused/benchmark_log_kv_updates.py", line 76, in checked_centroid
-    raise AssertionError(f"{exc}\nLargest-difference inputs: {json.dumps(values)}") from exc
-AssertionError: centroid update 1, ordinal offset=0, runs=256: centroid
-Tensor-likes are not equal!
-
-Mismatched elements: 1341 / 32768 (4.1%)
-Greatest absolute difference: 7.808208465576172e-05 at index (160, 41)
-Greatest relative difference: 0.07515373080968857 at index (60, 89)
-Largest-difference inputs: {"cluster": 160, "dim": 41, "old_mu": 1.2907462120056152, "sum": 376.7734375, "pre": 3879.0, "n": 288.0, "numerator": 5383.578125, "denom": 4167.0, "actual": 1.291877269744873, "expected": 1.2919553518295288}
+[rank5]:        Unexpected key(s) in state_dict: "model", "optimizer", "global_step", "data_epoch". 
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/data/lihourun/semanticLogKV/demo.py", line 1210, in <module>
+[rank2]:     run_cli(main)
+[rank2]:   File "/data/lihourun/semanticLogKV/utils.py", line 225, in run_cli
+[rank2]:     return func(**kwargs)
+[rank2]:   File "/data/lihourun/semanticLogKV/utils.py", line 147, in wrapper
+[rank2]:     return func(*expanded_args, **expanded_kwargs)
+[rank2]:   File "/data/lihourun/semanticLogKV/demo.py", line 813, in main
+[rank2]:     load_checkpoint(fabric, model, initial_ckpt_path, strict=True)
+[rank2]:   File "/data/lihourun/semanticLogKV/litgpt/utils.py", line 405, in load_checkpoint
+[rank2]:     fabric.load_raw(checkpoint_path, model, strict=strict)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/lightning/fabric/fabric.py", line 953, in load_raw
+[rank2]:     self._strategy.load_checkpoint(path=path, state=obj, strict=strict, weights_only=weights_only)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/lightning/fabric/strategies/fsdp.py", line 534, in load_checkpoint
+[rank2]:     _load_raw_module_state_from_path(path, module=state, world_size=self.world_size, strict=strict)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/lightning/fabric/strategies/model_parallel.py", line 541, in _load_raw_module_state_from_path
+[rank2]:     _load_raw_module_state(state_dict=state_dict, module=module, world_size=world_size, strict=strict)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/lightning/fabric/strategies/model_parallel.py", line 575, in _load_raw_module_state
+[rank2]:     module.load_state_dict(state_dict, strict=strict)
+[rank2]:   File "/home/ma-user/anaconda3/envs/torch218/lib/python3.10/site-packages/torch/nn/modules/module.py", line 2639, in load_state_dict
+[rank2]:     raise RuntimeError(
+[rank2]: RuntimeError: Error(s) in loading state_dict for FullyShardedDataParallel:
+[rank2]:        Missing key(s) in state_dict: "lm_head.weight", "transformer.wte.weight", "transformer.h.0.norm_1.weight", "transformer.h.0.attn.qkv.weight", "transformer.h.0.attn.proj.weight", "transformer.h.0.attn.norm_q.weight", "transformer.h.0.attn.norm_k.weight", "transformer.h.0.norm_2.weight", "transformer.h.0.mlp.fc_1.weight", "transformer.h.0.mlp.fc_2.weight", "transformer.h.0.mlp.proj.weight", "transformer.h.1.norm_1.weight", "transformer.h.1.attn.qkv.weight", "transformer.h.1.attn.proj.weight", "transformer.h.1.attn.norm_q.weight", "transformer.h.1.attn.norm_k.weight", "transformer.h.1.norm_2.weight", "transformer.h.1.mlp.fc_1.weight", "transformer.h.1.mlp.fc_2.weight", "transformer.h.1.mlp.proj.weight", "transformer.h.2.norm_1.weight", "transformer.h.2.attn.qkv.weight", "transformer.h.2.attn.proj.weight", "transformer.h.2.attn.norm_q.weight", "transformer.h.2.attn.norm_k.weight", "transformer.h.2.norm_2.weight", "transformer.h.2.mlp.fc_1.weight", "transformer.h.2.mlp.fc_2.weight", "transformer.h.2.mlp.proj.weight", "transformer.h.3.norm_1.weight", "transformer.h.3.attn.qkv.weight", "transformer.h.3.attn.proj.weight", "transformer.h.3.attn.norm_q.weight", "transformer.h.3.attn.norm_k.weight", "transformer.h.3.norm_2.weight", "transformer.h.3.mlp.fc_1.weight", "transformer.h.3.mlp.fc_2.weight", "transformer.h.3.mlp.proj.weight", "transformer.h.4.norm_1.weight", "transformer.h.4.attn.qkv.weight", "transformer.h.4.attn.proj.weight", "transformer.h.4.attn.norm_q.weight", "transformer.h.4.attn.norm_k.weight", "transformer.h.4.norm_2.weight", "transformer.h.4.mlp.fc_1.weight", "transformer.h.4.mlp.fc_2.weight", "transformer.h.4.mlp.proj.weight", "transformer.h.5.norm_1.weight", "transformer.h.5.attn.qkv.weight", "transformer.h.5.attn.proj.weight", "transformer.h.5.attn.norm_q.weight", "transformer.h.5.attn.norm_k.weight", "transformer.h.5.norm_2.weight", "transformer.h.5.mlp.fc_1.weight", "transformer.h.5.mlp.fc_2.weight", "transformer.h.5.mlp.proj.weight", "transformer.h.6.norm_1.weight", "transformer.h.6.attn.qkv.weight", "transformer.h.6.attn.proj.weight", "transformer.h.6.attn.norm_q.weight", "transformer.h.6.attn.norm_k.weight", "transformer.h.6.norm_2.weight", "transformer.h.6.mlp.fc_1.weight", "transformer.h.6.mlp.fc_2.weight", "transformer.h.6.mlp.proj.weight", "transformer.h.7.norm_1.weight", "transformer.h.7.attn.qkv.weight", "transformer.h.7.attn.proj.weight", "transformer.h.7.attn.norm_q.weight", "transformer.h.7.attn.norm_k.weight", "transformer.h.7.norm_2.weight", "transformer.h.7.mlp.fc_1.weight", "transformer.h.7.mlp.fc_2.weight", "transformer.h.7.mlp.proj.weight", "transformer.h.8.norm_1.weight", "transformer.h.8.attn.qkv.weight", "transformer.h.8.attn.proj.weight", "transformer.h.8.attn.norm_q.weight", "transformer.h.8.attn.norm_k.weight", "transformer.h.8.norm_2.weight", "transformer.h.8.mlp.fc_1.weight", "transformer.h.8.mlp.fc_2.weight", "transformer.h.8.mlp.proj.weight", "transformer.h.9.norm_1.weight", "transformer.h.9.attn.qkv.weight", "transformer.h.9.attn.proj.weight", "transformer.h.9.attn.norm_q.weight", "transformer.h.9.attn.norm_k.weight", "transformer.h.9.norm_2.weight", "transformer.h.9.mlp.fc_1.weight", "transformer.h.9.mlp.fc_2.weight", "transformer.h.9.mlp.proj.weight", "transformer.h.10.norm_1.weight", "transformer.h.10.attn.qkv.weight", "transformer.h.10.attn.proj.weight", "transformer.h.10.attn.norm_q.weight", "transformer.h.10.attn.norm_k.weight", "transformer.h.10.norm_2.weight", "transformer.h.10.mlp.fc_1.weight", "transformer.h.10.mlp.fc_2.weight", "transformer.h.10.mlp.proj.weight", "transformer.h.11.norm_1.weight", "transformer.h.11.attn.qkv.weight", "transformer.h.11.attn.proj.weight", "transformer.h.11.attn.norm_q.weight", "transformer.h.11.attn.norm_k.weight", "transformer.h.11.norm_2.weight", "transformer.h.11.mlp.fc_1.weight", "transformer.h.11.mlp.fc_2.weight", "transformer.h.11.mlp.proj.weight", "transformer.h.12.norm_1.weight", "transformer.h.12.attn.qkv.weight", "transformer.h.12.attn.proj.weight", "transformer.h.12.attn.norm_q.weight", "transformer.h.12.attn.norm_k.weight", "transformer.h.12.norm_2.weight", "transformer.h.12.mlp.fc_1.weight", "transformer.h.12.mlp.fc_2.weight", "transformer.h.12.mlp.proj.weight", "transformer.h.13.norm_1.weight", "transformer.h.13.attn.qkv.weight", "transformer.h.13.attn.proj.weight", "transformer.h.13.attn.norm_q.weight", "transformer.h.13.attn.norm_k.weight", "transformer.h.13.norm_2.weight", "transformer.h.13.mlp.fc_1.weight", "transformer.h.13.mlp.fc_2.weight", "transformer.h.13.mlp.proj.weight", "transformer.h.14.norm_1.weight", "transformer.h.14.attn.qkv.weight", "transformer.h.14.attn.proj.weight", "transformer.h.14.attn.norm_q.weight", "transformer.h.14.attn.norm_k.weight", "transformer.h.14.norm_2.weight", "transformer.h.14.mlp.fc_1.weight", "transformer.h.14.mlp.fc_2.weight", "transformer.h.14.mlp.proj.weight", "transformer.h.15.norm_1.weight", "transformer.h.15.attn.qkv.weight", "transformer.h.15.attn.proj.weight", "transformer.h.15.attn.norm_q.weight", "transformer.h.15.attn.norm_k.weight", "transformer.h.15.norm_2.weight", "transformer.h.15.mlp.fc_1.weight", "transformer.h.15.mlp.fc_2.weight", "transformer.h.15.mlp.proj.weight", "transformer.h.16.norm_1.weight", "transformer.h.16.attn.qkv.weight", "transformer.h.16.attn.proj.weight", "transformer.h.16.attn.norm_q.weight", "transformer.h.16.attn.norm_k.weight", "transformer.h.16.norm_2.weight", "transformer.h.16.mlp.fc_1.weight", "transformer.h.16.mlp.fc_2.weight", "transformer.h.16.mlp.proj.weight", "transformer.h.17.norm_1.weight", "transformer.h.17.attn.qkv.weight", "transformer.h.17.attn.proj.weight", "transformer.h.17.attn.norm_q.weight", "transformer.h.17.attn.norm_k.weight", "transformer.h.17.norm_2.weight", "transformer.h.17.mlp.fc_1.weight", "transformer.h.17.mlp.fc_2.weight", "transformer.h.17.mlp.proj.weight", "transformer.h.18.norm_1.weight", "transformer.h.18.attn.qkv.weight", "transformer.h.18.attn.proj.weight", "transformer.h.18.attn.norm_q.weight", "transformer.h.18.attn.norm_k.weight", "transformer.h.18.norm_2.weight", "transformer.h.18.mlp.fc_1.weight", "transformer.h.18.mlp.fc_2.weight", "transformer.h.18.mlp.proj.weight", "transformer.h.19.norm_1.weight", "transformer.h.19.attn.qkv.weight", "transformer.h.19.attn.proj.weight", "transformer.h.19.attn.norm_q.weight", "transformer.h.19.attn.norm_k.weight", "transformer.h.19.norm_2.weight", "transformer.h.19.mlp.fc_1.weight", "transformer.h.19.mlp.fc_2.weight", "transformer.h.19.mlp.proj.weight", "transformer.h.20.norm_1.weight", "transformer.h.20.attn.qkv.weight", "transformer.h.20.attn.proj.weight", "transformer.h.20.attn.norm_q.weight", "transformer.h.20.attn.norm_k.weight", "transformer.h.20.norm_2.weight", "transformer.h.20.mlp.fc_1.weight", "transformer.h.20.mlp.fc_2.weight", "transformer.h.20.mlp.proj.weight", "transformer.h.21.norm_1.weight", "transformer.h.21.attn.qkv.weight", "transformer.h.21.attn.proj.weight", "transformer.h.21.attn.norm_q.weight", "transformer.h.21.attn.norm_k.weight", "transformer.h.21.norm_2.weight", "transformer.h.21.mlp.fc_1.weight", "transformer.h.21.mlp.fc_2.weight", "transformer.h.21.mlp.proj.weight", "transformer.h.22.norm_1.weight", "transformer.h.22.attn.qkv.weight", "transformer.h.22.attn.proj.weight", "transformer.h.22.attn.norm_q.weight", "transformer.h.22.attn.norm_k.weight", "transformer.h.22.norm_2.weight", "transformer.h.22.mlp.fc_1.weight", "transformer.h.22.mlp.fc_2.weight", "transformer.h.22.mlp.proj.weight", "transformer.h.23.norm_1.weight", "transformer.h.23.attn.qkv.weight", "transformer.h.23.attn.proj.weight", "transformer.h.23.attn.norm_q.weight", "transformer.h.23.attn.norm_k.weight", "transformer.h.23.norm_2.weight", "transformer.h.23.mlp.fc_1.weight", "transformer.h.23.mlp.fc_2.weight", "transformer.h.23.mlp.proj.weight", "transformer.h.24.norm_1.weight", "transformer.h.24.attn.qkv.weight", "transformer.h.24.attn.proj.weight", "transformer.h.24.attn.norm_q.weight", "transformer.h.24.attn.norm_k.weight", "transformer.h.24.norm_2.weight", "transformer.h.24.mlp.fc_1.weight", "transformer.h.24.mlp.fc_2.weight", "transformer.h.24.mlp.proj.weight", "transformer.h.25.norm_1.weight", "transformer.h.25.attn.qkv.weight", "transformer.h.25.attn.proj.weight", "transformer.h.25.attn.norm_q.weight", "transformer.h.25.attn.norm_k.weight", "transformer.h.25.norm_2.weight", "transformer.h.25.mlp.fc_1.weight", "transformer.h.25.mlp.fc_2.weight", "transformer.h.25.mlp.proj.weight", "transformer.h.26.norm_1.weight", "transformer.h.26.attn.qkv.weight", "transformer.h.26.attn.proj.weight", "transformer.h.26.attn.norm_q.weight", "transformer.h.26.attn.norm_k.weight", "transformer.h.26.norm_2.weight", "transformer.h.26.mlp.fc_1.weight", "transformer.h.26.mlp.fc_2.weight", "transformer.h.26.mlp.proj.weight", "transformer.h.27.norm_1.weight", "transformer.h.27.attn.qkv.weight", "transformer.h.27.attn.proj.weight", "transformer.h.27.attn.norm_q.weight", "transformer.h.27.attn.norm_k.weight", "transformer.h.27.norm_2.weight", "transformer.h.27.mlp.fc_1.weight", "transformer.h.27.mlp.fc_2.weight", "transformer.h.27.mlp.proj.weight", "transformer.ln_f.weight". 
+[rank2]:        Unexpected key(s) in state_dict: "model", "optimizer", "global_step", "data_epoch". 

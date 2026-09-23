@@ -16,6 +16,45 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize('strategy', ['fsdp', 'model_parallel', 'single'])
+@pytest.mark.parametrize('wrapped', [False, True])
+def test_checkpoint_loader_accepts_training_state(tmp_path, strategy, wrapped):
+    import torch
+
+    tree = ast.parse((ROOT / 'litgpt/utils.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'load_checkpoint')
+    fsdp, model_parallel = type('FSDPStrategy', (), {}), type('ModelParallelStrategy', (), {})
+    source = torch.nn.Linear(2, 1)
+    target = torch.nn.Linear(2, 1)
+    weights = source.state_dict()
+    checkpoint = tmp_path / 'lit_model.pth'
+    torch.save(dict(model=weights, optimizer={}, global_step=12, data_epoch=1) if wrapped else weights, checkpoint)
+
+    def load(path, state, strict):
+        state['model'].load_state_dict(torch.load(path)['model'], strict=strict)
+
+    def load_raw(path, model, strict):
+        model.load_state_dict(torch.load(path), strict=strict)
+
+    fabric = SimpleNamespace(strategy={'fsdp': fsdp(), 'model_parallel': model_parallel(), 'single': None}[strategy],
+                             device='cpu', load=Mock(side_effect=load), load_raw=Mock(side_effect=load_raw))
+    scope = dict(FSDPStrategy=fsdp, ModelParallelStrategy=model_parallel, torch=torch, lazy_load=torch.load,
+                 load_from_full_model_state_dict=lambda **kw: kw['model'].load_state_dict(kw['full_sd'], strict=kw['strict']))
+    exec(compile(ast.Module(body=[function], type_ignores=[]), 'litgpt/utils.py', 'exec',
+                 flags=__future__.annotations.compiler_flag), scope)
+    scope['load_checkpoint'](fabric, target, checkpoint)
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(value, weights[name])
+    if strategy == 'fsdp':
+        assert fabric.load.call_count == int(wrapped)
+        assert fabric.load_raw.call_count == int(not wrapped)
+
+
+def test_semantic_fast_enables_auto_resume():
+    config = yaml.safe_load((ROOT / 'exp/qwen1.7b-32k/arc_semantic_fast.yaml').read_text())
+    assert config['auto_resume'] is True
+
+
 @pytest.mark.parametrize('status,artifact,expected', [(17, False, 17), (17, True, 17), (0, False, 1), (0, True, 0)])
 def test_majob_preserves_training_failure_before_output_check(tmp_path, status, artifact, expected):
     source = (ROOT / 'majob.sh').read_text()
