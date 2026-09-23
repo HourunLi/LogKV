@@ -1,0 +1,42 @@
+# SinkWindow（起始 token＋滑动窗口）· 32K Dense/SinkWindow/SemanticLogKV 三组对照实验
+# ============================================================
+# 独立 CPT 训练：每层只保留最前 S 个 token（起始区）和最近 W 个 token（滑动
+# 窗口），预算与 SemanticLogKV 匹配。继承 base.yaml 的全部共同训练条件——不要
+# 在这份文件里手动重复 base.yaml 已有的数值。
+#
+# S/W 是这里唯一允许改的两个数：
+#   - log_kv_sink_window_sink_size：任务说明 §4.1 建议主实验取 4，训练前冻结。
+#   - log_kv_sink_window_window_size：占位值，必须先跑
+#     scripts/calibrate_sinkwindow_w.py（见 RUNBOOK.md §三）针对
+#     semantic_stage1_frozen.yaml 实际测出的字节预算重新算一遍，再回填这里。
+#     不要凭感觉填数字，也不要复用其他实验的 W。
+#
+# 字段名和 eval.py 共用（跟这个仓库"train 和 eval 共享同一套 LogKV 配置"的
+# 既有约定一致），所以同一份 S/W 数值同时适用于训练和评测，不用分别填两遍。
+#
+# 注意：这份文件里的名字是 "SinkWindow"，不是 "SWA"，也不直接等同于
+# StreamingLLM——具体语义边界见 litgpt/sinkwindow_cache.py 的模块文档。
+config: base.yaml
+
+expid: qwen1.7b-32k-cpt-sinkwindow-stage1
+save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/_fsdp_staging_sinkwindow_stage1
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-sinkwindow-stage1
+
+log_kv_sink_window_mode: true
+# base.yaml 默认打开语义聚类；SinkWindow 分支必须显式关掉（不是
+# LogStructuredKVCache，语义相关字段在这个分支下全部无意义；demo.py 的
+# fail-fast 检查也会在两者同时为 true 时直接拒绝启动）。
+log_kv_semantic_clusters: false
+
+log_kv_sink_window_sink_size: 4
+# TODO(freeze-before-training)：跑完 scripts/calibrate_sinkwindow_w.py 后把这个
+# 占位值换成算出来的 window_size，然后和 sink_size 一起冻结，不要在三组训练启动
+# 之后再改。
+#
+# 故意写成 -1，不写 null：_o() 对 null 的处理是"沿用 CLI/Python 默认值"
+# （demo.py 里的默认是 1024），如果写 null，忘了替换这个占位符时会静默地用一个
+# 看起来正常、实则没经过校准的 1024 去训练，不会报错。-1 会在
+# SinkWindowKVCache/sink_window_train_chunk_attention 里触发 ValueError，
+# 忘了替换会在训练一启动就崩，不会静默用错误的 W 跑掉整个 CPT。
+log_kv_sink_window_window_size: -1

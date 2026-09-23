@@ -92,6 +92,21 @@ def _normal_path(path: str | os.PathLike) -> Path:
         return Path(os.path.abspath(p))
 
 
+def _check_sink_window_mode_compatible(log_kv_sink_window_mode: bool, log_kv_semantic_clusters: bool) -> None:
+    """Reject the one combination that would silently ignore a whole YAML
+    block: SinkWindow mode skips enable_log_kv_training() entirely (calls
+    enable_sink_window_training() instead), so no LogStructuredKVCache is
+    ever built and every log_kv_semantic_* param would do nothing.
+    """
+    if log_kv_sink_window_mode and log_kv_semantic_clusters:
+        raise ValueError(
+            "log_kv_sink_window_mode=True and log_kv_semantic_clusters=True are contradictory: "
+            "SinkWindow mode skips enable_log_kv_training() entirely, so no LogStructuredKVCache "
+            "is ever built and every log_kv_semantic_* param is silently ignored. Set "
+            "log_kv_semantic_clusters: false in the YAML for a SinkWindow-mode run."
+        )
+
+
 def _dump_resolved_config(fabric: L.Fabric, save_path: str | os.PathLike, resolved: dict) -> None:
     """Write the fully-*resolved* training config (YAML `config:` inheritance
     and _o() overrides already applied -- YAML non-null > CLI > default) to
@@ -506,7 +521,21 @@ def main(
     tensorboard_root: str = "./tb",
     # ── Experiment ──
     expid: str = "debug",
-    # ── Log-structured KV cache (always on) ──
+    # ── SinkWindow bypass (32K Dense/SinkWindow/SemanticLogKV comparison) ──
+    # When True, skips model.enable_log_kv_training() below and instead calls
+    # model.enable_sink_window_training(sink_size, window_size) -- every
+    # log_kv_semantic_* param in the block below is then ignored (mutually
+    # exclusive with log_kv_semantic_clusters=True, guarded below). See
+    # litgpt/sinkwindow_cache.py's module docstring for the mechanism and
+    # litgpt/model.py's CausalSelfAttention._sink_window_train_forward for
+    # exactly what runs. Shares field names with eval.py's own
+    # log_kv_sink_window_mode/*_sink_size/*_window_size so the same YAML
+    # values apply to both train and eval, same convention as the rest of
+    # this file's log_kv_* fields.
+    log_kv_sink_window_mode: bool = False,
+    log_kv_sink_window_sink_size: int = 4,
+    log_kv_sink_window_window_size: int = 1024,
+    # ── Log-structured KV cache (always on, unless log_kv_sink_window_mode=True) ──
     # This script IS the logKV adaptation phase: training always simulates the
     # compressed-KV streaming attention so the model learns to read merged
     # slots. Run it after dense pretraining, on already-pretrained base weights.
@@ -626,6 +655,9 @@ def main(
     enable_tensorboard = _o("enable_tensorboard", enable_tensorboard)
     tensorboard_root = _o("tensorboard_root", tensorboard_root)
     expid = _o("expid", expid)
+    log_kv_sink_window_mode = bool(_o("log_kv_sink_window_mode", log_kv_sink_window_mode))
+    log_kv_sink_window_sink_size = int(_o("log_kv_sink_window_sink_size", log_kv_sink_window_sink_size))
+    log_kv_sink_window_window_size = int(_o("log_kv_sink_window_window_size", log_kv_sink_window_window_size))
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_train_block = _o("log_kv_train_block", log_kv_train_block)
@@ -698,6 +730,7 @@ def main(
             "nothing would be written to save_path. Set save_ckpt: true in the YAML "
             "(or set run_eval: '' to skip the post-training eval)."
         )
+    _check_sink_window_mode_compatible(log_kv_sink_window_mode, log_kv_semantic_clusters)
 
     # 1. Set seeds
     set_random_seeds(42)
@@ -856,6 +889,13 @@ def main(
             checkpoint_dir=ckpt,
             benchmark=benchmark,
             output_path=f"{save_path}/evaluate",
+            # Without this, a SinkWindow-mode training run's run_eval
+            # self-check would silently fall through to eval.py's own
+            # default (log_kv_sink_window_mode=False) and evaluate through
+            # the LogKV compressed path instead.
+            log_kv_sink_window_mode=log_kv_sink_window_mode,
+            log_kv_sink_window_sink_size=log_kv_sink_window_sink_size,
+            log_kv_sink_window_window_size=log_kv_sink_window_window_size,
             log_kv_B=log_kv_B,
             log_kv_recent_size=log_kv_recent_size,
             log_kv_prefill_block=log_kv_prefill_block,
@@ -995,67 +1035,83 @@ def main(
         else None
     )
 
-    # Always simulate the logKV compressed-KV streaming attention during
-    # training — this script only supports the logKV adaptation route.
-    model.enable_log_kv_training(
-        batch_size=micro_batch_size,
-        max_seq_length=context_length,
-        device=fabric.device,
-        # Allocate cache buffers in the activation dtype instead of relying on
-        # the process default; keeps them aligned with the bf16-true params.
-        dtype=next(model.parameters()).dtype,
-        B=log_kv_B,
-        recent_size=log_kv_recent_size,
-        train_block=log_kv_train_block,
-        second_order_scale=initial_second_order_scale,
-        allocate_second_order=log_kv_second_order_scale != 0.0,
-        importance_pooling=log_kv_importance_pooling,
-        importance_pooling_lambda=log_kv_importance_pooling_lambda,
-        importance_pooling_temperature=log_kv_importance_pooling_temperature,
-        semantic_clusters=log_kv_semantic_clusters,
-        cluster_k_max=log_kv_cluster_k_max,
-        cluster_lambda_rel=log_kv_cluster_lambda_rel,
-        seg_eta=log_kv_seg_eta,
-        seg_g0=log_kv_seg_g0,
-        seg_gap_max=log_kv_seg_gap_max,
-        seg_block_level=log_kv_seg_block_level,
-        seg_forget=log_kv_seg_forget,
-        semantic_s_h=semantic_s_h,
-        semantic_flush_granularity=log_kv_semantic_flush_granularity,
-        semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
-        semantic_capacity_beta=log_kv_semantic_capacity_beta,
-        semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
-        semantic_legacy_route=log_kv_semantic_legacy_route,
-        semantic_anchor_mode=log_kv_semantic_anchor_mode,
-        semantic_pack_backend=log_kv_semantic_pack_backend,
-        semantic_centroid_backend=log_kv_semantic_centroid_backend,
-        semantic_summary_size=log_kv_semantic_summary_size,
-        semantic_replay_updates=log_kv_semantic_replay_updates,
-    )
-    effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
-    fabric.print(
-        f"logKV training ENABLED: B={log_kv_B}, "
-        f"recent_size={log_kv_recent_size}, "
-        f"train_block={log_kv_train_block} "
-        f"(effective={effective_log_kv_train_block}), "
-        f"second_order_scale={initial_second_order_scale:.4f} "
-        f"(target={log_kv_second_order_scale:.4f}, "
-        f"warmup_steps={log_kv_second_order_warmup_steps}), "
-        f"blocks/seq={math.ceil(context_length / effective_log_kv_train_block)}, "
-        f"importance_pooling={log_kv_importance_pooling} "
-        f"(lambda={log_kv_importance_pooling_lambda}, temperature={log_kv_importance_pooling_temperature}), "
-        f"semantic={log_kv_semantic_clusters} "
-        f"(K={log_kv_cluster_k_max}, lambda_rel={log_kv_cluster_lambda_rel}, "
-        f"g_max={log_kv_seg_gap_max}, l_block={log_kv_seg_block_level}, "
-        f"flush={log_kv_semantic_flush_granularity}, tree_chunk={log_kv_semantic_cluster_chunk_size}, "
-        f"s_h={log_kv_semantic_s_h_path}, "
-        f"capacity_beta={log_kv_semantic_capacity_beta}, "
-        f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
-        f"legacy_route={log_kv_semantic_legacy_route}, "
-        f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
-        f"centroid={log_kv_semantic_centroid_backend}, summary={log_kv_semantic_summary_size}, "
-        f"replay_updates={log_kv_semantic_replay_updates})"
-    )
+    if log_kv_sink_window_mode:
+        # No LogStructuredKVCache -- training operates on the full-sequence
+        # q/k/v directly (see CausalSelfAttention._sink_window_train_forward /
+        # sink_window_train_chunk_attention for the chunked, O(T*(S+W)) mask
+        # this actually applies). The guard near this function's start
+        # already rejects log_kv_semantic_clusters=True here.
+        model.enable_sink_window_training(
+            sink_size=log_kv_sink_window_sink_size,
+            window_size=log_kv_sink_window_window_size,
+            train_chunk_size=log_kv_sink_window_window_size,
+        )
+        fabric.print(
+            f"SinkWindow training ENABLED: sink_size={log_kv_sink_window_sink_size}, "
+            f"window_size={log_kv_sink_window_window_size}"
+        )
+    else:
+        # Always simulate the logKV compressed-KV streaming attention during
+        # training — this is the logKV/SinkWindow-comparison adaptation route.
+        model.enable_log_kv_training(
+            batch_size=micro_batch_size,
+            max_seq_length=context_length,
+            device=fabric.device,
+            # Allocate cache buffers in the activation dtype instead of relying on
+            # the process default; keeps them aligned with the bf16-true params.
+            dtype=next(model.parameters()).dtype,
+            B=log_kv_B,
+            recent_size=log_kv_recent_size,
+            train_block=log_kv_train_block,
+            second_order_scale=initial_second_order_scale,
+            allocate_second_order=log_kv_second_order_scale != 0.0,
+            importance_pooling=log_kv_importance_pooling,
+            importance_pooling_lambda=log_kv_importance_pooling_lambda,
+            importance_pooling_temperature=log_kv_importance_pooling_temperature,
+            semantic_clusters=log_kv_semantic_clusters,
+            cluster_k_max=log_kv_cluster_k_max,
+            cluster_lambda_rel=log_kv_cluster_lambda_rel,
+            seg_eta=log_kv_seg_eta,
+            seg_g0=log_kv_seg_g0,
+            seg_gap_max=log_kv_seg_gap_max,
+            seg_block_level=log_kv_seg_block_level,
+            seg_forget=log_kv_seg_forget,
+            semantic_s_h=semantic_s_h,
+            semantic_flush_granularity=log_kv_semantic_flush_granularity,
+            semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
+            semantic_capacity_beta=log_kv_semantic_capacity_beta,
+            semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
+            semantic_legacy_route=log_kv_semantic_legacy_route,
+            semantic_anchor_mode=log_kv_semantic_anchor_mode,
+            semantic_pack_backend=log_kv_semantic_pack_backend,
+            semantic_centroid_backend=log_kv_semantic_centroid_backend,
+            semantic_summary_size=log_kv_semantic_summary_size,
+            semantic_replay_updates=log_kv_semantic_replay_updates,
+        )
+        effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
+        fabric.print(
+            f"logKV training ENABLED: B={log_kv_B}, "
+            f"recent_size={log_kv_recent_size}, "
+            f"train_block={log_kv_train_block} "
+            f"(effective={effective_log_kv_train_block}), "
+            f"second_order_scale={initial_second_order_scale:.4f} "
+            f"(target={log_kv_second_order_scale:.4f}, "
+            f"warmup_steps={log_kv_second_order_warmup_steps}), "
+            f"blocks/seq={math.ceil(context_length / effective_log_kv_train_block)}, "
+            f"importance_pooling={log_kv_importance_pooling} "
+            f"(lambda={log_kv_importance_pooling_lambda}, temperature={log_kv_importance_pooling_temperature}), "
+            f"semantic={log_kv_semantic_clusters} "
+            f"(K={log_kv_cluster_k_max}, lambda_rel={log_kv_cluster_lambda_rel}, "
+            f"g_max={log_kv_seg_gap_max}, l_block={log_kv_seg_block_level}, "
+            f"flush={log_kv_semantic_flush_granularity}, tree_chunk={log_kv_semantic_cluster_chunk_size}, "
+            f"s_h={log_kv_semantic_s_h_path}, "
+            f"capacity_beta={log_kv_semantic_capacity_beta}, "
+            f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
+            f"legacy_route={log_kv_semantic_legacy_route}, "
+            f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
+            f"centroid={log_kv_semantic_centroid_backend}, summary={log_kv_semantic_summary_size}, "
+            f"replay_updates={log_kv_semantic_replay_updates})"
+        )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
     optimizer.zero_grad(set_to_none=True)

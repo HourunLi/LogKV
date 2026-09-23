@@ -1,0 +1,31 @@
+# SinkWindow（起始 token＋滑动窗口）· 32K Dense/SinkWindow/SemanticLogKV 三组对照实验 · 独立评测配置
+# ============================================================
+# 评的是 sinkwindow_stage1_train.yaml 训出的 checkpoint。sink_size/window_size
+# 必须和训练时冻结的值完全一致（任务说明 §4.2："训练、prefill 和逐 token
+# 生成必须实现相同的可见范围"）——不要在评测时单独调这两个数。
+#
+# 用法：
+#   torchrun --nproc_per_node=8 eval.py --config exp/qwen1.7b-32k/sinkwindow_stage1_eval.yaml
+#   bash eval.sh exp/qwen1.7b-32k/sinkwindow_stage1_eval.yaml niah_single_1,niah_single_2,niah_single_3 none
+
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1
+tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+benchmark: "niah_single_1,niah_single_2,niah_single_3"
+output_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1/evaluate
+
+log_kv_sink_window_mode: true
+log_kv_sink_window_sink_size: 4
+# 必须和 sinkwindow_stage1_train.yaml 里训练时实际用的值完全一致——训练脚本
+# 会把最终生效配置落盘到 {save_path}/resolved_config.yaml，核对时读那份文件，
+# 不要读这两份 YAML 的字面值（万一手改的时候漏改了一处）。同样故意写 -1
+# （不写 null），忘了替换会直接报错，而不是静默套用错误的窗口。
+log_kv_sink_window_window_size: -1
+
+# 没有这一行，eval.py 不会落盘 *_niah_samples.jsonl，位置分组分析和
+# cross-check 都没有输入——RUNBOOK.md §五/§六依赖这份文件存在。
+log_samples: true
+
+# niah_* 任务需要 metadata 才能拿到 tokenizer 路径和测试长度。
+metadata:
+  pretrained: *tokenizer_dir
+  max_seq_lengths: [32768]
