@@ -1,0 +1,24 @@
+# Dense（未压缩）· 32K Dense/SinkWindow/SemanticLogKV 三组对照实验
+# ============================================================
+# 独立 CPT 训练：完整因果注意力，不做任何 KV 压缩，作为"不限制显存"的参考分支
+# （任务说明 §二）。继承 base.yaml 的全部共同训练条件（数据/batch/LR/schedule/
+# steps/种子），只覆盖这个分支需要的字段——不要在这份文件里手动重复 base.yaml
+# 已有的数值，那样两边一旦改动不同步就会悄悄打破"三组同条件训练"的前提。
+#
+# 和 dense_niah_base.yaml 的区别：dense_niah_base.yaml 评的是"未经 CPT 的原始
+# Qwen3-1.7B-Base"，只作历史参照；这份文件训出的才是本次实验真正的 Dense 分支
+# （必须和 SinkWindow/SemanticLogKV 一样独立做 32K CPT，不能用未适配的原始权重
+# 代替）。
+config: base.yaml
+
+expid: qwen1.7b-32k-cpt-dense-stage1
+save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-dense-stage1
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/_fsdp_staging_dense_stage1
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-dense-stage1
+
+log_kv_dense_mode: true
+# base.yaml 默认打开语义聚类；dense 模式下必须显式关掉，否则 demo.py 的
+# fail-fast 检查会直接报错拒绝启动（log_kv_dense_mode 和
+# log_kv_semantic_clusters 同时为 true 是矛盾配置，dense 模式根本不会建
+# LogStructuredKVCache，语义相关字段全部无意义）。
+log_kv_semantic_clusters: false

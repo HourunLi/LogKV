@@ -1,0 +1,25 @@
+# Dense（未压缩）· 32K Dense/SinkWindow/SemanticLogKV 三组对照实验 · 独立评测配置
+# ============================================================
+# 评的是 dense_stage1_train.yaml 训出的 checkpoint（独立 32K CPT 过的 dense
+# 权重），不是原始 base checkpoint——那份是 dense_niah_base.yaml，只作历史
+# 参照，不是本实验的 Dense 分支。
+#
+# 用法（majob.sh 之外单独评测；单机/多机 torchrun 均可）:
+#   torchrun --nproc_per_node=8 eval.py --config exp/qwen1.7b-32k/dense_stage1_eval.yaml
+# 也可以用 eval.sh：
+#   bash eval.sh exp/qwen1.7b-32k/dense_stage1_eval.yaml niah_single_1,niah_single_2,niah_single_3 none
+
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-dense-stage1
+tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+benchmark: "niah_single_1,niah_single_2,niah_single_3"
+output_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-dense-stage1/evaluate
+
+log_kv_dense_mode: true
+# 没有这一行，eval.py 不会落盘 *_niah_samples.jsonl，位置分组分析和
+# cross-check 都没有输入——RUNBOOK.md §五/§六依赖这份文件存在。
+log_samples: true
+
+# niah_* 任务需要 metadata 才能拿到 tokenizer 路径和测试长度。
+metadata:
+  pretrained: *tokenizer_dir
+  max_seq_lengths: [32768]
