@@ -1,24 +1,31 @@
 # 快路由 + 一阶 Flash SDPA 配置。显式关闭二阶修正，否则会继承基线的 0.2，
 # `log_kv_slot_attention` 将继续走手写 score/softmax 路径。
-config: arc_semantic_stage1_threephase.yaml
-enable_tensorboard: false
+config: base.yaml
+enable_tensorboard: true
 auto_resume: true  # 直接 torchrun 时也从 save_path 恢复模型、优化器和步数；无 checkpoint 则加载 ckpt_dir。
 
 expid: qwen1.7b-32k-cpt-logKV-semantic-fast
-ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast/step_1200
-checkpoint_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast/step_1200
 save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast
 merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_semantic_fast
 tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-semantic-fast
 
+log_kv_semantic_clusters: true
+log_kv_cluster_k_max: 12
+log_kv_B: 256
+log_kv_recent_size: 2048
+log_kv_train_block: 2048
+log_kv_prefill_block: 2048
+log_kv_second_order_scale: 0
+log_kv_second_order_warmup_steps: 100
+log_kv_semantic_flush_granularity: 2048
+log_kv_semantic_cluster_chunk_size: 0
+
+
 # 走旧路由（每 orphan 一次 Ward merge）只用于 A/B 对照，默认 false。
 log_kv_semantic_legacy_route: null
-log_kv_second_order_scale: 0.0
 log_kv_semantic_anchor_mode: mid  # 单中心 anchor；multi 恢复 lo/mid/hi
 log_kv_semantic_pack_backend: auto  # CUDA 优先 Triton；torch 可用于数值/性能 A/B
 log_kv_profile_steps: null  # 默认仅 host 计时；例如 [3, 4, 5] 开启指定完整 step 的 CUDA 计时
-log_kv_B: 128
-log_kv_cluster_k_max: 8
 activation_checkpointing: true  # 整个 Block 重算，避免 norm/QKV/投影激活跨层累积
 entropy_chunk_size: 1024  # LM-head + CE 每次处理的 token 数，避免全序列 logits
 
