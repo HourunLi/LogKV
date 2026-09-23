@@ -52,9 +52,8 @@ mask"，在多 token 一次性提交且跨越绕回边界时会读到本该看�
 
 ## §二 测算 SemanticLogKV 的持久缓存字节数
 
-先确认 `exp/qwen1.7b-32k/semantic_stage1_frozen.yaml` 里的 `config:` 指向哪份
-候选配置——这个文件目前是占位符，训练前必须先看该文件顶部注释做出选择（详见
-文件内的 TODO）。确认后：
+`exp/qwen1.7b-32k/semantic_stage1_frozen.yaml` 已确认指向 `arc_semantic_fast.yaml`
+（文件内注释记录了继承链和关键超参数差异）。直接测：
 
 ```bash
 python scripts/measure_cache_bytes.py exp/qwen1.7b-32k/semantic_stage1_frozen.yaml \
@@ -214,18 +213,15 @@ hash（比如训练日志里打印过，或者你自己单独记的）。
 | `scripts/write_experiment_manifest.py` | 见 §七 |
 | `exp/qwen1.7b-32k/dense_stage1_{train,eval}.yaml` | Dense 分支冻结配置（dense 分支） |
 | `exp/qwen1.7b-32k/sinkwindow_stage1_{train,eval}.yaml` | SinkWindow 分支冻结配置（sinkwindow 分支） |
-| `exp/qwen1.7b-32k/semantic_stage1_frozen.yaml` | SemanticLogKV 分支配置占位符，训练前必须确认（见文件内 TODO） |
+| `exp/qwen1.7b-32k/semantic_stage1_frozen.yaml` | SemanticLogKV 分支配置，已确认指向 `arc_semantic_fast.yaml` |
 | `tests/test_dense_bypass.py`、`tests/test_sinkwindow_cache.py`、`tests/test_cache_accounting.py`、`tests/test_needle_spans_answer_exact.py`、`tests/test_resolved_config_dump.py`、`tests/test_niah_sample_rows.py`、`tests/test_calibrate_sinkwindow_w.py` | §一的验证脚本，写出来但没跑过 |
 
 ## 明确没有解决的事情（不要假装它们已经解决）
 
 1. **`eval.py` 还没有真正回放固定导出的 NIAH 样本**，见 §四。`cross-check` 是
    检测手段，不是预防手段。
-2. **SemanticLogKV 分支该用哪份候选配置**没有确认，见
-   `semantic_stage1_frozen.yaml` 内的 TODO 和它列出的 5 份候选之间的差异
-   （批量大小、步数都不完全一致，不是只有超参数不同）。
-3. **0.946/0.204/0.172 这三个历史成绩**在这个仓库里查不到出处（结果目录被
+2. **0.946/0.204/0.172 这三个历史成绩**在这个仓库里查不到出处（结果目录被
    gitignore、这个容器的 git 历史最早只到 2026-08-27）；按你的要求，本轮
    三组都独立重新训练，这三个数字只作历史背景，不代入正式对比表。
-4. 这次交付的所有代码都**只做过静态自查，没有执行过**（这个容器没有 GPU、
+3. 这次交付的所有代码都**只做过静态自查，没有执行过**（这个容器没有 GPU、
    没装 torch）；§一的验证是训练前的强制关卡，不是可选项。
