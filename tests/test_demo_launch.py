@@ -143,22 +143,31 @@ def test_training_checkpoint_source_is_not_implicit_save_path(tmp_path, auto, re
         exec(block, scope)
 
 
-@pytest.mark.parametrize('enabled,healthy', [('true', False), ('true', True), ('false', False)])
-def test_tensorboard_preflight_preserves_error_without_installing(enabled, healthy):
+@pytest.mark.parametrize('enabled,healthy,install_status,recheck_status', [
+    ('false', False, 1, 1), ('true', True, 1, 1),
+    ('true', False, 1, 1), ('true', False, 0, 1), ('true', False, 0, 0),
+])
+def test_tensorboard_preflight_installs_and_rechecks(enabled, healthy, install_status, recheck_status):
     source = (ROOT / 'majob.sh').read_text()
     start = source.index('    if [ "${ENABLE_TENSORBOARD}" == "true" ]; then')
     end = source.index('    "${PYTHON_BIN}" -m torch.distributed.run', start)
-    shell = f'ENABLE_TENSORBOARD={enabled}\nPROBE_STATUS={0 if healthy else 1}\n' + '''
+    shell = (f'ENABLE_TENSORBOARD={enabled}\nPROBE_STATUS={0 if healthy else 1}\n'
+             f'INSTALL_STATUS={install_status}\nRECHECK_STATUS={recheck_status}\n') + '''
 PYTHON_BIN=install_test
 check_tensorboard() {
     if [ "$PROBE_STATUS" != 0 ]; then echo ORIGINAL_BACKEND_ERROR >&2; fi
     return "$PROBE_STATUS"
 }
-install_test() { echo INSTALL_ATTEMPT; return 1; }
+install_test() {
+    echo "INSTALL_ATTEMPT $*"
+    PROBE_STATUS=$RECHECK_STATUS
+    return "$INSTALL_STATUS"
+}
 ''' + source[start:end] + '\necho READY_FOR_TRAINING'
     result = subprocess.run(['bash', '-c', shell], capture_output=True, text=True)
-    failed = enabled == 'true' and not healthy
+    attempted = enabled == 'true' and not healthy
+    failed = attempted and (install_status != 0 or recheck_status != 0)
     assert result.returncode == int(failed)
     assert ('READY_FOR_TRAINING' in result.stdout) == (not failed)
-    assert 'INSTALL_ATTEMPT' not in result.stdout
-    assert ('ORIGINAL_BACKEND_ERROR' in result.stderr) == failed
+    assert ('INSTALL_ATTEMPT -m pip install tensorboard>=2.14' in result.stdout) == attempted
+    assert ('ORIGINAL_BACKEND_ERROR' in result.stderr) == (attempted and install_status == 0 and recheck_status != 0)
