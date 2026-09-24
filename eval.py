@@ -315,9 +315,32 @@ apply_patch()
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
 
+def _read_social_iqa_cache(directory):
+    """Read the confirmed Arrow snapshot without globbing its parent directories."""
+    from datasets import Dataset, DatasetDict, DatasetInfo
+    from datasets.arrow_reader import ArrowReader
+
+    directory = Path(directory)
+    with (directory / "dataset_info.json").open(encoding="utf-8") as stream:
+        info = DatasetInfo.from_dict(json.load(stream))
+    expected = {"context", "question", "answerA", "answerB", "answerC", "label"}
+    if (info.dataset_name not in (None, "social_i_qa")
+            or info.config_name not in (None, "default")
+            or not expected.issubset(info.features or {})
+            or not {"train", "validation"}.issubset(info.splits or {})):
+        raise ValueError(f"Not a default social_i_qa cache: {directory}")
+    reader = ArrowReader(str(directory), info=info)
+    result = DatasetDict()
+    for split, split_info in info.splits.items():
+        result[split] = Dataset(**reader.read("social_i_qa", split, list(info.splits.values())))
+        if len(result[split]) != split_info.num_examples:
+            raise ValueError(f"Incomplete social_i_qa split {split}: {directory}")
+    return result
+
+
 @contextlib.contextmanager
 def _trace_hf_cache_resolution():
-    """Expose the local-cache exception that datasets masks with its Hub error."""
+    """Log hidden cache errors; recover social_iqa from its confirmed snapshot."""
     import functools
     import importlib
     import socket
@@ -350,23 +373,55 @@ def _trace_hf_cache_resolution():
         yield
         return
 
+    datasets_module = importlib.import_module("datasets")
+    original_load = datasets_module.load_dataset
     original = factory.get_module
+    cache_misses = set()
 
     @functools.wraps(original)
     def traced_get_module(self, *args, **kwargs):
         try:
             return original(self, *args, **kwargs)
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, FileNotFoundError):
+                cache_misses.add(self.name)
             emit("local_cache_failure", dataset=self.name, cache_dir_argument=self.cache_dir,
                  effective_cache_dir=os.path.expanduser(str(self.cache_dir or cfg.HF_DATASETS_CACHE)),
                  traceback=traceback.format_exc())
             raise
 
+    @functools.wraps(original_load)
+    def load_with_local_fallback(*args, **kwargs):
+        cache_misses.clear()
+        try:
+            return original_load(*args, **kwargs)
+        except (ConnectionError, FileNotFoundError):
+            path = args[0] if args else kwargs.get("path")
+            name = args[1] if len(args) > 1 else kwargs.get("name")
+            # Do not silently ignore a requested revision, split, streaming mode, or data files.
+            if (path != "allenai/social_i_qa" or path not in cache_misses
+                    or not cfg.HF_DATASETS_OFFLINE or name not in (None, "default")
+                    or len(args) > 2
+                    or set(kwargs) - {"path", "name", "cache_dir", "trust_remote_code"}):
+                raise
+            root = Path(kwargs.get("cache_dir") or cfg.HF_DATASETS_CACHE).expanduser()
+            # ponytail: one confirmed snapshot; set SOCIAL_IQA_CACHE_DIR if the cache is regenerated.
+            directory = Path(os.environ.get("SOCIAL_IQA_CACHE_DIR", str(
+                root / "allenai___social_i_qa/default/0.1.0"
+                / "674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8"
+            ))).expanduser()
+            result = _read_social_iqa_cache(directory)
+            emit("explicit_cache_loaded", dataset=path, directory=str(directory),
+                 rows={split: len(data) for split, data in result.items()})
+            return result
+
     factory.get_module = traced_get_module
+    datasets_module.load_dataset = load_with_local_fallback
     try:
         yield
     finally:
         factory.get_module = original
+        datasets_module.load_dataset = original_load
 
 
 def _load_lit_model_checkpoint(
