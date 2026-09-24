@@ -27,3 +27,23 @@ assert config.HF_DATASETS_OFFLINE, "Datasets 离线设置未生效"
 set_verbosity_debug()
 print(load_dataset("allenai/social_i_qa", name="default"))
 PY
+
+Hub offline: True
+Datasets offline: True
+Hub cache: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub
+Datasets cache: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
+Using the latest cached version of the dataset since allenai/social_i_qa couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'default' at /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache/allenai___social_i_qa/default/0.1.0/674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8 (last modified on Wed Sep 23 11:08:29 2026).
+Overwrite dataset info from restored data version if exists.
+Loading Dataset info from /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache/allenai___social_i_qa/default/0.1.0/674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8
+Constructing Dataset for split train, validation, from /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache/allenai___social_i_qa/default/0.1.0/674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8
+DatasetDict({
+    train: Dataset({
+        features: ['context', 'question', 'answerA', 'answerB', 'answerC', 'label'],
+        num_rows: 33410
+    })
+    validation: Dataset({
+        features: ['context', 'question', 'answerA', 'answerB', 'answerC', 'label'],
+        num_rows: 1954
+    })
+})
