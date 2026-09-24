@@ -35,7 +35,7 @@ def test_legacy_route_reaches_eval_arguments(tmp_path, script, setting, expected
         build_args = source[start:stop]
         print_args = "printf '%s\\n' ${EVAL_LOG_KV_ARGS}"
     else:
-        start = source.index('CONFIG_EXPORTS=$(python ')
+        start = source.index('CONFIG_EXPORTS=$("${PYTHON_BIN}" ')
         stop = source.index('eval "${CONFIG_EXPORTS}"', start) + len('eval "${CONFIG_EXPORTS}"')
         read_config = source[start:stop]
         start = source.index('LOG_KV_ARG_LIST=(')
@@ -43,7 +43,8 @@ def test_legacy_route_reaches_eval_arguments(tmp_path, script, setting, expected
         build_args = source[start:stop]
         print_args = "printf '%s\\n' \"${LOG_KV_ARG_LIST[@]}\""
     shell = '\n'.join(('set -e', 'CONFIG_FILE=$1', read_config, build_args, print_args))
-    env = {**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
+    env = {**os.environ, "PYTHON_BIN": sys.executable,
+           "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
     result = subprocess.run(["bash", "-c", shell, "bash", str(config)],
                             capture_output=True, text=True, check=True, env=env)
     args = result.stdout.splitlines()
