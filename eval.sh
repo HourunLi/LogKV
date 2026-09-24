@@ -13,7 +13,10 @@
 #       bash eval.sh exp/qwen1.7b-32k/diag.yaml niah_single_1 none
 
 if [ -f /home/ma-user/anaconda3/bin/activate ]; then
-    source /home/ma-user/anaconda3/bin/activate torch218
+    if ! source /home/ma-user/anaconda3/bin/activate torch218; then
+        echo "ERROR: failed to activate torch218."
+        exit 1
+    fi
 fi
 
 
@@ -32,6 +35,9 @@ export HF_DATASETS_IN_MEMORY_MAX_SIZE=0
 export HF_DATASETS_TRUST_REMOTE_CODE=1
 export TOKENIZERS_PARALLELISM=false
 export HF_ALLOW_CODE_EVAL=1
+
+PYTHON_BIN=$(python -c 'import sys; print(sys.executable)') || exit 1
+echo "Eval Python: ${PYTHON_BIN}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=32
 export CUDNN_LOGERR_DBG=1
@@ -98,7 +104,7 @@ fi
 
 echo "Reading eval settings from ${CONFIG_FILE}"
 
-CONFIG_EXPORTS=$(python - "${CONFIG_FILE}" <<'EOF'
+CONFIG_EXPORTS=$("${PYTHON_BIN}" - "${CONFIG_FILE}" <<'EOF'
 import os
 import re
 import shlex
@@ -218,7 +224,7 @@ checkpoint_exists() {
 }
 
 checkpoint_finished() {
-    python - "${SAVE_DIR}" "${MAX_STEPS}" "${NUM_EPOCHS}" <<'EOF'
+    "${PYTHON_BIN}" - "${SAVE_DIR}" "${MAX_STEPS}" "${NUM_EPOCHS}" <<'EOF'
 import os
 import sys
 
@@ -270,7 +276,7 @@ EOF
 }
 
 checkpoint_step_label() {
-    python - "${SAVE_DIR}" "${MAX_STEPS}" "${NUM_EPOCHS}" <<'EOF'
+    "${PYTHON_BIN}" - "${SAVE_DIR}" "${MAX_STEPS}" "${NUM_EPOCHS}" <<'EOF'
 import os
 import sys
 
@@ -421,7 +427,7 @@ if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* ]]; then
 fi
 
 if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
-    torchrun \
+    "${PYTHON_BIN}" -m torch.distributed.run \
         --nnodes=${NUM_NODES} \
         --nproc_per_node=${GPUS_PER_NODE} \
         --node_rank=${NODE_RANK} \
@@ -446,7 +452,7 @@ else
 fi
 
 if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
-    torchrun \
+    "${PYTHON_BIN}" -m torch.distributed.run \
         --nnodes=${NUM_NODES} \
         --nproc_per_node=${GPUS_PER_NODE} \
         --node_rank=${NODE_RANK} \
