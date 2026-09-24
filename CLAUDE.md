@@ -191,5 +191,7 @@ prompt 尾部的设定。
 - 新增会被 CLI 扫参覆盖的 YAML 字段写 `null`，否则 `_o()` 会让 YAML 非 null 值覆盖 CLI。
 - `majob.sh` 遇到已有 `save_path` checkpoint 会跳过训练；新实验用独立目录。
 - 本地 Python 环境用 conda env `mineru`；系统 Python 不适合跑仓库测试。
+- 公司环境 conda/pip 报 ProxyError 或证书错误时，先跑 `bash scripts/diagnose_conda_tls.sh`
+  （只读），按报告里的“结论提示”定位是代理层、conda、pip 还是 curl。
 - 任何“生产已实现”的判断以 `litgpt/log_kv_cache.py`、`litgpt/model.py` 实际代码为准；
   当前 SemanticLogKV 生产路径尚未落地。
