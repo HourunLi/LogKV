@@ -1,32 +1,25 @@
-[GlobalRank 3/32 (local 3)] 环境变量 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache[GlobalRank 4/32 (local 4)] 环境变量 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache[GlobalRank 5/32 (local 5)] 环境变量 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
+python - <<'PY'
+from pathlib import Path
+from importlib.metadata import version
 
-[GlobalRank 6/32 (local 6)] 环境变量 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
-[GlobalRank 0/32 (local 0)] 环境变量 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
+for package in ("datasets", "huggingface-hub", "lm_eval"):
+    print(package, version(package))
 
-[GlobalRank 7/32 (local 7)] 环境变量 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache[GlobalRank 1/32 (local 1)] 环境变量 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache[GlobalRank 3/32 (local 3)] 库实际使用 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache[GlobalRank 4/32 (local 4)] 库实际使用 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
-
-[GlobalRank 5/32 (local 5)] 库实际使用 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
-
-[GlobalRank 6/32 (local 6)] 库实际使用 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
-
-[GlobalRank 0/32 (local 0)] 库实际使用 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache[GlobalRank 2/32 (local 2)] 环境变量 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
-
-[GlobalRank 3/32 (local 3)] 环境变量 hub: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub
-[GlobalRank 4/32 (local 4)] 环境变量 hub: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub[GlobalRank 5/32 (local 5)] 环境变量 hub: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub[GlobalRank 6/32 (local 6)] 环境变量 hub: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub
-
-[GlobalRank 3/32 (local 3)] 库实际使用 hub: /home/ma-user/.cache/huggingface/hub[GlobalRank 7/32 (local 7)] 库实际使用 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache[GlobalRank 1/32 (local 1)] 库实际使用 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
-[GlobalRank 0/32 (local 0)] 环境变量 hub: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub
+root = Path("/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache")
+for subdir in ("hf_cache", "hub", "modules"):
+    folder = root / subdir
+    print(f"\n[{folder}] exists={folder.is_dir()}")
+    for path in folder.rglob("*social*"):
+        print(path, "exists=", path.exists(), "symlink=", path.is_symlink())
+PY
 
 
-[GlobalRank 2/32 (local 2)] 库实际使用 datasets: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
-[GlobalRank 4/32 (local 4)] 库实际使用 hub: /home/ma-user/.cache/huggingface/hub
-[GlobalRank 5/32 (local 5)] 库实际使用 hub: /home/ma-user/.cache/huggingface/hub
+datasets 4.8.4
+huggingface-hub 0.36.2
+lm_eval 0.4.11
 
-[GlobalRank 7/32 (local 7)] 环境变量 hub: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub[GlobalRank 6/32 (local 6)] 库实际使用 hub: /home/ma-user/.cache/huggingface/hub[GlobalRank 1/32 (local 1)] 环境变量 hub: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub
+[/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache] exists=True
 
-[GlobalRank 0/32 (local 0)] 库实际使用 hub: /home/ma-user/.cache/huggingface/hub
+[/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub] exists=True
 
-[GlobalRank 2/32 (local 2)] 环境变量 hub: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub
-[GlobalRank 7/32 (local 7)] 库实际使用 hub: /home/ma-user/.cache/huggingface/hub
-[GlobalRank 1/32 (local 1)] 库实际使用 hub: /home/ma-user/.cache/huggingface/hub
-[GlobalRank 2/32 (local 2)] 库实际使用 hub: /home/ma-user/.cache/huggingface/hub
+[/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/modules] exists=True
