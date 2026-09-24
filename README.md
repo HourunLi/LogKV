@@ -33,7 +33,6 @@ print("lm-eval 任务加载成功:", list(tasks))
 
 PY
 
-Hub offline: True
 Datasets offline: True
 Hub cache: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub
 Datasets cache: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
@@ -52,3 +51,9 @@ DatasetDict({
         num_rows: 1954
     })
 })
+Using the latest cached version of the dataset since allenai/social_i_qa couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'default' at /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache/allenai___social_i_qa/default/0.1.0/674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8 (last modified on Wed Sep 23 11:08:29 2026).
+Overwrite dataset info from restored data version if exists.
+Loading Dataset info from /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache/allenai___social_i_qa/default/0.1.0/674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8
+Constructing Dataset for split train, validation, from /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache/allenai___social_i_qa/default/0.1.0/674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8
+lm-eval 任务加载成功: ['social_iqa']
