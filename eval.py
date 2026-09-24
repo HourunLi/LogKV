@@ -315,6 +315,60 @@ apply_patch()
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
 
+@contextlib.contextmanager
+def _trace_hf_cache_resolution():
+    """Expose the local-cache exception that datasets masks with its Hub error."""
+    import functools
+    import importlib
+    import socket
+    import sys
+    import traceback
+
+    load = importlib.import_module("datasets.load")
+    cfg = importlib.import_module("datasets.config")
+    hub = importlib.import_module("huggingface_hub.constants")
+    factory = getattr(load, "CachedDatasetModuleFactory", None)
+    identity = dict(rank=_global_rank(), host=socket.gethostname(), pid=os.getpid(), python=sys.executable)
+
+    def emit(event, **details):
+        # One line per event keeps rank and exception together in aggregated logs.
+        print("[hf-cache] " + json.dumps(dict(event=event, **identity, **details),
+                                        ensure_ascii=False, default=str), file=sys.stderr, flush=True)
+
+    packages = {}
+    for name in ("datasets", "huggingface_hub", "lm_eval"):
+        module = importlib.import_module(name)
+        packages[name] = dict(version=getattr(module, "__version__", None), file=module.__file__)
+    emit("runtime", script=str(Path(__file__).resolve()), cwd=os.getcwd(), packages=packages,
+         datasets_cache=cfg.HF_DATASETS_CACHE, hub_cache=hub.HF_HUB_CACHE,
+         datasets_offline=cfg.HF_DATASETS_OFFLINE, hub_offline=hub.HF_HUB_OFFLINE,
+         environment={key: os.environ.get(key) for key in (
+             "HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE", "HF_MODULES_CACHE",
+             "HF_DATASETS_OFFLINE", "HF_HUB_OFFLINE", "HF_ENDPOINT", "PYTHONPATH", "PYTHON_EXEC")},
+         cache_trace_supported=factory is not None)
+    if factory is None:
+        yield
+        return
+
+    original = factory.get_module
+
+    @functools.wraps(original)
+    def traced_get_module(self, *args, **kwargs):
+        try:
+            return original(self, *args, **kwargs)
+        except Exception:
+            emit("local_cache_failure", dataset=self.name, cache_dir_argument=self.cache_dir,
+                 effective_cache_dir=os.path.expanduser(str(self.cache_dir or cfg.HF_DATASETS_CACHE)),
+                 traceback=traceback.format_exc())
+            raise
+
+    factory.get_module = traced_get_module
+    try:
+        yield
+    finally:
+        factory.get_module = original
+
+
 def _load_lit_model_checkpoint(
     checkpoint_dir: str, map_location: str | torch.device, wait_s: float = 120.0
 ) -> Any:
@@ -1291,6 +1345,7 @@ def main(
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
 
         with (
+            _trace_hf_cache_resolution(),
             diag_mode(
                 log_kv_diag_mode,
                 exact_from_layer=log_kv_diag_exact_from_layer,
