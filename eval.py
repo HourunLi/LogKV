@@ -315,29 +315,6 @@ apply_patch()
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
 
-def _read_social_iqa_cache(directory):
-    """Read the confirmed Arrow snapshot without globbing its parent directories."""
-    from datasets import Dataset, DatasetDict, DatasetInfo
-    from datasets.arrow_reader import ArrowReader
-
-    directory = Path(directory)
-    with (directory / "dataset_info.json").open(encoding="utf-8") as stream:
-        info = DatasetInfo.from_dict(json.load(stream))
-    expected = {"context", "question", "answerA", "answerB", "answerC", "label"}
-    if (info.dataset_name not in (None, "social_i_qa")
-            or info.config_name not in (None, "default")
-            or not expected.issubset(info.features or {})
-            or not {"train", "validation"}.issubset(info.splits or {})):
-        raise ValueError(f"Not a default social_i_qa cache: {directory}")
-    reader = ArrowReader(str(directory), info=info)
-    result = DatasetDict()
-    for split, split_info in info.splits.items():
-        result[split] = Dataset(**reader.read("social_i_qa", split, list(info.splits.values())))
-        if len(result[split]) != split_info.num_examples:
-            raise ValueError(f"Incomplete social_i_qa split {split}: {directory}")
-    return result
-
-
 def _walk_cache_path(path):
     """lstat each component of ``path`` in order and stop at the first one that cannot be entered.
 
@@ -427,7 +404,7 @@ def _walk_cache_path(path):
 
 @contextlib.contextmanager
 def _trace_hf_cache_resolution():
-    """Log hidden cache errors; recover social_iqa from its confirmed snapshot."""
+    """Log hidden cache errors; follow cache aliases that this mount cannot resolve."""
     import functools
     import importlib
     import socket
@@ -477,6 +454,23 @@ def _trace_hf_cache_resolution():
                  traceback=traceback.format_exc())
             raise
 
+    def unusable_alias(root, path):
+        """Return (alias, target) when the cache entry for ``namespace/name`` stands in for ``name``."""
+        from datasets.naming import camelcase_to_snakecase
+
+        namespace, name = path.split("/")
+        alias = root / f"{namespace}___{camelcase_to_snakecase(name)}"
+        target = root / camelcase_to_snakecase(name)
+        try:
+            # Anything this process can enter must be the legacy directory itself (a working link);
+            # a real directory of its own is not an alias, and its failure is a different problem.
+            if (not os.path.lexists(alias) or not target.is_dir()
+                    or alias.is_dir() and not os.path.samefile(alias, target)):
+                return None
+        except OSError:
+            return None
+        return alias, target
+
     @functools.wraps(original_load)
     def load_with_local_fallback(*args, **kwargs):
         cache_misses.clear()
@@ -484,35 +478,28 @@ def _trace_hf_cache_resolution():
             return original_load(*args, **kwargs)
         except (ConnectionError, FileNotFoundError):
             path = args[0] if args else kwargs.get("path")
-            name = args[1] if len(args) > 1 else kwargs.get("name")
-            # Do not silently ignore a requested revision, split, streaming mode, or data files.
-            if (path != "allenai/social_i_qa" or path not in cache_misses
-                    or not cfg.HF_DATASETS_OFFLINE or name not in (None, "default")
-                    or len(args) > 2
-                    or set(kwargs) - {"path", "name", "cache_dir", "trust_remote_code"}):
+            if not (cfg.HF_DATASETS_OFFLINE and isinstance(path, str) and path.count("/") == 1
+                    and path in cache_misses):
                 raise
             root = Path(kwargs.get("cache_dir") or cfg.HF_DATASETS_CACHE).expanduser()
-            # ponytail: one confirmed snapshot; set SOCIAL_IQA_CACHE_DIR if the cache is regenerated.
-            snapshot = "default/0.1.0/674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8"
-            # allenai___social_i_qa is a symlink to social_i_qa; also try the target directly,
-            # in case this mount does not resolve the link.
-            candidates = ([Path(os.environ["SOCIAL_IQA_CACHE_DIR"]).expanduser()]
-                          if os.environ.get("SOCIAL_IQA_CACHE_DIR")
-                          else [root / "allenai___social_i_qa" / snapshot, root / "social_i_qa" / snapshot])
-            failures = []
-            for directory in candidates:
-                try:
-                    result = _read_social_iqa_cache(directory)
-                except (OSError, ValueError) as exc:
-                    failures.append(exc)
-                    emit("explicit_cache_failure", dataset=path, directory=str(directory),
-                         error=f"{type(exc).__name__}: {exc}",
-                         walk=_walk_cache_path(directory / "dataset_info.json"))
-                    continue
-                emit("explicit_cache_loaded", dataset=path, directory=str(directory),
-                     rows={split: len(data) for split, data in result.items()})
-                return result
-            raise failures[0]
+            found = unusable_alias(root, path)
+            legacy = path.split("/")[1]
+            packaged = importlib.import_module("datasets.packaged_modules")._PACKAGED_DATASETS_MODULES
+            # The legacy name must reach the same cache lookup, not a packaged builder or a local folder.
+            if found is None or legacy in packaged or os.path.exists(legacy):
+                raise
+            alias, target = found
+            config = args[1] if len(args) > 1 else kwargs.get("name")
+            emit("cache_alias_unusable", dataset=path, alias=str(alias), target=str(target),
+                 walk=_walk_cache_path(alias / (config or "default")))
+            # Loading under the legacy name is what following namespace___name -> name would do.
+            if args:
+                result = original_load(legacy, *args[1:], **kwargs)
+            else:
+                result = original_load(**dict(kwargs, path=legacy))
+            emit("cache_alias_followed", dataset=path, loaded_as=legacy, directory=str(target),
+                 num_rows=getattr(result, "num_rows", None))
+            return result
 
     factory.get_module = traced_get_module
     datasets_module.load_dataset = load_with_local_fallback
