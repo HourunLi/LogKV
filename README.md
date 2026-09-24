@@ -26,6 +26,11 @@ assert config.HF_DATASETS_OFFLINE, "Datasets 离线设置未生效"
 
 set_verbosity_debug()
 print(load_dataset("allenai/social_i_qa", name="default"))
+from lm_eval.tasks import TaskManager, get_task_dict
+
+tasks = get_task_dict(["social_iqa"], task_manager=TaskManager())
+print("lm-eval 任务加载成功:", list(tasks))
+
 PY
 
 Hub offline: True
