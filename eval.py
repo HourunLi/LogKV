@@ -338,6 +338,93 @@ def _read_social_iqa_cache(directory):
     return result
 
 
+def _walk_cache_path(path):
+    """lstat each component of ``path`` in order and stop at the first one that cannot be entered.
+
+    ENOTDIR only says *some* parent is not a directory; this names which one, what it
+    really is in this process (symlink target, file contents), and which mount it lives on.
+    """
+    import re
+    import stat
+
+    def kind(mode):
+        for name in ("DIR", "REG", "LNK", "FIFO", "SOCK", "CHR", "BLK"):
+            if getattr(stat, f"S_IS{name}")(mode):
+                return name.lower()
+        return oct(stat.S_IFMT(mode))
+
+    def error(exc):
+        return f"{type(exc).__name__}: {exc}"
+
+    mounts = []
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8", errors="backslashreplace") as stream:
+            for line in stream:
+                fields = line.split()
+                tail = fields.index("-")
+                mounts.append(dict(point=re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4]),
+                                   root=fields[3], dev=fields[2], options=fields[5],
+                                   fstype=fields[tail + 1], source=fields[tail + 2]))
+    except (OSError, ValueError, IndexError):
+        pass
+
+    parts = Path(os.path.abspath(path)).parts
+    steps, previous_dev, last_dir = [], None, None
+    for index in range(len(parts)):
+        current = Path(*parts[:index + 1])
+        step = dict(path=str(current))
+        steps.append(step)
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            step.update(error=error(exc), blocks_traversal=True)
+            break
+        dev = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}"
+        step.update(type=kind(info.st_mode), mode=oct(stat.S_IMODE(info.st_mode)),
+                    size=info.st_size, dev=dev)
+        if dev != previous_dev:
+            # The entry lives on the fs holding its parent's real directory.
+            physical = os.path.join(os.path.realpath(current.parent), current.name)
+            covering = [m for m in mounts if m["point"] == "/" or physical == m["point"]
+                        or physical.startswith(m["point"] + "/")]
+            if covering:
+                step["mount"] = max(covering, key=lambda m: len(m["point"]))
+            previous_dev = dev
+        entered = info
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                step["link"] = os.readlink(current)
+                step["resolved"] = os.path.realpath(current)
+                entered = os.stat(current)
+            except OSError as exc:
+                step.update(target_error=error(exc), blocks_traversal=True)
+                break
+            step["target_type"] = kind(entered.st_mode)
+        if stat.S_ISDIR(entered.st_mode):
+            last_dir = current
+        elif index < len(parts) - 1:
+            step["blocks_traversal"] = True
+            if stat.S_ISREG(entered.st_mode):
+                # An object store without symlink support may surface a link as a small file.
+                try:
+                    with open(current, "rb") as stream:
+                        step["head"] = stream.read(256).decode("utf-8", "backslashreplace")
+                except OSError as exc:
+                    step["head_error"] = error(exc)
+            try:
+                step["xattrs"] = os.listxattr(current, follow_symlinks=False)
+            except OSError:
+                pass
+            break
+    if last_dir is not None:
+        try:
+            names = sorted(os.listdir(last_dir))
+            steps.append(dict(listing_of=str(last_dir), entries=names[:50], total=len(names)))
+        except OSError as exc:
+            steps.append(dict(listing_of=str(last_dir), error=error(exc)))
+    return steps
+
+
 @contextlib.contextmanager
 def _trace_hf_cache_resolution():
     """Log hidden cache errors; recover social_iqa from its confirmed snapshot."""
@@ -406,14 +493,26 @@ def _trace_hf_cache_resolution():
                 raise
             root = Path(kwargs.get("cache_dir") or cfg.HF_DATASETS_CACHE).expanduser()
             # ponytail: one confirmed snapshot; set SOCIAL_IQA_CACHE_DIR if the cache is regenerated.
-            directory = Path(os.environ.get("SOCIAL_IQA_CACHE_DIR", str(
-                root / "allenai___social_i_qa/default/0.1.0"
-                / "674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8"
-            ))).expanduser()
-            result = _read_social_iqa_cache(directory)
-            emit("explicit_cache_loaded", dataset=path, directory=str(directory),
-                 rows={split: len(data) for split, data in result.items()})
-            return result
+            snapshot = "default/0.1.0/674d85e42ac7430d3dcd4de7007feaffcb1527c535121e09bab2803fbcc925f8"
+            # allenai___social_i_qa is a symlink to social_i_qa; also try the target directly,
+            # in case this mount does not resolve the link.
+            candidates = ([Path(os.environ["SOCIAL_IQA_CACHE_DIR"]).expanduser()]
+                          if os.environ.get("SOCIAL_IQA_CACHE_DIR")
+                          else [root / "allenai___social_i_qa" / snapshot, root / "social_i_qa" / snapshot])
+            failures = []
+            for directory in candidates:
+                try:
+                    result = _read_social_iqa_cache(directory)
+                except (OSError, ValueError) as exc:
+                    failures.append(exc)
+                    emit("explicit_cache_failure", dataset=path, directory=str(directory),
+                         error=f"{type(exc).__name__}: {exc}",
+                         walk=_walk_cache_path(directory / "dataset_info.json"))
+                    continue
+                emit("explicit_cache_loaded", dataset=path, directory=str(directory),
+                     rows={split: len(data) for split, data in result.items()})
+                return result
+            raise failures[0]
 
     factory.get_module = traced_get_module
     datasets_module.load_dataset = load_with_local_fallback
