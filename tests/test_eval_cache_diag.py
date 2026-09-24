@@ -34,6 +34,7 @@ def test_cache_failure_is_visible_and_original_behavior_is_preserved():
     modules = {name: ModuleType(name) for name in ("datasets", "huggingface_hub", "lm_eval")}
     for module in modules.values():
         module.__version__, module.__file__ = "test", "/test/package.py"
+    modules["datasets"].load_dataset = lambda *args, **kwargs: result
     modules.update({
         "datasets.load": SimpleNamespace(CachedDatasetModuleFactory=Factory),
         "datasets.config": SimpleNamespace(HF_DATASETS_CACHE="/test/cache", HF_DATASETS_OFFLINE=True),
