@@ -28,3 +28,5 @@ client.py
 *.jsonl
 *.json
 *.npz
+# scripts/diagnose_conda_tls.sh 的报告目录（含证书链）
+conda_tls_diag_*/
