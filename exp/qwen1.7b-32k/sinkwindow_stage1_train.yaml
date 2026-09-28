@@ -18,10 +18,16 @@
 # StreamingLLM——具体语义边界见 litgpt/sinkwindow_cache.py 的模块文档。
 config: base.yaml
 
+global_batch_size: 32
+micro_batch_size: 4
+max_steps: 200
+
+enable_tensorboard: false
+
 expid: qwen1.7b-32k-cpt-sinkwindow-stage1
-save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1
-merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/_fsdp_staging_sinkwindow_stage1
-tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-sinkwindow-stage1
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_sinkwindow_stage1
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-sinkwindow-stage1
 
 log_kv_sink_window_mode: true
 # base.yaml 默认打开语义聚类；SinkWindow 分支必须显式关掉（不是
@@ -29,7 +35,7 @@ log_kv_sink_window_mode: true
 # fail-fast 检查也会在两者同时为 true 时直接拒绝启动）。
 log_kv_semantic_clusters: false
 
-log_kv_sink_window_sink_size: 4
+log_kv_sink_window_sink_size: 16
 # TODO(freeze-before-training)：跑完 scripts/calibrate_sinkwindow_w.py 后把这个
 # 占位值换成算出来的 window_size，然后和 sink_size 一起冻结，不要在三组训练启动
 # 之后再改。
@@ -39,4 +45,4 @@ log_kv_sink_window_sink_size: 4
 # 看起来正常、实则没经过校准的 1024 去训练，不会报错。-1 会在
 # SinkWindowKVCache/sink_window_train_chunk_attention 里触发 ValueError，
 # 忘了替换会在训练一启动就崩，不会静默用错误的 W 跑掉整个 CPT。
-log_kv_sink_window_window_size: -1
+log_kv_sink_window_window_size: 2048

@@ -3,8 +3,8 @@ config: base.yaml
 
 expid: qwen1.7b-32k-cpt-logKV-nonsemantic-train
 
-save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-nonsemantic-train
-merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/_fsdp_staging_nonsemantic_train
-tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-nonsemantic-train
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-nonsemantic-train
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_nonsemantic_train
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-nonsemantic-train
 
 log_kv_semantic_clusters: false
