@@ -5,7 +5,8 @@
 # 用法：
 #   bash scripts/diagnose_conda_tls.sh            # 快速检查，1-2 分钟
 #   bash scripts/diagnose_conda_tls.sh --full     # 额外跑一次 conda create --dry-run（真实下载路径）
-#   bash scripts/diagnose_conda_tls.sh --conda /home/ma-user/anaconda3/bin/conda --host mirror.example.com
+#   bash scripts/diagnose_conda_tls.sh --conda /home/ma-user/anaconda3/bin/conda --host hf-mirror.com
+#   （设置了 HF_ENDPOINT 时会自动探测它）
 #
 # 输出目录 ./conda_tls_diag_<时间戳>/：report.txt 是完整报告（贴回来即可），
 # chain_<host>.pem 是代理实际出示的证书链，candidate_ca_<host>.pem 是链顶自签根证书（若有）。
@@ -103,7 +104,7 @@ bypass_proxy() {  # $1=host；按 no_proxy 后缀匹配
 
 # ---------------------------------------------------------------- 3. CA 变量
 section "3. 证书相关环境变量"
-for v in REQUESTS_CA_BUNDLE CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR PIP_CERT PIP_INDEX_URL PIP_TRUSTED_HOST CONDARC; do
+for v in REQUESTS_CA_BUNDLE CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR PIP_CERT PIP_INDEX_URL PIP_TRUSTED_HOST CONDARC HF_ENDPOINT; do
   [ -z "${!v+x}" ] && continue
   val=${!v}; extra=""
   if [[ $v == *CA_BUNDLE || $v == SSL_CERT_FILE || $v == PIP_CERT ]]; then
@@ -229,6 +230,7 @@ done
 TARGETS=("${CONDA_URLS[@]}")
 [ ${#TARGETS[@]} -eq 0 ] && TARGETS=(https://repo.anaconda.com/pkgs/main/noarch/repodata.json https://conda.anaconda.org/conda-forge/noarch/repodata.json)
 TARGETS+=("${PIP_INDEX%/}/pip/")
+[[ ${HF_ENDPOINT:-} == https://* ]] && TARGETS+=("${HF_ENDPOINT%/}/")
 for h in "${EXTRA_HOSTS[@]}"; do TARGETS+=("https://$h/"); done
 
 declare -A DONE_HOST=()
@@ -241,12 +243,14 @@ probe() {
   [ -z "$PROXY_HOSTPORT" ] && via="直连（无代理变量）"
   echo "路由: $via"
 
-  local curl_rc="" curl_res="" sys_ok=0
+  local curl_rc="" curl_res="" sys_ok=0 curl_ok="" curl_60=""
   for c in "${CURLS[@]}"; do
     res=$(TO 40 "$c" -sS -o /dev/null --max-time 30 -w 'HTTP %{http_code}' "$url" 2>&1); rc=$?
     echo "curl[$c] exit=$rc: $(printf %s "$res" | head -2 | tr '\n' ' ' | redact)"
     [ -z "$curl_rc" ] && { curl_rc=$rc; curl_res=$res; }
+    [ $rc = 0 ] && curl_ok=$c; [ $rc = 60 ] && curl_60=$c
   done
+  [ -n "$curl_ok" ] && [ -n "$curl_60" ] && hint "$host: $curl_ok 能通、$curl_60 报证书错：两个 curl 用的 CA 库不同。能通的那个所用的 CA 库（通常是系统库）已含公司 CA，把 conda/pip/curl 都指向它即可。"
   case "$curl_rc" in
     60) hint "$host: curl exit 60 = 证书链不被 curl 的 CA 库信任。这是 curl 自己的判断，和 conda 的 ssl_verify 无关。" ;;
     35) if [[ $curl_res == *"wrong version number"* ]]; then
