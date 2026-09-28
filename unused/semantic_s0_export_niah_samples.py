@@ -55,7 +55,7 @@ if str(REPO_ROOT) not in sys.path:
 # local-cache patch below has nothing to redirect and falls through to the
 # network.
 if "HF_DATASETS_CACHE" not in os.environ and "PKU" not in os.environ:
-    _BASE = "/home/ma-user/work/bucket-wulan-green/wubohan/data/hf_cache"
+    _BASE = "/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache"
     os.environ["HF_HOME"] = _BASE
     os.environ["HF_DATASETS_CACHE"] = f"{_BASE}/hf_cache"
     os.environ["HF_EVALUATE_CACHE"] = f"{_BASE}/evaluate"

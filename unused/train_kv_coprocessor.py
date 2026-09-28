@@ -26,7 +26,7 @@ DEVICE = f"cuda:{local_rank}"
 
 PATH_0_6B = "checkpoints/Qwen/Qwen3-0.6B-Base"
 PATH_1_7B = "checkpoints/Qwen/Qwen3-1.7B-Base"
-DATA_DIR = "/home/ma-user/work/bucket-wulan-green/zhaoyusheng/fineweb-edu/sample/10BT/"
+DATA_DIR = "/home/ma-user/work/bucket-pangu-green/lihourun/fineweb-edu/sample/10BT/"
 
 SEQ_LEN = 1024       
 MAX_STEPS = 50000    

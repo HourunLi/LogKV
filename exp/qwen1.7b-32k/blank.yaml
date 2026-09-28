@@ -2,7 +2,7 @@ config: base.yaml
 
 expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-long
 
-ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
 
 global_batch_size: 128
 micro_batch_size: 1
@@ -13,15 +13,15 @@ min_lr: 5e-5
 weight_decay: 0.1
 num_devices: 8
 
-data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
+data_dir: /home/ma-user/work/bucket-pangu-green/lihourun/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
 save_interval: 10000
-save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-long
-merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/_fsdp_staging_semantic_stage1_long
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-new/qwen1.7b-32k-cpt-logKV-semantic-stage1-long
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-new/_fsdp_staging_semantic_stage1_long
 
 enable_tensorboard: true
-tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-32k-semantic-stage1-long
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-semantic-stage1-long
 
 log_kv_B: 512
 log_kv_recent_size: 1024

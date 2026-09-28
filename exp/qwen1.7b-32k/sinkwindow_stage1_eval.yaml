@@ -8,10 +8,10 @@
 #   torchrun --nproc_per_node=8 eval.py --config exp/qwen1.7b-32k/sinkwindow_stage1_eval.yaml
 #   bash eval.sh exp/qwen1.7b-32k/sinkwindow_stage1_eval.yaml niah_single_1,niah_single_2,niah_single_3 none
 
-checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1
-tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+checkpoint_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1
+tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
 benchmark: "niah_single_1,niah_single_2,niah_single_3"
-output_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1/evaluate
+output_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1/evaluate
 
 log_kv_sink_window_mode: true
 log_kv_sink_window_sink_size: 4

@@ -13,18 +13,18 @@ warmup_steps: 0
 min_lr: 5e-5
 entropy_chunk_size: 128
 
-ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
 dataset_name: "prolong"
 dataset_dir: "data"
-data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
+data_dir: /home/ma-user/work/bucket-pangu-green/lihourun/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
 save_interval: 200
-save_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/qwen1.7b-4k-cpt-logKV-semantic-stage1-k64
-merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-new/_fsdp_staging_qwen1.7b_4k_semantic_stage1_k64
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-new/qwen1.7b-4k-cpt-logKV-semantic-stage1-k64
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-new/_fsdp_staging_qwen1.7b_4k_semantic_stage1_k64
 
 enable_tensorboard: true
-tensorboard_root: /home/ma-user/work/bucket-wulan-green/lihourun/tb-4k-semantic-stage1-k64
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-4k-semantic-stage1-k64
 
 log_kv_B: 512
 log_kv_recent_size: 1024
