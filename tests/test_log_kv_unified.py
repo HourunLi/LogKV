@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing
@@ -349,7 +350,7 @@ def test_short_route_profiler_exports_trace_and_python_summary(tmp_path):
     trace = json.loads((tmp_path / 'route_trace.json').read_text())
     assert sum(e.get('name') == 'logkv/route_flush' for e in trace['traceEvents']) == 1
     names = {e.get('name') for e in trace['traceEvents']}
-    assert {'logkv/global_merge', 'logkv/pair_search'} <= names
+    assert {'logkv/global_merge', 'logkv/merge_round'} <= names
     summary = (tmp_path / 'route_summary.txt').read_text()
     assert 'aten::' in summary and 'route_and_flush_batch' in summary
     assert (tmp_path / 'route_python.prof').stat().st_size > 0
@@ -497,3 +498,59 @@ def test_deferred_op_log_matches_immediate_writes_with_uneven_lanes(device):
                 torch.testing.assert_close(got, want, atol=0, rtol=0)
         torch.testing.assert_close(actual.op_log, reference.op_log, atol=0, rtol=0)
         assert actual._op_log_host == reference._op_log_host
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('candidate_pass', [False, True])
+def test_incremental_rounds_match_full_recompute_without_ties(device, candidate_pass):
+    # Distinct random costs: Lance-Williams updates must reproduce every pair
+    # of the full-recompute rounds, in round and cost order.
+    torch.manual_seed(211)
+    cache = cache_for(device=device, K=4)
+    groups = [np.random.RandomState(i).randint(1, 4, size=n).astype(np.float32) for i, n in enumerate([70, 33, 5, 90])]
+    centers = [torch.randn(len(w), 8, device=device) * (i + 1) for i, w in enumerate(groups)]
+    kwargs = {'radius_limits': [2., 3., 1., 4.]} if candidate_pass else {'max_clusters': 4}
+    actual = cache._semantic_unified_reduce_arrays(groups, [c.clone() for c in centers], **kwargs)
+    expected = cache._semantic_unified_reduce_rounds(groups, [c.clone() for c in centers], **kwargs)
+    merged = 0
+    for (roots, traces, mu), (want_roots, want_traces, want_mu) in zip(actual, expected):
+        pairs = np.concatenate(traces) if traces else np.empty((0, 2), dtype=np.int64)
+        want = np.concatenate(want_traces) if want_traces else np.empty((0, 2), dtype=np.int64)
+        assert np.array_equal(roots, want_roots)
+        assert np.array_equal(pairs, want)
+        torch.testing.assert_close(mu, want_mu, atol=1e-5, rtol=1e-5)
+        merged += len(pairs)
+    assert merged
+
+
+def test_device_ward_entry_order_matches_two_pointer_merge():
+    rng = np.random.RandomState(7)
+    for _ in range(300):
+        metas, splits, sides = [], [], []
+        for _ in range(rng.randint(1, 4)):
+            keep, free = rng.randint(0, 6), rng.randint(0, 6)
+            keep += keep + free == 0
+            metas.append([(int(rng.randint(0, 5)), int(rng.randint(0, 8)), bool(rng.rand() < .7))
+                          for _ in range(keep + free)])
+            splits.append(keep)
+            sides += [keep, free]
+        expected, start = [], 0
+        for meta, split in zip(metas, splits):
+            expected += [start + i for i in LogStructuredKVCache._semantic_ward_entry_order(meta, split)]
+            start += len(meta)
+        flat = [m for meta in metas for m in meta]
+        sides = np.asarray(sides)
+        actual = LogStructuredKVCache._semantic_ward_entry_index(
+            torch.tensor([m[0] for m in flat]), torch.tensor([m[1] for m in flat]),
+            torch.tensor([m[2] for m in flat]), torch.from_numpy(np.repeat(np.arange(len(sides)), sides)),
+            torch.from_numpy(np.repeat(np.cumsum(sides), sides)),
+        )
+        assert actual.tolist() == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA/Triton')
+def test_fused_incremental_rounds_match_torch_reference():
+    pytest.importorskip('triton')
+    from unused.benchmark_log_kv_unified import check_incremental_reduce
+
+    check_incremental_reduce(torch.device('cuda'))

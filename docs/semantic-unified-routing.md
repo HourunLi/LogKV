@@ -22,9 +22,10 @@ Ward 使用 `n_a*n_b/(n_a+n_b) * ||mu_a-mu_b||²`，是 K 空间平方误差的�
 
 持久缓存仍为固定 K 套层级，注册 buffer 的布局和字节数与原路由相同，保持 O(log N)。
 临时距离矩阵为 O((F+K)²)，F 为固定的 flush 大小；不创建 `[F,F,head_dim]` 张量。
-CUDA 有 Triton 时每次批处理最多 16 个 batch/KV group，CPU/无 Triton 时为 4 个；
-距离矩阵、互近邻配对和中心更新一起计算，
-每轮统一回传配对。Python 簇成员关系在合并结束后统一重建，旧簇物理重建仍按原顺序执行。
+每个 tile 的 batch/KV group 数按 FP32 距离矩阵预算均衡选取（CUDA+Triton 256 MiB，
+其余 64 MiB；F=2048 时仍为 16/4 组）。自第六轮起，距离矩阵只在 tile 开始时算一次，
+之后逐轮增量更新，主机每轮只异步读回每组一个活跃标志（见第六轮）。
+Python 簇成员关系在合并结束后统一重建，旧簇物理重建仍按原顺序执行。
 生产路由的中心始终保持整块 Tensor，候选到全局合并之间不再逐 token 拆分中心并重建
 Tensor 对象；无合并的组直接复用候选和中心。逐节点中心仅由兼容接口按需物化。
 CUDA 融合核只读取一份 Gram 矩阵，在行内计算距离、Ward 代价、半径/容量筛选及 XOR
@@ -139,6 +140,78 @@ python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --i
 ```
 
 预检通过后用原配置跑一个真实训练 step，比较 route、replay 和总耗时；不需要重跑下游评测。
+
+### 第六轮：增量 Lance–Williams 轮次、异步终止与设备端旧簇排序
+
+v1.6 算子 profile（最后一次 flush，含 profiler 开销）为 252 ms，而 GPU 自身只忙
+57.8 ms：瓶颈在主机侧。`global_merge` 占 72%（182 ms），每轮都要：整块 FP32 Gram
+重算（`ampere_sgemm` 98 次、平均 268 µs）、最近邻核、`select_pairs` 的十余个小算子、
+一次 `.cpu()` 回传（114 次，约 25 ms 等待）、逐组 NumPy 循环（33 ms self）和
+`merge_pack` 映射上传。随机输入全局阶段每 tile 约 55 轮，每轮只合并约 7% 的簇，
+所以这些逐轮开销被放大。
+
+本轮在不改变配对规则的前提下改写轮次的求值方式：
+
+1. **增量距离**：每个 tile 只做一次居中 FP32 GEMM，以 `baddbmm_(beta=1)` 直接累加到
+   范数和上得到 D²（只分配一个 M×M，少四次整矩阵逐元素遍历）。合并 (a,b)→a′ 后用 Lance–Williams 恒等式
+   `D²(k,a′)=α·D²(k,a)+β·D²(k,b)−αβ·D²(a,b)`（α、β 为质量占比）更新 a′ 的行与列；
+   同轮两个都被合并的簇之间再套一次该恒等式。逐轮 O(M²·head_dim) 的 GEMM 变为
+   O(合并数·M) 的访存。
+2. **常驻行最小值**：每行保存打包键 `(cost 位模式 << 32) | (row ^ col)`，一次 int64
+   最小值即等价于原 XOR 平局规则。未合并簇之间的代价不变，因此只有“上一轮最近邻被
+   合并”的行需要整行重扫；合并后的行把新代价用 atomic min 推给其余行。随机输入早期
+   约一半行需要重扫（热点邻居），但重扫只读 D² 行，不含 head_dim 因子。
+3. **不压缩**：行号始终是输入节点号，形状整轮固定，不再逐轮回传尺寸或上传映射；
+   已合并的行以质量 0 屏蔽。
+4. **每轮 4 个 Triton 核 + 1 次 argsort**：`_select`（互为最近邻、精确半径复核、
+   被拒配对写入精确距离）、`_plan`（每组预算、质量/存活/trace 提交）、
+   `_lance_williams`（中心、行列更新、行最小值与推送）、`_scan`（脏行重扫）。
+   主机把每组活跃标志异步拷到 pinned 内存，并在下一轮排队后才读上一轮的标志：
+   GPU 不等待 Python，最多多排一个空操作轮。合并结束后一次性读回 trace 和存活行。
+5. **旧簇合并排序上设备**：两段稳定排序 + 段内前缀最大值，与原双指针归并等价
+   （双指针归并等于按两侧前缀最大值的稳定归并），去掉每一步的 `.cpu().tolist()` 同步和
+   Python 排序；3000 组随机用例（含平局、无质量 pad、非单调键）与原顺序逐项一致。
+6. **批量写入与 op-log**：无分段（`seg_gap=None`）时整块 NumPy 构建暂存行；op-log 直接以
+   NumPy 行记录与上传，不再逐 token 构造 tuple 再转回数组（训练每次 flush 约 B·G·F 行）。
+   span→索引改为一次 `repeat/arange`。
+
+语义与精度：
+
+- 配对规则不变：XOR 平局、互为最近邻、不重叠、精确半径复核、每组 `count−K` 预算按代价
+  取前缀、旧簇合并顺序按轮次和代价。容量硬上限（默认关闭）需要两套行最小值，仍走原
+  全量重算实现 `_semantic_unified_reduce_rounds`。
+- 牺牲的精度：LW 递推代替逐轮重算 Gram，舍入顺序不同，float32 近似平局时可能选到
+  不同配对。与 float64 全量重算对照（8 个紧簇种子），新旧实现首次偏离 float64 的轮次
+  完全相同，说明差异来自 float32 本身的近平局；随机输入下与原实现逐轮逐对一致。
+  完全相同或整数坐标的精确平局下，索引不再压缩，XOR 规则可能选出另一组同样合法的配对。
+- 候选阶段被精确复核拒绝的配对，会把这对的 D² 改写为精确值并重扫两行，之后这两行
+  可以与其它簇配对；原实现会因同一 GEMM 误差反复提议并冻结它们。紧致度约束不变。
+- 持久 KV buffer 布局和字节数不变；临时 D² 仍为 `[tile, F+K, F+K]` FP32，另有
+  O(tile·F) 的状态数组。`_SEMANTIC_ROUTE_TILE_BYTES` 调大可减少 tile 数和总轮数
+  （以显存换速度）。
+
+本地验证（CPU；未在 GPU 上测速）：
+
+- `tests/test_log_kv_unified.py` 34 项通过（CUDA 项跳过），新增增量轮次与全量重算
+  逐对一致、设备端旧簇排序、融合核对照三项。
+- Triton 核在解释器模式下与 Torch 参照逐位一致：trace、存活行、中心，覆盖随机、紧簇、
+  整数平局、全相同、半径约束、GEMM 抵消导致的拒绝和非 2 的幂维度。
+- 与修改前代码（git HEAD）同输入连续 6 次 flush（2×3 组、K=5、分段开/关、op-log 开、
+  非单调位置）：全部 buffer、宿主镜像和 op-log 逐位一致。
+
+A800 上需要复测。第一行应额外出现 `reference_incremental_verified: true`（融合核与
+Torch 参照对照）：
+
+```bash
+python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --iters 2 > route_v6.jsonl
+python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --iters 1 \
+  --profile-dir route_operator_profile_v6 > route_operator_profile_v6.jsonl
+```
+
+profile 标签：`logkv/candidates`、`logkv/global_merge`、`logkv/merge_round`（每轮）、
+`logkv/pair_matrix`（每 tile 一次的 GEMM）、`old_kv_merge`、`new_cluster_write`、
+`batched_write`；`pair_search`/`merge_pack` 只在容量硬上限回退路径出现。诊断模式的
+`merge_rounds` 记录每轮各组实际合并的配对数。
 
 ## 第一轮评测
 
