@@ -1,5 +1,7 @@
 """Whole-flush candidate construction, budget reduction, and training replay."""
 
+import math
+
 from contextlib import nullcontext
 from copy import deepcopy
 from unittest.mock import patch
@@ -382,3 +384,116 @@ def test_production_unified_route_does_not_unbind_token_centers(device):
             cache.route_and_flush_batch(k, k, torch.arange(start, start + 65, device=device),
                                         positions_host=[list(range(start, start + 65))] * 2)
     torch.testing.assert_close(cache.level_w.sum((2, 3, 4)), torch.full((2, 2), 130., device=device))
+
+
+# Keep the former node/serial-write path as an independent state oracle.
+def _node_route_reference(
+    self, k_raw: torch.Tensor, v: torch.Tensor, positions: torch.Tensor,
+    positions_host: list[list[int]], *, record: bool,
+) -> None:
+    jobs: list[tuple[int, int, int, tuple[int, ...]]] = []
+    lanes = [(b, g) for b in range(k_raw.size(0)) for g in range(k_raw.size(1))]
+    # Fused CUDA search needs one pair matrix, versus several for Torch.
+    # ponytail: 16 groups bound CUDA scratch; tile rows if larger flushes need less memory.
+    tile_size = 16 if k_raw.is_cuda else 4
+    for start in range(0, len(lanes), tile_size):
+        tile = lanes[start:start + tile_size]
+        centers = [k_raw[b, g].detach().float() for b, g in tile]
+        groups = [[_SemanticTreeCluster(None, 1, positions_host[b][i], (), (i,))
+                   for i in range(k_raw.size(2))] for b, g in tile]
+        candidates = self._semantic_unified_reduce_packed(
+            groups, centers, radius_limits=[math.sqrt(self._semantic_tree_threshold(b, g)) for b, g in tile]
+        )
+        existing = [self._semantic_tree_existing_set(b, g) for b, g in tile]
+        centers = [torch.cat((torch.stack([n.centroid for n in old]), candidate[2])) if old else candidate[2]
+                   for old, candidate in zip(existing, candidates)]
+        plans = self._semantic_unified_reduce_packed(
+            [old + candidate[0] for old, candidate in zip(existing, candidates)], centers,
+            max_clusters=self.K_max,
+        )
+        for (b, g), (nodes, old_merges, _) in zip(tile, plans):
+            for keep, free in old_merges:
+                self._semantic_ward_merge(b, g, keep, free, record=record)
+            free_slots = iter(self._semantic_free_clusters(b, g))
+            for node in nodes:
+                offsets = tuple(sorted(node.tokens, key=lambda i: positions_host[b][i]))
+                if not offsets:
+                    continue
+                if node.existing:
+                    target = min(node.existing)
+                else:
+                    target = next(free_slots)
+                    first, *rest = offsets
+                    self._semantic_new_cluster(
+                        b, g, target, positions_host[b][first], k_raw[b, g, first], v[b, g, first],
+                        positions[b, first], record=record,
+                    )
+                    offsets = tuple(rest)
+                if offsets:
+                    jobs.append((b, g, target, offsets))
+    self._semantic_commit_joins(sorted(jobs), k_raw, v, positions, positions_host, record=record)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('pattern', ['random', 'identical', 'clustered'])
+@pytest.mark.parametrize('seg_gap', [None, 3])
+def test_array_route_and_batched_writes_match_node_reference(device, pattern, seg_gap):
+    from types import MethodType
+    torch.manual_seed(167)
+    cache = cache_for(batch_size=2, groups=2, B=8, device=device, seg_gap_max=seg_gap,
+                      seg_block_level=2, seg_forget=1.)
+    reference = deepcopy(cache)
+    reference._semantic_route_unified = MethodType(_node_route_reference, reference)
+    for c in (cache, reference):
+        c.begin_op_log()
+    for step in range(3):
+        # More than 32 rows exercises GEMM, unequal rounds and old-old merges.
+        k = torch.randn(2, 2, 65, 8, device=device)
+        if pattern == 'identical':
+            k.fill_(.1)
+        elif pattern == 'clustered':
+            k = (torch.arange(65, device=device) // 16)[None, None, :, None] + .001 * k
+        v = torch.randn_like(k)
+        pos = (torch.arange(step * 65, (step + 1) * 65, device=device) * 7).expand(2, -1)
+        host = pos.cpu().tolist()
+        for c in (cache, reference):
+            c.route_and_flush_batch(k, v, pos, positions_host=host, record_op_log=True)
+        assert_snapshot(cache, snapshot(reference))
+        assert cache._op_log_host == reference._op_log_host
+        torch.testing.assert_close(cache.op_log, reference.op_log, atol=0, rtol=0)
+        torch.testing.assert_close(cache.op_log_len, reference.op_log_len, atol=0, rtol=0)
+        assert not cache._pending_op_starts
+
+
+def test_production_route_does_not_construct_token_nodes():
+    cache = cache_for(batch_size=2, groups=2)
+    k = torch.randn(2, 2, 65, 8)
+    with patch('litgpt.log_kv_cache._SemanticTreeCluster', side_effect=AssertionError('token node allocated')):
+        for step in range(2):
+            cache.route_and_flush_batch(k, k, torch.arange(step * 65, (step + 1) * 65))
+    assert cache.level_w.sum().item() == 2 * 2 * 65 * 2
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_benchmark_verifies_batched_state_before_timing(device):
+    from unused.benchmark_log_kv_unified import check_batched_state
+    check_batched_state(torch.device(device))
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_deferred_op_log_matches_immediate_writes_with_uneven_lanes(device):
+    actual = cache_for(device=device, batch_size=2, groups=2)
+    reference = deepcopy(actual)
+    for cache in (actual, reference):
+        cache.begin_op_log()
+    for step in range(2):
+        with actual._semantic_deferred_scalars():
+            for b, g, count in [(0, 1, 3), (1, 0, 1), (0, 1, 2), (1, 1, 4)]:
+                rows = [(2, 0, 0, step * 20 + i) for i in range(count)]
+                actual._record_ops(b, g, rows)
+                reference._record_ops(b, g, rows)
+            # Taking a log is also a visibility boundary inside a deferred block.
+            for got, want in zip(actual.take_op_log(), reference.take_op_log()):
+                torch.testing.assert_close(got, want, atol=0, rtol=0)
+        torch.testing.assert_close(actual.op_log, reference.op_log, atol=0, rtol=0)
+        assert actual._op_log_host == reference._op_log_host

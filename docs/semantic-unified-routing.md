@@ -109,6 +109,37 @@ CPU 上随机、全相同、聚簇三种输入连续三次 flush，与修改前�
 flush 与第三轮全部缓存 buffer、宿主状态逐位一致。新 profiler 范围 `logkv/merge_pack`
 用于区分更新压紧与配对计算，继续用同一短基准验证，不需要重跑完整训练。
 
+### 第五轮：数组归属和跨组批量写入
+
+第四轮 A800 已测到 0.61708s/flush；同配置真实训练为 route 363.07s/420、
+449s/step。150s/step 是下一目标，尚未达到或验证。
+
+本轮生产路由直接处理权重、根编号和合并边数组，不再为每个新 token 和中间簇构建
+`_SemanticTreeCluster`。候选归属通过并行指针跳转还原；旧簇之间的合并顺序仍按
+原始轮次和代价顺序提取。节点接口保留给诊断和参考检查。
+
+各 batch/group 的旧 KV 合并按依赖轮次批量执行：一轮每组最多一对，同组顺序不变，
+跨组共用排序元数据回传、gather、清空和 ladder append。新簇的首 token 同样批量
+初始化；后续写入和回放按片段生成数组索引，不再遍历所有 token 构建 Python 列表。
+整个 unified flush 延迟写回标量镜像和训练 op-log，末尾集中上传。推理持久 KV
+预算、候选紧致度判据、互为最近邻规则及 K=12 均未调整；每个配对轮次仍需一次主机回传。
+
+本地 CPU 同输入检查：随机、相同、聚簇三类输入，分段开/关，连续三次 flush 的
+缓存及宿主状态与修改前逐位一致；补充旧节点路由对照、op-log、更新回放和梯度检查。
+CPU 大样本的 Python 调用数从约 116 万降到 24 万，但总时长仅从 16.26s 降到
+15.76s，CPU 距离计算占主导，不能用这个总时长推算 A800 加速比。CUDA 性能和
+150s/step 目标需要在训练环境复测。
+
+短基准现增加批量写入与逐组写入的状态预检，失败直接报错；首行应额外出现
+`reference_state_verified: true`。用新目录避免与第四轮 profile 混淆：
+
+```bash
+python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --iters 1 \
+  --profile-dir route_operator_profile_v5 > route_operator_profile_v5.jsonl
+```
+
+预检通过后用原配置跑一个真实训练 step，比较 route、replay 和总耗时；不需要重跑下游评测。
+
 ## 第一轮评测
 
 使用已完成训练的同一个具体 `step_*` checkpoint。新配置
