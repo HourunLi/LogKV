@@ -696,7 +696,7 @@ def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
 
 
 class LogKVLM(LM):
-    """LM wrapper that scores and generates through LogKV or dense KV cache.
+    """LM wrapper that scores and generates through LogKV, SWA, or dense KV cache.
 
     By default, loglikelihood scoring and generate_until use the merged-position
     slot cache from the LogKV training path: full post-RoPE keys are stored as
@@ -716,6 +716,7 @@ class LogKVLM(LM):
         log_kv_prefill_block: int = 256,
         log_kv_second_order_scale: float = 1.0,
         log_kv_dense_mode: bool = False,
+        swa_window_size: int | None = None,
         log_kv_importance_pooling: bool = False,
         log_kv_importance_pooling_lambda: float = 1.0,
         log_kv_importance_pooling_temperature: float = 1.0,
@@ -733,10 +734,10 @@ class LogKVLM(LM):
         log_kv_semantic_capacity_beta: float = 0.0,
         log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
         log_kv_semantic_legacy_route: bool = False,
+        log_kv_semantic_unified_route: bool = False,
         log_kv_semantic_anchor_mode: str = "multi",
         log_kv_semantic_pack_backend: str = "auto",
         log_kv_semantic_centroid_backend: str = "sequential",
-        log_kv_semantic_summary_size: int = 1,
         log_kv_semantic_replay_updates: bool = False,
         tokenizer_dir: str | None = None,
     ):
@@ -748,6 +749,13 @@ class LogKVLM(LM):
         self.log_kv_prefill_block = log_kv_prefill_block
         self.log_kv_second_order_scale = float(log_kv_second_order_scale)
         self.log_kv_dense_mode = bool(log_kv_dense_mode)
+        if swa_window_size is not None and (swa_window_size < 0 or log_kv_dense_mode):
+            raise ValueError("swa_window_size must be >= 0 and cannot be combined with dense mode")
+        self.swa_window_size = swa_window_size
+        self.cache_budget = {}
+        if swa_window_size:
+            config_overrides = {**(config_overrides or {}), "sliding_window_size": swa_window_size,
+                                "sliding_window_indices": None}
         self.log_kv_importance_pooling = bool(log_kv_importance_pooling)
         self.log_kv_importance_pooling_lambda = float(log_kv_importance_pooling_lambda)
         self.log_kv_importance_pooling_temperature = float(log_kv_importance_pooling_temperature)
@@ -765,10 +773,10 @@ class LogKVLM(LM):
         self.log_kv_semantic_capacity_beta = float(log_kv_semantic_capacity_beta)
         self.log_kv_semantic_capacity_hard_cap_mult = float(log_kv_semantic_capacity_hard_cap_mult)
         self.log_kv_semantic_legacy_route = bool(log_kv_semantic_legacy_route)
+        self.log_kv_semantic_unified_route = bool(log_kv_semantic_unified_route)
         self.log_kv_semantic_anchor_mode = log_kv_semantic_anchor_mode
         self.log_kv_semantic_pack_backend = log_kv_semantic_pack_backend
         self.log_kv_semantic_centroid_backend = log_kv_semantic_centroid_backend
-        self.log_kv_semantic_summary_size = log_kv_semantic_summary_size
         self.log_kv_semantic_replay_updates = log_kv_semantic_replay_updates
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
@@ -806,7 +814,9 @@ class LogKVLM(LM):
             else None
         )
 
-        mode_name = "dense 标准 KV 注意力" if self.log_kv_dense_mode else "logKV 压缩注意力"
+        mode_name = "全程 SWA" if swa_window_size is not None else (
+            "dense 标准 KV 注意力" if self.log_kv_dense_mode else "logKV 压缩注意力"
+        )
         if is_master: print(f"🔧 正在初始化 Transformer ({mode_name})...")
         self.model = GPT(self.config).to(device).bfloat16()
 
@@ -854,7 +864,7 @@ class LogKVLM(LM):
             return
         dtype = next(self.model.parameters()).dtype
         max_seq_length = self.model.max_seq_length
-        if self.log_kv_dense_mode:
+        if self.log_kv_dense_mode or self.swa_window_size:
             self.model.set_kv_cache(
                 batch_size=1,
                 max_seq_length=max_seq_length,
@@ -862,6 +872,7 @@ class LogKVLM(LM):
                 dtype=dtype,
             )
             self._eval_cache_ready = True
+            self._report_cache_budget()
             return
         self.model.set_log_kv_cache(
             batch_size=1,
@@ -889,16 +900,52 @@ class LogKVLM(LM):
             semantic_capacity_beta=self.log_kv_semantic_capacity_beta,
             semantic_capacity_hard_cap_mult=self.log_kv_semantic_capacity_hard_cap_mult,
             semantic_legacy_route=self.log_kv_semantic_legacy_route,
+            semantic_unified_route=self.log_kv_semantic_unified_route,
             semantic_anchor_mode=self.log_kv_semantic_anchor_mode,
             semantic_pack_backend=self.log_kv_semantic_pack_backend,
             semantic_centroid_backend=self.log_kv_semantic_centroid_backend,
-            semantic_summary_size=self.log_kv_semantic_summary_size,
             semantic_replay_updates=self.log_kv_semantic_replay_updates,
         )
+        if self.swa_window_size == 0:
+            # Match allocated persistent cache buffers, including metadata and
+            # spare ladder/recent capacity. RoPE tables are common model state.
+            reference_bytes = self._cache_storage_bytes()
+            first = self.model.transformer.h[0].attn.kv_cache
+            bytes_per_position = self.config.n_layer * (
+                self.config.n_query_groups * (first.slot_k_dim + self.config.head_size)
+                * torch.empty((), dtype=dtype).element_size() + 8
+            )
+            self.swa_window_size = min(max_seq_length, reference_bytes // bytes_per_position)
+            if self.swa_window_size < 1:
+                raise ValueError("LogKV budget cannot fit one SWA position")
+            self.cache_budget["reference_logkv_bytes"] = reference_bytes
+            self.model.clear_kv_cache()
+            self.config.sliding_window_size = self.swa_window_size
+            self.config.sliding_window_indices = [1] * self.config.n_layer
+            for block in self.model.transformer.h:
+                block.attn.apply_sliding_window_attention = True
+            self.model.set_kv_cache(batch_size=1, max_seq_length=max_seq_length, device=self._device, dtype=dtype)
         self._eval_cache_ready = True
+        self._report_cache_budget()
+
+    def _cache_storage_bytes(self) -> int:
+        seen = {}
+        for block in self.model.transformer.h:
+            for name, tensor in block.attn.kv_cache.named_buffers():
+                if name in ("cos_cache", "sin_cache"):
+                    continue
+                storage = tensor.untyped_storage()
+                seen[storage.data_ptr()] = storage.nbytes()
+        return sum(seen.values())
+
+    def _report_cache_budget(self) -> None:
+        self.cache_budget.update(persistent_cache_bytes=self._cache_storage_bytes(),
+                                 swa_window_size=self.swa_window_size)
+        if _is_main():
+            print(f"🧮 persistent cache budget (excluding shared RoPE / transient workspace): {self.cache_budget}")
 
     def _reset_eval_cache(self) -> None:
-        if self.log_kv_dense_mode:
+        if self.log_kv_dense_mode or self.swa_window_size is not None:
             self.model.reset_kv_cache()
         else:
             self.model.reset_log_kv_cache()
@@ -1209,6 +1256,8 @@ def main(
     # true = 使用原生 O(N) 标准 KVCache 跑普通 causal dense attention；
     # false = 默认 LogKV 压缩注意力路径。dense 模式只用于手动基线对比。
     log_kv_dense_mode: bool = False,
+    # None = LogKV; 0 = SWA matched to LogKV's allocated cache bytes; >0 = explicit window.
+    swa_window_size: int | None = None,
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
     # prefill 分块大小：块内 query 共享块首冻结的 slot 状态。2 = 严格 2-token
@@ -1249,10 +1298,10 @@ def main(
     log_kv_semantic_capacity_beta: float = 0.0,
     log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
     log_kv_semantic_legacy_route: bool = False,
+    log_kv_semantic_unified_route: bool = False,
     log_kv_semantic_anchor_mode: str = "multi",
     log_kv_semantic_pack_backend: str = "auto",
     log_kv_semantic_centroid_backend: str = "sequential",
-    log_kv_semantic_summary_size: int = 1,
     log_kv_semantic_replay_updates: bool = False,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
@@ -1304,6 +1353,11 @@ def main(
                 "eval_log_kv_* YAML keys are no longer supported; use log_kv_* for the single eval LogKV config. "
                 f"Remove: {', '.join(_banned)}"
             )
+        if "log_kv_semantic_summary_size" in _yaml:
+            raise ValueError(
+                "log_kv_semantic_summary_size has been removed; delete this key. "
+                "KV entries now remain per-token before ladder compaction."
+            )
         _valid = set(inspect.signature(main).parameters)
         for _k in _yaml:
             if _k != "config" and _k not in _valid:
@@ -1319,6 +1373,7 @@ def main(
     output_path = _o("output_path", output_path)
     metadata = _o("metadata", metadata)
     log_kv_dense_mode = bool(_o("log_kv_dense_mode", log_kv_dense_mode))
+    swa_window_size = _o("swa_window_size", swa_window_size)
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
@@ -1334,7 +1389,6 @@ def main(
     log_kv_semantic_anchor_mode = _o("log_kv_semantic_anchor_mode", log_kv_semantic_anchor_mode)
     log_kv_semantic_pack_backend = _o("log_kv_semantic_pack_backend", log_kv_semantic_pack_backend)
     log_kv_semantic_centroid_backend = _o("log_kv_semantic_centroid_backend", log_kv_semantic_centroid_backend)
-    log_kv_semantic_summary_size = int(_o("log_kv_semantic_summary_size", log_kv_semantic_summary_size))
     log_kv_semantic_replay_updates = bool(_o("log_kv_semantic_replay_updates", log_kv_semantic_replay_updates))
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
@@ -1359,6 +1413,9 @@ def main(
     )
     log_kv_semantic_legacy_route = bool(
         _o("log_kv_semantic_legacy_route", log_kv_semantic_legacy_route)
+    )
+    log_kv_semantic_unified_route = bool(
+        _o("log_kv_semantic_unified_route", log_kv_semantic_unified_route)
     )
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
     limit = _o("limit", limit)
@@ -1397,17 +1454,19 @@ def main(
     device = f"cuda:{local_rank}"
 
     diag_active = log_kv_diag_mode not in (None, "off")
-    if log_kv_dense_mode:
+    if log_kv_dense_mode or swa_window_size is not None:
         if diag_active:
             raise ValueError(
-                "log_kv_dense_mode=True is incompatible with log_kv_diag_mode: "
+                "dense/SWA mode is incompatible with log_kv_diag_mode: "
                 "LogKV diagnostics require LogStructuredKVCache slots."
             )
 
     # 多节点时用全局 rank==0（每个节点都有一个 local_rank 0，用它会重复打印）
     if _is_main():
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
-        if log_kv_dense_mode:
+        if swa_window_size is not None:
+            print(f"🧩 SWA during prefill and decode | window: {swa_window_size} (0 = match LogKV bytes)")
+        elif log_kv_dense_mode:
             print(
                 "🧩 dense 标准 KV 注意力 | 使用 GPT.set_kv_cache() 原生 causal attention；"
                 "忽略 log_kv_B/recent_size/prefill_block/second_order_scale 等 LogKV 参数"
@@ -1428,8 +1487,9 @@ def main(
                 f"capacity_beta={log_kv_semantic_capacity_beta}, "
                 f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
                 f"legacy_route={log_kv_semantic_legacy_route}, "
+                f"unified_route={log_kv_semantic_unified_route}, "
                 f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
-                f"centroid={log_kv_semantic_centroid_backend}, summary={log_kv_semantic_summary_size}, "
+                f"centroid={log_kv_semantic_centroid_backend}, "
                 f"replay_updates={log_kv_semantic_replay_updates})"
             )
         if diag_active:
@@ -1458,6 +1518,7 @@ def main(
             log_kv_prefill_block=log_kv_prefill_block,
             log_kv_second_order_scale=log_kv_second_order_scale,
             log_kv_dense_mode=log_kv_dense_mode,
+            swa_window_size=swa_window_size,
             log_kv_importance_pooling=log_kv_importance_pooling,
             log_kv_importance_pooling_lambda=log_kv_importance_pooling_lambda,
             log_kv_importance_pooling_temperature=log_kv_importance_pooling_temperature,
@@ -1475,10 +1536,10 @@ def main(
             log_kv_semantic_capacity_beta=log_kv_semantic_capacity_beta,
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
             log_kv_semantic_legacy_route=log_kv_semantic_legacy_route,
+            log_kv_semantic_unified_route=log_kv_semantic_unified_route,
             log_kv_semantic_anchor_mode=log_kv_semantic_anchor_mode,
             log_kv_semantic_pack_backend=log_kv_semantic_pack_backend,
             log_kv_semantic_centroid_backend=log_kv_semantic_centroid_backend,
-            log_kv_semantic_summary_size=log_kv_semantic_summary_size,
             log_kv_semantic_replay_updates=log_kv_semantic_replay_updates,
             tokenizer_dir=tokenizer_dir,
         )
@@ -1502,6 +1563,7 @@ def main(
                 batch_size=1,
                 metadata=metadata,
                 limit=limit,
+                log_samples=True,
             )
         eval_done = True
 
@@ -1567,6 +1629,13 @@ def main(
                     "benchmark": benchmark,
                     "checkpoint_dir": checkpoint_dir,
                     "log_kv_dense_mode": log_kv_dense_mode,
+                    "swa_window_size": lm_model.swa_window_size,
+                    "cache_budget": lm_model.cache_budget,
+                    "log_kv_B": log_kv_B,
+                    "log_kv_recent_size": log_kv_recent_size,
+                    "log_kv_prefill_block": log_kv_prefill_block,
+                    "log_kv_second_order_scale": log_kv_second_order_scale,
+                    "metadata": metadata,
                     "log_kv_importance_pooling": log_kv_importance_pooling,
                     "log_kv_importance_pooling_lambda": log_kv_importance_pooling_lambda,
                     "log_kv_importance_pooling_temperature": log_kv_importance_pooling_temperature,
@@ -1584,10 +1653,10 @@ def main(
                     "log_kv_semantic_capacity_beta": log_kv_semantic_capacity_beta,
                     "log_kv_semantic_capacity_hard_cap_mult": log_kv_semantic_capacity_hard_cap_mult,
                     "log_kv_semantic_legacy_route": log_kv_semantic_legacy_route,
+                    "log_kv_semantic_unified_route": log_kv_semantic_unified_route,
                     "log_kv_semantic_anchor_mode": log_kv_semantic_anchor_mode,
                     "log_kv_semantic_pack_backend": log_kv_semantic_pack_backend,
                     "log_kv_semantic_centroid_backend": log_kv_semantic_centroid_backend,
-                    "log_kv_semantic_summary_size": log_kv_semantic_summary_size,
                     "log_kv_semantic_replay_updates": log_kv_semantic_replay_updates,
                     "results": results,
                 }

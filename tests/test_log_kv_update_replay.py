@@ -1,4 +1,4 @@
-"""Summary mass/position invariants and graph-owned update replay."""
+"""Per-token writes, parallel centroid updates, and graph-owned update replay."""
 from copy import deepcopy
 from contextlib import nullcontext
 import gc
@@ -17,11 +17,11 @@ from litgpt.log_kv_checkpoint import enable_logkv_checkpoint_replay
 DEVICES = ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA'))]
 
 
-def cache_for(device='cpu', summary=8, **kwargs):
+def cache_for(device='cpu', **kwargs):
     shape = (2, 2, 256, 8)
     return LogStructuredKVCache(
         shape, shape, B=3, recent_size=16, semantic_flush_granularity=16,
-        semantic_clusters=True, cluster_k_max=8, semantic_summary_size=summary,
+        semantic_clusters=True, cluster_k_max=8,
         semantic_centroid_backend='parallel', semantic_anchor_mode='mid',
         allocate_second_order=False, device=device,
         cos_cache=torch.ones(256, 8, device=device), sin_cache=torch.zeros(256, 8, device=device),
@@ -38,36 +38,10 @@ def assert_state(cache, expected):
 
 
 @pytest.mark.parametrize('device', DEVICES)
-def test_summary_preserves_mass_moments_and_lane_boundaries(device):
-    cache = cache_for(device)
-    counts = [19, 1, 5]
-    k = torch.arange(25 * 8, device=device, dtype=torch.float32).reshape(25, 8)
-    v = k * 2
-    p = torch.arange(25, device=device, dtype=torch.int64) * 11 + 2**34
-    block = (k, v, torch.ones(25, device=device), *(None,) * 5,
-             p, p, p, torch.arange(25, device=device), torch.zeros(25, device=device, dtype=torch.bool))
-    actual, compressed = cache._semantic_summarize_block(block, counts)
-    assert compressed == [3, 1, 1]
-    offset, row = 0, 0
-    for count in counts:
-        for start in range(offset, offset + count, 8):
-            end = min(start + 8, offset + count)
-            torch.testing.assert_close(actual[0][row], k[start:end].mean(0), atol=0, rtol=0)
-            torch.testing.assert_close(actual[1][row], v[start:end].mean(0), atol=0, rtol=0)
-            assert actual[2][row] == end - start
-            assert actual[8][row] == p[start] and actual[9][row] == p[end - 1]
-            assert actual[10][row] == p[start:end].sum()
-            row += 1
-        offset += count
-    torch.testing.assert_close((actual[0] * actual[2][:, None]).sum(0), k.sum(0))
-
-
-@pytest.mark.parametrize('device', DEVICES)
-@pytest.mark.parametrize('summary', [1, 8])
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
-def test_update_replay_skips_gather_centroid_and_parsing_and_restores_all_state(device, summary, dtype):
+def test_update_replay_skips_gather_centroid_and_parsing_and_restores_all_state(device, dtype):
     torch.manual_seed(11)
-    cache = cache_for(device, summary, semantic_replay_updates=True, dtype=dtype)
+    cache = cache_for(device, semantic_replay_updates=True, dtype=dtype)
     tape = _SemanticReplayUpdates()
     cache.begin_op_log()
     inputs, expected = [], []
@@ -98,7 +72,7 @@ def test_update_replay_skips_gather_centroid_and_parsing_and_restores_all_state(
 
 
 @pytest.mark.parametrize('device', DEVICES)
-def test_summary_oplog_replay_without_saved_updates_is_exact(device):
+def test_oplog_replay_without_saved_updates_is_exact(device):
     torch.manual_seed(21)
     cache = cache_for(device)
     inputs = [(torch.randn(2, 2, 16, 8, device=device), torch.randn(2, 2, 16, 8, device=device))
@@ -120,7 +94,7 @@ def test_summary_oplog_replay_without_saved_updates_is_exact(device):
 
 
 @pytest.mark.parametrize('device', DEVICES)
-def test_checkpoint_summary_updates_match_reference_gradients_and_release(device):
+def test_checkpoint_saved_updates_match_reference_gradients_and_release(device):
     torch.manual_seed(14)
     config = Config(block_size=64, n_layer=2, n_embd=32, n_head=4, n_query_groups=2,
                     vocab_size=41, padding_multiple=1, rotary_percentage=1.)
@@ -131,7 +105,7 @@ def test_checkpoint_summary_updates_match_reference_gradients_and_release(device
             batch_size=1, B=3, recent_size=8, train_block=8, second_order_scale=0.,
             semantic_clusters=True, cluster_k_max=8, semantic_flush_granularity=8,
             semantic_anchor_mode='mid', semantic_pack_backend='torch', allocate_second_order=False,
-            semantic_summary_size=8, semantic_replay_updates=bool(i), semantic_centroid_backend='parallel',
+            semantic_replay_updates=bool(i), semantic_centroid_backend='parallel',
             device=torch.device(device))
         apply_activation_checkpointing(model, check_fn=lambda m: isinstance(m, Block))
         enable_logkv_checkpoint_replay(model, Block)
@@ -163,13 +137,6 @@ def test_checkpoint_summary_updates_match_reference_gradients_and_release(device
         torch.testing.assert_close(a, b, atol=2e-6, rtol=2e-5)
     gc.collect()
     assert refs and all(ref() is None for ref in refs)
-
-
-@pytest.mark.parametrize('kwargs', [dict(semantic_legacy_route=True), dict(semantic_cluster_chunk_size=4),
-                                     dict(seg_gap_max=1)])
-def test_unsupported_summary_combinations_fail_explicitly(kwargs):
-    with pytest.raises(ValueError):
-        cache_for(**kwargs)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA/Triton')
@@ -205,7 +172,7 @@ def test_parallel_centroid_uneven_long_runs_match_fp64_reference(dtype):
 
 
 @pytest.mark.parametrize('device', DEVICES)
-def test_summary_inference_flush_partition_and_causality(device):
+def test_inference_flush_partition_and_causality(device):
     from litgpt.log_kv_cache import LogKVStreamTrainingAttention
     torch.manual_seed(98)
     caches = [cache_for(device, semantic_replay_updates=True) for _ in range(2)]
@@ -226,12 +193,6 @@ def test_summary_inference_flush_partition_and_causality(device):
     changed_v[:, :, 25:] *= -7
     changed = LogKVStreamTrainingAttention.apply(q, changed_k, changed_v, caches[0], .3, 16, 0., changed_k)
     torch.testing.assert_close(original[:, :, :25], changed[:, :, :25], atol=1e-6, rtol=1e-5)
-
-
-def test_summary_rejects_second_order_before_updates():
-    cache = cache_for()
-    with pytest.raises(ValueError, match='second_order_scale=0'):
-        cache.second_order = True
 
 
 def test_saved_updates_replay_from_prefilled_cache_without_reset():
@@ -293,9 +254,9 @@ def test_update_tape_cross_stream_wait_before_reset_and_replay():
     assert_state(cache, expected)
 
 
-def test_update_replay_retains_segment_pads_when_summaries_disabled():
+def test_update_replay_retains_segment_pads():
     torch.manual_seed(85)
-    cache = cache_for(summary=1, semantic_replay_updates=True, seg_gap_max=1, seg_block_level=2)
+    cache = cache_for(semantic_replay_updates=True, seg_gap_max=1, seg_block_level=2)
     k, v = torch.randn(2, 2, 64, 8), torch.randn(2, 2, 64, 8)
     tape = _SemanticReplayUpdates()
     cache.begin_op_log()

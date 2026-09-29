@@ -1,8 +1,8 @@
-"""Compare centroid, summary, and saved-update changes at the same token count.
+"""Compare centroid and saved-update changes at the same token count.
 
-python unused/benchmark_log_kv_summary_updates.py --iters 10
-Each variant validates route/replay against its own forward (summaries change
-approximation). Compilation, cache reset, and validation are outside timing.
+python unused/benchmark_log_kv_replay_updates.py --iters 10
+Each variant validates route/replay against its own forward.
+Compilation, cache reset, and validation are outside timing.
 """
 import argparse
 from copy import deepcopy
@@ -22,7 +22,7 @@ from benchmark_log_kv_updates import assert_buffers
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name, default in [('sequence', 32768), ('chunk', 2048), ('batch', 1), ('groups', 8),
-                          ('dim', 128), ('iters', 10), ('summary_size', 8)]:
+                          ('dim', 128), ('iters', 10)]:
         parser.add_argument('--' + name.replace('_', '-'), type=int, default=default)
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args()
@@ -51,14 +51,13 @@ def main():
 
     print(json.dumps({**vars(args), 'torch': torch.__version__, 'cuda': torch.version.cuda,
                       'device': torch.cuda.get_device_name(device) if device.type == 'cuda' else str(device)}), flush=True)
-    for label, centroid, summary, reuse in [('sequential', 'sequential', 1, False),
-                                           ('parallel', 'parallel', 1, False),
-                                           ('summary', 'parallel', args.summary_size, False),
-                                           ('saved_summary', 'parallel', args.summary_size, True)]:
+    for label, centroid, reuse in [('sequential', 'sequential', False),
+                                   ('parallel', 'parallel', False),
+                                   ('saved_updates', 'parallel', True)]:
         base = LogStructuredKVCache(
             (b, g, n, d), (b, g, n, d), B=64, recent_size=t, device=device, dtype=dtype,
             semantic_clusters=True, cluster_k_max=8, semantic_anchor_mode='mid', allocate_second_order=False,
-            semantic_centroid_backend=centroid, semantic_summary_size=summary, semantic_replay_updates=reuse,
+            semantic_centroid_backend=centroid, semantic_replay_updates=reuse,
             cos_cache=torch.ones(n, d, device=device), sin_cache=torch.zeros(n, d, device=device), rope_n_elem=d)
         with torch.no_grad():
             for k, v, pos, host in inputs[:-1]:

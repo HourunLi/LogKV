@@ -9,18 +9,18 @@ import pytest
 
 
 @pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
+@pytest.mark.parametrize("route", ["legacy_route", "unified_route"])
 @pytest.mark.parametrize("anchor_mode,pack_backend", [("mid", "triton"), ("multi", "torch")])
 @pytest.mark.parametrize("setting, expected", [("true", "true"), ("false", "false"), ("null", "false"), (None, "false")])
-def test_legacy_route_reaches_eval_arguments(tmp_path, script, setting, expected, anchor_mode, pack_backend):
+def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting, expected, anchor_mode, pack_backend):
     parent = tmp_path / "base.yaml"
     parent.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\n"
                       "log_kv_cluster_k_max: 8\nlog_kv_B: 64\n"
                       f"log_kv_semantic_centroid_backend: {'parallel' if anchor_mode == 'mid' else 'null'}\n"
-                      f"log_kv_semantic_summary_size: {'8' if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_replay_updates: {'true' if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_anchor_mode: {anchor_mode}\nlog_kv_semantic_pack_backend: {pack_backend}\n")
     if setting is not None:
-        parent.write_text(parent.read_text() + f"log_kv_semantic_legacy_route: {setting}\n")
+        parent.write_text(parent.read_text() + f"log_kv_semantic_{route}: {setting}\n")
     config = tmp_path / "run.yaml"
     config.write_text("config: base.yaml\n")
     source = (Path(__file__).resolve().parents[1] / script).read_text()
@@ -48,14 +48,37 @@ def test_legacy_route_reaches_eval_arguments(tmp_path, script, setting, expected
     result = subprocess.run(["bash", "-c", shell, "bash", str(config)],
                             capture_output=True, text=True, check=True, env=env)
     args = result.stdout.splitlines()
-    assert args.count("--log_kv_semantic_legacy_route") == 1
-    assert args[args.index("--log_kv_semantic_legacy_route") + 1] == expected
+    assert "--log_kv_semantic_summary_size" not in args
+    for name in ("legacy_route", "unified_route"):
+        flag = "--log_kv_semantic_" + name
+        assert args.count(flag) == 1
+        assert args[args.index(flag) + 1] == (expected if name == route else "false")
     # Also catch shifts in majob's positional read list after adding a field.
     assert args[args.index("--log_kv_cluster_k_max") + 1] == "8"
     assert args[args.index("--log_kv_B") + 1] == "64"
     assert args[args.index("--log_kv_semantic_anchor_mode") + 1] == anchor_mode
     assert args[args.index("--log_kv_semantic_pack_backend") + 1] == pack_backend
 
-    values = ("parallel", "8", "true") if anchor_mode == "mid" else ("sequential", "1", "false")
-    for name, value in zip(("centroid_backend", "summary_size", "replay_updates"), values):
+    values = ("parallel", "true") if anchor_mode == "mid" else ("sequential", "false")
+    for name, value in zip(("centroid_backend", "replay_updates"), values):
         assert args[args.index("--log_kv_semantic_" + name) + 1] == value
+
+
+@pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
+def test_removed_summary_config_is_rejected_before_launch(tmp_path, script):
+    (tmp_path / "base.yaml").write_text(
+        "save_path: /tmp/unused-checkpoint\nlog_kv_semantic_summary_size: 8\n"
+    )
+    config = tmp_path / "run.yaml"
+    config.write_text("config: base.yaml\n")
+    source = (Path(__file__).resolve().parents[1] / script).read_text()
+    marker = 'RAW_SAVE_DIR=$(python ' if script == "majob.sh" else 'CONFIG_EXPORTS=$("${PYTHON_BIN}" '
+    start = source.index(marker)
+    stop = source.index('\n)', start) + len('\n)')
+    shell = '\n'.join(('set -e', 'CONFIG_FILE=$1', source[start:stop]))
+    env = {**os.environ, "PYTHON_BIN": sys.executable,
+           "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
+    result = subprocess.run(["bash", "-c", shell, "bash", str(config)],
+                            capture_output=True, text=True, env=env)
+    assert result.returncode != 0
+    assert "log_kv_semantic_summary_size has been removed" in result.stderr
