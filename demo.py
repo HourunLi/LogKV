@@ -536,10 +536,10 @@ def main(
     # Opt in to the pre-batching router: one Ward merge per orphan and a
     # per-cluster ladder walk. Kept for A/B against the fast path only.
     log_kv_semantic_legacy_route: bool = False,
+    log_kv_semantic_unified_route: bool = False,
     log_kv_semantic_anchor_mode: str = "multi",
     log_kv_semantic_pack_backend: str = "auto",
     log_kv_semantic_centroid_backend: str = "sequential",
-    log_kv_semantic_summary_size: int = 1,
     log_kv_semantic_replay_updates: bool = False,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
@@ -567,6 +567,11 @@ def main(
             raise ValueError(
                 "eval_log_kv_* YAML keys are no longer supported; train and eval share the same LogKV config. "
                 f"Remove: {', '.join(_banned)}"
+            )
+        if "log_kv_semantic_summary_size" in _yaml:
+            raise ValueError(
+                "log_kv_semantic_summary_size has been removed; delete this key. "
+                "KV entries now remain per-token before ladder compaction."
             )
         _valid = set(inspect.signature(main).parameters)
         for _k in _yaml:
@@ -625,7 +630,6 @@ def main(
     log_kv_semantic_anchor_mode = _o("log_kv_semantic_anchor_mode", log_kv_semantic_anchor_mode)
     log_kv_semantic_pack_backend = _o("log_kv_semantic_pack_backend", log_kv_semantic_pack_backend)
     log_kv_semantic_centroid_backend = _o("log_kv_semantic_centroid_backend", log_kv_semantic_centroid_backend)
-    log_kv_semantic_summary_size = int(_o("log_kv_semantic_summary_size", log_kv_semantic_summary_size))
     log_kv_semantic_replay_updates = bool(_o("log_kv_semantic_replay_updates", log_kv_semantic_replay_updates))
     log_kv_profile_steps = _o("log_kv_profile_steps", log_kv_profile_steps)
     if log_kv_profile_steps is not None and (
@@ -657,6 +661,9 @@ def main(
     )
     log_kv_semantic_legacy_route = bool(
         _o("log_kv_semantic_legacy_route", log_kv_semantic_legacy_route)
+    )
+    log_kv_semantic_unified_route = bool(
+        _o("log_kv_semantic_unified_route", log_kv_semantic_unified_route)
     )
     activation_checkpointing = bool(_o("activation_checkpointing", activation_checkpointing))
     run_eval = _o("run_eval", run_eval)
@@ -849,10 +856,10 @@ def main(
             log_kv_semantic_capacity_beta=log_kv_semantic_capacity_beta,
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
             log_kv_semantic_legacy_route=log_kv_semantic_legacy_route,
+            log_kv_semantic_unified_route=log_kv_semantic_unified_route,
             log_kv_semantic_anchor_mode=log_kv_semantic_anchor_mode,
             log_kv_semantic_pack_backend=log_kv_semantic_pack_backend,
             log_kv_semantic_centroid_backend=log_kv_semantic_centroid_backend,
-            log_kv_semantic_summary_size=log_kv_semantic_summary_size,
             log_kv_semantic_replay_updates=log_kv_semantic_replay_updates,
             tokenizer_dir=tokenizer_dir,
         )
@@ -998,10 +1005,10 @@ def main(
         semantic_capacity_beta=log_kv_semantic_capacity_beta,
         semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
         semantic_legacy_route=log_kv_semantic_legacy_route,
+        semantic_unified_route=log_kv_semantic_unified_route,
         semantic_anchor_mode=log_kv_semantic_anchor_mode,
         semantic_pack_backend=log_kv_semantic_pack_backend,
         semantic_centroid_backend=log_kv_semantic_centroid_backend,
-        semantic_summary_size=log_kv_semantic_summary_size,
         semantic_replay_updates=log_kv_semantic_replay_updates,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
@@ -1024,8 +1031,9 @@ def main(
         f"capacity_beta={log_kv_semantic_capacity_beta}, "
         f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
         f"legacy_route={log_kv_semantic_legacy_route}, "
+        f"unified_route={log_kv_semantic_unified_route}, "
         f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
-        f"centroid={log_kv_semantic_centroid_backend}, summary={log_kv_semantic_summary_size}, "
+        f"centroid={log_kv_semantic_centroid_backend}, "
         f"replay_updates={log_kv_semantic_replay_updates})"
     )
 

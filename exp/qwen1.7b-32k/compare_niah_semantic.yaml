@@ -1,0 +1,11 @@
+# Use unused/compare_swa_niah.sh to pin the same checkpoint for both runs.
+config: arc_semantic_fast.yaml
+checkpoint_dir: null
+output_path: null
+benchmark: niah_single_1,niah_single_2,niah_single_3
+limit: null
+log_kv_dense_mode: false
+swa_window_size: null
+metadata:
+  pretrained: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
+  max_seq_lengths: [32768]
