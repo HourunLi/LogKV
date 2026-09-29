@@ -332,6 +332,201 @@ apply_patch()
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
 
+def _walk_cache_path(path):
+    """lstat each component of ``path`` in order and stop at the first one that cannot be entered.
+
+    ENOTDIR only says *some* parent is not a directory; this names which one, what it
+    really is in this process (symlink target, file contents), and which mount it lives on.
+    """
+    import re
+    import stat
+
+    def kind(mode):
+        for name in ("DIR", "REG", "LNK", "FIFO", "SOCK", "CHR", "BLK"):
+            if getattr(stat, f"S_IS{name}")(mode):
+                return name.lower()
+        return oct(stat.S_IFMT(mode))
+
+    def error(exc):
+        return f"{type(exc).__name__}: {exc}"
+
+    mounts = []
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8", errors="backslashreplace") as stream:
+            for line in stream:
+                fields = line.split()
+                tail = fields.index("-")
+                mounts.append(dict(point=re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4]),
+                                   root=fields[3], dev=fields[2], options=fields[5],
+                                   fstype=fields[tail + 1], source=fields[tail + 2]))
+    except (OSError, ValueError, IndexError):
+        pass
+
+    parts = Path(os.path.abspath(path)).parts
+    steps, previous_dev, last_dir = [], None, None
+    for index in range(len(parts)):
+        current = Path(*parts[:index + 1])
+        step = dict(path=str(current))
+        steps.append(step)
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            step.update(error=error(exc), blocks_traversal=True)
+            break
+        dev = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}"
+        step.update(type=kind(info.st_mode), mode=oct(stat.S_IMODE(info.st_mode)),
+                    size=info.st_size, dev=dev)
+        if dev != previous_dev:
+            # The entry lives on the fs holding its parent's real directory.
+            physical = os.path.join(os.path.realpath(current.parent), current.name)
+            covering = [m for m in mounts if m["point"] == "/" or physical == m["point"]
+                        or physical.startswith(m["point"] + "/")]
+            if covering:
+                step["mount"] = max(covering, key=lambda m: len(m["point"]))
+            previous_dev = dev
+        entered = info
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                step["link"] = os.readlink(current)
+                step["resolved"] = os.path.realpath(current)
+                entered = os.stat(current)
+            except OSError as exc:
+                step.update(target_error=error(exc), blocks_traversal=True)
+                break
+            step["target_type"] = kind(entered.st_mode)
+        if stat.S_ISDIR(entered.st_mode):
+            last_dir = current
+        elif index < len(parts) - 1:
+            step["blocks_traversal"] = True
+            if stat.S_ISREG(entered.st_mode):
+                # An object store without symlink support may surface a link as a small file.
+                try:
+                    with open(current, "rb") as stream:
+                        step["head"] = stream.read(256).decode("utf-8", "backslashreplace")
+                except OSError as exc:
+                    step["head_error"] = error(exc)
+            try:
+                step["xattrs"] = os.listxattr(current, follow_symlinks=False)
+            except OSError:
+                pass
+            break
+    if last_dir is not None:
+        try:
+            names = sorted(os.listdir(last_dir))
+            steps.append(dict(listing_of=str(last_dir), entries=names[:50], total=len(names)))
+        except OSError as exc:
+            steps.append(dict(listing_of=str(last_dir), error=error(exc)))
+    return steps
+
+
+@contextlib.contextmanager
+def _trace_hf_cache_resolution():
+    """Log hidden cache errors; follow cache aliases that this mount cannot resolve."""
+    import functools
+    import importlib
+    import socket
+    import sys
+    import traceback
+
+    load = importlib.import_module("datasets.load")
+    cfg = importlib.import_module("datasets.config")
+    hub = importlib.import_module("huggingface_hub.constants")
+    factory = getattr(load, "CachedDatasetModuleFactory", None)
+    identity = dict(rank=_global_rank(), host=socket.gethostname(), pid=os.getpid(), python=sys.executable)
+
+    def emit(event, **details):
+        # One line per event keeps rank and exception together in aggregated logs.
+        print("[hf-cache] " + json.dumps(dict(event=event, **identity, **details),
+                                        ensure_ascii=False, default=str), file=sys.stderr, flush=True)
+
+    packages = {}
+    for name in ("datasets", "huggingface_hub", "lm_eval"):
+        module = importlib.import_module(name)
+        packages[name] = dict(version=getattr(module, "__version__", None), file=module.__file__)
+    emit("runtime", script=str(Path(__file__).resolve()), cwd=os.getcwd(), packages=packages,
+         datasets_cache=cfg.HF_DATASETS_CACHE, hub_cache=hub.HF_HUB_CACHE,
+         datasets_offline=cfg.HF_DATASETS_OFFLINE, hub_offline=hub.HF_HUB_OFFLINE,
+         environment={key: os.environ.get(key) for key in (
+             "HF_HOME", "HF_DATASETS_CACHE", "HF_HUB_CACHE", "HF_MODULES_CACHE",
+             "HF_DATASETS_OFFLINE", "HF_HUB_OFFLINE", "HF_ENDPOINT", "PYTHONPATH", "PYTHON_EXEC")},
+         cache_trace_supported=factory is not None)
+    if factory is None:
+        yield
+        return
+
+    datasets_module = importlib.import_module("datasets")
+    original_load = datasets_module.load_dataset
+    original = factory.get_module
+    cache_misses = set()
+
+    @functools.wraps(original)
+    def traced_get_module(self, *args, **kwargs):
+        try:
+            return original(self, *args, **kwargs)
+        except Exception as exc:
+            if isinstance(exc, FileNotFoundError):
+                cache_misses.add(self.name)
+            emit("local_cache_failure", dataset=self.name, cache_dir_argument=self.cache_dir,
+                 effective_cache_dir=os.path.expanduser(str(self.cache_dir or cfg.HF_DATASETS_CACHE)),
+                 traceback=traceback.format_exc())
+            raise
+
+    def unusable_alias(root, path):
+        """Return (alias, target) when the cache entry for ``namespace/name`` stands in for ``name``."""
+        from datasets.naming import camelcase_to_snakecase
+
+        namespace, name = path.split("/")
+        alias = root / f"{namespace}___{camelcase_to_snakecase(name)}"
+        target = root / camelcase_to_snakecase(name)
+        try:
+            # Anything this process can enter must be the legacy directory itself (a working link);
+            # a real directory of its own is not an alias, and its failure is a different problem.
+            if (not os.path.lexists(alias) or not target.is_dir()
+                    or alias.is_dir() and not os.path.samefile(alias, target)):
+                return None
+        except OSError:
+            return None
+        return alias, target
+
+    @functools.wraps(original_load)
+    def load_with_local_fallback(*args, **kwargs):
+        cache_misses.clear()
+        try:
+            return original_load(*args, **kwargs)
+        except (ConnectionError, FileNotFoundError):
+            path = args[0] if args else kwargs.get("path")
+            if not (cfg.HF_DATASETS_OFFLINE and isinstance(path, str) and path.count("/") == 1
+                    and path in cache_misses):
+                raise
+            root = Path(kwargs.get("cache_dir") or cfg.HF_DATASETS_CACHE).expanduser()
+            found = unusable_alias(root, path)
+            legacy = path.split("/")[1]
+            packaged = importlib.import_module("datasets.packaged_modules")._PACKAGED_DATASETS_MODULES
+            # The legacy name must reach the same cache lookup, not a packaged builder or a local folder.
+            if found is None or legacy in packaged or os.path.exists(legacy):
+                raise
+            alias, target = found
+            config = args[1] if len(args) > 1 else kwargs.get("name")
+            emit("cache_alias_unusable", dataset=path, alias=str(alias), target=str(target),
+                 walk=_walk_cache_path(alias / (config or "default")))
+            # Loading under the legacy name is what following namespace___name -> name would do.
+            if args:
+                result = original_load(legacy, *args[1:], **kwargs)
+            else:
+                result = original_load(**dict(kwargs, path=legacy))
+            emit("cache_alias_followed", dataset=path, loaded_as=legacy, directory=str(target),
+                 num_rows=getattr(result, "num_rows", None))
+            return result
+
+    factory.get_module = traced_get_module
+    datasets_module.load_dataset = load_with_local_fallback
+    try:
+        yield
+    finally:
+        factory.get_module = original
+        datasets_module.load_dataset = original_load
+
+
 def _load_lit_model_checkpoint(
     checkpoint_dir: str, map_location: str | torch.device, wait_s: float = 120.0
 ) -> Any:
@@ -1380,6 +1575,7 @@ def main(
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
 
         with (
+            _trace_hf_cache_resolution(),
             diag_mode(
                 log_kv_diag_mode,
                 exact_from_layer=log_kv_diag_exact_from_layer,
