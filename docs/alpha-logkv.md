@@ -1,82 +1,113 @@
-# AlphaLogKV 第一版
+# AlphaLogKV：有限预算的精确片段
 
-`AlphaLogKV` 从 `semanticLogKV` 分出。新增固定精确池，默认关闭；训练配置
-`exp/qwen1.7b-32k/arc_alpha_cpt100.yaml` 开启每层 256 token、单片段最多 64 token。
-按用户最终决定从 Qwen Base 做 100 步 CPT，输出目录与旧实验分开。
+Alpha 在 SemanticLogKV 的 recent window 与压缩层之间增加可替换的精确池。
+默认关闭；[训练配置](../exp/qwen1.7b-32k/arc_alpha_cpt100.yaml) 开启每层每条样本
+`P=256` 个精确 token、片段上限 `64`。同层 KV groups 共用所选位置，各层独立选择。
+压缩槽的表示与注意力见 [算法规格](algorithm-spec.md)，归档后的分簇与合并见
+[统一路由](semantic-unified-routing.md)；本文只定义 Alpha 增量。
 
-## 保留规则
+## 片段与分数
 
-- 分词器在启动时建立自然结束符表，模型每次输入计算一次边界、各层共用。
-  句末标点、分号、换行和 EOS 是边界；冒号、UUID 连字符不是边界。
-  这是 token 末尾标点启发式，不是句法分析器。超过 64 token 允许切开。
-- 每层独立选择，层内 KV groups 共用片段位置。跨 flush 的未结束片段继续拼接，
-  其 token 也计入 256 预算；所以已完成片段的可用预算会随尾段长度变化。
-- 批量计算片段内 K/V 的相对方差，两个分量相加、KV groups 取平均：
-  `density = mean_groups(var(K)/mean(K²) + var(V)/mean(V²))`。
-  这是每 token 的压缩风险代理，不保证“语义重要”，也没有利用题目/答案或 UUID 正则。
-  计算均值仅用于打分，精确池中仍保存每个 token 原始 K/V。
-- 旧片段打分乘 1.1 以减少抖动；新片段按密度排序，替换时必须覆盖所有被淘汰
-  整段的总分 `density × token 数`。这是有界贪心替换，不是最优背包算法。
-- 每个已提交 token 只归属 recent、精确池、压缩层之一。新淘汰与旧淘汰 token
-  一起执行一次统一路由；旧位置插入时，仅重排受影响簇的现存条目，再进行层级合并。
-  已压缩条目不会被逆向拆开，精确片段被淘汰后不再恢复原文。
-- 精确 K 使用原始位置 RoPE、质量权重 1，与压缩槽进入同一次注意力。
+分词器启动时解码词表，按 token 末尾的句号、问号、叹号、分号、换行和 EOS 建立边界表；
+尾部空格、引号与部分右括号会被忽略，冒号和连字符不是边界。模型每次输入只生成一次
+边界标记，各层复用。这是便宜的标点启发式，不能保证句法或 UUID 完整。
 
-## 显存与速度约束
+每次 flush 把旧精确片段与新 token 一起考虑。未结束尾段跨 flush 拼接，遇自然边界、
+64-token 上限或位置不连续便闭合；允许在长度上限处切开。仍未结束的尾段强制保留，
+**其长度计入同一个 P 预算**，没有额外的尾段 KV 缓冲。
 
-新增存储从原 `B` 对应的压缩层预算扣除，自动选择更小的实际 `B`；日志打印
-`effective_B`。计算同时计入 K/V、GPU 位置/有效标志、层级元数据和最大 decode
-打包工作区。recent、flush、train/prefill block 仍为 2048，推理缓存仍是 O(log N)。
-此处约束缓存容量，不承诺含路由临时张量的每次 CUDA 峰值完全相同。
+对片段 `s`、KV group `g`、表示 `X∈{K_raw,V}`，令 `l` 为片段长度、`d_X` 为维度：
 
-打分为线性批量 GPU 计算，每次 flush 一次分数回传；整段预算决策在 CPU 上完成，
-没有逐 token 的 GPU 同步。精确槽已并入现有 Triton pack kernel；训练记录精确池
-及归档写入，checkpoint 重算和反向回放均不重选、不重路由。
-`alpha_select` 计时包含在 `route` 中，不能再次累加。
+```text
+μ_X(s,g) = mean_tokens X
+E_X(s,g) = mean_tokens,features X²
+R_X(s,g) = max(E_X − mean_features μ_X², 0) / max(E_X, 1e−12)
+q(s)     = mean_groups [R_K(s,g) + R_V(s,g)]
+density(s) = 1.1 × q(s)  （原精确池中已闭合的片段）
+             q(s)      （新片段，包括刚拼完整的旧尾段）
+```
 
-合并 semanticLogKV 增量路由后，Alpha 默认 `log_kv_semantic_merge_passes: 1`：
-每个 tile 初始化一次距离矩阵，随后在设备端增量更新距离与行最小值，并异步读取终止标志。
-包含上游的严格对称距离修复、旧簇排序和批量写入优化。互为最近邻规则保持；浮点递推及
-固定节点编号的平局处理可能改变具体配对，不能认为与旧实现逐位相同。
+K、V 两项权重均为 1。打分使用 FP32 批量归约；每次 flush 一次分数回传，CPU 完成
+整段预算决策。这是**丢弃片段内差异的风险代理**，不是语义重要性的保证；没有问题、
+答案标签或 UUID 正则，单 token 的方差分数为 0。
 
-`merge_passes: 4` 保留为对照：候选阶段也使用增量实现，全局阶段调用原冻结中心
-多扫描路径，一次距离计算选出多批不重叠配对，再统一更新中心。两个模式都保持最终
-簇预算、候选半径约束和有限 hard cap 行为。训练与评测共用配置，checkpoint/反向回放
-不重新选择精确片段或配对。Alpha 的变长归档按真实 token 数计数，空样本与补齐位置
-不会进入压缩簇；精确池收集仍直接写入已有缓冲区。
+先为强制尾段腾出空间，再按密度从高到低尝试新片段。空间不足时，按密度从低到高
+收集已选闭合片段，直到足够；仅当新片段总分 `density×l` **严格大于被淘汰整段总分之和**
+才替换。保留与淘汰都以整段为单位，预算按实际 token 数计算。这是有界贪心，不是最优背包。
 
-此前 CPU 的 0.512→0.408 秒/flush 是旧版本全量重算与四次扫描的对照，
-不能用来代表此次增量路由合并后的性能。合并后 CUDA 性能仍需目标机器确认。
+## 归档与注意力
 
-第一版使用当前 fast 配置：unified、mid、一阶、无 segment gap/padding；训练要求
-`semantic_replay_updates=true`。默认关闭时保留原路径。没有引入额外注意力打分、
-新的模型参数或外部依赖。尚未验证 NIAH 收益或 A800 额外开销。
+- 精确池保留各 token 的原始 K/V 和位置，均值只用于打分。读出按原始位置施加 RoPE，
+  质量权重为 1，与压缩槽共同参加一次注意力；不需要额外检索注意力。
+- 已提交 token 在 recent、精确池、压缩层之间仅有一个语义归属，不添加重复副本。
+  本次未入选的新 token 与被替换的旧片段一起执行统一路由。
+- 延迟归档可能早于簇内现存位置：只对受影响簇按位置重排条目，然后重新入层级。
+  已压缩条目不能拆回原 token；片段被淘汰后没有恢复原始精确表示的通道。
+- padding 不参与归档、质量计数或注意力。精确池收集直接写入预分配缓冲，打包复用
+  现有 Triton kernel。`alpha_select` 已包含在 `route` 计时中，不要重复相加。
 
-## 训练环境的最小验证
+默认 `log_kv_semantic_merge_passes: 1` 使用新增量路由；设为 `4` 保留冻结中心的
+近似配对对照。Alpha 不另建配对算法，具体路径与有限 hard cap 的回退规则见统一路由文档。
 
-先验证 CUDA 实现与回放，再测短路由；CPU 本地检查不能替代 CUDA 检查。
+## 同预算与复杂度
+
+精确池从压缩层预算扣款，**不缩短 recent window**。令 `G` 为 KV groups、`K` 为簇上限、
+`N` 为配置最大长度、`e` 为 K/V 元素字节数、`d_p=8⌈max(d_k+1,d_v)/8⌉`。
+当前一阶 mid 实现按每层、每条样本计算持久缓存与最大可复用打包缓冲的容量：
+
+```text
+L(B) = max(2, ceil(log2(N/(K×B) + 1)) + 2)
+C_entry = (d_k + d_v + 2d_p)×e + 41
+C_ladder(B) = G×K×L(B)×(B×C_entry + 2)
+C_exact = P×[G×(d_k + d_v + 2d_p)×e + 9]
+```
+
+`41` 是每个层级条目的元数据字节数，`2` 是每层计数；精确位置和有效标记共 `9` 字节。
+实现从原 `B−1` 向下找最大的 `B'≥2`，满足
+`C_ladder(B')+C_exact≤C_ladder(B)`；找不到则报错。层数随 `B'` 重新计算，日志显示
+`effective_B`。batch 容量乘 batch size，其余未改变的缓冲不计入这笔增量比较。
+
+固定 `P、G、K、B` 时，推理 KV 缓存仍为 `O(log N)`。这不代表总显存或 CUDA 峰值：
+输入、RoPE 表、临时距离矩阵、训练激活和回放历史不在上述 KV 容量约束内。
+
+## 训练、推理与最小运行入口
+
+Alpha 要求 unified、`K>1`、mid、一阶、关闭 segment gap/padding；训练还要求
+`semantic_replay_updates=true`。训练与推理走相同选择/归档规则；checkpoint 重算与反向
+使用记录的精确池状态和写入操作，不重新打分或路由。没有入层级前的 summary 均值压缩。
+
+当前配置从 **Qwen3-1.7B-Base** 开始 100 步 CPT，独立输出到
+`qwen1.7b-32k-alpha-cpt100`；该实验若已有 checkpoint，`auto_resume` 会恢复它。
+簇上限 12、原预算 B=128；recent、flush、train/prefill block 均为 2048。
+
+训练环境中，只训练、不触发 `majob.sh` 默认的全套后续评测：
 
 ```bash
-python -m pytest --noconftest -q tests/test_alpha_log_kv.py tests/test_log_kv_pack.py
+BENCHMARKS=none NIAH_BENCHMARKS=none \
+  bash majob.sh exp/qwen1.7b-32k/arc_alpha_cpt100.yaml
+```
+
+训练完成后，仅评测 32K single2/3：
+
+```bash
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+  bash eval.sh exp/qwen1.7b-32k/eval_alpha.yaml niah_single_2,niah_single_3 none
+```
+
+这里显式传 metadata：当前 `eval.sh` 不转发 YAML metadata，且默认会另跑 single1/2/3
+的六个长度档；第三参数 `none` 关闭这次额外评测。脚本从实验 `save_path` 加载训练产物，
+不是从 `ckpt_dir` 加载初始 Base 权重。
+
+如需验证 CUDA 路由性能，只跑以下短基准；与已有结果比较时保持 B、batch 和输入规模一致：
+
+```bash
 python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --B 128 --iters 3 \
   --alpha-exact-tokens 256 --alpha-span-max-tokens 64 --merge-passes 1 \
-  --profile-dir route_operator_profile_alpha_incremental > route_alpha_incremental.jsonl
+  --profile-dir route_operator_profile_alpha > route_alpha.jsonl
 ```
 
-基准先校验 Triton/Torch 增量实现的一致性及质量守恒，CUDA 输出应包含
-`reference_incremental_verified: true`。如需与冻结中心模式对照，将 `--merge-passes`
-改为 `4` 并使用另一输出路径；其余输入和预算保持相同。
-`reference_pairs_verified` 指同一模式的实现一致，不表示与旧配对相同。
-不要把 B=128 的结果直接与之前 B=256 的结果比较。合成路由不代表检索质量。
+合成基准的质量守恒/实现一致检查不能证明检索质量。Alpha 的 NIAH 收益、目标 A800
+速度和实际 step 耗时仍需真实运行确认；不沿用旧路由版本的 CPU 数字作为当前性能结论。
 
-通过后启动新实验：
-
-```bash
-bash majob.sh exp/qwen1.7b-32k/arc_alpha_cpt100.yaml
-```
-
-训练完仅评测 32K single2/3：
-
-```bash
-bash eval.sh exp/qwen1.7b-32k/eval_alpha.yaml
-```
+实现入口：[选择器](../litgpt/alpha_log_kv.py)、[缓存/回放](../litgpt/log_kv_cache.py)、
+[边界表](../litgpt/tokenizer.py)、[相关测试](../tests/test_alpha_log_kv.py)。
