@@ -195,7 +195,7 @@ seg_gap_max = cfg.get("log_kv_seg_gap_max")
 def semantic_budget(k_max, b_prime, n):
     """L_alloc/persistent-entries/readout-S for a (K_max, B') pair -- same
     formula as LogStructuredKVCache.__init__'s semantic branch
-    (docs/algorithm-spec.md §5.12)."""
+    (docs/algorithm-spec.md, memory budget)."""
     k_max = max(int(k_max), 1)
     b_prime = max(int(b_prime), 1)
     l_alloc = max(2, math.ceil(math.log2(n / max(k_max * b_prime, 1) + 1.0)) + 2)
