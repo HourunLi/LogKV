@@ -1,6 +1,7 @@
 """Bounded whole-span selection. Scores are compression-risk proxies, not labels."""
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 
@@ -12,6 +13,36 @@ class SpanSelection:
     positions: list[list[int]]
 
 
+def _cut_new_spans(new_pos, ends, carry, last_pos, max_span):
+    """Cut a flush into spans exactly as a token-by-token scan would.
+
+    A span restarts after a boundary token or at a position gap; a run is split
+    every max_span tokens, the first piece also counting a continued carry of
+    `carry` unfinished tokens. Only runs are visited in Python, never tokens.
+    Returns piece starts, stops, closed flags and whether piece 0 continues.
+    """
+    n = len(new_pos)
+    if not n:
+        return [], [], [], False
+    pos = np.asarray(new_pos, dtype=np.int64)
+    ends = np.asarray(ends, dtype=bool)
+    continues = bool(carry) and int(pos[0]) == last_pos + 1
+    breaks = (np.flatnonzero(ends[:-1] | (pos[1:] != pos[:-1] + 1)) + 1).tolist()
+    starts, stops = [], []
+    for k, (a, b) in enumerate(zip([0] + breaks, breaks + [n])):
+        step = max_span - carry if k == 0 and continues else max_span
+        while a < b:
+            starts.append(a)
+            stops.append(min(b, a + step))
+            a, step = stops[-1], max_span
+    closed = [True] * len(starts)
+    # Only the final piece can stay open: no boundary on the last token and
+    # below the cap (counting the carry if it is also the first piece).
+    final = stops[-1] - starts[-1] + (carry if continues and len(starts) == 1 else 0)
+    closed[-1] = bool(ends[-1]) or final == max_span
+    return starts, stops, closed, continues
+
+
 def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width, budget, max_span):
     """Indices refer to [padded old pool | current flush], shared across KV groups.
 
@@ -20,34 +51,36 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
     """
     candidates, bi, ti, lengths = [], [], [], []
     for b, (spans, old_pos, new_pos, boundaries) in enumerate(zip(old_spans, old_positions, new_positions, ends)):
-        row, offset, pending = [], 0, []
+        row, offset, pending = [], 0, None
         for length, closed in spans:
-            indices = list(range(offset, offset + length))
+            indices = np.arange(offset, offset + length, dtype=np.int64)
             offset += length
             if closed:
                 row.append((indices, True, True))
             else:
                 pending = indices
         all_pos = old_pos + [0] * (old_width - len(old_pos)) + list(new_pos)
-        for j, boundary in enumerate(boundaries):
-            i = old_width + j
-            if pending and all_pos[i] != all_pos[pending[-1]] + 1:
-                row.append((pending, False, True))
-                pending = []
-            pending.append(i)
-            if boundary or len(pending) == max_span:
-                row.append((pending, False, True))
-                pending = []
-        if pending:
+        carry = 0 if pending is None else len(pending)
+        starts, stops, closed, continues = _cut_new_spans(
+            new_pos, boundaries, carry, all_pos[pending[-1]] if carry else 0, max_span)
+        if carry and not continues and starts:
+            row.append((pending, False, True))  # A position gap closes the carried span.
+        for piece, (start, stop, done) in enumerate(zip(starts, stops, closed)):
+            indices = np.arange(old_width + start, old_width + stop, dtype=np.int64)
+            if piece == 0 and continues:
+                indices = np.concatenate((pending, indices))
+            row.append((indices, False, done))
+        if carry and not starts:
             row.append((pending, False, False))
         candidates.append((row, all_pos))
-        for indices, _, _ in row:
-            bi.extend([b] * len(indices))
-            ti.extend(indices)
-            lengths.append(len(indices))
+        if row:
+            sizes = [len(indices) for indices, _, _ in row]
+            bi.append(np.full(sum(sizes), b, dtype=np.int64))
+            ti.append(np.concatenate([indices for indices, _, _ in row]))
+            lengths.extend(sizes)
     if not lengths:
         return SpanSelection([[] for _ in ends], [[] for _ in ends], [[] for _ in ends], [[] for _ in ends])
-    index = torch.tensor([bi, ti], device=k.device, dtype=torch.long)
+    index = torch.from_numpy(np.stack((np.concatenate(bi), np.concatenate(ti)))).to(k.device)
     sizes = torch.tensor(lengths, device=k.device, dtype=torch.long)
     scores = None
     for values in (k, v):
@@ -91,8 +124,9 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
                 chosen.add(i)
                 room = available - length
         selected = [i for i in range(len(row)) if i in chosen]
-        keep.append([token for i in selected for token in row[i][0]])
-        archive.append([token for i in range(len(row)) if i not in chosen for token in row[i][0]])
+        rejected = [i for i in range(len(row)) if i not in chosen]
+        keep.append(np.concatenate([row[i][0] for i in selected]).tolist() if selected else [])
+        archive.append(np.concatenate([row[i][0] for i in rejected]).tolist() if rejected else [])
         output_spans.append([(len(row[i][0]), row[i][2]) for i in selected])
         output_positions.append([positions[i] for i in keep[-1]])
         offset += len(row)
