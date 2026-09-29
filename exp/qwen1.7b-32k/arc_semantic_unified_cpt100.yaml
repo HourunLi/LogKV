@@ -1,7 +1,7 @@
 # Short adaptation from the existing semantic checkpoint, not base-model CPT.
 config: arc_semantic_fast.yaml
 # Set this to the same checkpoint directory used for the routing comparison.
-ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
 resume_dir: null
 # Only resume this new experiment's own optimizer/step if interrupted.
 auto_resume: true
