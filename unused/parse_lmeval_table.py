@@ -7,289 +7,295 @@ model_outputs = {
     "base-prolong": """
 |                         Tasks                         |Version|Filter|n-shot|        Metric         |   | Value |   |Stderr|
 |-------------------------------------------------------|------:|------|-----:|-----------------------|---|------:|---|------|
-|arc_challenge                                          |      1|none  |     0|acc                    |↑  | 0.4411|±  |0.0145|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.4710|±  |0.0146|
-|arc_easy                                               |      1|none  |     0|acc                    |↑  | 0.7740|±  |0.0086|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.7597|±  |0.0088|
-|boolq                                                  |      2|none  |     0|acc                    |↑  | 0.7532|±  |0.0075|
-|ceval-valid                                            |      2|none  |      |acc                    |↑  | 0.6404|±  |0.0126|
-|                                                       |       |none  |      |acc_norm               |↑  | 0.6404|±  |0.0126|
+|arc_challenge                                          |      1|none  |     0|acc                    |↑  | 0.4369|±  |0.0145|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4565|±  |0.0146|
+|arc_easy                                               |      1|none  |     0|acc                    |↑  | 0.7635|±  |0.0087|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7382|±  |0.0090|
+|boolq                                                  |      2|none  |     0|acc                    |↑  | 0.7731|±  |0.0073|
+|ceval-valid                                            |      2|none  |      |acc                    |↑  | 0.6441|±  |0.0126|
+|                                                       |       |none  |      |acc_norm               |↑  | 0.6441|±  |0.0126|
 | - ceval-valid_accountant                              |      2|none  |     0|acc                    |↑  | 0.5510|±  |0.0718|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.5510|±  |0.0718|
-| - ceval-valid_advanced_mathematics                    |      2|none  |     0|acc                    |↑  | 0.2105|±  |0.0961|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.2105|±  |0.0961|
-| - ceval-valid_art_studies                             |      2|none  |     0|acc                    |↑  | 0.5455|±  |0.0880|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.5455|±  |0.0880|
-| - ceval-valid_basic_medicine                          |      2|none  |     0|acc                    |↑  | 0.6316|±  |0.1137|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6316|±  |0.1137|
-| - ceval-valid_business_administration                 |      2|none  |     0|acc                    |↑  | 0.6364|±  |0.0850|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6364|±  |0.0850|
-| - ceval-valid_chinese_language_and_literature         |      2|none  |     0|acc                    |↑  | 0.4783|±  |0.1065|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.4783|±  |0.1065|
+| - ceval-valid_advanced_mathematics                    |      2|none  |     0|acc                    |↑  | 0.3158|±  |0.1096|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.3158|±  |0.1096|
+| - ceval-valid_art_studies                             |      2|none  |     0|acc                    |↑  | 0.5758|±  |0.0874|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5758|±  |0.0874|
+| - ceval-valid_basic_medicine                          |      2|none  |     0|acc                    |↑  | 0.6842|±  |0.1096|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6842|±  |0.1096|
+| - ceval-valid_business_administration                 |      2|none  |     0|acc                    |↑  | 0.6061|±  |0.0864|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6061|±  |0.0864|
+| - ceval-valid_chinese_language_and_literature         |      2|none  |     0|acc                    |↑  | 0.5652|±  |0.1057|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5652|±  |0.1057|
 | - ceval-valid_civil_servant                           |      2|none  |     0|acc                    |↑  | 0.5106|±  |0.0737|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.5106|±  |0.0737|
-| - ceval-valid_clinical_medicine                       |      2|none  |     0|acc                    |↑  | 0.6364|±  |0.1050|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6364|±  |0.1050|
-| - ceval-valid_college_chemistry                       |      2|none  |     0|acc                    |↑  | 0.5833|±  |0.1028|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.5833|±  |0.1028|
-| - ceval-valid_college_economics                       |      2|none  |     0|acc                    |↑  | 0.5636|±  |0.0675|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.5636|±  |0.0675|
-| - ceval-valid_college_physics                         |      2|none  |     0|acc                    |↑  | 0.4211|±  |0.1164|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.4211|±  |0.1164|
+| - ceval-valid_clinical_medicine                       |      2|none  |     0|acc                    |↑  | 0.5455|±  |0.1087|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5455|±  |0.1087|
+| - ceval-valid_college_chemistry                       |      2|none  |     0|acc                    |↑  | 0.5000|±  |0.1043|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5000|±  |0.1043|
+| - ceval-valid_college_economics                       |      2|none  |     0|acc                    |↑  | 0.5818|±  |0.0671|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5818|±  |0.0671|
+| - ceval-valid_college_physics                         |      2|none  |     0|acc                    |↑  | 0.5789|±  |0.1164|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5789|±  |0.1164|
 | - ceval-valid_college_programming                     |      2|none  |     0|acc                    |↑  | 0.6757|±  |0.0780|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.6757|±  |0.0780|
 | - ceval-valid_computer_architecture                   |      2|none  |     0|acc                    |↑  | 0.7619|±  |0.0952|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.7619|±  |0.0952|
-| - ceval-valid_computer_network                        |      2|none  |     0|acc                    |↑  | 0.5263|±  |0.1177|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.5263|±  |0.1177|
-| - ceval-valid_discrete_mathematics                    |      2|none  |     0|acc                    |↑  | 0.1875|±  |0.1008|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.1875|±  |0.1008|
-| - ceval-valid_education_science                       |      2|none  |     0|acc                    |↑  | 0.7586|±  |0.0809|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.7586|±  |0.0809|
-| - ceval-valid_electrical_engineer                     |      2|none  |     0|acc                    |↑  | 0.4054|±  |0.0818|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.4054|±  |0.0818|
-| - ceval-valid_environmental_impact_assessment_engineer|      2|none  |     0|acc                    |↑  | 0.6774|±  |0.0853|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6774|±  |0.0853|
-| - ceval-valid_fire_engineer                           |      2|none  |     0|acc                    |↑  | 0.5161|±  |0.0912|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.5161|±  |0.0912|
-| - ceval-valid_high_school_biology                     |      2|none  |     0|acc                    |↑  | 0.6842|±  |0.1096|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6842|±  |0.1096|
+| - ceval-valid_computer_network                        |      2|none  |     0|acc                    |↑  | 0.4737|±  |0.1177|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4737|±  |0.1177|
+| - ceval-valid_discrete_mathematics                    |      2|none  |     0|acc                    |↑  | 0.2500|±  |0.1118|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.2500|±  |0.1118|
+| - ceval-valid_education_science                       |      2|none  |     0|acc                    |↑  | 0.7931|±  |0.0766|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7931|±  |0.0766|
+| - ceval-valid_electrical_engineer                     |      2|none  |     0|acc                    |↑  | 0.3784|±  |0.0808|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.3784|±  |0.0808|
+| - ceval-valid_environmental_impact_assessment_engineer|      2|none  |     0|acc                    |↑  | 0.7097|±  |0.0829|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7097|±  |0.0829|
+| - ceval-valid_fire_engineer                           |      2|none  |     0|acc                    |↑  | 0.4839|±  |0.0912|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4839|±  |0.0912|
+| - ceval-valid_high_school_biology                     |      2|none  |     0|acc                    |↑  | 0.7368|±  |0.1038|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7368|±  |0.1038|
 | - ceval-valid_high_school_chemistry                   |      2|none  |     0|acc                    |↑  | 0.4737|±  |0.1177|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.4737|±  |0.1177|
-| - ceval-valid_high_school_chinese                     |      2|none  |     0|acc                    |↑  | 0.6316|±  |0.1137|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6316|±  |0.1137|
-| - ceval-valid_high_school_geography                   |      2|none  |     0|acc                    |↑  | 0.6316|±  |0.1137|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6316|±  |0.1137|
-| - ceval-valid_high_school_history                     |      2|none  |     0|acc                    |↑  | 0.7500|±  |0.0993|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.7500|±  |0.0993|
+| - ceval-valid_high_school_chinese                     |      2|none  |     0|acc                    |↑  | 0.5789|±  |0.1164|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5789|±  |0.1164|
+| - ceval-valid_high_school_geography                   |      2|none  |     0|acc                    |↑  | 0.7368|±  |0.1038|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7368|±  |0.1038|
+| - ceval-valid_high_school_history                     |      2|none  |     0|acc                    |↑  | 0.8000|±  |0.0918|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8000|±  |0.0918|
 | - ceval-valid_high_school_mathematics                 |      2|none  |     0|acc                    |↑  | 0.5000|±  |0.1213|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.5000|±  |0.1213|
-| - ceval-valid_high_school_physics                     |      2|none  |     0|acc                    |↑  | 0.7895|±  |0.0961|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.7895|±  |0.0961|
-| - ceval-valid_high_school_politics                    |      2|none  |     0|acc                    |↑  | 0.8947|±  |0.0723|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.8947|±  |0.0723|
+| - ceval-valid_high_school_physics                     |      2|none  |     0|acc                    |↑  | 0.6842|±  |0.1096|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6842|±  |0.1096|
+| - ceval-valid_high_school_politics                    |      2|none  |     0|acc                    |↑  | 0.9474|±  |0.0526|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.9474|±  |0.0526|
 | - ceval-valid_ideological_and_moral_cultivation       |      2|none  |     0|acc                    |↑  | 0.9474|±  |0.0526|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.9474|±  |0.0526|
-| - ceval-valid_law                                     |      2|none  |     0|acc                    |↑  | 0.5000|±  |0.1043|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.5000|±  |0.1043|
-| - ceval-valid_legal_professional                      |      2|none  |     0|acc                    |↑  | 0.5217|±  |0.1065|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.5217|±  |0.1065|
-| - ceval-valid_logic                                   |      2|none  |     0|acc                    |↑  | 0.6818|±  |0.1016|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6818|±  |0.1016|
-| - ceval-valid_mao_zedong_thought                      |      2|none  |     0|acc                    |↑  | 0.8750|±  |0.0690|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.8750|±  |0.0690|
-| - ceval-valid_marxism                                 |      2|none  |     0|acc                    |↑  | 0.7895|±  |0.0961|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.7895|±  |0.0961|
+| - ceval-valid_law                                     |      2|none  |     0|acc                    |↑  | 0.4583|±  |0.1039|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4583|±  |0.1039|
+| - ceval-valid_legal_professional                      |      2|none  |     0|acc                    |↑  | 0.4348|±  |0.1057|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4348|±  |0.1057|
+| - ceval-valid_logic                                   |      2|none  |     0|acc                    |↑  | 0.5909|±  |0.1073|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5909|±  |0.1073|
+| - ceval-valid_mao_zedong_thought                      |      2|none  |     0|acc                    |↑  | 0.8333|±  |0.0777|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8333|±  |0.0777|
+| - ceval-valid_marxism                                 |      2|none  |     0|acc                    |↑  | 0.8421|±  |0.0859|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8421|±  |0.0859|
 | - ceval-valid_metrology_engineer                      |      2|none  |     0|acc                    |↑  | 0.7083|±  |0.0948|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.7083|±  |0.0948|
 | - ceval-valid_middle_school_biology                   |      2|none  |     0|acc                    |↑  | 0.9524|±  |0.0476|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.9524|±  |0.0476|
 | - ceval-valid_middle_school_chemistry                 |      2|none  |     0|acc                    |↑  | 0.9000|±  |0.0688|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.9000|±  |0.0688|
-| - ceval-valid_middle_school_geography                 |      2|none  |     0|acc                    |↑  | 0.6667|±  |0.1421|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6667|±  |0.1421|
-| - ceval-valid_middle_school_history                   |      2|none  |     0|acc                    |↑  | 1.0000|±  |     0|
-|                                                       |       |none  |     0|acc_norm               |↑  | 1.0000|±  |     0|
+| - ceval-valid_middle_school_geography                 |      2|none  |     0|acc                    |↑  | 0.7500|±  |0.1306|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7500|±  |0.1306|
+| - ceval-valid_middle_school_history                   |      2|none  |     0|acc                    |↑  | 0.9545|±  |0.0455|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.9545|±  |0.0455|
 | - ceval-valid_middle_school_mathematics               |      2|none  |     0|acc                    |↑  | 0.5263|±  |0.1177|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.5263|±  |0.1177|
-| - ceval-valid_middle_school_physics                   |      2|none  |     0|acc                    |↑  | 0.7368|±  |0.1038|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.7368|±  |0.1038|
+| - ceval-valid_middle_school_physics                   |      2|none  |     0|acc                    |↑  | 0.8421|±  |0.0859|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8421|±  |0.0859|
 | - ceval-valid_middle_school_politics                  |      2|none  |     0|acc                    |↑  | 0.8571|±  |0.0782|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.8571|±  |0.0782|
-| - ceval-valid_modern_chinese_history                  |      2|none  |     0|acc                    |↑  | 0.7391|±  |0.0936|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.7391|±  |0.0936|
-| - ceval-valid_operating_system                        |      2|none  |     0|acc                    |↑  | 0.6316|±  |0.1137|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6316|±  |0.1137|
-| - ceval-valid_physician                               |      2|none  |     0|acc                    |↑  | 0.6939|±  |0.0665|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6939|±  |0.0665|
-| - ceval-valid_plant_protection                        |      2|none  |     0|acc                    |↑  | 0.8636|±  |0.0749|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.8636|±  |0.0749|
-| - ceval-valid_probability_and_statistics              |      2|none  |     0|acc                    |↑  | 0.3889|±  |0.1182|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.3889|±  |0.1182|
-| - ceval-valid_professional_tour_guide                 |      2|none  |     0|acc                    |↑  | 0.5862|±  |0.0931|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.5862|±  |0.0931|
+| - ceval-valid_modern_chinese_history                  |      2|none  |     0|acc                    |↑  | 0.8261|±  |0.0808|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8261|±  |0.0808|
+| - ceval-valid_operating_system                        |      2|none  |     0|acc                    |↑  | 0.6842|±  |0.1096|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6842|±  |0.1096|
+| - ceval-valid_physician                               |      2|none  |     0|acc                    |↑  | 0.6735|±  |0.0677|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6735|±  |0.0677|
+| - ceval-valid_plant_protection                        |      2|none  |     0|acc                    |↑  | 0.7727|±  |0.0914|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7727|±  |0.0914|
+| - ceval-valid_probability_and_statistics              |      2|none  |     0|acc                    |↑  | 0.5000|±  |0.1213|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5000|±  |0.1213|
+| - ceval-valid_professional_tour_guide                 |      2|none  |     0|acc                    |↑  | 0.5517|±  |0.0940|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5517|±  |0.0940|
 | - ceval-valid_sports_science                          |      2|none  |     0|acc                    |↑  | 0.6842|±  |0.1096|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.6842|±  |0.1096|
 | - ceval-valid_tax_accountant                          |      2|none  |     0|acc                    |↑  | 0.5714|±  |0.0714|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.5714|±  |0.0714|
-| - ceval-valid_teacher_qualification                   |      2|none  |     0|acc                    |↑  | 0.7727|±  |0.0639|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.7727|±  |0.0639|
-| - ceval-valid_urban_and_rural_planner                 |      2|none  |     0|acc                    |↑  | 0.6739|±  |0.0699|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6739|±  |0.0699|
-| - ceval-valid_veterinary_medicine                     |      2|none  |     0|acc                    |↑  | 0.6957|±  |0.0981|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6957|±  |0.0981|
-|hellaswag                                              |      1|none  |     0|acc                    |↑  | 0.4820|±  |0.0050|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.6521|±  |0.0048|
-|ifeval                                                 |      4|none  |     0|inst_level_loose_acc   |↑  | 0.2854|±  |   N/A|
-|                                                       |       |none  |     0|inst_level_strict_acc  |↑  | 0.2650|±  |   N/A|
-|                                                       |       |none  |     0|prompt_level_loose_acc |↑  | 0.1590|±  |0.0157|
-|                                                       |       |none  |     0|prompt_level_strict_acc|↑  | 0.1405|±  |0.0150|
-|longbench_2wikimqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.1690|±  |0.0214|
-|                                                       |       |none  |     0|score                  |↑  | 0.1690|±  |0.0214|
-|longbench_2wikimqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.1637|±  |0.0157|
-|                                                       |       |none  |     0|score                  |↑  | 0.1637|±  |0.0157|
-|longbench_dureader                                     |      5|none  |     0|rouge_zh_score         |↑  | 0.2438|±  |0.0158|
-|                                                       |       |none  |     0|score                  |↑  | 0.2438|±  |0.0158|
-|longbench_gov_report                                   |      5|none  |     0|rouge_score            |↑  | 0.3037|±  |0.0064|
-|                                                       |       |none  |     0|score                  |↑  | 0.3037|±  |0.0064|
-|longbench_gov_report_e                                 |      5|none  |     0|rouge_score            |↑  | 0.3125|±  |0.0050|
-|                                                       |       |none  |     0|score                  |↑  | 0.3125|±  |0.0050|
-|longbench_hotpotqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.1325|±  |0.0158|
-|                                                       |       |none  |     0|score                  |↑  | 0.1325|±  |0.0158|
-|longbench_hotpotqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.1886|±  |0.0162|
-|                                                       |       |none  |     0|score                  |↑  | 0.1886|±  |0.0162|
-|longbench_lcc                                          |      5|none  |     0|code_sim_score         |↑  | 0.0593|±  |0.0047|
-|                                                       |       |none  |     0|score                  |↑  | 0.0593|±  |0.0047|
-|longbench_lcc_e                                        |      5|none  |     0|code_sim_score         |↑  | 0.1072|±  |0.0104|
-|                                                       |       |none  |     0|score                  |↑  | 0.1072|±  |0.0104|
-|longbench_lsht                                         |      5|none  |     0|classification_score   |↑  | 0.3417|±  |0.0322|
-|                                                       |       |none  |     0|score                  |↑  | 0.3417|±  |0.0322|
-|longbench_multi_news                                   |      5|none  |     0|rouge_score            |↑  | 0.2416|±  |0.0070|
-|                                                       |       |none  |     0|score                  |↑  | 0.2416|±  |0.0070|
-|longbench_multi_news_e                                 |      5|none  |     0|rouge_score            |↑  | 0.1882|±  |0.0062|
-|                                                       |       |none  |     0|score                  |↑  | 0.1882|±  |0.0062|
-|longbench_multifieldqa_en                              |      5|none  |     0|qa_f1_score            |↑  | 0.3802|±  |0.0250|
-|                                                       |       |none  |     0|score                  |↑  | 0.3802|±  |0.0250|
-|longbench_multifieldqa_en_e                            |      5|none  |     0|qa_f1_score            |↑  | 0.3802|±  |0.0250|
-|                                                       |       |none  |     0|score                  |↑  | 0.3802|±  |0.0250|
-|longbench_multifieldqa_zh                              |      5|none  |     0|qa_f1_zh_score         |↑  | 0.2911|±  |0.0179|
-|                                                       |       |none  |     0|score                  |↑  | 0.2911|±  |0.0179|
-|longbench_musique                                      |      5|none  |     0|qa_f1_score            |↑  | 0.0619|±  |0.0087|
-|                                                       |       |none  |     0|score                  |↑  | 0.0619|±  |0.0087|
-|longbench_narrativeqa                                  |      5|none  |     0|qa_f1_score            |↑  | 0.0709|±  |0.0095|
-|                                                       |       |none  |     0|score                  |↑  | 0.0709|±  |0.0095|
-|longbench_passage_count                                |      5|none  |     0|count_score            |↑  | 0.0237|±  |0.0101|
-|                                                       |       |none  |     0|score                  |↑  | 0.0237|±  |0.0101|
-|longbench_passage_count_e                              |      5|none  |     0|count_score            |↑  | 0.0471|±  |0.0122|
-|                                                       |       |none  |     0|score                  |↑  | 0.0471|±  |0.0122|
-|longbench_passage_retrieval_en                         |      5|none  |     0|retrieval_score        |↑  | 0.1825|±  |0.0273|
-|                                                       |       |none  |     0|score                  |↑  | 0.1825|±  |0.0273|
-|longbench_passage_retrieval_en_e                       |      5|none  |     0|retrieval_score        |↑  | 0.2950|±  |0.0263|
-|                                                       |       |none  |     0|score                  |↑  | 0.2950|±  |0.0263|
-|longbench_qasper                                       |      5|none  |     0|qa_f1_score            |↑  | 0.2676|±  |0.0204|
-|                                                       |       |none  |     0|score                  |↑  | 0.2676|±  |0.0204|
-|longbench_qasper_e                                     |      5|none  |     0|qa_f1_score            |↑  | 0.2498|±  |0.0183|
-|                                                       |       |none  |     0|score                  |↑  | 0.2498|±  |0.0183|
-|longbench_qmsum                                        |      5|none  |     0|rouge_score            |↑  | 0.2080|±  |0.0052|
-|                                                       |       |none  |     0|score                  |↑  | 0.2080|±  |0.0052|
-|longbench_repobench-p                                  |      5|none  |     0|code_sim_score         |↑  | 0.0959|±  |0.0071|
-|                                                       |       |none  |     0|score                  |↑  | 0.0959|±  |0.0071|
-|longbench_repobench-p_e                                |      5|none  |     0|code_sim_score         |↑  | 0.0995|±  |0.0091|
-|                                                       |       |none  |     0|score                  |↑  | 0.0995|±  |0.0091|
-|longbench_samsum                                       |      5|none  |     0|rouge_score            |↑  | 0.3584|±  |0.0101|
-|                                                       |       |none  |     0|score                  |↑  | 0.3584|±  |0.0101|
-|longbench_samsum_e                                     |      5|none  |     0|rouge_score            |↑  | 0.3463|±  |0.0076|
-|                                                       |       |none  |     0|score                  |↑  | 0.3463|±  |0.0076|
-|longbench_trec                                         |      5|none  |     0|classification_score   |↑  | 0.4050|±  |0.0220|
-|                                                       |       |none  |     0|score                  |↑  | 0.4050|±  |0.0220|
-|longbench_trec_e                                       |      5|none  |     0|classification_score   |↑  | 0.3750|±  |0.0172|
-|                                                       |       |none  |     0|score                  |↑  | 0.3750|±  |0.0172|
-|longbench_triviaqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.2134|±  |0.0077|
-|                                                       |       |none  |     0|score                  |↑  | 0.2134|±  |0.0077|
-|longbench_triviaqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.2057|±  |0.0059|
-|                                                       |       |none  |     0|score                  |↑  | 0.2057|±  |0.0059|
-|longbench_vcsum                                        |      5|none  |     0|rouge_zh_score         |↑  | 0.1002|±  |0.0033|
-|                                                       |       |none  |     0|score                  |↑  | 0.1002|±  |0.0033|
-|mmlu                                                   |      2|none  |      |acc                    |↑  | 0.5998|±  |0.0039|
-| - humanities                                          |      2|none  |      |acc                    |↑  | 0.5107|±  |0.0068|
-|  - formal_logic                                       |      1|none  |     0|acc                    |↑  | 0.4762|±  |0.0447|
-|  - high_school_european_history                       |      1|none  |     0|acc                    |↑  | 0.6909|±  |0.0361|
-|  - high_school_us_history                             |      1|none  |     0|acc                    |↑  | 0.7108|±  |0.0318|
-|  - high_school_world_history                          |      1|none  |     0|acc                    |↑  | 0.7848|±  |0.0268|
-|  - international_law                                  |      1|none  |     0|acc                    |↑  | 0.8017|±  |0.0364|
+| - ceval-valid_teacher_qualification                   |      2|none  |     0|acc                    |↑  | 0.7955|±  |0.0615|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7955|±  |0.0615|
+| - ceval-valid_urban_and_rural_planner                 |      2|none  |     0|acc                    |↑  | 0.6304|±  |0.0720|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6304|±  |0.0720|
+| - ceval-valid_veterinary_medicine                     |      2|none  |     0|acc                    |↑  | 0.7391|±  |0.0936|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7391|±  |0.0936|
+|hellaswag                                              |      1|none  |     0|acc                    |↑  | 0.4852|±  |0.0050|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6547|±  |0.0047|
+|ifeval                                                 |      4|none  |     0|inst_level_loose_acc   |↑  | 0.2878|±  |   N/A|
+|                                                       |       |none  |     0|inst_level_strict_acc  |↑  | 0.2758|±  |   N/A|
+|                                                       |       |none  |     0|prompt_level_loose_acc |↑  | 0.1701|±  |0.0162|
+|                                                       |       |none  |     0|prompt_level_strict_acc|↑  | 0.1590|±  |0.0157|
+|longbench_2wikimqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.2193|±  |0.0256|
+|                                                       |       |none  |     0|score                  |↑  | 0.2193|±  |0.0256|
+|longbench_2wikimqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.2354|±  |0.0214|
+|                                                       |       |none  |     0|score                  |↑  | 0.2354|±  |0.0214|
+|longbench_dureader                                     |      5|none  |     0|rouge_zh_score         |↑  | 0.1651|±  |0.0088|
+|                                                       |       |none  |     0|score                  |↑  | 0.1651|±  |0.0088|
+|longbench_gov_report                                   |      5|none  |     0|rouge_score            |↑  | 0.2401|±  |0.0051|
+|                                                       |       |none  |     0|score                  |↑  | 0.2401|±  |0.0051|
+|longbench_gov_report_e                                 |      5|none  |     0|rouge_score            |↑  | 0.2595|±  |0.0040|
+|                                                       |       |none  |     0|score                  |↑  | 0.2595|±  |0.0040|
+|longbench_hotpotqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.2486|±  |0.0251|
+|                                                       |       |none  |     0|score                  |↑  | 0.2486|±  |0.0251|
+|longbench_hotpotqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.2832|±  |0.0218|
+|                                                       |       |none  |     0|score                  |↑  | 0.2832|±  |0.0218|
+|longbench_lcc                                          |      5|none  |     0|code_sim_score         |↑  | 0.0625|±  |0.0061|
+|                                                       |       |none  |     0|score                  |↑  | 0.0625|±  |0.0061|
+|longbench_lcc_e                                        |      5|none  |     0|code_sim_score         |↑  | 0.1559|±  |0.0141|
+|                                                       |       |none  |     0|score                  |↑  | 0.1559|±  |0.0141|
+|longbench_lsht                                         |      5|none  |     0|classification_score   |↑  | 0.2542|±  |0.0285|
+|                                                       |       |none  |     0|score                  |↑  | 0.2542|±  |0.0285|
+|longbench_multi_news                                   |      5|none  |     0|rouge_score            |↑  | 0.2492|±  |0.0054|
+|                                                       |       |none  |     0|score                  |↑  | 0.2492|±  |0.0054|
+|longbench_multi_news_e                                 |      5|none  |     0|rouge_score            |↑  | 0.2112|±  |0.0050|
+|                                                       |       |none  |     0|score                  |↑  | 0.2112|±  |0.0050|
+|longbench_multifieldqa_en                              |      5|none  |     0|qa_f1_score            |↑  | 0.4121|±  |0.0265|
+|                                                       |       |none  |     0|score                  |↑  | 0.4121|±  |0.0265|
+|longbench_multifieldqa_en_e                            |      5|none  |     0|qa_f1_score            |↑  | 0.4121|±  |0.0265|
+|                                                       |       |none  |     0|score                  |↑  | 0.4121|±  |0.0265|
+|longbench_multifieldqa_zh                              |      5|none  |     0|qa_f1_zh_score         |↑  | 0.4244|±  |0.0220|
+|                                                       |       |none  |     0|score                  |↑  | 0.4244|±  |0.0220|
+|longbench_musique                                      |      5|none  |     0|qa_f1_score            |↑  | 0.0870|±  |0.0145|
+|                                                       |       |none  |     0|score                  |↑  | 0.0870|±  |0.0145|
+|longbench_narrativeqa                                  |      5|none  |     0|qa_f1_score            |↑  | 0.0837|±  |0.0100|
+|                                                       |       |none  |     0|score                  |↑  | 0.0837|±  |0.0100|
+|longbench_passage_count                                |      5|none  |     0|count_score            |↑  | 0.0150|±  |0.0086|
+|                                                       |       |none  |     0|score                  |↑  | 0.0150|±  |0.0086|
+|longbench_passage_count_e                              |      5|none  |     0|count_score            |↑  | 0.0500|±  |0.0126|
+|                                                       |       |none  |     0|score                  |↑  | 0.0500|±  |0.0126|
+|longbench_passage_retrieval_en                         |      5|none  |     0|retrieval_score        |↑  | 0.2750|±  |0.0317|
+|                                                       |       |none  |     0|score                  |↑  | 0.2750|±  |0.0317|
+|longbench_passage_retrieval_en_e                       |      5|none  |     0|retrieval_score        |↑  | 0.4867|±  |0.0289|
+|                                                       |       |none  |     0|score                  |↑  | 0.4867|±  |0.0289|
+|longbench_qasper                                       |      5|none  |     0|qa_f1_score            |↑  | 0.2870|±  |0.0230|
+|                                                       |       |none  |     0|score                  |↑  | 0.2870|±  |0.0230|
+|longbench_qasper_e                                     |      5|none  |     0|qa_f1_score            |↑  | 0.2745|±  |0.0218|
+|                                                       |       |none  |     0|score                  |↑  | 0.2745|±  |0.0218|
+|longbench_qmsum                                        |      5|none  |     0|rouge_score            |↑  | 0.2272|±  |0.0049|
+|                                                       |       |none  |     0|score                  |↑  | 0.2272|±  |0.0049|
+|longbench_repobench-p                                  |      5|none  |     0|code_sim_score         |↑  | 0.1389|±  |0.0101|
+|                                                       |       |none  |     0|score                  |↑  | 0.1389|±  |0.0101|
+|longbench_repobench-p_e                                |      5|none  |     0|code_sim_score         |↑  | 0.1322|±  |0.0116|
+|                                                       |       |none  |     0|score                  |↑  | 0.1322|±  |0.0116|
+|longbench_samsum                                       |      5|none  |     0|rouge_score            |↑  | 0.3394|±  |0.0089|
+|                                                       |       |none  |     0|score                  |↑  | 0.3394|±  |0.0089|
+|longbench_samsum_e                                     |      5|none  |     0|rouge_score            |↑  | 0.3299|±  |0.0066|
+|                                                       |       |none  |     0|score                  |↑  | 0.3299|±  |0.0066|
+|longbench_trec                                         |      5|none  |     0|classification_score   |↑  | 0.4192|±  |0.0221|
+|                                                       |       |none  |     0|score                  |↑  | 0.4192|±  |0.0221|
+|longbench_trec_e                                       |      5|none  |     0|classification_score   |↑  | 0.3939|±  |0.0177|
+|                                                       |       |none  |     0|score                  |↑  | 0.3939|±  |0.0177|
+|longbench_triviaqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.2178|±  |0.0081|
+|                                                       |       |none  |     0|score                  |↑  | 0.2178|±  |0.0081|
+|longbench_triviaqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.2185|±  |0.0063|
+|                                                       |       |none  |     0|score                  |↑  | 0.2185|±  |0.0063|
+|longbench_vcsum                                        |      5|none  |     0|rouge_zh_score         |↑  | 0.1089|±  |0.0053|
+|                                                       |       |none  |     0|score                  |↑  | 0.1089|±  |0.0053|
+|mmlu                                                   |      2|none  |      |acc                    |↑  | 0.6008|±  |0.0039|
+| - humanities                                          |      2|none  |      |acc                    |↑  | 0.5084|±  |0.0067|
+|  - formal_logic                                       |      1|none  |     0|acc                    |↑  | 0.5079|±  |0.0447|
+|  - high_school_european_history                       |      1|none  |     0|acc                    |↑  | 0.7273|±  |0.0348|
+|  - high_school_us_history                             |      1|none  |     0|acc                    |↑  | 0.7255|±  |0.0313|
+|  - high_school_world_history                          |      1|none  |     0|acc                    |↑  | 0.7764|±  |0.0271|
+|  - international_law                                  |      1|none  |     0|acc                    |↑  | 0.8182|±  |0.0352|
 |  - jurisprudence                                      |      1|none  |     0|acc                    |↑  | 0.7222|±  |0.0433|
-|  - logical_fallacies                                  |      1|none  |     0|acc                    |↑  | 0.7546|±  |0.0338|
+|  - logical_fallacies                                  |      1|none  |     0|acc                    |↑  | 0.7423|±  |0.0344|
 |  - moral_disputes                                     |      1|none  |     0|acc                    |↑  | 0.6590|±  |0.0255|
-|  - moral_scenarios                                    |      1|none  |     0|acc                    |↑  | 0.2469|±  |0.0144|
-|  - philosophy                                         |      1|none  |     0|acc                    |↑  | 0.6399|±  |0.0273|
-|  - prehistory                                         |      1|none  |     0|acc                    |↑  | 0.6327|±  |0.0268|
-|  - professional_law                                   |      1|none  |     0|acc                    |↑  | 0.4055|±  |0.0125|
-|  - world_religions                                    |      1|none  |     0|acc                    |↑  | 0.7310|±  |0.0340|
-| - other                                               |      2|none  |      |acc                    |↑  | 0.6437|±  |0.0083|
-|  - business_ethics                                    |      1|none  |     0|acc                    |↑  | 0.6300|±  |0.0485|
-|  - clinical_knowledge                                 |      1|none  |     0|acc                    |↑  | 0.6453|±  |0.0294|
-|  - college_medicine                                   |      1|none  |     0|acc                    |↑  | 0.5896|±  |0.0375|
+|  - moral_scenarios                                    |      1|none  |     0|acc                    |↑  | 0.2223|±  |0.0139|
+|  - philosophy                                         |      1|none  |     0|acc                    |↑  | 0.6527|±  |0.0270|
+|  - prehistory                                         |      1|none  |     0|acc                    |↑  | 0.6389|±  |0.0267|
+|  - professional_law                                   |      1|none  |     0|acc                    |↑  | 0.4003|±  |0.0125|
+|  - world_religions                                    |      1|none  |     0|acc                    |↑  | 0.7427|±  |0.0335|
+| - other                                               |      2|none  |      |acc                    |↑  | 0.6540|±  |0.0083|
+|  - business_ethics                                    |      1|none  |     0|acc                    |↑  | 0.6400|±  |0.0482|
+|  - clinical_knowledge                                 |      1|none  |     0|acc                    |↑  | 0.6679|±  |0.0290|
+|  - college_medicine                                   |      1|none  |     0|acc                    |↑  | 0.6069|±  |0.0372|
 |  - global_facts                                       |      1|none  |     0|acc                    |↑  | 0.2900|±  |0.0456|
-|  - human_aging                                        |      1|none  |     0|acc                    |↑  | 0.6233|±  |0.0325|
-|  - management                                         |      1|none  |     0|acc                    |↑  | 0.7670|±  |0.0419|
-|  - marketing                                          |      1|none  |     0|acc                    |↑  | 0.8462|±  |0.0236|
-|  - medical_genetics                                   |      1|none  |     0|acc                    |↑  | 0.7000|±  |0.0461|
-|  - miscellaneous                                      |      1|none  |     0|acc                    |↑  | 0.7356|±  |0.0158|
-|  - nutrition                                          |      1|none  |     0|acc                    |↑  | 0.6797|±  |0.0267|
-|  - professional_accounting                            |      1|none  |     0|acc                    |↑  | 0.4433|±  |0.0296|
-|  - professional_medicine                              |      1|none  |     0|acc                    |↑  | 0.5846|±  |0.0299|
-|  - virology                                           |      1|none  |     0|acc                    |↑  | 0.4880|±  |0.0389|
-| - social sciences                                     |      2|none  |      |acc                    |↑  | 0.7127|±  |0.0080|
-|  - econometrics                                       |      1|none  |     0|acc                    |↑  | 0.4825|±  |0.0470|
-|  - high_school_geography                              |      1|none  |     0|acc                    |↑  | 0.7879|±  |0.0291|
-|  - high_school_government_and_politics                |      1|none  |     0|acc                    |↑  | 0.8083|±  |0.0284|
-|  - high_school_macroeconomics                         |      1|none  |     0|acc                    |↑  | 0.6538|±  |0.0241|
-|  - high_school_microeconomics                         |      1|none  |     0|acc                    |↑  | 0.7395|±  |0.0285|
-|  - high_school_psychology                             |      1|none  |     0|acc                    |↑  | 0.8257|±  |0.0163|
-|  - human_sexuality                                    |      1|none  |     0|acc                    |↑  | 0.7176|±  |0.0395|
-|  - professional_psychology                            |      1|none  |     0|acc                    |↑  | 0.6062|±  |0.0198|
-|  - public_relations                                   |      1|none  |     0|acc                    |↑  | 0.5909|±  |0.0471|
-|  - security_studies                                   |      1|none  |     0|acc                    |↑  | 0.7265|±  |0.0285|
-|  - sociology                                          |      1|none  |     0|acc                    |↑  | 0.7811|±  |0.0292|
-|  - us_foreign_policy                                  |      1|none  |     0|acc                    |↑  | 0.8000|±  |0.0402|
-| - stem                                                |      2|none  |      |acc                    |↑  | 0.5794|±  |0.0085|
+|  - human_aging                                        |      1|none  |     0|acc                    |↑  | 0.6188|±  |0.0326|
+|  - management                                         |      1|none  |     0|acc                    |↑  | 0.7864|±  |0.0406|
+|  - marketing                                          |      1|none  |     0|acc                    |↑  | 0.8547|±  |0.0231|
+|  - medical_genetics                                   |      1|none  |     0|acc                    |↑  | 0.7100|±  |0.0456|
+|  - miscellaneous                                      |      1|none  |     0|acc                    |↑  | 0.7280|±  |0.0159|
+|  - nutrition                                          |      1|none  |     0|acc                    |↑  | 0.6993|±  |0.0263|
+|  - professional_accounting                            |      1|none  |     0|acc                    |↑  | 0.4645|±  |0.0298|
+|  - professional_medicine                              |      1|none  |     0|acc                    |↑  | 0.6250|±  |0.0294|
+|  - virology                                           |      1|none  |     0|acc                    |↑  | 0.4940|±  |0.0389|
+| - social sciences                                     |      2|none  |      |acc                    |↑  | 0.7130|±  |0.0080|
+|  - econometrics                                       |      1|none  |     0|acc                    |↑  | 0.5175|±  |0.0470|
+|  - high_school_geography                              |      1|none  |     0|acc                    |↑  | 0.8131|±  |0.0278|
+|  - high_school_government_and_politics                |      1|none  |     0|acc                    |↑  | 0.7824|±  |0.0298|
+|  - high_school_macroeconomics                         |      1|none  |     0|acc                    |↑  | 0.6359|±  |0.0244|
+|  - high_school_microeconomics                         |      1|none  |     0|acc                    |↑  | 0.7185|±  |0.0292|
+|  - high_school_psychology                             |      1|none  |     0|acc                    |↑  | 0.8312|±  |0.0161|
+|  - human_sexuality                                    |      1|none  |     0|acc                    |↑  | 0.7405|±  |0.0384|
+|  - professional_psychology                            |      1|none  |     0|acc                    |↑  | 0.6176|±  |0.0197|
+|  - public_relations                                   |      1|none  |     0|acc                    |↑  | 0.6000|±  |0.0469|
+|  - security_studies                                   |      1|none  |     0|acc                    |↑  | 0.6980|±  |0.0294|
+|  - sociology                                          |      1|none  |     0|acc                    |↑  | 0.7960|±  |0.0285|
+|  - us_foreign_policy                                  |      1|none  |     0|acc                    |↑  | 0.7900|±  |0.0409|
+| - stem                                                |      2|none  |      |acc                    |↑  | 0.5769|±  |0.0085|
 |  - abstract_algebra                                   |      1|none  |     0|acc                    |↑  | 0.3700|±  |0.0485|
-|  - anatomy                                            |      1|none  |     0|acc                    |↑  | 0.5926|±  |0.0424|
-|  - astronomy                                          |      1|none  |     0|acc                    |↑  | 0.7105|±  |0.0369|
+|  - anatomy                                            |      1|none  |     0|acc                    |↑  | 0.6074|±  |0.0422|
+|  - astronomy                                          |      1|none  |     0|acc                    |↑  | 0.7237|±  |0.0364|
 |  - college_biology                                    |      1|none  |     0|acc                    |↑  | 0.7569|±  |0.0359|
 |  - college_chemistry                                  |      1|none  |     0|acc                    |↑  | 0.4200|±  |0.0496|
-|  - college_computer_science                           |      1|none  |     0|acc                    |↑  | 0.6000|±  |0.0492|
-|  - college_mathematics                                |      1|none  |     0|acc                    |↑  | 0.3900|±  |0.0490|
-|  - college_physics                                    |      1|none  |     0|acc                    |↑  | 0.4412|±  |0.0494|
-|  - computer_security                                  |      1|none  |     0|acc                    |↑  | 0.8000|±  |0.0402|
-|  - conceptual_physics                                 |      1|none  |     0|acc                    |↑  | 0.6213|±  |0.0317|
-|  - electrical_engineering                             |      1|none  |     0|acc                    |↑  | 0.6069|±  |0.0407|
-|  - elementary_mathematics                             |      1|none  |     0|acc                    |↑  | 0.5556|±  |0.0256|
+|  - college_computer_science                           |      1|none  |     0|acc                    |↑  | 0.5700|±  |0.0498|
+|  - college_mathematics                                |      1|none  |     0|acc                    |↑  | 0.3600|±  |0.0482|
+|  - college_physics                                    |      1|none  |     0|acc                    |↑  | 0.4020|±  |0.0488|
+|  - computer_security                                  |      1|none  |     0|acc                    |↑  | 0.7700|±  |0.0423|
+|  - conceptual_physics                                 |      1|none  |     0|acc                    |↑  | 0.6511|±  |0.0312|
+|  - electrical_engineering                             |      1|none  |     0|acc                    |↑  | 0.6138|±  |0.0406|
+|  - elementary_mathematics                             |      1|none  |     0|acc                    |↑  | 0.5661|±  |0.0255|
 |  - high_school_biology                                |      1|none  |     0|acc                    |↑  | 0.7839|±  |0.0234|
 |  - high_school_chemistry                              |      1|none  |     0|acc                    |↑  | 0.5813|±  |0.0347|
-|  - high_school_computer_science                       |      1|none  |     0|acc                    |↑  | 0.6900|±  |0.0465|
-|  - high_school_mathematics                            |      1|none  |     0|acc                    |↑  | 0.4296|±  |0.0302|
-|  - high_school_physics                                |      1|none  |     0|acc                    |↑  | 0.4371|±  |0.0405|
-|  - high_school_statistics                             |      1|none  |     0|acc                    |↑  | 0.5602|±  |0.0339|
+|  - high_school_computer_science                       |      1|none  |     0|acc                    |↑  | 0.7000|±  |0.0461|
+|  - high_school_mathematics                            |      1|none  |     0|acc                    |↑  | 0.3926|±  |0.0298|
+|  - high_school_physics                                |      1|none  |     0|acc                    |↑  | 0.4172|±  |0.0403|
+|  - high_school_statistics                             |      1|none  |     0|acc                    |↑  | 0.5648|±  |0.0338|
 |  - machine_learning                                   |      1|none  |     0|acc                    |↑  | 0.4464|±  |0.0472|
-|openbookqa                                             |      1|none  |     0|acc                    |↑  | 0.2980|±  |0.0205|
-|                                                       |       |none  |     0|acc_norm               |↑  | 0.3920|±  |0.0219|
-|piqa                                                   |      1|none  |     0|acc                    |↑  | 0.7541|±  |0.0100|
+|niah_single_1                                          |      1|none  |     0|32768                  |↑  | 0.9880|±  |   N/A|
+|                                                       |       |none  |     0|4096                   |↑  |-1.0000|±  |   N/A|
+|niah_single_2                                          |      1|none  |     0|32768                  |↑  | 0.2440|±  |   N/A|
+|                                                       |       |none  |     0|4096                   |↑  |-1.0000|±  |   N/A|
+|niah_single_3                                          |      1|none  |     0|32768                  |↑  | 0.2020|±  |   N/A|
+|                                                       |       |none  |     0|4096                   |↑  |-1.0000|±  |   N/A|
+|openbookqa                                             |      1|none  |     0|acc                    |↑  | 0.3060|±  |0.0206|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4020|±  |0.0219|
+|piqa                                                   |      1|none  |     0|acc                    |↑  | 0.7563|±  |0.0100|
 |                                                       |       |none  |     0|acc_norm               |↑  | 0.7601|±  |0.0100|
-|social_iqa                                             |      0|none  |     0|acc                    |↑  | 0.4616|±  |0.0113|
-|truthfulqa_gen                                         |      3|none  |     0|bleu_acc               |↑  | 0.4027|±  |0.0172|
-|                                                       |       |none  |     0|bleu_diff              |↑  |-0.1318|±  |0.0498|
-|                                                       |       |none  |     0|bleu_max               |↑  | 1.4033|±  |0.0856|
-|                                                       |       |none  |     0|rouge1_acc             |↑  | 0.4406|±  |0.0174|
-|                                                       |       |none  |     0|rouge1_diff            |↑  |-0.2033|±  |0.0886|
-|                                                       |       |none  |     0|rouge1_max             |↑  | 5.3768|±  |0.1446|
-|                                                       |       |none  |     0|rouge2_acc             |↑  | 0.3660|±  |0.0169|
-|                                                       |       |none  |     0|rouge2_diff            |↑  |-0.2816|±  |0.0959|
-|                                                       |       |none  |     0|rouge2_max             |↑  | 3.2554|±  |0.1305|
-|                                                       |       |none  |     0|rougeL_acc             |↑  | 0.4272|±  |0.0173|
-|                                                       |       |none  |     0|rougeL_diff            |↑  |-0.2099|±  |0.0884|
-|                                                       |       |none  |     0|rougeL_max             |↑  | 5.1236|±  |0.1410|
-|truthfulqa_mc1                                         |      2|none  |     0|acc                    |↑  | 0.2950|±  |0.0160|
-|truthfulqa_mc2                                         |      3|none  |     0|acc                    |↑  | 0.4511|±  |0.0144|
-|winogrande                                             |      1|none  |     0|acc                    |↑  | 0.6401|±  |0.0135|
-|niah_single_1|      1|none  |     0|  1024|   |1.000|±  |     0|
-|             |       |none  |     0| 16384|↑  |0.998|±  |   N/A|
-|             |       |none  |     0|  2048|   |1.000|±  |     0|
-|             |       |none  |     0| 32768|↑  |0.996|±  |   N/A|
-|             |       |none  |     0|  4096|↑  |1.000|±  |   N/A|
-|             |       |none  |     0|  8192|↑  |0.998|±  |   N/A|
-|niah_single_2|      1|none  |     0|  1024|   |1.000|±  |0.0000|
-|             |       |none  |     0| 16384|↑  |0.998|±  |   N/A|
-|             |       |none  |     0|  2048|   |1.000|±  |0.0000|
-|             |       |none  |     0| 32768|↑  |0.888|±  |   N/A|
-|             |       |none  |     0|  4096|↑  |1.000|±  |   N/A|
-|             |       |none  |     0|  8192|↑  |1.000|±  |   N/A|
-|niah_single_3|      1|none  |     0|  1024|   |1.000|±  |0.0000|
-|             |       |none  |     0| 16384|↑  |0.992|±  |   N/A|
-|             |       |none  |     0|  2048|   |0.998|±  |0.0020|
-|             |       |none  |     0| 32768|↑  |0.922|±  |   N/A|
-|             |       |none  |     0|  4096|↑  |0.996|±  |   N/A|
-|             |       |none  |     0|  8192|↑  |0.980|±  |   N/A|
+|social_iqa                                             |      0|none  |     0|acc                    |↑  | 0.4698|±  |0.0113|
+|truthfulqa_gen                                         |      3|none  |     0|bleu_acc               |↑  | 0.3880|±  |0.0171|
+|                                                       |       |none  |     0|bleu_diff              |↑  |-0.1583|±  |0.0542|
+|                                                       |       |none  |     0|bleu_max               |↑  | 1.3547|±  |0.0859|
+|                                                       |       |none  |     0|rouge1_acc             |↑  | 0.4186|±  |0.0173|
+|                                                       |       |none  |     0|rouge1_diff            |↑  |-0.1502|±  |0.0865|
+|                                                       |       |none  |     0|rouge1_max             |↑  | 5.2079|±  |0.1522|
+|                                                       |       |none  |     0|rouge2_acc             |↑  | 0.3623|±  |0.0168|
+|                                                       |       |none  |     0|rouge2_diff            |↑  |-0.3077|±  |0.0990|
+|                                                       |       |none  |     0|rouge2_max             |↑  | 3.1597|±  |0.1290|
+|                                                       |       |none  |     0|rougeL_acc             |↑  | 0.4015|±  |0.0172|
+|                                                       |       |none  |     0|rougeL_diff            |↑  |-0.2003|±  |0.0866|
+|                                                       |       |none  |     0|rougeL_max             |↑  | 4.9586|±  |0.1463|
+|truthfulqa_mc1                                         |      2|none  |     0|acc                    |↑  | 0.2999|±  |0.0160|
+|truthfulqa_mc2                                         |      3|none  |     0|acc                    |↑  | 0.4601|±  |0.0145|
+|winogrande                                             |      1|none  |     0|acc                    |↑  | 0.6598|±  |0.0133|
+|niah_single_1|      1|none  |     0|  1024|   |-1|±  |     0|
+|             |       |none  |     0| 16384|↑  |-1|±  |   N/A|
+|             |       |none  |     0|  2048|   |-1|±  |     0|
+|             |       |none  |     0| 32768|↑  |0.946|±  |   N/A|
+|             |       |none  |     0|  4096|↑  |-1|±  |   N/A|
+|             |       |none  |     0|  8192|↑  |-1|±  |   N/A|
+|niah_single_2|      1|none  |     0|  1024|   |-1|±  |0.0000|
+|             |       |none  |     0| 16384|↑  |-1|±  |   N/A|
+|             |       |none  |     0|  2048|   |-1|±  |0.0000|
+|             |       |none  |     0| 32768|↑  |0.204|±  |   N/A|
+|             |       |none  |     0|  4096|↑  |-1|±  |   N/A|
+|             |       |none  |     0|  8192|↑  |-1|±  |   N/A|
+|niah_single_3|      1|none  |     0|  1024|   |-1|±  |0.0000|
+|             |       |none  |     0| 16384|↑  |-1|±  |   N/A|
+|             |       |none  |     0|  2048|   |-1|±  |0.0020|
+|             |       |none  |     0| 32768|↑  |0.172|±  |   N/A|
+|             |       |none  |     0|  4096|↑  |-1|±  |   N/A|
+|             |       |none  |     0|  8192|↑  |-1|±  |   N/A|
     """
 }
 
