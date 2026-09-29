@@ -14,5 +14,5 @@ log_kv_alpha_span_max_tokens: 64
 log_kv_seg_gap_max: null
 log_kv_seg_block_level: 0
 log_kv_semantic_replay_updates: true
-# Four disjoint MNN sweeps per frozen distance matrix; 1 restores original pairing.
-log_kv_semantic_merge_passes: 4
+# Incremental device-resident Ward rounds; 4 keeps the frozen-center comparison path.
+log_kv_semantic_merge_passes: 1
