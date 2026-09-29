@@ -345,18 +345,25 @@ def _lance_williams(DIST, MU, MASS, RADIUS, LIMITS, ALIVE, KEEP, PARTNER, PMA, P
         for start in range(0, M, BLOCK):
             cols = start + tl.arange(0, BLOCK)
             inb = cols < M
-            new = (alpha * tl.load(DIST + (base + a) * M + cols, inb, 0.0)
-                   + beta * tl.load(DIST + (base + b) * M + cols, inb, 0.0) - shift)
+            x_aa = tl.load(DIST + (base + a) * M + cols, inb, 0.0)
+            x_ba = tl.load(DIST + (base + b) * M + cols, inb, 0.0)
+            new = alpha * x_aa + beta * x_ba - shift
             keep = inb & (tl.load(KEEP + base + cols, inb, -1) == ROUND)
             q = tl.load(PARTNER + base + cols, keep, 0)
-            partner = (alpha * tl.load(DIST + (base + a) * M + q, keep, 0.0)
-                       + beta * tl.load(DIST + (base + b) * M + q, keep, 0.0) - shift)
+            x_ab = tl.load(DIST + (base + a) * M + q, keep, 0.0)
+            x_bb = tl.load(DIST + (base + b) * M + q, keep, 0.0)
             qa = tl.load(PMA + base + cols, keep, 1.0)
             qb = tl.load(PMB + base + cols, keep, 0.0)
             qalpha = tl.div_rn(qa, qa + qb)
             qbeta = tl.div_rn(qb, qa + qb)
-            both = qalpha * new + qbeta * partner - qalpha * qbeta * tl.load(PDAB + base + cols, keep, 0.0)
-            new = tl.where(keep, both, new)
+            qshift = qalpha * qbeta * tl.load(PDAB + base + cols, keep, 0.0)
+            # Both clusters merged this round: expand the lower keep first, so
+            # the program owning the other row computes the same bits and D
+            # stays exactly symmetric (asymmetry can leave no mutual pair).
+            own_first = qalpha * new + qbeta * (alpha * x_ab + beta * x_bb - shift) - qshift
+            other_first = (alpha * (qalpha * x_aa + qbeta * x_ab - qshift)
+                           + beta * (qalpha * x_ba + qbeta * x_bb - qshift) - shift)
+            new = tl.where(keep, tl.where(a < cols, own_first, other_first), new)
             new = tl.where(cols == a, 0.0, tl.maximum(new, 0.0))
             alive = inb & (tl.load(ALIVE + base + cols, inb, 0) != 0)
             tl.store(DIST + (base + a) * M + cols, new, alive)
@@ -372,6 +379,31 @@ def _lance_williams(DIST, MU, MASS, RADIUS, LIMITS, ALIVE, KEEP, PARTNER, PMA, P
             result = tl.minimum(result, tl.min(packed, axis=0))
             tl.atomic_min(PACKED + base + cols, packed, mask=valid & ~keep)
         tl.store(PACKED + base + a, result)
+
+
+@triton.jit(do_not_specialize=["M"])
+def _mirror(DIST, M, BLOCK: tl.constexpr):
+    """Copy the upper triangle onto the lower one, in place and exactly."""
+    bi = tl.program_id(0)
+    bj = tl.program_id(1)
+    if bj <= bi:
+        base = tl.program_id(2).to(tl.int64) * M * M
+        rows = bi * BLOCK + tl.arange(0, BLOCK)
+        cols = bj * BLOCK + tl.arange(0, BLOCK)
+        # Read the transposed tile row-contiguously; lower entries are never sources.
+        upper = tl.load(DIST + base + cols[:, None].to(tl.int64) * M + rows[None, :],
+                        (cols < M)[:, None] & (rows < M)[None, :], 0.0)
+        lower = (rows[:, None] > cols[None, :]) & (rows < M)[:, None] & (cols < M)[None, :]
+        tl.store(DIST + base + rows[:, None].to(tl.int64) * M + cols[None, :], tl.trans(upper), lower)
+
+
+def mirror(dist):
+    """Make [L, M, M] exactly symmetric; the incremental rounds rely on it."""
+    lanes, size = dist.shape[:2]
+    if lanes and size > 1:
+        tiles = triton.cdiv(size, 32)
+        _mirror[(tiles, tiles, lanes)](dist, size, 32, num_warps=4)
+    return dist
 
 
 class UnifiedReduce:

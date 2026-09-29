@@ -213,6 +213,43 @@ profile 标签：`logkv/candidates`、`logkv/global_merge`、`logkv/merge_round`
 `batched_write`；`pair_search`/`merge_pack` 只在容量硬上限回退路径出现。诊断模式的
 `merge_rounds` 记录每轮各组实际合并的配对数。
 
+### 第六轮补丁：距离矩阵保持严格对称（修复 “no finite merge cost”）
+
+A800 实测第六轮：`route_median_s_per_flush` 0.0728 s（第四轮 0.617 s），
+`reference_incremental_verified: true`。但实际运行报错
+`RuntimeError: unified routing has no finite merge cost to satisfy the cluster budget`。
+
+原因：同一轮里两个簇都被合并时，它们之间的新距离由两个 Triton 程序各自用二次
+Lance–Williams 公式计算，展开顺序相反（p 先 q 后、q 先 p 后），float32 舍入不同，
+D 出现 ulp 级不对称。D 对称时，全局最小键的那一对必然互为最近邻；不对称时，近似平局
+可能形成 p→q→r→p 的偏好环，没有任何互为最近邻的配对，于是簇数仍大于 K 时报错。
+原全量重算实现每轮都从对称的 Gram 出发，没有这个问题。CPU 上用格点加 ulp 级噪声构造
+的输入，400 次全部出现不对称（最大绝对差 6.0，距离量级 1e6）。
+
+修复：
+
+1. 两个都被合并的簇之间，固定按“保留下标小的一侧先展开”计算。借助旧 D 的对称性，
+   两侧程序读到相同的四个旧距离、按同一运算顺序求值，写入逐位相同的值；其余条目本来
+   就由同一程序同时写入行和列。修复后同样的 400 次输入不对称为 0。
+2. 初始矩阵显式把上三角镜像到下三角（CUDA 用一个 Triton 核，其余用 Torch 分块复制），
+   不再依赖 GEMM 恰好逐位对称。
+3. 兜底：全局阶段若仍有组找不到互近邻配对，只把这些组交给原全量重算重跑，并警告一次；
+   真的没有有限代价时仍抛出原错误。
+4. 顺带修复：生产路由之前绕过了容量硬上限；硬上限非零时现在走全量重算（原行为）。
+5. CPU 上 `from_numpy(...).to('cpu')` 与调用方数组共享内存，质量原地更新会改写调用方
+   权重；现改为复制。
+
+验证（CPU）：`tests/test_log_kv_unified.py` 38 项通过，新增逐轮对称性、卡住回退、
+硬上限路由三项；Triton 核在解释器中与 Torch 参照逐位一致，且两者的 D 始终严格对称；
+与修改前代码的缓存状态对照仍逐位一致。基准预检 `check_incremental_reduce` 新增格点
+近平局用例，并断言 D 严格对称。
+
+v1.7 profile 读法（下一步）：最后一次 flush 带 profiler 为 109 ms，GPU 自身 50 ms；
+轮次循环已转为 GPU 受限（`cudaEventSynchronize` 11 ms 是主机在等 GPU）。GPU 热点是
+`_scan`（16.2 ms/120 次）和 `_lance_williams`（16.1 ms/116 次）：前者逐行、逐程序串行
+检查脏行，后者对每个存活列都做一次 64 位 atomic min。可先读当前键、只在更小时推送，
+并把 `_scan` 改为多行二维 tile。主机侧 `batched_write` 仍有约 15 ms Python。
+
 ## 第一轮评测
 
 使用已完成训练的同一个具体 `step_*` checkpoint。新配置
