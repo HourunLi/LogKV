@@ -10,6 +10,7 @@ import argparse
 import cProfile
 from collections import defaultdict
 from contextlib import ExitStack
+from copy import deepcopy
 import io
 import json
 from pathlib import Path
@@ -68,6 +69,45 @@ def check_merge_pack(cache, device):
         torch.testing.assert_close(mass, original[1], rtol=0, atol=0)
 
 
+def check_batched_state(device):
+    """Exercise old merges/new slots against serial physical writes before timing."""
+    shape = (1, 2, 256, 8)
+    actual = LogStructuredKVCache(
+        shape, shape, B=3, recent_size=16, semantic_clusters=True, cluster_k_max=3,
+        semantic_unified_route=True, allocate_second_order=False, device=device,
+        dtype=torch.bfloat16 if device.type == 'cuda' else torch.float32,
+        cos_cache=torch.ones(256, 8, device=device), sin_cache=torch.zeros(256, 8, device=device), rope_n_elem=8,
+    )
+    for g in range(2):
+        for c, value in enumerate((0., .01, 100.)):
+            k = torch.full((8,), value, device=device, dtype=actual.level_k.dtype)
+            actual._semantic_new_cluster(0, g, c, c, k, k, torch.tensor(c, device=device), record=False)
+    reference = deepcopy(actual)
+    for cache in (actual, reference):
+        cache.begin_op_log()
+
+    def serial_merge(jobs, *, record):
+        for b, g, keep, free in jobs:
+            reference._semantic_ward_merge(b, g, keep, free, record=record)
+
+    def serial_new(jobs, k, v, pos, host, *, record):
+        for b, g, c, i in jobs:
+            reference._semantic_new_cluster(b, g, c, host[b][i], k[b, g, i], v[b, g, i], pos[b, i], record=record)
+
+    with patch.object(reference, '_semantic_ward_merge_batch', serial_merge), \
+         patch.object(reference, '_semantic_new_clusters', serial_new):
+        for step in range(2):
+            k = torch.tensor([1000. + step * 2000] * 8 + [2000. + step * 2000] * 8,
+                             device=device, dtype=actual.level_k.dtype).view(1, 1, 16, 1).expand(1, 2, 16, 8)
+            pos = torch.arange(3 + step * 16, 19 + step * 16, device=device)
+            for cache in (actual, reference):
+                cache.route_and_flush_batch(k, k, pos, record_op_log=True)
+            for name, value in actual.named_buffers():
+                torch.testing.assert_close(value, reference.get_buffer(name), rtol=0, atol=0, msg=name)
+            for name in actual._UPDATE_HOST_FIELDS + ('_semantic_counts', '_op_log_host'):
+                assert getattr(actual, name) == getattr(reference, name), name
+
+
 def profile_route(cache, inputs, device, directory):
     """Profile only the last flush, with its preceding cache state built outside capture."""
     out = Path(directory)
@@ -103,13 +143,13 @@ def profile_route(cache, inputs, device, directory):
     # No per-stage synchronization or pair-count readbacks in this capture.
     with ExitStack() as stack:
         for method, label in (
-            ('_semantic_unified_reduce_packed', 'reduce'),
+            ('_semantic_unified_reduce_arrays', 'reduce'),
             ('_semantic_unified_round_pairs', 'pair_search'),
             ('_semantic_unified_gram', 'gram'),
             ('_semantic_unified_merge_pack', 'merge_pack'),
             ('_semantic_unified_select_pairs', 'select_pairs'),
-            ('_semantic_ward_merge', 'old_kv_merge'),
-            ('_semantic_new_cluster', 'new_cluster_write'),
+            ('_semantic_ward_merge_batch', 'old_kv_merge'),
+            ('_semantic_new_clusters', 'new_cluster_write'),
             ('_semantic_commit_joins', 'batched_write'),
         ):
             stack.enter_context(patch.object(cache, method, annotated(getattr(cache, method), label)))
@@ -186,6 +226,7 @@ def main():
     if fused:
         check_round_pairs(cache, device)
         check_merge_pack(cache, device)
+    check_batched_state(device)
     prototypes = torch.randn(args.batch, args.groups, args.clusters, args.dim, device=device, dtype=dtype)
     inputs = []
     for step in range(args.flushes):
@@ -236,6 +277,7 @@ def main():
                           'route_group_tile': 16 if fused else 4,
                           'reference_pairs_verified': True if fused else None,
                           'reference_updates_verified': True if fused else None,
+                          'reference_state_verified': True,
                           'mass_verified': True}), flush=True)
 
         if args.profile_dir:
@@ -244,7 +286,7 @@ def main():
 
         stages = defaultdict(float)
         rounds, phase = [], ['']
-        reduce = cache._semantic_unified_reduce_packed
+        reduce = cache._semantic_unified_reduce_arrays
         pairs = cache._semantic_unified_round_pairs
 
         def reduce_timed(*a, **kw):
@@ -269,10 +311,10 @@ def main():
 
         cache.reset_parameters()
         with ExitStack() as stack:
-            stack.enter_context(patch.object(cache, '_semantic_unified_reduce_packed', reduce_timed))
+            stack.enter_context(patch.object(cache, '_semantic_unified_reduce_arrays', reduce_timed))
             stack.enter_context(patch.object(cache, '_semantic_unified_round_pairs', pairs_counted))
-            for name, stage in [('_semantic_ward_merge', 'old_kv_merge'),
-                                ('_semantic_new_cluster', 'new_cluster_write'),
+            for name, stage in [('_semantic_ward_merge_batch', 'old_kv_merge'),
+                                ('_semantic_new_clusters', 'new_cluster_write'),
                                 ('_semantic_commit_joins', 'batched_write')]:
                 stack.enter_context(patch.object(cache, name, timed(stage, getattr(cache, name))))
             validate(run())
