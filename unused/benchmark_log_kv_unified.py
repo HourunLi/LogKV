@@ -45,6 +45,29 @@ def check_round_pairs(cache, device):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def check_merge_pack(cache, device):
+    """Centroid rounding affects later pairs: verify updates as well as selection."""
+    generator = torch.Generator(device=device).manual_seed(93)
+    for dim in (7, 128):
+        mu = torch.randn(3, 11, dim, device=device, generator=generator)
+        mass = torch.randint(1, 500000, (3, 11), device=device, generator=generator).float()
+        radius = torch.zeros_like(mass)
+        src = torch.arange(0, 30, 2, device=device).view(3, 5)
+        partner = src + 1
+        src[0, 1] = -1
+        src[2] = -1
+        partner[1, 2] = -1
+        indices = torch.stack((src, partner))
+        original = mu.clone(), mass.clone()
+        with patch('litgpt.log_kv_cache._triton_route', return_value=None):
+            expected = cache._semantic_unified_merge_pack(mu, mass, radius, indices, False)
+        actual = cache._semantic_unified_merge_pack(mu, mass, radius, indices, False)
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        torch.testing.assert_close(mu, original[0], rtol=0, atol=0)
+        torch.testing.assert_close(mass, original[1], rtol=0, atol=0)
+
+
 def profile_route(cache, inputs, device, directory):
     """Profile only the last flush, with its preceding cache state built outside capture."""
     out = Path(directory)
@@ -83,6 +106,7 @@ def profile_route(cache, inputs, device, directory):
             ('_semantic_unified_reduce_packed', 'reduce'),
             ('_semantic_unified_round_pairs', 'pair_search'),
             ('_semantic_unified_gram', 'gram'),
+            ('_semantic_unified_merge_pack', 'merge_pack'),
             ('_semantic_unified_select_pairs', 'select_pairs'),
             ('_semantic_ward_merge', 'old_kv_merge'),
             ('_semantic_new_cluster', 'new_cluster_write'),
@@ -161,6 +185,7 @@ def main():
     fused = device.type == 'cuda' and _triton_route() is not None
     if fused:
         check_round_pairs(cache, device)
+        check_merge_pack(cache, device)
     prototypes = torch.randn(args.batch, args.groups, args.clusters, args.dim, device=device, dtype=dtype)
     inputs = []
     for step in range(args.flushes):
@@ -210,6 +235,7 @@ def main():
                           'route_backend': 'triton' if fused else 'torch',
                           'route_group_tile': 16 if fused else 4,
                           'reference_pairs_verified': True if fused else None,
+                          'reference_updates_verified': True if fused else None,
                           'mass_verified': True}), flush=True)
 
         if args.profile_dir:

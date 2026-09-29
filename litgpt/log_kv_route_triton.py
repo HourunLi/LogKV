@@ -86,3 +86,52 @@ def nearest(data, mass, radius, limits, cap, norm=None):
             num_warps=4, enable_fp_fusion=False,
         )
     return (best, cost), full
+
+
+@triton.jit(do_not_specialize=["ROWS"])
+def _merge_pack(MU, MASS, INDICES, OUT_MU, OUT_MASS, OUT_RADIUS, ROWS,
+                D: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
+    dims = tl.arange(0, BD)
+    live = row < ROWS
+    src = tl.load(INDICES + row, live, -1).to(tl.int64)
+    present = live & (src >= 0)
+    partner = tl.load(INDICES + ROWS + row, present, -1).to(tl.int64)
+    merge = present & (partner >= 0)
+    ma = tl.load(MASS + src, present, 0)
+    mb = tl.load(MASS + partner, merge, 0)
+    a = tl.load(MU + src[:, None] * D + dims[None, :],
+                present[:, None] & (dims < D)[None, :], 0)
+    b = tl.load(MU + partner[:, None] * D + dims[None, :],
+                merge[:, None] & (dims < D)[None, :], 0)
+    total = ma + mb
+    merged = tl.div_rn(ma[:, None] * a + mb[:, None] * b,
+                       tl.where(merge, total, 1.0)[:, None])
+    # Copy untouched centers directly: recomputing ma*a/ma changes rounding.
+    value = tl.where(merge[:, None], merged, a)
+    tl.store(OUT_MU + row[:, None] * D + dims[None, :], value,
+             live[:, None] & (dims < D)[None, :])
+    tl.store(OUT_MASS + row, tl.where(merge, total, ma), live)
+    tl.store(OUT_RADIUS + row, 0.0, live)
+
+
+def merge_pack(mu, mass, indices):
+    """Merge and pack a global routing round into independent FP32 buffers.
+
+    indices is contiguous int64 [2, groups_out, clusters_out]. Its two planes
+    contain flattened source/partner rows; -1 denotes padding/no partner.
+    Radius is zero because only the global stage uses this kernel.
+    """
+    groups, size = indices.shape[1:]
+    dims = mu.size(-1)
+    out_mu = mu.new_empty((groups, size, dims))
+    out_mass = mass.new_empty((groups, size))
+    out_radius = mass.new_empty((groups, size))
+    rows = groups * size
+    if rows:
+        _merge_pack[(triton.cdiv(rows, 8),)](
+            mu, mass, indices, out_mu, out_mass, out_radius, rows,
+            dims, triton.next_power_of_2(dims), 8,
+            num_warps=4, enable_fp_fusion=False,
+        )
+    return out_mu, out_mass, out_radius
