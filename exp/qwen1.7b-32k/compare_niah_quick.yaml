@@ -1,6 +1,5 @@
 # Small paired comparison: same checkpoint and samples, only routing changes.
 config: compare_niah_unified.yaml
 benchmark: niah_single_2,niah_single_3
-limit: 50
 # null lets the CLI choose false (existing fast route) or true (unified route).
 log_kv_semantic_unified_route: null
