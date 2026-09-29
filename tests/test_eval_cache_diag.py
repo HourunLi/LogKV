@@ -62,6 +62,41 @@ def test_cache_failure_is_visible_and_original_behavior_is_preserved():
     assert "PermissionError: cannot enumerate cached configurations" in events[-1]["traceback"]
 
 
+def test_path_walk_names_the_component_that_blocks_traversal():
+    import tempfile
+    source = Path(__file__).resolve().parents[1] / "eval.py"
+    node = next(n for n in ast.parse(source.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == "_walk_cache_path")
+    scope = dict(os=os, Path=Path)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
+    walk = scope["_walk_cache_path"]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        snapshot = Path("default/0.1.0/674d85e4/dataset_info.json")
+        (root / "social_i_qa" / snapshot).parent.mkdir(parents=True)
+        (root / "social_i_qa" / snapshot).write_text("{}")
+        (root / "healthy").symlink_to("social_i_qa")
+        (root / "flattened").write_text("social_i_qa")
+        (root / "to_file").symlink_to("flattened")
+        (root / "dangling").symlink_to("missing_dir")
+
+        steps = walk(root / "healthy" / snapshot)
+        assert not any(step.get("blocks_traversal") for step in steps)
+        assert steps[0]["path"] == "/" and "fstype" in steps[0]["mount"]
+        link = next(step for step in steps if step.get("path") == str(root / "healthy"))
+        assert (link["type"], link["link"], link["target_type"]) == ("lnk", "social_i_qa", "dir")
+        assert steps[-1]["entries"] == ["dataset_info.json"]
+
+        for name, expected in (("flattened", dict(type="reg", head="social_i_qa")),
+                               ("to_file", dict(type="lnk", target_type="reg", head="social_i_qa")),
+                               ("dangling", dict(type="lnk", link="missing_dir"))):
+            steps = walk(root / name / snapshot)
+            blocking = [step for step in steps if step.get("blocks_traversal")]
+            assert [step["path"] for step in blocking] == [str(root / name)], (name, steps)
+            assert expected.items() <= blocking[0].items(), (name, blocking)
+            assert steps[-1]["listing_of"] == str(root)
+
+
 def test_eval_launch_uses_selected_python_for_both_jobs():
     source = (Path(__file__).resolve().parents[1] / "eval.sh").read_text()
     start = source.index('if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then')
@@ -84,5 +119,6 @@ torchrun() { echo WRONG_INTERPRETER; return 99; }
 
 if __name__ == "__main__":
     test_cache_failure_is_visible_and_original_behavior_is_preserved()
+    test_path_walk_names_the_component_that_blocks_traversal()
     test_eval_launch_uses_selected_python_for_both_jobs()
     print("HF cache diagnostic check passed")
