@@ -327,3 +327,33 @@ def test_short_route_profiler_exports_trace_and_python_summary(tmp_path):
     assert 'aten::' in summary and 'route_and_flush_batch' in summary
     assert (tmp_path / 'route_python.prof').stat().st_size > 0
     assert result['profiled_flushes_per_pass'] == 1
+
+
+def test_packed_candidates_reuse_unmerged_nodes_and_centers():
+    cache = cache_for()
+    mu = torch.arange(9.).unsqueeze(1).expand(9, 8).contiguous() * 10
+    nodes = [_SemanticTreeCluster(None, 1, i, (), (i,)) for i in range(9)]
+    result, merges, centers = cache._semantic_unified_reduce_packed([nodes], [mu], radius_limits=[.1])[0]
+    assert not merges and centers is mu
+    assert all(a is b for a, b in zip(result, nodes))
+    result, _, centers = cache._semantic_unified_reduce_packed([nodes], [mu], max_clusters=3)[0]
+    assert len(result) == len(centers) == 3
+    for node, center in zip(result, centers):
+        torch.testing.assert_close(center, mu[list(node.tokens)].mean(0))
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_production_unified_route_does_not_unbind_token_centers(device):
+    cache = cache_for(device=device, batch_size=2, groups=2)
+    unbind = torch.Tensor.unbind
+
+    def checked(tensor, dim=0):
+        assert not (tensor.ndim == 2 and dim == 0 and tensor.size(0) > cache.K_max and tensor.size(1) == 8)
+        return unbind(tensor, dim)
+
+    with patch.object(torch.Tensor, 'unbind', checked):
+        for start in (0, 65):
+            k = torch.randn(2, 2, 65, 8, device=device)
+            cache.route_and_flush_batch(k, k, torch.arange(start, start + 65, device=device),
+                                        positions_host=[list(range(start, start + 65))] * 2)
+    torch.testing.assert_close(cache.level_w.sum((2, 3, 4)), torch.full((2, 2), 130., device=device))
