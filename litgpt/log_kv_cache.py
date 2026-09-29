@@ -133,7 +133,8 @@ class _SemanticReplayUpdates:
 
 
 class _SemanticTreeCluster(NamedTuple):
-    centroid: torch.Tensor
+    # Unified production routing carries centroids in a separate packed tensor.
+    centroid: torch.Tensor | None
     n_total: int
     p_hi: int
     existing: tuple[int, ...]
@@ -2396,8 +2397,23 @@ class LogStructuredKVCache(nn.Module):
         self, groups: list[list[_SemanticTreeCluster]], *,
         max_clusters: int | None = None, radius_limits: list[float] | None = None,
     ) -> list[tuple[list[_SemanticTreeCluster], list[tuple[int, int]]]]:
-        """Reduce a bounded tile of groups together; rebuild Python nodes once.
+        """Node-based adapter for callers that need individual centroid tensors."""
+        centers = [torch.stack([n.centroid for n in nodes]).float() if nodes else None for nodes in groups]
+        packed = self._semantic_unified_reduce_packed(
+            groups, centers, max_clusters=max_clusters, radius_limits=radius_limits,
+        )
+        return [(nodes if len(nodes) == len(original) else
+                 [node._replace(centroid=center) for node, center in zip(nodes, mu.unbind(0))], merges)
+                for original, (nodes, merges, mu) in zip(groups, packed)]
 
+    @torch.no_grad()
+    def _semantic_unified_reduce_packed(
+        self, groups: list[list[_SemanticTreeCluster]], centroids: list[torch.Tensor | None], *,
+        max_clusters: int | None = None, radius_limits: list[float] | None = None,
+    ) -> list[tuple[list[_SemanticTreeCluster], list[tuple[int, int]], torch.Tensor | None]]:
+        """Reduce a bounded tile using packed centers and host-only membership.
+
+        Node centroid fields are ignored here; returned centers stay packed too.
         One pairing readback per round serves all groups. Counts and membership
         stay on the host; centers/masses/radii are updated together on device.
         Rounds and the ordering of physical old-old merges retain their original
@@ -2408,14 +2424,14 @@ class LogStructuredKVCache(nn.Module):
         active = [i for i, nodes in enumerate(groups) if len(nodes) > target]
         for i, nodes in enumerate(groups):
             if i not in active:
-                outputs[i] = (list(nodes), [])
+                outputs[i] = (list(nodes), [], centroids[i])
         if not active:
             return outputs
         counts = [len(groups[i]) for i in active]
         size = max(counts)
-        sample = groups[active[0]][0].centroid
+        sample = centroids[active[0]]
         dev = sample.device
-        mu = torch.stack([F.pad(torch.stack([n.centroid for n in groups[i]]).float(),
+        mu = torch.stack([F.pad(centroids[i].float(),
                                (0, 0, 0, size - len(groups[i]))) for i in active])
         mass = torch.tensor([[n.n_total for n in groups[i]] + [0] * (size - len(groups[i]))
                              for i in active], device=dev, dtype=torch.float32)
@@ -2461,7 +2477,8 @@ class LogStructuredKVCache(nn.Module):
             mass[lane, left] = combined
             size = max(next_counts)
             # Pack surviving centers, preserving each group's original index order.
-            flat = [lane_i * mu.size(1) + j for lane_i, row in survivor_rows
+            stride = mu.size(1)
+            flat = [lane_i * stride + j for lane_i, row in survivor_rows
                     for j in row + [row[0]] * (size - len(row))]
             index = torch.tensor(flat, device=dev)
             mu = mu.flatten(0, 1).index_select(0, index).view(len(next_active), size, -1)
@@ -2483,7 +2500,8 @@ class LogStructuredKVCache(nn.Module):
                 roots = [roots[i] for i in continuing]
                 counts = [counts[i] for i in continuing]
         for group, original in enumerate(groups):
-            if not traces[group] and (len(original) <= target):
+            if not traces[group]:
+                outputs[group] = (list(original), [], centroids[group])
                 continue
             nodes = list(original)
             old_merges = []
@@ -2496,8 +2514,7 @@ class LogStructuredKVCache(nn.Module):
                     a.existing + b.existing, a.tokens + b.tokens,
                 )
             surviving, centers = outputs[group]
-            outputs[group] = ([nodes[i]._replace(centroid=center)
-                               for i, center in zip(surviving, centers.unbind(0))], old_merges)
+            outputs[group] = ([nodes[i] for i in surviving], old_merges, centers)
         return outputs
 
     def _semantic_unified_reduce(
@@ -2527,16 +2544,20 @@ class LogStructuredKVCache(nn.Module):
         tile_size = 16 if k_raw.is_cuda and _triton_route() is not None else 4
         for start in range(0, len(lanes), tile_size):
             tile = lanes[start:start + tile_size]
-            groups = [[_SemanticTreeCluster(key, 1, positions_host[b][i], (), (i,))
-                       for i, key in enumerate(k_raw[b, g].detach().float().unbind(0))] for b, g in tile]
-            candidates = self._semantic_unified_reduce_batch(
-                groups, radius_limits=[math.sqrt(self._semantic_tree_threshold(b, g)) for b, g in tile]
+            centers = [k_raw[b, g].detach().float() for b, g in tile]
+            groups = [[_SemanticTreeCluster(None, 1, positions_host[b][i], (), (i,))
+                       for i in range(k_raw.size(2))] for b, g in tile]
+            candidates = self._semantic_unified_reduce_packed(
+                groups, centers, radius_limits=[math.sqrt(self._semantic_tree_threshold(b, g)) for b, g in tile]
             )
-            plans = self._semantic_unified_reduce_batch(
-                [self._semantic_tree_existing_set(b, g) + candidate[0]
-                 for (b, g), candidate in zip(tile, candidates)], max_clusters=self.K_max,
+            existing = [self._semantic_tree_existing_set(b, g) for b, g in tile]
+            centers = [torch.cat((torch.stack([n.centroid for n in old]), candidate[2])) if old else candidate[2]
+                       for old, candidate in zip(existing, candidates)]
+            plans = self._semantic_unified_reduce_packed(
+                [old + candidate[0] for old, candidate in zip(existing, candidates)], centers,
+                max_clusters=self.K_max,
             )
-            for (b, g), (nodes, old_merges) in zip(tile, plans):
+            for (b, g), (nodes, old_merges, _) in zip(tile, plans):
                 for keep, free in old_merges:
                     self._semantic_ward_merge(b, g, keep, free, record=record)
                 free_slots = iter(self._semantic_free_clusters(b, g))

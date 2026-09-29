@@ -80,7 +80,7 @@ def profile_route(cache, inputs, device, directory):
     # No per-stage synchronization or pair-count readbacks in this capture.
     with ExitStack() as stack:
         for method, label in (
-            ('_semantic_unified_reduce_batch', 'reduce'),
+            ('_semantic_unified_reduce_packed', 'reduce'),
             ('_semantic_unified_round_pairs', 'pair_search'),
             ('_semantic_unified_gram', 'gram'),
             ('_semantic_unified_select_pairs', 'select_pairs'),
@@ -218,7 +218,7 @@ def main():
 
         stages = defaultdict(float)
         rounds, phase = [], ['']
-        reduce = cache._semantic_unified_reduce_batch
+        reduce = cache._semantic_unified_reduce_packed
         pairs = cache._semantic_unified_round_pairs
 
         def reduce_timed(*a, **kw):
@@ -243,7 +243,7 @@ def main():
 
         cache.reset_parameters()
         with ExitStack() as stack:
-            stack.enter_context(patch.object(cache, '_semantic_unified_reduce_batch', reduce_timed))
+            stack.enter_context(patch.object(cache, '_semantic_unified_reduce_packed', reduce_timed))
             stack.enter_context(patch.object(cache, '_semantic_unified_round_pairs', pairs_counted))
             for name, stage in [('_semantic_ward_merge', 'old_kv_merge'),
                                 ('_semantic_new_cluster', 'new_cluster_write'),
