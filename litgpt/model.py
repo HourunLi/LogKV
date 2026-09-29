@@ -183,6 +183,12 @@ class GPT(nn.Module):
             mask = None  # defaults to causal mask
             input_pos_maxp1 = None
 
+        span_kwargs = {}
+        if getattr(self, "_alpha_enabled", False):
+            table = getattr(self, "alpha_span_boundaries", None)
+            if table is None:
+                raise RuntimeError("AlphaLogKV needs set_alpha_span_boundary_ids() before forward")
+            span_kwargs["span_ends"] = table[idx].detach().cpu().tolist()
         x = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
@@ -196,9 +202,10 @@ class GPT(nn.Module):
                     mask,
                     input_pos,
                     input_pos_maxp1,
+                    **span_kwargs,
                 )
             else:
-                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1)
+                x = block(x, cos, sin, mask, input_pos, input_pos_maxp1, **span_kwargs)
         if lm_head_start is not None:
             # Drop hidden states the caller does not need logits for BEFORE the
             # O(T x vocab) projection — the transformer stack above already ran
@@ -220,6 +227,12 @@ class GPT(nn.Module):
             return [clamp_head(self.lm_head(x_i)) for x_i in x.split(lm_head_chunk_size, dim=1)]
         else:
             return clamp_head(self.lm_head(x))  # (B, T, padded_vocab_size)
+
+    def set_alpha_span_boundary_ids(self, ids) -> None:
+        """Install the tokenizer's fixed natural-boundary lookup once per model."""
+        table = torch.zeros(self.config.padded_vocab_size, device=self.transformer.wte.weight.device, dtype=torch.bool)
+        table[list(ids)] = True
+        self.register_buffer("alpha_span_boundaries", table, persistent=False)
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -320,6 +333,7 @@ class GPT(nn.Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
+        self._alpha_enabled = False
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
 
@@ -346,6 +360,7 @@ class GPT(nn.Module):
             self.mask_cache = build_mask_cache(max_seq_length, device)
 
     def clear_kv_cache(self) -> None:
+        self._alpha_enabled = False
         self.mask_cache = None
         for block in self.transformer.h:
             block.attn.kv_cache = None
@@ -389,10 +404,13 @@ class GPT(nn.Module):
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
         semantic_unified_route: bool = False,
+        semantic_merge_passes: int = 1,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
         semantic_centroid_backend: str = "sequential",
         semantic_replay_updates: bool = False,
+        alpha_exact_tokens: int = 0,
+        alpha_span_max_tokens: int = 64,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -430,6 +448,9 @@ class GPT(nn.Module):
                 < 1.0 dampens outlier tokens). Orthogonal to
                 ``importance_pooling_lambda``. See ``LogStructuredKVCache``.
         """
+        self._alpha_enabled = bool(alpha_exact_tokens)
+        if alpha_exact_tokens and second_order_scale != 0.:
+            raise ValueError("AlphaLogKV requires second_order_scale=0")
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
         if max_seq_length is None:
@@ -476,10 +497,13 @@ class GPT(nn.Module):
                 semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
                 semantic_legacy_route=semantic_legacy_route,
                 semantic_unified_route=semantic_unified_route,
+                semantic_merge_passes=semantic_merge_passes,
                 semantic_anchor_mode=semantic_anchor_mode,
                 semantic_pack_backend=semantic_pack_backend,
                 semantic_centroid_backend=semantic_centroid_backend,
                 semantic_replay_updates=semantic_replay_updates,
+                alpha_exact_tokens=alpha_exact_tokens,
+                alpha_span_max_tokens=alpha_span_max_tokens,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -544,11 +568,14 @@ class GPT(nn.Module):
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
         semantic_unified_route: bool = False,
+        semantic_merge_passes: int = 1,
         allocate_second_order: bool = True,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
         semantic_centroid_backend: str = "sequential",
         semantic_replay_updates: bool = False,
+        alpha_exact_tokens: int = 0,
+        alpha_span_max_tokens: int = 64,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -588,6 +615,9 @@ class GPT(nn.Module):
                 raise ValueError(
                     f"semantic_s_h with 2 dims must be (n_layer, n_query_groups), got {tuple(semantic_s_h.shape)}"
                 )
+        self._alpha_enabled = bool(alpha_exact_tokens)
+        if alpha_exact_tokens and second_order_scale != 0.:
+            raise ValueError("AlphaLogKV requires second_order_scale=0")
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
         if max_seq_length is None:
@@ -623,10 +653,13 @@ class GPT(nn.Module):
                 semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
                 semantic_legacy_route=semantic_legacy_route,
                 semantic_unified_route=semantic_unified_route,
+                semantic_merge_passes=semantic_merge_passes,
                 semantic_anchor_mode=semantic_anchor_mode,
                 semantic_pack_backend=semantic_pack_backend,
                 semantic_centroid_backend=semantic_centroid_backend,
                 semantic_replay_updates=semantic_replay_updates,
+                alpha_exact_tokens=alpha_exact_tokens,
+                alpha_span_max_tokens=alpha_span_max_tokens,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -637,6 +670,7 @@ class GPT(nn.Module):
 
     def disable_log_kv_training(self) -> None:
         """Turn off logKV training mode and drop the caches."""
+        self._alpha_enabled = False
         for block in self.transformer.h:
             block.attn.training_log_kv = False
             block.attn.kv_cache = None
@@ -687,6 +721,7 @@ class Block(nn.Module):
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
+        span_ends: list[list[bool]] | None = None,
     ) -> torch.Tensor:
         """
         Non-parallel residual       Parallel residual
@@ -710,7 +745,8 @@ class Block(nn.Module):
         """
 
         x_normed = self.norm_1(x)
-        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1)
+        attention_output = self.attn(x_normed, cos, sin, mask, input_pos, input_pos_maxp1,
+                                     **({"span_ends": span_ends} if span_ends is not None else {}))
         attention_output = self.post_attention_norm(attention_output)
 
         if self.config.parallel_residual:
@@ -793,6 +829,7 @@ class CausalSelfAttention(nn.Module):
         mask: torch.Tensor | None = None,
         input_pos: torch.Tensor | None = None,
         input_pos_maxp1: int | None = None,
+        span_ends: list[list[bool]] | None = None,
     ) -> torch.Tensor:
         # Notation:
         # - B          | batch size
@@ -886,7 +923,7 @@ class CausalSelfAttention(nn.Module):
         # low-memory Function (graph-free stream + backward replay): the naive
         # per-chunk graph saves O(T/2 x S) tensors per layer and OOMs at 32K.
         if self.training_log_kv and input_pos is None:
-            return self._log_kv_train_lowmem_forward(q, k, v, B, T, k_raw=k_raw)
+            return self._log_kv_train_lowmem_forward(q, k, v, B, T, k_raw=k_raw, span_ends=span_ends)
 
         # Apply kv-cache during inference.
         if input_pos is not None:
@@ -899,7 +936,7 @@ class CausalSelfAttention(nn.Module):
                 # A trailing single token is kept pending so an odd-length prompt
                 # pairs with the first decode token, matching training chunks.
                 return self._log_kv_training_forward(
-                    q, k, v, B, T, reset_cache=False, defer_last_single=True, k_raw=k_raw, input_pos=input_pos
+                    q, k, v, B, T, reset_cache=False, defer_last_single=True, k_raw=k_raw, input_pos=input_pos, span_ends=span_ends
                 )
 
             if self.apply_sliding_window_attention:
@@ -1033,6 +1070,7 @@ class CausalSelfAttention(nn.Module):
         B: int,
         T: int,
         k_raw: torch.Tensor | None = None,
+        span_ends: list[list[bool]] | None = None,
     ) -> torch.Tensor:
         """Training forward over the logKV stream with O(T + S) memory.
 
@@ -1071,6 +1109,7 @@ class CausalSelfAttention(nn.Module):
             if k_raw is None:
                 raise ValueError("semantic LogKV training requires pre-RoPE k_raw")
             args.append(k_raw)
+            args.append(span_ends)
         y = LogKVStreamTrainingAttention.apply(*args)  # (B, n_head, T, hs)
         y = y.transpose(1, 2).reshape(B, T, self.config.head_size * self.config.n_head)
         return self.proj(y)
@@ -1085,6 +1124,7 @@ class CausalSelfAttention(nn.Module):
         reset_cache: bool = True,
         defer_last_single: bool = False,
         k_raw: torch.Tensor | None = None,
+        span_ends: list[list[bool]] | None = None,
         input_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reference forward simulating the logKV streaming compaction with a
@@ -1171,7 +1211,8 @@ class CausalSelfAttention(nn.Module):
         pending = self._log_kv_pending if defer_last_single else None
         if pending is not None:
             if cache.semantic_clusters:
-                pk, pv, pk_raw, ppos = pending
+                pk, pv, pk_raw, ppos = pending[:4]
+                pending_ends = pending[4] if len(pending) > 4 else None
             else:
                 pk, pv = pending
                 pk_raw = pk
@@ -1192,6 +1233,7 @@ class CausalSelfAttention(nn.Module):
                 torch.cat([pv, v_b.detach()], dim=2),
                 k_raw=torch.cat([pk_raw, k_raw[:, :, :1, :].detach()], dim=2) if cache.semantic_clusters else None,
                 input_pos=torch.cat([ppos, pos_b], dim=-1) if cache.semantic_clusters and ppos is not None and pos_b is not None else None,
+                span_ends=[a + b[:1] for a, b in zip(pending_ends, span_ends)] if span_ends is not None else None,
             )
             self._log_kv_pending = None
             start = 1
@@ -1260,6 +1302,7 @@ class CausalSelfAttention(nn.Module):
                         v[:, :, start:commit_end, :].detach(),
                         k_raw=k_raw[:, :, start:commit_end, :].detach() if cache.semantic_clusters else None,
                         input_pos=_pos_slice(start, commit_end),
+                        span_ends=[row[start:commit_end] for row in span_ends] if span_ends is not None else None,
                     )
                 if defer_tail:
                     if cache.semantic_clusters:
@@ -1268,6 +1311,7 @@ class CausalSelfAttention(nn.Module):
                             v[:, :, commit_end:block_end, :].detach(),
                             k_raw[:, :, commit_end:block_end, :].detach(),
                             _pos_slice(commit_end, block_end),
+                            [row[commit_end:block_end] for row in span_ends] if span_ends is not None else None,
                         )
                     else:
                         self._log_kv_pending = (
@@ -1294,7 +1338,8 @@ class CausalSelfAttention(nn.Module):
             # When the window overflows, oldest t tokens are compacted into hierarchy.
             if defer_chunk:
                 if cache.semantic_clusters:
-                    self._log_kv_pending = (k_b.detach(), v_b.detach(), k_raw[:, :, start:end, :].detach(), _pos_slice(start, end))
+                    self._log_kv_pending = (k_b.detach(), v_b.detach(), k_raw[:, :, start:end, :].detach(), _pos_slice(start, end),
+                                            [row[start:end] for row in span_ends] if span_ends is not None else None)
                 else:
                     self._log_kv_pending = (k_b.detach(), v_b.detach())
             else:
@@ -1303,6 +1348,7 @@ class CausalSelfAttention(nn.Module):
                     v_b.detach(),
                     k_raw=k_raw[:, :, start:end, :].detach() if cache.semantic_clusters else None,
                     input_pos=_pos_slice(start, end),
+                    span_ends=[row[start:end] for row in span_ends] if span_ends is not None else None,
                 )
 
             start = end
@@ -1399,6 +1445,7 @@ class CausalSelfAttention(nn.Module):
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
         semantic_unified_route: bool = False,
+        semantic_merge_passes: int = 1,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
         allocate_second_order: bool = True,
@@ -1406,6 +1453,8 @@ class CausalSelfAttention(nn.Module):
         semantic_pack_backend: str = "auto",
         semantic_centroid_backend: str = "sequential",
         semantic_replay_updates: bool = False,
+        alpha_exact_tokens: int = 0,
+        alpha_span_max_tokens: int = 64,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1466,10 +1515,13 @@ class CausalSelfAttention(nn.Module):
             semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
             semantic_legacy_route=semantic_legacy_route,
             semantic_unified_route=semantic_unified_route,
+            semantic_merge_passes=semantic_merge_passes,
             semantic_anchor_mode=semantic_anchor_mode,
             semantic_pack_backend=semantic_pack_backend,
             semantic_centroid_backend=semantic_centroid_backend,
             semantic_replay_updates=semantic_replay_updates,
+            alpha_exact_tokens=alpha_exact_tokens,
+            alpha_span_max_tokens=alpha_span_max_tokens,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,

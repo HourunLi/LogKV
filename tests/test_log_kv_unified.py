@@ -497,3 +497,58 @@ def test_deferred_op_log_matches_immediate_writes_with_uneven_lanes(device):
                 torch.testing.assert_close(got, want, atol=0, rtol=0)
         torch.testing.assert_close(actual.op_log, reference.op_log, atol=0, rtol=0)
         assert actual._op_log_host == reference._op_log_host
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_frozen_matching_sweeps_match_reference_and_preserve_constraints(device):
+    """An independent peeling oracle, ragged groups, ties and guarded paths."""
+    cache = cache_for(semantic_merge_passes=4)
+    rng = torch.Generator().manual_seed(98)
+    mu = torch.randint(-4, 5, (3, 65, 8), generator=rng).float().to(device)
+    mu[0].zero_()
+    mass = torch.ones(3, 65, device=device)
+    mass[1, 51:] = 0
+    mass[2] = 0
+    radius = torch.zeros_like(mass)
+    d2 = (mu[:, :, None] - mu[:, None, :]).square().sum(-1)
+    cost = d2 * (mass[:, :, None] * mass[:, None, :] / (mass[:, :, None] + mass[:, None, :]).clamp_min(1))
+    cost.masked_fill_(~((mass > 0)[:, :, None] & (mass > 0)[:, None, :]), math.inf)
+    cost.diagonal(dim1=-2, dim2=-1).fill_(math.inf)
+    expected = []
+    for lane in range(3):
+        remaining = cost[lane].clone()
+        chosen = []
+        for _ in range(4):
+            pairs = cache._semantic_unified_pairs(remaining, 32)
+            chosen.extend(pairs.tolist())
+            remaining[pairs.flatten()] = math.inf
+            remaining[:, pairs.flatten()] = math.inf
+        expected.append(sorted(chosen, key=lambda pair: (float(cost[lane, pair[0], pair[1]]), pair[0])))
+    actual = cache._semantic_unified_round_pairs(mu, mass, radius, None, math.inf, True)
+    for rows, wanted in zip(actual.cpu(), expected):
+        pairs = rows[rows[:, 0] >= 0]
+        assert pairs.tolist() == wanted
+        assert pairs.unique().numel() == pairs.numel()
+    for limits, cap, overflow in ((mu.new_full((3,), .5), math.inf, False), (None, .1, True)):
+        actual = cache._semantic_unified_round_pairs(mu, mass, radius, limits, cap, overflow)
+        cache.semantic_merge_passes = 1
+        expected = cache._semantic_unified_round_pairs(mu, mass, radius, limits, cap, overflow)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        cache.semantic_merge_passes = 4
+
+
+def test_frozen_matching_reduction_reaches_budget_and_conserves_centroids():
+    import numpy as np
+    cache = cache_for(semantic_merge_passes=4)
+    torch.manual_seed(11)
+    centers = [torch.randn(n, 8) for n in (65, 19)]
+    weights = [np.arange(1, len(mu) + 1, dtype=np.float32) for mu in centers]
+    for mu, weight, (roots, traces, reduced) in zip(
+        centers, weights, cache._semantic_unified_reduce_arrays(weights, centers, max_clusters=3)
+    ):
+        assert len(roots) == 3
+        labels = cache._semantic_unified_labels(len(mu), roots, traces)
+        for c in range(3):
+            member = torch.from_numpy(labels == c)
+            w = torch.from_numpy(weight)[member]
+            torch.testing.assert_close(reduced[c], (mu[member] * w[:, None]).sum(0) / w.sum())

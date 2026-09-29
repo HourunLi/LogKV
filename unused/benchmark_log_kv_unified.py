@@ -26,6 +26,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from litgpt.log_kv_cache import LogStructuredKVCache, _triton_route
 
 
+def cache_mass(cache):
+    mass = cache.level_w.sum((2, 3, 4))
+    if cache.alpha_exact_tokens:
+        mass = mass + cache.alpha_valid.sum(-1)[:, None]
+    return mass
+
+
+def flush_route(cache, k, v, pos, host):
+    # Synthetic punctuation only: this benchmarks mechanics, not selection quality.
+    ends = [[(p + b * 7) % max(1, cache.alpha_span_max_tokens // 2) == 0 for p in row]
+            for b, row in enumerate(host)] if cache.alpha_exact_tokens else None
+    cache.route_and_flush_batch(k, v, pos, positions_host=host, span_ends=ends)
+
+
 def check_round_pairs(cache, device):
     """Cheap fused-vs-Torch check before timing; no checkpoint or training needed."""
     generator = torch.Generator(device=device).manual_seed(91)
@@ -120,12 +134,12 @@ def profile_route(cache, inputs, device, directory):
     def prepare():
         cache.reset_parameters()
         for k, v, pos, host in inputs[:-1]:
-            cache.route_and_flush_batch(k, v, pos, positions_host=host)
+            flush_route(cache, k, v, pos, host)
         sync()
 
     def flush():
         k, v, pos, host = inputs[-1]
-        cache.route_and_flush_batch(k, v, pos, positions_host=host)
+        flush_route(cache, k, v, pos, host)
 
     def annotated(fn, label):
         def wrapped(*a, **kw):
@@ -151,6 +165,8 @@ def profile_route(cache, inputs, device, directory):
             ('_semantic_ward_merge_batch', 'old_kv_merge'),
             ('_semantic_new_clusters', 'new_cluster_write'),
             ('_semantic_commit_joins', 'batched_write'),
+            ('_alpha_route_flush', 'alpha_select_and_archive'),
+            ('_alpha_commit_joins', 'alpha_archive'),
         ):
             stack.enter_context(patch.object(cache, method, annotated(getattr(cache, method), label)))
         with torch.profiler.profile(activities=activities, record_shapes=True) as prof:
@@ -185,7 +201,7 @@ def profile_route(cache, inputs, device, directory):
     report.write('\nPython call sites, sorted by cumulative time:\n')
     pstats.Stats(python_profile, stream=report).strip_dirs().sort_stats('cumtime').print_stats(30)
     expected = len(inputs) * inputs[0][0].size(2)
-    torch.testing.assert_close(cache.level_w.sum((2, 3, 4)),
+    torch.testing.assert_close(cache_mass(cache),
                                torch.full(inputs[0][0].shape[:2], float(expected), device=device), rtol=0, atol=0)
     (out / 'route_summary.txt').write_text(report.getvalue())
     return {'profile_summary': str(out / 'route_summary.txt'),
@@ -202,6 +218,9 @@ def main():
     for name, default in [('tokens', 2048), ('dim', 128), ('batch', 1), ('groups', 1),
                           ('clusters', 12), ('B', 256), ('flushes', 2), ('iters', 3)]:
         p.add_argument('--' + name, type=int, default=default)
+    p.add_argument('--merge-passes', type=int, default=1, help='Frozen-center global matching sweeps (1 = original)')
+    p.add_argument('--alpha-exact-tokens', type=int, default=0)
+    p.add_argument('--alpha-span-max-tokens', type=int, default=64)
     args = p.parse_args()
     if min(args.tokens, args.dim, args.batch, args.groups, args.clusters, args.B, args.flushes, args.iters) < 1:
         p.error('all sizes and iteration counts must be positive')
@@ -219,6 +238,8 @@ def main():
         shape, shape, B=args.B, recent_size=args.tokens, semantic_flush_granularity=args.tokens,
         semantic_clusters=True, cluster_k_max=args.clusters, semantic_unified_route=True,
         semantic_anchor_mode='mid', semantic_centroid_backend='parallel', allocate_second_order=False,
+        semantic_merge_passes=args.merge_passes,
+        alpha_exact_tokens=args.alpha_exact_tokens, alpha_span_max_tokens=args.alpha_span_max_tokens,
         device=device, dtype=dtype, cos_cache=torch.ones(n, args.dim, device=device),
         sin_cache=torch.zeros(n, args.dim, device=device), rope_n_elem=args.dim,
     )
@@ -244,11 +265,11 @@ def main():
 
     def run():
         for step, (k, v, pos, host) in enumerate(inputs):
-            cache.route_and_flush_batch(k, v, pos, positions_host=host)
+            flush_route(cache, k, v, pos, host)
         return args.flushes * args.tokens
 
     def validate(mass):
-        torch.testing.assert_close(cache.level_w.sum((2, 3, 4)),
+        torch.testing.assert_close(cache_mass(cache),
                                    torch.full((args.batch, args.groups), float(mass), device=device), rtol=0, atol=0)
         assert (cache.alive.sum(-1) <= args.clusters).all()
 
@@ -274,7 +295,9 @@ def main():
                           'route_median_s_per_flush': statistics.median(times) / args.flushes,
                           'peak_extra_MiB': max(peaks) if device.type == 'cuda' else None,
                           'route_backend': 'triton' if fused else 'torch',
+                          'pairing_rule': 'frozen_mnn' if args.merge_passes > 1 else 'mnn',
                           'route_group_tile': 16 if fused else 4,
+                          'effective_B': cache.B, 'exact_count': cache.alpha_count,
                           'reference_pairs_verified': True if fused else None,
                           'reference_updates_verified': True if fused else None,
                           'reference_state_verified': True,
