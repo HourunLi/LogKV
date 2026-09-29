@@ -34,13 +34,12 @@
 及归档写入，checkpoint 重算和反向回放均不重选、不重路由。
 `alpha_select` 计时包含在 `route` 中，不能再次累加。
 
-Alpha 配置启用 `log_kv_semantic_merge_passes: 4`：全局合并每次计算距离后，
-在 GPU 上连续执行四次互为最近邻扫描，已匹配端点退出后续扫描，最后一次性排序、
-回传并更新中心。扫描之间复用距离及工作区，没有 CPU 同步；后续扫描只读取尚未
-匹配的距离子矩阵。这会改变原配对结果：新合并中心到下一轮才参与竞争。
-候选簇半径约束不变，有限 hard cap 仍走原配对。设为 `1` 恢复原规则；
-训练、评测共用此参数，checkpoint/反向回放不重新配对。
-精确池收集直接写入已有缓冲区，减少三份暂存及复制。
+Alpha 配置启用 `log_kv_semantic_merge_passes: 4`：全局合并每轮先按冻结的中心
+连续做四次互为最近邻扫描，已匹配端点退出后续扫描，最后按代价统一排序、截断到预算
+并一次更新中心。这会改变原配对结果：新合并中心到下一轮才参与竞争。候选簇半径约束
+不变，有限 hard cap 仍走原配对。设为 `1` 恢复原规则；训练、评测共用此参数，
+checkpoint/反向回放不重新配对。精确池收集直接写入已有缓冲区，减少三份暂存及复制。
+（第二版起由增量轮次实现，规则相同，见下节。）
 
 本地 CPU 合成验证（batch=1、groups=1、2048×128、B=128、精确池256、两次flush）：
 passes=1→4，全局合并轮数95→26，单次flush中位耗时0.512→0.408秒。
@@ -49,6 +48,44 @@ passes=1→4，全局合并轮数95→26，单次flush中位耗时0.512→0.408�
 第一版使用当前 fast 配置：unified、mid、一阶、无 segment gap/padding；训练要求
 `semantic_replay_updates=true`。默认关闭时保留原路径。没有引入额外注意力打分、
 新的模型参数或外部依赖。尚未验证 NIAH 收益或 A800 额外开销。
+
+## 第二版：速度优化（算法规则不变）
+
+1. **合并 `semanticLogKV` 的增量轮次**（第六轮及对称修复）：每个 tile 只做一次
+   FP32 GEMM 得到距离矩阵，之后用 Lance–Williams 公式只更新被合并簇的行/列；每行
+   最近邻常驻显存，只有“上一轮最近邻被合并”的行重扫；形状固定不压缩，主机每轮只
+   异步读回每组一个活跃标志。该实现曾在 A800 上把 semanticLogKV 的路由从
+   0.617 s/flush 降到 0.0728 s/flush（B=256、无精确池，不是 Alpha 的实测值）。
+2. **冻结中心多次扫描并入增量轮次**：第一次扫描读常驻最近邻；之后的扫描只让
+   “受限最近邻已被匹配”的未匹配行在未匹配列上重扫（Triton `_scan` 模式 2），再由
+   `_select_more` 在 GPU 上接受新的互为最近邻对；真实最近邻表不受影响，合并后照常
+   维护。与原 `matching_sweeps` 同一规则：不同轮之间仍无主机同步。
+3. **两个热点 kernel**：`_scan` 改为 8 行 × 256 列的二维 tile，脏行标志向量化读取，
+   干净 tile 直接退出；`_lance_williams` 先合并读取目标行当前键，只在更小时才做
+   64 位 atomic min（大多数行最近邻不变，原来每个存活列都做一次原子操作）。
+4. **`_alpha_commit_joins`**：去掉逐 token Python（`min` 生成器、`(b,g,i)` 元组）和
+   `.cpu()` 位置回传；延迟簇的旧条目与新 token 在 GPU 上按 (簇, 位置) 一次稳定排序
+   （旧条目优先，与原逐簇稳定排序一致），每个字段一次 gather + 两次 scatter 直接写到
+   排序后位置，少一份整簇拷贝。新 `p_hi` 用“旧 p_hi 与最新新 token 取大”：簇内条目
+   位置都不超过该簇 p_hi，所以与原先读回旧位置的结果相同。
+5. **`select_spans`**：片段切分由逐 token 循环改为按段（边界/位置断点）处理，长段按
+   64 切块并计入跨 flush 尾段，输出列表、闭合标记与原扫描一致；打分与贪心不变。
+   每层每次 flush 都会调用，原先是 32K 训练前向里逐 token 的 Python 热点。
+6. **`_semantic_route_unified`** 支持每个 batch 行不同的归档 token 数（`token_counts`），
+   连续 lane 直接切片，否则一次 gather；padding 行质量为 0，永不参与配对。
+
+精度与语义：配对规则、预算、紧致度复核、K、精确池规则均不变；与原全量重算相比仅有
+float32 舍入顺序不同，近似平局时可能选到另一对（随机输入下逐对一致）。
+
+验证：本次修改只做了静态检查（`python -m py_compile` 与逐行推演），没有在本机运行
+测试或基准。请在训练环境运行：
+
+```bash
+python -m pytest --noconftest -q tests/test_alpha_log_kv.py tests/test_log_kv_pack.py tests/test_log_kv_unified.py
+```
+
+`tests/test_log_kv_unified.py` 新增增量冻结扫描与全量重算冻结扫描逐对一致的检查；
+基准预检 `check_incremental_reduce` 额外覆盖 passes=4 的融合核与 Torch 参照逐位一致。
 
 ## 训练环境的最小验证
 

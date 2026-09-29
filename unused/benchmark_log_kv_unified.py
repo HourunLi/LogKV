@@ -23,7 +23,7 @@ from unittest.mock import patch
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from litgpt.log_kv_cache import LogStructuredKVCache, _triton_route
+from litgpt.log_kv_cache import LogStructuredKVCache, _UnifiedReduceTorch, _triton_route
 
 
 def cache_mass(cache):
@@ -81,6 +81,58 @@ def check_merge_pack(cache, device):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
         torch.testing.assert_close(mu, original[0], rtol=0, atol=0)
         torch.testing.assert_close(mass, original[1], rtol=0, atol=0)
+
+
+def check_incremental_reduce(device):
+    """Fused incremental rounds against the Torch reference on the same device.
+
+    The global pass (one sweep or frozen sweeps) is elementwise-identical and
+    must match bit for bit. The candidate pass sums exact squared differences
+    in a different order, so it compares partitions; random inputs make exact
+    bound ties negligible.
+    """
+    fused = _triton_route()
+    generator = torch.Generator(device=device).manual_seed(95)
+    for size, dim, pattern in ((5, 8, 'ints'), (33, 7, 'ties'), (65, 128, 'random'), (300, 16, 'clusters'),
+                               (160, 3, 'lattice')):
+        count = torch.tensor([size, size - 3, size // 2, 2], device=device)
+        mu = torch.randn(4, size, dim, device=device, generator=generator)
+        if pattern == 'ints':
+            mu = mu.mul(2).round()
+        elif pattern == 'ties':
+            mu[0] = .5  # Exact ties exercise the XOR rule and packed keys.
+        elif pattern == 'clusters':
+            mu = torch.randint(0, 5, (4, size, 1), device=device, generator=generator).float() * 4 + .05 * mu
+        elif pattern == 'lattice':
+            # Ulp-level near ties between clusters merged in the same round.
+            mu = torch.randint(0, 3, mu.shape, device=device, generator=generator).float() * 1000 + 1e-4 * mu
+        mask = torch.arange(size, device=device)[None, :] < count[:, None]
+        mu = mu * mask[..., None]
+        mass = torch.randint(1, 4, (4, size), device=device, generator=generator).float() * mask
+        # passes > 1 covers the frozen-center sweeps used by the Alpha config.
+        for limits, target, passes in ((None, 3, 1), (None, 3, 4), (mu.new_tensor([1., 2., 30., .1]), 1, 1)):
+            results = []
+            for reducer_type in (_UnifiedReduceTorch, fused.UnifiedReduce):
+                state = mu.clone()
+                dist = LogStructuredKVCache._semantic_unified_pair_matrix(state)
+                reducer = reducer_type(dist, state, mass.clone(), count, limits, target, passes)
+                for round_ in range(1, 2 * size + 8):
+                    if not bool(reducer.step(round_).any()):
+                        break
+                # Symmetry guarantees a mutual pair whenever a finite cost exists.
+                assert torch.equal(dist, dist.transpose(1, 2)), 'incremental distance matrix lost symmetry'
+                results.append((reducer.finish(), state))
+            (expected, expected_mu), (actual, actual_mu) = results
+            if limits is None:
+                for a, b in zip(actual[0], expected[0]):
+                    assert (a == b).all(), 'fused global merge trace differs from Torch'
+                assert (actual[1] == expected[1]).all() and (actual[2] == expected[2]).all()
+                torch.testing.assert_close(actual_mu, expected_mu, rtol=0, atol=0)
+            else:
+                for lane, (a, b) in enumerate(zip(actual[0], expected[0])):
+                    assert sorted(map(tuple, a.tolist())) == sorted(map(tuple, b.tolist())), \
+                        f'fused candidate partition differs from Torch (lane {lane})'
+                assert (actual[1] == expected[1]).all()
 
 
 def check_batched_state(device):
@@ -157,11 +209,12 @@ def profile_route(cache, inputs, device, directory):
     # No per-stage synchronization or pair-count readbacks in this capture.
     with ExitStack() as stack:
         for method, label in (
-            ('_semantic_unified_reduce_arrays', 'reduce'),
+            ('_semantic_unified_reduce_device', 'reduce'),
+            ('_semantic_unified_round', 'merge_round'),
+            ('_semantic_unified_pair_matrix', 'pair_matrix'),
+            # Full-recompute stages; only the capacity-capped fallback runs them.
             ('_semantic_unified_round_pairs', 'pair_search'),
-            ('_semantic_unified_gram', 'gram'),
             ('_semantic_unified_merge_pack', 'merge_pack'),
-            ('_semantic_unified_select_pairs', 'select_pairs'),
             ('_semantic_ward_merge_batch', 'old_kv_merge'),
             ('_semantic_new_clusters', 'new_cluster_write'),
             ('_semantic_commit_joins', 'batched_write'),
@@ -247,6 +300,7 @@ def main():
     if fused:
         check_round_pairs(cache, device)
         check_merge_pack(cache, device)
+        check_incremental_reduce(device)
     check_batched_state(device)
     prototypes = torch.randn(args.batch, args.groups, args.clusters, args.dim, device=device, dtype=dtype)
     inputs = []
@@ -296,10 +350,11 @@ def main():
                           'peak_extra_MiB': max(peaks) if device.type == 'cuda' else None,
                           'route_backend': 'triton' if fused else 'torch',
                           'pairing_rule': 'frozen_mnn' if args.merge_passes > 1 else 'mnn',
-                          'route_group_tile': 16 if fused else 4,
+                          'route_group_tile': cache._semantic_unified_tile(args.batch * args.groups, args.tokens, device),
                           'effective_B': cache.B, 'exact_count': cache.alpha_count,
                           'reference_pairs_verified': True if fused else None,
                           'reference_updates_verified': True if fused else None,
+                          'reference_incremental_verified': True if fused else None,
                           'reference_state_verified': True,
                           'mass_verified': True}), flush=True)
 
@@ -309,17 +364,19 @@ def main():
 
         stages = defaultdict(float)
         rounds, phase = [], ['']
-        reduce = cache._semantic_unified_reduce_arrays
-        pairs = cache._semantic_unified_round_pairs
+        reduce = cache._semantic_unified_reduce_device
+        merge_round = cache._semantic_unified_round
 
         def reduce_timed(*a, **kw):
             phase[0] = 'candidates' if kw.get('radius_limits') is not None else 'global_merge'
             return timed(phase[0], reduce)(*a, **kw)
 
-        def pairs_counted(mu, *a, **kw):
-            result = pairs(mu, *a, **kw)
-            sizes = (result[..., 0] >= 0).sum(-1).cpu().tolist()
-            rounds.append({'phase': phase[0], 'matrix_size': mu.size(1), 'proposed_pairs_per_group': sizes})
+        def round_counted(reducer, round_):
+            before = reducer.count.cpu()
+            result = merge_round(reducer, round_)
+            merged = (before - reducer.count.cpu()).tolist()
+            rounds.append({'phase': phase[0], 'matrix_size': reducer.mass.size(1), 'round': round_,
+                           'merged_pairs_per_group': merged})
             return result
 
         def timed(name, fn):
@@ -334,14 +391,14 @@ def main():
 
         cache.reset_parameters()
         with ExitStack() as stack:
-            stack.enter_context(patch.object(cache, '_semantic_unified_reduce_arrays', reduce_timed))
-            stack.enter_context(patch.object(cache, '_semantic_unified_round_pairs', pairs_counted))
+            stack.enter_context(patch.object(cache, '_semantic_unified_reduce_device', reduce_timed))
+            stack.enter_context(patch.object(cache, '_semantic_unified_round', round_counted))
             for name, stage in [('_semantic_ward_merge_batch', 'old_kv_merge'),
                                 ('_semantic_new_clusters', 'new_cluster_write'),
                                 ('_semantic_commit_joins', 'batched_write')]:
                 stack.enter_context(patch.object(cache, name, timed(stage, getattr(cache, name))))
             validate(run())
-        print(json.dumps({'diagnostic_stage_s': dict(stages), 'pairing_searches': rounds,
+        print(json.dumps({'diagnostic_stage_s': dict(stages), 'merge_rounds': rounds,
                           'note': 'Separate synchronized diagnostic pass; includes instrumentation overhead.'}), flush=True)
 
 
