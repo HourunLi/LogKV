@@ -24,7 +24,7 @@ Position handling ("expected RoPE", merged into the compressed state):
   fade as spans widen, so positional resolution decays ∝ span width ∝ distance
   (constant relative error). The merged key is deliberately NOT renormalized:
   the norm shrinkage encodes the span's positional uncertainty.
-- NO per-token state of any kind survives outside the recent window.
+- Optional AlphaLogKV retains a fixed-size pool of exact spans outside recent.
 
 Slot attention (``log_kv_slot_attention``), when rank-1 stats are supplied:
     score_s = scale·(q · k_s) + 0.5·scale²·sigma2_s·(q · sigma_u_s)² + λ·log(w_s)
@@ -411,6 +411,7 @@ class LogStructuredKVCache(nn.Module):
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
         semantic_unified_route: bool = False,
+        semantic_merge_passes: int = 1,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
         semantic_centroid_backend: str = "sequential",
@@ -419,6 +420,8 @@ class LogStructuredKVCache(nn.Module):
         sin_cache: torch.Tensor | None = None,
         rope_n_elem: int | None = None,
         allocate_second_order: bool = True,
+        alpha_exact_tokens: int = 0,
+        alpha_span_max_tokens: int = 64,
     ) -> None:
         super().__init__()
 
@@ -433,6 +436,19 @@ class LogStructuredKVCache(nn.Module):
         self.B = B
         self.allocate_second_order = bool(allocate_second_order)
         self.semantic_clusters = bool(semantic_clusters)
+        self.alpha_exact_tokens = int(alpha_exact_tokens)
+        self.alpha_span_max_tokens = int(alpha_span_max_tokens)
+        self.alpha_count = 0
+        if self.alpha_exact_tokens < 0:
+            raise ValueError("alpha_exact_tokens must be >= 0")
+        if self.alpha_exact_tokens:
+            if not (semantic_clusters and semantic_unified_route and semantic_anchor_mode == "mid"
+                    and not allocate_second_order and cluster_k_max > 1):
+                raise ValueError("AlphaLogKV requires unified semantic routing, K > 1, mid anchors and no second-order allocation")
+            if (seg_gap_max is not None and math.isfinite(seg_gap_max)) or seg_block_level:
+                raise ValueError("AlphaLogKV requires disabled segment gaps/padding for delayed archival")
+            if not 1 <= self.alpha_span_max_tokens <= self.alpha_exact_tokens:
+                raise ValueError("alpha_span_max_tokens must be in [1, alpha_exact_tokens]")
         if semantic_anchor_mode not in ("mid", "multi"):
             raise ValueError("semantic_anchor_mode must be 'mid' or 'multi'")
         if semantic_pack_backend not in ("auto", "torch", "triton"):
@@ -450,6 +466,9 @@ class LogStructuredKVCache(nn.Module):
         self.semantic_centroid_backend = semantic_centroid_backend
         self.semantic_replay_updates = bool(semantic_replay_updates)
         self.semantic_unified_route = bool(semantic_unified_route)
+        self.semantic_merge_passes = int(semantic_merge_passes)
+        if self.semantic_merge_passes < 1:
+            raise ValueError("semantic_merge_passes must be >= 1")
         if self.semantic_unified_route:
             if not self.semantic_clusters or semantic_legacy_route or semantic_cluster_chunk_size:
                 raise ValueError("unified routing requires semantic clusters and excludes legacy/chunk-tree routing")
@@ -556,6 +575,26 @@ class LogStructuredKVCache(nn.Module):
             # levels needed; total levels = carry + 1 write level.
             self.max_levels = max(2, math.ceil(math.log2(max((max_seq_length + 1) / denom, 1))) + 1)
         self.L_alloc = self.max_levels
+        if self.alpha_exact_tokens:
+            # Pay for exact K/V and metadata from the ladder, never from the
+            # recent window (which would shorten the training/prefill blocks).
+            # Include the maximum reusable packed decode workspace as well.
+            element = torch.empty((), dtype=dtype).element_size()
+            packed_dim = ((max(k_dim + 1, v_dim) + 7) // 8) * 8
+            entry_bytes = (k_dim + v_dim + 2 * packed_dim) * element + 41
+            exact_bytes = self.alpha_exact_tokens * (n_groups * (k_dim + v_dim + 2 * packed_dim) * element + 9)
+            baseline = n_groups * self.K_max * self.L_alloc * (B * entry_bytes + 2)
+            self.alpha_baseline_B = B
+            for candidate in range(B - 1, 1, -1):
+                levels = max(2, math.ceil(math.log2(max_seq_length / (self.K_max * candidate) + 1.0)) + 2)
+                needed = n_groups * self.K_max * levels * (candidate * entry_bytes + 2) + exact_bytes
+                if needed <= baseline:
+                    B = self.B = candidate
+                    self.L_alloc = self.max_levels = levels
+                    self.alpha_budget_bytes = (batch_size * baseline, batch_size * needed)
+                    break
+            else:
+                raise ValueError("compressed ladder budget is too small for alpha_exact_tokens; increase B or reduce exact capacity")
         self.B_prime = B
         self.recent_capacity = self.recent_size * 2 if self.semantic_clusters else self.recent_size
 
@@ -589,6 +628,17 @@ class LogStructuredKVCache(nn.Module):
                 [0] * self.recent_capacity for _ in range(batch_size)
             ]
         self.recent_count: int = 0
+        if self.alpha_exact_tokens:
+            P = self.alpha_exact_tokens
+            self.register_buffer("alpha_k_raw", torch.zeros(batch_size, n_groups, P, k_dim, device=device, dtype=dtype), persistent=False)
+            self.register_buffer("alpha_v", torch.zeros(batch_size, n_groups, P, v_dim, device=device, dtype=dtype), persistent=False)
+            self.register_buffer("alpha_pos", torch.zeros(batch_size, P, device=device, dtype=torch.int64), persistent=False)
+            self.register_buffer("alpha_valid", torch.zeros(batch_size, P, device=device, dtype=torch.bool), persistent=False)
+            self._alpha_spans = [[] for _ in range(batch_size)]
+            self._alpha_positions = [[] for _ in range(batch_size)]
+            self._recent_span_ends = [[False] * self.recent_capacity for _ in range(batch_size)]
+            self._UPDATE_DEVICE_FIELDS = (*self._UPDATE_DEVICE_FIELDS, "alpha_k_raw", "alpha_v", "alpha_pos", "alpha_valid")
+            self._UPDATE_HOST_FIELDS = (*self._UPDATE_HOST_FIELDS, "_alpha_spans", "_alpha_positions", "alpha_count")
 
         # ---- Hierarchical entries: (B, G, K_max, L_alloc, B', ·) ----
         # K_max=1 is the current single-cluster path; the indexed layout is the
@@ -2503,13 +2553,36 @@ class LogStructuredKVCache(nn.Module):
                 torch.set_float32_matmul_precision(precision)
         return gram, norm
 
+    @staticmethod
+    def _semantic_unified_matching_sweeps(cost, passes):
+        """Torch reference: freeze centers, peel disjoint mutual pairs, sort once."""
+        size = cost.size(-1)
+        ids = torch.arange(size, device=cost.device)
+        tie = ids[:, None].bitwise_xor(ids[None, :])
+        partner = ids.expand(cost.size(0), -1).clone()
+        pair_cost = cost.new_full(partner.shape, float("inf"))
+        remaining = cost.clone()
+        for _ in range(passes):
+            best_cost = remaining.amin(-1)
+            best = torch.where(remaining == best_cost[..., None], tie, 2 * size).argmin(-1)
+            accept = (ids != best) & (best.gather(1, best) == ids) & torch.isfinite(best_cost)
+            partner = torch.where(accept, best, partner)
+            pair_cost = torch.where(accept, best_cost, pair_cost)
+            remaining.masked_fill_(accept[:, :, None] | accept[:, None, :], float("inf"))
+        return partner, pair_cost
+
     def _semantic_unified_round_pairs(self, mu, mass, radius, limits, cap, allow_overflow):
-        """One unchanged Ward round; CUDA fuses cost masks and nearest-neighbour reduction."""
+        """Ward matching; optional frozen-center sweeps amortize global round overhead."""
         size = mu.size(1)
+        # ponytail: approximate only uncapped global merges. Candidate radius
+        # checks and finite-cap fallback retain the original matching rules.
+        passes = self.semantic_merge_passes if limits is None and cap == math.inf else 1
         fused = _triton_route() if mu.is_cuda else None
         if fused is not None:
             data, norm = (self._semantic_unified_gram(mu) if size > 32
                           else (self._semantic_unified_distance2(mu), None))
+            if passes > 1:
+                return self._semantic_unified_select_pairs(*fused.matching_sweeps(data, mass, norm, passes), size // 2)
             nearest, fallback = fused.nearest(data, mass, radius, limits, cap, norm=norm)
             pairs = self._semantic_unified_select_pairs(*nearest, size // 2)
             if allow_overflow and fallback is not None:
@@ -2522,6 +2595,8 @@ class LogStructuredKVCache(nn.Module):
             live = mass > 0
             cost.masked_fill_(~(live[:, :, None] & live[:, None, :]), float("inf"))
             cost.diagonal(dim1=-2, dim2=-1).fill_(float("inf"))
+            if passes > 1:
+                return self._semantic_unified_select_pairs(*self._semantic_unified_matching_sweeps(cost, passes), size // 2)
             if limits is not None:
                 distance = distance2.sqrt_()
                 bound = torch.maximum(
@@ -2728,26 +2803,25 @@ class LogStructuredKVCache(nn.Module):
 
     def _semantic_route_unified(
         self, k_raw: torch.Tensor, v: torch.Tensor, positions: torch.Tensor,
-        positions_host: list[list[int]], *, record: bool,
+        positions_host: list[list[int]], *, record: bool, token_counts=None,
     ) -> None:
         jobs, routes, merge_jobs, new_jobs = [], [], [], []
-        lanes = [(b, g) for b in range(k_raw.size(0)) for g in range(k_raw.size(1))]
+        token_counts = [k_raw.size(2)] * k_raw.size(0) if token_counts is None else token_counts
+        lanes = [(b, g) for b in range(k_raw.size(0)) for g in range(k_raw.size(1)) if token_counts[b]]
         # ponytail: bound the temporary pair matrix to 16 groups on CUDA.
         tile_size = 16 if k_raw.is_cuda and _triton_route() is not None else 4
-        tokens = k_raw.size(2)
-        host_pos = np.asarray(positions_host, dtype=np.int64)
-        position_order = np.argsort(host_pos, axis=1, kind="stable")
+        position_order = [np.argsort(row[:n], kind="stable") for row, n in zip(positions_host, token_counts)]
         for start in range(0, len(lanes), tile_size):
             tile = lanes[start:start + tile_size]
-            centers = [k_raw[b, g].detach().float() for b, g in tile]
+            centers = [k_raw[b, g, :token_counts[b]].detach().float() for b, g in tile]
             candidates = self._semantic_unified_reduce_arrays(
-                [np.ones(tokens, dtype=np.float32)] * len(tile), centers,
+                [np.ones(token_counts[b], dtype=np.float32) for b, _ in tile], centers,
                 radius_limits=[math.sqrt(self._semantic_tree_threshold(b, g)) for b, g in tile],
             )
             live = [np.asarray(self._semantic_live_clusters(b, g), dtype=np.int64) for b, g in tile]
             labels, weights, centers = [], [], []
             for (b, g), old, (roots, traces, mu) in zip(tile, live, candidates):
-                label = self._semantic_unified_labels(tokens, roots, traces)
+                label = self._semantic_unified_labels(token_counts[b], roots, traces)
                 labels.append(label)
                 weights.append(np.concatenate((np.asarray(self._semantic_n_total[b][g])[old],
                                                np.bincount(label, minlength=len(roots)))))
@@ -2784,8 +2858,123 @@ class LogStructuredKVCache(nn.Module):
                 if len(offsets):
                     jobs.append((b, g, target, offsets))
         self._semantic_new_clusters(new_jobs, k_raw, v, positions, positions_host, record=record)
-        self._semantic_commit_joins(sorted(jobs, key=lambda job: job[:3]), k_raw, v, positions, positions_host,
-                                    record=record)
+        commit = self._alpha_commit_joins if self.alpha_exact_tokens else self._semantic_commit_joins
+        commit(sorted(jobs, key=lambda job: job[:3]), k_raw, v, positions, positions_host, record=record)
+
+    def _alpha_commit_joins(self, jobs, k_raw, v, positions, positions_host, *, record):
+        """Insert delayed exact evictions in position order, batching affected clusters."""
+        ordinary, delayed = [], []
+        for job in jobs:
+            b, g, c, offsets = job
+            (delayed if min(positions_host[b][i] for i in offsets) < self._semantic_p_hi_c[b][g][c]
+             else ordinary).append(job)
+        self._semantic_commit_joins(ordinary, k_raw, v, positions, positions_host, record=record)
+        if not delayed:
+            return
+        fields = self._semantic_flat_level_fields()
+        spans, counts, new_indices, old_counts = [], [], [], []
+        for b, g, c, offsets in delayed:
+            base = self._semantic_lane_base(b, g, c)
+            n = 0
+            for ell, count in enumerate(self._semantic_counts[b][g][c]):
+                spans.append((base + ell * self.B, base + ell * self.B + count))
+                n += count
+            old_counts.append(n)
+            counts.append(n + len(offsets))
+            new_indices.extend((b, g, int(i)) for i in offsets)
+        src = torch.from_numpy(_spans_to_index_array(spans)).to(k_raw.device)
+        # One metadata read for all delayed lanes; no per-token CUDA sync.
+        old_pos = fields[8][src].cpu().numpy()
+        index = torch.tensor(new_indices, device=k_raw.device, dtype=torch.long).T
+        bi, gi, ti = index.unbind(0)
+        nk, nv, np_ = k_raw[bi, gi, ti], v[bi, gi, ti], positions[bi, ti]
+        n_new = len(new_indices)
+        new = (nk, nv, self.level_w.new_ones(n_new), *self._empty_stats(nk, nv),
+               np_, np_, np_, self.level_order.new_zeros(n_new), self.pad_mask.new_zeros(n_new))
+        combined = tuple(torch.cat((field[src], value), 0) if field is not None else None
+                         for field, value in zip(fields, new))
+        orders, phases, old_start, new_start = [], [], 0, 0
+        totals, highs = [], []
+        for (b, g, c, offsets), old_n, count in zip(delayed, old_counts, counts):
+            idx = np.concatenate((np.arange(old_start, old_start + old_n),
+                                  len(src) + np.arange(new_start, new_start + len(offsets))))
+            pos = np.concatenate((old_pos[old_start:old_start + old_n],
+                                  np.asarray(positions_host[b])[offsets]))
+            orders.append(idx[np.argsort(pos, kind="stable")])
+            phases.append(np.arange(count, dtype=np.int64))
+            totals.append(self._semantic_n_total[b][g][c] + len(offsets))
+            highs.append(max(self._semantic_p_hi_c[b][g][c], int(pos.max())))
+            if record:
+                self._record_ops(b, g, [(LOG_KV_OP_JOIN, c, 0, int(positions_host[b][i])) for i in offsets])
+            old_start += old_n
+            new_start += len(offsets)
+        order = torch.from_numpy(np.concatenate(orders)).to(k_raw.device)
+        block = tuple(x[order] if x is not None else None for x in combined)
+        block = block[:11] + (torch.from_numpy(np.concatenate(phases)).to(k_raw.device), block[12])
+        lanes = [job[:3] for job in delayed]
+        ids = torch.tensor([(b * self.n_groups + g) * self.K_max + c for b, g, c in lanes], device=k_raw.device)
+        lengths = torch.tensor([len(job[3]) for job in delayed], device=k_raw.device)
+        sums = torch.segment_reduce(nk.float(), "sum", lengths=lengths, unsafe=True)
+        mu, ne = self.centroid.flatten(0, 2), self.n_eff.flatten()
+        pre = ne[ids]
+        updated = (pre[:, None] * mu[ids] + sums) / (pre + lengths)[:, None]
+        self._semantic_clear_clusters(lanes)
+        mu.index_copy_(0, ids, updated)
+        ne.index_copy_(0, ids, pre + lengths)
+        for (b, g, c), total, hi, count in zip(lanes, totals, highs, counts):
+            self._set_semantic_alive(b, g, c, True)
+            self._set_semantic_n_total(b, g, c, total)
+            self._set_semantic_p_hi(b, g, c, hi)
+            self._set_semantic_level0_phase(b, g, c, count)
+            self._semantic_ward_dirty[b][g] = True
+        self._semantic_append_entries_batched(lanes, counts, block)
+
+    @torch.no_grad()
+    def _alpha_route_flush(self, k, v, positions, positions_host, span_ends, *, record):
+        from litgpt.alpha_log_kv import select_spans
+        if span_ends is None:
+            raise ValueError("AlphaLogKV requires natural span boundaries")
+        old_width = self.alpha_count
+        keys = torch.cat((self.alpha_k_raw[:, :, :old_width], k), dim=2)
+        values = torch.cat((self.alpha_v[:, :, :old_width], v), dim=2)
+        pos = torch.cat((self.alpha_pos[:, :old_width], positions), dim=1)
+        host = [old + [0] * (old_width - len(old)) + new for old, new in zip(self._alpha_positions, positions_host)]
+        with logkv_timed("alpha_select"):
+            selected = select_spans(keys, values, self._alpha_spans, self._alpha_positions,
+                                    positions_host, span_ends, old_width, self.alpha_exact_tokens, self.alpha_span_max_tokens)
+
+        def gather(rows, width, out=None):
+            offsets = np.zeros((self.batch_size, width), dtype=np.int64)
+            valid = np.zeros_like(offsets, dtype=np.bool_)
+            for b, row in enumerate(rows):
+                offsets[b, :len(row)] = row
+                valid[b, :len(row)] = True
+            idx = torch.from_numpy(offsets).to(k.device)
+            mask = torch.from_numpy(valid).to(k.device)
+            ki = idx[:, None, :, None].expand(-1, self.n_groups, -1, self.k_dim)
+            vi = idx[:, None, :, None].expand(-1, self.n_groups, -1, self.v_dim)
+            result = (torch.gather(keys, 2, ki, out=None if out is None else out[0]),
+                      torch.gather(values, 2, vi, out=None if out is None else out[1]),
+                      torch.gather(pos, 1, idx, out=None if out is None else out[2]))
+            for value in result[:2]:
+                value.masked_fill_(~mask[:, None, :, None], 0)
+            result[2].masked_fill_(~mask, 0)
+            return (*result, mask)
+
+        # Sources are independent cat buffers; write straight into persistent
+        # exact storage without three staging allocations and copy kernels.
+        *_, valid = gather(selected.keep, self.alpha_exact_tokens,
+                           out=(self.alpha_k_raw, self.alpha_v, self.alpha_pos))
+        self.alpha_valid.copy_(valid)
+        self.alpha_count = max(map(len, selected.keep), default=0)
+        self._alpha_spans, self._alpha_positions = selected.spans, selected.positions
+        counts = list(map(len, selected.archive))
+        width = max(counts, default=0)
+        if width:
+            ak, av, ap, _ = gather(selected.archive, width)
+            archive_host = [[host[b][i] for i in row] + [0] * (width - len(row))
+                            for b, row in enumerate(selected.archive)]
+            self._semantic_route_unified(ak, av, ap, archive_host, record=record, token_counts=counts)
 
     def _semantic_commit_joins(
         self,
@@ -3452,8 +3641,10 @@ class LogStructuredKVCache(nn.Module):
             key = tuple(tuple(row) for row in host)
             signature = (k.shape, v.shape, k.dtype, v.dtype, k.device,
                          self.semantic_centroid_backend, self.second_order,
-                         self.semantic_unified_route,
-                         self.K_max, self.B, self.L_alloc, self.recent_size, self.semantic_flush_granularity)
+                         self.semantic_unified_route, self.semantic_merge_passes,
+                         self.K_max, self.B, self.L_alloc, self.recent_size, self.semantic_flush_granularity,
+                         self.alpha_exact_tokens, self.alpha_span_max_tokens,
+                         tuple(map(tuple, kwargs.get("span_ends") or ())))
             if self._replaying_updates:
                 if not replay or key not in updates.flushes:
                     raise RuntimeError("missing semantic update record; rerouting is not allowed")
@@ -3524,6 +3715,7 @@ class LogStructuredKVCache(nn.Module):
         replay_op_log_len: torch.Tensor | None = None,
         replay_op_log_host: list[list[list[tuple[int, int, int, int]]]] | None = None,
         replay_plans: _SemanticReplayPlans | None = None,
+        span_ends: list[list[bool]] | None = None,
     ) -> None:
         if not self.semantic_clusters:
             raise RuntimeError("route_and_flush_batch is only valid for semantic LogKV")
@@ -3537,6 +3729,12 @@ class LogStructuredKVCache(nn.Module):
             if replay_plans is not None:
                 raise RuntimeError("semantic replay plans require CPU positions; device readback is not allowed")
             positions_host = [[int(x) for x in row] for row in positions.detach().cpu().tolist()]
+        if self.alpha_exact_tokens:
+            if replay_op_log is not None:
+                raise RuntimeError("AlphaLogKV replay requires semantic_replay_updates; reranking is not allowed")
+            with self._semantic_deferred_scalars():
+                self._alpha_route_flush(k_raw, v, positions, positions_host, span_ends, record=record_op_log)
+            return
         if replay_op_log is not None:
             if replay_op_log_len is None:
                 raise ValueError("replay_op_log_len is required with replay_op_log")
@@ -4109,6 +4307,7 @@ class LogStructuredKVCache(nn.Module):
                 replay_op_log_len=replay_op_log_len,
                 replay_op_log_host=replay_op_log_host,
                 replay_plans=replay_plans,
+                span_ends=[row[:take] for row in self._recent_span_ends] if self.alpha_exact_tokens else None,
             )
             remaining = self.recent_count - take
             if remaining > 0:
@@ -4118,8 +4317,12 @@ class LogStructuredKVCache(nn.Module):
                 self.recent_pos[:, :remaining] = self.recent_pos[:, take:self.recent_count].clone()
                 for b in range(self.batch_size):
                     self._recent_pos_host[b][:remaining] = self._recent_pos_host[b][take:self.recent_count]
+                    if self.alpha_exact_tokens:
+                        self._recent_span_ends[b][:remaining] = self._recent_span_ends[b][take:self.recent_count]
             for b in range(self.batch_size):
                 self._recent_pos_host[b][remaining:self.recent_count] = [0] * (self.recent_count - remaining)
+                if self.alpha_exact_tokens:
+                    self._recent_span_ends[b][remaining:self.recent_count] = [False] * (self.recent_count - remaining)
             self.recent_k[:, :, remaining:self.recent_count, :].zero_()
             self.recent_k_raw[:, :, remaining:self.recent_count, :].zero_()
             self.recent_v[:, :, remaining:self.recent_count, :].zero_()
@@ -4139,6 +4342,7 @@ class LogStructuredKVCache(nn.Module):
         replay_op_log_len: torch.Tensor | None = None,
         replay_op_log_host: list[list[list[tuple[int, int, int, int]]]] | None = None,
         replay_plans: _SemanticReplayPlans | None = None,
+        span_ends: list[list[bool]] | None = None,
     ) -> None:
         n = k_roped.size(2)
         if n > self.recent_size:
@@ -4147,6 +4351,11 @@ class LogStructuredKVCache(nn.Module):
             raise ValueError(f"k_raw shape {tuple(k_raw.shape)} does not match semantic cache shape")
         positions = self._semantic_input_positions(n, input_pos)
         positions_host = self._semantic_input_positions_host(n, input_pos)
+        if self.alpha_exact_tokens:
+            if span_ends is None or len(span_ends) != self.batch_size or any(len(row) != n for row in span_ends):
+                raise ValueError("AlphaLogKV span boundaries must match the input batch and token count")
+            for b in range(self.batch_size):
+                self._recent_span_ends[b][self.recent_count:self.recent_count + n] = span_ends[b]
         self._count_tokens(n)
         if self.recent_count + n > self.recent_capacity:
             raise RuntimeError(
@@ -4312,6 +4521,7 @@ class LogStructuredKVCache(nn.Module):
         replay_op_log_len: torch.Tensor | None = None,
         replay_op_log_host: list[list[list[tuple[int, int, int, int]]]] | None = None,
         replay_plans: _SemanticReplayPlans | None = None,
+        span_ends: list[list[bool]] | None = None,
     ) -> None:
         """Add tokens to the sliding window. When the window overflows, the
         oldest 2 tokens are flushed (compacted) into level 0.
@@ -4329,6 +4539,7 @@ class LogStructuredKVCache(nn.Module):
                 replay_op_log_len=replay_op_log_len,
                 replay_op_log_host=replay_op_log_host,
                 replay_plans=replay_plans,
+                span_ends=span_ends,
             )
             return
         n = k.size(2)
@@ -4493,6 +4704,17 @@ class LogStructuredKVCache(nn.Module):
         k_parts: list[torch.Tensor] = [slot_k]
         v_parts: list[torch.Tensor] = [slot_v]
         w_parts: list[torch.Tensor] = [slot_w]
+        if self.alpha_count:
+            count = self.alpha_count
+            valid = self.alpha_valid[:, None, :count].expand(-1, self.n_groups, -1)
+            anchors = self.alpha_pos[:, None, :count, None].expand(-1, self.n_groups, -1, -1)
+            keys = materialize_anchor_keys(self.alpha_k_raw[:, :, :count], anchors,
+                                          self.cos_cache, self.sin_cache, self.rope_n_elem).squeeze(-2)
+            k_parts.append(keys.masked_fill(~valid[..., None], 0))
+            v_parts.append(self.alpha_v[:, :, :count])
+            w_parts.append(valid.float())
+            slot_valid = torch.cat((slot_valid, valid), dim=-1)
+            M_s = torch.cat((M_s, torch.ones_like(valid, dtype=M_s.dtype)), dim=-1)
         sigma_u_parts: list[torch.Tensor] = []
         sigma2_parts: list[torch.Tensor] = []
         gamma_a_parts: list[torch.Tensor] = []
@@ -4704,6 +4926,9 @@ class LogStructuredKVCache(nn.Module):
         self.recent_v = self.recent_v.to(dtype)
         if self.semantic_clusters:
             self.recent_k_raw = self.recent_k_raw.to(dtype)
+        if self.alpha_exact_tokens:
+            self.alpha_k_raw = self.alpha_k_raw.to(dtype)
+            self.alpha_v = self.alpha_v.to(dtype)
         self.level_k = self.level_k.to(dtype)
         self.level_v = self.level_v.to(dtype)
         if self.allocate_second_order:
@@ -4725,6 +4950,13 @@ class LogStructuredKVCache(nn.Module):
             for row in self._recent_pos_host:
                 row[:] = [0] * self.recent_capacity
         self.recent_count = 0
+        self.alpha_count = 0
+        if self.alpha_exact_tokens:
+            for name in ("alpha_k_raw", "alpha_v", "alpha_pos", "alpha_valid"):
+                getattr(self, name).zero_()
+            self._alpha_spans = [[] for _ in range(self.batch_size)]
+            self._alpha_positions = [[] for _ in range(self.batch_size)]
+            self._recent_span_ends = [[False] * self.recent_capacity for _ in range(self.batch_size)]
         self.level_k.zero_()
         self.level_v.zero_()
         self.level_w.zero_()
@@ -4775,7 +5007,7 @@ class LogStructuredKVCache(nn.Module):
         if hasattr(self, "_counts"):
             return self.recent_count + sum(self._counts)
         if hasattr(self, "_semantic_counts"):
-            return self.recent_count + sum(
+            return self.recent_count + self.alpha_count + sum(
                 count
                 for c_counts in self._semantic_counts[0][0]
                 for count in c_counts
@@ -4801,6 +5033,9 @@ class LogStructuredKVCache(nn.Module):
             top_live = top_counts.masked_fill(~alive, 0)
             return {
                 "semantic_clusters": True,
+                "alpha_exact_tokens": self.alpha_exact_tokens,
+                "alpha_visible_slots": self.alpha_count,
+                "effective_B": self.B,
                 "target_tokens_per_cluster": target,
                 "K_max_binding_rate": float((live_counts >= self.K_max).to(torch.float32).mean().item()),
                 "live_clusters_mean": float(live_counts.mean().item()),
@@ -5223,7 +5458,7 @@ def _mid_chunk_attention(cache, q, k, v, scale, causal_tail, plan, reuse_prefix)
         plan = cache._semantic_attention_plan() if plan is None else plan
     with logkv_timed("pack"):
         if reuse and buffers is None:
-            capacity = plan[0].size(-1) + cache.recent_size + max(2, k.size(2))
+            capacity = plan[0].size(-1) + cache.alpha_count + cache.recent_size + max(2, k.size(2))
             buffers = (k.new_empty(*k.shape[:2], capacity, dim), v.new_empty(*v.shape[:2], capacity, dim))
         ka, va = pack_mid_kv(cache, plan, k, v, dim, buffers=buffers, skip_pooled=skip_pooled, recent_start=recent_start)
         if reuse:
@@ -5346,8 +5581,12 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, cache, scale, train_block, second_order_scale, k_raw=None):
+    def forward(ctx, q, k, v, cache, scale, train_block, second_order_scale, k_raw=None, span_ends=None):
         commit_k_raw = k if k_raw is None else k_raw
+        ctx.input_count = len(ctx.needs_input_grad)
+        ctx.span_ends = None if span_ends is None else tuple(map(tuple, span_ends))
+        if cache.alpha_exact_tokens and (not cache.semantic_replay_updates or second_order_scale != 0.):
+            raise ValueError("AlphaLogKV training requires semantic_replay_updates and second_order_scale=0")
 
         T = q.size(2)
         train_block = int(train_block)
@@ -5362,7 +5601,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             scale, train_block, second_order_scale, k_raw is not None,
             cache.semantic_anchor_mode, cache.K_max, cache.B, cache.recent_size,
             cache.semantic_centroid_backend, cache.semantic_replay_updates,
-            cache.semantic_unified_route,
+            cache.semantic_unified_route, cache.semantic_merge_passes,
+            cache.alpha_exact_tokens, cache.alpha_span_max_tokens, ctx.span_ends,
         )
         checkpoint_log = checkpoint_route_replay(cache, signature)
         updates = (_SemanticReplayUpdates() if checkpoint_log is None else checkpoint_log[4]) if cache.semantic_replay_updates else None
@@ -5418,6 +5658,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                         replay_op_log_len=checkpoint_log[1] if checkpoint_log is not None else None,
                         replay_op_log_host=checkpoint_log[2] if checkpoint_log is not None else None,
                         replay_plans=checkpoint_log[3] if checkpoint_log is not None else None,
+                        span_ends=[row[start:end] for row in ctx.span_ends] if ctx.span_ends is not None else None,
                     )
                 start = end
         if checkpoint_log is None:
@@ -5436,7 +5677,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.update_tensor_offset = 3 + int(k_raw is not None) + len(plan_tensors)
         ctx.update_flushes = updates.flushes if updates is not None else None
         ctx.update_config = (cache.semantic_centroid_backend,
-                             cache.semantic_replay_updates, cache.semantic_unified_route)
+                             cache.semantic_replay_updates, cache.semantic_unified_route, cache.semantic_merge_passes,
+                             cache.alpha_exact_tokens, cache.alpha_span_max_tokens)
         ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors,
                               *(updates.tensors if updates is not None else ()))
         ctx.has_attention_plans = cache.semantic_clusters
@@ -5464,7 +5706,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             k_raw = k
         cache = ctx.cache
         if ctx.update_config != (cache.semantic_centroid_backend,
-                                 cache.semantic_replay_updates, cache.semantic_unified_route):
+                                 cache.semantic_replay_updates, cache.semantic_unified_route, cache.semantic_merge_passes,
+                                 cache.alpha_exact_tokens, cache.alpha_span_max_tokens):
             raise RuntimeError("semantic update configuration changed between forward and backward")
         updates = (_SemanticReplayUpdates(ctx.update_flushes, saved[ctx.update_tensor_offset:])
                    if ctx.update_flushes is not None else None)
@@ -5514,9 +5757,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                     replay_op_log_len=ctx.op_log_len if needs_op_log else None,
                     replay_op_log_host=ctx.op_log_host if needs_op_log else None,
                     replay_plans=ctx.replay_plans if needs_op_log else None,
+                    span_ends=[row[start:end] for row in ctx.span_ends] if ctx.span_ends is not None else None,
                 )
             start = end
-        grad_inputs = (dq, dk, dv, None, None, None, None)
-        if ctx.has_k_raw:
-            return grad_inputs + (None,)
-        return grad_inputs
+        return (dq, dk, dv) + (None,) * (ctx.input_count - 3)

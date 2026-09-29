@@ -196,10 +196,13 @@ emit("LOG_KV_SECOND_ORDER_SCALE", value_or("log_kv_second_order_scale", 1.0))
 emit("LOG_KV_SEMANTIC", str(bool(cfg.get("log_kv_semantic_clusters", False))).lower())
 emit("LOG_KV_SEMANTIC_LEGACY_ROUTE", str(bool(cfg.get("log_kv_semantic_legacy_route", False))).lower())
 emit("LOG_KV_SEMANTIC_UNIFIED_ROUTE", str(bool(cfg.get("log_kv_semantic_unified_route", False))).lower())
+emit("LOG_KV_SEMANTIC_MERGE_PASSES", int(value_or("log_kv_semantic_merge_passes", 1)))
 emit("LOG_KV_SEMANTIC_ANCHOR_MODE", value_or("log_kv_semantic_anchor_mode", "multi"))
 emit("LOG_KV_SEMANTIC_PACK_BACKEND", value_or("log_kv_semantic_pack_backend", "auto"))
 emit("LOG_KV_SEMANTIC_CENTROID_BACKEND", value_or("log_kv_semantic_centroid_backend", "sequential"))
 emit("LOG_KV_SEMANTIC_REPLAY_UPDATES", str(bool(cfg.get("log_kv_semantic_replay_updates", False))).lower())
+emit("LOG_KV_ALPHA_EXACT_TOKENS", int(value_or("log_kv_alpha_exact_tokens", 0)))
+emit("LOG_KV_ALPHA_SPAN_MAX_TOKENS", int(value_or("log_kv_alpha_span_max_tokens", 64)))
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
 emit("LOG_KV_CLUSTER_LAMBDA_REL", value_or("log_kv_cluster_lambda_rel", 1.0))
 emit("LOG_KV_SEG_ETA", value_or("log_kv_seg_eta", 1.0))
@@ -324,10 +327,13 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
         --log_kv_semantic_clusters true
         --log_kv_semantic_legacy_route "${LOG_KV_SEMANTIC_LEGACY_ROUTE}"
         --log_kv_semantic_unified_route "${LOG_KV_SEMANTIC_UNIFIED_ROUTE}"
+        --log_kv_semantic_merge_passes "${LOG_KV_SEMANTIC_MERGE_PASSES}"
         --log_kv_semantic_anchor_mode "${LOG_KV_SEMANTIC_ANCHOR_MODE}"
         --log_kv_semantic_pack_backend "${LOG_KV_SEMANTIC_PACK_BACKEND}"
         --log_kv_semantic_centroid_backend "${LOG_KV_SEMANTIC_CENTROID_BACKEND}"
         --log_kv_semantic_replay_updates "${LOG_KV_SEMANTIC_REPLAY_UPDATES}"
+        --log_kv_alpha_exact_tokens "${LOG_KV_ALPHA_EXACT_TOKENS}"
+        --log_kv_alpha_span_max_tokens "${LOG_KV_ALPHA_SPAN_MAX_TOKENS}"
         --log_kv_cluster_k_max "${LOG_KV_CLUSTER_K_MAX}"
         --log_kv_cluster_lambda_rel "${LOG_KV_CLUSTER_LAMBDA_REL}"
         --log_kv_seg_eta "${LOG_KV_SEG_ETA}"

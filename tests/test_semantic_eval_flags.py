@@ -16,6 +16,8 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
     parent = tmp_path / "base.yaml"
     parent.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\n"
                       "log_kv_cluster_k_max: 8\nlog_kv_B: 64\n"
+                      "log_kv_alpha_exact_tokens: 256\nlog_kv_alpha_span_max_tokens: 64\n"
+                      f"log_kv_semantic_merge_passes: {4 if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_centroid_backend: {'parallel' if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_replay_updates: {'true' if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_anchor_mode: {anchor_mode}\nlog_kv_semantic_pack_backend: {pack_backend}\n")
@@ -56,6 +58,9 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
     # Also catch shifts in majob's positional read list after adding a field.
     assert args[args.index("--log_kv_cluster_k_max") + 1] == "8"
     assert args[args.index("--log_kv_B") + 1] == "64"
+    assert args[args.index("--log_kv_semantic_merge_passes") + 1] == ("4" if anchor_mode == "mid" else "1")
+    assert args[args.index("--log_kv_alpha_exact_tokens") + 1] == "256"
+    assert args[args.index("--log_kv_alpha_span_max_tokens") + 1] == "64"
     assert args[args.index("--log_kv_semantic_anchor_mode") + 1] == anchor_mode
     assert args[args.index("--log_kv_semantic_pack_backend") + 1] == pack_backend
 

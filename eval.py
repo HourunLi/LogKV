@@ -735,10 +735,13 @@ class LogKVLM(LM):
         log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
         log_kv_semantic_legacy_route: bool = False,
         log_kv_semantic_unified_route: bool = False,
+        log_kv_semantic_merge_passes: int = 1,
         log_kv_semantic_anchor_mode: str = "multi",
         log_kv_semantic_pack_backend: str = "auto",
         log_kv_semantic_centroid_backend: str = "sequential",
         log_kv_semantic_replay_updates: bool = False,
+        log_kv_alpha_exact_tokens: int = 0,
+        log_kv_alpha_span_max_tokens: int = 64,
         tokenizer_dir: str | None = None,
     ):
         super().__init__()
@@ -774,10 +777,13 @@ class LogKVLM(LM):
         self.log_kv_semantic_capacity_hard_cap_mult = float(log_kv_semantic_capacity_hard_cap_mult)
         self.log_kv_semantic_legacy_route = bool(log_kv_semantic_legacy_route)
         self.log_kv_semantic_unified_route = bool(log_kv_semantic_unified_route)
+        self.log_kv_semantic_merge_passes = int(log_kv_semantic_merge_passes)
         self.log_kv_semantic_anchor_mode = log_kv_semantic_anchor_mode
         self.log_kv_semantic_pack_backend = log_kv_semantic_pack_backend
         self.log_kv_semantic_centroid_backend = log_kv_semantic_centroid_backend
         self.log_kv_semantic_replay_updates = log_kv_semantic_replay_updates
+        self.log_kv_alpha_exact_tokens = log_kv_alpha_exact_tokens
+        self.log_kv_alpha_span_max_tokens = log_kv_alpha_span_max_tokens
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -819,6 +825,8 @@ class LogKVLM(LM):
         )
         if is_master: print(f"🔧 正在初始化 Transformer ({mode_name})...")
         self.model = GPT(self.config).to(device).bfloat16()
+        if log_kv_alpha_exact_tokens:
+            self.model.set_alpha_span_boundary_ids(self.tokenizer.alpha_span_boundary_ids)
 
         if is_master: print(f"🔄 正在加载权重...")
         checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
@@ -901,10 +909,13 @@ class LogKVLM(LM):
             semantic_capacity_hard_cap_mult=self.log_kv_semantic_capacity_hard_cap_mult,
             semantic_legacy_route=self.log_kv_semantic_legacy_route,
             semantic_unified_route=self.log_kv_semantic_unified_route,
+            semantic_merge_passes=self.log_kv_semantic_merge_passes,
             semantic_anchor_mode=self.log_kv_semantic_anchor_mode,
             semantic_pack_backend=self.log_kv_semantic_pack_backend,
             semantic_centroid_backend=self.log_kv_semantic_centroid_backend,
             semantic_replay_updates=self.log_kv_semantic_replay_updates,
+            alpha_exact_tokens=self.log_kv_alpha_exact_tokens,
+            alpha_span_max_tokens=self.log_kv_alpha_span_max_tokens,
         )
         if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
@@ -941,6 +952,10 @@ class LogKVLM(LM):
     def _report_cache_budget(self) -> None:
         self.cache_budget.update(persistent_cache_bytes=self._cache_storage_bytes(),
                                  swa_window_size=self.swa_window_size)
+        first = self.model.transformer.h[0].attn.kv_cache
+        if getattr(first, "alpha_exact_tokens", 0):
+            self.cache_budget.update(alpha_exact_tokens=first.alpha_exact_tokens, effective_B=first.B,
+                                     alpha_span_max_tokens=first.alpha_span_max_tokens)
         if _is_main():
             print(f"🧮 persistent cache budget (excluding shared RoPE / transient workspace): {self.cache_budget}")
 
@@ -1299,10 +1314,13 @@ def main(
     log_kv_semantic_capacity_hard_cap_mult: float = 0.0,
     log_kv_semantic_legacy_route: bool = False,
     log_kv_semantic_unified_route: bool = False,
+    log_kv_semantic_merge_passes: int = 1,
     log_kv_semantic_anchor_mode: str = "multi",
     log_kv_semantic_pack_backend: str = "auto",
     log_kv_semantic_centroid_backend: str = "sequential",
     log_kv_semantic_replay_updates: bool = False,
+    log_kv_alpha_exact_tokens: int = 0,
+    log_kv_alpha_span_max_tokens: int = 64,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1390,6 +1408,8 @@ def main(
     log_kv_semantic_pack_backend = _o("log_kv_semantic_pack_backend", log_kv_semantic_pack_backend)
     log_kv_semantic_centroid_backend = _o("log_kv_semantic_centroid_backend", log_kv_semantic_centroid_backend)
     log_kv_semantic_replay_updates = bool(_o("log_kv_semantic_replay_updates", log_kv_semantic_replay_updates))
+    log_kv_alpha_exact_tokens = int(_o("log_kv_alpha_exact_tokens", log_kv_alpha_exact_tokens))
+    log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
     log_kv_seg_eta = float(_o("log_kv_seg_eta", log_kv_seg_eta))
@@ -1417,6 +1437,7 @@ def main(
     log_kv_semantic_unified_route = bool(
         _o("log_kv_semantic_unified_route", log_kv_semantic_unified_route)
     )
+    log_kv_semantic_merge_passes = int(_o("log_kv_semantic_merge_passes", log_kv_semantic_merge_passes))
     tokenizer_dir = _o("tokenizer_dir", tokenizer_dir)
     limit = _o("limit", limit)
     log_kv_diag_mode = _o("log_kv_diag_mode", log_kv_diag_mode)
@@ -1488,6 +1509,7 @@ def main(
                 f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
                 f"legacy_route={log_kv_semantic_legacy_route}, "
                 f"unified_route={log_kv_semantic_unified_route}, "
+                f"merge_passes={log_kv_semantic_merge_passes}, "
                 f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
                 f"centroid={log_kv_semantic_centroid_backend}, "
                 f"replay_updates={log_kv_semantic_replay_updates})"
@@ -1537,10 +1559,13 @@ def main(
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
             log_kv_semantic_legacy_route=log_kv_semantic_legacy_route,
             log_kv_semantic_unified_route=log_kv_semantic_unified_route,
+            log_kv_semantic_merge_passes=log_kv_semantic_merge_passes,
             log_kv_semantic_anchor_mode=log_kv_semantic_anchor_mode,
             log_kv_semantic_pack_backend=log_kv_semantic_pack_backend,
             log_kv_semantic_centroid_backend=log_kv_semantic_centroid_backend,
             log_kv_semantic_replay_updates=log_kv_semantic_replay_updates,
+            log_kv_alpha_exact_tokens=log_kv_alpha_exact_tokens,
+            log_kv_alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
             tokenizer_dir=tokenizer_dir,
         )
         if world_size > 1:
@@ -1654,10 +1679,13 @@ def main(
                     "log_kv_semantic_capacity_hard_cap_mult": log_kv_semantic_capacity_hard_cap_mult,
                     "log_kv_semantic_legacy_route": log_kv_semantic_legacy_route,
                     "log_kv_semantic_unified_route": log_kv_semantic_unified_route,
+                    "log_kv_semantic_merge_passes": log_kv_semantic_merge_passes,
                     "log_kv_semantic_anchor_mode": log_kv_semantic_anchor_mode,
                     "log_kv_semantic_pack_backend": log_kv_semantic_pack_backend,
                     "log_kv_semantic_centroid_backend": log_kv_semantic_centroid_backend,
                     "log_kv_semantic_replay_updates": log_kv_semantic_replay_updates,
+                    "log_kv_alpha_exact_tokens": log_kv_alpha_exact_tokens,
+                    "log_kv_alpha_span_max_tokens": log_kv_alpha_span_max_tokens,
                     "results": results,
                 }
 
