@@ -19,7 +19,27 @@ from unittest.mock import patch
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from litgpt.log_kv_cache import LogStructuredKVCache
+from litgpt.log_kv_cache import LogStructuredKVCache, _triton_route
+
+
+def check_round_pairs(cache, device):
+    """Cheap fused-vs-Torch check before timing; no checkpoint or training needed."""
+    generator = torch.Generator(device=device).manual_seed(91)
+    for size in (5, 33, 65):
+        mu = torch.randint(-4, 5, (4, size, 8), device=device, generator=generator).float()
+        mu[0].zero_()  # Exact ties, including a non-power-of-two row length.
+        mass = torch.randint(1, 4, (4, size), device=device, generator=generator).float()
+        mass[0].fill_(1)
+        mass[2, size // 2:] = 0  # Ragged padding.
+        mass[3].zero_()         # No live pairs.
+        radius = torch.zeros_like(mass)
+        limits = mu.new_tensor([0., 8., 2., 1.])
+        for bound, cap, overflow in ((None, float('inf'), True), (None, 4., True),
+                                     (None, .1, True), (limits, 4., False)):
+            with patch('litgpt.log_kv_cache._triton_route', return_value=None):
+                expected = cache._semantic_unified_round_pairs(mu, mass, radius, bound, cap, overflow)
+            actual = cache._semantic_unified_round_pairs(mu, mass, radius, bound, cap, overflow)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def main():
@@ -49,6 +69,9 @@ def main():
         device=device, dtype=dtype, cos_cache=torch.ones(n, args.dim, device=device),
         sin_cache=torch.zeros(n, args.dim, device=device), rope_n_elem=args.dim,
     )
+    fused = device.type == 'cuda' and _triton_route() is not None
+    if fused:
+        check_round_pairs(cache, device)
     prototypes = torch.randn(args.batch, args.groups, args.clusters, args.dim, device=device, dtype=dtype)
     inputs = []
     for step in range(args.flushes):
@@ -95,21 +118,24 @@ def main():
                           'hardware': torch.cuda.get_device_name(device) if device.type == 'cuda' else str(device),
                           'route_median_s_per_flush': statistics.median(times) / args.flushes,
                           'peak_extra_MiB': max(peaks) if device.type == 'cuda' else None,
+                          'route_backend': 'triton' if fused else 'torch',
+                          'route_group_tile': 16 if fused else 4,
+                          'reference_pairs_verified': True if fused else None,
                           'mass_verified': True}), flush=True)
 
         stages = defaultdict(float)
         rounds, phase = [], ['']
         reduce = cache._semantic_unified_reduce_batch
-        pairs = cache._semantic_unified_pairs
+        pairs = cache._semantic_unified_round_pairs
 
         def reduce_timed(*a, **kw):
             phase[0] = 'candidates' if kw.get('radius_limits') is not None else 'global_merge'
             return timed(phase[0], reduce)(*a, **kw)
 
-        def pairs_counted(cost, count):
-            result = pairs(cost, count)
+        def pairs_counted(mu, *a, **kw):
+            result = pairs(mu, *a, **kw)
             sizes = (result[..., 0] >= 0).sum(-1).cpu().tolist()
-            rounds.append({'phase': phase[0], 'matrix_size': cost.size(-1), 'proposed_pairs_per_group': sizes})
+            rounds.append({'phase': phase[0], 'matrix_size': mu.size(1), 'proposed_pairs_per_group': sizes})
             return result
 
         def timed(name, fn):
@@ -125,7 +151,7 @@ def main():
         cache.reset_parameters()
         with ExitStack() as stack:
             stack.enter_context(patch.object(cache, '_semantic_unified_reduce_batch', reduce_timed))
-            stack.enter_context(patch.object(cache, '_semantic_unified_pairs', pairs_counted))
+            stack.enter_context(patch.object(cache, '_semantic_unified_round_pairs', pairs_counted))
             for name, stage in [('_semantic_ward_merge', 'old_kv_merge'),
                                 ('_semantic_new_cluster', 'new_cluster_write'),
                                 ('_semantic_commit_joins', 'batched_write')]:

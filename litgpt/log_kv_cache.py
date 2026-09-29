@@ -326,6 +326,15 @@ def _triton_updates():
         return None
 
 
+@lru_cache(maxsize=1)
+def _triton_route():
+    try:
+        from litgpt import log_kv_route_triton
+        return log_kv_route_triton
+    except ImportError:
+        return None
+
+
 def _spans_to_index_array(spans: list[tuple[int, int]]) -> np.ndarray:
     """Concatenate half-open ``[start, stop)`` ranges into one int64 array."""
     parts = [np.arange(start, stop, dtype=np.int64) for start, stop in spans if stop > start]
@@ -2290,13 +2299,21 @@ class LogStructuredKVCache(nn.Module):
         best_cost = cost.amin(dim=-1, keepdim=True)
         tie = ids[:, None].bitwise_xor(ids[None, :])
         best = torch.where(cost == best_cost, tie, 2 * size).argmin(dim=-1)
-        valid = (ids < best) & (best.gather(1, best) == ids) & torch.isfinite(best_cost[..., 0])
-        pair_cost = cost.gather(2, best.unsqueeze(-1)).squeeze(-1).masked_fill(~valid, float("inf"))
+        pairs = LogStructuredKVCache._semantic_unified_select_pairs(best, best_cost[..., 0], max_pairs)
+        return pairs[0][pairs[0, :, 0] >= 0] if single else pairs
+
+    @staticmethod
+    def _semantic_unified_select_pairs(best: torch.Tensor, best_cost: torch.Tensor, max_pairs: int) -> torch.Tensor:
+        """Select disjoint mutual pairs from row minima without an M x M cost tensor."""
+        size = best.size(-1)
+        ids = torch.arange(size, device=best.device)
+        valid = (ids < best) & (best.gather(1, best) == ids) & torch.isfinite(best_cost)
+        pair_cost = best_cost.masked_fill(~valid, float("inf"))
         left = pair_cost.argsort(dim=-1, stable=True)[:, :min(max_pairs, size // 2)]
         right = best.gather(1, left)
         pairs = torch.stack((left, right), dim=-1)
         pairs.masked_fill_(~valid.gather(1, left).unsqueeze(-1), -1)
-        return pairs[0][pairs[0, :, 0] >= 0] if single else pairs
+        return pairs
 
     @staticmethod
     def _semantic_unified_distance2(mu: torch.Tensor) -> torch.Tensor:
@@ -2308,6 +2325,12 @@ class LogStructuredKVCache(nn.Module):
         """
         if mu.size(1) <= 32:
             return torch.cdist(mu, mu, compute_mode="donot_use_mm_for_euclid_dist").square()
+        gram, norm = LogStructuredKVCache._semantic_unified_gram(mu)
+        return (norm[:, :, None] + norm[:, None, :] - 2 * gram).clamp_min_(0)
+
+    @staticmethod
+    def _semantic_unified_gram(mu: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The CUDA row kernel consumes Gram/norm directly, without M x M intermediates."""
         precision = torch.get_float32_matmul_precision()
         try:
             # Training enables "high" globally. Routing distances need full
@@ -2317,13 +2340,56 @@ class LogStructuredKVCache(nn.Module):
             with torch.autocast(device_type=mu.device.type, enabled=False):
                 centered = mu.float() - mu[:, :1].float()
                 norm = centered.square().sum(-1)
-                distance2 = (norm[:, :, None] + norm[:, None, :] - 2 * torch.bmm(
-                    centered, centered.transpose(1, 2)
-                )).clamp_min_(0)
+                gram = torch.bmm(centered, centered.transpose(1, 2))
         finally:
             if mu.is_cuda:
                 torch.set_float32_matmul_precision(precision)
-        return distance2
+        return gram, norm
+
+    def _semantic_unified_round_pairs(self, mu, mass, radius, limits, cap, allow_overflow):
+        """One unchanged Ward round; CUDA fuses cost masks and nearest-neighbour reduction."""
+        size = mu.size(1)
+        fused = _triton_route() if mu.is_cuda else None
+        if fused is not None:
+            data, norm = (self._semantic_unified_gram(mu) if size > 32
+                          else (self._semantic_unified_distance2(mu), None))
+            nearest, fallback = fused.nearest(data, mass, radius, limits, cap, norm=norm)
+            pairs = self._semantic_unified_select_pairs(*nearest, size // 2)
+            if allow_overflow and fallback is not None:
+                fallback_pairs = self._semantic_unified_select_pairs(*fallback, size // 2)
+                pairs = torch.where((pairs[:, :, 0] >= 0).any(1)[:, None, None], pairs, fallback_pairs)
+        else:
+            distance2 = self._semantic_unified_distance2(mu)
+            total = mass[:, :, None] + mass[:, None, :]
+            cost = distance2 * (mass[:, :, None] * mass[:, None, :] / total.clamp_min(1))
+            live = mass > 0
+            cost.masked_fill_(~(live[:, :, None] & live[:, None, :]), float("inf"))
+            cost.diagonal(dim1=-2, dim2=-1).fill_(float("inf"))
+            if limits is not None:
+                distance = distance2.sqrt_()
+                bound = torch.maximum(
+                    radius[:, :, None] + (mass[:, None, :] / total.clamp_min(1)) * distance,
+                    radius[:, None, :] + (mass[:, :, None] / total.clamp_min(1)) * distance,
+                )
+                cost.masked_fill_(bound > limits[:, None, None], float("inf"))
+            limited = cost.masked_fill(total > cap, float("inf")) if cap != math.inf else cost
+            pairs = self._semantic_unified_pairs(limited, size // 2)
+            if allow_overflow and cap != math.inf:
+                fallback = self._semantic_unified_pairs(cost, size // 2)
+                pairs = torch.where((pairs[:, :, 0] >= 0).any(1)[:, None, None], pairs, fallback)
+        if limits is not None:
+            # Verify selected radii with direct differences: GEMM cancellation
+            # must not let a candidate exceed its original compactness bound.
+            left, right = pairs.clamp_min(0).unbind(-1)
+            lane_ids = torch.arange(mu.size(0), device=mu.device)[:, None]
+            ml, mr = mass[lane_ids, left], mass[lane_ids, right]
+            exact = (mu[lane_ids, left] - mu[lane_ids, right]).norm(dim=-1)
+            bound = torch.maximum(
+                radius[lane_ids, left] + mr / (ml + mr).clamp_min(1) * exact,
+                radius[lane_ids, right] + ml / (ml + mr).clamp_min(1) * exact,
+            )
+            pairs.masked_fill_((bound > limits[:, None]).unsqueeze(-1), -1)
+        return pairs
 
     @torch.no_grad()
     def _semantic_unified_reduce_batch(
@@ -2358,40 +2424,9 @@ class LogStructuredKVCache(nn.Module):
         traces = [[] for _ in groups]
         cap = self._semantic_hard_cap()
         while active:
-            distance2 = self._semantic_unified_distance2(mu)
-            total = mass[:, :, None] + mass[:, None, :]
-            cost = distance2 * (mass[:, :, None] * mass[:, None, :] / total.clamp_min(1))
-            live = mass > 0
-            cost.masked_fill_(~(live[:, :, None] & live[:, None, :]), float("inf"))
-            cost.diagonal(dim1=-2, dim2=-1).fill_(float("inf"))
-            merged_radius = None
-            if radius_limits is not None:
-                distance = distance2.sqrt_()
-                merged_radius = torch.maximum(
-                    radius[:, :, None] + (mass[:, None, :] / total.clamp_min(1)) * distance,
-                    radius[:, None, :] + (mass[:, :, None] / total.clamp_min(1)) * distance,
-                )
-                limits = torch.tensor([radius_limits[i] for i in active], device=dev)
-                cost.masked_fill_(merged_radius > limits[:, None, None], float("inf"))
-            limited = cost.masked_fill(total > cap, float("inf")) if cap != math.inf else cost
-            pairs = self._semantic_unified_pairs(limited, size // 2)
-            if max_clusters is not None and cap != math.inf:
-                # Preserve the existing overflow rule independently for each group.
-                fallback = self._semantic_unified_pairs(cost, size // 2)
-                pairs = torch.where((pairs[:, :, 0] >= 0).any(1)[:, None, None], pairs, fallback)
-            if radius_limits is not None:
-                # GEMM may underestimate a near-zero distance by cancellation.
-                # Check selected pairs directly so this never widens a candidate
-                # past its radius bound. This work is O(number of pairs * D).
-                left, right = pairs.clamp_min(0).unbind(-1)
-                lane_ids = torch.arange(len(active), device=dev)[:, None]
-                ml, mr = mass[lane_ids, left], mass[lane_ids, right]
-                exact = (mu[lane_ids, left] - mu[lane_ids, right]).norm(dim=-1)
-                bound = torch.maximum(
-                    radius[lane_ids, left] + mr / (ml + mr).clamp_min(1) * exact,
-                    radius[lane_ids, right] + ml / (ml + mr).clamp_min(1) * exact,
-                )
-                pairs.masked_fill_((bound > limits[:, None]).unsqueeze(-1), -1)
+            limits = (None if radius_limits is None else
+                      torch.tensor([radius_limits[i] for i in active], device=dev))
+            pairs = self._semantic_unified_round_pairs(mu, mass, radius, limits, cap, max_clusters is not None)
             pair_rows = pairs.cpu().tolist()
             merge_indices, survivor_rows, next_active, next_roots, next_counts = [], [], [], [], []
             for lane, group in enumerate(active):
@@ -2447,7 +2482,6 @@ class LogStructuredKVCache(nn.Module):
                 active = [active[i] for i in continuing]
                 roots = [roots[i] for i in continuing]
                 counts = [counts[i] for i in continuing]
-            del cost, limited, distance2, total, merged_radius
         for group, original in enumerate(groups):
             if not traces[group] and (len(original) <= target):
                 continue
@@ -2488,10 +2522,11 @@ class LogStructuredKVCache(nn.Module):
     ) -> None:
         jobs: list[tuple[int, int, int, tuple[int, ...]]] = []
         lanes = [(b, g) for b in range(k_raw.size(0)) for g in range(k_raw.size(1))]
-        # ponytail: at most four independent groups share pair-matrix workspace;
-        # tile pair search before increasing this if GPU peak memory becomes limiting.
-        for start in range(0, len(lanes), 4):
-            tile = lanes[start:start + 4]
+        # Fused CUDA search needs one pair matrix, versus several for Torch.
+        # ponytail: 16 groups bound CUDA scratch; tile rows if larger flushes need less memory.
+        tile_size = 16 if k_raw.is_cuda and _triton_route() is not None else 4
+        for start in range(0, len(lanes), tile_size):
+            tile = lanes[start:start + tile_size]
             groups = [[_SemanticTreeCluster(key, 1, positions_host[b][i], (), (i,))
                        for i, key in enumerate(k_raw[b, g].detach().float().unbind(0))] for b, g in tile]
             candidates = self._semantic_unified_reduce_batch(

@@ -299,3 +299,11 @@ def test_batched_global_merge_relaxes_impossible_hard_cap_without_losing_mass():
         assert len(nodes) == 3
         assert sum(n.n_total for n in nodes) == len(original)
         assert sorted(i for n in nodes for i in n.tokens) == list(range(len(original)))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA/Triton')
+def test_fused_round_pairs_match_reference_for_ties_padding_caps_and_radius():
+    pytest.importorskip('triton')
+    from unused.benchmark_log_kv_unified import check_round_pairs
+
+    check_round_pairs(cache_for(device='cuda'), torch.device('cuda'))
