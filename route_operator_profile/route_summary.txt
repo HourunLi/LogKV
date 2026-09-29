@@ -4,161 +4,161 @@ CPU operator time can include CUDA waits; it is not pure CPU computation.
 Nested total times overlap; do not add them together.
 
 CPU operators, sorted by self CPU time:
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------------------------------------------  
-                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls                                      Input Shapes  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------------------------------------------  
-                                     logkv/global_merge        25.51%     149.510ms        48.44%     283.945ms     141.973ms       0.000us         0.00%      40.005ms      20.002ms             2                                                []  
-                                      logkv/route_flush        12.09%      70.884ms       100.00%     586.171ms     586.171ms       0.000us         0.00%      51.495ms      51.495ms             1                                                []  
-                                    logkv/batched_write        11.95%      70.036ms        12.16%      71.266ms      71.266ms       0.000us         0.00%     575.837us     575.837us             1                                                []  
-                                     logkv/old_kv_merge         6.76%      39.604ms        16.45%      96.455ms       4.019ms       0.000us         0.00%       5.104ms     212.665us            24                                                []  
-                                        cudaMemcpyAsync         5.55%      32.546ms         5.55%      32.546ms      14.231us       0.000us         0.00%       0.000us       0.000us          2287                                                []  
-                                       cudaLaunchKernel         4.02%      23.593ms         4.02%      23.593ms       5.224us       0.000us         0.00%       0.000us       0.000us          4516                                                []  
-                                logkv/new_cluster_write         2.41%      14.155ms         5.60%      32.840ms       1.368ms       0.000us         0.00%       1.262ms      52.569us            24                                                []  
-                                      logkv/pair_search         2.35%      13.787ms        16.28%      95.422ms     851.979us       0.000us         0.00%      41.304ms     368.783us           112                                                []  
-                                     logkv/select_pairs         2.05%      12.005ms         9.94%      58.244ms     520.033us       0.000us         0.00%      11.334ms     101.193us           112                                                []  
-                                       logkv/merge_pack         1.88%      11.027ms         2.44%      14.321ms     130.193us       0.000us         0.00%      37.184us       0.338us           110                                                []  
-                                  cudaStreamSynchronize         1.58%       9.243ms         1.58%       9.243ms       8.922us       0.000us         0.00%       0.000us       0.000us          1036                                                []  
-                                       logkv/candidates         1.56%       9.146ms         2.89%      16.951ms       8.475ms       0.000us         0.00%       3.288ms       1.644ms             2                                                []  
-                                             logkv/gram         1.30%       7.593ms         3.23%      18.937ms     193.239us       0.000us         0.00%      28.831ms     294.194us            98                                                []  
-                                    aten::empty_strided         1.18%       6.892ms         1.18%       6.892ms       4.478us       0.000us         0.00%       0.000us       0.000us          1539                          [[], [], [], [], [], []]  
-                                            aten::empty         0.75%       4.407ms         0.75%       4.407ms       3.451us       0.000us         0.00%       0.000us       0.000us          1277                          [[], [], [], [], [], []]  
-                                            aten::copy_         0.69%       4.038ms         2.34%      13.689ms      18.012us       1.028ms         1.60%       1.028ms       1.353us           760                                      [[], [], []]  
-                                              aten::cat         0.53%       3.103ms         0.88%       5.167ms      13.048us       1.628ms         2.53%       1.628ms       4.112us           396                                          [[], []]  
-                                       cuLaunchKernelEx         0.52%       3.076ms         0.52%       3.076ms       9.492us     613.759us         0.95%     613.759us       1.894us           324                                                []  
-                                               aten::lt         0.38%       2.208ms         0.38%       2.228ms       2.228ms       4.608us         0.01%       4.608us       4.608us             1                                  [[95], [16, 95]]  
-                                           aten::select         0.38%       2.201ms         0.45%       2.639ms       3.307us       0.000us         0.00%       0.000us       0.000us           798                      [[4, 8, 12, 6, 256], [], []]  
-                                           aten::select         0.37%       2.190ms         0.44%       2.606ms       3.393us       0.000us         0.00%       0.000us       0.000us           768                              [[4, 8, 12], [], []]  
-                                           aten::select         0.30%       1.746ms         0.35%       2.051ms       2.571us       0.000us         0.00%       0.000us       0.000us           798                         [[8, 12, 6, 256], [], []]  
-                                            aten::fill_         0.29%       1.714ms         0.67%       3.904ms       7.746us       1.120ms         1.74%       1.120ms       2.222us           504                                    [[6, 256], []]  
-                                            aten::copy_         0.29%       1.684ms         0.79%       4.644ms       9.902us     967.448us         1.50%     967.448us       2.063us           469                                [[128], [128], []]  
-                                           aten::select         0.28%       1.661ms         0.33%       1.945ms       2.532us       0.000us         0.00%       0.000us       0.000us           768                                 [[8, 12], [], []]  
-                                           aten::arange         0.28%       1.615ms         0.68%       3.987ms      14.551us     575.836us         0.89%     575.836us       2.102us           274                                 [[], [], [], [0]]  
-                                           aten::select         0.27%       1.609ms         0.33%       1.921ms       2.407us       0.000us         0.00%       0.000us       0.000us           798                            [[12, 6, 256], [], []]  
-                                          aten::resize_         0.27%       1.558ms         0.27%       1.558ms       2.696us       0.000us         0.00%       0.000us       0.000us           578                                     [[0], [], []]  
-                                Activity Buffer Request         0.25%       1.494ms         0.25%       1.494ms       1.494ms       7.520us         0.01%       7.520us       7.520us             1                                                []  
-                                           aten::select         0.24%       1.419ms         0.29%       1.717ms       2.236us       0.000us         0.00%       0.000us       0.000us           768                                    [[12], [], []]  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------------------------------------------  
-Self CPU time total: 586.194ms
-Self CUDA time total: 64.387ms
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  -----------------------------------------------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls                                           Input Shapes  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  -----------------------------------------------------  
+                                     logkv/global_merge        20.73%      52.293ms        72.26%     182.309ms      91.155ms       0.000us         0.00%      39.617ms      19.808ms             2                                                     []  
+                                        cudaMemcpyAsync         9.64%      24.314ms         9.64%      24.314ms      34.784us       0.000us         0.00%       0.000us       0.000us           699                                                     []  
+                                    logkv/batched_write         8.81%      22.233ms         9.21%      23.235ms      23.235ms       0.000us         0.00%     574.654us     574.654us             1                                                     []  
+                                      logkv/route_flush         6.57%      16.579ms        99.99%     252.276ms     252.276ms       0.000us         0.00%      45.031ms      45.031ms             1                                                     []  
+                                       cudaLaunchKernel         6.02%      15.198ms         6.02%      15.198ms       5.152us       0.000us         0.00%       0.000us       0.000us          2950                                                     []  
+                                      logkv/pair_search         5.18%      13.059ms        36.27%      91.514ms     817.092us       0.000us         0.00%      40.764ms     363.968us           112                                                     []  
+                                     logkv/select_pairs         4.64%      11.716ms        21.53%      54.331ms     485.098us       0.000us         0.00%      11.335ms     101.202us           112                                                     []  
+                                       logkv/merge_pack         4.17%      10.518ms         5.42%      13.682ms     124.380us       0.000us         0.00%     182.432us       1.658us           110                                                     []  
+                                     logkv/old_kv_merge         3.52%       8.873ms         4.80%      12.121ms       6.061ms       0.000us         0.00%     576.062us     288.031us             2                                                     []  
+                                             logkv/gram         2.98%       7.528ms         7.85%      19.807ms     202.109us       0.000us         0.00%      28.841ms     294.297us            98                                                     []  
+                                            aten::empty         1.32%       3.326ms         1.32%       3.326ms       3.619us       0.000us         0.00%       0.000us       0.000us           919                               [[], [], [], [], [], []]  
+                                    aten::empty_strided         1.30%       3.291ms         1.30%       3.291ms       5.334us       0.000us         0.00%       0.000us       0.000us           617                               [[], [], [], [], [], []]  
+                                  cudaStreamSynchronize         1.09%       2.762ms         1.09%       2.762ms       9.330us       0.000us         0.00%       0.000us       0.000us           296                                                     []  
+                                       logkv/candidates         0.86%       2.179ms         3.87%       9.775ms       4.888ms       0.000us         0.00%       3.288ms       1.644ms             2                                                     []  
+                                       cuLaunchKernelEx         0.86%       2.160ms         0.86%       2.160ms       9.112us     197.025us         0.34%     197.025us       0.831us           237                                                     []  
+                                Activity Buffer Request         0.80%       2.008ms         0.80%       2.008ms       2.008ms       7.232us         0.01%       7.232us       7.232us             1                                                     []  
+                                        aten::transpose         0.58%       1.465ms         0.59%       1.484ms       1.484ms       0.000us         0.00%       0.000us       0.000us             1                               [[16, 272, 128], [], []]  
+                                              aten::cat         0.54%       1.357ms         0.85%       2.155ms      14.364us     808.960us         1.40%     808.960us       5.393us           150                                               [[], []]  
+                                           aten::arange         0.50%       1.260ms         1.25%       3.143ms      13.909us     482.004us         0.83%     482.004us       2.133us           226                                      [[], [], [], [0]]  
+                                          aten::resize_         0.42%       1.052ms         0.42%       1.052ms       2.724us       0.000us         0.00%       0.000us       0.000us           386                                          [[0], [], []]  
+                                logkv/new_cluster_write         0.34%     863.897us         0.68%       1.719ms       1.719ms       0.000us         0.00%     162.815us     162.815us             1                                                     []  
+                                           aten::arange         0.33%     826.925us         1.89%       4.769ms      21.101us       0.000us         0.00%     482.004us       2.133us           226                                   [[], [], [], [], []]  
+                                              aten::pad         0.31%     787.502us         0.68%       1.717ms      53.648us       0.000us         0.00%     114.049us       3.564us            32                              [[2048, 128], [], [], []]  
+                                         aten::_to_copy         0.27%     677.785us         1.36%       3.433ms     107.273us       0.000us         0.00%     231.707us       7.241us            32                  [[2048, 128], [], [], [], [], [], []]  
+                                            aten::stack         0.24%     600.078us         1.10%       2.774ms      23.512us       0.000us         0.00%     661.408us       5.605us           118                                               [[], []]  
+                                            aten::copy_         0.16%     403.031us         1.19%       2.996ms      46.817us     338.524us         0.59%     345.756us       5.402us            64                         [[2048, 128], [2048, 128], []]  
+                                  cudaStreamIsCapturing         0.12%     304.143us         0.12%     304.143us       1.028us       0.000us         0.00%       0.000us       0.000us           296                                                     []  
+                                     aten::index_select         0.12%     302.413us         0.28%     701.735us      21.929us     382.078us         0.66%     382.078us      11.940us            32                                  [[12, 128], [], [12]]  
+                                            aten::copy_         0.09%     220.246us         0.29%     722.889us      22.590us      43.104us         0.07%      43.104us       1.347us            32                                       [[12], [12], []]  
+                                            aten::index         0.06%     151.425us         0.22%     548.562us      68.570us      68.160us         0.12%     125.408us      15.676us             8                                       [[16, 2048], []]  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  -----------------------------------------------------  
+Self CPU time total: 252.299ms
+Self CUDA time total: 57.810ms
 
 
 CUDA operators, sorted by self device time:
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------------------------------------------  
-                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls                                      Input Shapes  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------------------------------------------  
-                                      logkv/route_flush         0.00%       0.000us         0.00%       0.000us       0.000us     275.715ms       428.21%     275.715ms     275.715ms             1                                                []  
-                                     logkv/global_merge         0.00%       0.000us         0.00%       0.000us       0.000us     193.296ms       300.21%     193.296ms      96.648ms             2                                                []  
-                                     logkv/old_kv_merge         0.00%       0.000us         0.00%       0.000us       0.000us      92.853ms       144.21%      92.853ms       3.869ms            24                                                []  
-                                     logkv/select_pairs         0.00%       0.000us         0.00%       0.000us       0.000us      41.978ms        65.20%      41.978ms     374.799us           112                                                []  
-                                             logkv/gram         0.00%       0.000us         0.00%       0.000us       0.000us      35.677ms        55.41%      35.677ms     364.048us            98                                                []  
-                                logkv/new_cluster_write         0.00%       0.000us         0.00%       0.000us       0.000us      30.647ms        47.60%      30.647ms       1.277ms            24                                                []  
-                                ampere_sgemm_128x128_tn         0.00%       0.000us         0.00%       0.000us       0.000us      26.273ms        40.80%      26.273ms     268.091us            98                                                []  
-                                      logkv/pair_search         0.00%       0.000us         0.00%       0.000us       0.000us      13.809ms        21.45%      13.809ms     123.295us           112                                                []  
-                                       logkv/candidates         0.00%       0.000us         0.00%       0.000us       0.000us      13.779ms        21.40%      13.779ms       6.889ms             2                                                []  
-                                               _nearest         0.00%       0.000us         0.00%       0.000us       0.000us      11.508ms        17.87%      11.508ms     102.753us           112                                                []  
-                                    logkv/batched_write         0.00%       0.000us         0.00%       0.000us       0.000us      11.296ms        17.54%      11.296ms      11.296ms             1                                                []  
-                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us       3.003ms         4.66%       3.003ms       2.400us          1251                                                []  
-                                              aten::bmm         0.01%      71.067us         0.01%      83.932us      41.966us       2.655ms         4.12%       2.655ms       1.327ms             2                [[16, 2060, 128], [16, 128, 2060]]  
-                                              aten::bmm         0.02%     123.280us         0.02%     145.576us      72.788us       2.344ms         3.64%       2.344ms       1.172ms             2                [[16, 2048, 128], [16, 128, 2048]]  
-                       Memcpy HtoD (Pageable -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us       2.258ms         3.51%       2.258ms       2.509us           900                                                []  
-void at::native::_scatter_gather_elementwise_kernel<...         0.00%       0.000us         0.00%       0.000us       0.000us       2.025ms         3.14%       2.025ms       6.328us           320                                                []  
-                                              aten::cat         0.53%       3.103ms         0.88%       5.167ms      13.048us       1.628ms         2.53%       1.628ms       4.112us           396                                          [[], []]  
-void at::native::radixSortKVInPlace<2, -1, 32, 32, f...         0.00%       0.000us         0.00%       0.000us       0.000us       1.422ms         2.21%       1.422ms      28.439us            50                                                []  
-                                              aten::bmm         0.01%      29.836us         0.01%      36.276us      36.276us       1.177ms         1.83%       1.177ms       1.177ms             1                [[16, 1933, 128], [16, 128, 1933]]  
-                                              aten::bmm         0.01%      29.485us         0.01%      35.412us      35.412us       1.175ms         1.83%       1.175ms       1.175ms             1                [[16, 1947, 128], [16, 128, 1947]]  
-                                            aten::fill_         0.29%       1.714ms         0.67%       3.904ms       7.746us       1.120ms         1.74%       1.120ms       2.222us           504                                    [[6, 256], []]  
-                                              aten::bmm         0.00%      27.680us         0.01%      33.639us      33.639us       1.049ms         1.63%       1.049ms       1.049ms             1                [[16, 1836, 128], [16, 128, 1836]]  
-                                              aten::bmm         0.00%      28.331us         0.01%      34.187us      34.187us       1.048ms         1.63%       1.048ms       1.048ms             1                [[16, 1834, 128], [16, 128, 1834]]  
-                                            aten::copy_         0.69%       4.038ms         2.34%      13.689ms      18.012us       1.028ms         1.60%       1.028ms       1.353us           760                                      [[], [], []]  
-void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       1.011ms         1.57%       1.011ms      10.318us            98                                                []  
-                                            aten::copy_         0.29%       1.684ms         0.79%       4.644ms       9.902us     967.448us         1.50%     967.448us       2.063us           469                                [[128], [128], []]  
-void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     929.785us         1.44%     929.785us       9.488us            98                                                []  
-                                              aten::bmm         0.00%      28.128us         0.01%      34.193us      34.193us     923.101us         1.43%     923.101us     923.101us             1                [[16, 1738, 128], [16, 128, 1738]]  
-                                              aten::bmm         0.00%      28.924us         0.01%      34.902us      34.902us     923.036us         1.43%     923.036us     923.036us             1                [[16, 1734, 128], [16, 128, 1734]]  
-                                            _merge_pack         0.00%       0.000us         0.00%       0.000us       0.000us     916.699us         1.42%     916.699us       8.334us           110                                                []  
--------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------------------------------------------  
-Self CPU time total: 586.194ms
-Self CUDA time total: 64.387ms
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  -----------------------------------------------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls                                           Input Shapes  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  -----------------------------------------------------  
+                                      logkv/route_flush         0.00%       0.000us         0.00%       0.000us       0.000us     247.223ms       427.65%     247.223ms     247.223ms             1                                                     []  
+                                     logkv/global_merge         0.00%       0.000us         0.00%       0.000us       0.000us     181.718ms       314.34%     181.718ms      90.859ms             2                                                     []  
+                                     logkv/select_pairs         0.00%       0.000us         0.00%       0.000us       0.000us      38.490ms        66.58%      38.490ms     343.663us           112                                                     []  
+                                             logkv/gram         0.00%       0.000us         0.00%       0.000us       0.000us      36.796ms        63.65%      36.796ms     375.465us            98                                                     []  
+                                ampere_sgemm_128x128_tn         0.00%       0.000us         0.00%       0.000us       0.000us      26.272ms        45.45%      26.272ms     268.086us            98                                                     []  
+                                      logkv/pair_search         0.00%       0.000us         0.00%       0.000us       0.000us      13.723ms        23.74%      13.723ms     122.530us           112                                                     []  
+                                               _nearest         0.00%       0.000us         0.00%       0.000us       0.000us      11.502ms        19.90%      11.502ms     102.700us           112                                                     []  
+                                     logkv/old_kv_merge         0.00%       0.000us         0.00%       0.000us       0.000us      11.317ms        19.58%      11.317ms       5.658ms             2                                                     []  
+                                    logkv/batched_write         0.00%       0.000us         0.00%       0.000us       0.000us       9.268ms        16.03%       9.268ms       9.268ms             1                                                     []  
+                                       logkv/candidates         0.00%       0.000us         0.00%       0.000us       0.000us       7.326ms        12.67%       7.326ms       3.663ms             2                                                     []  
+                                              aten::bmm         0.02%      55.029us         0.03%      67.214us      33.607us       2.654ms         4.59%       2.654ms       1.327ms             2                     [[16, 2060, 128], [16, 128, 2060]]  
+                                              aten::bmm         0.04%     101.155us         0.05%     117.574us      58.787us       2.344ms         4.05%       2.344ms       1.172ms             2                     [[16, 2048, 128], [16, 128, 2048]]  
+void at::native::_scatter_gather_elementwise_kernel<...         0.00%       0.000us         0.00%       0.000us       0.000us       1.723ms         2.98%       1.723ms       7.427us           232                                                     []  
+                                logkv/new_cluster_write         0.00%       0.000us         0.00%       0.000us       0.000us       1.509ms         2.61%       1.509ms       1.509ms             1                                                     []  
+void at::native::radixSortKVInPlace<2, -1, 32, 32, f...         0.00%       0.000us         0.00%       0.000us       0.000us       1.429ms         2.47%       1.429ms      28.577us            50                                                     []  
+                       Memcpy HtoD (Pageable -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us       1.361ms         2.35%       1.361ms       7.480us           182                                                     []  
+                                              aten::bmm         0.01%      25.119us         0.01%      30.807us      30.807us       1.176ms         2.03%       1.176ms       1.176ms             1                     [[16, 1947, 128], [16, 128, 1947]]  
+                                              aten::bmm         0.01%      25.847us         0.01%      31.598us      31.598us       1.175ms         2.03%       1.175ms       1.175ms             1                     [[16, 1933, 128], [16, 128, 1933]]  
+                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us       1.172ms         2.03%       1.172ms       2.909us           403                                                     []  
+                                              aten::bmm         0.01%      23.609us         0.01%      29.133us      29.133us       1.048ms         1.81%       1.048ms       1.048ms             1                     [[16, 1834, 128], [16, 128, 1834]]  
+                                              aten::bmm         0.01%      24.884us         0.01%      30.649us      30.649us       1.047ms         1.81%       1.047ms       1.047ms             1                     [[16, 1836, 128], [16, 128, 1836]]  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       1.020ms         1.76%       1.020ms      10.200us           100                                                     []  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     929.629us         1.61%     929.629us       9.486us            98                                                     []  
+                                              aten::bmm         0.01%      25.090us         0.01%      30.736us      30.736us     923.773us         1.60%     923.773us     923.773us             1                     [[16, 1734, 128], [16, 128, 1734]]  
+                                              aten::bmm         0.01%      25.056us         0.01%      30.851us      30.851us     923.325us         1.60%     923.325us     923.325us             1                     [[16, 1738, 128], [16, 128, 1738]]  
+                                            _merge_pack         0.00%       0.000us         0.00%       0.000us       0.000us     911.774us         1.58%     911.774us       8.289us           110                                                     []  
+                                       logkv/merge_pack         0.00%       0.000us         0.00%       0.000us       0.000us     911.774us         1.58%     911.774us       8.289us           110                                                     []  
+                                              aten::cat         0.54%       1.357ms         0.85%       2.155ms      14.364us     808.960us         1.40%     808.960us       5.393us           150                                               [[], []]  
+                                              aten::bmm         0.01%      24.071us         0.01%      29.697us      29.697us     802.845us         1.39%     802.845us     802.845us             1                     [[16, 1630, 128], [16, 128, 1630]]  
+                                              aten::bmm         0.01%      23.903us         0.01%      29.547us      29.547us     800.733us         1.39%     800.733us     800.733us             1                     [[16, 1648, 128], [16, 128, 1648]]  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  -----------------------------------------------------  
+Self CPU time total: 252.299ms
+Self CUDA time total: 57.810ms
 
-CUDA device events captured: 7613
+CUDA device events captured: 4327
 
 
 Python call sites, sorted by self time (includes blocking native calls):
-         1065210 function calls (1064962 primitive calls) in 0.599 seconds
+         143311 function calls (143263 primitive calls) in 0.227 seconds
 
    Ordered by: internal time
-   List reduced from 274 to 30 due to restriction <30>
+   List reduced from 284 to 30 due to restriction <30>
 
    ncalls  tottime  percall  cumtime  percall filename:lineno(function)
-        4    0.102    0.026    0.314    0.079 log_kv_cache.py:2434(_semantic_unified_reduce_packed)
-        1    0.055    0.055    0.128    0.128 log_kv_cache.py:2620(_semantic_commit_joins_inner)
-   131460    0.028    0.000    0.028    0.000 {built-in method __new__ of type object at 0x564422323720}
-   131456    0.028    0.000    0.056    0.000 <string>:1(<lambda>)
-      136    0.026    0.000    0.026    0.000 {method 'cpu' of 'torch._C.TensorBase' objects}
-      841    0.022    0.000    0.037    0.000 {built-in method builtins.sorted}
-    65895    0.017    0.000    0.017    0.000 log_kv_cache.py:2673(<genexpr>)
-   278469    0.015    0.000    0.015    0.000 {method 'append' of 'list' objects}
-       64    0.014    0.000    0.028    0.000 {built-in method numpy.fromiter}
-   131520    0.014    0.000    0.014    0.000 log_kv_cache.py:2461(<genexpr>)
-    66461    0.013    0.000    0.014    0.000 {built-in method builtins.max}
-      112    0.011    0.000    0.041    0.000 log_kv_cache.py:2306(_semantic_unified_select_pairs)
-       24    0.010    0.000    0.068    0.003 log_kv_cache.py:1876(_semantic_ward_merge)
-      776    0.009    0.000    0.009    0.000 {method 'clone' of 'torch._C.TensorBase' objects}
-      112    0.009    0.000    0.009    0.000 {method 'argsort' of 'torch._C.TensorBase' objects}
-      206    0.008    0.000    0.008    0.000 {method 'to' of 'torch._C.TensorBase' objects}
-       32    0.007    0.000    0.007    0.000 {method 'tolist' of 'numpy.ndarray' objects}
-    65536    0.007    0.000    0.007    0.000 log_kv_cache.py:2579(<lambda>)
-    65512    0.007    0.000    0.007    0.000 log_kv_cache.py:2646(<lambda>)
-      431    0.006    0.000    0.024    0.000 {method 'extend' of 'list' objects}
-       72    0.006    0.000    0.024    0.000 log_kv_cache.py:1506(_semantic_clear_cluster)
-      744    0.006    0.000    0.006    0.000 {method 'zero_' of 'torch._C.TensorBase' objects}
+        4    0.033    0.008    0.168    0.042 log_kv_cache.py:2616(_semantic_unified_reduce_arrays)
+      114    0.025    0.000    0.025    0.000 {method 'cpu' of 'torch._C.TensorBase' objects}
+      112    0.011    0.000    0.036    0.000 log_kv_cache.py:2462(_semantic_unified_select_pairs)
+        1    0.009    0.009    0.028    0.028 log_kv_cache.py:2814(_semantic_commit_joins_inner)
+      161    0.008    0.000    0.008    0.000 {method 'to' of 'torch._C.TensorBase' objects}
+      112    0.006    0.000    0.006    0.000 {method 'argsort' of 'torch._C.TensorBase' objects}
+        1    0.006    0.006    0.229    0.229 log_kv_cache.py:2729(_semantic_route_unified)
       112    0.005    0.000    0.005    0.000 {built-in method torch.isfinite}
-      162    0.005    0.000    0.005    0.000 {built-in method torch.arange}
-        1    0.005    0.005    0.626    0.626 log_kv_cache.py:2550(_semantic_route_unified)
-       49    0.005    0.000    0.032    0.001 log_kv_cache.py:1305(_semantic_append_entries_batched)
+       32    0.005    0.000    0.005    0.000 log_kv_cache.py:2759(<listcomp>)
       336    0.005    0.000    0.005    0.000 {method 'gather' of 'torch._C.TensorBase' objects}
-      324    0.005    0.000    0.019    0.000 jit.py:695(run)
-       98    0.004    0.000    0.014    0.000 log_kv_cache.py:2332(_semantic_unified_gram)
-       49    0.004    0.000    0.009    0.000 log_kv_cache.py:1092(_semantic_level_block)
+       98    0.005    0.000    0.014    0.000 log_kv_cache.py:2488(_semantic_unified_gram)
+       24    0.004    0.000    0.007    0.000 log_kv_cache.py:1925(_semantic_ward_entry_order)
+     1708    0.004    0.000    0.005    0.000 numeric.py:290(full)
+      237    0.003    0.000    0.013    0.000 jit.py:695(run)
+      112    0.003    0.000    0.003    0.000 {method 'masked_fill' of 'torch._C.TensorBase' objects}
+     1600    0.003    0.000    0.004    0.000 numeric.py:137(ones)
+       98    0.003    0.000    0.003    0.000 {built-in method torch.bmm}
+     4381    0.003    0.000    0.003    0.000 {built-in method numpy.arange}
+     1981    0.003    0.000    0.011    0.000 numeric.py:646(flatnonzero)
+        4    0.002    0.001    0.012    0.003 log_kv_cache.py:1306(_semantic_append_entries_batched)
+      113    0.002    0.000    0.002    0.000 {method 'cumsum' of 'numpy.ndarray' objects}
+     1981    0.002    0.000    0.002    0.000 {method 'nonzero' of 'numpy.ndarray' objects}
+      118    0.002    0.000    0.002    0.000 {built-in method torch.stack}
+    30622    0.002    0.000    0.002    0.000 {built-in method builtins.len}
+      114    0.002    0.000    0.002    0.000 {built-in method torch.arange}
+      332    0.002    0.000    0.002    0.000 {method 'new_empty' of 'torch._C.TensorBase' objects}
+       64    0.002    0.000    0.003    0.000 log_kv_cache.py:2709(_semantic_unified_labels)
+      357    0.002    0.000    0.003    0.000 jit.py:1074(__call__)
+      440    0.002    0.000    0.002    0.000 log_kv_cache.py:2690(<genexpr>)
+     2907    0.002    0.000    0.003    0.000 log_kv_cache.py:910(_semantic_mark_scalar_dirty)
 
 
 
 Python call sites, sorted by cumulative time:
-         1065210 function calls (1064962 primitive calls) in 0.599 seconds
+         143311 function calls (143263 primitive calls) in 0.227 seconds
 
    Ordered by: cumulative time
-   List reduced from 274 to 30 due to restriction <30>
+   List reduced from 284 to 30 due to restriction <30>
 
    ncalls  tottime  percall  cumtime  percall filename:lineno(function)
-        1    0.000    0.000    0.629    0.629 benchmark_log_kv_unified.py:86(flush)
-        1    0.000    0.000    0.629    0.629 log_kv_cache.py:3272(route_and_flush_batch)
-        1    0.003    0.003    0.629    0.629 log_kv_cache.py:3346(_route_and_flush_batch)
-        1    0.005    0.005    0.626    0.626 log_kv_cache.py:2550(_semantic_route_unified)
-        4    0.000    0.000    0.315    0.079 _contextlib.py:120(decorate_context)
-        4    0.102    0.026    0.314    0.079 log_kv_cache.py:2434(_semantic_unified_reduce_packed)
-        1    0.001    0.001    0.130    0.130 log_kv_cache.py:2596(_semantic_commit_joins)
-        1    0.055    0.055    0.128    0.128 log_kv_cache.py:2620(_semantic_commit_joins_inner)
-      112    0.002    0.000    0.068    0.001 log_kv_cache.py:2350(_semantic_unified_round_pairs)
-       24    0.010    0.000    0.068    0.003 log_kv_cache.py:1876(_semantic_ward_merge)
-        2    0.000    0.000    0.057    0.028 log_kv_cache.py:2562(<listcomp>)
-   131456    0.028    0.000    0.056    0.000 <string>:1(<lambda>)
-      112    0.011    0.000    0.041    0.000 log_kv_cache.py:2306(_semantic_unified_select_pairs)
-      841    0.022    0.000    0.037    0.000 {built-in method builtins.sorted}
-       49    0.005    0.000    0.032    0.001 log_kv_cache.py:1305(_semantic_append_entries_batched)
-       64    0.014    0.000    0.028    0.000 {built-in method numpy.fromiter}
-   131460    0.028    0.000    0.028    0.000 {built-in method __new__ of type object at 0x564422323720}
-      383    0.002    0.000    0.026    0.000 log_kv_cache.py:2660(close_run)
-      136    0.026    0.000    0.026    0.000 {method 'cpu' of 'torch._C.TensorBase' objects}
-      431    0.006    0.000    0.024    0.000 {method 'extend' of 'list' objects}
-       72    0.006    0.000    0.024    0.000 log_kv_cache.py:1506(_semantic_clear_cluster)
-       48    0.001    0.000    0.022    0.000 log_kv_cache.py:1459(_semantic_append_entry_block)
-       24    0.001    0.000    0.022    0.001 log_kv_cache.py:1729(_semantic_new_cluster)
-      324    0.001    0.000    0.020    0.000 jit.py:370(<lambda>)
-      324    0.005    0.000    0.019    0.000 jit.py:695(run)
-    65895    0.017    0.000    0.017    0.000 log_kv_cache.py:2673(<genexpr>)
-        1    0.004    0.004    0.016    0.016 log_kv_cache.py:2774(_semantic_apply_join_plan)
-   278469    0.015    0.000    0.015    0.000 {method 'append' of 'list' objects}
-   131520    0.014    0.000    0.014    0.000 log_kv_cache.py:2461(<genexpr>)
-       98    0.004    0.000    0.014    0.000 log_kv_cache.py:2332(_semantic_unified_gram)
+        1    0.000    0.000    0.230    0.230 benchmark_log_kv_unified.py:126(flush)
+        1    0.000    0.000    0.230    0.230 log_kv_cache.py:3439(route_and_flush_batch)
+        1    0.000    0.000    0.230    0.230 log_kv_cache.py:3515(_route_and_flush_batch)
+        1    0.006    0.006    0.229    0.229 log_kv_cache.py:2729(_semantic_route_unified)
+        4    0.000    0.000    0.168    0.042 _contextlib.py:120(decorate_context)
+        4    0.033    0.008    0.168    0.042 log_kv_cache.py:2616(_semantic_unified_reduce_arrays)
+      112    0.002    0.000    0.063    0.001 log_kv_cache.py:2506(_semantic_unified_round_pairs)
+      112    0.011    0.000    0.036    0.000 log_kv_cache.py:2462(_semantic_unified_select_pairs)
+        1    0.000    0.000    0.028    0.028 log_kv_cache.py:2790(_semantic_commit_joins)
+        1    0.009    0.009    0.028    0.028 log_kv_cache.py:2814(_semantic_commit_joins_inner)
+      114    0.025    0.000    0.025    0.000 {method 'cpu' of 'torch._C.TensorBase' objects}
+        2    0.001    0.001    0.015    0.007 log_kv_cache.py:1977(_semantic_ward_merge_batch)
+      237    0.001    0.000    0.014    0.000 jit.py:370(<lambda>)
+       98    0.005    0.000    0.014    0.000 log_kv_cache.py:2488(_semantic_unified_gram)
+      237    0.003    0.000    0.013    0.000 jit.py:695(run)
+        4    0.002    0.001    0.012    0.003 log_kv_cache.py:1306(_semantic_append_entries_batched)
+      110    0.000    0.000    0.012    0.000 log_kv_cache.py:2565(_semantic_unified_merge_pack)
+        1    0.001    0.001    0.012    0.012 log_kv_cache.py:2941(_semantic_apply_join_plan)
+      110    0.001    0.000    0.012    0.000 log_kv_route_triton.py:118(merge_pack)
+     1981    0.003    0.000    0.011    0.000 numeric.py:646(flatnonzero)
+      112    0.001    0.000    0.010    0.000 log_kv_route_triton.py:67(nearest)
+      161    0.008    0.000    0.008    0.000 {method 'to' of 'torch._C.TensorBase' objects}
+       24    0.004    0.000    0.007    0.000 log_kv_cache.py:1925(_semantic_ward_entry_order)
+        7    0.001    0.000    0.006    0.001 log_kv_cache.py:1281(_semantic_index_tensors)
+      112    0.006    0.000    0.006    0.000 {method 'argsort' of 'torch._C.TensorBase' objects}
+      112    0.005    0.000    0.005    0.000 {built-in method torch.isfinite}
+       32    0.005    0.000    0.005    0.000 log_kv_cache.py:2759(<listcomp>)
+     1981    0.001    0.000    0.005    0.000 fromnumeric.py:2018(nonzero)
+     1708    0.004    0.000    0.005    0.000 numeric.py:290(full)
+      336    0.005    0.000    0.005    0.000 {method 'gather' of 'torch._C.TensorBase' objects}
 
 
