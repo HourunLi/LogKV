@@ -71,6 +71,22 @@ CUDA/Triton 下脚本先对少量输入核对融合路径与 Torch 参照的配�
 阶段插桩会增加同步，不能拿它替代第一行总耗时。默认随机输入和两次 flush；这是性能诊断，
 不代表真实 NIAH 质量、整步训练吞吐或完整训练峰值。现有新路由 YAML 无需加新开关。
 
+第二轮 A800 实测为 2.110s/flush、330 MiB，配对检查通过；相比上一轮耗时仅下降
+7.4%。下一步使用算子 profiler 区分距离计算、GPU 启动/等待与 Python 调度开销：
+
+```bash
+python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --iters 1 \
+  --profile-dir route_operator_profile > route_operator_profile.jsonl
+```
+
+该模式替代原有阶段计时，先保留未插桩基准，然后分别采集一次 Torch CPU/CUDA profiler
+和一次 cProfile。每次仅记录最后一个 flush，前面的缓存构建、reset、编译预热不纳入采集；
+采集不额外逐阶段同步。`route_summary.txt` 包含按自身耗时排序的 CPU/CUDA 算子与
+Python 调用排名，`route_trace.json` 是带 `logkv/` 阶段标记的 Chrome 时间线，
+`route_python.prof` 可供后续离线分析。若未采集到 CUDA device events，摘要明确提示
+无法归因到 GPU kernel，不能把空 CUDA 表解释成 GPU 没有耗时。profiler 本身有开销，
+速度对比仍看未插桩 JSON；嵌套阶段的累计时间不能相加。
+
 ## 第一轮评测
 
 使用已完成训练的同一个具体 `step_*` checkpoint。新配置

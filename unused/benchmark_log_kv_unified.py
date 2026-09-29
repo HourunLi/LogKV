@@ -7,10 +7,13 @@ pass synchronizes stage boundaries and records merge rounds; do not add its
 numbers to the uninstrumented timing. Synthetic keys do not predict NIAH quality.
 """
 import argparse
+import cProfile
 from collections import defaultdict
 from contextlib import ExitStack
+import io
 import json
 from pathlib import Path
+import pstats
 import statistics
 import sys
 import time
@@ -42,10 +45,96 @@ def check_round_pairs(cache, device):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def profile_route(cache, inputs, device, directory):
+    """Profile only the last flush, with its preceding cache state built outside capture."""
+    out = Path(directory)
+    out.mkdir(parents=True, exist_ok=True)
+
+    def sync():
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+
+    def prepare():
+        cache.reset_parameters()
+        for k, v, pos, host in inputs[:-1]:
+            cache.route_and_flush_batch(k, v, pos, positions_host=host)
+        sync()
+
+    def flush():
+        k, v, pos, host = inputs[-1]
+        cache.route_and_flush_batch(k, v, pos, positions_host=host)
+
+    def annotated(fn, label):
+        def wrapped(*a, **kw):
+            name = label
+            if label == 'reduce':
+                name = 'candidates' if kw.get('radius_limits') is not None else 'global_merge'
+            with torch.profiler.record_function('logkv/' + name):
+                return fn(*a, **kw)
+        return wrapped
+
+    prepare()
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if device.type == 'cuda':
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    # No per-stage synchronization or pair-count readbacks in this capture.
+    with ExitStack() as stack:
+        for method, label in (
+            ('_semantic_unified_reduce_batch', 'reduce'),
+            ('_semantic_unified_round_pairs', 'pair_search'),
+            ('_semantic_unified_gram', 'gram'),
+            ('_semantic_unified_select_pairs', 'select_pairs'),
+            ('_semantic_ward_merge', 'old_kv_merge'),
+            ('_semantic_new_cluster', 'new_cluster_write'),
+            ('_semantic_commit_joins', 'batched_write'),
+        ):
+            stack.enter_context(patch.object(cache, method, annotated(getattr(cache, method), label)))
+        with torch.profiler.profile(activities=activities, record_shapes=True) as prof:
+            with torch.profiler.record_function('logkv/route_flush'):
+                flush()
+            sync()
+    prof.export_chrome_trace(str(out / 'route_trace.json'))
+    averages = prof.key_averages(group_by_input_shape=True)
+    cuda_events = sum(e.device_type == torch.autograd.DeviceType.CUDA for e in prof.events())
+    report = io.StringIO()
+    report.write('One warmed final flush; preceding flushes and cache reset excluded.\n'
+                 'Profiler overhead is included. Use the uninstrumented JSON timing for speed comparisons.\n'
+                 'CPU operator time can include CUDA waits; it is not pure CPU computation.\n'
+                 'Nested total times overlap; do not add them together.\n\n')
+    report.write('CPU operators, sorted by self CPU time:\n')
+    report.write(averages.table(sort_by='self_cpu_time_total', row_limit=30))
+    if device.type == 'cuda':
+        report.write('\n\nCUDA operators, sorted by self device time:\n')
+        report.write(averages.table(sort_by='self_device_time_total', row_limit=30))
+        report.write(f'\nCUDA device events captured: {cuda_events}\n')
+        if not cuda_events:
+            report.write('WARNING: no CUDA device events captured; GPU kernel attribution is unavailable.\n')
+
+    # Separate pass: cProfile reveals Python overhead without torch-profiler hooks.
+    prepare()
+    python_profile = cProfile.Profile()
+    python_profile.runcall(flush)
+    sync()
+    python_profile.dump_stats(str(out / 'route_python.prof'))
+    report.write('\n\nPython call sites, sorted by self time (includes blocking native calls):\n')
+    pstats.Stats(python_profile, stream=report).strip_dirs().sort_stats('tottime').print_stats(30)
+    report.write('\nPython call sites, sorted by cumulative time:\n')
+    pstats.Stats(python_profile, stream=report).strip_dirs().sort_stats('cumtime').print_stats(30)
+    expected = len(inputs) * inputs[0][0].size(2)
+    torch.testing.assert_close(cache.level_w.sum((2, 3, 4)),
+                               torch.full(inputs[0][0].shape[:2], float(expected), device=device), rtol=0, atol=0)
+    (out / 'route_summary.txt').write_text(report.getvalue())
+    return {'profile_summary': str(out / 'route_summary.txt'),
+            'profile_trace': str(out / 'route_trace.json'),
+            'python_profile': str(out / 'route_python.prof'),
+            'cuda_device_events': cuda_events, 'profiled_flushes_per_pass': 1}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--device', default='cuda')
     p.add_argument('--pattern', choices=('random', 'clustered'), default='random')
+    p.add_argument('--profile-dir', help='Write CPU/CUDA operator tables, trace and Python profile; replaces stage diagnostics')
     for name, default in [('tokens', 2048), ('dim', 128), ('batch', 1), ('groups', 1),
                           ('clusters', 12), ('B', 256), ('flushes', 2), ('iters', 3)]:
         p.add_argument('--' + name, type=int, default=default)
@@ -122,6 +211,10 @@ def main():
                           'route_group_tile': 16 if fused else 4,
                           'reference_pairs_verified': True if fused else None,
                           'mass_verified': True}), flush=True)
+
+        if args.profile_dir:
+            print(json.dumps(profile_route(cache, inputs, device, args.profile_dir)), flush=True)
+            return
 
         stages = defaultdict(float)
         rounds, phase = [], ['']

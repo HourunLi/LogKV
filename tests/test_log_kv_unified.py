@@ -307,3 +307,23 @@ def test_fused_round_pairs_match_reference_for_ties_padding_caps_and_radius():
     from unused.benchmark_log_kv_unified import check_round_pairs
 
     check_round_pairs(cache_for(device='cuda'), torch.device('cuda'))
+
+
+def test_short_route_profiler_exports_trace_and_python_summary(tmp_path):
+    import json
+    from unused.benchmark_log_kv_unified import profile_route
+
+    torch.manual_seed(18)
+    cache = cache_for()
+    inputs = [(torch.randn(1, 1, 8, 8), torch.randn(1, 1, 8, 8),
+               torch.arange(start, start + 8), [list(range(start, start + 8))]) for start in (0, 8)]
+    with torch.no_grad():
+        result = profile_route(cache, inputs, torch.device('cpu'), tmp_path)
+    trace = json.loads((tmp_path / 'route_trace.json').read_text())
+    assert sum(e.get('name') == 'logkv/route_flush' for e in trace['traceEvents']) == 1
+    names = {e.get('name') for e in trace['traceEvents']}
+    assert {'logkv/global_merge', 'logkv/pair_search'} <= names
+    summary = (tmp_path / 'route_summary.txt').read_text()
+    assert 'aten::' in summary and 'route_and_flush_batch' in summary
+    assert (tmp_path / 'route_python.prof').stat().st_size > 0
+    assert result['profiled_flushes_per_pass'] == 1
