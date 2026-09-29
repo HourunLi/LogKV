@@ -309,6 +309,31 @@ def test_fused_round_pairs_match_reference_for_ties_padding_caps_and_radius():
     check_round_pairs(cache_for(device='cuda'), torch.device('cuda'))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA/Triton')
+def test_fused_merge_pack_matches_reference_and_keeps_inputs_immutable():
+    pytest.importorskip('triton')
+    from unused.benchmark_log_kv_unified import check_merge_pack
+
+    check_merge_pack(cache_for(device='cuda'), torch.device('cuda'))
+
+
+def test_merge_pack_preserves_centers_mass_radius_and_padding():
+    mu = torch.tensor([[[1., 2.], [3., 6.], [7., 9.], [8., 5.]]])
+    mass = torch.tensor([[2., 6., 3., 4.]])
+    radius = torch.tensor([[.5, 1., 2., 3.]])
+    indices = torch.tensor([[[0, 2, 3, -1]], [[1, -1, -1, -1]]])
+    original = mu.clone(), mass.clone(), radius.clone()
+    center, weight, bound = LogStructuredKVCache._semantic_unified_merge_pack(mu, mass, radius, indices, True)
+    torch.testing.assert_close(center, torch.tensor([[[2.5, 5.], [7., 9.], [8., 5.], [0., 0.]]]))
+    torch.testing.assert_close(weight, torch.tensor([[8., 3., 4., 0.]]))
+    expected_radius = torch.maximum(.5 + .75 * (mu[0, 0] - mu[0, 1]).norm(),
+                                    1. + .25 * (mu[0, 0] - mu[0, 1]).norm())
+    torch.testing.assert_close(bound[0, 0], expected_radius)
+    torch.testing.assert_close(bound[0, 1:], torch.tensor([2., 3., 0.]))
+    for actual, before in zip((mu, mass, radius), original):
+        torch.testing.assert_close(actual, before, rtol=0, atol=0)
+
+
 def test_short_route_profiler_exports_trace_and_python_summary(tmp_path):
     import json
     from unused.benchmark_log_kv_unified import profile_route

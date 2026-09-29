@@ -2406,6 +2406,31 @@ class LogStructuredKVCache(nn.Module):
                  [node._replace(centroid=center) for node, center in zip(nodes, mu.unbind(0))], merges)
                 for original, (nodes, merges, mu) in zip(groups, packed)]
 
+    @staticmethod
+    def _semantic_unified_merge_pack(mu, mass, radius, indices, candidate_pass):
+        """Merge and compact from immutable source rows; padding has source -1."""
+        fused = _triton_route() if mu.is_cuda and not candidate_pass else None
+        if fused is not None:
+            return fused.merge_pack(mu, mass, indices)
+        src, partner = indices.unbind(0)
+        live, merge = src >= 0, partner >= 0
+        src, partner = src.clamp_min(0), partner.clamp_min(0)
+        a, b = mu.flatten(0, 1)[src], mu.flatten(0, 1)[partner]
+        ma, mb = mass.flatten()[src], mass.flatten()[partner]
+        combined = ma + mb
+        center = (ma[..., None] * a + mb[..., None] * b) / combined.clamp_min(1)[..., None]
+        center = torch.where(merge[..., None], center, a).masked_fill_(~live[..., None], 0)
+        weight = torch.where(merge, combined, ma).masked_fill_(~live, 0)
+        if candidate_pass:
+            ra, rb = radius.flatten()[src], radius.flatten()[partner]
+            distance = (a - b).norm(dim=-1)
+            bound = torch.maximum(ra + mb / combined.clamp_min(1) * distance,
+                                  rb + ma / combined.clamp_min(1) * distance)
+            out_radius = torch.where(merge, bound, ra).masked_fill_(~live, 0)
+        else:
+            out_radius = torch.zeros_like(weight)
+        return center, weight, out_radius
+
     @torch.no_grad()
     def _semantic_unified_reduce_packed(
         self, groups: list[list[_SemanticTreeCluster]], centroids: list[torch.Tensor | None], *,
@@ -2429,83 +2454,72 @@ class LogStructuredKVCache(nn.Module):
             return outputs
         counts = [len(groups[i]) for i in active]
         size = max(counts)
-        sample = centroids[active[0]]
-        dev = sample.device
-        mu = torch.stack([F.pad(centroids[i].float(),
-                               (0, 0, 0, size - len(groups[i]))) for i in active])
-        mass = torch.tensor([[n.n_total for n in groups[i]] + [0] * (size - len(groups[i]))
-                             for i in active], device=dev, dtype=torch.float32)
+        dev = centroids[active[0]].device
+        mu = torch.stack([F.pad(centroids[i].float(), (0, 0, 0, size - len(groups[i]))) for i in active])
+        weights = np.zeros((len(active), size), dtype=np.float32)
+        for lane, group in enumerate(active):
+            weights[lane, :counts[lane]] = np.fromiter((n.n_total for n in groups[group]), dtype=np.float32)
+        mass = torch.from_numpy(weights).to(dev)
         radius = torch.zeros_like(mass)
-        roots = [list(range(n)) for n in counts]
+        roots = [np.arange(n, dtype=np.int64) for n in counts]
         traces = [[] for _ in groups]
         cap = self._semantic_hard_cap()
         while active:
             limits = (None if radius_limits is None else
                       torch.tensor([radius_limits[i] for i in active], device=dev))
             pairs = self._semantic_unified_round_pairs(mu, mass, radius, limits, cap, max_clusters is not None)
-            pair_rows = pairs.cpu().tolist()
-            merge_indices, survivor_rows, next_active, next_roots, next_counts = [], [], [], [], []
+            # NumPy views avoid materializing all padded pairs as Python objects.
+            pair_rows = pairs.cpu().numpy()
+            valid = pair_rows[:, :, 0] >= 0
+            valid &= valid.cumsum(axis=1) <= (np.asarray(counts)[:, None] - target)
+            stride = mu.size(1)
+            pending = []
             for lane, group in enumerate(active):
-                selected = [(a, b) for a, b in pair_rows[lane] if a >= 0][:counts[lane] - target]
-                if not selected:
+                selected = pair_rows[lane, valid[lane]]
+                if not len(selected):
                     if max_clusters is not None:
                         raise RuntimeError("unified routing has no finite merge cost to satisfy the cluster budget")
                     outputs[group] = (roots[lane], mu[lane, :counts[lane]])
                     continue
-                dropped = set()
-                for a, b in selected:
-                    traces[group].append((roots[lane][a], roots[lane][b]))
-                    merge_indices.append((lane, a, b))
-                    dropped.add(b)
-                keep = [j for j in range(counts[lane]) if j not in dropped]
-                next_active.append(group)
-                next_roots.append([roots[lane][j] for j in keep])
-                next_counts.append(len(keep))
-                survivor_rows.append((lane, keep))
-            if not merge_indices:
+                # Store original node IDs in round/cost order, then rebuild once.
+                traces[group].append(roots[lane][selected])
+                keep = np.ones(counts[lane], dtype=bool)
+                keep[selected[:, 1]] = False
+                surviving = np.flatnonzero(keep)
+                partner = np.full(counts[lane], -1, dtype=np.int64)
+                partner[selected[:, 0]] = lane * stride + selected[:, 1]
+                pending.append((group, roots[lane][surviving], lane * stride + surviving, partner[surviving]))
+            if not pending:
                 break
-            lane, left, right = torch.tensor(merge_indices, device=dev).unbind(1)
-            combined = mass[lane, left] + mass[lane, right]
-            if radius_limits is not None:
-                exact = (mu[lane, left] - mu[lane, right]).norm(dim=-1)
-                radius[lane, left] = torch.maximum(
-                    radius[lane, left] + mass[lane, right] / combined * exact,
-                    radius[lane, right] + mass[lane, left] / combined * exact,
-                )
-            mu[lane, left] = (mass[lane, left, None] * mu[lane, left]
-                              + mass[lane, right, None] * mu[lane, right]) / combined[:, None]
-            mass[lane, left] = combined
-            size = max(next_counts)
-            # Pack surviving centers, preserving each group's original index order.
-            stride = mu.size(1)
-            flat = [lane_i * stride + j for lane_i, row in survivor_rows
-                    for j in row + [row[0]] * (size - len(row))]
-            index = torch.tensor(flat, device=dev)
-            mu = mu.flatten(0, 1).index_select(0, index).view(len(next_active), size, -1)
-            mass = mass.flatten().index_select(0, index).view(len(next_active), size)
-            radius = radius.flatten().index_select(0, index).view(len(next_active), size)
-            live = torch.arange(size, device=dev)[None] < torch.tensor(next_counts, device=dev)[:, None]
-            mass.masked_fill_(~live, 0)
-            active, roots, counts = next_active, next_roots, next_counts
-            continuing = []
-            for lane_i, group in enumerate(active):
-                if counts[lane_i] <= target:
-                    outputs[group] = (roots[lane_i], mu[lane_i, :counts[lane_i]])
-                else:
-                    continuing.append(lane_i)
-            if len(continuing) != len(active):
-                take = torch.tensor(continuing, device=dev, dtype=torch.long)
-                mu, mass, radius = (t.index_select(0, take) for t in (mu, mass, radius))
-                active = [active[i] for i in continuing]
-                roots = [roots[i] for i in continuing]
-                counts = [counts[i] for i in continuing]
+            # Pack continuing groups first: a prefix view retires completed lanes
+            # without three extra index_select kernels and another index upload.
+            running = [entry for entry in pending if len(entry[1]) > target]
+            finished = [entry for entry in pending if len(entry[1]) <= target]
+            pending = running + finished
+            size = max(len(entry[1]) for entry in pending)
+            mapping = np.full((2, len(pending), size), -1, dtype=np.int64)
+            for lane, (_, root, src, partner) in enumerate(pending):
+                mapping[0, lane, :len(root)] = src
+                mapping[1, lane, :len(root)] = partner
+            # One array upload describes both merging and compaction. The device
+            # reads old buffers and writes new ones, so disjoint pairs cannot race.
+            indices = torch.from_numpy(mapping).to(dev)
+            mu, mass, radius = self._semantic_unified_merge_pack(
+                mu, mass, radius, indices, radius_limits is not None,
+            )
+            for lane, (group, root, _, _) in enumerate(finished, start=len(running)):
+                outputs[group] = (root, mu[lane, :len(root)])
+            active = [entry[0] for entry in running]
+            roots = [entry[1] for entry in running]
+            counts = [len(root) for root in roots]
+            mu, mass, radius = (t[:len(running)] for t in (mu, mass, radius))
         for group, original in enumerate(groups):
             if not traces[group]:
                 outputs[group] = (list(original), [], centroids[group])
                 continue
             nodes = list(original)
             old_merges = []
-            for i, j in traces[group]:
+            for i, j in np.concatenate(traces[group]).tolist():
                 a, b = nodes[i], nodes[j]
                 if a.existing and b.existing:
                     old_merges.append(tuple(sorted((min(a.existing), min(b.existing)))))

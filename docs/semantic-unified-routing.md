@@ -95,6 +95,20 @@ Python 调用排名，`route_trace.json` 是带 `logkv/` 阶段标记的 Chrome 
 CPU 上随机、全相同、聚簇三种输入连续三次 flush，与修改前全部缓存 buffer 和宿主状态
 逐位一致；真实 GPU 加速需复测，不能用上述插桩时间相减推算。
 
+第三轮 A800 实测进一步降至 1.435s/flush、330 MiB。第四轮按剩余热点优化每轮数据流：
+配对回传后直接使用 NumPy 数组，批量筛选有效配对、生成存活索引和保存原始节点 ID，
+不再逐轮构造嵌套 Python 列表。每轮只上传一份来源/合并对象映射。全局阶段的 CUDA
+`merge_pack` 在一个 kernel 中读取旧中心和权重，输出合并且压紧的新缓冲区；未合并行
+直接复制，完成组通过前缀切片退出，避免额外索引上传和三次 `index_select`。
+候选半径仍用原 Torch 运算顺序，配对规则、组内合并顺序、K 预算和持久 KV 布局不变。
+每轮仍有一次回传，算法相依的轮次没有被声称完全并行。
+
+基准现在先检查融合更新与 Torch 的逐位一致性，覆盖不等权重、复制行、padding、非二次幂
+维度和输入不可变性；第一行应同时有 `reference_pairs_verified: true` 和
+`reference_updates_verified: true`。第四轮 CUDA 性能尚待实测；CPU 三类输入连续三次
+flush 与第三轮全部缓存 buffer、宿主状态逐位一致。新 profiler 范围 `logkv/merge_pack`
+用于区分更新压紧与配对计算，继续用同一短基准验证，不需要重跑完整训练。
+
 ## 第一轮评测
 
 使用已完成训练的同一个具体 `step_*` checkpoint。新配置
