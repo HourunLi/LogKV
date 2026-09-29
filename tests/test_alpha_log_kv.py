@@ -17,7 +17,7 @@ from litgpt.model import GPT, Block
 
 def cache_for(device="cpu", dtype=torch.float32, **overrides):
     args = dict(B=8, recent_size=8, semantic_clusters=True, cluster_k_max=4,
-                semantic_unified_route=True, semantic_merge_passes=4, semantic_anchor_mode="mid", allocate_second_order=False,
+                semantic_unified_route=True, semantic_merge_passes=1, semantic_anchor_mode="mid", allocate_second_order=False,
                 semantic_replay_updates=True, semantic_flush_granularity=8,
                 cos_cache=torch.ones(128, 8, device=device), sin_cache=torch.zeros(128, 8, device=device),
                 rope_n_elem=8, alpha_exact_tokens=8, alpha_span_max_tokens=4)
@@ -103,13 +103,37 @@ def test_delayed_archive_updates_hi_and_preserves_original_weighted_positions():
     assert c._semantic_n_total[0][0][0] == 3
 
 
-def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients():
+@pytest.mark.parametrize("merge_passes", [1, 4])
+def test_ragged_archive_excludes_padding_and_preserves_empty_lanes(merge_passes):
+    torch.manual_seed(71)
+    c = cache_for(semantic_merge_passes=merge_passes)
+    expected_mass = torch.zeros(2, 2)
+    expected_sum = torch.zeros(2, 2, 8)
+    # One lane per tile also exercises a whole empty tile, not only padding
+    # next to a nonempty lane. Later flushes archive older exact positions.
+    with patch.object(c, "_semantic_unified_tile", return_value=1), torch.no_grad():
+        for step, counts in enumerate(([0, 1], [7, 0], [1, 7], [0, 0])):
+            k = torch.randn(2, 2, 7, 8)
+            pos = torch.arange(30 - 7 * step, 23 - 7 * step, -1).expand(2, -1)
+            for b, count in enumerate(counts):
+                expected_mass[b] += count
+                expected_sum[b] += k[b, :, :count].sum(1)
+                k[b, :, count:] = 10000  # Padding must never become an entry.
+            c._semantic_route_unified(k, k, pos, pos.tolist(), record=False, token_counts=counts)
+            torch.testing.assert_close(c.level_w.sum((2, 3, 4)), expected_mass)
+            actual = (c.level_k.float() * c.level_w[..., None]).sum((2, 3, 4))
+            torch.testing.assert_close(actual, expected_sum, atol=3e-6, rtol=3e-5)
+            assert (c.alive.sum(-1) <= c.K_max).all()
+
+
+@pytest.mark.parametrize("merge_passes", [1, 4])
+def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(merge_passes):
     torch.manual_seed(31)
     originals = [torch.randn(2, 2, 40, 8) for _ in range(3)]
     results, grads = [], []
     ends = boundaries(40)
     for lowmem in (False, True):
-        c = cache_for()
+        c = cache_for(semantic_merge_passes=merge_passes)
         q, k, v = [x.clone().requires_grad_() for x in originals]
         if lowmem:
             y = LogKVStreamTrainingAttention.apply(q, k, v, c, .3, 8, 0., k, ends)
@@ -174,7 +198,7 @@ def test_model_checkpoint_and_odd_prefill_decode():
     original = GPT(config)
     models = [deepcopy(original), deepcopy(original)]
     kwargs = dict(batch_size=2, B=8, recent_size=8, second_order_scale=0., semantic_clusters=True,
-                  cluster_k_max=4, semantic_unified_route=True, semantic_merge_passes=4, semantic_flush_granularity=8,
+                  cluster_k_max=4, semantic_unified_route=True, semantic_merge_passes=1, semantic_flush_granularity=8,
                   semantic_anchor_mode="mid", allocate_second_order=False, semantic_replay_updates=True,
                   alpha_exact_tokens=8, alpha_span_max_tokens=4)
     for model in models:

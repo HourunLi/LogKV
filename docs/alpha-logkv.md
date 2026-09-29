@@ -34,17 +34,19 @@
 及归档写入，checkpoint 重算和反向回放均不重选、不重路由。
 `alpha_select` 计时包含在 `route` 中，不能再次累加。
 
-Alpha 配置启用 `log_kv_semantic_merge_passes: 4`：全局合并每次计算距离后，
-在 GPU 上连续执行四次互为最近邻扫描，已匹配端点退出后续扫描，最后一次性排序、
-回传并更新中心。扫描之间复用距离及工作区，没有 CPU 同步；后续扫描只读取尚未
-匹配的距离子矩阵。这会改变原配对结果：新合并中心到下一轮才参与竞争。
-候选簇半径约束不变，有限 hard cap 仍走原配对。设为 `1` 恢复原规则；
-训练、评测共用此参数，checkpoint/反向回放不重新配对。
-精确池收集直接写入已有缓冲区，减少三份暂存及复制。
+合并 semanticLogKV 增量路由后，Alpha 默认 `log_kv_semantic_merge_passes: 1`：
+每个 tile 初始化一次距离矩阵，随后在设备端增量更新距离与行最小值，并异步读取终止标志。
+包含上游的严格对称距离修复、旧簇排序和批量写入优化。互为最近邻规则保持；浮点递推及
+固定节点编号的平局处理可能改变具体配对，不能认为与旧实现逐位相同。
 
-本地 CPU 合成验证（batch=1、groups=1、2048×128、B=128、精确池256、两次flush）：
-passes=1→4，全局合并轮数95→26，单次flush中位耗时0.512→0.408秒。
-这是CPU数据，不能外推A800速度或NIAH质量；CUDA实现尚待目标机器验证。
+`merge_passes: 4` 保留为对照：候选阶段也使用增量实现，全局阶段调用原冻结中心
+多扫描路径，一次距离计算选出多批不重叠配对，再统一更新中心。两个模式都保持最终
+簇预算、候选半径约束和有限 hard cap 行为。训练与评测共用配置，checkpoint/反向回放
+不重新选择精确片段或配对。Alpha 的变长归档按真实 token 数计数，空样本与补齐位置
+不会进入压缩簇；精确池收集仍直接写入已有缓冲区。
+
+此前 CPU 的 0.512→0.408 秒/flush 是旧版本全量重算与四次扫描的对照，
+不能用来代表此次增量路由合并后的性能。合并后 CUDA 性能仍需目标机器确认。
 
 第一版使用当前 fast 配置：unified、mid、一阶、无 segment gap/padding；训练要求
 `semantic_replay_updates=true`。默认关闭时保留原路径。没有引入额外注意力打分、
@@ -56,15 +58,14 @@ passes=1→4，全局合并轮数95→26，单次flush中位耗时0.512→0.408�
 
 ```bash
 python -m pytest --noconftest -q tests/test_alpha_log_kv.py tests/test_log_kv_pack.py
-for passes in 1 4; do
-  python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --B 128 --iters 3 \
-    --alpha-exact-tokens 256 --alpha-span-max-tokens 64 --merge-passes "$passes" \
-    --profile-dir "route_operator_profile_alpha_p${passes}" \
-    > "route_alpha_p${passes}.jsonl" || break
-done
+python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --B 128 --iters 3 \
+  --alpha-exact-tokens 256 --alpha-span-max-tokens 64 --merge-passes 1 \
+  --profile-dir route_operator_profile_alpha_incremental > route_alpha_incremental.jsonl
 ```
 
-两档使用相同输入和预算，基准会先校验当前配对模式的 Triton/Torch 一致性及质量守恒。
+基准先校验 Triton/Torch 增量实现的一致性及质量守恒，CUDA 输出应包含
+`reference_incremental_verified: true`。如需与冻结中心模式对照，将 `--merge-passes`
+改为 `4` 并使用另一输出路径；其余输入和预算保持相同。
 `reference_pairs_verified` 指同一模式的实现一致，不表示与旧配对相同。
 不要把 B=128 的结果直接与之前 B=256 的结果比较。合成路由不代表检索质量。
 
