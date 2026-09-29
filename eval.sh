@@ -140,6 +140,8 @@ def expand(value):
 def load(path):
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
+    if "log_kv_semantic_summary_size" in cfg:
+        raise SystemExit("log_kv_semantic_summary_size has been removed; delete this key.")
     if "config" in cfg:
         base_path = os.path.join(os.path.dirname(path), cfg.pop("config"))
         base = load(base_path)
@@ -193,10 +195,10 @@ emit("LOG_KV_PREFILL", value_or("log_kv_prefill_block", 256))
 emit("LOG_KV_SECOND_ORDER_SCALE", value_or("log_kv_second_order_scale", 1.0))
 emit("LOG_KV_SEMANTIC", str(bool(cfg.get("log_kv_semantic_clusters", False))).lower())
 emit("LOG_KV_SEMANTIC_LEGACY_ROUTE", str(bool(cfg.get("log_kv_semantic_legacy_route", False))).lower())
+emit("LOG_KV_SEMANTIC_UNIFIED_ROUTE", str(bool(cfg.get("log_kv_semantic_unified_route", False))).lower())
 emit("LOG_KV_SEMANTIC_ANCHOR_MODE", value_or("log_kv_semantic_anchor_mode", "multi"))
 emit("LOG_KV_SEMANTIC_PACK_BACKEND", value_or("log_kv_semantic_pack_backend", "auto"))
 emit("LOG_KV_SEMANTIC_CENTROID_BACKEND", value_or("log_kv_semantic_centroid_backend", "sequential"))
-emit("LOG_KV_SEMANTIC_SUMMARY_SIZE", value_or("log_kv_semantic_summary_size", 1))
 emit("LOG_KV_SEMANTIC_REPLAY_UPDATES", str(bool(cfg.get("log_kv_semantic_replay_updates", False))).lower())
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
 emit("LOG_KV_CLUSTER_LAMBDA_REL", value_or("log_kv_cluster_lambda_rel", 1.0))
@@ -321,10 +323,10 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
     LOG_KV_ARG_LIST+=(
         --log_kv_semantic_clusters true
         --log_kv_semantic_legacy_route "${LOG_KV_SEMANTIC_LEGACY_ROUTE}"
+        --log_kv_semantic_unified_route "${LOG_KV_SEMANTIC_UNIFIED_ROUTE}"
         --log_kv_semantic_anchor_mode "${LOG_KV_SEMANTIC_ANCHOR_MODE}"
         --log_kv_semantic_pack_backend "${LOG_KV_SEMANTIC_PACK_BACKEND}"
         --log_kv_semantic_centroid_backend "${LOG_KV_SEMANTIC_CENTROID_BACKEND}"
-        --log_kv_semantic_summary_size "${LOG_KV_SEMANTIC_SUMMARY_SIZE}"
         --log_kv_semantic_replay_updates "${LOG_KV_SEMANTIC_REPLAY_UPDATES}"
         --log_kv_cluster_k_max "${LOG_KV_CLUSTER_K_MAX}"
         --log_kv_cluster_lambda_rel "${LOG_KV_CLUSTER_LAMBDA_REL}"
@@ -353,7 +355,7 @@ fi
 
 echo "Checkpoint: ${SAVE_DIR}"
 echo "Output dir: ${EVAL_OUTPUT_DIR}"
-echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND})"
+echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, unified_route=${LOG_KV_SEMANTIC_UNIFIED_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND})"
 if [ -n "${DIAG_ARGS}" ]; then
     echo "Extra eval args: ${DIAG_ARGS}"
 fi

@@ -3,7 +3,7 @@
 The checkpoint frame owns the records, not a layer-global queue. It retains no
 full Q/K/V or ladder snapshots; op-log tensors are shared with the original
 context, together with CPU replay schedules. When enabled, a fifth record owns
-small input summaries and routing-state updates on their original device. Recompute contexts can
+input entries and routing-state updates on their original device. Recompute contexts can
 be entered again for retain_graph backward.
 """
 

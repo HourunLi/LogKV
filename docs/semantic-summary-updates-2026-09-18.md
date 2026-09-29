@@ -1,5 +1,9 @@
 # SemanticLogKV 更新路径：并行 centroid、小组摘要、训练更新复用
 
+> 历史记录：2026-09-29 已删除 summary 提前平均及配置入口，以下配置和 summary 基准仅供历史参考。
+> 训练更新回放继续保留；当前测试为 `tests/test_log_kv_update_replay.py`，基准为
+> `unused/benchmark_log_kv_replay_updates.py`。所有新 token 逐个进入层级缓存。
+
 本轮只实现这三项；32K、K=8、B=64、global batch=128、micro batch=1 和 Block
 activation checkpoint 保持原配置。没有接入 hash，没有新增或移除原有快路由的建簇规则。
 

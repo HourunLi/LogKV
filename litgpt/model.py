@@ -155,10 +155,12 @@ class GPT(nn.Module):
             if input_pos.dim() == 1:
                 cos = cos.unsqueeze(0)
                 sin = sin.unsqueeze(0)
-            all_log_kv_cache = all(
-                isinstance(block.attn.kv_cache, LogStructuredKVCache) for block in self.transformer.h
+            local_cache_masks = all(
+                isinstance(block.attn.kv_cache, LogStructuredKVCache)
+                or (isinstance(block.attn.kv_cache, KVCache) and block.attn.kv_cache.is_sliding_window)
+                for block in self.transformer.h
             )
-            if all_log_kv_cache:
+            if local_cache_masks:
                 mask = None
             else:
                 if self.mask_cache is None:
@@ -335,7 +337,10 @@ class GPT(nn.Module):
             )
             block.attn._log_kv_pending = None
 
-        if self.mask_cache is None or self.mask_cache.size(3) != max_seq_length:
+        if all(isinstance(block.attn.kv_cache, KVCache) and block.attn.kv_cache.is_sliding_window
+               for block in self.transformer.h):
+            self.mask_cache = None
+        elif self.mask_cache is None or self.mask_cache.size(3) != max_seq_length:
             # passing `attn_mask` to SDPA disables the flash implementation. since we only need the mask
             # for the kv-cache support (only during inference), we only create it in that situation
             self.mask_cache = build_mask_cache(max_seq_length, device)
@@ -383,10 +388,10 @@ class GPT(nn.Module):
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
+        semantic_unified_route: bool = False,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
         semantic_centroid_backend: str = "sequential",
-        semantic_summary_size: int = 1,
         semantic_replay_updates: bool = False,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
@@ -470,10 +475,10 @@ class GPT(nn.Module):
                 semantic_capacity_beta=semantic_capacity_beta,
                 semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
                 semantic_legacy_route=semantic_legacy_route,
+                semantic_unified_route=semantic_unified_route,
                 semantic_anchor_mode=semantic_anchor_mode,
                 semantic_pack_backend=semantic_pack_backend,
                 semantic_centroid_backend=semantic_centroid_backend,
-                semantic_summary_size=semantic_summary_size,
                 semantic_replay_updates=semantic_replay_updates,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
@@ -538,11 +543,11 @@ class GPT(nn.Module):
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
+        semantic_unified_route: bool = False,
         allocate_second_order: bool = True,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
         semantic_centroid_backend: str = "sequential",
-        semantic_summary_size: int = 1,
         semantic_replay_updates: bool = False,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
@@ -617,10 +622,10 @@ class GPT(nn.Module):
                 semantic_capacity_beta=semantic_capacity_beta,
                 semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
                 semantic_legacy_route=semantic_legacy_route,
+                semantic_unified_route=semantic_unified_route,
                 semantic_anchor_mode=semantic_anchor_mode,
                 semantic_pack_backend=semantic_pack_backend,
                 semantic_centroid_backend=semantic_centroid_backend,
-                semantic_summary_size=semantic_summary_size,
                 semantic_replay_updates=semantic_replay_updates,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
@@ -897,12 +902,10 @@ class CausalSelfAttention(nn.Module):
                     q, k, v, B, T, reset_cache=False, defer_last_single=True, k_raw=k_raw, input_pos=input_pos
                 )
 
-            k, v = self.kv_cache(input_pos, k, v)
-
             if self.apply_sliding_window_attention:
-                actual_kv_len = k.size(2)
-                if mask is not None and mask.size(-1) != actual_kv_len:
-                    mask = mask[..., :actual_kv_len]
+                return self._sliding_window_forward(q, k, v, input_pos)
+
+            k, v = self.kv_cache(input_pos, k, v)
 
             if input_pos_maxp1 is not None and not isinstance(self.kv_cache, LogStructuredKVCache):
                 # Subselect along sequence dimension (only for standard cache)
@@ -953,6 +956,44 @@ class CausalSelfAttention(nn.Module):
 
         # Output projection.
         return self.proj(y)  # (B, T, C)
+
+    def _sliding_window_forward(self, q, k, v, input_pos):
+        """Exact local causal attention, including prefill longer than the ring.
+
+        Read the old ring before committing each block: overwriting it first
+        loses keys needed by the block's early queries. Absolute positions mask
+        both future tokens and stale ring slots, regardless of ring ordering.
+        """
+        cache = self.kv_cache
+        batch, heads, length, _ = q.shape
+        positions = input_pos.expand(batch, -1) if input_pos.ndim == 1 else input_pos
+        window = cache.max_cache_len
+        if cache.k.dtype != k.dtype:
+            cache.k = cache.k.to(k.dtype)
+        if cache.v.dtype != v.dtype:
+            cache.v = cache.v.to(v.dtype)
+        # ponytail: bounded SDPA blocks for correctness first; a local Flash
+        # kernel can replace the explicit mask if profiling warrants it.
+        chunk = min(1024, window)
+        outputs = []
+        for start in range(0, length, chunk):
+            end = min(start + chunk, length)
+            pos = positions[:, start:end]
+            key_pos = torch.cat((cache.positions[:batch], pos), dim=-1)
+            key_pos[:, :window].masked_fill_(key_pos[:, :window] >= pos[:, :1], -1)
+            keys = torch.cat((cache.k[:batch], k[:, :, start:end]), dim=2)
+            values = torch.cat((cache.v[:batch], v[:, :, start:end]), dim=2)
+            distance = pos[:, :, None] - key_pos[:, None, :]
+            allowed = (key_pos[:, None, :] >= 0) & (distance >= 0) & (distance < window)
+            mask = q.new_zeros(batch, 1, end - start, key_pos.size(-1))
+            mask.masked_fill_(~allowed[:, None], float("-inf"))
+            if keys.size(1) != heads:
+                repeats = heads // keys.size(1)
+                keys = keys.repeat_interleave(repeats, dim=1)
+                values = values.repeat_interleave(repeats, dim=1)
+            outputs.append(self.scaled_dot_product_attention(q[:, :, start:end], keys, values, mask))
+            cache(pos, k[:, :, start:end], v[:, :, start:end])
+        return self.proj(torch.cat(outputs, dim=1).reshape(batch, length, -1))
 
     def _assert_log_kv_input_pos_contiguous(self, input_pos: torch.Tensor, T: int) -> None:
         """Validate the append-only LogKV cache contract.
@@ -1357,13 +1398,13 @@ class CausalSelfAttention(nn.Module):
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
+        semantic_unified_route: bool = False,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
         allocate_second_order: bool = True,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
         semantic_centroid_backend: str = "sequential",
-        semantic_summary_size: int = 1,
         semantic_replay_updates: bool = False,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
@@ -1424,10 +1465,10 @@ class CausalSelfAttention(nn.Module):
             semantic_capacity_beta=semantic_capacity_beta,
             semantic_capacity_hard_cap_mult=semantic_capacity_hard_cap_mult,
             semantic_legacy_route=semantic_legacy_route,
+            semantic_unified_route=semantic_unified_route,
             semantic_anchor_mode=semantic_anchor_mode,
             semantic_pack_backend=semantic_pack_backend,
             semantic_centroid_backend=semantic_centroid_backend,
-            semantic_summary_size=semantic_summary_size,
             semantic_replay_updates=semantic_replay_updates,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
@@ -2040,6 +2081,13 @@ class KVCache(nn.Module):
         self.is_sliding_window = is_sliding_window
         self.sliding_window_size = sliding_window_size
         self.max_cache_len = k_shape[2]
+        if is_sliding_window:
+            if self.max_cache_len < 1:
+                raise ValueError("sliding window must contain at least one token")
+            self.register_buffer(
+                "positions", torch.full((k_shape[0], self.max_cache_len), -1, device=device, dtype=torch.long),
+                persistent=False,
+            )
 
     def forward(self, input_pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -2075,6 +2123,8 @@ class KVCache(nn.Module):
                     f"Please use chunked prefill with chunk size <= {self.max_cache_len} to avoid this issue."
                 )
             cache_positions = input_pos % self.max_cache_len
+            positions = input_pos.expand(bs, -1) if input_pos.ndim == 1 else input_pos
+            self.positions[:bs].scatter_(1, positions % self.max_cache_len, positions)
             k = batched_index_copy_(self.k[:bs, ...], -2, cache_positions, k)
             v = batched_index_copy_(self.v[:bs, ...], -2, cache_positions, v)
 
@@ -2092,6 +2142,8 @@ class KVCache(nn.Module):
     def reset_parameters(self) -> None:
         torch.nn.init.zeros_(self.k)
         torch.nn.init.zeros_(self.v)
+        if self.is_sliding_window:
+            self.positions.fill_(-1)
 
 
 def build_mask_cache(max_seq_length: int, device: torch.device | None = None) -> torch.Tensor:
