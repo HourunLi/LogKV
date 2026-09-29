@@ -1,0 +1,4 @@
+config: compare_niah_semantic.yaml
+# Same weights, tokenizer, tasks, samples, and persistent cache byte budget.
+# No dense prefill; 0 measures the reference LogKV allocation then builds SWA.
+swa_window_size: 0

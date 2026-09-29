@@ -400,10 +400,10 @@ class LogStructuredKVCache(nn.Module):
         semantic_capacity_beta: float = 0.0,
         semantic_capacity_hard_cap_mult: float = 0.0,
         semantic_legacy_route: bool = False,
+        semantic_unified_route: bool = False,
         semantic_anchor_mode: str = "multi",
         semantic_pack_backend: str = "auto",
         semantic_centroid_backend: str = "sequential",
-        semantic_summary_size: int = 1,
         semantic_replay_updates: bool = False,
         cos_cache: torch.Tensor | None = None,
         sin_cache: torch.Tensor | None = None,
@@ -437,16 +437,19 @@ class LogStructuredKVCache(nn.Module):
             raise ValueError(f"semantic LogKV requires B >= 2, got {self.B}")
         if semantic_centroid_backend not in ("sequential", "parallel"):
             raise ValueError("semantic_centroid_backend must be sequential or parallel")
-        if isinstance(semantic_summary_size, bool) or int(semantic_summary_size) != semantic_summary_size or not 1 <= semantic_summary_size <= 256:
-            raise ValueError("semantic_summary_size must be an integer in [1, 256]")
         self.semantic_centroid_backend = semantic_centroid_backend
-        self.semantic_summary_size = int(semantic_summary_size)
         self.semantic_replay_updates = bool(semantic_replay_updates)
-        if self.semantic_summary_size > 1 or self.semantic_replay_updates:
+        self.semantic_unified_route = bool(semantic_unified_route)
+        if self.semantic_unified_route:
+            if not self.semantic_clusters or semantic_legacy_route or semantic_cluster_chunk_size:
+                raise ValueError("unified routing requires semantic clusters and excludes legacy/chunk-tree routing")
+            if semantic_capacity_beta != 0.0:
+                raise ValueError("unified routing uses Ward costs; semantic_capacity_beta must be 0")
+            if seg_gap_max is not None and math.isfinite(seg_gap_max) and seg_forget != 1.0:
+                raise ValueError("unified Ward routing requires seg_forget=1 when segment boundaries are enabled")
+        if self.semantic_replay_updates:
             if not self.semantic_clusters or self.K_max <= 1 or semantic_legacy_route or semantic_cluster_chunk_size:
-                raise ValueError("summary/update replay requires fast three-phase semantic routing with K > 1")
-        if self.semantic_summary_size > 1 and seg_gap_max is not None and math.isfinite(seg_gap_max):
-            raise ValueError("semantic summaries require seg_gap_max=None; segment alignment uses token entries")
+                raise ValueError("update replay requires fast or unified semantic routing with K > 1")
         self._active_updates = None
         self._update_actions = None
         self._replaying_updates = False
@@ -800,8 +803,6 @@ class LogStructuredKVCache(nn.Module):
     @second_order.setter
     def second_order(self, value: bool) -> None:
         value = bool(value)
-        if value and self.semantic_summary_size > 1:
-            raise ValueError("semantic summaries require second_order_scale=0")
         if value != self._second_order and self._has_compacted_levels():
             raise RuntimeError(
                 f"LogStructuredKVCache: cannot change `second_order` "
@@ -2274,6 +2275,147 @@ class LogStructuredKVCache(nn.Module):
             result.append(self._semantic_tree_reduce_to_budget(clusters))
         return result
 
+    @staticmethod
+    def _semantic_unified_pairs(cost: torch.Tensor, max_pairs: int) -> torch.Tensor:
+        """Mutual-nearest disjoint pairs, using a symmetric deterministic tie break.
+
+        All pairs see the same round's costs. XOR ties pair identical neighbours
+        in parallel instead of sending every identical key to cluster zero.
+        This is a parallel Ward approximation, not sequential greedy Ward.
+        """
+        ids = torch.arange(cost.size(0), device=cost.device)
+        best_cost = cost.amin(dim=1, keepdim=True)
+        tie = ids[:, None].bitwise_xor(ids[None, :])
+        tie.masked_fill_(cost != best_cost, 2 * cost.size(0))
+        best = tie.argmin(dim=1)
+        left = ids[(ids < best) & (best[best] == ids) & torch.isfinite(best_cost[:, 0])]
+        right = best[left]
+        order = cost[left, right].argsort(stable=True)[:max_pairs]
+        return torch.stack((left[order], right[order]), dim=1)
+
+    @torch.no_grad()
+    def _semantic_unified_reduce(
+        self,
+        clusters: list[_SemanticTreeCluster],
+        *,
+        max_clusters: int | None = None,
+        radius_limit: float | None = None,
+    ) -> tuple[list[_SemanticTreeCluster], list[tuple[int, int]]]:
+        """Plan parallel merge rounds without writing or allocating KV ladders.
+
+        Candidate formation has only a radius bound, never a K_max reduction.
+        The second pass includes ALL old and new candidates and enforces K_max.
+        Record old-old operations in planning order; new token writes are deferred
+        until that entire structural plan has been committed.
+        """
+        nodes = list(clusters)
+        old_merges: list[tuple[int, int]] = []
+        if len(nodes) < 2:
+            return nodes, old_merges
+        mu = torch.stack([node.centroid for node in nodes]).float()
+        mass = torch.tensor([node.n_total for node in nodes], device=mu.device, dtype=torch.float32)
+        radius = torch.zeros_like(mass)
+        target = 1 if max_clusters is None else max_clusters
+        cap = self._semantic_hard_cap()
+        while len(nodes) > target:
+            # ponytail: O(M^2) workspace per lane, M <= flush_tokens + K_max.
+            # Tile pair search only if profiling shows this bounded workspace is too large.
+            distance = torch.cdist(mu, mu, compute_mode="donot_use_mm_for_euclid_dist")
+            total = mass[:, None] + mass[None, :]
+            cost = distance.square() * (mass[:, None] * mass[None, :] / total)
+            cost.fill_diagonal_(float("inf"))
+            merged_radius = None
+            if radius_limit is not None:
+                # Triangle inequality bounds every member's distance to the new
+                # centroid. Connected components alone would allow long chains.
+                merged_radius = torch.maximum(
+                    radius[:, None] + (mass[None, :] / total) * distance,
+                    radius[None, :] + (mass[:, None] / total) * distance,
+                )
+                cost.masked_fill_(merged_radius > radius_limit, float("inf"))
+            limited = cost.masked_fill(total > cap, float("inf")) if cap != math.inf else cost
+            pairs = self._semantic_unified_pairs(limited, len(nodes) - target)
+            pair_list = pairs.cpu().tolist()
+            if not pair_list and max_clusters is not None and cap != math.inf:
+                # Same overflow policy as existing routes: preserve every token
+                # and the cluster budget when no pair satisfies the load cap.
+                pairs = self._semantic_unified_pairs(cost, len(nodes) - target)
+                pair_list = pairs.cpu().tolist()
+            if not pair_list:
+                if max_clusters is not None:
+                    raise RuntimeError("unified routing has no finite merge cost to satisfy the cluster budget")
+                break
+            left, right = pairs.unbind(dim=1)
+            combined = mass[left] + mass[right]
+            mu[left] = (mass[left, None] * mu[left] + mass[right, None] * mu[right]) / combined[:, None]
+            mass[left] = combined
+            if merged_radius is not None:
+                radius[left] = merged_radius[left, right]
+            keep = torch.ones(len(nodes), device=mu.device, dtype=torch.bool)
+            keep[right] = False
+            mu, mass, radius = mu[keep], mass[keep], radius[keep]
+            for i, j in pair_list:
+                a, b = nodes[i], nodes[j]
+                if a.existing and b.existing:
+                    old_merges.append(tuple(sorted((min(a.existing), min(b.existing)))))
+                nodes[i] = _SemanticTreeCluster(
+                    a.centroid, a.n_total + b.n_total, max(a.p_hi, b.p_hi),
+                    a.existing + b.existing, a.tokens + b.tokens,
+                )
+            dropped = {j for _, j in pair_list}
+            survivors = [node for i, node in enumerate(nodes) if i not in dropped]
+            nodes = [node._replace(centroid=center) for node, center in zip(survivors, mu.unbind(0))]
+            del cost, limited, distance, total, merged_radius
+        return nodes, old_merges
+
+    def _semantic_unified_candidates(
+        self, b: int, g: int, k_raw: torch.Tensor, positions_host: list[list[int]]
+    ) -> list[_SemanticTreeCluster]:
+        """Adaptive, compact groups over the whole flush; singletons are valid."""
+        nodes = [
+            _SemanticTreeCluster(key, 1, positions_host[b][i], (), (i,))
+            for i, key in enumerate(k_raw[b, g].detach().float().unbind(0))
+        ]
+        candidates, _ = self._semantic_unified_reduce(
+            nodes, radius_limit=math.sqrt(self._semantic_tree_threshold(b, g))
+        )
+        return candidates
+
+    def _semantic_route_unified(
+        self, k_raw: torch.Tensor, v: torch.Tensor, positions: torch.Tensor,
+        positions_host: list[list[int]], *, record: bool,
+    ) -> None:
+        jobs: list[tuple[int, int, int, tuple[int, ...]]] = []
+        for b in range(k_raw.size(0)):
+            for g in range(k_raw.size(1)):
+                candidates = self._semantic_unified_candidates(b, g, k_raw, positions_host)
+                nodes, old_merges = self._semantic_unified_reduce(
+                    self._semantic_tree_existing_set(b, g) + candidates, max_clusters=self.K_max
+                )
+                # Preserve the planned old-old merge order, not cluster-ID order.
+                # All structural ops precede token ops so op-log replay cannot
+                # stop at the last consumed token with a trailing merge unread.
+                for keep, free in old_merges:
+                    self._semantic_ward_merge(b, g, keep, free, record=record)
+                free_slots = iter(self._semantic_free_clusters(b, g))
+                for node in nodes:
+                    offsets = tuple(sorted(node.tokens, key=lambda i: positions_host[b][i]))
+                    if not offsets:
+                        continue
+                    if node.existing:
+                        target = min(node.existing)
+                    else:
+                        target = next(free_slots)
+                        first, *rest = offsets
+                        self._semantic_new_cluster(
+                            b, g, target, positions_host[b][first], k_raw[b, g, first], v[b, g, first],
+                            positions[b, first], record=record,
+                        )
+                        offsets = tuple(rest)
+                    if offsets:
+                        jobs.append((b, g, target, offsets))
+        self._semantic_commit_joins(sorted(jobs), k_raw, v, positions, positions_host, record=record)
+
     def _semantic_commit_joins(
         self,
         jobs: list[tuple[int, int, int, tuple[int, ...]]],
@@ -2452,45 +2594,6 @@ class LogStructuredKVCache(nn.Module):
             runs, [], total, k_raw, v, positions,
         )
 
-    def _semantic_summarize_block(self, block, counts):
-        """Pool consecutive same-cluster tokens within this flush, never across lanes.
-
-        ponytail: tail groups are committed immediately; cross-flush pending
-        groups would add mutable inference state for little maintenance saving.
-        """
-        if self.semantic_summary_size == 1:
-            return block, counts
-        if self.second_order:
-            raise ValueError("semantic summaries currently require second_order_scale=0")
-        size = self.semantic_summary_size
-        starts, lengths, summary_counts = [], [], []
-        offset = 0
-        for count in counts:
-            summary_counts.append((count + size - 1) // size)
-            for begin in range(0, count, size):
-                starts.append(offset + begin)
-                lengths.append(min(size, count - begin))
-            offset += count
-        meta = torch.tensor([starts, lengths], device=block[0].device, dtype=torch.int64)
-        start, length = meta.unbind(0)
-        local = torch.arange(size, device=meta.device)
-        valid = local[None, :] < length[:, None]
-        index = (start[:, None] + local).clamp_max(offset - 1)
-        w = block[2][index] * valid
-        mass = w.sum(1)
-        denom = mass.clamp_min(1).unsqueeze(-1)
-        k = (block[0][index].float() * w[..., None]).sum(1) / denom
-        v = (block[1][index].float() * w[..., None]).sum(1) / denom
-        # Raw JOIN inputs have unit mass and no pads (validated at construction).
-        lo = block[8].index_select(0, start)
-        hi = block[9].index_select(0, start + length - 1)
-        sum_wp = (block[10][index] * valid).sum(1)
-        order = block[11].index_select(0, start)
-        k, v = k.to(block[0].dtype), v.to(block[1].dtype)
-        return (k, v, mass,
-                *self._empty_stats(k, v, mass), lo, hi, sum_wp, order,
-                torch.zeros_like(mass, dtype=torch.bool)), summary_counts
-
     def _semantic_apply_join_plan(
         self,
         lanes: list[tuple[int, int, int]],
@@ -2579,8 +2682,7 @@ class LogStructuredKVCache(nn.Module):
             order_t,
             block_pad,
         )
-        block, append_counts = self._semantic_summarize_block(block, lane_counts)
-        self._semantic_append_entries_batched(lanes, append_counts, block)
+        self._semantic_append_entries_batched(lanes, lane_counts, block)
 
         # Keep the increasing-token sum order: atomic/tree reductions can
         # perturb centroid routing. The CUDA loop fuses that sum with the update.
@@ -3005,7 +3107,8 @@ class LogStructuredKVCache(nn.Module):
                 raise RuntimeError("update replay CPU positions do not match the flush shape")
             key = tuple(tuple(row) for row in host)
             signature = (k.shape, v.shape, k.dtype, v.dtype, k.device,
-                         self.semantic_summary_size, self.semantic_centroid_backend, self.second_order,
+                         self.semantic_centroid_backend, self.second_order,
+                         self.semantic_unified_route,
                          self.K_max, self.B, self.L_alloc, self.recent_size, self.semantic_flush_granularity)
             if self._replaying_updates:
                 if not replay or key not in updates.flushes:
@@ -3078,8 +3181,6 @@ class LogStructuredKVCache(nn.Module):
     ) -> None:
         if not self.semantic_clusters:
             raise RuntimeError("route_and_flush_batch is only valid for semantic LogKV")
-        if self.semantic_summary_size > 1 and self.second_order:
-            raise ValueError("semantic summaries require second_order_scale=0")
         if replay_plans is not None and replay_op_log is None:
             raise RuntimeError("semantic replay plans require the matching op-log; rerouting is not allowed")
         if record_op_log and self.op_log is None:
@@ -3138,6 +3239,10 @@ class LogStructuredKVCache(nn.Module):
                                 b, g, cluster, int(arg), k_raw[b, g, offset], v[b, g, offset],
                                 positions[b, offset], record=False
                             )
+            return
+
+        if self.semantic_unified_route:
+            self._semantic_route_unified(k_raw, v, positions, positions_host, record=record_op_log)
             return
 
         if (
@@ -4909,7 +5014,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             q.shape, k.shape, v.shape, q.dtype, k.dtype, v.dtype, q.device,
             scale, train_block, second_order_scale, k_raw is not None,
             cache.semantic_anchor_mode, cache.K_max, cache.B, cache.recent_size,
-            cache.semantic_summary_size, cache.semantic_centroid_backend, cache.semantic_replay_updates,
+            cache.semantic_centroid_backend, cache.semantic_replay_updates,
+            cache.semantic_unified_route,
         )
         checkpoint_log = checkpoint_route_replay(cache, signature)
         updates = (_SemanticReplayUpdates() if checkpoint_log is None else checkpoint_log[4]) if cache.semantic_replay_updates else None
@@ -4982,7 +5088,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         plan_tensors = [tensor for plan in attention_plans if plan is not None for tensor in plan]
         ctx.update_tensor_offset = 3 + int(k_raw is not None) + len(plan_tensors)
         ctx.update_flushes = updates.flushes if updates is not None else None
-        ctx.update_config = (cache.semantic_summary_size, cache.semantic_centroid_backend, cache.semantic_replay_updates)
+        ctx.update_config = (cache.semantic_centroid_backend,
+                             cache.semantic_replay_updates, cache.semantic_unified_route)
         ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors,
                               *(updates.tensors if updates is not None else ()))
         ctx.has_attention_plans = cache.semantic_clusters
@@ -5009,7 +5116,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             q, k, v = saved[:3]
             k_raw = k
         cache = ctx.cache
-        if ctx.update_config != (cache.semantic_summary_size, cache.semantic_centroid_backend, cache.semantic_replay_updates):
+        if ctx.update_config != (cache.semantic_centroid_backend,
+                                 cache.semantic_replay_updates, cache.semantic_unified_route):
             raise RuntimeError("semantic update configuration changed between forward and backward")
         updates = (_SemanticReplayUpdates(ctx.update_flushes, saved[ctx.update_tensor_offset:])
                    if ctx.update_flushes is not None else None)
