@@ -9,7 +9,7 @@ import torch
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import apply_activation_checkpointing
 
 from litgpt.config import Config
-from litgpt.log_kv_cache import LOG_KV_OP_WARD_MERGE, LogStructuredKVCache, _SemanticReplayUpdates
+from litgpt.log_kv_cache import LOG_KV_OP_WARD_MERGE, LogStructuredKVCache, _SemanticReplayUpdates, _SemanticTreeCluster
 from litgpt.log_kv_checkpoint import enable_logkv_checkpoint_replay
 from litgpt.model import Block, GPT
 
@@ -236,3 +236,66 @@ def test_unified_checkpoint_gradients_match_without_checkpoint_and_skip_reroutin
         gradients.append([p.grad.clone() for p in model.parameters()])
     for expected, actual in zip([losses[0]] + gradients[0], [losses[1]] + gradients[1]):
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('candidate_pass', [False, True])
+def test_batched_reduce_matches_independent_groups_with_uneven_convergence(device, candidate_pass):
+    torch.manual_seed(92)
+    cache = cache_for(device=device)
+    groups = []
+    for group, count in enumerate([0, 1, 3, 65, 41, 20]):
+        points = torch.randn(count, 8, device=device) * (group + 1)
+        groups.append([_SemanticTreeCluster(k, (i % 3) + 1, i, (i,) if i < 3 else (), (i,))
+                       for i, k in enumerate(points.unbind(0))])
+    radii = [0., 1., 100., 2., 30., .1]
+    kwargs = {'radius_limits': radii} if candidate_pass else {'max_clusters': 3}
+    actual = cache._semantic_unified_reduce_batch(groups, **kwargs)
+    for i, (nodes, merges) in enumerate(actual):
+        args = {'radius_limit': radii[i]} if candidate_pass else {'max_clusters': 3}
+        expected, expected_merges = cache._semantic_unified_reduce(groups[i], **args)
+        assert merges == expected_merges
+        assert [(n.n_total, n.p_hi, n.existing, n.tokens) for n in nodes] == [
+            (n.n_total, n.p_hi, n.existing, n.tokens) for n in expected]
+        for a, b in zip(nodes, expected):
+            torch.testing.assert_close(a.centroid, b.centroid, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_gemm_distance_keeps_fp32_under_autocast_and_large_common_offset(device):
+    torch.manual_seed(124)
+    points = torch.randn(2, 65, 8, device=device) + 10000
+    expected = torch.cdist(points.double(), points.double(),
+                           compute_mode='donot_use_mm_for_euclid_dist').square().float()
+    precision = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision('high')
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            actual = LogStructuredKVCache._semantic_unified_distance2(points)
+        assert actual.dtype == torch.float32
+        assert torch.get_float32_matmul_precision() == 'high'
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=3e-6)
+    finally:
+        torch.set_float32_matmul_precision(precision)
+
+
+def test_gemm_cancellation_cannot_widen_candidate_radius():
+    cache = cache_for()
+    # A large separation between two groups makes close within-group squared
+    # distances vulnerable to cancellation even after subtracting one origin.
+    k = keys([0.] + [10000. + i * .2 for i in range(64)])
+    candidates = cache._semantic_unified_candidates(0, 0, k, [list(range(65))])
+    assert sum(len(n.tokens) for n in candidates) == 65
+    for n in candidates:
+        members = k[0, 0, list(n.tokens)]
+        assert ((members - n.centroid).norm(dim=-1) <= .501).all()
+
+
+def test_batched_global_merge_relaxes_impossible_hard_cap_without_losing_mass():
+    cache = cache_for(semantic_capacity_hard_cap_mult=.1)
+    groups = [[_SemanticTreeCluster(torch.full((8,), float(i)), 1, i, (), (i,))
+               for i in range(count)] for count in [7, 11]]
+    for original, (nodes, _) in zip(groups, cache._semantic_unified_reduce_batch(groups, max_clusters=3)):
+        assert len(nodes) == 3
+        assert sum(n.n_total for n in nodes) == len(original)
+        assert sorted(i for n in nodes for i in n.tokens) == list(range(len(original)))

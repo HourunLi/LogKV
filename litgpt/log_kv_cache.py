@@ -2277,84 +2277,183 @@ class LogStructuredKVCache(nn.Module):
 
     @staticmethod
     def _semantic_unified_pairs(cost: torch.Tensor, max_pairs: int) -> torch.Tensor:
-        """Mutual-nearest disjoint pairs, using a symmetric deterministic tie break.
+        """Mutual-nearest disjoint pairs, batched over independent KV groups.
 
-        All pairs see the same round's costs. XOR ties pair identical neighbours
-        in parallel instead of sending every identical key to cluster zero.
-        This is a parallel Ward approximation, not sequential greedy Ward.
+        Batched results are padded with -1; this avoids a CUDA nonzero/host
+        synchronization per group. The 2-D entry point keeps its compact result.
         """
-        ids = torch.arange(cost.size(0), device=cost.device)
-        best_cost = cost.amin(dim=1, keepdim=True)
+        single = cost.ndim == 2
+        if single:
+            cost = cost.unsqueeze(0)
+        size = cost.size(-1)
+        ids = torch.arange(size, device=cost.device, dtype=torch.int32)
+        best_cost = cost.amin(dim=-1, keepdim=True)
         tie = ids[:, None].bitwise_xor(ids[None, :])
-        tie.masked_fill_(cost != best_cost, 2 * cost.size(0))
-        best = tie.argmin(dim=1)
-        left = ids[(ids < best) & (best[best] == ids) & torch.isfinite(best_cost[:, 0])]
-        right = best[left]
-        order = cost[left, right].argsort(stable=True)[:max_pairs]
-        return torch.stack((left[order], right[order]), dim=1)
+        best = torch.where(cost == best_cost, tie, 2 * size).argmin(dim=-1)
+        valid = (ids < best) & (best.gather(1, best) == ids) & torch.isfinite(best_cost[..., 0])
+        pair_cost = cost.gather(2, best.unsqueeze(-1)).squeeze(-1).masked_fill(~valid, float("inf"))
+        left = pair_cost.argsort(dim=-1, stable=True)[:, :min(max_pairs, size // 2)]
+        right = best.gather(1, left)
+        pairs = torch.stack((left, right), dim=-1)
+        pairs.masked_fill_(~valid.gather(1, left).unsqueeze(-1), -1)
+        return pairs[0][pairs[0, :, 0] >= 0] if single else pairs
+
+    @staticmethod
+    def _semantic_unified_distance2(mu: torch.Tensor) -> torch.Tensor:
+        """FP32 squared distances via GEMM; direct differences for small sets.
+
+        Subtract a shared origin before GEMM to avoid cancellation when keys
+        have a large common offset. Close ties may differ from direct cdist
+        because the floating-point summation order changes.
+        """
+        if mu.size(1) <= 32:
+            return torch.cdist(mu, mu, compute_mode="donot_use_mm_for_euclid_dist").square()
+        precision = torch.get_float32_matmul_precision()
+        try:
+            # Training enables "high" globally. Routing distances need full
+            # FP32 products even inside bf16 autocast; restore the caller's mode.
+            if mu.is_cuda:
+                torch.set_float32_matmul_precision("highest")
+            with torch.autocast(device_type=mu.device.type, enabled=False):
+                centered = mu.float() - mu[:, :1].float()
+                norm = centered.square().sum(-1)
+                distance2 = (norm[:, :, None] + norm[:, None, :] - 2 * torch.bmm(
+                    centered, centered.transpose(1, 2)
+                )).clamp_min_(0)
+        finally:
+            if mu.is_cuda:
+                torch.set_float32_matmul_precision(precision)
+        return distance2
 
     @torch.no_grad()
-    def _semantic_unified_reduce(
-        self,
-        clusters: list[_SemanticTreeCluster],
-        *,
-        max_clusters: int | None = None,
-        radius_limit: float | None = None,
-    ) -> tuple[list[_SemanticTreeCluster], list[tuple[int, int]]]:
-        """Plan parallel merge rounds without writing or allocating KV ladders.
+    def _semantic_unified_reduce_batch(
+        self, groups: list[list[_SemanticTreeCluster]], *,
+        max_clusters: int | None = None, radius_limits: list[float] | None = None,
+    ) -> list[tuple[list[_SemanticTreeCluster], list[tuple[int, int]]]]:
+        """Reduce a bounded tile of groups together; rebuild Python nodes once.
 
-        Candidate formation has only a radius bound, never a K_max reduction.
-        The second pass includes ALL old and new candidates and enforces K_max.
-        Record old-old operations in planning order; new token writes are deferred
-        until that entire structural plan has been committed.
+        One pairing readback per round serves all groups. Counts and membership
+        stay on the host; centers/masses/radii are updated together on device.
+        Rounds and the ordering of physical old-old merges retain their original
+        semantics. Only floating-point distance evaluation changes to GEMM.
         """
-        nodes = list(clusters)
-        old_merges: list[tuple[int, int]] = []
-        if len(nodes) < 2:
-            return nodes, old_merges
-        mu = torch.stack([node.centroid for node in nodes]).float()
-        mass = torch.tensor([node.n_total for node in nodes], device=mu.device, dtype=torch.float32)
-        radius = torch.zeros_like(mass)
         target = 1 if max_clusters is None else max_clusters
+        outputs = [None] * len(groups)
+        active = [i for i, nodes in enumerate(groups) if len(nodes) > target]
+        for i, nodes in enumerate(groups):
+            if i not in active:
+                outputs[i] = (list(nodes), [])
+        if not active:
+            return outputs
+        counts = [len(groups[i]) for i in active]
+        size = max(counts)
+        sample = groups[active[0]][0].centroid
+        dev = sample.device
+        mu = torch.stack([F.pad(torch.stack([n.centroid for n in groups[i]]).float(),
+                               (0, 0, 0, size - len(groups[i]))) for i in active])
+        mass = torch.tensor([[n.n_total for n in groups[i]] + [0] * (size - len(groups[i]))
+                             for i in active], device=dev, dtype=torch.float32)
+        radius = torch.zeros_like(mass)
+        roots = [list(range(n)) for n in counts]
+        traces = [[] for _ in groups]
         cap = self._semantic_hard_cap()
-        while len(nodes) > target:
-            # ponytail: O(M^2) workspace per lane, M <= flush_tokens + K_max.
-            # Tile pair search only if profiling shows this bounded workspace is too large.
-            distance = torch.cdist(mu, mu, compute_mode="donot_use_mm_for_euclid_dist")
-            total = mass[:, None] + mass[None, :]
-            cost = distance.square() * (mass[:, None] * mass[None, :] / total)
-            cost.fill_diagonal_(float("inf"))
+        while active:
+            distance2 = self._semantic_unified_distance2(mu)
+            total = mass[:, :, None] + mass[:, None, :]
+            cost = distance2 * (mass[:, :, None] * mass[:, None, :] / total.clamp_min(1))
+            live = mass > 0
+            cost.masked_fill_(~(live[:, :, None] & live[:, None, :]), float("inf"))
+            cost.diagonal(dim1=-2, dim2=-1).fill_(float("inf"))
             merged_radius = None
-            if radius_limit is not None:
-                # Triangle inequality bounds every member's distance to the new
-                # centroid. Connected components alone would allow long chains.
+            if radius_limits is not None:
+                distance = distance2.sqrt_()
                 merged_radius = torch.maximum(
-                    radius[:, None] + (mass[None, :] / total) * distance,
-                    radius[None, :] + (mass[:, None] / total) * distance,
+                    radius[:, :, None] + (mass[:, None, :] / total.clamp_min(1)) * distance,
+                    radius[:, None, :] + (mass[:, :, None] / total.clamp_min(1)) * distance,
                 )
-                cost.masked_fill_(merged_radius > radius_limit, float("inf"))
+                limits = torch.tensor([radius_limits[i] for i in active], device=dev)
+                cost.masked_fill_(merged_radius > limits[:, None, None], float("inf"))
             limited = cost.masked_fill(total > cap, float("inf")) if cap != math.inf else cost
-            pairs = self._semantic_unified_pairs(limited, len(nodes) - target)
-            pair_list = pairs.cpu().tolist()
-            if not pair_list and max_clusters is not None and cap != math.inf:
-                # Same overflow policy as existing routes: preserve every token
-                # and the cluster budget when no pair satisfies the load cap.
-                pairs = self._semantic_unified_pairs(cost, len(nodes) - target)
-                pair_list = pairs.cpu().tolist()
-            if not pair_list:
-                if max_clusters is not None:
-                    raise RuntimeError("unified routing has no finite merge cost to satisfy the cluster budget")
+            pairs = self._semantic_unified_pairs(limited, size // 2)
+            if max_clusters is not None and cap != math.inf:
+                # Preserve the existing overflow rule independently for each group.
+                fallback = self._semantic_unified_pairs(cost, size // 2)
+                pairs = torch.where((pairs[:, :, 0] >= 0).any(1)[:, None, None], pairs, fallback)
+            if radius_limits is not None:
+                # GEMM may underestimate a near-zero distance by cancellation.
+                # Check selected pairs directly so this never widens a candidate
+                # past its radius bound. This work is O(number of pairs * D).
+                left, right = pairs.clamp_min(0).unbind(-1)
+                lane_ids = torch.arange(len(active), device=dev)[:, None]
+                ml, mr = mass[lane_ids, left], mass[lane_ids, right]
+                exact = (mu[lane_ids, left] - mu[lane_ids, right]).norm(dim=-1)
+                bound = torch.maximum(
+                    radius[lane_ids, left] + mr / (ml + mr).clamp_min(1) * exact,
+                    radius[lane_ids, right] + ml / (ml + mr).clamp_min(1) * exact,
+                )
+                pairs.masked_fill_((bound > limits[:, None]).unsqueeze(-1), -1)
+            pair_rows = pairs.cpu().tolist()
+            merge_indices, survivor_rows, next_active, next_roots, next_counts = [], [], [], [], []
+            for lane, group in enumerate(active):
+                selected = [(a, b) for a, b in pair_rows[lane] if a >= 0][:counts[lane] - target]
+                if not selected:
+                    if max_clusters is not None:
+                        raise RuntimeError("unified routing has no finite merge cost to satisfy the cluster budget")
+                    outputs[group] = (roots[lane], mu[lane, :counts[lane]])
+                    continue
+                dropped = set()
+                for a, b in selected:
+                    traces[group].append((roots[lane][a], roots[lane][b]))
+                    merge_indices.append((lane, a, b))
+                    dropped.add(b)
+                keep = [j for j in range(counts[lane]) if j not in dropped]
+                next_active.append(group)
+                next_roots.append([roots[lane][j] for j in keep])
+                next_counts.append(len(keep))
+                survivor_rows.append((lane, keep))
+            if not merge_indices:
                 break
-            left, right = pairs.unbind(dim=1)
-            combined = mass[left] + mass[right]
-            mu[left] = (mass[left, None] * mu[left] + mass[right, None] * mu[right]) / combined[:, None]
-            mass[left] = combined
-            if merged_radius is not None:
-                radius[left] = merged_radius[left, right]
-            keep = torch.ones(len(nodes), device=mu.device, dtype=torch.bool)
-            keep[right] = False
-            mu, mass, radius = mu[keep], mass[keep], radius[keep]
-            for i, j in pair_list:
+            lane, left, right = torch.tensor(merge_indices, device=dev).unbind(1)
+            combined = mass[lane, left] + mass[lane, right]
+            if radius_limits is not None:
+                exact = (mu[lane, left] - mu[lane, right]).norm(dim=-1)
+                radius[lane, left] = torch.maximum(
+                    radius[lane, left] + mass[lane, right] / combined * exact,
+                    radius[lane, right] + mass[lane, left] / combined * exact,
+                )
+            mu[lane, left] = (mass[lane, left, None] * mu[lane, left]
+                              + mass[lane, right, None] * mu[lane, right]) / combined[:, None]
+            mass[lane, left] = combined
+            size = max(next_counts)
+            # Pack surviving centers, preserving each group's original index order.
+            flat = [lane_i * mu.size(1) + j for lane_i, row in survivor_rows
+                    for j in row + [row[0]] * (size - len(row))]
+            index = torch.tensor(flat, device=dev)
+            mu = mu.flatten(0, 1).index_select(0, index).view(len(next_active), size, -1)
+            mass = mass.flatten().index_select(0, index).view(len(next_active), size)
+            radius = radius.flatten().index_select(0, index).view(len(next_active), size)
+            live = torch.arange(size, device=dev)[None] < torch.tensor(next_counts, device=dev)[:, None]
+            mass.masked_fill_(~live, 0)
+            active, roots, counts = next_active, next_roots, next_counts
+            continuing = []
+            for lane_i, group in enumerate(active):
+                if counts[lane_i] <= target:
+                    outputs[group] = (roots[lane_i], mu[lane_i, :counts[lane_i]])
+                else:
+                    continuing.append(lane_i)
+            if len(continuing) != len(active):
+                take = torch.tensor(continuing, device=dev, dtype=torch.long)
+                mu, mass, radius = (t.index_select(0, take) for t in (mu, mass, radius))
+                active = [active[i] for i in continuing]
+                roots = [roots[i] for i in continuing]
+                counts = [counts[i] for i in continuing]
+            del cost, limited, distance2, total, merged_radius
+        for group, original in enumerate(groups):
+            if not traces[group] and (len(original) <= target):
+                continue
+            nodes = list(original)
+            old_merges = []
+            for i, j in traces[group]:
                 a, b = nodes[i], nodes[j]
                 if a.existing and b.existing:
                     old_merges.append(tuple(sorted((min(a.existing), min(b.existing)))))
@@ -2362,39 +2461,47 @@ class LogStructuredKVCache(nn.Module):
                     a.centroid, a.n_total + b.n_total, max(a.p_hi, b.p_hi),
                     a.existing + b.existing, a.tokens + b.tokens,
                 )
-            dropped = {j for _, j in pair_list}
-            survivors = [node for i, node in enumerate(nodes) if i not in dropped]
-            nodes = [node._replace(centroid=center) for node, center in zip(survivors, mu.unbind(0))]
-            del cost, limited, distance, total, merged_radius
-        return nodes, old_merges
+            surviving, centers = outputs[group]
+            outputs[group] = ([nodes[i]._replace(centroid=center)
+                               for i, center in zip(surviving, centers.unbind(0))], old_merges)
+        return outputs
+
+    def _semantic_unified_reduce(
+        self, clusters: list[_SemanticTreeCluster], *,
+        max_clusters: int | None = None, radius_limit: float | None = None,
+    ) -> tuple[list[_SemanticTreeCluster], list[tuple[int, int]]]:
+        return self._semantic_unified_reduce_batch(
+            [clusters], max_clusters=max_clusters,
+            radius_limits=None if radius_limit is None else [radius_limit],
+        )[0]
 
     def _semantic_unified_candidates(
         self, b: int, g: int, k_raw: torch.Tensor, positions_host: list[list[int]]
     ) -> list[_SemanticTreeCluster]:
-        """Adaptive, compact groups over the whole flush; singletons are valid."""
-        nodes = [
-            _SemanticTreeCluster(key, 1, positions_host[b][i], (), (i,))
-            for i, key in enumerate(k_raw[b, g].detach().float().unbind(0))
-        ]
-        candidates, _ = self._semantic_unified_reduce(
-            nodes, radius_limit=math.sqrt(self._semantic_tree_threshold(b, g))
-        )
-        return candidates
+        nodes = [_SemanticTreeCluster(key, 1, positions_host[b][i], (), (i,))
+                 for i, key in enumerate(k_raw[b, g].detach().float().unbind(0))]
+        return self._semantic_unified_reduce(nodes, radius_limit=math.sqrt(self._semantic_tree_threshold(b, g)))[0]
 
     def _semantic_route_unified(
         self, k_raw: torch.Tensor, v: torch.Tensor, positions: torch.Tensor,
         positions_host: list[list[int]], *, record: bool,
     ) -> None:
         jobs: list[tuple[int, int, int, tuple[int, ...]]] = []
-        for b in range(k_raw.size(0)):
-            for g in range(k_raw.size(1)):
-                candidates = self._semantic_unified_candidates(b, g, k_raw, positions_host)
-                nodes, old_merges = self._semantic_unified_reduce(
-                    self._semantic_tree_existing_set(b, g) + candidates, max_clusters=self.K_max
-                )
-                # Preserve the planned old-old merge order, not cluster-ID order.
-                # All structural ops precede token ops so op-log replay cannot
-                # stop at the last consumed token with a trailing merge unread.
+        lanes = [(b, g) for b in range(k_raw.size(0)) for g in range(k_raw.size(1))]
+        # ponytail: at most four independent groups share pair-matrix workspace;
+        # tile pair search before increasing this if GPU peak memory becomes limiting.
+        for start in range(0, len(lanes), 4):
+            tile = lanes[start:start + 4]
+            groups = [[_SemanticTreeCluster(key, 1, positions_host[b][i], (), (i,))
+                       for i, key in enumerate(k_raw[b, g].detach().float().unbind(0))] for b, g in tile]
+            candidates = self._semantic_unified_reduce_batch(
+                groups, radius_limits=[math.sqrt(self._semantic_tree_threshold(b, g)) for b, g in tile]
+            )
+            plans = self._semantic_unified_reduce_batch(
+                [self._semantic_tree_existing_set(b, g) + candidate[0]
+                 for (b, g), candidate in zip(tile, candidates)], max_clusters=self.K_max,
+            )
+            for (b, g), (nodes, old_merges) in zip(tile, plans):
                 for keep, free in old_merges:
                     self._semantic_ward_merge(b, g, keep, free, record=record)
                 free_slots = iter(self._semantic_free_clusters(b, g))
