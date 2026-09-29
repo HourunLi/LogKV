@@ -554,3 +554,78 @@ def test_fused_incremental_rounds_match_torch_reference():
     from unused.benchmark_log_kv_unified import check_incremental_reduce
 
     check_incremental_reduce(torch.device('cuda'))
+
+
+def _reducer_type(device):
+    from litgpt.log_kv_cache import _UnifiedReduceTorch, _triton_route
+    fused = _triton_route() if device == 'cuda' else None
+    return fused.UnifiedReduce if fused is not None else _UnifiedReduceTorch
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('limited', [False, True])
+def test_incremental_distances_stay_exactly_symmetric(device, limited):
+    # Lattice keys with ulp-level noise: pairs merged in the same round meet
+    # near ties. An asymmetric entry can form a preference cycle with no mutual
+    # pair, which used to abort routing with "no finite merge cost".
+    torch.manual_seed(7)
+    lanes, size = 4, 120
+    mu = torch.randint(0, 3, (lanes, size, 3), device=device).float()
+    mu = mu * 1000 + 1e-4 * torch.randn_like(mu)
+    mass = torch.randint(1, 4, (lanes, size), device=device).float()
+    dist = LogStructuredKVCache._semantic_unified_pair_matrix(mu)
+    limits = torch.full((lanes,), 5., device=device) if limited else None
+    reducer = _reducer_type(device)(dist, mu, mass, torch.full((lanes,), size, device=device), limits, 1 if limited else 3)
+    for round_ in range(1, 2 * size + 8):
+        active = reducer.step(round_)
+        live = torch.as_tensor(reducer.alive, device=device).bool()
+        both = live[:, :, None] & live[:, None, :]
+        assert torch.equal(dist[both], dist.transpose(1, 2)[both]), f'asymmetric after round {round_}'
+        if not bool(active.any()):
+            break
+    _, _, stuck = reducer.finish()
+    if not limited:
+        assert not np.asarray(stuck).any()
+
+
+def test_stuck_incremental_lane_falls_back_to_full_recompute():
+    from litgpt.log_kv_cache import _UnifiedReduceTorch
+
+    torch.manual_seed(5)
+    cache = cache_for(K=3)
+    groups = [np.ones(n, dtype=np.float32) for n in (20, 17)]
+    centers = [torch.randn(len(w), 8) for w in groups]
+    finish = _UnifiedReduceTorch.finish
+
+    def stuck_first_lane(self):
+        traces, alive, stuck = finish(self)
+        stuck = np.asarray(stuck).copy()
+        stuck[0] = True
+        return traces, alive, stuck
+
+    LogStructuredKVCache._semantic_warned_stuck = False
+    with patch.object(_UnifiedReduceTorch, 'finish', stuck_first_lane), pytest.warns(UserWarning, match='full-recompute'):
+        actual = cache._semantic_unified_reduce_arrays(groups, [c.clone() for c in centers], max_clusters=3)
+    expected = cache._semantic_unified_reduce_rounds(groups[:1], [centers[0].clone()], max_clusters=3)[0]
+    roots, traces, mu = actual[0]
+    assert np.array_equal(roots, expected[0])
+    assert np.array_equal(np.concatenate(traces), np.concatenate(expected[1]))
+    torch.testing.assert_close(mu, expected[2], rtol=0, atol=0)
+    assert len(actual[1][0]) == 3
+
+
+def test_production_route_honours_capacity_hard_cap():
+    cache = cache_for(K=3, semantic_capacity_hard_cap_mult=.1)
+    rounds = cache._semantic_unified_reduce_rounds
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs.get('max_clusters'))
+        return rounds(*args, **kwargs)
+
+    with patch.object(cache, '_semantic_unified_reduce_rounds', counted):
+        k = keys([float(i * 10) for i in range(16)])
+        cache.route_and_flush_batch(k, k, torch.arange(16))
+    assert 3 in calls
+    assert cache.alive.sum() <= 3
+    assert cache.level_w.sum().item() == 16

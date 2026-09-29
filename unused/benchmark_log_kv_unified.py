@@ -78,7 +78,8 @@ def check_incremental_reduce(device):
     """
     fused = _triton_route()
     generator = torch.Generator(device=device).manual_seed(95)
-    for size, dim, pattern in ((5, 8, 'ints'), (33, 7, 'ties'), (65, 128, 'random'), (300, 16, 'clusters')):
+    for size, dim, pattern in ((5, 8, 'ints'), (33, 7, 'ties'), (65, 128, 'random'), (300, 16, 'clusters'),
+                               (160, 3, 'lattice')):
         count = torch.tensor([size, size - 3, size // 2, 2], device=device)
         mu = torch.randn(4, size, dim, device=device, generator=generator)
         if pattern == 'ints':
@@ -87,6 +88,9 @@ def check_incremental_reduce(device):
             mu[0] = .5  # Exact ties exercise the XOR rule and packed keys.
         elif pattern == 'clusters':
             mu = torch.randint(0, 5, (4, size, 1), device=device, generator=generator).float() * 4 + .05 * mu
+        elif pattern == 'lattice':
+            # Ulp-level near ties between clusters merged in the same round.
+            mu = torch.randint(0, 3, mu.shape, device=device, generator=generator).float() * 1000 + 1e-4 * mu
         mask = torch.arange(size, device=device)[None, :] < count[:, None]
         mu = mu * mask[..., None]
         mass = torch.randint(1, 4, (4, size), device=device, generator=generator).float() * mask
@@ -99,6 +103,8 @@ def check_incremental_reduce(device):
                 for round_ in range(1, 2 * size + 8):
                     if not bool(reducer.step(round_).any()):
                         break
+                # Symmetry guarantees a mutual pair whenever a finite cost exists.
+                assert torch.equal(dist, dist.transpose(1, 2)), 'incremental distance matrix lost symmetry'
                 results.append((reducer.finish(), state))
             (expected, expected_mu), (actual, actual_mu) = results
             if limits is None:

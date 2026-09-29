@@ -45,6 +45,7 @@ from __future__ import annotations
 import contextlib
 from copy import deepcopy
 import math
+import warnings
 from array import array
 from functools import lru_cache
 from typing import Any, NamedTuple, NoReturn
@@ -482,14 +483,20 @@ class _UnifiedReduceTorch:
             self.radius[lane, a] = bound[lane, a]
         self.mu[lane, a] = (ma[:, None] * self.mu[lane, a] + mb[:, None] * self.mu[lane, b]) / total.clamp_min(1)[:, None]
         rows = lane[:, None]
-        new = alpha[:, None] * self.dist[lane, a] + beta[:, None] * self.dist[lane, b] - shift[:, None]
+        alpha, beta, shift = alpha[:, None], beta[:, None], shift[:, None]
+        x_aa, x_ba = self.dist[lane, a], self.dist[lane, b]
+        new = alpha * x_aa + beta * x_ba - shift
         is_keep = keep[lane]
         q = partner[lane]
-        other = (alpha[:, None] * self.dist[rows, a[:, None], q]
-                 + beta[:, None] * self.dist[rows, b[:, None], q] - shift[:, None])
+        x_ab, x_bb = self.dist[rows, a[:, None], q], self.dist[rows, b[:, None], q]
         qa, qb, qd = pma[lane], pmb[lane], pdab[lane]
         qalpha, qbeta = qa / (qa + qb), qb / (qa + qb)
-        new = torch.where(is_keep, qalpha * new + qbeta * other - qalpha * qbeta * qd, new).clamp_min_(0)
+        qshift = qalpha * qbeta * qd
+        # Both merged: lower keep first, so both owners write identical bits.
+        own_first = qalpha * new + qbeta * (alpha * x_ab + beta * x_bb - shift) - qshift
+        other_first = alpha * (qalpha * x_aa + qbeta * x_ab - qshift) + beta * (qalpha * x_ba + qbeta * x_bb - qshift) - shift
+        both = torch.where(a[:, None] < ids[None, :], own_first, other_first)
+        new = torch.where(is_keep, both, new).clamp_min_(0)
         new[torch.arange(a.numel(), device=a.device), a] = 0
         alive = self.alive[lane]
         pi, ci = (alive & ~is_keep).nonzero(as_tuple=True)
@@ -2841,7 +2848,8 @@ class LogStructuredKVCache(nn.Module):
         sums in place.
         """
         if mu.size(1) <= 32:
-            return torch.cdist(mu, mu, compute_mode="donot_use_mm_for_euclid_dist").square()
+            dist = torch.cdist(mu, mu, compute_mode="donot_use_mm_for_euclid_dist").square()
+            return LogStructuredKVCache._semantic_unified_symmetrize_(dist)
         precision = torch.get_float32_matmul_precision()
         try:
             # Same FP32/centering rules as `_semantic_unified_gram`; the norm
@@ -2856,7 +2864,27 @@ class LogStructuredKVCache(nn.Module):
         finally:
             if mu.is_cuda:
                 torch.set_float32_matmul_precision(precision)
-        return dist.clamp_min_(0)
+        return LogStructuredKVCache._semantic_unified_symmetrize_(dist.clamp_min_(0))
+
+    @staticmethod
+    def _semantic_unified_symmetrize_(dist: torch.Tensor) -> torch.Tensor:
+        """Copy the upper triangle onto the lower one in place.
+
+        The rounds keep D symmetric by construction; this removes any reliance
+        on the GEMM producing bitwise-symmetric products. Exact copies only.
+        """
+        fused = _triton_route() if dist.is_cuda else None
+        if fused is not None and hasattr(fused, "mirror"):
+            return fused.mirror(dist)
+        size = dist.size(1)
+        ids = torch.arange(size, device=dist.device)
+        for start in range(0, size, 256):
+            stop = min(size, start + 256)
+            rows = dist[:, start:stop, :stop]
+            # Sources (j, i) with j < i are never written, so chunks cannot race.
+            mirrored = dist[:, :stop, start:stop].transpose(1, 2)
+            rows.copy_(torch.where(ids[start:stop, None] > ids[None, :stop], mirrored, rows))
+        return dist
 
     _SEMANTIC_ROUTE_FLAG_BUFFERS: dict = {}
 
@@ -2896,20 +2924,44 @@ class LogStructuredKVCache(nn.Module):
         else:
             size = mu.size(1)
             weights = weights[:, :size]
-        count = torch.tensor([counts[i] for i in active], dtype=torch.int64).to(dev)
-        mass = torch.from_numpy(np.ascontiguousarray(weights, dtype=np.float32)).to(dev)
-        limits = (None if radius_limits is None else
-                  torch.tensor([radius_limits[i] for i in active], dtype=torch.float32).to(dev))
+        active_counts = [counts[i] for i in active]
+        active_limits = None if radius_limits is None else [radius_limits[i] for i in active]
+        if self._semantic_hard_cap() != math.inf:
+            # Capacity fallback keeps two minima per row; use full recompute.
+            results = self._semantic_unified_reduce_fallback(
+                mu, mu, range(len(active)), active_counts, weights,
+                target=target, radius_limits=active_limits, strict=strict,
+            )
+        else:
+            # A stuck lane is rerun from its inputs, so keep them for the budget pass.
+            results = self._semantic_unified_reduce_incremental(
+                mu, active_counts, weights, target=target, radius_limits=active_limits, strict=strict,
+                original=mu.clone() if strict else None,
+            )
+        for (roots, trace), i in zip(results, active):
+            survivors[i], traces[i] = roots, trace
+        if lane_index is not None:
+            buffer[:, :size].index_copy_(0, lane_index, mu)
+        return survivors, traces
+
+    def _semantic_unified_reduce_incremental(self, mu, counts, weights, *, target, radius_limits, strict, original):
+        """Incremental rounds for every lane of `mu`; see `_semantic_unified_reduce_device`."""
+        dev = mu.device
+        size = mu.size(1)
+        count = torch.tensor(counts, dtype=torch.int64).to(dev)
+        # A copy: the rounds update masses in place and CPU from_numpy would alias.
+        mass = torch.from_numpy(np.array(weights, dtype=np.float32)).to(dev)
+        limits = None if radius_limits is None else torch.tensor(radius_limits, dtype=torch.float32).to(dev)
         dist = self._semantic_unified_pair_matrix(mu)
         fused = _triton_route() if dev.type == "cuda" else None
         reducer_type = getattr(fused, "UnifiedReduce", None) or _UnifiedReduceTorch
         reducer = reducer_type(dist, mu, mass, count, limits, target)
         asynchronous = reducer_type is not _UnifiedReduceTorch
         if asynchronous:
-            key = (dev, len(active))
+            key = (dev, len(counts))
             flags = self._SEMANTIC_ROUTE_FLAG_BUFFERS.get(key)
             if flags is None:
-                flags = torch.zeros((2, len(active)), dtype=torch.int32, pin_memory=True)
+                flags = torch.zeros((2, len(counts)), dtype=torch.int32, pin_memory=True)
                 self._SEMANTIC_ROUTE_FLAG_BUFFERS[key] = flags
             events = (torch.cuda.Event(), torch.cuda.Event())
             stream = torch.cuda.current_stream(dev)
@@ -2929,14 +2981,42 @@ class LogStructuredKVCache(nn.Module):
                 if not bool(flags[(round_ - 1) % 2].any()):
                     break
         lane_traces, alive, stuck = reducer.finish()
-        if strict and stuck.any():
-            raise RuntimeError("unified routing has no finite merge cost to satisfy the cluster budget")
-        for lane, i in enumerate(active):
-            survivors[i] = np.flatnonzero(alive[lane])
-            traces[i] = lane_traces[lane]
-        if lane_index is not None:
-            buffer[:, :size].index_copy_(0, lane_index, mu)
-        return survivors, traces
+        results = [(np.flatnonzero(alive[lane]), lane_traces[lane]) for lane in range(len(counts))]
+        stuck_lanes = np.flatnonzero(stuck).tolist() if strict else []
+        if stuck_lanes:
+            # A symmetric D always has a mutual pair while any cost is finite,
+            # so this should be unreachable. Rather than abort training, redo
+            # those lanes with full recompute (which raises if nothing is finite).
+            if not getattr(LogStructuredKVCache, "_semantic_warned_stuck", False):
+                LogStructuredKVCache._semantic_warned_stuck = True
+                warnings.warn("incremental unified routing found no mutual pair below the cluster "
+                              "budget; recomputing those groups with full-recompute rounds")
+            redo = self._semantic_unified_reduce_fallback(
+                original, mu, stuck_lanes, counts, weights, target=target, radius_limits=radius_limits, strict=True,
+            )
+            for lane, result in zip(stuck_lanes, redo):
+                results[lane] = result
+        return results
+
+    def _semantic_unified_reduce_fallback(self, source, out, lanes, counts, weights, *, target, radius_limits, strict):
+        """Full-recompute rounds for selected lanes of a padded buffer.
+
+        Reads inputs from `source`, writes final centers into `out` (they may
+        alias) and returns (survivors, trace) per lane like the incremental path.
+        """
+        lanes = list(lanes)
+        reduced = self._semantic_unified_reduce_rounds(
+            [weights[lane, :counts[lane]] for lane in lanes],
+            [source[lane, :counts[lane]] for lane in lanes],
+            max_clusters=target if strict else None,
+            radius_limits=None if radius_limits is None else [radius_limits[lane] for lane in lanes],
+        )
+        results = []
+        for lane, (roots, trace, center) in zip(lanes, reduced):
+            if trace:
+                out[lane].index_copy_(0, torch.from_numpy(roots).to(out.device), center.to(out.dtype))
+            results.append((roots, np.concatenate(trace) if trace else np.empty((0, 2), dtype=np.int64)))
+        return results
 
     def _semantic_unified_round(self, reducer, round_):
         """One device round; separate method so profilers can label it."""
@@ -2950,10 +3030,6 @@ class LogStructuredKVCache(nn.Module):
         """Device centers plus numeric host roots; no per-token Python nodes."""
         target = 1 if max_clusters is None else max_clusters
         active = [i for i, nodes in enumerate(groups) if len(nodes) > target]
-        if self._semantic_hard_cap() != math.inf:
-            # Capacity fallback keeps two minima per row; use full recompute.
-            return self._semantic_unified_reduce_rounds(
-                groups, centroids, max_clusters=max_clusters, radius_limits=radius_limits)
         active_set = set(active)
         outputs = [None] * len(groups)
         for i, nodes in enumerate(groups):
