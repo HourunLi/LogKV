@@ -3468,30 +3468,22 @@ class LogStructuredKVCache(nn.Module):
         compact[surviving] = np.arange(len(surviving))
         return compact[parent]
 
-    # Minimum FP32 distance-matrix budget per tile: 16 lanes x 2048^2 on
-    # CUDA+Triton (256 MiB); the Torch reference also materializes row
-    # temporaries, so it uses less. CUDA tiles grow with free memory up to
-    # LOGKV_ROUTE_TILE_MB (default 1 GiB): a whole Alpha flush (32 lanes of
-    # ~2.3k tokens) then routes as ONE tile instead of three, each of which
-    # runs its own candidate and global round loops with per-round syncs.
-    _SEMANTIC_ROUTE_TILE_BYTES = {True: 256 << 20, False: 64 << 20}
-    _SEMANTIC_ROUTE_TILE_MAX_BYTES = int(os.environ.get("LOGKV_ROUTE_TILE_MB", "1024")) << 20
+    # FP32 distance-matrix budget per tile. CUDA+Triton keeps 16 lanes x
+    # 2048^2 (256 MiB) unless LOGKV_ROUTE_TILE_MB asks for more: a 32-lane
+    # Alpha flush then routes as one tile (~0.7 GiB) with fewer round loops,
+    # but that peak sits on top of training activations, so it is opt-in.
+    # The Torch reference also materializes row temporaries, so it uses less.
+    _SEMANTIC_ROUTE_TILE_BYTES = {True: int(os.environ.get("LOGKV_ROUTE_TILE_MB", "256")) << 20, False: 64 << 20}
 
     def _semantic_unified_tile(self, lanes: int, tokens: int, device: torch.device) -> int:
         """Largest balanced lane tile whose FP32 distance matrix fits the budget.
 
         Every round costs a fixed number of launches and a host round trip per
         tile, so fewer, wider tiles are faster; balanced tiles avoid a nearly
-        empty last tile. On CUDA the budget is a quarter of what the allocator
-        could hand out now (free device memory plus its cached, unused blocks),
-        clamped to [256 MiB, LOGKV_ROUTE_TILE_MB]; the query does not sync.
+        empty last tile.
         """
         fused = device.type == "cuda" and _triton_route() is not None
         budget = self._SEMANTIC_ROUTE_TILE_BYTES[fused]
-        if fused:
-            free, _ = torch.cuda.mem_get_info(device)
-            cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
-            budget = max(budget, min(self._SEMANTIC_ROUTE_TILE_MAX_BYTES, (free + cached) // 4))
         widest = max(1, budget // max(1, 4 * tokens * tokens))
         tiles = -(-lanes // widest)
         return max(1, -(-lanes // max(tiles, 1)))
