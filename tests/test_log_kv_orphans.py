@@ -47,12 +47,13 @@ def _case(groups, device="cpu", dtype=torch.float32, capped=False, mixed=True):
 
 def _plan(case, orphans=None, jobs=None):
     cache, keys, values, positions, host, original_orphans, novelty, direct = case
-    with patch.object(cache, "_semantic_new_cluster") as new, patch.object(cache, "_semantic_commit_joins") as commit:
+    with patch.object(cache, "_semantic_new_clusters") as new, patch.object(cache, "_semantic_commit_joins") as commit:
         cache._semantic_route_orphans_fast(
             original_orphans if orphans is None else orphans, keys, values, positions, host,
             novelty, direct if jobs is None else jobs, record=True,
         )
-    created = [call.args[:4] for call in new.call_args_list]
+    # New clusters open in one batched call of (b, g, cluster, first offset).
+    created = [(b, g, c, host[b][i]) for call in new.call_args_list for b, g, c, i in call.args[0]]
     return created, commit.call_args.args[0]
 
 
