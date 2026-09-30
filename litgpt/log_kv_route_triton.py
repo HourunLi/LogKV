@@ -600,9 +600,9 @@ class UnifiedReduce:
     SCAN_ROWS, SCAN_BLOCK, SELECT_ROWS = 8, 256, 64
     # In-kernel bitonic sort of up to this many pairs per lane (one program).
     SORT_LIMIT = 4096
-    # Rounds 1-2 run eagerly: every kernel variant is compiled before capture,
-    # and reductions that finish within two rounds never pay for a capture.
-    GRAPH_ROUND = 3
+    # Round 1 runs eagerly, so every kernel variant is compiled (and a missing
+    # in-kernel sort detected) before the capture at round 2.
+    GRAPH_ROUND = 2
     graphs = os.environ.get("LOGKV_ROUTE_CUDA_GRAPH", "1") != "0"
     # Cleared if this Triton cannot compile the in-kernel sort; argsort then.
     sort_ok = True

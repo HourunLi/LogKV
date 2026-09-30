@@ -2,7 +2,8 @@
 
 CUDA spans include stream idle/wait time, not just kernel execution. Model-level
 forward/backward spans contain the LogKV spans; never add the two sets together.
-alpha_select is included in route; do not add it again to the route total.
+alpha_select covers span selection inside route (do not add that part to the
+route total again) plus the post-flush score prefetch, which runs outside route.
 """
 
 from contextlib import contextmanager

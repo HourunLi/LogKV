@@ -49,6 +49,14 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
     A final unfinished span is mandatory until a boundary or the length cap.
     Scoring makes one batched GPU pass and one small score transfer per flush.
     """
+    candidates, bi, ti, lengths = cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span)
+    if not lengths:
+        return SpanSelection([[] for _ in ends], [[] for _ in ends], [[] for _ in ends], [[] for _ in ends])
+    return choose_spans(candidates, score_spans(k, v, bi, ti, lengths).cpu().tolist(), budget)
+
+
+def cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span):
+    """Whole candidate spans per row and their flat (row, token) coordinates (host only)."""
     candidates, bi, ti, lengths = [], [], [], []
     for b, (spans, old_pos, new_pos, boundaries) in enumerate(zip(old_spans, old_positions, new_positions, ends)):
         row, offset, pending = [], 0, None
@@ -78,8 +86,11 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
             bi.append(np.full(sum(sizes), b, dtype=np.int64))
             ti.append(np.concatenate([indices for indices, _, _ in row]))
             lengths.extend(sizes)
-    if not lengths:
-        return SpanSelection([[] for _ in ends], [[] for _ in ends], [[] for _ in ends], [[] for _ in ends])
+    return candidates, bi, ti, lengths
+
+
+def score_spans(k, v, bi, ti, lengths):
+    """Device tensor of span scores in candidate order; nothing is read back."""
     # One upload for token coordinates and span sizes. Pinned + non_blocking:
     # a pageable copy would first wait for every queued kernel.
     host = torch.from_numpy(np.concatenate((*bi, *ti, np.asarray(lengths, dtype=np.int64))))
@@ -94,7 +105,11 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
         residual = (energy - means.square().mean(-1)).clamp_min(0)
         part = (residual / energy.clamp_min(1e-12)).mean(-1)
         scores = part if scores is None else scores + part
-    host_scores = scores.cpu().tolist()
+    return scores
+
+
+def choose_spans(candidates, host_scores, budget):
+    """Bounded whole-span greedy from host scores (see the module docstring)."""
     keep, archive, output_spans, output_positions = [], [], [], []
     offset = 0
     for row, positions in candidates:
