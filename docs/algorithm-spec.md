@@ -87,9 +87,8 @@ rnew <= sqrt(cluster_lambda_rel · s_h)
 
 ## 4. 簇内压缩与统计量
 
-路由候选只决定成员归属，**不会把候选中心当成一个 summary 写入 cache**。每个归档 token
-以 `w=1` 的 entry 进入 level 0；`log_kv_semantic_summary_size` 已移除，旧 YAML 含该键
-会报错，应删除，不能继续通过设成 `1` 启用新行为。
+路由候选只决定成员归属，候选中心不写入 cache。每个归档 token 以 `w=1` 的 entry
+进入 level 0。
 
 每簇每层最多 `B′` 个 entry，层满时把最老内容按时间顺序相邻配对、加权合并后向上进位。
 顶层饱和时继续合并最老内容，保持预算和 mass，不因容量直接删除 token。

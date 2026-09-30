@@ -104,7 +104,7 @@ python -m pytest --noconftest -q tests/test_alpha_log_kv.py tests/test_log_kv_pa
 
 Alpha 要求 unified、`K>1`、mid、一阶、关闭 segment gap/padding；训练还要求
 `semantic_replay_updates=true`。训练与推理走相同选择/归档规则；checkpoint 重算与反向
-使用记录的精确池状态和写入操作，不重新打分或路由。没有入层级前的 summary 均值压缩。
+使用记录的精确池状态和写入操作，不重新打分或路由。
 
 当前配置从 **Qwen3-1.7B-Base** 开始 100 步 CPT，独立输出到
 `qwen1.7b-32k-alpha-cpt100`；该实验若已有 checkpoint，`auto_resume` 会恢复它。

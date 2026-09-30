@@ -1371,11 +1371,6 @@ def main(
                 "eval_log_kv_* YAML keys are no longer supported; use log_kv_* for the single eval LogKV config. "
                 f"Remove: {', '.join(_banned)}"
             )
-        if "log_kv_semantic_summary_size" in _yaml:
-            raise ValueError(
-                "log_kv_semantic_summary_size has been removed; delete this key. "
-                "KV entries now remain per-token before ladder compaction."
-            )
         _valid = set(inspect.signature(main).parameters)
         for _k in _yaml:
             if _k != "config" and _k not in _valid:
