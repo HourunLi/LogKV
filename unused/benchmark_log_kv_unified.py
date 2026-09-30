@@ -83,13 +83,29 @@ def check_merge_pack(cache, device):
         torch.testing.assert_close(mass, original[1], rtol=0, atol=0)
 
 
+def check_pair_distances(device):
+    """Fused distance epilogue against the unfused expression on the same GEMM."""
+    fused = _triton_route()
+    generator = torch.Generator(device=device).manual_seed(96)
+    for lanes, size, dim in ((3, 33, 7), (2, 130, 64), (1, 257, 128)):
+        mu = torch.randn(lanes, size, dim, device=device, generator=generator)
+        centered = mu - mu[:, :1]
+        norm = centered.square().sum(-1)
+        gram = torch.bmm(centered, centered.transpose(1, 2))
+        dist = ((norm[:, :, None] + norm[:, None, :]) - 2 * gram).clamp_min(0)
+        expected = dist.triu() + dist.triu(1).transpose(1, 2)
+        actual = fused.pair_distances(gram.clone(), norm)
+        assert torch.equal(actual, expected), 'fused pair distances differ from the unfused expression'
+
+
 def check_incremental_reduce(device):
     """Fused incremental rounds against the Torch reference on the same device.
 
     The global pass (one sweep or frozen sweeps) is elementwise-identical and
     must match bit for bit. The candidate pass sums exact squared differences
     in a different order, so it compares partitions; random inputs make exact
-    bound ties negligible.
+    bound ties negligible. The fused reducer runs twice: as configured (CUDA
+    graph replay, in-kernel sort) and with eager launches plus argsort.
     """
     fused = _triton_route()
     generator = torch.Generator(device=device).manual_seed(95)
@@ -112,27 +128,35 @@ def check_incremental_reduce(device):
         # passes > 1 covers the frozen-center sweeps used by the Alpha config.
         for limits, target, passes in ((None, 3, 1), (None, 3, 4), (mu.new_tensor([1., 2., 30., .1]), 1, 1)):
             results = []
-            for reducer_type in (_UnifiedReduceTorch, fused.UnifiedReduce):
+            for reducer_type, eager in ((_UnifiedReduceTorch, False), (fused.UnifiedReduce, False),
+                                        (fused.UnifiedReduce, True)):
                 state = mu.clone()
                 dist = LogStructuredKVCache._semantic_unified_pair_matrix(state)
                 reducer = reducer_type(dist, state, mass.clone(), count, limits, target, passes)
+                if eager:
+                    reducer.sort, reducer.graph = False, False
                 for round_ in range(1, 2 * size + 8):
                     if not bool(reducer.step(round_).any()):
                         break
                 # Symmetry guarantees a mutual pair whenever a finite cost exists.
                 assert torch.equal(dist, dist.transpose(1, 2)), 'incremental distance matrix lost symmetry'
                 results.append((reducer.finish(), state))
-            (expected, expected_mu), (actual, actual_mu) = results
-            if limits is None:
-                for a, b in zip(actual[0], expected[0]):
-                    assert (a == b).all(), 'fused global merge trace differs from Torch'
-                assert (actual[1] == expected[1]).all() and (actual[2] == expected[2]).all()
-                torch.testing.assert_close(actual_mu, expected_mu, rtol=0, atol=0)
-            else:
-                for lane, (a, b) in enumerate(zip(actual[0], expected[0])):
-                    assert sorted(map(tuple, a.tolist())) == sorted(map(tuple, b.tolist())), \
-                        f'fused candidate partition differs from Torch (lane {lane})'
-                assert (actual[1] == expected[1]).all()
+            (expected, expected_mu), *fused_results = results
+            for actual, actual_mu in fused_results:
+                if limits is None:
+                    for a, b in zip(actual[0], expected[0]):
+                        assert (a == b).all(), 'fused global merge trace differs from Torch'
+                    assert (actual[1] == expected[1]).all() and (actual[2] == expected[2]).all()
+                    torch.testing.assert_close(actual_mu, expected_mu, rtol=0, atol=0)
+                else:
+                    for lane, (a, b) in enumerate(zip(actual[0], expected[0])):
+                        assert sorted(map(tuple, a.tolist())) == sorted(map(tuple, b.tolist())), \
+                            f'fused candidate partition differs from Torch (lane {lane})'
+                    assert (actual[1] == expected[1]).all()
+            # Graph replay and in-kernel sort change launches only: bit-identical.
+            (replayed, replayed_mu), (launched, launched_mu) = fused_results
+            assert all((a == b).all() for a, b in zip(replayed[0], launched[0])), 'graph/sort trace differs from eager'
+            assert torch.equal(replayed_mu, launched_mu)
 
 
 def check_batched_state(device):
@@ -300,6 +324,7 @@ def main():
     if fused:
         check_round_pairs(cache, device)
         check_merge_pack(cache, device)
+        check_pair_distances(device)
         check_incremental_reduce(device)
     check_batched_state(device)
     prototypes = torch.randn(args.batch, args.groups, args.clusters, args.dim, device=device, dtype=dtype)

@@ -86,6 +86,8 @@ C_exact = P×[G×(d_k + d_v + 2d_p)×e + 9]
 - `merge_passes>1` 的冻结中心扫描并入增量轮次（见统一路由文档），不再回退全量重算。
 - Triton `_scan` 改为 8 行 × 256 列二维 tile，干净 tile 直接退出；`_lance_williams`
   先读目标行当前键，只在更小时才做 64 位 atomic min。
+- 每轮路由整轮 CUDA graph 重放、`_plan` 核内排序、距离矩阵单趟融合尾部、层级追加的
+  向量化主机规划与异步锁页上传，见统一路由文档；轨迹与原实现逐位一致。
 
 与全量重算相比仅有 float32 舍入顺序差异，近似平局时可能选到另一对。以上改动只做了
 静态检查；请在训练环境运行：
@@ -95,7 +97,8 @@ python -m pytest --noconftest -q tests/test_alpha_log_kv.py tests/test_log_kv_pa
 ```
 
 `tests/test_log_kv_unified.py` 检查增量冻结扫描与全量重算冻结扫描逐对一致；基准预检
-`check_incremental_reduce` 覆盖 passes=4 的融合核与 Torch 参照逐位一致。
+`check_incremental_reduce` 覆盖 passes=4 的融合核与 Torch 参照逐位一致，并比较 graph
+重放/核内排序与逐核启动/argsort 两种执行方式；`check_pair_distances` 检查融合距离尾部。
 
 ## 训练、推理与最小运行入口
 
