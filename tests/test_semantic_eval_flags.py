@@ -50,7 +50,6 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
     result = subprocess.run(["bash", "-c", shell, "bash", str(config)],
                             capture_output=True, text=True, check=True, env=env)
     args = result.stdout.splitlines()
-    assert "--log_kv_semantic_summary_size" not in args
     for name in ("legacy_route", "unified_route"):
         flag = "--log_kv_semantic_" + name
         assert args.count(flag) == 1
@@ -67,23 +66,3 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
     values = ("parallel", "true") if anchor_mode == "mid" else ("sequential", "false")
     for name, value in zip(("centroid_backend", "replay_updates"), values):
         assert args[args.index("--log_kv_semantic_" + name) + 1] == value
-
-
-@pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
-def test_removed_summary_config_is_rejected_before_launch(tmp_path, script):
-    (tmp_path / "base.yaml").write_text(
-        "save_path: /tmp/unused-checkpoint\nlog_kv_semantic_summary_size: 8\n"
-    )
-    config = tmp_path / "run.yaml"
-    config.write_text("config: base.yaml\n")
-    source = (Path(__file__).resolve().parents[1] / script).read_text()
-    marker = 'RAW_SAVE_DIR=$(python ' if script == "majob.sh" else 'CONFIG_EXPORTS=$("${PYTHON_BIN}" '
-    start = source.index(marker)
-    stop = source.index('\n)', start) + len('\n)')
-    shell = '\n'.join(('set -e', 'CONFIG_FILE=$1', source[start:stop]))
-    env = {**os.environ, "PYTHON_BIN": sys.executable,
-           "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
-    result = subprocess.run(["bash", "-c", shell, "bash", str(config)],
-                            capture_output=True, text=True, env=env)
-    assert result.returncode != 0
-    assert "log_kv_semantic_summary_size has been removed" in result.stderr

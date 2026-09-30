@@ -140,8 +140,6 @@ def expand(value):
 def load(path):
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    if "log_kv_semantic_summary_size" in cfg:
-        raise SystemExit("log_kv_semantic_summary_size has been removed; delete this key.")
     if "config" in cfg:
         base_path = os.path.join(os.path.dirname(path), cfg.pop("config"))
         base = load(base_path)
