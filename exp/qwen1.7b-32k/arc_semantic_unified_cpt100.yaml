@@ -11,9 +11,9 @@ save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32
 merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_semantic_unified_cpt100
 tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-semantic-unified-cpt100
 
-max_steps: 100
+max_steps: 200
 learning_rate: 5e-6
-min_lr: 5e-6
+min_lr: 2e-6
 warmup_steps: 10
 save_interval: 50
 run_eval: ""
