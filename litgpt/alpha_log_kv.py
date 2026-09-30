@@ -80,8 +80,12 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
             lengths.extend(sizes)
     if not lengths:
         return SpanSelection([[] for _ in ends], [[] for _ in ends], [[] for _ in ends], [[] for _ in ends])
-    index = torch.from_numpy(np.stack((np.concatenate(bi), np.concatenate(ti)))).to(k.device)
-    sizes = torch.tensor(lengths, device=k.device, dtype=torch.long)
+    # One upload for token coordinates and span sizes. Pinned + non_blocking:
+    # a pageable copy would first wait for every queued kernel.
+    host = torch.from_numpy(np.concatenate((*bi, *ti, np.asarray(lengths, dtype=np.int64))))
+    packed = host.pin_memory().to(k.device, non_blocking=True) if k.is_cuda else host.to(k.device)
+    tokens = (host.numel() - len(lengths)) // 2
+    index, sizes = packed[:2 * tokens].view(2, tokens), packed[2 * tokens:]
     scores = None
     for values in (k, v):
         x = values[index[0], :, index[1]].detach().float()
