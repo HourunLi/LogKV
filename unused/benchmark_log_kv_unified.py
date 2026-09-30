@@ -212,7 +212,7 @@ def profile_route(cache, inputs, device, directory):
             ('_semantic_unified_reduce_device', 'reduce'),
             ('_semantic_unified_round', 'merge_round'),
             ('_semantic_unified_pair_matrix', 'pair_matrix'),
-            # Full-recompute stages; only the capacity-capped fallback runs them.
+            # Full-recompute stages: finite capacity or the stalled-lane fallback.
             ('_semantic_unified_round_pairs', 'pair_search'),
             ('_semantic_unified_merge_pack', 'merge_pack'),
             ('_semantic_ward_merge_batch', 'old_kv_merge'),
@@ -366,17 +366,25 @@ def main():
         rounds, phase = [], ['']
         reduce = cache._semantic_unified_reduce_device
         merge_round = cache._semantic_unified_round
+        pairs = cache._semantic_unified_round_pairs
 
         def reduce_timed(*a, **kw):
             phase[0] = 'candidates' if kw.get('radius_limits') is not None else 'global_merge'
             return timed(phase[0], reduce)(*a, **kw)
 
         def round_counted(reducer, round_):
-            before = reducer.count.cpu()
+            before = reducer.count.cpu().clone()
             result = merge_round(reducer, round_)
             merged = (before - reducer.count.cpu()).tolist()
             rounds.append({'phase': phase[0], 'matrix_size': reducer.mass.size(1), 'round': round_,
                            'merged_pairs_per_group': merged})
+            return result
+
+        def pairs_counted(mu, *a, **kw):
+            result = pairs(mu, *a, **kw)
+            sizes = (result[..., 0] >= 0).sum(-1).cpu().tolist()
+            rounds.append({'phase': phase[0], 'matrix_size': mu.size(1),
+                           'proposed_pairs_per_group': sizes})
             return result
 
         def timed(name, fn):
@@ -393,6 +401,7 @@ def main():
         with ExitStack() as stack:
             stack.enter_context(patch.object(cache, '_semantic_unified_reduce_device', reduce_timed))
             stack.enter_context(patch.object(cache, '_semantic_unified_round', round_counted))
+            stack.enter_context(patch.object(cache, '_semantic_unified_round_pairs', pairs_counted))
             for name, stage in [('_semantic_ward_merge_batch', 'old_kv_merge'),
                                 ('_semantic_new_clusters', 'new_cluster_write'),
                                 ('_semantic_commit_joins', 'batched_write')]:
