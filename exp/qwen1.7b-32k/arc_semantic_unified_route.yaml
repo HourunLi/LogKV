@@ -6,16 +6,16 @@ resume_dir: null
 # Only resume this new experiment's own optimizer/step if interrupted.
 auto_resume: true
 
-expid: qwen1.7b-32k-semantic-unified-cpt100
-save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-semantic-unified-cpt100
-merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_semantic_unified_cpt100
-tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-semantic-unified-cpt100
+expid: qwen1.7b-32k-semantic-unified-route
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-semantic-unified-route
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_semantic-unified-route
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-semantic-unified-route
 
-max_steps: 200
+max_steps: 1000
 learning_rate: 5e-6
 min_lr: 2e-6
-warmup_steps: 10
-save_interval: 50
+warmup_steps: 100
+save_interval: 200
 run_eval: ""
 
 log_kv_semantic_unified_route: true
