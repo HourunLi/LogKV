@@ -64,7 +64,7 @@ D(k,a′) = α D(k,a) + β D(k,b) − αβ D(a,b)
   或候选被拒的行重扫，新合并行向其他行推送更小代价。
 - CUDA 每轮执行配对、预算提交、增量更新和脏行扫描。预算排序在 `_plan` 核内完成：
   有限配对键 `(代价位<<32)|行号` 先压缩再做位序排序，等价于按代价的稳定 argsort。
-  轮次号常驻显存，从第 3 轮起整轮作为一个 CUDA graph 重放，主机每轮只剩一次 graph
+  轮次号常驻显存，从第 2 轮起整轮作为一个 CUDA graph 重放，主机每轮只剩一次 graph
   launch；`LOGKV_ROUTE_CUDA_GRAPH=0` 恢复逐核启动。编译或捕获失败会告警并回退到
   argsort/逐核启动，规则不变。
   每轮异步回传每组一个活跃标志，主机读取前一轮的结果，最多多排一个空轮。
@@ -89,8 +89,11 @@ Alpha 的冻结中心近似配对并入增量轮次。候选阶段每轮仍只�
 
 持久 KV 是固定 K 套层级；路由临时矩阵为 `O(tile·(F+P+K)²)`，F 是固定 flush 大小，
 P 是固定 Alpha 精确预算。它不是全上下文 `N×N` 注意力矩阵。
-每 tile 的组数以输入宽度估算，CUDA/Triton 目标256 MiB，其他路径64 MiB；
-这只控制主要 FP32 距离矩阵的规模，不是所有临时张量或训练峰值的严格上限。
+每 tile 的组数以输入宽度估算。CUDA/Triton 的距离矩阵预算为当前可分配显存（空闲显存
+加分配器缓存中未用的块）的四分之一，限制在 256 MiB 与 `LOGKV_ROUTE_TILE_MB`（默认
+1024）之间：显存充足时一次 Alpha flush 的 32 组（约 2.3k token）合成一个 tile，
+候选/全局两段轮次各只跑一遍。其他路径 64 MiB。这只控制主要 FP32 距离矩阵的规模，
+不是所有临时张量或训练峰值的严格上限；显存紧张时调小 `LOGKV_ROUTE_TILE_MB`。
 
 性能检查复用 [Alpha 指南](alpha-logkv.md) 的短路由命令。去掉 `--alpha-*` 参数可检查纯
 semantic 路由；比较时固定 B、输入形状、后端与预热方式。
@@ -99,5 +102,6 @@ semantic 路由；比较时固定 B、输入形状、后端与预热方式。
   `reference_incremental_verified=true`。检查只证明当前实现对照，不证明检索质量。
 - 不带 profile 时，第二行的分阶段/轮数诊断会额外同步；不能替代第一行总耗时。
 - `--profile-dir` 记录最后一次 flush 的 CPU/CUDA 算子和 Python 调用。
-  `route` 包含 `alpha_select`；阶段嵌套计时不能相加当总时间。
+  `route` 包含 flush 内的 `alpha_select`；`alpha_select` 另含 flush 之后的打分预取
+  （在 `route` 之外）。阶段嵌套计时不能相加当总时间。
 - 训练 `logKV_host` 是累计主机墙钟时间，可能含 GPU 等待；短路由不能证明整步训练达到目标。
