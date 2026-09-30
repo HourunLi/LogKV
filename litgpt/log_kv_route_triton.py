@@ -711,8 +711,14 @@ class UnifiedReduce:
             order, keys, block, rows = self.pair_cost, self.sort_keys, self.sort_block, triton.next_power_of_2(size)
             warps = 16 if rows > 8192 else 8 if rows > 2048 else 4
         else:
-            order = self.pair_cost.argsort(dim=1, stable=True)
-            keys, rows = order, 1
+            # Preallocated outputs: nothing is allocated while a graph captures,
+            # so no per-graph private memory pool is created.
+            if getattr(self, "order", None) is None:
+                self.order = torch.empty_like(self.pair_cost, dtype=torch.int64)
+                self.sorted_cost = torch.empty_like(self.pair_cost)
+            torch.sort(self.pair_cost, dim=1, stable=True, out=(self.sorted_cost, self.order))
+            order = keys = self.order
+            rows = 1
             warps = 8 if block > 1024 else 4
         _plan[(lanes,)](
             order, keys, self.pair_cost, self.mate, self.mass, self.radius, self.bound, self.dist, self.alive,
