@@ -5,6 +5,8 @@ leave the kernel; the caller applies the unchanged mutual-nearest pairing.
 """
 
 import math
+import os
+import warnings
 
 import torch
 import triton
@@ -222,8 +224,8 @@ def _cost_limited(d2, mi, mj, ri, rj, limit, valid, SQRT_RN: tl.constexpr):
     return tl.where(valid, d2 * tl.div_rn(mi * mj, denom), float("inf")), valid
 
 
-@triton.jit(do_not_specialize=["M", "ROUND"])
-def _scan(DIST, MASS, RADIUS, LIMITS, ALIVE, KEEP, MERGED, REJECT, MATCH, BEST, OUT, M, ROUND,
+@triton.jit(do_not_specialize=["M"])
+def _scan(DIST, MASS, RADIUS, LIMITS, ALIVE, KEEP, MERGED, REJECT, MATCH, BEST, OUT, M, ROUND_PTR,
           MODE: tl.constexpr, HAVE_LIMITS: tl.constexpr, SQRT_RN: tl.constexpr,
           ROWS: tl.constexpr, BLOCK: tl.constexpr):
     """Row minima for dirty rows, ROWS rows at a time.
@@ -236,6 +238,7 @@ def _scan(DIST, MASS, RADIUS, LIMITS, ALIVE, KEEP, MERGED, REJECT, MATCH, BEST, 
     """
     lane = tl.program_id(1).to(tl.int64)
     base = lane * M
+    ROUND = tl.load(ROUND_PTR)
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     dirty = rows < M
     dirty = dirty & (tl.load(ALIVE + base + rows, dirty, 0) != 0)
@@ -271,9 +274,9 @@ def _scan(DIST, MASS, RADIUS, LIMITS, ALIVE, KEEP, MERGED, REJECT, MATCH, BEST, 
         tl.store(OUT + base + rows, result, dirty)
 
 
-@triton.jit(do_not_specialize=["M", "ROUND"])
+@triton.jit(do_not_specialize=["M"])
 def _select(PACKED, ALIVE, MASS, RADIUS, LIMITS, MU, DIST, BEST, PAIR_COST, BOUND, REJECT, NPROP,
-            MATE, RESTRICTED, MATCH, M, ROUND,
+            MATE, RESTRICTED, MATCH, M, ROUND_PTR,
             DIM: tl.constexpr, HAVE_LIMITS: tl.constexpr, SQRT_RN: tl.constexpr, MULTI: tl.constexpr,
             BS: tl.constexpr, BD: tl.constexpr):
     """Mutual pairs from packed minima; exact compactness check before budgeting.
@@ -283,6 +286,7 @@ def _select(PACKED, ALIVE, MASS, RADIUS, LIMITS, MU, DIST, BEST, PAIR_COST, BOUN
     """
     lane = tl.program_id(1).to(tl.int64)
     base = lane * M
+    ROUND = tl.load(ROUND_PTR)
     rows = (tl.program_id(0) * BS + tl.arange(0, BS)).to(tl.int64)
     live = rows < M
     packed = tl.load(PACKED + base + rows, live, 0)
@@ -328,8 +332,8 @@ def _select(PACKED, ALIVE, MASS, RADIUS, LIMITS, MU, DIST, BEST, PAIR_COST, BOUN
         tl.store(MATCH + base + best, ROUND, valid)
 
 
-@triton.jit(do_not_specialize=["M", "ROUND"])
-def _select_more(RESTRICTED, ALIVE, MATCH, MATE, PAIR_COST, NPROP, M, ROUND, BS: tl.constexpr):
+@triton.jit(do_not_specialize=["M"])
+def _select_more(RESTRICTED, ALIVE, MATCH, MATE, PAIR_COST, NPROP, M, ROUND_PTR, BS: tl.constexpr):
     """One frozen-center sweep: mutual pairs among rows unmatched so far.
 
     Only the left endpoint of a mutual pair claims it, and a row has at most
@@ -337,6 +341,7 @@ def _select_more(RESTRICTED, ALIVE, MATCH, MATE, PAIR_COST, NPROP, M, ROUND, BS:
     """
     lane = tl.program_id(1).to(tl.int64)
     base = lane * M
+    ROUND = tl.load(ROUND_PTR)
     rows = (tl.program_id(0) * BS + tl.arange(0, BS)).to(tl.int64)
     free = rows < M
     free = free & (tl.load(ALIVE + base + rows, free, 0) != 0) & (tl.load(MATCH + base + rows, free, 0) != ROUND)
@@ -353,17 +358,36 @@ def _select_more(RESTRICTED, ALIVE, MATCH, MATE, PAIR_COST, NPROP, M, ROUND, BS:
     tl.store(MATCH + base + best, ROUND, valid)
 
 
-@triton.jit(do_not_specialize=["M", "H", "ROUND", "TARGET"])
-def _plan(ORDER, PAIR_COST, MATE, MASS, RADIUS, BOUND, DIST, ALIVE, KEEP, MERGED, PARTNER, PMA, PMB, PDAB,
-          PAIR_A, COUNT, MERGES, NPROP, ACTIVE, STUCK, TRACE, M, H, ROUND, TARGET,
-          HAVE_LIMITS: tl.constexpr, BLOCK: tl.constexpr):
-    """Cheapest pairs within the lane budget; commit masses and the merge trace."""
+@triton.jit(do_not_specialize=["M", "H", "TARGET"])
+def _plan(ORDER, KEYS, PAIR_COST, MATE, MASS, RADIUS, BOUND, DIST, ALIVE, KEEP, MERGED, PARTNER, PMA, PMB,
+          PDAB, PAIR_A, COUNT, MERGES, NPROP, ACTIVE, STUCK, TRACE, M, H, ROUND_PTR, TARGET,
+          HAVE_LIMITS: tl.constexpr, SORT: tl.constexpr, BLOCK: tl.constexpr, ROWS: tl.constexpr):
+    """Cheapest pairs within the lane budget; commit masses and the merge trace.
+
+    SORT orders the lane in-kernel: the finite pair keys (cost bits << 32) | row
+    are compacted into KEYS (disjoint pairs number at most H <= BLOCK) and one
+    bitonic sort of those unique keys equals the stable argsort by cost. It
+    replaces the separate sort launches. Otherwise ORDER holds that argsort.
+    """
     lane = tl.program_id(0).to(tl.int64)
     base = lane * M
+    ROUND = tl.load(ROUND_PTR)
     t = tl.arange(0, BLOCK)
     inb = t < H
-    left = tl.load(ORDER + base + t, inb, 0)
-    ok = inb & (tl.load(PAIR_COST + base + left, inb, float("inf")) < float("inf"))
+    if SORT:
+        rows = tl.arange(0, ROWS)
+        cost = tl.load(PAIR_COST + base + rows, rows < M, float("inf"))
+        finite = (rows < M) & (cost < float("inf"))
+        slot = tl.cumsum(finite.to(tl.int32), axis=0) - 1
+        tl.store(KEYS + lane * BLOCK + slot, _pack(cost, rows), finite & (slot < BLOCK))
+        pairs = tl.minimum(tl.sum(finite.to(tl.int32), axis=0), BLOCK)
+        tl.debug_barrier()  # The compacted keys are read back by other threads.
+        key = tl.sort(tl.load(KEYS + lane * BLOCK + t, t < pairs, 9223372036854775807))
+        left = key & 0xFFFFFFFF
+        ok = inb & (t < pairs)
+    else:
+        left = tl.load(ORDER + base + t, inb, 0)
+        ok = inb & (tl.load(PAIR_COST + base + left, inb, float("inf")) < float("inf"))
     count = tl.load(COUNT + lane)
     nprop = tl.load(NPROP + lane)
     rank = tl.cumsum(ok.to(tl.int32), axis=0)
@@ -400,9 +424,9 @@ def _plan(ORDER, PAIR_COST, MATE, MASS, RADIUS, BOUND, DIST, ALIVE, KEEP, MERGED
     tl.store(STUCK + lane, stuck | ((remaining > TARGET) & (nprop == 0)).to(tl.int32))
 
 
-@triton.jit(do_not_specialize=["M", "H", "ROUND"])
+@triton.jit(do_not_specialize=["M", "H"])
 def _lance_williams(DIST, MU, MASS, RADIUS, LIMITS, ALIVE, KEEP, PARTNER, PMA, PMB, PDAB, PAIR_A, PACKED,
-                    M, H, ROUND, DIM: tl.constexpr, HAVE_LIMITS: tl.constexpr, SQRT_RN: tl.constexpr,
+                    M, H, ROUND_PTR, DIM: tl.constexpr, HAVE_LIMITS: tl.constexpr, SQRT_RN: tl.constexpr,
                     BLOCK: tl.constexpr, BD: tl.constexpr):
     """Merged centroid, updated distance row/column, row minimum and pushes.
 
@@ -416,6 +440,7 @@ def _lance_williams(DIST, MU, MASS, RADIUS, LIMITS, ALIVE, KEEP, PARTNER, PMA, P
     base = lane * M
     a = tl.load(PAIR_A + lane * H + t).to(tl.int64)
     if a >= 0:
+        ROUND = tl.load(ROUND_PTR)
         b = tl.load(PARTNER + base + a)
         ma = tl.load(PMA + base + a)
         mb = tl.load(PMB + base + a)
@@ -431,7 +456,8 @@ def _lance_williams(DIST, MU, MASS, RADIUS, LIMITS, ALIVE, KEEP, PARTNER, PMA, P
             xb = tl.load(MU + (base + b) * DIM + d, dm, 0.0)
             tl.store(MU + (base + a) * DIM + d, tl.div_rn(ma * xa + mb * xb, denom), dm)
         mi = tl.load(MASS + base + a)
-        result = tl.min(tl.full([BLOCK], 9223372036854775807, tl.int64), axis=0)
+        # Elementwise minima; one cross-warp reduction after the loop, not per tile.
+        acc = tl.full([BLOCK], 9223372036854775807, tl.int64)
         for start in range(0, M, BLOCK):
             cols = start + tl.arange(0, BLOCK)
             inb = cols < M
@@ -466,13 +492,13 @@ def _lance_williams(DIST, MU, MASS, RADIUS, LIMITS, ALIVE, KEEP, PARTNER, PMA, P
             else:
                 cost, valid = _cost(new, mi, mj, alive & (cols != a))
             packed = tl.where(inb, _pack(cost, cols ^ a), 9223372036854775807)
-            result = tl.minimum(result, tl.min(packed, axis=0))
+            acc = tl.minimum(acc, packed)
             # Most rows keep their partner; a coalesced read skips their atomics.
             # A stale read can only allow an extra atomic, never lose a minimum.
             push = valid & ~keep
             push = push & (packed < tl.load(PACKED + base + cols, push, 0))
             tl.atomic_min(PACKED + base + cols, packed, mask=push)
-        tl.store(PACKED + base + a, result)
+        tl.store(PACKED + base + a, tl.min(acc, axis=0))
 
 
 @triton.jit(do_not_specialize=["M"])
@@ -500,6 +526,61 @@ def mirror(dist):
     return dist
 
 
+@triton.jit(do_not_specialize=["M"])
+def _pair_distances(DIST, NORM, M, BLOCK: tl.constexpr):
+    """max(n_i + n_j - 2 G_ij, 0) from the upper triangle of G, mirrored, in place.
+
+    Each upper tile is read only by its own program, which then writes it and
+    its transposed lower tile; lower tiles are never sources, so no tile races.
+    """
+    bi = tl.program_id(0)
+    bj = tl.program_id(1)
+    if bi <= bj:
+        lane = tl.program_id(2).to(tl.int64)
+        base = lane * M * M
+        rows = bi * BLOCK + tl.arange(0, BLOCK)
+        cols = bj * BLOCK + tl.arange(0, BLOCK)
+        rin = rows < M
+        cin = cols < M
+        at = base + rows[:, None].to(tl.int64) * M + cols[None, :]
+        gram = tl.load(DIST + at, rin[:, None] & cin[None, :], 0.0)
+        ni = tl.load(NORM + lane * M + rows, rin, 0.0)
+        nj = tl.load(NORM + lane * M + cols, cin, 0.0)
+        # (n_i + n_j) - 2 G rounds once, like the GEMM epilogue it replaces.
+        dist = tl.maximum((ni[:, None] + nj[None, :]) - 2.0 * gram, 0.0)
+        if bi == bj:
+            dist = tl.where(rows[:, None] <= cols[None, :], dist, tl.trans(dist))
+        else:
+            tl.store(DIST + base + cols[:, None].to(tl.int64) * M + rows[None, :], tl.trans(dist),
+                     cin[:, None] & rin[None, :])
+        tl.store(DIST + at, dist, rin[:, None] & cin[None, :])
+
+
+def pair_distances(gram, norm):
+    """Turn contiguous FP32 Gram products [L, M, M] into symmetric squared distances.
+
+    One pass replaces the broadcast norm sum, the GEMM's beta read, the clamp
+    and the mirror; entries equal the unfused expression bit for bit.
+    """
+    lanes, size = gram.shape[:2]
+    if lanes and size:
+        tiles = triton.cdiv(size, 64)
+        _pair_distances[(tiles, tiles, lanes)](gram, norm.contiguous(), size, 64, num_warps=4,
+                                               enable_fp_fusion=False)
+    return gram
+
+
+def _row_block(size, widest=1024):
+    """Column tile for full-row loops: least masked tail, then the widest tile.
+
+    Sizes just above a power of two (flush + K old clusters) would otherwise
+    spend a third of a 1024 tile on masked columns.
+    """
+    choices = [b for b in (256, 512, 1024) if b <= widest] or [widest]
+    best = min(choices, key=lambda b: (triton.cdiv(size, b) * b, -b))
+    return min(best, triton.next_power_of_2(max(size, 1)))
+
+
 class UnifiedReduce:
     """Device state for incremental rounds; the host reads one flag per lane.
 
@@ -508,10 +589,23 @@ class UnifiedReduce:
     each round runs frozen-center sweeps: after the first mutual pairs, rows
     whose restricted partner was matched rescan the unmatched columns only,
     and all pairs of the round are budgeted together by cost.
+
+    The round number lives on the device, so a round is a fixed launch
+    sequence: from round GRAPH_ROUND on it is replayed as one CUDA graph
+    instead of five to seven Python-side kernel launches. Set
+    LOGKV_ROUTE_CUDA_GRAPH=0 to launch every round eagerly.
     """
 
     INF_KEY = 0x7F800000 << 32
     SCAN_ROWS, SCAN_BLOCK, SELECT_ROWS = 8, 256, 64
+    # In-kernel bitonic sort of up to this many pairs per lane (one program).
+    SORT_LIMIT = 4096
+    # Rounds 1-2 run eagerly: every kernel variant is compiled before capture,
+    # and reductions that finish within two rounds never pay for a capture.
+    GRAPH_ROUND = 3
+    graphs = os.environ.get("LOGKV_ROUTE_CUDA_GRAPH", "1") != "0"
+    # Cleared if this Triton cannot compile the in-kernel sort; argsort then.
+    sort_ok = True
 
     def __init__(self, dist, mu, mass, count, limits, target, passes=1):
         lanes, size = mass.shape
@@ -529,6 +623,7 @@ class UnifiedReduce:
         self.nprop = torch.zeros_like(self.merges)
         self.active = torch.zeros_like(self.merges)
         self.stuck = torch.zeros_like(self.merges)
+        self.round = torch.zeros(1, dtype=torch.int32, device=dev)
         self.keep = torch.full((lanes, size), -1, dtype=torch.int32, device=dev)
         self.merged = torch.full_like(self.keep, -1)
         self.reject = torch.full_like(self.keep, -1)
@@ -545,60 +640,127 @@ class UnifiedReduce:
         self.packed = torch.full((lanes, size), self.INF_KEY, dtype=torch.int64, device=dev)
         self.restricted = torch.empty_like(self.packed) if self.passes > 1 else self.packed
         self.sqrt_rn = hasattr(tl, "sqrt_rn")
-        self.row_block = min(1024, triton.next_power_of_2(size))
+        self.sort_block = max(2, triton.next_power_of_2(max(self.half, 1)))
+        self.sort = UnifiedReduce.sort_ok and hasattr(tl, "sort") and self.sort_block <= self.SORT_LIMIT
+        self.sort_keys = torch.empty((lanes, self.sort_block), dtype=torch.int64, device=dev) if self.sort else None
+        self.row_block = _row_block(size)
         self.scan_block = min(self.SCAN_BLOCK, triton.next_power_of_2(size))
         self.dim_block = min(32, triton.next_power_of_2(self.dim))
-        self._scan(0, mode=0)
+        self.graph = None
+        self._scan(mode=0)
 
     def _limits(self):
         return self.limits if self.limits is not None else self.mass
 
-    def _scan(self, round_, *, mode):
+    def _scan(self, *, mode):
         lanes, size = self.mass.shape
         _scan[(triton.cdiv(size, self.SCAN_ROWS), lanes)](
             self.dist, self.mass, self.radius, self._limits(), self.alive, self.keep, self.merged,
             self.reject, self.match, self.best, self.restricted if mode == 2 else self.packed,
-            size, round_, mode, self.limits is not None, self.sqrt_rn, self.SCAN_ROWS, self.scan_block,
+            size, self.round, mode, self.limits is not None, self.sqrt_rn, self.SCAN_ROWS, self.scan_block,
             num_warps=4, enable_fp_fusion=False,
         )
 
-    def step(self, round_):
+    def _launch(self):
+        """Queue one round. Reads no host state that changes between rounds."""
         lanes, size = self.mass.shape
         limited = self.limits is not None
         multi = self.passes > 1
+        self.round.add_(1)
         grid = (triton.cdiv(size, self.SELECT_ROWS), lanes)
         _select[grid](
             self.packed, self.alive, self.mass, self.radius, self._limits(), self.mu, self.dist,
             self.best, self.pair_cost, self.bound, self.reject, self.nprop,
-            self.mate, self.restricted, self.match, size, round_,
+            self.mate, self.restricted, self.match, size, self.round,
             self.dim, limited, self.sqrt_rn, multi, self.SELECT_ROWS, self.dim_block,
             num_warps=4, enable_fp_fusion=False,
         )
         for _ in range(self.passes - 1):
             # Frozen centers: stream order separates each rescan from the
             # sweep that consumes it; no host read between sweeps.
-            self._scan(round_, mode=2)
+            self._scan(mode=2)
             _select_more[grid](
                 self.restricted, self.alive, self.match, self.mate, self.pair_cost, self.nprop,
-                size, round_, self.SELECT_ROWS, num_warps=4,
+                size, self.round, self.SELECT_ROWS, num_warps=4,
             )
-        order = self.pair_cost.argsort(dim=1, stable=True)
-        plan_block = triton.next_power_of_2(max(self.half, 1))
-        _plan[(lanes,)](
-            order, self.pair_cost, self.mate, self.mass, self.radius, self.bound, self.dist, self.alive,
-            self.keep, self.merged, self.partner, self.pma, self.pmb, self.pdab, self.pair_a,
-            self.count, self.merges, self.nprop, self.active, self.stuck, self.trace,
-            size, self.half, round_, self.target, limited, plan_block,
-            num_warps=8 if plan_block > 1024 else 4, enable_fp_fusion=False,
-        )
+        if self.sort:
+            try:
+                self._plan(sort=True)
+            except Exception as error:  # Compilation happens before launch: nothing ran.
+                if torch.cuda.is_current_stream_capturing():
+                    raise
+                UnifiedReduce.sort_ok = self.sort = False
+                warnings.warn(f"LogKV route in-kernel sort unavailable ({type(error).__name__}: {error}); "
+                              "using argsort")
+                self._plan(sort=False)
+        else:
+            self._plan(sort=False)
         _lance_williams[(max(self.half, 1), lanes)](
             self.dist, self.mu, self.mass, self.radius, self._limits(), self.alive, self.keep,
             self.partner, self.pma, self.pmb, self.pdab, self.pair_a, self.packed,
-            size, self.half, round_, self.dim, limited, self.sqrt_rn, self.row_block,
+            size, self.half, self.round, self.dim, limited, self.sqrt_rn, self.row_block,
             triton.next_power_of_2(self.dim) if self.dim <= 256 else 256,
             num_warps=4, enable_fp_fusion=False,
         )
-        self._scan(round_, mode=1)
+        self._scan(mode=1)
+
+    def _plan(self, *, sort):
+        lanes, size = self.mass.shape
+        block = triton.next_power_of_2(max(self.half, 1))
+        if sort:
+            order, keys, block, rows = self.pair_cost, self.sort_keys, self.sort_block, triton.next_power_of_2(size)
+            warps = 16 if rows > 8192 else 8 if rows > 2048 else 4
+        else:
+            order = self.pair_cost.argsort(dim=1, stable=True)
+            keys, rows = order, 1
+            warps = 8 if block > 1024 else 4
+        _plan[(lanes,)](
+            order, keys, self.pair_cost, self.mate, self.mass, self.radius, self.bound, self.dist, self.alive,
+            self.keep, self.merged, self.partner, self.pma, self.pmb, self.pdab, self.pair_a,
+            self.count, self.merges, self.nprop, self.active, self.stuck, self.trace,
+            size, self.half, self.round, self.target, self.limits is not None, sort, block, rows,
+            num_warps=warps, enable_fp_fusion=False,
+        )
+
+    def _capture(self):
+        """Record one round as a CUDA graph; None means keep launching eagerly.
+
+        Uses the capture API directly: the `torch.cuda.graph` context would also
+        synchronize, run gc and empty the allocator cache on every reduction.
+        Thread-local capture leaves other threads (data loading) unaffected.
+        """
+        dev = self.mass.device
+        current = torch.cuda.current_stream(dev)
+        side = torch.cuda.Stream(dev)
+        side.wait_stream(current)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.stream(side):
+                graph.capture_begin(capture_error_mode="thread_local")
+                try:
+                    self._launch()
+                finally:
+                    graph.capture_end()
+        except Exception as error:  # Old PyTorch, or a launch that cannot be captured.
+            UnifiedReduce.graphs = False
+            warnings.warn(f"LogKV route CUDA graphs disabled ({type(error).__name__}: {error}); "
+                          "launching rounds eagerly")
+            graph = None
+        current.wait_stream(side)
+        return graph
+
+    def step(self, round_):
+        """Queue round `round_`; rounds must be stepped as 1, 2, 3, ...
+
+        `graph` is None until a capture is attempted, then the graph or False.
+        """
+        if self.graph is None and round_ >= self.GRAPH_ROUND and UnifiedReduce.graphs:
+            graph = self._capture()
+            self.graph = False if graph is None else graph
+        if isinstance(self.graph, torch.cuda.CUDAGraph):
+            self.graph.replay()
+        else:
+            self._launch()
         return self.active
 
     def finish(self):

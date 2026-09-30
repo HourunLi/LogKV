@@ -317,6 +317,7 @@ def _pair_rank1_stats(
 
 
 _EMPTY_INDEX = np.empty(0, dtype=np.int64)
+_NUMPY_DTYPES = {torch.bool: np.bool_, torch.int16: np.int16, torch.int32: np.int32, torch.int64: np.int64}
 
 
 @lru_cache(maxsize=1)
@@ -351,6 +352,80 @@ def _spans_to_index_array(spans: list[tuple[int, int]]) -> np.ndarray:
     if not total:
         return _EMPTY_INDEX
     return np.repeat(bounds[:, 0] - (np.cumsum(lengths) - lengths), lengths) + np.arange(total, dtype=np.int64)
+
+
+def _ranges_to_index_array(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """`_spans_to_index_array` for array-valued ranges; empty ranges allowed."""
+    lengths = np.maximum(np.asarray(lengths, dtype=np.int64), 0)
+    total = int(lengths.sum())
+    if not total:
+        return _EMPTY_INDEX
+    starts = np.asarray(starts, dtype=np.int64)
+    return np.repeat(starts - (np.cumsum(lengths) - lengths), lengths) + np.arange(total, dtype=np.int64)
+
+
+def _upload(array: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Host array -> tensor on `device` without synchronizing the stream.
+
+    A blocking CPU->CUDA copy synchronizes the current stream, so each small
+    index upload used to wait for every queued kernel. Staging through the
+    caching pinned allocator makes the copy asynchronous; the allocator keeps
+    the pinned block until the copy has run. Other devices are unchanged.
+    """
+    tensor = torch.from_numpy(np.ascontiguousarray(array))
+    if device.type != "cuda" or not tensor.numel():
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)
+
+
+def _ladder_level_plan(count, start, length, base, B, top):
+    """Host plan of one Fenwick ladder level for many lanes at once.
+
+    Inputs are aligned int64 arrays over the lanes that still carry entries:
+    their current count at this level, the offset and length of those entries
+    in the staging block, and the level's first cache row. Entries first fill
+    free slots; a lane left with entries merges its oldest pairs from the pool
+    [stored level (B rows) | remaining staged rows] and keeps the rest.
+
+    Returns (count after this level, fill source rows, fill destination rows,
+    positions of lanes with entries left, their staging offsets and lengths
+    after the fill, merge plan). The merge plan is None at the top level or
+    when no lane is left; otherwise it is (stored rows, staged rows, pair pool
+    rows, survivor pool rows, survivor destinations, cleared rows, carried
+    entries per lane), in lane order -- the indices `merge_scatter` consumes.
+    """
+    take = np.minimum(B - count, length)
+    fill = take > 0
+    fill_src = _ranges_to_index_array(start[fill], take[fill])
+    fill_dst = _ranges_to_index_array((base + count)[fill], take[fill])
+    count, start, length = count + take, start + take, length - take
+    rest = np.flatnonzero(length > 0)
+    if top or not len(rest):
+        return count, fill_src, fill_dst, rest, start, length, None
+    m, base = length[rest], base[rest]
+    carry = (m + 1) // 2
+    pairs = 2 * carry
+    survive = B + m - pairs
+    count[rest] = survive
+    n = len(rest)
+    stored = np.arange(n, dtype=np.int64) * B
+    staged = n * B + np.cumsum(m) - m
+    head = np.minimum(pairs, B)  # Pair rows taken from the stored level.
+    spill = pairs - head          # Pair rows taken from the staged entries.
+
+    def interleave(first, second):
+        return np.stack((first, second), axis=1).reshape(-1)
+
+    plan = (
+        _ranges_to_index_array(base, np.full(n, B, dtype=np.int64)),
+        _ranges_to_index_array(start[rest], m),
+        _ranges_to_index_array(interleave(stored, staged), interleave(head, spill)),
+        _ranges_to_index_array(interleave(stored + head, staged + spill), interleave(B - head, m - spill)),
+        _ranges_to_index_array(base, survive),
+        _ranges_to_index_array(base + survive, B - survive),
+        carry,
+    )
+    return count, fill_src, fill_dst, rest, start, length, plan
 
 
 _UNIFIED_INF_KEY = 0x7F800000 << 32
@@ -1175,7 +1250,10 @@ class LogStructuredKVCache(nn.Module):
             if name not in dirty:
                 continue
             buf = getattr(self, name)
-            buf.copy_(torch.tensor(getattr(self, mirror), dtype=dtype, device="cpu"))
+            # NumPy converts the nested mirror lists far faster than torch.tensor,
+            # and a pinned source keeps the copy off the host's critical path.
+            host = torch.from_numpy(np.asarray(getattr(self, mirror), dtype=_NUMPY_DTYPES[dtype]))
+            buf.copy_(host.pin_memory() if buf.is_cuda else host, non_blocking=buf.is_cuda)
         dirty.clear()
 
     def _semantic_mark_scalar_dirty(self, name: str) -> bool:
@@ -1204,6 +1282,28 @@ class LogStructuredKVCache(nn.Module):
         if not self._semantic_mark_scalar_dirty("alive"):
             self.alive[b, g, c] = alive
         self._semantic_alive[b][g][c] = alive
+
+    _SEMANTIC_SCALAR_FIELDS = {
+        "alive": ("_semantic_alive", bool),
+        "p_hi_c": ("_semantic_p_hi_c", int),
+        "current_segment": ("_semantic_current_segment", int),
+        "level0_phase": ("_semantic_level0_phase", int),
+        "n_total": ("_semantic_n_total", int),
+    }
+
+    def _set_semantic_scalars(self, name: str, lanes, values) -> None:
+        """Bulk `_set_semantic_<name>` for many (b, g, c); one dirty mark when deferred."""
+        mirror, cast = self._SEMANTIC_SCALAR_FIELDS[name]
+        mirror = getattr(self, mirror)
+        if self._semantic_mark_scalar_dirty(name):
+            for (b, g, c), value in zip(lanes, values):
+                mirror[b][g][c] = cast(value)
+            return
+        device = getattr(self, name)
+        for (b, g, c), value in zip(lanes, values):
+            value = cast(value)
+            device[b, g, c] = value
+            mirror[b][g][c] = value
 
     def _semantic_live_clusters(self, b: int, g: int) -> list[int]:
         return [c for c, alive in enumerate(self._semantic_alive[b][g]) if alive]
@@ -1550,23 +1650,23 @@ class LogStructuredKVCache(nn.Module):
             self._set_semantic_level_count(b, g, c, ell, self.B)
 
     def _semantic_index_tensors(
-        self, device: torch.device, *span_lists: list[tuple[int, int]]
+        self, device: torch.device, *span_lists: list[tuple[int, int]] | np.ndarray
     ) -> list[torch.Tensor]:
         """Build several range-derived index tensors with ONE host->device copy.
 
         ``torch.tensor(<python list>, device="cuda")`` is a blocking pageable
         transfer, and building the list costs more on the host than the kernels
         it feeds save. Every index here is a concatenation of contiguous ranges,
-        so numpy builds them ~35x faster and they travel together.
+        so numpy builds them ~35x faster and they travel together. Arguments are
+        span lists or ready int64 index arrays.
         """
-        arrays = [_spans_to_index_array(spans) for spans in span_lists]
+        arrays = [spans if isinstance(spans, np.ndarray) else _spans_to_index_array(spans) for spans in span_lists]
         sizes = [int(a.size) for a in arrays]
         total = sum(sizes)
         if total == 0:
             empty = torch.empty(0, dtype=torch.long, device=device)
             return [empty] * len(arrays)
-        flat = torch.from_numpy(np.concatenate(arrays) if len(arrays) > 1 else arrays[0])
-        flat = flat.to(device, copy=False)
+        flat = _upload(np.concatenate(arrays) if len(arrays) > 1 else arrays[0], device)
         out: list[torch.Tensor] = []
         off = 0
         for n in sizes:
@@ -1589,16 +1689,18 @@ class LogStructuredKVCache(nn.Module):
 
         The per-level index arithmetic runs on the host against the
         `_semantic_counts` mirror, which is already the authority for these
-        counts, so none of it costs a device sync. Indices are accumulated as
-        ranges and moved once per level (see `_semantic_index_tensors`).
+        counts, so none of it costs a device sync. It is whole-array NumPy over
+        the lanes (`_ladder_level_plan`) and its indices move once per level
+        (see `_semantic_index_tensors`); the mirror is written back once.
         """
         if self._update_actions is not None:
             self._update_actions.append(("append", (tuple(lanes), tuple(counts)),
                                          tuple(self._active_updates.save(x) for x in block)))
 
         self._mid_decode_state = None
-        active = [i for i in range(len(lanes)) if counts[i] > 0]
-        if not active:
+        lengths = np.asarray(counts, dtype=np.int64).reshape(-1)
+        active = np.flatnonzero(lengths > 0)
+        if not len(active):
             return
         fields = self._semantic_flat_level_fields()
         dev = fields[0].device
@@ -1607,82 +1709,26 @@ class LogStructuredKVCache(nn.Module):
                  and fields[1].dtype in (torch.float16, torch.bfloat16, torch.float32)
                  and fields[2].dtype == torch.float32
                  and all(x is None or x.is_contiguous() for x in block) else None)
-        bases = [self._semantic_lane_base(*lane) for lane in lanes]
+        B, L = self.B, self.L_alloc
+        lane_ids = np.asarray(lanes, dtype=np.int64).reshape(-1, 3)[active]
+        bases = ((lane_ids[:, 0] * self.n_groups + lane_ids[:, 1]) * self.K_max + lane_ids[:, 2]) * (L * B)
+        mirrors = [self._semantic_counts[b][g][c] for b, g, c in lane_ids.tolist()]
+        level = np.array(mirrors, dtype=np.int64).reshape(len(active), L)
+        before = level.copy()
+        # Lanes still carrying entries (rows of `level`), with their staging
+        # offsets and lengths in the current stage block.
+        pos = np.arange(len(active))
+        length = lengths[active]
+        start = np.cumsum(length) - length
         stage = block
-        spans: dict[int, tuple[int, int]] = {}
-        off = 0
-        for i, n in enumerate(counts):
-            spans[i] = (off, n)
-            off += n
-
-        for ell in range(self.L_alloc):
-            if not active:
-                return
-            top = ell == self.L_alloc - 1
-            fill_src: list[tuple[int, int]] = []
-            fill_dst: list[tuple[int, int]] = []
-            store_rows: list[tuple[int, int]] = []
-            stage_rows: list[tuple[int, int]] = []
-            surv_dst: list[tuple[int, int]] = []
-            clear_dst: list[tuple[int, int]] = []
-            n_store = 0
-            n_stage = 0
-            recs: list[tuple[int, int, int, int]] = []  # (st_off, sg_off, m, n_pair_rows)
-            overflow_top: list[tuple[int, int, int]] = []  # (lane_i, start, count)
-            carry_counts: list[tuple[int, int]] = []
-            next_active: list[int] = []
-
-            for i in active:
-                b, g, c = lanes[i]
-                s, m = spans[i]
-                cnt = self._semantic_counts[b][g][c][ell]
-                base = bases[i] + ell * self.B
-                take = min(self.B - cnt, m)
-                if take:
-                    fill_src.append((s, s + take))
-                    fill_dst.append((base + cnt, base + cnt + take))
-                    cnt += take
-                    s += take
-                    m -= take
-                if m == 0:
-                    self._set_semantic_level_count(b, g, c, ell, cnt)
-                    continue
-                if top:
-                    overflow_top.append((i, s, m))
-                    continue
-                carry_n = (m + 1) // 2
-                n_pair_rows = 2 * carry_n
-                n_surv = self.B + m - n_pair_rows
-                recs.append((n_store, n_stage, m, n_pair_rows))
-                store_rows.append((base, base + self.B))
-                n_store += self.B
-                stage_rows.append((s, s + m))
-                n_stage += m
-                surv_dst.append((base, base + n_surv))
-                if n_surv < self.B:
-                    clear_dst.append((base + n_surv, base + self.B))
-                self._set_semantic_level_count(b, g, c, ell, n_surv)
-                carry_counts.append((i, carry_n))
-                next_active.append(i)
-
-            # The pool is [gathered storage rows] ++ [gathered staging rows], so
-            # staging positions shift by the total storage row count.
-            pair_idx: list[tuple[int, int]] = []
-            surv_idx: list[tuple[int, int]] = []
-            for st_off, sg_off, m, n_pair_rows in recs:
-                ps = min(self.B, n_pair_rows)
-                pair_idx.append((st_off, st_off + ps))
-                if n_pair_rows > ps:
-                    begin = n_store + sg_off
-                    pair_idx.append((begin, begin + n_pair_rows - ps))
-                if ps < self.B:
-                    surv_idx.append((st_off + ps, st_off + self.B))
-                begin = n_store + sg_off + max(0, n_pair_rows - self.B)
-                surv_idx.append((begin, n_store + sg_off + m))
-
+        for ell in range(L):
+            top = ell == L - 1
+            count, fill_src, fill_dst, rest, start, length, plan = _ladder_level_plan(
+                level[pos, ell], start, length, bases[pos] + ell * B, B, top,
+            )
+            level[pos, ell] = count
             fs, fd, si, gi, pi, vi, sd, cd = self._semantic_index_tensors(
-                dev, fill_src, fill_dst, store_rows, stage_rows,
-                pair_idx, surv_idx, surv_dst, clear_dst,
+                dev, fill_src, fill_dst, *(plan[:6] if plan is not None else (_EMPTY_INDEX,) * 6),
             )
 
             # Fill first: an overflowing lane's pooled rows include the slots this
@@ -1695,14 +1741,15 @@ class LogStructuredKVCache(nn.Module):
                         if f is not None:
                             f.index_copy_(0, fd, x.index_select(0, fs).to(f.dtype))
 
-            for i, s, m in overflow_top:
-                b, g, c = lanes[i]
-                self._semantic_append_top_level_overflow(
-                    b, g, c, self._semantic_slice_block(stage, s, s + m)
-                )
-
-            if not recs:
-                return
+            if top:
+                for j in rest.tolist():
+                    b, g, c = lanes[active[pos[j]]]
+                    self._semantic_append_top_level_overflow(
+                        b, g, c, self._semantic_slice_block(stage, int(start[j]), int(start[j] + length[j]))
+                    )
+                break
+            if plan is None:
+                break
 
             if fused is not None:
                 carry = fused.merge_scatter(fields, stage, si, gi, pi, vi, sd, cd)
@@ -1721,12 +1768,22 @@ class LogStructuredKVCache(nn.Module):
                             f.index_fill_(0, cd, 0)
 
             stage = carry
-            spans = {}
-            off = 0
-            for i, cn in carry_counts:
-                spans[i] = (off, cn)
-                off += cn
-            active = next_active
+            pos = pos[rest]
+            length = plan[6]
+            start = np.cumsum(length) - length
+
+        # One mirror write-back. Top-level overflow already stored B for its
+        # lanes, which is also the count here after their fill.
+        changed = np.flatnonzero((level != before).any(axis=1))
+        if not len(changed):
+            return
+        if self._semantic_mark_scalar_dirty("level_count"):
+            for j, row in zip(changed.tolist(), level[changed].tolist()):
+                mirrors[j][:] = row
+            return
+        for j, ell in zip(*np.nonzero(level != before)):
+            b, g, c = lanes[active[j]]
+            self._set_semantic_level_count(b, g, c, int(ell), int(level[j, ell]))
 
     def _semantic_append_entry_block(self, b: int, g: int, c: int, block: tuple[torch.Tensor, ...]) -> None:
         self._semantic_append_entries_batched([(b, g, c)], [block[0].size(0)], block)
@@ -1884,10 +1941,10 @@ class LogStructuredKVCache(nn.Module):
             else:
                 rows.append(np.asarray(self._op_log_host[b][g][start:end], dtype=np.int32).reshape(-1, 4))
         pending.clear()
-        indices = torch.from_numpy(_spans_to_index_array(spans)).to(self.op_log.device)
-        values = torch.from_numpy(np.concatenate(rows)).to(self.op_log.device)
+        indices = _upload(_spans_to_index_array(spans), self.op_log.device)
+        values = _upload(np.concatenate(rows), self.op_log.device)
         self.op_log.view(-1, 4).index_copy_(0, indices, values)
-        self.op_log_len.copy_(torch.tensor(self._op_log_len_host, dtype=torch.int32))
+        self.op_log_len.copy_(_upload(np.asarray(self._op_log_len_host, dtype=np.int32), self.op_log_len.device))
         starts.clear()
 
     def _record_semantic_join_run(
@@ -2066,7 +2123,7 @@ class LogStructuredKVCache(nn.Module):
             return
         lanes = [(b, g, c) for b, g, c, _ in jobs]
         self._semantic_clear_clusters(lanes)
-        indices = torch.tensor(jobs, device=k_raw.device, dtype=torch.long).T
+        indices = _upload(np.asarray(jobs, dtype=np.int64).reshape(-1, 4).T, k_raw.device)
         bi, gi, ci, ti = indices.unbind(0)
         ids = (bi * self.n_groups + gi) * self.K_max + ci
         key, value, pos = k_raw.detach()[bi, gi, ti], v.detach()[bi, gi, ti], positions[bi, ti].long()
@@ -2076,14 +2133,22 @@ class LogStructuredKVCache(nn.Module):
         block = (key, value, self.level_w.new_ones(n), *self._empty_stats(key, value),
                  pos, pos, pos, self.level_order.new_zeros(n), self.pad_mask.new_zeros(n))
         self._semantic_append_entries_batched(lanes, [1] * n, block)
-        for b, g, c, i in jobs:
-            self._set_semantic_alive(b, g, c, True)
-            self._set_semantic_n_total(b, g, c, 1)
-            self._set_semantic_p_hi(b, g, c, positions_host[b][i])
-            self._set_semantic_level0_phase(b, g, c, 1)
+        first = [positions_host[b][i] for b, _, _, i in jobs]
+        self._set_semantic_scalars("alive", lanes, [True] * n)
+        self._set_semantic_scalars("n_total", lanes, [1] * n)
+        self._set_semantic_scalars("p_hi_c", lanes, first)
+        self._set_semantic_scalars("level0_phase", lanes, [1] * n)
+        for b, g, _ in lanes:
             self._semantic_ward_dirty[b][g] = True
-            if record:
-                self._record_op(b, g, LOG_KV_OP_NEW_CLUSTER, c, 0, int(positions_host[b][i]))
+        if record:
+            # Consecutive jobs of one (b, g) share a log append, in job order.
+            start = 0
+            for stop in range(1, n + 1):
+                if stop == n or jobs[stop][:2] != jobs[start][:2]:
+                    b, g = jobs[start][:2]
+                    self._record_ops(b, g, [(LOG_KV_OP_NEW_CLUSTER, c, 0, int(p))
+                                            for (_, _, c, _), p in zip(jobs[start:stop], first[start:stop])])
+                    start = stop
 
     def _semantic_join(
         self,
@@ -2268,8 +2333,8 @@ class LogStructuredKVCache(nn.Module):
         if self._update_actions is not None:
             self._update_actions.append(("clear_batch", tuple(lanes), ()))
         self._mid_decode_state = None
-        ids = torch.tensor([(b * self.n_groups + g) * self.K_max + c for b, g, c in lanes],
-                           device=self.level_k.device, dtype=torch.long)
+        ids = _upload(np.fromiter(((b * self.n_groups + g) * self.K_max + c for b, g, c in lanes),
+                                  dtype=np.int64, count=len(lanes)), self.level_k.device)
         fields = ["level_k", "level_v", "level_w", "level_imp", "level_p_lo", "level_p_hi",
                   "level_sum_wp", "level_order", "pad_mask"]
         if self.allocate_second_order:
@@ -2279,13 +2344,28 @@ class LogStructuredKVCache(nn.Module):
         ward = self.ward_cost.flatten(0, 1)
         ward[ids // self.K_max, ids % self.K_max, :] = float("inf")
         ward[ids // self.K_max, :, ids % self.K_max] = float("inf")
+        if not self._semantic_mark_scalar_dirty("level_count"):
+            for b, g, c in lanes:
+                self._clear_semantic_cluster_counts(b, g, c)
+                self._set_semantic_alive(b, g, c, False)
+                self._set_semantic_n_total(b, g, c, 0)
+                self._set_semantic_p_hi(b, g, c, -1)
+                self._set_semantic_current_segment(b, g, c, 0)
+                self._set_semantic_level0_phase(b, g, c, 0)
+            return
+        # Deferred: the same mirror writes, with one dirty mark per field.
+        for name in ("alive", "n_total", "p_hi_c", "current_segment", "level0_phase"):
+            self._semantic_mark_scalar_dirty(name)
+        zeros = [0] * self.L_alloc
+        counts, alive, n_total = self._semantic_counts, self._semantic_alive, self._semantic_n_total
+        p_hi, segment, phase = self._semantic_p_hi_c, self._semantic_current_segment, self._semantic_level0_phase
         for b, g, c in lanes:
-            self._clear_semantic_cluster_counts(b, g, c)
-            self._set_semantic_alive(b, g, c, False)
-            self._set_semantic_n_total(b, g, c, 0)
-            self._set_semantic_p_hi(b, g, c, -1)
-            self._set_semantic_current_segment(b, g, c, 0)
-            self._set_semantic_level0_phase(b, g, c, 0)
+            counts[b][g][c][:] = zeros
+            alive[b][g][c] = False
+            n_total[b][g][c] = 0
+            p_hi[b][g][c] = -1
+            segment[b][g][c] = 0
+            phase[b][g][c] = 0
 
     def _semantic_ward_merge_batch(self, jobs, *, record):
         """One ordered merge per independent group; batch readback and writes.
@@ -2326,9 +2406,9 @@ class LogStructuredKVCache(nn.Module):
         segment_end = np.repeat(np.cumsum(sides), sides)
         phases = np.arange(len(source), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
         # One upload for the entry ordering, phases, cluster ids and masses.
-        packed = torch.from_numpy(np.concatenate((
+        packed = _upload(np.concatenate((
             source, segment, segment_end, phases, keep_ids, free_ids, masses,
-        )).astype(np.int64)).to(self.level_k.device)
+        )).astype(np.int64), self.level_k.device)
         n, n_jobs = len(source), len(jobs)
         source_t, segment_t, end_t, phase_t = packed[:4 * n].view(4, n).unbind(0)
         ki, fi = packed[4 * n:4 * n + 2 * n_jobs].view(2, n_jobs).unbind(0)
@@ -2954,16 +3034,20 @@ class LogStructuredKVCache(nn.Module):
             outputs.append(([nodes[i] for i in surviving], old_merges, centers))
         return outputs
 
+    _semantic_fused_distances = True
+
     @staticmethod
     def _semantic_unified_pair_matrix(mu: torch.Tensor) -> torch.Tensor:
         """FP32 squared distances [L, M, M]; the persistent state of the rounds.
 
-        Only one M x M buffer is allocated: the GEMM accumulates into the norm
-        sums in place.
+        Only one M x M buffer is allocated: on CUDA a plain GEMM followed by
+        one fused norm/clamp/mirror pass over it, elsewhere the GEMM
+        accumulates into the norm sums in place.
         """
         if mu.size(1) <= 32:
             dist = torch.cdist(mu, mu, compute_mode="donot_use_mm_for_euclid_dist").square()
             return LogStructuredKVCache._semantic_unified_symmetrize_(dist)
+        fused = _triton_route() if mu.is_cuda and LogStructuredKVCache._semantic_fused_distances else None
         precision = torch.get_float32_matmul_precision()
         try:
             # Same FP32/centering rules as `_semantic_unified_gram`; the norm
@@ -2973,6 +3057,18 @@ class LogStructuredKVCache(nn.Module):
             with torch.autocast(device_type=mu.device.type, enabled=False):
                 centered = mu.float() - mu[:, :1].float()
                 norm = centered.square().sum(-1)
+                if fused is not None and hasattr(fused, "pair_distances"):
+                    # One read of the upper triangle and one write replace the
+                    # norm broadcast, the beta read, the clamp and the mirror;
+                    # the epilogue rounds like the baddbmm below.
+                    gram = torch.bmm(centered, centered.transpose(1, 2))
+                    try:
+                        return fused.pair_distances(gram, norm)
+                    except Exception as error:  # Compilation fails before launch.
+                        LogStructuredKVCache._semantic_fused_distances = False
+                        warnings.warn(f"fused pair distances unavailable ({type(error).__name__}: {error}); "
+                                      "using the unfused expression")
+                        del gram
                 dist = norm[:, :, None] + norm[:, None, :]
                 dist.baddbmm_(centered, centered.transpose(1, 2), alpha=-2)
         finally:
@@ -3032,7 +3128,7 @@ class LogStructuredKVCache(nn.Module):
         buffer, lane_index = mu, None
         if len(active) < lanes:
             size = max(counts[i] for i in active)
-            lane_index = torch.tensor(active, device=dev)
+            lane_index = _upload(np.asarray(active, dtype=np.int64), dev)
             mu = buffer.index_select(0, lane_index)[:, :size].contiguous()
             weights = weights[active, :size]
         else:
@@ -3062,12 +3158,12 @@ class LogStructuredKVCache(nn.Module):
         """Incremental rounds for every lane of `mu`; see `_semantic_unified_reduce_device`."""
         dev = mu.device
         size = mu.size(1)
-        count = torch.tensor(counts, dtype=torch.int64).to(dev)
+        count = _upload(np.asarray(counts, dtype=np.int64), dev)
         # A copy: the rounds update masses in place and CPU from_numpy would alias.
         # Rows beyond a lane's count are padding and must never pair.
         weights = np.where(np.arange(size)[None, :] < np.asarray(counts)[:, None], weights, 0)
-        mass = torch.from_numpy(np.array(weights, dtype=np.float32)).to(dev)
-        limits = None if radius_limits is None else torch.tensor(radius_limits, dtype=torch.float32).to(dev)
+        mass = _upload(np.array(weights, dtype=np.float32), dev)
+        limits = None if radius_limits is None else _upload(np.asarray(radius_limits, dtype=np.float32), dev)
         dist = self._semantic_unified_pair_matrix(mu)
         fused = _triton_route() if dev.type == "cuda" else None
         reducer_type = getattr(fused, "UnifiedReduce", None) or _UnifiedReduceTorch
@@ -3082,6 +3178,7 @@ class LogStructuredKVCache(nn.Module):
             if flags is None:
                 flags = torch.zeros((2, len(counts)), dtype=torch.int32, pin_memory=True)
                 self._SEMANTIC_ROUTE_FLAG_BUFFERS[key] = flags
+            host_flags = flags.numpy()  # Pinned memory viewed without a torch op per read.
             events = (torch.cuda.Event(), torch.cuda.Event())
             stream = torch.cuda.current_stream(dev)
         # Every round before the last merges or pins a pair; the cap is a guard.
@@ -3097,7 +3194,7 @@ class LogStructuredKVCache(nn.Module):
             events[round_ % 2].record(stream)
             if round_ > 1:
                 events[(round_ - 1) % 2].synchronize()
-                if not bool(flags[(round_ - 1) % 2].any()):
+                if not host_flags[(round_ - 1) % 2].any():
                     break
         lane_traces, alive, stuck = reducer.finish()
         results = [(np.flatnonzero(alive[lane]), lane_traces[lane]) for lane in range(len(counts))]
@@ -3327,7 +3424,7 @@ class LogStructuredKVCache(nn.Module):
             flat = [b * n_groups + g for b, g in tile]
             # A contiguous tile is a slice; otherwise gather its lanes once.
             source = (keys[flat[0]:flat[0] + width] if flat[-1] - flat[0] == width - 1
-                      else keys.index_select(0, torch.tensor(flat, device=k_raw.device)))
+                      else keys.index_select(0, _upload(np.asarray(flat, dtype=np.int64), k_raw.device)))
             # Candidate pass on an owned, contiguous FP32 copy (the reducer
             # writes centers in place and indexes rows directly).
             mu = torch.empty((width, span, dim), dtype=torch.float32, device=k_raw.device)
@@ -3355,7 +3452,7 @@ class LogStructuredKVCache(nn.Module):
             src_new = np.concatenate([lane * span + roots for lane, roots in enumerate(candidates)])
             dst_new = np.concatenate([lane * size + len(old) + np.arange(len(roots))
                                       for lane, (old, roots) in enumerate(zip(live, candidates))])
-            index = torch.from_numpy(np.concatenate((src_old, dst_old, src_new, dst_new)).astype(np.int64)).to(k_raw.device)
+            index = _upload(np.concatenate((src_old, dst_old, src_new, dst_new)).astype(np.int64), k_raw.device)
             n_old, n_new = len(src_old), len(src_new)
             centers = mu.new_zeros((width * size, dim))
             if n_old:
@@ -3454,12 +3551,12 @@ class LogStructuredKVCache(nn.Module):
         lane_c = np.fromiter((c for _, _, c in lanes), dtype=np.int64, count=n_del)
         new_job = np.repeat(job_ids, new_len)
         # One upload: sources, sort keys, token coordinates, phases, cluster ids.
-        packed = torch.from_numpy(np.concatenate((
+        packed = _upload(np.concatenate((
             src, np.repeat(job_ids, old_len), new_job,
             lane_b[new_job], lane_g[new_job], new_off, new_pos,
             np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts),
             (lane_b * self.n_groups + lane_g) * self.K_max + lane_c, new_len,
-        ))).to(k_raw.device)
+        )), k_raw.device)
         cut = np.cumsum([n_old, n_old, n_new, n_new, n_new, n_new, n_new, total, n_del, n_del])
         src_t, old_job_t, new_job_t, bi, gi, ti, pos_t, phase_t, ids, lengths_t = packed.tensor_split(cut[:-1].tolist())
         # Stable (job, position) sort over [existing entries | new tokens]
@@ -3530,8 +3627,8 @@ class LogStructuredKVCache(nn.Module):
             for b, row in enumerate(rows):
                 offsets[b, :len(row)] = row
                 valid[b, :len(row)] = True
-            idx = torch.from_numpy(offsets).to(k.device)
-            mask = torch.from_numpy(valid).to(k.device)
+            idx = _upload(offsets, k.device)
+            mask = _upload(valid, k.device)
             ki = idx[:, None, :, None].expand(-1, self.n_groups, -1, self.k_dim)
             vi = idx[:, None, :, None].expand(-1, self.n_groups, -1, self.v_dim)
             result = (torch.gather(keys, 2, ki, out=None if out is None else out[0]),
@@ -3693,12 +3790,14 @@ class LogStructuredKVCache(nn.Module):
         runs = [[0, int(flat), int(count), False]
                 for flat, count in zip(lane_ids * self.K_max + cluster, lengths)]
         last = pos[starts + lengths - 1]
-        lanes = []
-        for (b, g, c, _), count, end_phase, hi in zip(jobs, lengths.tolist(), (phase + lengths).tolist(), last.tolist()):
-            lanes.append((b, g, c))
-            self._set_semantic_level0_phase(b, g, c, end_phase)
-            self._set_semantic_p_hi(b, g, c, hi)
-            self._set_semantic_n_total(b, g, c, self._semantic_n_total[b][g][c] + count)
+        # Lanes are unique here (the batched append requires it), so totals can
+        # be read from the mirror up front.
+        lanes = [job[:3] for job in jobs]
+        totals = np.fromiter((self._semantic_n_total[b][g][c] for b, g, c in lanes),
+                             dtype=np.int64, count=len(lanes)) + lengths
+        self._set_semantic_scalars("level0_phase", lanes, (phase + lengths).tolist())
+        self._set_semantic_scalars("p_hi_c", lanes, last.tolist())
+        self._set_semantic_scalars("n_total", lanes, totals.tolist())
         # Segments are unchanged, but the per-job path rewrote them; keep the
         # same deferred device refresh.
         self._semantic_mark_scalar_dirty("current_segment")
@@ -3826,7 +3925,7 @@ class LogStructuredKVCache(nn.Module):
         meta[3] = [runs[j][2] for j in run_order]
         meta[4] = np.asarray([self.seg_forget if runs[j][3] else 1.0 for j in run_order],
                              dtype=np.float32).view(np.int32)
-        packed_t = torch.from_numpy(packed).to(dev, copy=False)
+        packed_t = _upload(packed, dev)
         at = packed_t[:n_tok]
         bi, gi, ti = packed_t[n_tok:4 * n_tok].view(3, n_tok).unbind(0)
         order_t = packed_t[4 * n_tok:4 * n_tok + len(order_vals)]

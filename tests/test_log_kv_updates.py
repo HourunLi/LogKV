@@ -230,6 +230,17 @@ def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype):
                                            msg=lambda detail: f"B={B}, step={step}, {name}\n{detail}")
 
 
+def test_ranges_index_matches_span_index():
+    import numpy as np
+
+    rng = np.random.default_rng(11)
+    for _ in range(50):
+        starts = rng.integers(0, 100, size=int(rng.integers(0, 12)))
+        lengths = rng.integers(-2, 6, size=starts.size)
+        spans = [(int(a), int(a + max(n, 0))) for a, n in zip(starts, lengths)]
+        assert np.array_equal(kv._ranges_to_index_array(starts, lengths), kv._spans_to_index_array(spans))
+
+
 def test_benchmark_checks_later_iterations(monkeypatch):
     import sys
     from unused import benchmark_log_kv_updates as benchmark
