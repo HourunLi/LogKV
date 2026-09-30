@@ -5,7 +5,7 @@ expid: qwen1.7b-32k-cpt-logKV-semantic-stage1-k1
 
 ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
 
-global_batch_size: 32
+global_batch_size: 64
 micro_batch_size: 2
 max_steps: 200
 learning_rate: 5e-5
