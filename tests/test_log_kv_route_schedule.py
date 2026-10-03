@@ -34,6 +34,7 @@ def test_cuda_schedule_polls_four_rounds_at_a_time_without_cuda(stop_round):
          patch.object(cache, "_semantic_unified_pair_matrix", return_value=None), \
          patch.object(cache, "_SEMANTIC_ROUTE_FLAG_BUFFERS", {(device, 1): torch.zeros(1, dtype=torch.int32)}), \
          patch.object(torch.Tensor, "to", lambda self, *args, **kwargs: self), \
+         patch.object(torch.Tensor, "pin_memory", lambda self: self), \
          patch("torch.cuda.Event", return_value=event), patch("torch.cuda.current_stream", return_value=object()):
         cache._semantic_unified_reduce_incremental(
             mu, [size], np.ones((1, size), dtype=np.float32),
