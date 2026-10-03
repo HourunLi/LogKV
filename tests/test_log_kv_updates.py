@@ -195,8 +195,8 @@ def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype):
     lanes = [(0, 0, 0), (0, 1, 7), (1, 0, 4), (1, 1, 1)]
     make_indices = cache._semantic_index_tensors
 
-    def checked_indices(*args):
-        fs, fd, si, gi, pi, vi, sd, cd = result = make_indices(*args)
+    def checked_indices(*args, **kwargs):
+        fs, fd, si, gi, pi, vi, sd, cd = result = make_indices(*args, **kwargs)
         for index in (fs, fd, si, gi, sd, cd):
             assert index.unique().numel() == index.numel()
         assert pi.numel() % 2 == 0

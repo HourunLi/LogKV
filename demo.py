@@ -544,6 +544,8 @@ def main(
     log_kv_semantic_replay_updates: bool = False,
     log_kv_alpha_exact_tokens: int = 0,
     log_kv_alpha_span_max_tokens: int = 64,
+    log_kv_beta_novelty: bool = False,
+    log_kv_beta_adaptive_merge: bool = False,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
     # ── Eval ──
@@ -636,6 +638,8 @@ def main(
     log_kv_semantic_replay_updates = bool(_o("log_kv_semantic_replay_updates", log_kv_semantic_replay_updates))
     log_kv_alpha_exact_tokens = int(_o("log_kv_alpha_exact_tokens", log_kv_alpha_exact_tokens))
     log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
+    log_kv_beta_novelty = bool(_o("log_kv_beta_novelty", log_kv_beta_novelty))
+    log_kv_beta_adaptive_merge = bool(_o("log_kv_beta_adaptive_merge", log_kv_beta_adaptive_merge))
     log_kv_profile_steps = _o("log_kv_profile_steps", log_kv_profile_steps)
     if log_kv_profile_steps is not None and (
         not isinstance(log_kv_profile_steps, (list, tuple))
@@ -870,6 +874,8 @@ def main(
             log_kv_semantic_replay_updates=log_kv_semantic_replay_updates,
             log_kv_alpha_exact_tokens=log_kv_alpha_exact_tokens,
             log_kv_alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
+            log_kv_beta_novelty=log_kv_beta_novelty,
+            log_kv_beta_adaptive_merge=log_kv_beta_adaptive_merge,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -1025,6 +1031,8 @@ def main(
         semantic_replay_updates=log_kv_semantic_replay_updates,
         alpha_exact_tokens=log_kv_alpha_exact_tokens,
         alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
+        beta_novelty=log_kv_beta_novelty,
+        beta_adaptive_merge=log_kv_beta_adaptive_merge,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
@@ -1052,6 +1060,7 @@ def main(
         f"centroid={log_kv_semantic_centroid_backend}, "
         f"replay_updates={log_kv_semantic_replay_updates}, "
         f"alpha_exact={log_kv_alpha_exact_tokens}, alpha_span_max={log_kv_alpha_span_max_tokens}, "
+        f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
         f"effective_B={model.transformer.h[0].attn.kv_cache.B})"
     )
 

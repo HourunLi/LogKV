@@ -1,0 +1,10 @@
+# Beta: Base initialization, independent output and both bounded algorithm changes.
+config: arc_alpha_cpt100.yaml
+expid: qwen1.7b-32k-beta-cpt100
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-beta-cpt100
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_beta_cpt100
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-beta-cpt100
+
+# Keep Alpha's 256 exact tokens, 64-token span cap and incremental unified route.
+log_kv_beta_novelty: true
+log_kv_beta_adaptive_merge: true

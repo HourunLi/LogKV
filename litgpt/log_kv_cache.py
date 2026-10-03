@@ -604,6 +604,8 @@ class LogStructuredKVCache(nn.Module):
         allocate_second_order: bool = True,
         alpha_exact_tokens: int = 0,
         alpha_span_max_tokens: int = 64,
+        beta_novelty: bool = False,
+        beta_adaptive_merge: bool = False,
     ) -> None:
         super().__init__()
 
@@ -620,7 +622,11 @@ class LogStructuredKVCache(nn.Module):
         self.semantic_clusters = bool(semantic_clusters)
         self.alpha_exact_tokens = int(alpha_exact_tokens)
         self.alpha_span_max_tokens = int(alpha_span_max_tokens)
+        self.beta_novelty = bool(beta_novelty)
+        self.beta_adaptive_merge = bool(beta_adaptive_merge)
         self.alpha_count = 0
+        if (self.beta_novelty or self.beta_adaptive_merge) and not self.alpha_exact_tokens:
+            raise ValueError("BetaLogKV requires the Alpha exact-span cache (alpha_exact_tokens > 0)")
         if self.alpha_exact_tokens < 0:
             raise ValueError("alpha_exact_tokens must be >= 0")
         if self.alpha_exact_tokens:
@@ -1511,7 +1517,7 @@ class LogStructuredKVCache(nn.Module):
             self._set_semantic_level_count(b, g, c, ell, self.B)
 
     def _semantic_index_tensors(
-        self, device: torch.device, *span_lists: list[tuple[int, int]]
+        self, device: torch.device, *span_lists: list[tuple[int, int]], extra: np.ndarray | None = None,
     ) -> list[torch.Tensor]:
         """Build several range-derived index tensors with ONE host->device copy.
 
@@ -1521,6 +1527,8 @@ class LogStructuredKVCache(nn.Module):
         so numpy builds them ~35x faster and they travel together.
         """
         arrays = [_spans_to_index_array(spans) for spans in span_lists]
+        if extra is not None:
+            arrays.append(extra.reshape(-1))
         sizes = [int(a.size) for a in arrays]
         total = sum(sizes)
         if total == 0:
@@ -1540,6 +1548,8 @@ class LogStructuredKVCache(nn.Module):
         lanes: list[tuple[int, int, int]],
         counts: list[int],
         block: tuple[torch.Tensor, ...],
+        *,
+        replay_cuts: dict[int, torch.Tensor] | None = None,
     ) -> None:
         """Fenwick-append `block` into many (b, g, cluster) ladders at once.
 
@@ -1553,8 +1563,17 @@ class LogStructuredKVCache(nn.Module):
         counts, so none of it costs a device sync. Indices are accumulated as
         ranges and moved once per level (see `_semantic_index_tensors`).
         """
+        if self.beta_adaptive_merge and self._replaying_updates and replay_cuts is None:
+            raise RuntimeError("Beta update replay requires recorded compaction cuts")
+        cut_records = None
         if self._update_actions is not None:
-            self._update_actions.append(("append", (tuple(lanes), tuple(counts)),
+            metadata = (tuple(lanes), tuple(counts))
+            kind = "append"
+            if self.beta_adaptive_merge:
+                cut_records = []
+                metadata = (*metadata, cut_records)
+                kind = "append_beta"
+            self._update_actions.append((kind, metadata,
                                          tuple(self._active_updates.save(x) for x in block)))
 
         self._mid_decode_state = None
@@ -1641,10 +1660,20 @@ class LogStructuredKVCache(nn.Module):
                 begin = n_store + sg_off + max(0, n_pair_rows - self.B)
                 surv_idx.append((begin, n_store + sg_off + m))
 
-            fs, fd, si, gi, pi, vi, sd, cd = self._semantic_index_tensors(
+            beta_lengths, beta_layout = None, None
+            if self.beta_adaptive_merge and recs:
+                beta_lengths = [n_pair_rows for _, _, _, n_pair_rows in recs]
+                if fused is not None:
+                    from litgpt.beta_log_kv import make_layout
+
+                    beta_layout = make_layout(beta_lengths, "cpu").numpy()
+            indices = self._semantic_index_tensors(
                 dev, fill_src, fill_dst, store_rows, stage_rows,
-                pair_idx, surv_idx, surv_dst, clear_dst,
+                pair_idx, surv_idx, surv_dst, clear_dst, extra=beta_layout,
             )
+            fs, fd, si, gi, pi, vi, sd, cd = indices[:8]
+            if beta_layout is not None:
+                beta_layout = indices[8].view(-1, 3)
 
             # Fill first: an overflowing lane's pooled rows include the slots this
             # very step just topped up.
@@ -1665,14 +1694,33 @@ class LogStructuredKVCache(nn.Module):
             if not recs:
                 return
 
+            cuts = None
+            if self.beta_adaptive_merge:
+                # Each lane supplies an even number of rows. Never group across
+                # concatenated lane boundaries, including a two-row tail.
+                if replay_cuts is not None:
+                    if ell not in replay_cuts:
+                        raise RuntimeError(f"missing Beta compaction cuts for level {ell}")
+                    cuts = replay_cuts[ell]
             if fused is not None:
-                carry = fused.merge_scatter(fields, stage, si, gi, pi, vi, sd, cd)
+                if self.beta_adaptive_merge:
+                    carry, cuts = fused.merge_scatter(fields, stage, si, gi, pi, vi, sd, cd,
+                                                       beta_lengths=beta_lengths, beta_cuts=cuts,
+                                                       beta_layout=beta_layout)
+                else:
+                    carry = fused.merge_scatter(fields, stage, si, gi, pi, vi, sd, cd)
             else:
                 pool = tuple(
                     torch.cat([f.index_select(0, si), x.index_select(0, gi).to(f.dtype)], dim=0) if f is not None else None
                     for f, x in zip(fields, stage)
                 )
-                carry = self._semantic_merge_block_pairs(tuple(x.index_select(0, pi) if x is not None else None for x in pool))
+                merge_block = tuple(x.index_select(0, pi) if x is not None else None for x in pool)
+                if self.beta_adaptive_merge:
+                    from litgpt.beta_log_kv import merge_blocks
+
+                    carry, cuts = merge_blocks(merge_block, beta_lengths, cuts=cuts)
+                else:
+                    carry = self._semantic_merge_block_pairs(merge_block)
                 for f, x in zip(fields, pool):
                     if f is not None:
                         f.index_copy_(0, sd, x.index_select(0, vi))
@@ -1680,6 +1728,9 @@ class LogStructuredKVCache(nn.Module):
                     for f in fields:
                         if f is not None:
                             f.index_fill_(0, cd, 0)
+
+            if cut_records is not None:
+                cut_records.append((ell, self._active_updates.save(cuts)))
 
             stage = carry
             spans = {}
@@ -2979,7 +3030,7 @@ class LogStructuredKVCache(nn.Module):
         XOR tie rule, disjoint mutual pairs, exact compactness verification and
         a per-lane budget of `count - target` pairs taken by increasing cost.
         Only the evaluation changed: distances are updated incrementally, and
-        the host reads one active flag per lane, one round behind the device.
+        the host reads one active flag per lane after each four device rounds.
         A candidate pair rejected by the exact check is pinned to its exact
         distance, so its rows may pair elsewhere in later rounds.
         """
@@ -3021,7 +3072,7 @@ class LogStructuredKVCache(nn.Module):
         return survivors, traces
 
     def _semantic_unified_reduce_incremental(self, mu, counts, weights, *, target, radius_limits, strict, original):
-        """Incremental rounds for every lane of `mu`; see `_semantic_unified_reduce_device`."""
+        """Incremental rounds, checking CUDA completion once per four rounds."""
         dev = mu.device
         size = mu.size(1)
         count = torch.tensor(counts, dtype=torch.int64).to(dev)
@@ -3037,25 +3088,29 @@ class LogStructuredKVCache(nn.Module):
             key = (dev, len(counts))
             flags = self._SEMANTIC_ROUTE_FLAG_BUFFERS.get(key)
             if flags is None:
-                flags = torch.zeros((2, len(counts)), dtype=torch.int32, pin_memory=True)
+                flags = torch.zeros(len(counts), dtype=torch.int32, pin_memory=True)
                 self._SEMANTIC_ROUTE_FLAG_BUFFERS[key] = flags
-            events = (torch.cuda.Event(), torch.cuda.Event())
+            event = torch.cuda.Event()
             stream = torch.cuda.current_stream(dev)
         # Every round before the last merges or pins a pair; the cap is a guard.
-        for round_ in range(1, 2 * size + 8):
+        last_round = 2 * size + 7
+        for round_ in range(1, last_round + 1):
             flag = self._semantic_unified_round(reducer, round_)
             if not asynchronous:
                 if not bool(flag.any()):
                     break
                 continue
-            # Queue this round, then read the previous one: the device never
-            # waits for Python, and at most one extra no-op round is queued.
-            flags[round_ % 2].copy_(flag, non_blocking=True)
-            events[round_ % 2].record(stream)
-            if round_ > 1:
-                events[(round_ - 1) % 2].synchronize()
-                if not bool(flags[(round_ - 1) % 2].any()):
-                    break
+            # Round order and pair selection stay unchanged. Once inactive,
+            # a lane cannot merge again: it reached TARGET or has no proposals
+            # and no dirty rows to rescan. At most three extra no-op rounds
+            # trade small launches for 4x fewer host waits and flag transfers.
+            if round_ % 4 and round_ != last_round:
+                continue
+            flags.copy_(flag, non_blocking=True)
+            event.record(stream)
+            event.synchronize()
+            if not bool(flags.any()):
+                break
         lane_traces, alive, stuck = reducer.finish()
         results = [(np.flatnonzero(alive[lane]), lane_traces[lane]) for lane in range(len(counts))]
         stuck_lanes = np.flatnonzero(stuck).tolist() if strict else []
@@ -3432,7 +3487,8 @@ class LogStructuredKVCache(nn.Module):
         host = [old + [0] * (old_width - len(old)) + new for old, new in zip(self._alpha_positions, positions_host)]
         with logkv_timed("alpha_select"):
             selected = select_spans(keys, values, self._alpha_spans, self._alpha_positions,
-                                    positions_host, span_ends, old_width, self.alpha_exact_tokens, self.alpha_span_max_tokens)
+                                    positions_host, span_ends, old_width, self.alpha_exact_tokens, self.alpha_span_max_tokens,
+                                    beta_novelty=self.beta_novelty, centroids=self.centroid, centroid_valid=self.alive)
 
         def gather(rows, width, out=None):
             offsets = np.zeros((self.batch_size, width), dtype=np.int64)
@@ -3452,17 +3508,30 @@ class LogStructuredKVCache(nn.Module):
             result[2].masked_fill_(~mask, 0)
             return (*result, mask)
 
-        # Sources are independent cat buffers; write straight into persistent
-        # exact storage without three staging allocations and copy kernels.
-        *_, valid = gather(selected.keep, self.alpha_exact_tokens,
-                           out=(self.alpha_k_raw, self.alpha_v, self.alpha_pos))
-        self.alpha_valid.copy_(valid)
-        self.alpha_count = max(map(len, selected.keep), default=0)
-        self._alpha_spans, self._alpha_positions = selected.spans, selected.positions
         counts = list(map(len, selected.archive))
         width = max(counts, default=0)
+        fused = _triton_updates() if keys.is_cuda else None
+        if fused is not None:
+            # One index upload and one copy kernel for both destinations,
+            # including zero-filled ragged rows. The cat sources do not alias
+            # the exact pool we overwrite, so no cross-CTA read/write race.
+            offsets = np.full((self.batch_size, self.alpha_exact_tokens + width), -1, dtype=np.int64)
+            for b, (keep, archive) in enumerate(zip(selected.keep, selected.archive)):
+                offsets[b, :len(keep)] = keep
+                offsets[b, self.alpha_exact_tokens:self.alpha_exact_tokens + len(archive)] = archive
+            ak, av, ap = fused.alpha_partition(
+                keys, values, pos, torch.from_numpy(offsets).to(k.device),
+                (self.alpha_k_raw, self.alpha_v, self.alpha_pos, self.alpha_valid),
+            )
+        else:
+            *_, valid = gather(selected.keep, self.alpha_exact_tokens,
+                               out=(self.alpha_k_raw, self.alpha_v, self.alpha_pos))
+            self.alpha_valid.copy_(valid)
+            if width:
+                ak, av, ap, _ = gather(selected.archive, width)
+        self.alpha_count = max(map(len, selected.keep), default=0)
+        self._alpha_spans, self._alpha_positions = selected.spans, selected.positions
         if width:
-            ak, av, ap, _ = gather(selected.archive, width)
             archive_host = [[host[b][i] for i in row] + [0] * (width - len(row))
                             for b, row in enumerate(selected.archive)]
             self._semantic_route_unified(ak, av, ap, archive_host, record=record, token_counts=counts)
@@ -4195,6 +4264,7 @@ class LogStructuredKVCache(nn.Module):
                          self.semantic_unified_route, self.semantic_merge_passes,
                          self.K_max, self.B, self.L_alloc, self.recent_size, self.semantic_flush_granularity,
                          self.alpha_exact_tokens, self.alpha_span_max_tokens,
+                         self.beta_novelty, self.beta_adaptive_merge,
                          tuple(map(tuple, kwargs.get("span_ends") or ())))
             if self._replaying_updates:
                 if not replay or key not in updates.flushes:
@@ -4223,7 +4293,15 @@ class LogStructuredKVCache(nn.Module):
                                 for tensor in block:
                                     if tensor is not None:
                                         tensor.record_stream(stream)
-                            self._semantic_append_entries_batched(*metadata, block)
+                            if kind == "append_beta":
+                                lanes, counts, cut_indices = metadata
+                                cuts = {ell: updates.tensors[index] for ell, index in cut_indices}
+                                if ready is not None:
+                                    for tensor in cuts.values():
+                                        tensor.record_stream(stream)
+                                self._semantic_append_entries_batched(lanes, counts, block, replay_cuts=cuts)
+                            else:
+                                self._semantic_append_entries_batched(*metadata, block)
                 for name, index in zip(self._UPDATE_DEVICE_FIELDS, state):
                     tensor = updates.tensors[index]
                     if ready is not None:
@@ -6101,7 +6179,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
     alive at any time. Peak memory: O(T + train_block*S) instead of O(T*S).
     Semantic replay additionally saves O(T/train_block*S) compact integer/bool
     anchor metadata, avoiding repeated sorting and device-to-host counts. It
-    never retains the per-chunk K/V payload and releases plans after backward.
+    releases plans after backward. Update replay additionally retains detached
+    write payloads and state until this graph's backward completes.
     When a Block checkpoint has LogKV routing contexts installed, its recompute
     reuses the original op-log instead of calculating routing decisions again.
     Both replay passes share CPU-only parsed schedules owned by this graph;
@@ -6114,9 +6193,9 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         token's own block (the cache commits detached copies), so per-block
         grads are complete and disjoint, and the replayed per-block
         ``autograd.grad`` reproduces them one-to-one.
-      - The replay is deterministic: compaction is pure mean-pooling with
-        count-based binary carries — no RNG, identical shapes take identical
-        kernels — so the rebuilt per-block prefix states equal forward's.
+      - Routing and exact-span choices are recorded. Beta also records its
+        content-dependent compaction cuts; replay applies these same weighted
+        merges without reselecting, rebuilding the forward prefix states.
       - Backward does not depend on any cache state forward left behind: it
         resets the buffers AND re-derives ``cache.second_order`` from its own
         ``second_order_scale`` before replaying, so neither interleaved
@@ -6154,6 +6233,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             cache.semantic_centroid_backend, cache.semantic_replay_updates,
             cache.semantic_unified_route, cache.semantic_merge_passes,
             cache.alpha_exact_tokens, cache.alpha_span_max_tokens, ctx.span_ends,
+            cache.beta_novelty, cache.beta_adaptive_merge,
         )
         checkpoint_log = checkpoint_route_replay(cache, signature)
         updates = (_SemanticReplayUpdates() if checkpoint_log is None else checkpoint_log[4]) if cache.semantic_replay_updates else None
@@ -6229,7 +6309,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.update_flushes = updates.flushes if updates is not None else None
         ctx.update_config = (cache.semantic_centroid_backend,
                              cache.semantic_replay_updates, cache.semantic_unified_route, cache.semantic_merge_passes,
-                             cache.alpha_exact_tokens, cache.alpha_span_max_tokens)
+                             cache.alpha_exact_tokens, cache.alpha_span_max_tokens,
+                             cache.beta_novelty, cache.beta_adaptive_merge)
         ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors,
                               *(updates.tensors if updates is not None else ()))
         ctx.has_attention_plans = cache.semantic_clusters
@@ -6258,7 +6339,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         cache = ctx.cache
         if ctx.update_config != (cache.semantic_centroid_backend,
                                  cache.semantic_replay_updates, cache.semantic_unified_route, cache.semantic_merge_passes,
-                                 cache.alpha_exact_tokens, cache.alpha_span_max_tokens):
+                                 cache.alpha_exact_tokens, cache.alpha_span_max_tokens,
+                                 cache.beta_novelty, cache.beta_adaptive_merge):
             raise RuntimeError("semantic update configuration changed between forward and backward")
         updates = (_SemanticReplayUpdates(ctx.update_flushes, saved[ctx.update_tensor_offset:])
                    if ctx.update_flushes is not None else None)

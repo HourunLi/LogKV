@@ -22,7 +22,8 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
                       f"log_kv_semantic_replay_updates: {'true' if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_anchor_mode: {anchor_mode}\nlog_kv_semantic_pack_backend: {pack_backend}\n")
     if setting is not None:
-        parent.write_text(parent.read_text() + f"log_kv_semantic_{route}: {setting}\n")
+        parent.write_text(parent.read_text() + f"log_kv_semantic_{route}: {setting}\n"
+                          f"log_kv_beta_novelty: {setting}\nlog_kv_beta_adaptive_merge: {setting}\n")
     config = tmp_path / "run.yaml"
     config.write_text("config: base.yaml\n")
     source = (Path(__file__).resolve().parents[1] / script).read_text()
@@ -61,6 +62,10 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
     assert args[args.index("--log_kv_semantic_merge_passes") + 1] == ("4" if anchor_mode == "mid" else "1")
     assert args[args.index("--log_kv_alpha_exact_tokens") + 1] == "256"
     assert args[args.index("--log_kv_alpha_span_max_tokens") + 1] == "64"
+    for name in ("novelty", "adaptive_merge"):
+        flag = "--log_kv_beta_" + name
+        assert args.count(flag) == 1
+        assert args[args.index(flag) + 1] == expected
     assert args[args.index("--log_kv_semantic_anchor_mode") + 1] == anchor_mode
     assert args[args.index("--log_kv_semantic_pack_backend") + 1] == pack_backend
 

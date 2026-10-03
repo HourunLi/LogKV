@@ -411,6 +411,8 @@ class GPT(nn.Module):
         semantic_replay_updates: bool = False,
         alpha_exact_tokens: int = 0,
         alpha_span_max_tokens: int = 64,
+        beta_novelty: bool = False,
+        beta_adaptive_merge: bool = False,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -504,6 +506,8 @@ class GPT(nn.Module):
                 semantic_replay_updates=semantic_replay_updates,
                 alpha_exact_tokens=alpha_exact_tokens,
                 alpha_span_max_tokens=alpha_span_max_tokens,
+                beta_novelty=beta_novelty,
+                beta_adaptive_merge=beta_adaptive_merge,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -576,6 +580,8 @@ class GPT(nn.Module):
         semantic_replay_updates: bool = False,
         alpha_exact_tokens: int = 0,
         alpha_span_max_tokens: int = 64,
+        beta_novelty: bool = False,
+        beta_adaptive_merge: bool = False,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -660,6 +666,8 @@ class GPT(nn.Module):
                 semantic_replay_updates=semantic_replay_updates,
                 alpha_exact_tokens=alpha_exact_tokens,
                 alpha_span_max_tokens=alpha_span_max_tokens,
+                beta_novelty=beta_novelty,
+                beta_adaptive_merge=beta_adaptive_merge,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -1455,6 +1463,8 @@ class CausalSelfAttention(nn.Module):
         semantic_replay_updates: bool = False,
         alpha_exact_tokens: int = 0,
         alpha_span_max_tokens: int = 64,
+        beta_novelty: bool = False,
+        beta_adaptive_merge: bool = False,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1522,6 +1532,8 @@ class CausalSelfAttention(nn.Module):
             semantic_replay_updates=semantic_replay_updates,
             alpha_exact_tokens=alpha_exact_tokens,
             alpha_span_max_tokens=alpha_span_max_tokens,
+            beta_novelty=beta_novelty,
+            beta_adaptive_merge=beta_adaptive_merge,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,
