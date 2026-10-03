@@ -38,6 +38,43 @@ def test_tokenizer_boundary_table_keeps_identifier_hyphens_and_colons():
     assert tokenizer.alpha_span_boundary_ids == (3, 4, 6, 7, 8, 9)
 
 
+def _token_loop_runs(new_pos, ends, pending, pending_pos, max_span):
+    """The per-token span rule that `_new_runs` vectorizes."""
+    current, out, pending_closed = list(range(-pending, 0)), [], False
+    last = pending_pos
+    for j, (pos, end) in enumerate(zip(new_pos, ends)):
+        if current and pos != last + 1:
+            if current[0] < 0 and current[-1] < 0:
+                pending_closed = True
+            else:
+                out.append((max(current[0], 0), current[-1] + 1, True))
+            current = []
+        current.append(j)
+        last = pos
+        if end or len(current) == max_span:
+            out.append((max(current[0], 0), current[-1] + 1, True))
+            current = []
+    if current and current[-1] >= 0:
+        out.append((max(current[0], 0), current[-1] + 1, False))
+    return pending_closed, out
+
+
+def test_vectorized_span_runs_match_token_loop():
+    from litgpt.alpha_log_kv import _new_runs
+
+    generator = torch.Generator().manual_seed(11)
+    for _ in range(400):
+        count, max_span = int(torch.randint(0, 30, (), generator=generator)), int(torch.randint(1, 6, (), generator=generator))
+        pending = int(torch.randint(0, max_span + 2, (), generator=generator))
+        steps = 1 + (torch.rand(count, generator=generator) < .1).long() * torch.randint(1, 4, (count,), generator=generator)
+        new_pos = (100 + steps.cumsum(0)).tolist()
+        ends = (torch.rand(count, generator=generator) < .2).tolist()
+        pending_pos = new_pos[0] - int(torch.randint(1, 3, (), generator=generator)) if count else 0
+        closed, starts, stops, done = _new_runs(new_pos, ends, pending, pending_pos, max_span)
+        assert (closed, list(zip(starts.tolist(), stops.tolist(), done.tolist()))) == \
+            _token_loop_runs(new_pos, ends, pending, pending_pos, max_span)
+
+
 def test_spans_are_whole_and_pending_crosses_flush_and_cap():
     k = torch.randn(1, 2, 7, 8)
     result = select_spans(k, k, [[(2, False)]], [[0, 1]], [[2, 3, 4, 5, 6]],

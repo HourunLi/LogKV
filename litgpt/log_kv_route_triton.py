@@ -541,7 +541,7 @@ class UnifiedReduce:
     def _compact(self):
         lanes, size = self.mass.shape
         _compact_live[(lanes,)](self.alive, self.order, self.listed, size,
-                                min(2048, triton.next_power_of_2(size)), num_warps=4)
+                                min(2048, max(32, triton.next_power_of_2(size))), num_warps=4)
 
     def _scan(self, round_, *, full=False):
         lanes, size = self.mass.shape
