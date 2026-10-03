@@ -339,7 +339,7 @@ def _triton_route():
 
 def _spans_to_index_array(spans: list[tuple[int, int]]) -> np.ndarray:
     """Concatenate half-open ``[start, stop)`` ranges into one int64 array."""
-    if not spans:
+    if len(spans) == 0:
         return _EMPTY_INDEX
     if len(spans) == 1:
         start, stop = spans[0]
@@ -351,6 +351,22 @@ def _spans_to_index_array(spans: list[tuple[int, int]]) -> np.ndarray:
     if not total:
         return _EMPTY_INDEX
     return np.repeat(bounds[:, 0] - (np.cumsum(lengths) - lengths), lengths) + np.arange(total, dtype=np.int64)
+
+
+def _upload(values, device) -> torch.Tensor:
+    """Host metadata to `device` without a hidden stream synchronization.
+
+    A blocking copy from pageable memory is `memcpy_and_sync`: the host waits
+    for every queued kernel, so host scheduling cannot overlap device work.
+    Pinned staging makes the copy asynchronous; the caching host allocator
+    keeps the staging block until the copy's stream event completes, and the
+    caller's array may be reused at once. CPU devices alias as before.
+    """
+    tensor = values if isinstance(values, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(values))
+    device = torch.device(device)
+    if device.type != "cuda" or not tensor.numel():
+        return tensor.to(device)
+    return tensor.pin_memory().to(device, non_blocking=True)
 
 
 _UNIFIED_INF_KEY = 0x7F800000 << 32
@@ -1142,7 +1158,7 @@ class LogStructuredKVCache(nn.Module):
             if name not in dirty:
                 continue
             buf = getattr(self, name)
-            buf.copy_(torch.tensor(getattr(self, mirror), dtype=dtype, device="cpu"))
+            buf.copy_(_upload(torch.tensor(getattr(self, mirror), dtype=dtype), buf.device))
         dirty.clear()
 
     def _semantic_mark_scalar_dirty(self, name: str) -> bool:
@@ -1534,8 +1550,7 @@ class LogStructuredKVCache(nn.Module):
         if total == 0:
             empty = torch.empty(0, dtype=torch.long, device=device)
             return [empty] * len(arrays)
-        flat = torch.from_numpy(np.concatenate(arrays) if len(arrays) > 1 else arrays[0])
-        flat = flat.to(device, copy=False)
+        flat = _upload(np.concatenate(arrays) if len(arrays) > 1 else arrays[0], device)
         out: list[torch.Tensor] = []
         off = 0
         for n in sizes:
@@ -1871,7 +1886,7 @@ class LogStructuredKVCache(nn.Module):
                 pending = self._pending_op_rows = {}
             pending.setdefault((b, g), []).append(array)
         else:
-            self.op_log[b, g, idx:end] = torch.from_numpy(array.astype(np.int32)).to(self.op_log.device)
+            self.op_log[b, g, idx:end] = _upload(array.astype(np.int32), self.op_log.device)
             self.op_log_len[b, g] = end
         if hasattr(self, "_op_log_len_host"):
             # Column lists give Python ints directly; zip builds the row tuples.
@@ -1896,10 +1911,15 @@ class LogStructuredKVCache(nn.Module):
             else:
                 rows.append(np.asarray(self._op_log_host[b][g][start:end], dtype=np.int32).reshape(-1, 4))
         pending.clear()
-        indices = torch.from_numpy(_spans_to_index_array(spans)).to(self.op_log.device)
-        values = torch.from_numpy(np.concatenate(rows)).to(self.op_log.device)
-        self.op_log.view(-1, 4).index_copy_(0, indices, values)
-        self.op_log_len.copy_(torch.tensor(self._op_log_len_host, dtype=torch.int32))
+        indices = _spans_to_index_array(spans)
+        values = np.concatenate(rows)
+        # One upload: indices, int32 rows widened to int64, then the lengths.
+        packed = _upload(np.concatenate((indices, values.reshape(-1).astype(np.int64),
+                                         np.asarray(self._op_log_len_host, dtype=np.int64).reshape(-1))),
+                         self.op_log.device)
+        n = len(indices)
+        self.op_log.view(-1, 4).index_copy_(0, packed[:n], packed[n:5 * n].view(n, 4).to(torch.int32))
+        self.op_log_len.copy_(packed[5 * n:].view(self.op_log_len.shape))
         starts.clear()
 
     def _record_semantic_join_run(
@@ -2078,7 +2098,7 @@ class LogStructuredKVCache(nn.Module):
             return
         lanes = [(b, g, c) for b, g, c, _ in jobs]
         self._semantic_clear_clusters(lanes)
-        indices = torch.tensor(jobs, device=k_raw.device, dtype=torch.long).T
+        indices = _upload(np.asarray(jobs, dtype=np.int64).reshape(-1, 4), k_raw.device).T
         bi, gi, ci, ti = indices.unbind(0)
         ids = (bi * self.n_groups + gi) * self.K_max + ci
         key, value, pos = k_raw.detach()[bi, gi, ti], v.detach()[bi, gi, ti], positions[bi, ti].long()
@@ -2280,8 +2300,8 @@ class LogStructuredKVCache(nn.Module):
         if self._update_actions is not None:
             self._update_actions.append(("clear_batch", tuple(lanes), ()))
         self._mid_decode_state = None
-        ids = torch.tensor([(b * self.n_groups + g) * self.K_max + c for b, g, c in lanes],
-                           device=self.level_k.device, dtype=torch.long)
+        ids = _upload(np.asarray([(b * self.n_groups + g) * self.K_max + c for b, g, c in lanes], dtype=np.int64),
+                      self.level_k.device)
         fields = ["level_k", "level_v", "level_w", "level_imp", "level_p_lo", "level_p_hi",
                   "level_sum_wp", "level_order", "pad_mask"]
         if self.allocate_second_order:
@@ -2338,9 +2358,9 @@ class LogStructuredKVCache(nn.Module):
         segment_end = np.repeat(np.cumsum(sides), sides)
         phases = np.arange(len(source), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
         # One upload for the entry ordering, phases, cluster ids and masses.
-        packed = torch.from_numpy(np.concatenate((
+        packed = _upload(np.concatenate((
             source, segment, segment_end, phases, keep_ids, free_ids, masses,
-        )).astype(np.int64)).to(self.level_k.device)
+        )).astype(np.int64), self.level_k.device)
         n, n_jobs = len(source), len(jobs)
         source_t, segment_t, end_t, phase_t = packed[:4 * n].view(4, n).unbind(0)
         ki, fi = packed[4 * n:4 * n + 2 * n_jobs].view(2, n_jobs).unbind(0)
@@ -3044,7 +3064,7 @@ class LogStructuredKVCache(nn.Module):
         buffer, lane_index = mu, None
         if len(active) < lanes:
             size = max(counts[i] for i in active)
-            lane_index = torch.tensor(active, device=dev)
+            lane_index = _upload(np.asarray(active, dtype=np.int64), dev)
             mu = buffer.index_select(0, lane_index)[:, :size].contiguous()
             weights = weights[active, :size]
         else:
@@ -3075,10 +3095,10 @@ class LogStructuredKVCache(nn.Module):
         """Incremental rounds, checking CUDA completion once per four rounds."""
         dev = mu.device
         size = mu.size(1)
-        count = torch.tensor(counts, dtype=torch.int64).to(dev)
+        count = _upload(np.asarray(counts, dtype=np.int64), dev)
         # A copy: the rounds update masses in place and CPU from_numpy would alias.
-        mass = torch.from_numpy(np.array(weights, dtype=np.float32)).to(dev)
-        limits = None if radius_limits is None else torch.tensor(radius_limits, dtype=torch.float32).to(dev)
+        mass = _upload(np.array(weights, dtype=np.float32), dev)
+        limits = None if radius_limits is None else _upload(np.asarray(radius_limits, dtype=np.float32), dev)
         dist = self._semantic_unified_pair_matrix(mu)
         fused = _triton_route() if dev.type == "cuda" else None
         reducer_type = getattr(fused, "UnifiedReduce", None) or _UnifiedReduceTorch
@@ -3358,7 +3378,7 @@ class LogStructuredKVCache(nn.Module):
             src_new = np.concatenate([lane * tokens + roots for lane, roots in enumerate(candidates)])
             dst_new = np.concatenate([lane * size + len(old) + np.arange(len(roots))
                                       for lane, (old, roots) in enumerate(zip(live, candidates))])
-            index = torch.from_numpy(np.concatenate((src_old, dst_old, src_new, dst_new))).to(k_raw.device)
+            index = _upload(np.concatenate((src_old, dst_old, src_new, dst_new)), k_raw.device)
             n_old, n_new = len(src_old), len(src_new)
             centers = mu.new_zeros((width * size, dim))
             if n_old:
@@ -3408,65 +3428,89 @@ class LogStructuredKVCache(nn.Module):
         commit(sorted(jobs, key=lambda job: job[:3]), k_raw, v, positions, positions_host, record=record)
 
     def _alpha_commit_joins(self, jobs, k_raw, v, positions, positions_host, *, record):
-        """Insert delayed exact evictions in position order, batching affected clusters."""
-        ordinary, delayed = [], []
-        for job in jobs:
-            b, g, c, offsets = job
-            (delayed if min(positions_host[b][i] for i in offsets) < self._semantic_p_hi_c[b][g][c]
-             else ordinary).append(job)
-        self._semantic_commit_joins(ordinary, k_raw, v, positions, positions_host, record=record)
-        if not delayed:
+        """Insert delayed exact evictions in position order, batching affected clusters.
+
+        Most clusters receive some evicted exact token, so this path is common.
+        Host work is whole-array NumPy, and the position order is one device
+        stable sort keyed by (lane, position) instead of reading ladder
+        positions back: old entries never lie past their cluster's p_hi.
+        """
+        if not jobs:
             return
+        host_pos = np.asarray(positions_host, dtype=np.int64)
+        n_jobs = len(jobs)
+        lengths = np.fromiter((len(job[3]) for job in jobs), dtype=np.int64, count=n_jobs)
+        offsets = np.concatenate([np.asarray(job[3], dtype=np.int64) for job in jobs])
+        batch = np.fromiter((job[0] for job in jobs), dtype=np.int64, count=n_jobs)
+        owner = np.repeat(np.arange(n_jobs), lengths)
+        token_pos = host_pos[batch[owner], offsets]
+        p_hi = np.fromiter((self._semantic_p_hi_c[b][g][c] for b, g, c, _ in jobs), dtype=np.int64, count=n_jobs)
+        late = np.minimum.reduceat(token_pos, np.cumsum(lengths) - lengths) < p_hi
+        flags = late.tolist()
+        self._semantic_commit_joins([job for job, d in zip(jobs, flags) if not d],
+                                    k_raw, v, positions, positions_host, record=record)
+        if not late.any():
+            return
+        delayed = [job for job, d in zip(jobs, flags) if d]
+        nd, n_levels = len(delayed), self.L_alloc
+        late_tokens = late[owner]
+        new_len, new_off, new_pos = lengths[late], offsets[late_tokens], token_pos[late_tokens]
+        lane_b = batch[late]
+        lane_g = np.fromiter((g for _, g, _, _ in delayed), dtype=np.int64, count=nd)
+        lane_c = np.fromiter((c for _, _, c, _ in delayed), dtype=np.int64, count=nd)
+        lane_id = (lane_b * self.n_groups + lane_g) * self.K_max + lane_c
+        level_counts = np.array([self._semantic_counts[b][g][c] for b, g, c, _ in delayed], dtype=np.int64)
+        span_start = (lane_id * n_levels)[:, None] * self.B + np.arange(n_levels) * self.B
+        src = _spans_to_index_array(np.stack((span_start, span_start + level_counts), -1).reshape(-1, 2))
+        old_counts = level_counts.sum(1)
+        counts = old_counts + new_len
+        new_owner = np.repeat(np.arange(nd), new_len)
+        # Per lane: its old entries (ladder order) then its new tokens, as in
+        # the former per-lane concatenation; `rank` is also the new phase.
+        segment = np.repeat(np.arange(nd), counts)
+        rank = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+        old_n = old_counts[segment]
+        lane_major = np.where(rank < old_n, (np.cumsum(old_counts) - old_counts)[segment] + rank,
+                              len(src) + (np.cumsum(new_len) - new_len)[segment] + rank - old_n)
+        n_src, n_new, n_all = len(src), len(new_off), len(rank)
+        # One upload for gathers, ordering, phases and centroid metadata.
+        packed = _upload(np.concatenate((src, lane_b[new_owner], lane_g[new_owner], new_off, lane_id, new_len,
+                                         lane_major, segment, rank)), k_raw.device)
+        cut = np.cumsum([n_src, 3 * n_new, nd, nd, n_all, n_all])
+        src_t = packed[:cut[0]]
+        bi, gi, ti = packed[cut[0]:cut[1]].view(3, n_new).unbind(0)
+        ids, lengths_t = packed[cut[1]:cut[2]], packed[cut[2]:cut[3]]
+        lane_major_t, segment_t, phase_t = packed[cut[3]:cut[4]], packed[cut[4]:cut[5]], packed[cut[5]:]
         fields = self._semantic_flat_level_fields()
-        spans, counts, new_indices, old_counts = [], [], [], []
-        for b, g, c, offsets in delayed:
-            base = self._semantic_lane_base(b, g, c)
-            n = 0
-            for ell, count in enumerate(self._semantic_counts[b][g][c]):
-                spans.append((base + ell * self.B, base + ell * self.B + count))
-                n += count
-            old_counts.append(n)
-            counts.append(n + len(offsets))
-            new_indices.extend((b, g, int(i)) for i in offsets)
-        src = torch.from_numpy(_spans_to_index_array(spans)).to(k_raw.device)
-        # One metadata read for all delayed lanes; no per-token CUDA sync.
-        old_pos = fields[8][src].cpu().numpy()
-        index = torch.tensor(new_indices, device=k_raw.device, dtype=torch.long).T
-        bi, gi, ti = index.unbind(0)
         nk, nv, np_ = k_raw[bi, gi, ti], v[bi, gi, ti], positions[bi, ti]
-        n_new = len(new_indices)
         new = (nk, nv, self.level_w.new_ones(n_new), *self._empty_stats(nk, nv),
                np_, np_, np_, self.level_order.new_zeros(n_new), self.pad_mask.new_zeros(n_new))
-        combined = tuple(torch.cat((field[src], value), 0) if field is not None else None
+        combined = tuple(torch.cat((field[src_t], value), 0) if field is not None else None
                          for field, value in zip(fields, new))
-        orders, phases, old_start, new_start = [], [], 0, 0
-        totals, highs = [], []
-        for (b, g, c, offsets), old_n, count in zip(delayed, old_counts, counts):
-            idx = np.concatenate((np.arange(old_start, old_start + old_n),
-                                  len(src) + np.arange(new_start, new_start + len(offsets))))
-            pos = np.concatenate((old_pos[old_start:old_start + old_n],
-                                  np.asarray(positions_host[b])[offsets]))
-            orders.append(idx[np.argsort(pos, kind="stable")])
-            phases.append(np.arange(count, dtype=np.int64))
-            totals.append(self._semantic_n_total[b][g][c] + len(offsets))
-            highs.append(max(self._semantic_p_hi_c[b][g][c], int(pos.max())))
-            if record:
-                self._record_ops(b, g, [(LOG_KV_OP_JOIN, c, 0, int(positions_host[b][i])) for i in offsets])
-            old_start += old_n
-            new_start += len(offsets)
-        order = torch.from_numpy(np.concatenate(orders)).to(k_raw.device)
+        # Positions are nonnegative and below 2**40; the lane id leads the key.
+        key = (segment_t << 40) | combined[8].index_select(0, lane_major_t)
+        order = lane_major_t.index_select(0, torch.argsort(key, stable=True))
         block = tuple(x[order] if x is not None else None for x in combined)
-        block = block[:11] + (torch.from_numpy(np.concatenate(phases)).to(k_raw.device), block[12])
-        lanes = [job[:3] for job in delayed]
-        ids = torch.tensor([(b * self.n_groups + g) * self.K_max + c for b, g, c in lanes], device=k_raw.device)
-        lengths = torch.tensor([len(job[3]) for job in delayed], device=k_raw.device)
-        sums = torch.segment_reduce(nk.float(), "sum", lengths=lengths, unsafe=True)
+        block = block[:11] + (phase_t, block[12])
+        if record:
+            rows = np.empty((n_new, 4), dtype=np.int64)
+            rows[:, 0], rows[:, 1], rows[:, 2], rows[:, 3] = LOG_KV_OP_JOIN, lane_c[new_owner], 0, new_pos
+            lane_rows = (lane_b * self.n_groups + lane_g)[new_owner]
+            bounds = np.concatenate(([0], np.flatnonzero(lane_rows[1:] != lane_rows[:-1]) + 1, [n_new]))
+            for lo, hi in zip(bounds[:-1].tolist(), bounds[1:].tolist()):
+                self._record_ops(int(lane_b[new_owner[lo]]), int(lane_g[new_owner[lo]]), rows[lo:hi])
+        new_start = np.cumsum(new_len) - new_len
+        highs = np.maximum(p_hi[late], np.maximum.reduceat(new_pos, new_start)).tolist()
+        sums = torch.segment_reduce(nk.float(), "sum", lengths=lengths_t, unsafe=True)
         mu, ne = self.centroid.flatten(0, 2), self.n_eff.flatten()
         pre = ne[ids]
-        updated = (pre[:, None] * mu[ids] + sums) / (pre + lengths)[:, None]
+        updated = (pre[:, None] * mu[ids] + sums) / (pre + lengths_t)[:, None]
+        lanes = [job[:3] for job in delayed]
+        totals = [self._semantic_n_total[b][g][c] + n for (b, g, c), n in zip(lanes, new_len.tolist())]
         self._semantic_clear_clusters(lanes)
         mu.index_copy_(0, ids, updated)
-        ne.index_copy_(0, ids, pre + lengths)
+        ne.index_copy_(0, ids, pre + lengths_t)
+        counts = counts.tolist()
         for (b, g, c), total, hi, count in zip(lanes, totals, highs, counts):
             self._set_semantic_alive(b, g, c, True)
             self._set_semantic_n_total(b, g, c, total)
@@ -3480,11 +3524,10 @@ class LogStructuredKVCache(nn.Module):
         from litgpt.alpha_log_kv import select_spans
         if span_ends is None:
             raise ValueError("AlphaLogKV requires natural span boundaries")
-        old_width = self.alpha_count
+        old_width, old_positions = self.alpha_count, self._alpha_positions
         keys = torch.cat((self.alpha_k_raw[:, :, :old_width], k), dim=2)
         values = torch.cat((self.alpha_v[:, :, :old_width], v), dim=2)
         pos = torch.cat((self.alpha_pos[:, :old_width], positions), dim=1)
-        host = [old + [0] * (old_width - len(old)) + new for old, new in zip(self._alpha_positions, positions_host)]
         with logkv_timed("alpha_select"):
             selected = select_spans(keys, values, self._alpha_spans, self._alpha_positions,
                                     positions_host, span_ends, old_width, self.alpha_exact_tokens, self.alpha_span_max_tokens,
@@ -3496,8 +3539,8 @@ class LogStructuredKVCache(nn.Module):
             for b, row in enumerate(rows):
                 offsets[b, :len(row)] = row
                 valid[b, :len(row)] = True
-            idx = torch.from_numpy(offsets).to(k.device)
-            mask = torch.from_numpy(valid).to(k.device)
+            idx = _upload(offsets, k.device)
+            mask = _upload(valid, k.device)
             ki = idx[:, None, :, None].expand(-1, self.n_groups, -1, self.k_dim)
             vi = idx[:, None, :, None].expand(-1, self.n_groups, -1, self.v_dim)
             result = (torch.gather(keys, 2, ki, out=None if out is None else out[0]),
@@ -3520,7 +3563,7 @@ class LogStructuredKVCache(nn.Module):
                 offsets[b, :len(keep)] = keep
                 offsets[b, self.alpha_exact_tokens:self.alpha_exact_tokens + len(archive)] = archive
             ak, av, ap = fused.alpha_partition(
-                keys, values, pos, torch.from_numpy(offsets).to(k.device),
+                keys, values, pos, _upload(offsets, k.device),
                 (self.alpha_k_raw, self.alpha_v, self.alpha_pos, self.alpha_valid),
             )
         else:
@@ -3532,8 +3575,16 @@ class LogStructuredKVCache(nn.Module):
         self.alpha_count = max(map(len, selected.keep), default=0)
         self._alpha_spans, self._alpha_positions = selected.spans, selected.positions
         if width:
-            archive_host = [[host[b][i] for i in row] + [0] * (width - len(row))
-                            for b, row in enumerate(selected.archive)]
+            # [old pool | flush] host positions, gathered for the archive rows.
+            host = np.zeros((self.batch_size, old_width + k.size(2)), dtype=np.int64)
+            for b, old in enumerate(old_positions):
+                host[b, :len(old)] = old
+            host[:, old_width:] = positions_host
+            rows = np.zeros((self.batch_size, width), dtype=np.int64)
+            for b, row in enumerate(selected.archive):
+                rows[b, :len(row)] = row
+            live = np.arange(width) < np.asarray(counts)[:, None]
+            archive_host = np.where(live, np.take_along_axis(host, rows, 1), 0).tolist()
             self._semantic_route_unified(ak, av, ap, archive_host, record=record, token_counts=counts)
 
     def _semantic_commit_joins(
@@ -3805,7 +3856,7 @@ class LogStructuredKVCache(nn.Module):
         meta[3] = [runs[j][2] for j in run_order]
         meta[4] = np.asarray([self.seg_forget if runs[j][3] else 1.0 for j in run_order],
                              dtype=np.float32).view(np.int32)
-        packed_t = torch.from_numpy(packed).to(dev, copy=False)
+        packed_t = _upload(packed, dev)
         at = packed_t[:n_tok]
         bi, gi, ti = packed_t[n_tok:4 * n_tok].view(3, n_tok).unbind(0)
         order_t = packed_t[4 * n_tok:4 * n_tok + len(order_vals)]
@@ -5277,25 +5328,19 @@ class LogStructuredKVCache(nn.Module):
         this path never reads either endpoint. Segment-alignment pads remain
         masked inside occupied ranges; there are none in the fast configuration.
         """
-        spans = []
-        for batch in self._semantic_counts:
-            for groups in batch:
-                spans.append([
-                    (c * self.L_alloc * self.B_prime + ell * self.B_prime, count)
-                    for c, levels in enumerate(groups)
-                    for ell in range(self.L_alloc - 1, -1, -1)
-                    if (count := levels[ell]) > 0
-                ])
-        sizes = [sum(n for _, n in row) for row in spans]
-        width = max(sizes, default=0)
-        indices = np.full((len(spans), width), -1, dtype=np.int64)
-        for lane, row in enumerate(spans):
-            offset = 0
-            for start, n in row:
-                indices[lane, offset:offset + n] = np.arange(start, start + n)
-                offset += n
+        # Whole-array form of the per-lane (cluster, top level first) loop.
+        counts = np.asarray(self._semantic_counts, dtype=np.int64)[..., ::-1]
+        counts = counts.reshape(-1, self.K_max * self.L_alloc)
+        levels = np.arange(self.L_alloc - 1, -1, -1, dtype=np.int64)
+        starts = ((np.arange(self.K_max, dtype=np.int64)[:, None] * self.L_alloc + levels) * self.B_prime).reshape(-1)
+        sizes = counts.sum(1)
+        width = int(sizes.max(initial=0))
+        indices = np.full((len(counts), width), -1, dtype=np.int64)
+        flat = _spans_to_index_array(np.stack((np.broadcast_to(starts, counts.shape), starts + counts), -1).reshape(-1, 2))
+        lane = np.repeat(np.arange(len(counts)), sizes)
+        indices[lane, np.arange(len(flat)) - np.repeat(np.cumsum(sizes) - sizes, sizes)] = flat
         shape = (self.batch_size, self.n_groups, width)
-        physical_idx = torch.from_numpy(indices).to(self.level_w.device).view(shape)
+        physical_idx = _upload(indices, self.level_w.device).view(shape)
         occupied = physical_idx >= 0
         physical_idx = physical_idx.clamp_min(0)
         weights = self.level_w.flatten(2).gather(2, physical_idx)
