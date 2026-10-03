@@ -3111,15 +3111,23 @@ class LogStructuredKVCache(nn.Module):
         reducer = reducer_type(dist, mu, mass, count, limits, target)
         asynchronous = reducer_type is not _UnifiedReduceTorch
         if asynchronous:
-            key = (dev, len(counts))
+            # Reducers exposing (active, live count) rows also learn a live
+            # bound at each poll, which narrows later launches.
+            status = getattr(reducer, "status", None)
+            key = (dev, len(counts)) if status is None else (dev, len(counts), 2)
             flags = self._SEMANTIC_ROUTE_FLAG_BUFFERS.get(key)
             if flags is None:
-                flags = torch.zeros(len(counts), dtype=torch.int32, pin_memory=True)
+                shape = (len(counts),) if status is None else tuple(status.shape)
+                flags = torch.zeros(shape, dtype=torch.int32, pin_memory=True)
                 self._SEMANTIC_ROUTE_FLAG_BUFFERS[key] = flags
             event = torch.cuda.Event()
             stream = torch.cuda.current_stream(dev)
         # Every round before the last merges or pins a pair; the cap is a guard.
         last_round = 2 * size + 7
+        # Without radius limits a lane only stops at TARGET, and a round at
+        # most halves it, so earlier polls cannot observe completion.
+        bounded = asynchronous and status is not None and radius_limits is None
+        next_poll = max(4, self._semantic_min_rounds(max(counts), target)) if bounded else 4
         for round_ in range(1, last_round + 1):
             flag = self._semantic_unified_round(reducer, round_)
             if not asynchronous:
@@ -3130,12 +3138,18 @@ class LogStructuredKVCache(nn.Module):
             # a lane cannot merge again: it reached TARGET or has no proposals
             # and no dirty rows to rescan. At most three extra no-op rounds
             # trade small launches for 4x fewer host waits and flag transfers.
-            if round_ % 4 and round_ != last_round:
+            if round_ < next_poll and round_ != last_round:
                 continue
-            flags.copy_(flag, non_blocking=True)
+            flags.copy_(flag if status is None else status, non_blocking=True)
             event.record(stream)
             event.synchronize()
-            if not bool(flags.any()):
+            next_poll = round_ + 4
+            if status is not None:
+                live = int(flags[1].max())
+                reducer.limit_live(live)
+                if bounded:
+                    next_poll = round_ + max(4, self._semantic_min_rounds(live, target))
+            if not bool((flags if status is None else flags[0]).any()):
                 break
         lane_traces, alive, stuck = reducer.finish()
         results = [(np.flatnonzero(alive[lane]), lane_traces[lane]) for lane in range(len(counts))]
@@ -3154,6 +3168,15 @@ class LogStructuredKVCache(nn.Module):
             for lane, result in zip(stuck_lanes, redo):
                 results[lane] = result
         return results
+
+    @staticmethod
+    def _semantic_min_rounds(count: int, target: int) -> int:
+        """Fewest disjoint-pair rounds that can take `count` clusters to `target`."""
+        rounds = 0
+        while count > target:
+            count = max((count + 1) // 2, target)
+            rounds += 1
+        return rounds
 
     def _semantic_unified_reduce_fallback(self, source, out, lanes, counts, weights, *, target, radius_limits, strict):
         """Full-recompute rounds for selected lanes of a padded buffer.

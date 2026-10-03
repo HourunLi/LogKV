@@ -223,20 +223,25 @@ def _cost_limited(d2, mi, mj, ri, rj, limit, valid, SQRT_RN: tl.constexpr):
 
 
 @triton.jit(do_not_specialize=["M", "ROUND"])
-def _scan(DIST, MASS, RADIUS, LIMITS, ALIVE, KEEP, MERGED, REJECT, BEST, PACKED, M, ROUND,
+def _scan(DIST, MASS, RADIUS, LIMITS, ALIVE, KEEP, MERGED, REJECT, BEST, PACKED, ORDER, LISTED, M, ROUND,
           FULL: tl.constexpr, HAVE_LIMITS: tl.constexpr, SQRT_RN: tl.constexpr,
           ROWS: tl.constexpr, BLOCK: tl.constexpr):
     """Full row minimum for rows whose previous partner merged, or all rows.
 
     Most rows are clean after a round, so each program checks ROWS rows and
     rescans only the dirty ones instead of launching one program per row.
+    Rows and columns come from the ascending live list: retired nodes are
+    neither rescanned nor read, and an exact minimum ignores visiting order.
     """
     lane = tl.program_id(1).to(tl.int64)
     base = lane * M
+    listed = tl.load(LISTED + lane)
     for i in range(ROWS):
-        row = tl.program_id(0) * ROWS + i
-        dirty = row < M
+        slot = tl.program_id(0) * ROWS + i
+        row = slot
+        dirty = slot < listed
         if dirty:
+            row = tl.load(ORDER + base + slot)
             dirty = tl.load(ALIVE + base + row) != 0
         if not FULL:
             if dirty:
@@ -246,9 +251,10 @@ def _scan(DIST, MASS, RADIUS, LIMITS, ALIVE, KEEP, MERGED, REJECT, BEST, PACKED,
         if dirty:
             mi = tl.load(MASS + base + row)
             result = tl.min(tl.full([BLOCK], 9223372036854775807, tl.int64), axis=0)
-            for start in range(0, M, BLOCK):
-                cols = start + tl.arange(0, BLOCK)
-                inb = cols < M
+            for start in range(0, listed, BLOCK):
+                at = start + tl.arange(0, BLOCK)
+                inb = at < listed
+                cols = tl.load(ORDER + base + at, inb, 0)
                 mj = tl.load(MASS + base + cols, inb, 0.0)
                 d2 = tl.load(DIST + (base + row) * M + cols, inb, 0.0)
                 if HAVE_LIMITS:
@@ -358,14 +364,15 @@ def _plan(ORDER, PAIR_COST, BEST, MASS, RADIUS, BOUND, DIST, ALIVE, KEEP, MERGED
 
 @triton.jit(do_not_specialize=["M", "H", "ROUND"])
 def _lance_williams(DIST, MU, MASS, RADIUS, LIMITS, ALIVE, KEEP, PARTNER, PMA, PMB, PDAB, PAIR_A, PACKED,
-                    M, H, ROUND, DIM: tl.constexpr, HAVE_LIMITS: tl.constexpr, SQRT_RN: tl.constexpr,
-                    BLOCK: tl.constexpr, BD: tl.constexpr):
+                    ORDER, LISTED, M, H, ROUND, DIM: tl.constexpr, HAVE_LIMITS: tl.constexpr,
+                    SQRT_RN: tl.constexpr, BLOCK: tl.constexpr, BD: tl.constexpr):
     """Merged centroid, updated distance row/column, row minimum and pushes.
 
     Row a is written only by its own program; columns are written only into
     live rows that did not merge this round. Dead rows b and dead columns are
     never written, so every read of rows a/b and gathered columns b_q sees the
-    previous round.
+    previous round. Columns come from the live list rebuilt after this round's
+    plan, so the retired columns, which were only masked, are skipped.
     """
     t = tl.program_id(0)
     lane = tl.program_id(1).to(tl.int64)
@@ -387,10 +394,12 @@ def _lance_williams(DIST, MU, MASS, RADIUS, LIMITS, ALIVE, KEEP, PARTNER, PMA, P
             xb = tl.load(MU + (base + b) * DIM + d, dm, 0.0)
             tl.store(MU + (base + a) * DIM + d, tl.div_rn(ma * xa + mb * xb, denom), dm)
         mi = tl.load(MASS + base + a)
+        listed = tl.load(LISTED + lane)
         result = tl.min(tl.full([BLOCK], 9223372036854775807, tl.int64), axis=0)
-        for start in range(0, M, BLOCK):
-            cols = start + tl.arange(0, BLOCK)
-            inb = cols < M
+        for start in range(0, listed, BLOCK):
+            at = start + tl.arange(0, BLOCK)
+            inb = at < listed
+            cols = tl.load(ORDER + base + at, inb, 0)
             x_aa = tl.load(DIST + (base + a) * M + cols, inb, 0.0)
             x_ba = tl.load(DIST + (base + b) * M + cols, inb, 0.0)
             new = alpha * x_aa + beta * x_ba - shift
@@ -428,6 +437,22 @@ def _lance_williams(DIST, MU, MASS, RADIUS, LIMITS, ALIVE, KEEP, PARTNER, PMA, P
 
 
 @triton.jit(do_not_specialize=["M"])
+def _compact_live(ALIVE, ORDER, LISTED, M, BLOCK: tl.constexpr):
+    """Ascending live node ids per lane; entries past LISTED are stale."""
+    lane = tl.program_id(0).to(tl.int64)
+    base = lane * M
+    offset = tl.sum(tl.zeros([BLOCK], tl.int32), axis=0)
+    for start in range(0, M, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        inb = cols < M
+        live = (tl.load(ALIVE + base + cols, inb, 0) != 0) & inb
+        flag = live.to(tl.int32)
+        tl.store(ORDER + base + offset + tl.cumsum(flag, axis=0) - 1, cols, live)
+        offset += tl.sum(flag, axis=0)
+    tl.store(LISTED + lane, offset)
+
+
+@triton.jit(do_not_specialize=["M"])
 def _mirror(DIST, M, BLOCK: tl.constexpr):
     """Copy the upper triangle onto the lower one, in place and exactly."""
     bi = tl.program_id(0)
@@ -453,10 +478,12 @@ def mirror(dist):
 
 
 class UnifiedReduce:
-    """Device state for incremental rounds; the host reads one flag per lane.
+    """Device state for incremental rounds; the host polls one status pair per lane.
 
     Shapes never shrink, so rounds need no host sizes. Traces are written in
-    round order and, within a round, in (cost, left) order.
+    round order and, within a round, in (cost, left) order. Row scans and
+    row updates walk a per-lane live list rebuilt after every plan; launches
+    shrink to the largest live count the host last polled.
     """
 
     INF_KEY = 0x7F800000 << 32
@@ -471,10 +498,11 @@ class UnifiedReduce:
         self.alive = (ids[None, :] < count[:, None]).to(torch.int8)
         self.radius = torch.zeros_like(mass)
         self.bound = torch.zeros_like(mass)
-        self.count = count.to(torch.int32)
+        # Rows: active flag, live count. One small copy serves each host poll.
+        self.status = torch.stack((torch.zeros_like(count, dtype=torch.int32), count.to(torch.int32)))
+        self.active, self.count = self.status.unbind(0)
         self.merges = torch.zeros(lanes, dtype=torch.int32, device=dev)
         self.nprop = torch.zeros_like(self.merges)
-        self.active = torch.zeros_like(self.merges)
         self.stuck = torch.zeros_like(self.merges)
         self.keep = torch.full((lanes, size), -1, dtype=torch.int32, device=dev)
         self.merged = torch.full_like(self.keep, -1)
@@ -488,20 +516,39 @@ class UnifiedReduce:
         self.pair_a = torch.empty((lanes, max(self.half, 1)), dtype=torch.int32, device=dev)
         self.trace = torch.zeros((lanes, size, 2), dtype=torch.int64, device=dev)
         self.packed = torch.full((lanes, size), self.INF_KEY, dtype=torch.int64, device=dev)
+        self.order = torch.empty((lanes, size), dtype=torch.int32, device=dev)
+        self.listed = torch.empty(lanes, dtype=torch.int32, device=dev)
         self.sqrt_rn = hasattr(tl, "sqrt_rn")
-        self.row_block = min(1024, triton.next_power_of_2(size))
         self.dim_block = min(32, triton.next_power_of_2(self.dim))
+        self.live_bound = size
+        self._compact()
         self._scan(0, full=True)
 
     def _limits(self):
         return self.limits if self.limits is not None else self.mass
 
+    def limit_live(self, count):
+        """Host upper bound on every lane's live count, e.g. from a poll.
+
+        Live counts never grow, so a polled maximum bounds every later round.
+        It only narrows launch grids and loop tiles; results are unchanged.
+        """
+        self.live_bound = max(1, min(self.live_bound, int(count)))
+
+    def _row_block(self):
+        return min(1024, max(64, triton.next_power_of_2(self.live_bound)))
+
+    def _compact(self):
+        lanes, size = self.mass.shape
+        _compact_live[(lanes,)](self.alive, self.order, self.listed, size,
+                                min(2048, triton.next_power_of_2(size)), num_warps=4)
+
     def _scan(self, round_, *, full=False):
         lanes, size = self.mass.shape
-        _scan[(triton.cdiv(size, 4), lanes)](
+        _scan[(triton.cdiv(self.live_bound, 4), lanes)](
             self.dist, self.mass, self.radius, self._limits(), self.alive, self.keep, self.merged,
-            self.reject, self.best, self.packed, size, round_, full, self.limits is not None,
-            self.sqrt_rn, 4, self.row_block, num_warps=4, enable_fp_fusion=False,
+            self.reject, self.best, self.packed, self.order, self.listed, size, round_, full,
+            self.limits is not None, self.sqrt_rn, 4, self._row_block(), num_warps=4, enable_fp_fusion=False,
         )
 
     def step(self, round_):
@@ -521,10 +568,13 @@ class UnifiedReduce:
             size, self.half, round_, self.target, limited, plan_block,
             num_warps=8 if plan_block > 1024 else 4, enable_fp_fusion=False,
         )
-        _lance_williams[(max(self.half, 1), lanes)](
+        # Retire this round's right nodes from the list before the row passes.
+        self._compact()
+        # A round merges at most half of the live nodes of any lane.
+        _lance_williams[(max(min(self.half, self.live_bound // 2), 1), lanes)](
             self.dist, self.mu, self.mass, self.radius, self._limits(), self.alive, self.keep,
-            self.partner, self.pma, self.pmb, self.pdab, self.pair_a, self.packed,
-            size, self.half, round_, self.dim, limited, self.sqrt_rn, self.row_block,
+            self.partner, self.pma, self.pmb, self.pdab, self.pair_a, self.packed, self.order, self.listed,
+            size, self.half, round_, self.dim, limited, self.sqrt_rn, self._row_block(),
             triton.next_power_of_2(self.dim) if self.dim <= 256 else 256,
             num_warps=4, enable_fp_fusion=False,
         )
