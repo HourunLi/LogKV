@@ -1,16 +1,17 @@
-# SemanticLogKV / AlphaLogKV 算法规格
+# SemanticLogKV / AlphaLogKV / BetaLogKV 算法规格
 
-本文描述当前实现的共享机制，以 `AlphaLogKV` 分支源码为准。Alpha 的片段选择与预算
+本文描述当前 `betaLogKV` 分支的共享机制。Alpha 的片段选择与预算
 细节见 [AlphaLogKV](alpha-logkv.md)，路由内核见 [统一路由](semantic-unified-routing.md)，
-位置读出见 [Position / RoPE](position.md)。旧 Stage 0 路线图和未落地的设计不作为现行契约。
+位置读出见 [Position / RoPE](position.md)。Beta 的评分与自适应压缩见
+[BetaLogKV](beta-logkv.md)。旧 Stage 0 路线图和未落地的设计不作为现行契约。
 
 ## 1. 当前入口与配置
 
-当前训练配置是 `exp/qwen1.7b-32k/arc_alpha_cpt100.yaml`，依次继承
-`arc_semantic_unified_cpt100.yaml`、`arc_semantic_fast.yaml`、`base.yaml`。
-Python API 为兼容旧路径保留保守默认值，不能把不传参数等同于运行 Alpha。
+当前训练配置是 `exp/qwen1.7b-32k/arc_beta_cpt100.yaml`，依次继承
+`arc_alpha_cpt100.yaml`、`arc_semantic_unified_cpt100.yaml`、`arc_semantic_fast.yaml`、`base.yaml`。
+Python API 为兼容旧路径保留保守默认值，不能把不传参数等同于运行 Beta。
 
-| 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 当前 Alpha 配置 |
+| 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 当前 Beta 配置 |
 |---|---|---|
 | `semantic_clusters` / `cluster_k_max` | `false` / `1` | `true` / `12` |
 | `semantic_unified_route` | `false` | `true` |
@@ -21,9 +22,10 @@ Python API 为兼容旧路径保留保守默认值，不能把不传参数等同
 | `semantic_centroid_backend` | `sequential` | `parallel` |
 | `semantic_replay_updates` | `false` | `true` |
 | `alpha_exact_tokens` / `alpha_span_max_tokens` | `0` / `64` | `256` / `64` |
+| `beta_novelty` / `beta_adaptive_merge` | `false` / `false` | `true` / `true` |
 
 当前 `recent_size`、`train_block`、`prefill_block` 均为 `2048`，上下文长度 `32768`；
-二阶修正关闭，segment 间隔保护和 padding 关闭。Alpha CPT 从配置中的 Base 权重初始化，
+二阶修正关闭，segment 间隔保护和 padding 关闭。Beta CPT 从配置中的 Base 权重初始化，
 若独立输出目录已有 checkpoint，`auto_resume` 会恢复该实验自己的训练状态。
 
 ## 2. 存储对象与数据流
@@ -76,7 +78,7 @@ rnew <= sqrt(cluster_lambda_rel · s_h)
 因此预算压力下最终簇可以变宽，不能把候选半径当成最终信息损失的保证。
 
 每轮选多对互为最近邻、互不重叠的簇，按代价限制合并数量，避免低于目标簇数。
-`merge_passes=1` 默认使用设备上的增量距离更新和最近邻缓存；轮间只传递小型活动标志，
+`merge_passes=1` 默认使用设备上的增量距离更新和最近邻缓存；CUDA 每 4 轮检查一次小型活动标志，
 结束后回传归属记录。它保留每轮更新中心的规则，但浮点舍入与固定索引 tie-break 不保证
 与旧版重新压紧编号的实现逐位一致。
 
@@ -93,6 +95,9 @@ rnew <= sqrt(cluster_lambda_rel · s_h)
 
 每簇每层最多 `B′` 个 entry，层满时把最老内容按时间顺序相邻配对、加权合并后向上进位。
 顶层饱和时继续合并最老内容，保持预算和 mass，不因容量直接删除 token。
+Beta 在非顶层批量进位中，把同一 lane 内连续四个待合并 entry 切为两组：
+比较 `2|2`、`1|3`、`3|1` 的归一化 K/V 失真，保留代价最低者；不足四个的两条尾部仍二合一。
+预算、进位条目数和下列加权统计规则不变；这里的连续指簇内 entry 顺序，不是连续原文 token。
 
 ```text
 wnew      = wa+wb
@@ -161,6 +166,7 @@ Alpha 从原 `B` 对应的预算扣出精确池，重新计算有效 `B′` 与 
 同一次前向的路由。当前 `semantic_replay_updates=true` 还保存 detached 的实际写入 K/V、
 小型状态与更新动作，使重放复用同一批量写入结果，避免重新分簇、选择精确片段和浮点轨迹
 漂移。关闭该选项的兼容路径使用 op-log 与解析后的调度重建状态。
+Beta 还记录每次局部压缩的切分位置；checkpoint 和 backward 直接应用记录，不重新计算切分代价。
 
 这些记录由各自 autograd 调用持有，不能借用另一个输入的缓存；backward 完成后随图释放。
 **训练内存不是 `O(log N)`**：它还包括全序列 Q/K/V、attention plan、更新记录和单块重算图。

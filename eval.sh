@@ -203,6 +203,8 @@ emit("LOG_KV_SEMANTIC_CENTROID_BACKEND", value_or("log_kv_semantic_centroid_back
 emit("LOG_KV_SEMANTIC_REPLAY_UPDATES", str(bool(cfg.get("log_kv_semantic_replay_updates", False))).lower())
 emit("LOG_KV_ALPHA_EXACT_TOKENS", int(value_or("log_kv_alpha_exact_tokens", 0)))
 emit("LOG_KV_ALPHA_SPAN_MAX_TOKENS", int(value_or("log_kv_alpha_span_max_tokens", 64)))
+emit("LOG_KV_BETA_NOVELTY", str(bool(cfg.get("log_kv_beta_novelty", False))).lower())
+emit("LOG_KV_BETA_ADAPTIVE_MERGE", str(bool(cfg.get("log_kv_beta_adaptive_merge", False))).lower())
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
 emit("LOG_KV_CLUSTER_LAMBDA_REL", value_or("log_kv_cluster_lambda_rel", 1.0))
 emit("LOG_KV_SEG_ETA", value_or("log_kv_seg_eta", 1.0))
@@ -334,6 +336,8 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
         --log_kv_semantic_replay_updates "${LOG_KV_SEMANTIC_REPLAY_UPDATES}"
         --log_kv_alpha_exact_tokens "${LOG_KV_ALPHA_EXACT_TOKENS}"
         --log_kv_alpha_span_max_tokens "${LOG_KV_ALPHA_SPAN_MAX_TOKENS}"
+        --log_kv_beta_novelty "${LOG_KV_BETA_NOVELTY}"
+        --log_kv_beta_adaptive_merge "${LOG_KV_BETA_ADAPTIVE_MERGE}"
         --log_kv_cluster_k_max "${LOG_KV_CLUSTER_K_MAX}"
         --log_kv_cluster_lambda_rel "${LOG_KV_CLUSTER_LAMBDA_REL}"
         --log_kv_seg_eta "${LOG_KV_SEG_ETA}"

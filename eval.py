@@ -742,6 +742,8 @@ class LogKVLM(LM):
         log_kv_semantic_replay_updates: bool = False,
         log_kv_alpha_exact_tokens: int = 0,
         log_kv_alpha_span_max_tokens: int = 64,
+        log_kv_beta_novelty: bool = False,
+        log_kv_beta_adaptive_merge: bool = False,
         tokenizer_dir: str | None = None,
     ):
         super().__init__()
@@ -784,6 +786,8 @@ class LogKVLM(LM):
         self.log_kv_semantic_replay_updates = log_kv_semantic_replay_updates
         self.log_kv_alpha_exact_tokens = log_kv_alpha_exact_tokens
         self.log_kv_alpha_span_max_tokens = log_kv_alpha_span_max_tokens
+        self.log_kv_beta_novelty = bool(log_kv_beta_novelty)
+        self.log_kv_beta_adaptive_merge = bool(log_kv_beta_adaptive_merge)
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -916,6 +920,8 @@ class LogKVLM(LM):
             semantic_replay_updates=self.log_kv_semantic_replay_updates,
             alpha_exact_tokens=self.log_kv_alpha_exact_tokens,
             alpha_span_max_tokens=self.log_kv_alpha_span_max_tokens,
+            beta_novelty=self.log_kv_beta_novelty,
+            beta_adaptive_merge=self.log_kv_beta_adaptive_merge,
         )
         if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
@@ -955,7 +961,8 @@ class LogKVLM(LM):
         first = self.model.transformer.h[0].attn.kv_cache
         if getattr(first, "alpha_exact_tokens", 0):
             self.cache_budget.update(alpha_exact_tokens=first.alpha_exact_tokens, effective_B=first.B,
-                                     alpha_span_max_tokens=first.alpha_span_max_tokens)
+                                     alpha_span_max_tokens=first.alpha_span_max_tokens,
+                                     beta_novelty=first.beta_novelty, beta_adaptive_merge=first.beta_adaptive_merge)
         if _is_main():
             print(f"🧮 persistent cache budget (excluding shared RoPE / transient workspace): {self.cache_budget}")
 
@@ -1321,6 +1328,8 @@ def main(
     log_kv_semantic_replay_updates: bool = False,
     log_kv_alpha_exact_tokens: int = 0,
     log_kv_alpha_span_max_tokens: int = 64,
+    log_kv_beta_novelty: bool = False,
+    log_kv_beta_adaptive_merge: bool = False,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1410,6 +1419,8 @@ def main(
     log_kv_semantic_replay_updates = bool(_o("log_kv_semantic_replay_updates", log_kv_semantic_replay_updates))
     log_kv_alpha_exact_tokens = int(_o("log_kv_alpha_exact_tokens", log_kv_alpha_exact_tokens))
     log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
+    log_kv_beta_novelty = bool(_o("log_kv_beta_novelty", log_kv_beta_novelty))
+    log_kv_beta_adaptive_merge = bool(_o("log_kv_beta_adaptive_merge", log_kv_beta_adaptive_merge))
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
     log_kv_seg_eta = float(_o("log_kv_seg_eta", log_kv_seg_eta))
@@ -1512,7 +1523,8 @@ def main(
                 f"merge_passes={log_kv_semantic_merge_passes}, "
                 f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
                 f"centroid={log_kv_semantic_centroid_backend}, "
-                f"replay_updates={log_kv_semantic_replay_updates})"
+                f"replay_updates={log_kv_semantic_replay_updates}, "
+                f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge})"
             )
         if diag_active:
             print(
@@ -1566,6 +1578,8 @@ def main(
             log_kv_semantic_replay_updates=log_kv_semantic_replay_updates,
             log_kv_alpha_exact_tokens=log_kv_alpha_exact_tokens,
             log_kv_alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
+            log_kv_beta_novelty=log_kv_beta_novelty,
+            log_kv_beta_adaptive_merge=log_kv_beta_adaptive_merge,
             tokenizer_dir=tokenizer_dir,
         )
         if world_size > 1:
@@ -1686,6 +1700,8 @@ def main(
                     "log_kv_semantic_replay_updates": log_kv_semantic_replay_updates,
                     "log_kv_alpha_exact_tokens": log_kv_alpha_exact_tokens,
                     "log_kv_alpha_span_max_tokens": log_kv_alpha_span_max_tokens,
+                    "log_kv_beta_novelty": log_kv_beta_novelty,
+                    "log_kv_beta_adaptive_merge": log_kv_beta_adaptive_merge,
                     "results": results,
                 }
 

@@ -53,11 +53,35 @@ def test_spans_are_whole_and_pending_crosses_flush_and_cap():
     assert result.archive == [[0, 1, 2, 3]]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA")
+@pytest.mark.parametrize("archive_width", [0, 5])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_exact_partition_copies_payload_and_padding(archive_width, dtype):
+    from litgpt.log_kv_updates_triton import alpha_partition
+
+    k = torch.randn(2, 3, 13, 7, device="cuda", dtype=dtype)
+    v = torch.randn(2, 3, 13, 11, device="cuda", dtype=dtype)
+    pos = torch.arange(26, device="cuda").view(2, 13)
+    index = torch.tensor([[12, 7, -1, -1, 0, 5, 9, 3, 4],
+                          [0, 1, 12, -1, 7, 8, -1, -1, -1]], device="cuda")[:, :4 + archive_width].contiguous()
+    exact = (k.new_full((2, 3, 4, 7), float("nan")), v.new_full((2, 3, 4, 11), float("nan")),
+             pos.new_full((2, 4), -9), torch.ones(2, 4, device="cuda", dtype=torch.bool))
+    archive = alpha_partition(k, v, pos, index, exact)
+    mask, src = index >= 0, index.clamp_min(0)
+    for expected, actual in ((k.gather(2, src[:, None, :, None].expand(-1, 3, -1, 7)), torch.cat((exact[0], archive[0]), 2)),
+                              (v.gather(2, src[:, None, :, None].expand(-1, 3, -1, 11)), torch.cat((exact[1], archive[1]), 2))):
+        expected.masked_fill_(~mask[:, None, :, None], 0)
+        torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+    torch.testing.assert_close(torch.cat((exact[2], archive[2]), 1), pos.gather(1, src).masked_fill(~mask, 0), rtol=0, atol=0)
+    torch.testing.assert_close(exact[3], mask[:, :4], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"))])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_mass_payload_positions_and_budget_are_conserved(dtype, device):
+@pytest.mark.parametrize("beta", [False, True])
+def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta):
     torch.manual_seed(17)
-    c = cache_for(dtype=dtype, device=device)
+    c = cache_for(dtype=dtype, device=device, beta_novelty=beta, beta_adaptive_merge=beta)
     baseline = cache_for(dtype=dtype, device=device, alpha_exact_tokens=0)
     payload_bytes = lambda cache: sum(x.numel() * x.element_size() for x in cache.buffers())
     assert payload_bytes(c) <= payload_bytes(baseline)
@@ -127,13 +151,14 @@ def test_ragged_archive_excludes_padding_and_preserves_empty_lanes(merge_passes)
 
 
 @pytest.mark.parametrize("merge_passes", [1, 4])
-def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(merge_passes):
+@pytest.mark.parametrize("beta", [False, True])
+def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(merge_passes, beta):
     torch.manual_seed(31)
     originals = [torch.randn(2, 2, 40, 8) for _ in range(3)]
     results, grads = [], []
     ends = boundaries(40)
     for lowmem in (False, True):
-        c = cache_for(semantic_merge_passes=merge_passes)
+        c = cache_for(semantic_merge_passes=merge_passes, beta_novelty=beta, beta_adaptive_merge=beta)
         q, k, v = [x.clone().requires_grad_() for x in originals]
         if lowmem:
             y = LogKVStreamTrainingAttention.apply(q, k, v, c, .3, 8, 0., k, ends)
@@ -146,7 +171,8 @@ def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradi
                     c.add_recent(k[:, :, start:stop], v[:, :, start:stop], k_raw=k[:, :, start:stop],
                                  span_ends=[row[start:stop] for row in ends])
             y = torch.cat(outputs, 2)
-        with patch.object(c, "_alpha_route_flush", side_effect=AssertionError("rerouted during backward")):
+        with patch.object(c, "_alpha_route_flush", side_effect=AssertionError("rerouted during backward")), \
+             patch("litgpt.beta_log_kv.select_cuts", side_effect=AssertionError("reselected cuts during backward")):
             y.square().sum().backward()
         results.append(y.detach())
         grads.append([x.grad for x in (q, k, v)])
@@ -191,7 +217,8 @@ def test_packing_includes_exact_rope_mask_and_current_gradients(device, dtype):
             torch.testing.assert_close(x, y)
 
 
-def test_model_checkpoint_and_odd_prefill_decode():
+@pytest.mark.parametrize("beta", [False, True])
+def test_model_checkpoint_and_odd_prefill_decode(beta):
     torch.manual_seed(55)
     config = Config(block_size=64, n_layer=2, n_embd=32, n_head=4, n_query_groups=2,
                     vocab_size=41, padding_multiple=1, rotary_percentage=1.)
@@ -200,7 +227,7 @@ def test_model_checkpoint_and_odd_prefill_decode():
     kwargs = dict(batch_size=2, B=8, recent_size=8, second_order_scale=0., semantic_clusters=True,
                   cluster_k_max=4, semantic_unified_route=True, semantic_merge_passes=1, semantic_flush_granularity=8,
                   semantic_anchor_mode="mid", allocate_second_order=False, semantic_replay_updates=True,
-                  alpha_exact_tokens=8, alpha_span_max_tokens=4)
+                  alpha_exact_tokens=8, alpha_span_max_tokens=4, beta_novelty=beta, beta_adaptive_merge=beta)
     for model in models:
         model.set_alpha_span_boundary_ids([0, 3, 7])
         model.enable_log_kv_training(train_block=8, **kwargs)
@@ -210,7 +237,8 @@ def test_model_checkpoint_and_odd_prefill_decode():
     losses, grads = [], []
     for model in models:
         ys = [model(x).square().mean() for x in xs]
-        with patch.object(LogStructuredKVCache, "_alpha_route_flush", side_effect=AssertionError("rerouted")):
+        with patch.object(LogStructuredKVCache, "_alpha_route_flush", side_effect=AssertionError("rerouted")), \
+             patch("litgpt.beta_log_kv.select_cuts", side_effect=AssertionError("reselected cuts")):
             ys[1].backward()
             ys[0].backward()
         losses.append(torch.stack([y.detach() for y in ys]))

@@ -23,7 +23,7 @@ from unittest.mock import patch
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from litgpt.log_kv_cache import LogStructuredKVCache, _UnifiedReduceTorch, _triton_route
+from litgpt.log_kv_cache import LogStructuredKVCache, _UnifiedReduceTorch, _triton_route, _triton_updates
 
 
 def cache_mass(cache):
@@ -206,6 +206,14 @@ def profile_route(cache, inputs, device, directory):
         activities.append(torch.profiler.ProfilerActivity.CUDA)
     # No per-stage synchronization or pair-count readbacks in this capture.
     with ExitStack() as stack:
+        if cache.alpha_exact_tokens:
+            from litgpt import alpha_log_kv
+
+            stack.enter_context(patch.object(alpha_log_kv, 'select_spans', annotated(alpha_log_kv.select_spans, 'exact_select')))
+            updates = _triton_updates() if device.type == 'cuda' else None
+            if updates is not None:
+                stack.enter_context(patch.object(updates, 'alpha_partition', annotated(updates.alpha_partition, 'exact_partition')))
+                stack.enter_context(patch.object(updates, 'merge_scatter', annotated(updates.merge_scatter, 'ladder_merge_scatter')))
         for method, label in (
             ('_semantic_unified_reduce_device', 'reduce'),
             ('_semantic_unified_round', 'merge_round'),
@@ -272,6 +280,8 @@ def main():
     p.add_argument('--merge-passes', type=int, default=1, help='Frozen-center global matching sweeps (1 = original)')
     p.add_argument('--alpha-exact-tokens', type=int, default=0)
     p.add_argument('--alpha-span-max-tokens', type=int, default=64)
+    p.add_argument('--beta-novelty', action='store_true')
+    p.add_argument('--beta-adaptive-merge', action='store_true')
     args = p.parse_args()
     if min(args.tokens, args.dim, args.batch, args.groups, args.clusters, args.B, args.flushes, args.iters) < 1:
         p.error('all sizes and iteration counts must be positive')
@@ -291,6 +301,7 @@ def main():
         semantic_anchor_mode='mid', semantic_centroid_backend='parallel', allocate_second_order=False,
         semantic_merge_passes=args.merge_passes,
         alpha_exact_tokens=args.alpha_exact_tokens, alpha_span_max_tokens=args.alpha_span_max_tokens,
+        beta_novelty=args.beta_novelty, beta_adaptive_merge=args.beta_adaptive_merge,
         device=device, dtype=dtype, cos_cache=torch.ones(n, args.dim, device=device),
         sin_cache=torch.zeros(n, args.dim, device=device), rope_n_elem=args.dim,
     )
@@ -350,6 +361,7 @@ def main():
                           'pairing_rule': 'frozen_mnn' if args.merge_passes > 1 else 'mnn',
                           'route_group_tile': cache._semantic_unified_tile(args.batch * args.groups, args.tokens, device),
                           'effective_B': cache.B, 'exact_count': cache.alpha_count,
+                          'reference_checks_scope': 'shared_unified_route_and_pairwise_updates',
                           'reference_pairs_verified': True if fused else None,
                           'reference_updates_verified': True if fused else None,
                           'reference_incremental_verified': True if fused else None,

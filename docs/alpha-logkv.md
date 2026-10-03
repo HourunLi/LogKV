@@ -1,5 +1,8 @@
 # AlphaLogKV：有限预算的精确片段
 
+本文保留 Alpha 基线定义。当前 Beta 配置沿用这里的分段、替换和预算，
+评分与簇内压缩的两项改动见 [BetaLogKV](beta-logkv.md)。
+
 Alpha 在 SemanticLogKV 的 recent window 与压缩层之间增加可替换的精确池。
 默认关闭；[训练配置](../exp/qwen1.7b-32k/arc_alpha_cpt100.yaml) 开启每层每条样本
 `P=256` 个精确 token、片段上限 `64`。同层 KV groups 共用所选位置，各层独立选择。
