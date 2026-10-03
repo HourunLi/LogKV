@@ -369,6 +369,23 @@ def _upload(values, device) -> torch.Tensor:
     return tensor.pin_memory().to(device, non_blocking=True)
 
 
+_PLAIN_SCALARS = (int, float, bool)
+
+
+def _copy_host(value):
+    """`deepcopy` for nested lists of plain scalars (the host mirrors).
+
+    Replay records copy several such mirrors per flush; deepcopy's memo and
+    dispatch dominated those copies. Anything else still uses deepcopy.
+    """
+    if type(value) is list:
+        if value and type(value[0]) is list:
+            return [_copy_host(x) for x in value]
+        if all(type(x) in _PLAIN_SCALARS for x in value):
+            return value[:]
+    return deepcopy(value)
+
+
 _UNIFIED_INF_KEY = 0x7F800000 << 32
 
 
@@ -1158,7 +1175,9 @@ class LogStructuredKVCache(nn.Module):
             if name not in dirty:
                 continue
             buf = getattr(self, name)
-            buf.copy_(_upload(torch.tensor(getattr(self, mirror), dtype=dtype), buf.device))
+            # NumPy converts the nested mirror lists faster than torch.tensor.
+            values = np.array(getattr(self, mirror), dtype=torch.empty((), dtype=dtype).numpy().dtype)
+            buf.copy_(_upload(values, buf.device))
         dirty.clear()
 
     def _semantic_mark_scalar_dirty(self, name: str) -> bool:
@@ -4346,8 +4365,8 @@ class LogStructuredKVCache(nn.Module):
                         tensor.record_stream(stream)
                     getattr(self, name).copy_(tensor)
                 for name, value in zip(self._UPDATE_HOST_FIELDS, host_state):
-                    setattr(self, name, deepcopy(value))
-                self._op_replay_cursor_host = deepcopy(ends)
+                    setattr(self, name, _copy_host(value))
+                self._op_replay_cursor_host = _copy_host(ends)
                 return
             if replay or key in updates.flushes:
                 raise RuntimeError("duplicate or incorrectly bound semantic update recording")
@@ -4355,18 +4374,18 @@ class LogStructuredKVCache(nn.Module):
                 self.begin_op_log()
             if not kwargs.get("record_op_log"):
                 raise RuntimeError("semantic update recording requires record_op_log=True")
-            starts = deepcopy(self._op_log_len_host)
+            starts = _copy_host(self._op_log_len_host)
             self._update_actions = []
             try:
                 self._route_and_flush_batch(*args, **kwargs)
                 state = tuple(updates.save(getattr(self, name)) for name in self._UPDATE_DEVICE_FIELDS)
-                host_state = tuple(deepcopy(getattr(self, name)) for name in self._UPDATE_HOST_FIELDS)
+                host_state = tuple(_copy_host(getattr(self, name)) for name in self._UPDATE_HOST_FIELDS)
                 ready = None
                 if k.is_cuda:
                     ready = torch.cuda.Event()
                     ready.record(torch.cuda.current_stream(k.device))
                 updates.flushes[key] = (signature, tuple(self._update_actions), state, host_state, starts,
-                                       deepcopy(self._op_log_len_host), ready)
+                                       _copy_host(self._op_log_len_host), ready)
             finally:
                 self._update_actions = None
 

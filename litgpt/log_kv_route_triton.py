@@ -533,8 +533,10 @@ class UnifiedReduce:
 
     def finish(self):
         """One readback: per-lane traces, merge counts, survivors and stuck flags."""
-        merges = self.merges.cpu().numpy()
-        trace = self.trace.cpu().numpy()
-        alive = self.alive.cpu().numpy().astype(bool)
-        stuck = self.stuck.cpu().numpy().astype(bool)
+        lanes, size = self.alive.shape
+        packed = torch.cat((self.merges.long(), self.stuck.long(), self.alive.long().view(-1),
+                            self.trace.view(-1))).cpu().numpy()
+        merges, stuck = packed[:lanes], packed[lanes:2 * lanes].astype(bool)
+        alive = packed[2 * lanes:2 * lanes + lanes * size].reshape(lanes, size).astype(bool)
+        trace = packed[2 * lanes + lanes * size:].reshape(lanes, size, 2)
         return [trace[lane, :n] for lane, n in enumerate(merges)], alive, stuck
