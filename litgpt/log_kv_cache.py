@@ -3348,6 +3348,31 @@ class LogStructuredKVCache(nn.Module):
         compact[surviving] = np.arange(len(surviving))
         return compact[parent]
 
+    @staticmethod
+    def _semantic_unified_labels_batch(sizes, survivors, traces):
+        """`_semantic_unified_labels` for many lanes, offset into one forest.
+
+        Lanes never share nodes, so one pointer-jumping pass over the
+        concatenation yields each lane's labels unchanged.
+        """
+        sizes = np.asarray(sizes, dtype=np.int64)
+        offsets = np.cumsum(sizes) - sizes
+        parent = np.arange(int(sizes.sum()), dtype=np.int64)
+        pairs = [trace + offset for trace, offset in zip(traces, offsets.tolist()) if len(trace)]
+        if pairs:
+            pairs = np.concatenate(pairs)
+            parent[pairs[:, 1]] = pairs[:, 0]
+            while True:
+                grandparent = parent[parent]
+                if np.array_equal(parent, grandparent):
+                    break
+                parent = grandparent
+        compact = np.empty(len(parent), dtype=np.int64)
+        compact[np.concatenate([np.asarray(rows, dtype=np.int64) + offset
+                                for rows, offset in zip(survivors, offsets.tolist())])] = np.concatenate(
+            [np.arange(len(rows), dtype=np.int64) for rows in survivors])
+        return np.split(compact[parent], offsets[1:])
+
     # CUDA+Triton keeps the Gram footprint of 16 lanes x 2048^2 FP32 (256 MiB);
     # the Torch reference also materializes row temporaries, so it uses less.
     _SEMANTIC_ROUTE_TILE_BYTES = {True: 256 << 20, False: 64 << 20}
@@ -3390,10 +3415,9 @@ class LogStructuredKVCache(nn.Module):
                 radius_limits=[math.sqrt(self._semantic_tree_threshold(b, g)) for b, g in tile],
             )
             live = [np.asarray(self._semantic_live_clusters(b, g), dtype=np.int64) for b, g in tile]
-            labels, weights = [], []
-            for (b, g), old, roots, trace in zip(tile, live, candidates, candidate_traces):
-                label = self._semantic_unified_labels(token_counts[b], roots, [trace])
-                labels.append(label)
+            labels = self._semantic_unified_labels_batch(candidate_counts, candidates, candidate_traces)
+            weights = []
+            for (b, g), old, roots, label in zip(tile, live, candidates, labels):
                 weights.append(np.concatenate((
                     np.asarray(self._semantic_n_total[b][g], dtype=np.float32)[old],
                     np.bincount(label, minlength=len(roots)).astype(np.float32),
@@ -3420,12 +3444,12 @@ class LogStructuredKVCache(nn.Module):
             plans = self._semantic_unified_reduce_device(
                 centers.view(width, size, dim), counts, padded, target=self.K_max, strict=True,
             )
-            for (b, g), old, candidate_labels, weight, roots, trace in zip(tile, live, labels, weights, *plans):
+            merged_labels = self._semantic_unified_labels_batch(counts, *plans)
+            for (b, g), old, candidate_labels, roots, trace, label in zip(tile, live, labels, *plans, merged_labels):
                 # Old roots precede candidates; preserve their merge order.
                 old_trace = trace[trace[:, 1] < len(old)]
                 merge_jobs.append((b, g, [tuple(pair) for pair in old[old_trace].tolist()]))
-                assignment = self._semantic_unified_labels(len(weight), roots, [trace])[len(old) + candidate_labels]
-                routes.append((b, g, old, assignment, roots))
+                routes.append((b, g, old, label[len(old) + candidate_labels], roots))
         for step in range(max((len(pairs) for _, _, pairs in merge_jobs), default=0)):
             self._semantic_ward_merge_batch(
                 [(b, g, *pairs[step]) for b, g, pairs in merge_jobs if step < len(pairs)], record=record,
