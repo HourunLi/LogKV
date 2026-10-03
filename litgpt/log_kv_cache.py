@@ -1176,8 +1176,7 @@ class LogStructuredKVCache(nn.Module):
                 continue
             buf = getattr(self, name)
             # NumPy converts the nested mirror lists faster than torch.tensor.
-            values = np.array(getattr(self, mirror), dtype=torch.empty((), dtype=dtype).numpy().dtype)
-            buf.copy_(_upload(values, buf.device))
+            buf.copy_(_upload(torch.from_numpy(np.array(getattr(self, mirror))).to(dtype), buf.device))
         dirty.clear()
 
     def _semantic_mark_scalar_dirty(self, name: str) -> bool:
@@ -3330,30 +3329,18 @@ class LogStructuredKVCache(nn.Module):
 
     @staticmethod
     def _semantic_unified_labels(size, surviving, traces):
-        """Resolve a merge forest in parallel, then map leaves to compact rows.
-
-        Every right root is retired exactly once. Its parent is always a smaller
-        original root, so pointer jumping terminates without a token-wise walk.
-        """
-        parent = np.arange(size, dtype=np.int64)
-        if traces:
-            pairs = np.concatenate(traces)
-            parent[pairs[:, 1]] = pairs[:, 0]
-            while True:
-                grandparent = parent[parent]
-                if np.array_equal(parent, grandparent):
-                    break
-                parent = grandparent
-        compact = np.empty(size, dtype=np.int64)
-        compact[surviving] = np.arange(len(surviving))
-        return compact[parent]
+        """Map one lane's leaves to compact surviving rows; see the batched form."""
+        trace = np.concatenate(traces) if traces else np.empty((0, 2), dtype=np.int64)
+        return LogStructuredKVCache._semantic_unified_labels_batch([size], [surviving], [trace])[0]
 
     @staticmethod
     def _semantic_unified_labels_batch(sizes, survivors, traces):
-        """`_semantic_unified_labels` for many lanes, offset into one forest.
+        """Resolve merge forests in parallel, then map leaves to compact rows.
 
-        Lanes never share nodes, so one pointer-jumping pass over the
-        concatenation yields each lane's labels unchanged.
+        Every right root is retired exactly once. Its parent is always a smaller
+        original root, so pointer jumping terminates without a token-wise walk.
+        Lanes never share nodes, so they are offset into one forest and
+        resolved by a single pass.
         """
         sizes = np.asarray(sizes, dtype=np.int64)
         offsets = np.cumsum(sizes) - sizes
