@@ -1177,6 +1177,19 @@ class LogStructuredKVCache(nn.Module):
             self.level_count[b, g, c, ell] = count
         self._semantic_counts[b][g][c][ell] = count
 
+    def _set_semantic_level_counts(self, lanes, rows, ell: int, counts) -> None:
+        """Batched `_set_semantic_level_count` for `lanes[rows]`; one dirty mark when deferred."""
+        if not len(rows):
+            return
+        if self._semantic_mark_scalar_dirty("level_count"):
+            mirror = self._semantic_counts
+            for i, count in zip(rows.tolist(), counts.tolist()):
+                b, g, c = lanes[i]
+                mirror[b][g][c][ell] = count
+            return
+        for i, count in zip(rows.tolist(), counts.tolist()):
+            self._set_semantic_level_count(*lanes[i], ell, count)
+
     def _clear_semantic_cluster_counts(self, b: int, g: int, c: int) -> None:
         if not self._semantic_mark_scalar_dirty("level_count"):
             self.level_count[b, g, c].zero_()
@@ -1592,8 +1605,9 @@ class LogStructuredKVCache(nn.Module):
                                          tuple(self._active_updates.save(x) for x in block)))
 
         self._mid_decode_state = None
-        active = [i for i in range(len(lanes)) if counts[i] > 0]
-        if not active:
+        lengths = np.asarray(counts, dtype=np.int64).reshape(-1)
+        active = np.flatnonzero(lengths > 0)
+        if not len(active):
             return
         fields = self._semantic_flat_level_fields()
         dev = fields[0].device
@@ -1602,82 +1616,59 @@ class LogStructuredKVCache(nn.Module):
                  and fields[1].dtype in (torch.float16, torch.bfloat16, torch.float32)
                  and fields[2].dtype == torch.float32
                  and all(x is None or x.is_contiguous() for x in block) else None)
-        bases = [self._semantic_lane_base(*lane) for lane in lanes]
+        # Lanes are distinct, so each level is scheduled for all lanes at once
+        # from a snapshot of the host counts, with one NumPy pass per level.
+        B = self.B
+        lane_ids = np.asarray(lanes, dtype=np.int64).reshape(-1, 3)
+        bases = ((lane_ids[:, 0] * self.n_groups + lane_ids[:, 1]) * self.K_max + lane_ids[:, 2]) * self.L_alloc * B
+        level_counts = np.array([self._semantic_counts[b][g][c] for b, g, c in lanes], dtype=np.int64)
         stage = block
-        spans: dict[int, tuple[int, int]] = {}
-        off = 0
-        for i, n in enumerate(counts):
-            spans[i] = (off, n)
-            off += n
+        offsets = (np.cumsum(lengths) - lengths)[active]
+        lengths = lengths[active]
 
         for ell in range(self.L_alloc):
-            if not active:
+            if not len(active):
                 return
             top = ell == self.L_alloc - 1
-            fill_src: list[tuple[int, int]] = []
-            fill_dst: list[tuple[int, int]] = []
-            store_rows: list[tuple[int, int]] = []
-            stage_rows: list[tuple[int, int]] = []
-            surv_dst: list[tuple[int, int]] = []
-            clear_dst: list[tuple[int, int]] = []
-            n_store = 0
-            n_stage = 0
-            recs: list[tuple[int, int, int, int]] = []  # (st_off, sg_off, m, n_pair_rows)
-            overflow_top: list[tuple[int, int, int]] = []  # (lane_i, start, count)
-            carry_counts: list[tuple[int, int]] = []
-            next_active: list[int] = []
-
-            for i in active:
-                b, g, c = lanes[i]
-                s, m = spans[i]
-                cnt = self._semantic_counts[b][g][c][ell]
-                base = bases[i] + ell * self.B
-                take = min(self.B - cnt, m)
-                if take:
-                    fill_src.append((s, s + take))
-                    fill_dst.append((base + cnt, base + cnt + take))
-                    cnt += take
-                    s += take
-                    m -= take
-                if m == 0:
-                    self._set_semantic_level_count(b, g, c, ell, cnt)
-                    continue
-                if top:
-                    overflow_top.append((i, s, m))
-                    continue
-                carry_n = (m + 1) // 2
-                n_pair_rows = 2 * carry_n
-                n_surv = self.B + m - n_pair_rows
-                recs.append((n_store, n_stage, m, n_pair_rows))
-                store_rows.append((base, base + self.B))
-                n_store += self.B
-                stage_rows.append((s, s + m))
-                n_stage += m
-                surv_dst.append((base, base + n_surv))
-                if n_surv < self.B:
-                    clear_dst.append((base + n_surv, base + self.B))
-                self._set_semantic_level_count(b, g, c, ell, n_surv)
-                carry_counts.append((i, carry_n))
-                next_active.append(i)
-
+            base = bases[active] + ell * B
+            filled = level_counts[active, ell]
+            take = np.minimum(B - filled, lengths)
+            fill_src = np.stack((offsets, offsets + take), -1)
+            fill_dst = np.stack((base + filled, base + filled + take), -1)
+            filled = filled + take
+            offsets = offsets + take
+            lengths = lengths - take
+            done = lengths == 0
+            self._set_semantic_level_counts(lanes, active[done], ell, filled[done])
+            over = ~done
+            overflow_top = list(zip(active[over].tolist(), offsets[over].tolist(), lengths[over].tolist())) if top else []
+            carry_mask = np.zeros_like(over) if top else over
             # The pool is [gathered storage rows] ++ [gathered staging rows], so
             # staging positions shift by the total storage row count.
-            pair_idx: list[tuple[int, int]] = []
-            surv_idx: list[tuple[int, int]] = []
-            for st_off, sg_off, m, n_pair_rows in recs:
-                ps = min(self.B, n_pair_rows)
-                pair_idx.append((st_off, st_off + ps))
-                if n_pair_rows > ps:
-                    begin = n_store + sg_off
-                    pair_idx.append((begin, begin + n_pair_rows - ps))
-                if ps < self.B:
-                    surv_idx.append((st_off + ps, st_off + self.B))
-                begin = n_store + sg_off + max(0, n_pair_rows - self.B)
-                surv_idx.append((begin, n_store + sg_off + m))
+            base, m = base[carry_mask], lengths[carry_mask]
+            n_recs = len(m)
+            carry_n = (m + 1) // 2
+            n_pair_rows = 2 * carry_n
+            n_surv = B + m - n_pair_rows
+            store_off = np.arange(n_recs, dtype=np.int64) * B
+            n_store = n_recs * B
+            stage_off = n_store + np.cumsum(m) - m
+            store_rows = np.stack((base, base + B), -1)
+            stage_rows = np.stack((offsets[carry_mask], offsets[carry_mask] + m), -1)
+            surv_dst = np.stack((base, base + n_surv), -1)
+            clear_dst = np.stack((base + n_surv, base + B), -1)
+            self._set_semantic_level_counts(lanes, active[carry_mask], ell, n_surv)
+            ps = np.minimum(B, n_pair_rows)
+            # Per record: storage pair rows, then staging pair rows; then the
+            # storage survivors and staging survivors. Empty ranges vanish.
+            pair_idx = np.stack((store_off, store_off + ps, stage_off, stage_off + n_pair_rows - ps), -1)
+            surv_idx = np.stack((store_off + ps, store_off + B,
+                                 stage_off + np.maximum(0, n_pair_rows - B), stage_off + m), -1)
+            pair_idx, surv_idx = pair_idx.reshape(-1, 2), surv_idx.reshape(-1, 2)
 
             beta_lengths, beta_layout = None, None
-            if self.beta_adaptive_merge and recs:
-                beta_lengths = [n_pair_rows for _, _, _, n_pair_rows in recs]
+            if self.beta_adaptive_merge and n_recs:
+                beta_lengths = n_pair_rows.tolist()
                 if fused is not None:
                     from litgpt.beta_log_kv import make_layout
 
@@ -1700,13 +1691,13 @@ class LogStructuredKVCache(nn.Module):
                         if f is not None:
                             f.index_copy_(0, fd, x.index_select(0, fs).to(f.dtype))
 
-            for i, s, m in overflow_top:
+            for i, start, n in overflow_top:
                 b, g, c = lanes[i]
                 self._semantic_append_top_level_overflow(
-                    b, g, c, self._semantic_slice_block(stage, s, s + m)
+                    b, g, c, self._semantic_slice_block(stage, start, start + n)
                 )
 
-            if not recs:
+            if not n_recs:
                 return
 
             cuts = None
@@ -1748,12 +1739,8 @@ class LogStructuredKVCache(nn.Module):
                 cut_records.append((ell, self._active_updates.save(cuts)))
 
             stage = carry
-            spans = {}
-            off = 0
-            for i, cn in carry_counts:
-                spans[i] = (off, cn)
-                off += cn
-            active = next_active
+            active, lengths = active[carry_mask], carry_n
+            offsets = np.cumsum(lengths) - lengths
 
     def _semantic_append_entry_block(self, b: int, g: int, c: int, block: tuple[torch.Tensor, ...]) -> None:
         self._semantic_append_entries_batched([(b, g, c)], [block[0].size(0)], block)
