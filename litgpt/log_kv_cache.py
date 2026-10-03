@@ -3360,9 +3360,11 @@ class LogStructuredKVCache(nn.Module):
             [np.arange(len(rows), dtype=np.int64) for rows in survivors])
         return np.split(compact[parent], offsets[1:])
 
-    # CUDA+Triton keeps the Gram footprint of 16 lanes x 2048^2 FP32 (256 MiB);
-    # the Torch reference also materializes row temporaries, so it uses less.
-    _SEMANTIC_ROUTE_TILE_BYTES = {True: 256 << 20, False: 64 << 20}
+    # CUDA+Triton: 1 GiB holds the FP32 distances of 32 lanes x ~2.3K nodes
+    # (batch 4 x 8 groups, flush plus evicted exact tokens), so the training
+    # shape routes in one tile: one round sequence, poll and GEMM per stage.
+    # The Torch reference also materializes row temporaries, so it uses less.
+    _SEMANTIC_ROUTE_TILE_BYTES = {True: 1 << 30, False: 64 << 20}
 
     def _semantic_unified_tile(self, lanes: int, tokens: int, device: torch.device) -> int:
         """Largest balanced lane tile whose FP32 distance matrix fits the budget.
@@ -3487,9 +3489,9 @@ class LogStructuredKVCache(nn.Module):
         p_hi = np.fromiter((self._semantic_p_hi_c[b][g][c] for b, g, c, _ in jobs), dtype=np.int64, count=n_jobs)
         late = np.minimum.reduceat(token_pos, np.cumsum(lengths) - lengths) < p_hi
         flags = late.tolist()
-        self._semantic_commit_joins([job for job, d in zip(jobs, flags) if not d],
-                                    k_raw, v, positions, positions_host, record=record)
+        ordinary = [job for job, d in zip(jobs, flags) if not d]
         if not late.any():
+            self._semantic_commit_joins(ordinary, k_raw, v, positions, positions_host, record=record)
             return
         delayed = [job for job, d in zip(jobs, flags) if d]
         nd, n_levels = len(delayed), self.L_alloc
@@ -3530,15 +3532,8 @@ class LogStructuredKVCache(nn.Module):
         # Positions are nonnegative and below 2**40; the lane id leads the key.
         key = (segment_t << 40) | combined[8].index_select(0, lane_major_t)
         order = lane_major_t.index_select(0, torch.argsort(key, stable=True))
-        block = tuple(x[order] if x is not None else None for x in combined)
-        block = block[:11] + (phase_t, block[12])
-        if record:
-            rows = np.empty((n_new, 4), dtype=np.int64)
-            rows[:, 0], rows[:, 1], rows[:, 2], rows[:, 3] = LOG_KV_OP_JOIN, lane_c[new_owner], 0, new_pos
-            lane_rows = (lane_b * self.n_groups + lane_g)[new_owner]
-            bounds = np.concatenate(([0], np.flatnonzero(lane_rows[1:] != lane_rows[:-1]) + 1, [n_new]))
-            for lo, hi in zip(bounds[:-1].tolist(), bounds[1:].tolist()):
-                self._record_ops(int(lane_b[new_owner[lo]]), int(lane_g[new_owner[lo]]), rows[lo:hi])
+        # Delayed rows as (source, row index) pairs; the phases are final.
+        tail = tuple(None if x is None else (x, order) for x in combined[:11]) + ((phase_t, None), (combined[12], order))
         new_start = np.cumsum(new_len) - new_len
         highs = np.maximum(p_hi[late], np.maximum.reduceat(new_pos, new_start)).tolist()
         sums = torch.segment_reduce(nk.float(), "sum", lengths=lengths_t, unsafe=True)
@@ -3557,7 +3552,43 @@ class LogStructuredKVCache(nn.Module):
             self._set_semantic_p_hi(b, g, c, hi)
             self._set_semantic_level0_phase(b, g, c, count)
             self._semantic_ward_dirty[b][g] = True
-        self._semantic_append_entries_batched(lanes, counts, block)
+        # Ordinary and delayed lanes are disjoint and the delayed rows were
+        # gathered before the clear, so one batched ladder append serves both.
+        # Ordinary op rows still precede the delayed ones within each lane.
+        if ordinary:
+            self._semantic_commit_joins(ordinary, k_raw, v, positions, positions_host, record=record,
+                                        tail=(lanes, counts, tail))
+        else:
+            self._semantic_append_entries_batched(lanes, counts, tuple(
+                None if part is None else self._semantic_tail_rows(*part) for part in tail))
+        if record:
+            rows = np.empty((n_new, 4), dtype=np.int64)
+            rows[:, 0], rows[:, 1], rows[:, 2], rows[:, 3] = LOG_KV_OP_JOIN, lane_c[new_owner], 0, new_pos
+            lane_rows = (lane_b * self.n_groups + lane_g)[new_owner]
+            bounds = np.concatenate(([0], np.flatnonzero(lane_rows[1:] != lane_rows[:-1]) + 1, [n_new]))
+            for lo, hi in zip(bounds[:-1].tolist(), bounds[1:].tolist()):
+                self._record_ops(int(lane_b[new_owner[lo]]), int(lane_g[new_owner[lo]]), rows[lo:hi])
+
+    @staticmethod
+    def _semantic_tail_rows(source, index, out=None):
+        """Rows `index` of `source` (all rows when None), optionally into `out`."""
+        if index is None:
+            return source if out is None else out.copy_(source)
+        if out is None:
+            return source.index_select(0, index)
+        if out.dtype == source.dtype:
+            return torch.index_select(source, 0, index, out=out)
+        return out.copy_(source.index_select(0, index))
+
+    @classmethod
+    def _semantic_stack_rows(cls, head, part):
+        """Head rows then tail rows in one staging tensor; dtypes promote exactly."""
+        source, index = part
+        rows = source.size(0) if index is None else index.numel()
+        out = head.new_empty((head.size(0) + rows, *head.shape[1:]), dtype=torch.promote_types(head.dtype, source.dtype))
+        out[:head.size(0)].copy_(head)
+        cls._semantic_tail_rows(source, index, out[head.size(0):])
+        return out
 
     @torch.no_grad()
     def _alpha_route_flush(self, k, v, positions, positions_host, span_ends, *, record):
@@ -3636,6 +3667,7 @@ class LogStructuredKVCache(nn.Module):
         positions_host: list[list[int]],
         *,
         record: bool = False,
+        tail=None,
     ) -> None:
         """Join many (b, g, cluster) -> token-offset assignments in one pass.
 
@@ -3644,12 +3676,13 @@ class LogStructuredKVCache(nn.Module):
         alignment and the hard cap keep the exact host-side rules the per-cluster
         path used -- the difference is that every lane's entries land in a single
         staging block, so one batched ladder append and one batched centroid
-        update serve all of them.
+        update serve all of them. An optional `tail` of (lanes, counts, row
+        sources) for other, already prepared lanes joins that ladder append.
         """
         if not jobs:
             return
         with self._semantic_deferred_scalars():
-            self._semantic_commit_joins_inner(jobs, k_raw, v, positions, positions_host, record=record)
+            self._semantic_commit_joins_inner(jobs, k_raw, v, positions, positions_host, record=record, tail=tail)
 
     def _semantic_commit_joins_inner(
         self,
@@ -3660,12 +3693,13 @@ class LogStructuredKVCache(nn.Module):
         positions_host: list[list[int]],
         *,
         record: bool = False,
+        tail=None,
     ) -> None:
         T, n_groups = k_raw.size(2), k_raw.size(1)
         host_pos = np.asarray(positions_host, dtype=np.int64)
         seg_on = self.seg_gap_max != math.inf
         if not seg_on:
-            self._semantic_commit_joins_unsegmented(jobs, host_pos, k_raw, v, positions, record=record)
+            self._semantic_commit_joins_unsegmented(jobs, host_pos, k_raw, v, positions, record=record, tail=tail)
             return
         align = 1 << self.seg_block_level
         lanes, lane_counts, runs, pending_ops = [], [], [], []
@@ -3730,10 +3764,12 @@ class LogStructuredKVCache(nn.Module):
         if lanes:
             self._semantic_apply_join_plan(
                 lanes, lane_counts, np.concatenate(at_parts), np.concatenate(src_parts), np.concatenate(order_parts),
-                runs, pending_ops, total, k_raw, v, positions,
+                runs, pending_ops, total, k_raw, v, positions, tail=tail,
             )
+        elif tail is not None:
+            raise RuntimeError("a join tail needs at least one joined lane")
 
-    def _semantic_commit_joins_unsegmented(self, jobs, host_pos, k_raw, v, positions, *, record):
+    def _semantic_commit_joins_unsegmented(self, jobs, host_pos, k_raw, v, positions, *, record, tail=None):
         """Unsegmented joins for every (b, g, cluster) with whole-array NumPy.
 
         Without segment gaps each job is one run with no pads, so staging rows
@@ -3742,6 +3778,8 @@ class LogStructuredKVCache(nn.Module):
         """
         jobs = [job for job in jobs if len(job[3])]
         if not jobs:
+            if tail is not None:
+                raise RuntimeError("a join tail needs at least one joined lane")
             return
         T, n_groups = k_raw.size(2), k_raw.size(1)
         lengths = np.fromiter((len(job[3]) for job in jobs), dtype=np.int64, count=len(jobs))
@@ -3787,7 +3825,7 @@ class LogStructuredKVCache(nn.Module):
                 pending_ops.append((job[0], job[1], rows[part[0]:part[-1] + 1]))
         self._semantic_apply_join_plan(
             lanes, lengths.tolist(), np.arange(total, dtype=np.int64), (lane_ids * T)[owner] + offsets,
-            phase[owner] + rank, runs, pending_ops, total, k_raw, v, positions,
+            phase[owner] + rank, runs, pending_ops, total, k_raw, v, positions, tail=tail,
         )
 
 
@@ -3851,11 +3889,15 @@ class LogStructuredKVCache(nn.Module):
         k_raw: torch.Tensor,
         v: torch.Tensor,
         positions: torch.Tensor,
+        *,
+        tail=None,
     ) -> None:
         """Materialize one staging block for every lane and commit it.
 
         Shared by forward routing and op-log replay: the two differ only in how
-        the plan is derived, never in how it lands.
+        the plan is derived, never in how it lands. A `tail` of (lanes, counts,
+        (source, row index) per field) is staged after these rows and shares
+        the ladder append; centroid updates stay with the joined lanes.
         """
         dev = k_raw.device
         if not lanes:
@@ -3926,7 +3968,14 @@ class LogStructuredKVCache(nn.Module):
             order_t,
             block_pad,
         )
-        self._semantic_append_entries_batched(lanes, lane_counts, block)
+        if tail is None:
+            self._semantic_append_entries_batched(lanes, lane_counts, block)
+        else:
+            tail_lanes, tail_counts, tail_rows = tail
+            self._semantic_append_entries_batched(
+                list(lanes) + list(tail_lanes), list(lane_counts) + list(tail_counts),
+                tuple(None if head is None else self._semantic_stack_rows(head, part)
+                      for head, part in zip(block, tail_rows)))
 
         # Keep the increasing-token sum order: atomic/tree reductions can
         # perturb centroid routing. The CUDA loop fuses that sum with the update.

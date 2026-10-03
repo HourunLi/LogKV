@@ -151,6 +151,40 @@ def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta):
         torch.testing.assert_close(total, source.float().sum(2), atol=.12 if dtype == torch.bfloat16 else 3e-5, rtol=.01)
 
 
+def test_ordinary_and_delayed_joins_share_one_ladder_append():
+    torch.manual_seed(5)
+    c = cache_for(beta_novelty=True, beta_adaptive_merge=True)
+    c.begin_op_log()
+    commit, append = c._alpha_commit_joins, c._semantic_append_entries_batched
+    checked = []
+
+    def split_reference(jobs, k_raw, v, positions, host, *, record):
+        late = [min(host[b][i] for i in offsets) < c._semantic_p_hi_c[b][g][cluster]
+                for b, g, cluster, offsets in jobs]
+        reference = deepcopy(c)
+        for kind in (False, True):
+            part = [job for job, is_late in zip(jobs, late) if is_late == kind]
+            # deepcopy also copies the instance patch; call the real method.
+            LogStructuredKVCache._alpha_commit_joins(reference, part, k_raw, v, positions, host, record=record)
+        with patch.object(c, "_semantic_append_entries_batched", wraps=append) as appends:
+            commit(jobs, k_raw, v, positions, host, record=record)
+        if any(late) and not all(late):
+            assert appends.call_count == 1
+            checked.append(True)
+        for name, value in c.named_buffers():
+            torch.testing.assert_close(value, reference.get_buffer(name), rtol=0, atol=0, msg=name)
+        for name in c._UPDATE_HOST_FIELDS + ("_semantic_counts", "_op_log_host"):
+            assert getattr(c, name) == getattr(reference, name), name
+
+    k, v = torch.randn(2, 2, 96, 8), torch.randn(2, 2, 96, 8)
+    ends = boundaries(96)
+    with patch.object(c, "_alpha_commit_joins", side_effect=split_reference):
+        for start in range(0, 96, 8):
+            c.add_recent(k[:, :, start:start + 8], v[:, :, start:start + 8], k_raw=k[:, :, start:start + 8],
+                         span_ends=[row[start:start + 8] for row in ends], record_op_log=True)
+    assert checked
+
+
 def test_delayed_archive_updates_hi_and_preserves_original_weighted_positions():
     c = cache_for()
     k = torch.randn(2, 2, 8, 8)
