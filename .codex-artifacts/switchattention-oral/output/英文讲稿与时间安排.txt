@@ -1,0 +1,120 @@
+Switch Attention — 9:30 talk + 2:30 Q&A
+English script with Chinese delivery cues
+
+Slide 1: Switch Attention: Towards Dynamic and Fine-grained Hybrid Transformers
+0:00–0:20 (20 s)
+Hello everyone. Today I will present Switch Attention. Our question is simple: can a transformer decide when it needs global context, separately for each token and each layer? We study this through dynamic routing between full attention and sliding window attention.
+
+0:00–0:20。开场直接抛出研究问题，不口述全部作者与单位。
+Sources: Paper p. 1, title and abstract
+
+Slide 2: Global context is useful—but not for every computation
+0:20–1:05 (45 s)
+Full attention lets a token access the entire preceding context, but its cost grows with context length. Sliding window attention limits this access to recent tokens, making local computation cheaper. The tradeoff is losing direct access to distant information. A common compromise assigns full attention to some layers and sliding windows to others. But this schedule is fixed before seeing the input. It spends the same pattern of global computation on an easy local continuation and on a question that requires retrieving something far away.
+
+0:20–1:05。指向 global / local，再指向固定层交替模式；落点是输入变化而计算分配不变。
+Sources: Paper pp. 1–2, Introduction, Paper p. 1, Figure 1(a)
+
+Slide 3: Choose attention at every token and every layer
+1:05–1:50 (45 s)
+Switch Attention changes the unit of this decision. Instead of assigning an attention type to a whole layer, we make a separate choice for each token at each layer. In this diagram, the static model uses the same pattern across tokens. In our model, the pattern can change across both dimensions. A token can receive global information at one layer and use a local window at another. The aim is to retain access to distant information while learning where that access is actually useful for prediction.
+
+1:05–1:50。沿图的 token 轴与 layer 轴各指一次。不要把颜色解读为独立专家或不同参数组。
+Sources: Paper p. 1, Figure 1, Paper pp. 2–4, Sections 3.1–3.2
+
+Slide 4: A small router selects one attention branch
+1:50–2:45 (55 s)
+At inference, the router is a linear mapping of the current hidden representation, followed by a sigmoid. A probability above one half selects full attention; otherwise, it selects the sliding window. Both branches share the query, key, and value projections and one KV cache. During decoding, we compute only the selected attention branch for the current token. The decision therefore does not require first evaluating both alternatives. The selected branch still performs its usual attention operation. What changes is which context range this token reads, based on information already available in its hidden representation.
+
+1:50–2:45。按 hidden state → router → selected branch 讲。强调 only selected branch 指推理，避免与下一页训练混淆。
+Sources: Paper pp. 3–4, Figure 2(b) and Section 3.2, Paper p. 6, Implementation Details, Paper Appendix A, inference algorithm
+
+Slide 5: Penalize global attention less when it matters more
+2:45–3:50 (65 s)
+How do we encourage efficiency without forcing every token into the local branch? We add a softplus penalty to the router logit. Reducing this penalty term pushes the router toward sliding window attention. Its weight is adaptive. The numerator is a fixed base weight; the denominator combines a small constant, the token prediction loss, and the disagreement between the two attention outputs. If prediction is difficult, or the branches disagree strongly, the denominator grows and the efficiency penalty becomes weaker. This gives the model more freedom to choose full attention. These signals are used only during training. At inference, routing uses the hidden representation alone, with no ground truth or future tokens.
+
+2:45–3:50。只解释分母变大→惩罚减弱这一条因果链，不逐符号朗读公式。训练标签与推理信息边界必须说清。
+Sources: Paper pp. 4–5, Section 3.3, Equations 7–8, Paper p. 5, training-only clarification
+
+Slide 6: Convert an existing full-attention model through CPT
+3:50–4:40 (50 s)
+We initialize from a pretrained full attention model and update the whole model through continual pretraining. During training, both attention branches are computed. A hard gate selects the output, and a straight-through estimator lets the router receive gradients. Our main model has one point five billion parameters, twenty-two layers, and a window of one thousand twenty-four tokens. Conversion uses twenty billion tokens for the four-K setting and eight billion tokens for the thirty-two-K setting. Evaluation covers twenty-three datasets, including commonsense reasoning, in-context retrieval, and long-context understanding. I will focus on the results that require longer-range access.
+
+3:50–4:40。training computes both 与 inference computes selected 对应起来。参数和训练量指表格带过。
+Sources: Paper pp. 4–5, Sections 3.2 and 3.4, Paper pp. 6–7, Section 4.1, Paper Appendix F, implementation details
+
+Slide 7: Preserve retrieval quality at 4K
+4:40–5:30 (50 s)
+First, consider retrieval within a four-K context. Some questions need information beyond the local window, so using sliding windows everywhere can lose useful evidence. Across the six datasets in this comparison, Switch Attention and the full attention baseline both have a reported average of fifty-two point nine. The static hybrid baseline scores fifty point six. That is a gain of two point three points over the fixed schedule. Individual datasets show different tradeoffs, but the aggregate result suggests that learned routing can preserve retrieval quality better than this static allocation of attention.
+
+4:40–5:30。先指 Full 与 Swi 的同值，再指 SH 的差距。说 points，不说 percent。
+Sources: Paper p. 7, Table 2 and Section 4.2, In-Context Retrieval
+
+Slide 8: Match the reported full-attention average on LongBench-E
+5:30–6:20 (50 s)
+The same pattern appears on LongBench-E, where inputs can reach thirty-two thousand tokens. Switch Attention and full attention both report an average score of thirty-seven point four. The static hybrid scores thirty-five point two, and DuoAttention scores thirty-three point nine. Relative to the static hybrid, our gain is two point two points. These equal averages do not mean that every task has the same outcome, or establish statistical equivalence by themselves. They show that, under this evaluation setup, the overall long-context score is preserved while the model can choose cheaper local attention.
+
+5:30–6:20。限定为 reported average parity；不要宣称每项一致或由平均数证明统计等价。
+Sources: Paper p. 7, Table 3 and Section 4.2, Long-Context Understanding
+
+Slide 9: Routing responds to where the evidence is
+6:20–7:25 (65 s)
+Does routing actually respond to the input? In needle-in-a-haystack retrieval, we move the target information to different positions and measure routing while the model generates the answer. When the needle lies outside the local window, full attention is used about thirty percent of the time. When it lies inside the window, that falls to about five percent. The model achieves one hundred percent retrieval accuracy over the tested grid. The horizontal axis moves the needle toward the end of the prompt. The different curves use different context lengths, so they enter the local window at different depths. The drop in global attention follows this change in where the relevant information is available.
+
+6:20–7:25。讲清横轴是needle位置，越往右越靠近prompt末端。不同长度进入window的深度不同。100%仅限测试网格。
+Sources: Paper pp. 8–9, Figures 3, 5 and 6, Paper pp. 8–9, Section 4.4, Paper Appendix J, Table 7
+
+Slide 10: Read fewer KV tokens during decoding
+7:25–8:25 (60 s)
+The efficiency result is easiest to interpret as the number of KV tokens accessed during decoding. At a thirty-two-K position, full attention accesses thirty-two-K tokens. Switch Attention averages seven point three-K in the standard setting, or about four point four times fewer. In the simple setting, this falls to two point six-K, about twelve times fewer. The difference between these settings is consistent with input-dependent routing. Global reads are concentrated where the learned router chooses to use them, rather than following a fixed schedule. These figures measure the amount of KV access, not the capacity of the stored cache. They also do not directly measure end-to-end speedup. Actual latency depends on the implementation, hardware, and the rest of the model.
+
+7:25–8:25。逐组解释32/7.3和32/2.6。必须说 KV access，不能说 cache memory reduction 或12倍速度。
+Sources: Paper p. 8, Figure 4(b) and Section 4.4, Inference Efficiency, Paper Appendix K.2, Table 9
+
+Slide 11: Practical costs and current limits
+8:25–9:00 (35 s)
+There are practical costs and limits. In the reported thirty-two-K training measurement, computing both branches adds eight point four percent forward overhead and seven point nine percent backward overhead per layer. The model still stores the full KV history for possible future global reads. Experiments cover models up to three billion parameters, and this study does not report a measured end-to-end inference speedup.
+
+8:25–9:00。限制直接说明；不展开 kernel 推导。若被问硬件实现，转备份页。
+Sources: Paper p. 9, Limitations, Paper pp. 20–21, Appendix K.1, Table 8, Paper Appendix A, shared full-history KV cache
+
+Slide 12: Global attention becomes a decision, not a fixed schedule
+9:00–9:30 (30 s)
+The main takeaway is that global attention can be allocated according to the input, at the level of individual tokens and layers. Switch Attention learns this allocation through continual pretraining and adaptive regularization, while preserving the reported average quality on retrieval and long-context benchmarks. Our kernel implementation is available at the link on this slide. Thank you. I am happy to take questions.
+
+9:00–9:30。停在结论与代码链接页，保留最后2分30秒问答。代码地址不逐字符朗读。
+Sources: Paper pp. 1 and 9, Abstract and Conclusion, https://github.com/YushengZhao/SwitchAttentionKernels
+
+Q&A: 9:30–12:00
+
+1. Does the router need future tokens?
+No. NLL and branch disagreement only determine the regularization weight during teacher-forced training. Inference routing uses the current hidden representation.
+
+2. Does this reduce KV-cache capacity?
+It reduces how many KV tokens are read. The complete shared history remains stored, because a later query may require full attention.
+
+3. What is the measured inference speedup?
+The paper reports GFLOPs and KV-access reductions and releases a prefill kernel. It does not report end-to-end inference latency or throughput speedup.
+
+4. Why compute both branches during training?
+This supports hard-gate training with straight-through gradients and branch-disagreement regularization. The measured per-layer CPT overhead at32K is8.4% forward and7.9% backward. See slide11.
+
+5. Is the full-attention ratio fixed at13%?
+No. About13% is an observed average across400M tokens from the CPT data distribution. It is not a fixed budget or a universal rate. NIAH answer-generation measurements are a different distribution.
+
+6. What does the3B experiment show?
+It provides a limited scaling check. Retrieval improves from55.4 to55.8, while the five-task LongBench-E average changes from37.2 to36.6. Larger scales remain unverified. See backup3 (slide15).
+
+7. How are results compared with static hybrids?
+The1.5B experiment reports52.9 versus50.6 for retrieval and37.4 versus35.2 for LongBench-E, comparing SwiAttn with SH(3:1). SWA-CPT and static hybrids receive the same added token budgets. The full-attention baseline does not receive the same extra CPT, so the full comparison is not equal-total-compute.
+
+8. Does the statistical result prove equivalence?
+No. The equal rounded averages and the non-significant difference from FullAttn support similar observed performance in this experiment. They do not establish statistical equivalence.
+
+Backup navigation
+Slide13 / Backup1: hard gate and STE
+Slide14 / Backup2: adaptive regularization ablation
+Slide15 / Backup3:3B results
+Slide16 / Backup4: NIAH accuracy
+Slide17 / Backup5: kernel tiling and arithmetic intensity
+Slide18 / Backup6: per-task LongBench-E results and statistical details

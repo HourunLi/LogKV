@@ -2,10 +2,10 @@
 config: arc_semantic_unified.yaml
 ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
 resume_dir: null
-expid: qwen1.7b-32k-alpha_k12_b128
-save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-alpha_k12_b128
-merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_alpha_k12_b128
-tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-alpha_k12_b128
+expid: qwen1.7b-32k-alpha_k12_b128_4k
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-alpha_k12_b128_4k
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_alpha_k12_b128_4k
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-alpha_k12_b128_4k
 
 # Total exact token budget, including an unfinished span crossing a flush.
 # B=128 is the original byte budget; the cache deducts exact storage from B.
