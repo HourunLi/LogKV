@@ -105,6 +105,8 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
 
 `eval.sh` 从 `save_path` 加载训练产物；第三参数 `none` 关闭默认追加的多长度 NIAH。
 显式 metadata 是必需的，脚本目前不转发 YAML 中这一字段。
+多卡评测各 rank 汇合时每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印仍未到达的 rank，
+超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
 
 实现入口：[评分](../litgpt/alpha_log_kv.py)、[压缩参考](../litgpt/beta_log_kv.py)、
 [CUDA 更新](../litgpt/log_kv_updates_triton.py)、[缓存与回放](../litgpt/log_kv_cache.py)。
