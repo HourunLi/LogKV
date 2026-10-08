@@ -15,7 +15,7 @@ max_steps: 1200
 learning_rate: 5e-6
 min_lr: 3e-6
 warmup_steps: 200
-save_interval: 400
+save_interval: 200
 run_eval: ""
 
 log_kv_semantic_unified_route: true
