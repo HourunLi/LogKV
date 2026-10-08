@@ -138,6 +138,8 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
 这里显式传 metadata：当前 `eval.sh` 不转发 YAML metadata，且默认会另跑 single1/2/3
 的六个长度档；第三参数 `none` 关闭这次额外评测。脚本从实验 `save_path` 加载训练产物，
 不是从 `ckpt_dir` 加载初始 Base 权重。
+多卡评测各 rank 汇合时每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印仍未到达的 rank，
+超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
 
 如需验证 CUDA 路由性能，只跑以下短基准；与已有结果比较时保持 B、batch 和输入规模一致：
 
