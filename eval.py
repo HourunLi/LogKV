@@ -181,6 +181,47 @@ def _broadcast_obj(obj: Any, src: int = 0, group=None) -> Any:
     return box[0]
 
 
+
+_SYNC_SEQ = 0
+
+
+def _wait_all_ranks(stage: str) -> float:
+    """所有 rank 汇合，返回本 rank 的等待秒数；等待期间定期打印仍未到达的 rank。
+
+    不用 ``monitored_barrier``：它等待时进程没有任何输出、GPU 利用率恒定，ModelArts
+    卡死检测（进程 IO 不变 + GPU 利用率不变，默认 30 min）会把"等最慢的 rank / 等 rank 0
+    写结果"判成卡死，且要到 12h 超时才报告缺席 rank。这里改在默认进程组的 TCPStore 上
+    计数：CPU 轮询，每 ``LOGKV_EVAL_SYNC_HEARTBEAT_S``（默认 300s）打印一次缺席 rank；
+    超过 ``LOGKV_EVAL_SYNC_TIMEOUT_S``（默认 7200s，<=0 不限）仍未到齐就报错。
+    所有 rank 必须按相同顺序调用（键按调用序号区分）。
+    """
+    global _SYNC_SEQ
+    if not _dist_ready():
+        return 0.0
+    _SYNC_SEQ += 1
+    key = f"logkv_eval_sync/{_SYNC_SEQ}"
+    world = _world_size()
+    store = dist.distributed_c10d._get_default_store()
+    store.set(f"{key}/rank{_global_rank()}", "1")
+    store.add(key, 1)
+    heartbeat_s = max(_env_int("LOGKV_EVAL_SYNC_HEARTBEAT_S", 300), 1)
+    timeout_s = _env_int("LOGKV_EVAL_SYNC_TIMEOUT_S", 7200)
+    t0 = time.perf_counter()
+    next_report = heartbeat_s
+    while store.add(key, 0) < world:
+        waited = time.perf_counter() - t0
+        timed_out = 0 < timeout_s <= waited
+        if timed_out or waited >= next_report:
+            missing = [r for r in range(world) if not store.check([f"{key}/rank{r}"])]
+            message = f"[{_rank_label()}] {stage}: 已等待 {waited:.0f}s，仍未到达的 rank: {missing}"
+            if timed_out:
+                raise RuntimeError(f"{message}（超过 LOGKV_EVAL_SYNC_TIMEOUT_S={timeout_s}）")
+            print(f"⏳ {message}", flush=True)
+            next_report += heartbeat_s
+        time.sleep(1.0)
+    return time.perf_counter() - t0
+
+
 def _hb(stage: str) -> None:
     """无条件心跳打印（所有 rank，不受 is_main 限制），排查多机卡死用。
 
@@ -975,11 +1016,9 @@ class LogKVLM(LM):
             return local_result_list
 
         # 结果只有 float/bool/str，不必经 GPU/NCCL 序列化与通信。
-        # 用 CPU 屏障等待长上下文的负载差异；超时时报告尚未到达的 rank。
+        # 汇合等待长上下文的负载差异；等待期间的心跳与超时见 _wait_all_ranks。
         print(f"⏳ [{_rank_label()}] {tag} 本 rank {len(local_result_list)} 条已完成，等待其它 rank", flush=True)
-        t0 = time.perf_counter()
-        dist.monitored_barrier(group=self.process_group, timeout=timedelta(hours=12), wait_all_ranks=True)
-        wait_s = time.perf_counter() - t0
+        wait_s = _wait_all_ranks(f"{tag} 汇总")
         print(
             f"🤝 [{_rank_label()}] {tag} 全部 rank 已就绪，等待用时 {wait_s:.1f}s；开始 Gloo 结果汇总",
             flush=True,
@@ -1755,9 +1794,8 @@ def main(
         try:
             if _dist_ready():
                 if eval_done:
-                    t0 = time.perf_counter()
-                    dist.monitored_barrier(group=eval_group, timeout=timedelta(hours=12), wait_all_ranks=True)
-                    print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {time.perf_counter() - t0:.1f}s", flush=True)
+                    wait_s = _wait_all_ranks("收尾同步")
+                    print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {wait_s:.1f}s", flush=True)
                 else:
                     print(f"⚠️ [{_rank_label()}] 评测未正常结束，跳过收尾 barrier", flush=True)
         finally:
