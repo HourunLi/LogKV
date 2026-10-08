@@ -181,6 +181,46 @@ def _broadcast_obj(obj: Any, src: int = 0) -> Any:
     return box[0]
 
 
+_SYNC_SEQ = 0
+
+
+def _wait_all_ranks(stage: str) -> float:
+    """所有 rank 汇合，返回本 rank 的等待秒数；等待期间定期打印仍未到达的 rank。
+
+    不用 ``dist.barrier()``：NCCL barrier 等待时 GPU 利用率恒为 100% 且进程没有任何
+    输出，ModelArts 卡死检测（进程 IO 不变 + GPU 利用率不变，默认 30 min）会把"等最慢
+    的 rank / 等 rank 0 写结果"判成卡死，日志里也看不出在等谁。这里改在默认进程组的
+    TCPStore 上计数：CPU 轮询，每 ``LOGKV_EVAL_SYNC_HEARTBEAT_S``（默认 300s）打印一次
+    缺席 rank；超过 ``LOGKV_EVAL_SYNC_TIMEOUT_S``（默认 7200s，<=0 不限）仍未到齐就报错。
+    所有 rank 必须按相同顺序调用（键按调用序号区分）。
+    """
+    global _SYNC_SEQ
+    if not _dist_ready():
+        return 0.0
+    _SYNC_SEQ += 1
+    key = f"logkv_eval_sync/{_SYNC_SEQ}"
+    world = _world_size()
+    store = dist.distributed_c10d._get_default_store()
+    store.set(f"{key}/rank{_global_rank()}", "1")
+    store.add(key, 1)
+    heartbeat_s = max(_env_int("LOGKV_EVAL_SYNC_HEARTBEAT_S", 300), 1)
+    timeout_s = _env_int("LOGKV_EVAL_SYNC_TIMEOUT_S", 7200)
+    t0 = time.perf_counter()
+    next_report = heartbeat_s
+    while store.add(key, 0) < world:
+        waited = time.perf_counter() - t0
+        timed_out = 0 < timeout_s <= waited
+        if timed_out or waited >= next_report:
+            missing = [r for r in range(world) if not store.check([f"{key}/rank{r}"])]
+            message = f"[{_rank_label()}] {stage}: 已等待 {waited:.0f}s，仍未到达的 rank: {missing}"
+            if timed_out:
+                raise RuntimeError(f"{message}（超过 LOGKV_EVAL_SYNC_TIMEOUT_S={timeout_s}）")
+            print(f"⏳ {message}", flush=True)
+            next_report += heartbeat_s
+        time.sleep(1.0)
+    return time.perf_counter() - t0
+
+
 def _hb(stage: str) -> None:
     """无条件心跳打印（所有 rank，不受 is_main 限制），排查多机卡死用。
 
@@ -958,11 +998,9 @@ class LogKVLM(LM):
             return local_result_list
 
         # 各 rank 拿到的样本长度差异很大（长上下文生成尤甚），最慢的 rank 决定整体
-        # 结束时间。先显式 barrier 把"等其它 rank"的时间量出来单独打印，否则它会被
-        # 算进 all_gather 里，看上去就是"评测跑完之后莫名卡住"。
-        t0 = time.perf_counter()
-        dist.barrier()
-        wait_s = time.perf_counter() - t0
+        # 结束时间。先汇合把"等其它 rank"的时间量出来单独打印，否则它会被算进
+        # all_gather 里，看上去就是"评测跑完之后莫名卡住"；等待期间的心跳见 _wait_all_ranks。
+        wait_s = _wait_all_ranks(f"{tag} 汇总")
         print(
             f"⏳ [{_rank_label()}] {tag} 本 rank {len(local_result_list)} 条已完成，"
             f"等待其它 rank 用时 {wait_s:.1f}s",
@@ -1719,15 +1757,14 @@ def main(
         # json/csv/xlsx；进程组从头到尾没被销毁，退出时要等 NCCL watchdog 把
         # 通信子 abort 掉才肯收敛，启动器（torchrun / ModelArts）就一直挂在
         # "等最后一个 worker 退出"上。
-        # 现在改成：rank 0 写完 → barrier 汇合 → 一起 destroy_process_group() →
-        # 一起退出。
+        # 现在改成：rank 0 写完 → 汇合（_wait_all_ranks，等待期间有心跳）→ 一起
+        # destroy_process_group() → 一起退出。
         # 这里的异常一律吞掉：finally 里抛出会顶掉 try 中真正的报错，把根因藏起来。
         if _dist_ready():
             if eval_done:
-                t0 = time.perf_counter()
                 try:
-                    dist.barrier()
-                    print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {time.perf_counter() - t0:.1f}s", flush=True)
+                    wait_s = _wait_all_ranks("收尾同步")
+                    print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {wait_s:.1f}s", flush=True)
                 except Exception as e:  # noqa: BLE001 — 收尾阶段不掩盖主异常
                     print(f"⚠️ [{_rank_label()}] 收尾 barrier 失败（忽略）: {e}", flush=True)
             else:

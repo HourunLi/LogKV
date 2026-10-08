@@ -39,6 +39,8 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
 
 `eval.sh` 从 `save_path` 解析实际 checkpoint；它不转发 YAML metadata，故此处显式指定
 单档长度。第三参数 `none` 关闭默认追加的 single1/2/3 六档评测。
+多卡评测各 rank 汇合时每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印仍未到达的 rank，
+超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
 这里沿用训练 YAML；现有 `eval.yaml` 的 B=256，且未开启 unified/mid，不适用于这组对照。
 
 已完成权重的全程 SWA 配对比较使用专门入口；其语义组是原 fast 路由，详见对照文档：
