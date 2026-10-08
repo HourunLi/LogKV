@@ -44,7 +44,8 @@ export NVTE_CUDA_INCLUDE_DIR=/usr/local/cuda-12.8/include # must turn on when mu
 
 export NCCL_NVLS_ENABLE=0
 export NCCL_NET_PLUGIN=none
-export NCCL_IB_TIMEOUT=12000
+# IB timeout is an exponent (4.096 us * 2^value), not milliseconds.
+export NCCL_IB_TIMEOUT=${NCCL_IB_TIMEOUT:-20}
 export NCCL_NET_GDR_LEVEL=2  # Enable GPUDirect RDMA if RDMA is available # optim0129
 export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
 
