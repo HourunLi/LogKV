@@ -24,13 +24,16 @@ import torch.distributed as dist
 def _load_collectives():
     source = Path(__file__).resolve().parents[1] / "eval.py"
     tree = ast.parse(source.read_text())
-    names = {"_dist_ready", "_bcast_device", "_broadcast_obj"}
-    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    names = {"_dist_ready", "_bcast_device", "_broadcast_obj", "_env_int", "_wait_all_ranks"}
+    # all_gather_results meets the other ranks through _wait_all_ranks and its sequence counter.
+    nodes = [node for node in tree.body if (isinstance(node, ast.FunctionDef) and node.name in names)
+             or (isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["_SYNC_SEQ"])]
     model = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LogKVLM")
     nodes.append(next(node for node in model.body if isinstance(node, ast.FunctionDef)
                       and node.name == "all_gather_results"))
     scope = dict(torch=torch, dist=dist, time=time, timedelta=timedelta, Any=Any,
-                 _world_size=dist.get_world_size, _rank_label=lambda: f"rank {dist.get_rank()}")
+                 os=os, _world_size=dist.get_world_size, _global_rank=dist.get_rank,
+                 _rank_label=lambda: f"rank {dist.get_rank()}")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     return scope
 
