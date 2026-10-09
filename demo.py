@@ -548,6 +548,13 @@ def main(
     log_kv_alpha_span_max_tokens: int = 64,
     log_kv_beta_novelty: bool = True,
     log_kv_beta_adaptive_merge: bool = True,
+    # Gamma (on by default): delayed Alpha evictions re-sort only ladder level 0 instead
+    # of re-merging the whole cluster, and a saturated top level merges its lightest
+    # adjacent pair instead of folding into slot 0. level_slack 2 keeps the classic
+    # spare levels; fewer spends the same bytes on a wider B' (more live entries).
+    log_kv_gamma_level0_reinsert: bool = True,
+    log_kv_gamma_top_merge: str = "lightest",
+    log_kv_gamma_level_slack: int = 2,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
     # ── Eval ──
@@ -637,6 +644,9 @@ def main(
     log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
     log_kv_beta_novelty = bool(_o("log_kv_beta_novelty", log_kv_beta_novelty))
     log_kv_beta_adaptive_merge = bool(_o("log_kv_beta_adaptive_merge", log_kv_beta_adaptive_merge))
+    log_kv_gamma_level0_reinsert = bool(_o("log_kv_gamma_level0_reinsert", log_kv_gamma_level0_reinsert))
+    log_kv_gamma_top_merge = str(_o("log_kv_gamma_top_merge", log_kv_gamma_top_merge))
+    log_kv_gamma_level_slack = int(_o("log_kv_gamma_level_slack", log_kv_gamma_level_slack))
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
@@ -878,6 +888,9 @@ def main(
             log_kv_alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
             log_kv_beta_novelty=log_kv_beta_novelty,
             log_kv_beta_adaptive_merge=log_kv_beta_adaptive_merge,
+            log_kv_gamma_level0_reinsert=log_kv_gamma_level0_reinsert,
+            log_kv_gamma_top_merge=log_kv_gamma_top_merge,
+            log_kv_gamma_level_slack=log_kv_gamma_level_slack,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -1035,6 +1048,9 @@ def main(
         alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
         beta_novelty=log_kv_beta_novelty,
         beta_adaptive_merge=log_kv_beta_adaptive_merge,
+        gamma_level0_reinsert=log_kv_gamma_level0_reinsert,
+        gamma_top_merge=log_kv_gamma_top_merge,
+        gamma_level_slack=log_kv_gamma_level_slack,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
@@ -1063,7 +1079,9 @@ def main(
         f"replay_updates={log_kv_semantic_replay_updates}, "
         f"alpha_exact={log_kv_alpha_exact_tokens}, alpha_span_max={log_kv_alpha_span_max_tokens}, "
         f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
-        f"effective_B={model.transformer.h[0].attn.kv_cache.B})"
+        f"gamma_level0_reinsert={log_kv_gamma_level0_reinsert}, gamma_top_merge={log_kv_gamma_top_merge}, "
+        f"gamma_level_slack={log_kv_gamma_level_slack}, "
+        f"effective_B={model.transformer.h[0].attn.kv_cache.B}, levels={model.transformer.h[0].attn.kv_cache.L_alloc})"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))

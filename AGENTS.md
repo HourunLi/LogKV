@@ -5,7 +5,7 @@
 不要把旧分支、旧实验的参数或分数当成当前默认。
 
 - 默认中文，先给结论。只询问会改变实现选择的信息，常规可逆工作直接推进。
-- 当前默认路线是 attach 路由 + Alpha + Beta（入口参数与 `arc_semantic_fast.yaml` 默认开启）；
+- 当前默认路线是 attach 路由 + Alpha + Beta + Gamma（入口参数与 `arc_semantic_fast.yaml` 默认开启）；
   unified 路由保留为对照，其中 `merge_passes=1` 为增量路由、`4` 为冻结中心近似配对。
 - 改默认值时，给依赖旧行为的实验 YAML 显式写出原开关，避免复评旧 checkpoint 时被悄悄改变。
 - 推理 KV 预算必须保持 O(log N)。精确槽、未闭合片段和打包工作区按文档口径计入预算。

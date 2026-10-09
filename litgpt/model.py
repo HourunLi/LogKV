@@ -413,6 +413,9 @@ class GPT(nn.Module):
         alpha_span_max_tokens: int = 64,
         beta_novelty: bool = False,
         beta_adaptive_merge: bool = False,
+        gamma_level0_reinsert: bool = False,
+        gamma_top_merge: str = "fold",
+        gamma_level_slack: int = 2,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -508,6 +511,9 @@ class GPT(nn.Module):
                 alpha_span_max_tokens=alpha_span_max_tokens,
                 beta_novelty=beta_novelty,
                 beta_adaptive_merge=beta_adaptive_merge,
+                gamma_level0_reinsert=gamma_level0_reinsert,
+                gamma_top_merge=gamma_top_merge,
+                gamma_level_slack=gamma_level_slack,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -582,6 +588,9 @@ class GPT(nn.Module):
         alpha_span_max_tokens: int = 64,
         beta_novelty: bool = False,
         beta_adaptive_merge: bool = False,
+        gamma_level0_reinsert: bool = False,
+        gamma_top_merge: str = "fold",
+        gamma_level_slack: int = 2,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -668,6 +677,9 @@ class GPT(nn.Module):
                 alpha_span_max_tokens=alpha_span_max_tokens,
                 beta_novelty=beta_novelty,
                 beta_adaptive_merge=beta_adaptive_merge,
+                gamma_level0_reinsert=gamma_level0_reinsert,
+                gamma_top_merge=gamma_top_merge,
+                gamma_level_slack=gamma_level_slack,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -1465,6 +1477,9 @@ class CausalSelfAttention(nn.Module):
         alpha_span_max_tokens: int = 64,
         beta_novelty: bool = False,
         beta_adaptive_merge: bool = False,
+        gamma_level0_reinsert: bool = False,
+        gamma_top_merge: str = "fold",
+        gamma_level_slack: int = 2,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1534,6 +1549,9 @@ class CausalSelfAttention(nn.Module):
             alpha_span_max_tokens=alpha_span_max_tokens,
             beta_novelty=beta_novelty,
             beta_adaptive_merge=beta_adaptive_merge,
+            gamma_level0_reinsert=gamma_level0_reinsert,
+            gamma_top_merge=gamma_top_merge,
+            gamma_level_slack=gamma_level_slack,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,

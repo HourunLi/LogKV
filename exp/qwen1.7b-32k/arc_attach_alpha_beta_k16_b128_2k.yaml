@@ -1,4 +1,4 @@
-# 当前默认路线：attach 路由分簇 + Alpha 精确片段 + Beta（新颖度评分、簇内四进二压缩）。
+# attach 路由分簇 + Alpha 精确片段 + Beta（新颖度评分、簇内四进二压缩），Gamma 之前的实验。
 # 算法开关沿用 arc_semantic_fast.yaml 的默认值；训练超参与 attach_route_k12_b128_2k 基线一致。
 config: arc_semantic_fast.yaml
 ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
@@ -21,3 +21,8 @@ run_eval: ""
 log_kv_cluster_k_max: 16
 log_kv_B: 128  # 原始字节预算；精确池从中扣除，日志 effective_B 为实际值
 log_kv_recent_size: 2048
+
+# Gamma 之前的实验：保持旧梯子行为，复评与训练时一致（延迟归档整簇重入层级、顶层左折叠）。
+log_kv_gamma_level0_reinsert: false
+log_kv_gamma_top_merge: fold
+log_kv_gamma_level_slack: 2

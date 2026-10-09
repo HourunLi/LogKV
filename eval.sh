@@ -210,6 +210,10 @@ emit("LOG_KV_ALPHA_EXACT_TOKENS", int(value_or("log_kv_alpha_exact_tokens", 256)
 emit("LOG_KV_ALPHA_SPAN_MAX_TOKENS", int(value_or("log_kv_alpha_span_max_tokens", 64)))
 emit("LOG_KV_BETA_NOVELTY", str(bool(value_or("log_kv_beta_novelty", True))).lower())
 emit("LOG_KV_BETA_ADAPTIVE_MERGE", str(bool(value_or("log_kv_beta_adaptive_merge", True))).lower())
+# Gamma defaults on; YAML false / "fold" restores the earlier ladder behaviour.
+emit("LOG_KV_GAMMA_LEVEL0_REINSERT", str(bool(value_or("log_kv_gamma_level0_reinsert", True))).lower())
+emit("LOG_KV_GAMMA_TOP_MERGE", value_or("log_kv_gamma_top_merge", "lightest"))
+emit("LOG_KV_GAMMA_LEVEL_SLACK", int(value_or("log_kv_gamma_level_slack", 2)))
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
 emit("LOG_KV_CLUSTER_LAMBDA_REL", value_or("log_kv_cluster_lambda_rel", 1.0))
 emit("LOG_KV_SEG_ETA", value_or("log_kv_seg_eta", 1.0))
@@ -343,6 +347,9 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
         --log_kv_alpha_span_max_tokens "${LOG_KV_ALPHA_SPAN_MAX_TOKENS}"
         --log_kv_beta_novelty "${LOG_KV_BETA_NOVELTY}"
         --log_kv_beta_adaptive_merge "${LOG_KV_BETA_ADAPTIVE_MERGE}"
+        --log_kv_gamma_level0_reinsert "${LOG_KV_GAMMA_LEVEL0_REINSERT}"
+        --log_kv_gamma_top_merge "${LOG_KV_GAMMA_TOP_MERGE}"
+        --log_kv_gamma_level_slack "${LOG_KV_GAMMA_LEVEL_SLACK}"
         --log_kv_cluster_k_max "${LOG_KV_CLUSTER_K_MAX}"
         --log_kv_cluster_lambda_rel "${LOG_KV_CLUSTER_LAMBDA_REL}"
         --log_kv_seg_eta "${LOG_KV_SEG_ETA}"

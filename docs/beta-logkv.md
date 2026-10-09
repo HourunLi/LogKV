@@ -65,9 +65,11 @@ CUDA 一阶路径用融合 kernel 并行处理四元组，并在同一 launch �
 
 ## 最小运行入口
 
-[默认训练配置](../exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml)（attach + Alpha + Beta）
-从 Base 初始化，使用独立输出目录，训练超参与 `arc_semantic_attach_route_k12_b128_2k` 基线一致；
-`_4k` 版本仅把 recent 改为 4096。该目录已有 checkpoint 时 `auto_resume` 恢复它。
+当前默认训练配置是 Gamma 的 [`arc_gamma_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml)
+（attach + Alpha + Beta + Gamma，见 [Gamma](gamma-logkv.md)）。Gamma 之前的
+[`arc_attach_alpha_beta_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml)
+从 Base 初始化，训练超参与 `arc_semantic_attach_route_k12_b128_2k` 基线一致，`_4k` 版本仅把 recent
+改为 4096，并显式写回旧梯子。该目录已有 checkpoint 时 `auto_resume` 恢复它。
 `arc_beta_cpt100.yaml` 保留早先 unified + Beta 的 100 步实验。训练与评测均沿用两个开关：
 
 ```yaml
@@ -97,14 +99,14 @@ profile 另标注 `exact_select`、`exact_partition`、`ladder_merge_scatter`，
 
 ```bash
 BENCHMARKS=none NIAH_BENCHMARKS=none \
-  bash majob.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml
+  bash majob.sh exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml
 ```
 
 训练后仅评测 32K single2/3：
 
 ```bash
 DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
-  bash eval.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml niah_single_2,niah_single_3 none
+  bash eval.sh exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 
 `eval.sh` 从 `save_path` 加载训练产物；第三参数 `none` 关闭默认追加的多长度 NIAH。

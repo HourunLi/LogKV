@@ -785,6 +785,9 @@ class LogKVLM(LM):
         log_kv_alpha_span_max_tokens: int = 64,
         log_kv_beta_novelty: bool = False,
         log_kv_beta_adaptive_merge: bool = False,
+        log_kv_gamma_level0_reinsert: bool = False,
+        log_kv_gamma_top_merge: str = "fold",
+        log_kv_gamma_level_slack: int = 2,
         tokenizer_dir: str | None = None,
         process_group=None,
     ):
@@ -831,6 +834,9 @@ class LogKVLM(LM):
         self.log_kv_alpha_span_max_tokens = log_kv_alpha_span_max_tokens
         self.log_kv_beta_novelty = bool(log_kv_beta_novelty)
         self.log_kv_beta_adaptive_merge = bool(log_kv_beta_adaptive_merge)
+        self.log_kv_gamma_level0_reinsert = bool(log_kv_gamma_level0_reinsert)
+        self.log_kv_gamma_top_merge = str(log_kv_gamma_top_merge)
+        self.log_kv_gamma_level_slack = int(log_kv_gamma_level_slack)
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -966,6 +972,9 @@ class LogKVLM(LM):
             alpha_span_max_tokens=self.log_kv_alpha_span_max_tokens,
             beta_novelty=self.log_kv_beta_novelty,
             beta_adaptive_merge=self.log_kv_beta_adaptive_merge,
+            gamma_level0_reinsert=self.log_kv_gamma_level0_reinsert,
+            gamma_top_merge=self.log_kv_gamma_top_merge,
+            gamma_level_slack=self.log_kv_gamma_level_slack,
         )
         if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
@@ -1007,6 +1016,10 @@ class LogKVLM(LM):
             self.cache_budget.update(alpha_exact_tokens=first.alpha_exact_tokens, effective_B=first.B,
                                      alpha_span_max_tokens=first.alpha_span_max_tokens,
                                      beta_novelty=first.beta_novelty, beta_adaptive_merge=first.beta_adaptive_merge)
+        if getattr(first, "semantic_clusters", False):
+            self.cache_budget.update(effective_B=first.B, levels=first.L_alloc,
+                                     gamma_level0_reinsert=first.gamma_level0_reinsert,
+                                     gamma_top_merge=first.gamma_top_merge, gamma_level_slack=first.gamma_level_slack)
         if _is_main():
             print(f"🧮 persistent cache budget (excluding shared RoPE / transient workspace): {self.cache_budget}")
 
@@ -1392,6 +1405,13 @@ def main(
     log_kv_alpha_span_max_tokens: int = 64,
     log_kv_beta_novelty: bool = True,
     log_kv_beta_adaptive_merge: bool = True,
+    # Gamma (on by default): delayed Alpha evictions re-sort only ladder level 0 instead
+    # of re-merging the whole cluster, and a saturated top level merges its lightest
+    # adjacent pair instead of folding into slot 0. level_slack 2 keeps the classic
+    # spare levels; fewer spends the same bytes on a wider B' (more live entries).
+    log_kv_gamma_level0_reinsert: bool = True,
+    log_kv_gamma_top_merge: str = "lightest",
+    log_kv_gamma_level_slack: int = 2,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1478,6 +1498,9 @@ def main(
     log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
     log_kv_beta_novelty = bool(_o("log_kv_beta_novelty", log_kv_beta_novelty))
     log_kv_beta_adaptive_merge = bool(_o("log_kv_beta_adaptive_merge", log_kv_beta_adaptive_merge))
+    log_kv_gamma_level0_reinsert = bool(_o("log_kv_gamma_level0_reinsert", log_kv_gamma_level0_reinsert))
+    log_kv_gamma_top_merge = str(_o("log_kv_gamma_top_merge", log_kv_gamma_top_merge))
+    log_kv_gamma_level_slack = int(_o("log_kv_gamma_level_slack", log_kv_gamma_level_slack))
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
@@ -1578,7 +1601,9 @@ def main(
                 f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
                 f"centroid={log_kv_semantic_centroid_backend}, "
                 f"replay_updates={log_kv_semantic_replay_updates}, "
-                f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge})"
+                f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
+                f"gamma_level0_reinsert={log_kv_gamma_level0_reinsert}, gamma_top_merge={log_kv_gamma_top_merge}, "
+                f"gamma_level_slack={log_kv_gamma_level_slack})"
             )
         if diag_active:
             print(
@@ -1649,6 +1674,9 @@ def main(
             log_kv_alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
             log_kv_beta_novelty=log_kv_beta_novelty,
             log_kv_beta_adaptive_merge=log_kv_beta_adaptive_merge,
+            log_kv_gamma_level0_reinsert=log_kv_gamma_level0_reinsert,
+            log_kv_gamma_top_merge=log_kv_gamma_top_merge,
+            log_kv_gamma_level_slack=log_kv_gamma_level_slack,
             tokenizer_dir=tokenizer_dir,
             process_group=eval_group,
         )
@@ -1797,6 +1825,9 @@ def main(
                     "log_kv_alpha_span_max_tokens": log_kv_alpha_span_max_tokens,
                     "log_kv_beta_novelty": log_kv_beta_novelty,
                     "log_kv_beta_adaptive_merge": log_kv_beta_adaptive_merge,
+                    "log_kv_gamma_level0_reinsert": log_kv_gamma_level0_reinsert,
+                    "log_kv_gamma_top_merge": log_kv_gamma_top_merge,
+                    "log_kv_gamma_level_slack": log_kv_gamma_level_slack,
                     "results": results,
                 }
 

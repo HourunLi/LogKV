@@ -49,5 +49,11 @@ log_kv_alpha_exact_tokens: 256  # 每层每条样本的精确 token 总数，从
 log_kv_alpha_span_max_tokens: 64
 log_kv_beta_novelty: true
 log_kv_beta_adaptive_merge: true
+# Gamma（默认开启）：延迟归档只把第 0 层与迟到 token 一起重排，不再整簇重入层级；
+# 顶层饱和时合并质量和最小的相邻对。level_slack 2 = 原有两层余量；更小则同字节换更宽 B′
+#（存活条目增多，槽位压缩倍数下降）。旧实验 YAML 显式写回旧行为。
+log_kv_gamma_level0_reinsert: true
+log_kv_gamma_top_merge: lightest
+log_kv_gamma_level_slack: 2
 log_kv_seg_gap_max: null  # Alpha 延迟归档要求关闭 segment gap/padding
 log_kv_seg_block_level: 0

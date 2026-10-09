@@ -21,3 +21,8 @@ log_kv_dense_mode: true
 metadata:
   pretrained: *tokenizer_dir
   max_seq_lengths: [32768]
+
+# Gamma 之前的实验：保持旧梯子行为，复评与训练时一致（延迟归档整簇重入层级、顶层左折叠）。
+log_kv_gamma_level0_reinsert: false
+log_kv_gamma_top_merge: fold
+log_kv_gamma_level_slack: 2
