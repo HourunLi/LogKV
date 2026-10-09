@@ -19,8 +19,8 @@
 config: base.yaml
 
 global_batch_size: 32
-micro_batch_size: 4
-max_steps: 200
+micro_batch_size: 2
+max_steps: 800
 
 enable_tensorboard: false
 

@@ -46,8 +46,8 @@ from utils import *
 # rank 0 做，再 broadcast 给其它 rank**。共享盘（OBS/NFS）的元数据缓存在各节点
 # 上的可见时刻不一致，若每个 rank 自己 stat/glob，就可能出现分支不一致 ——
 # 一部分 rank 进了集合通信（barrier / all_gather）而另一部分跳过或直接抛异常
-# 退出，剩下的 rank 就一直等到 NCCL 超时（这里设的是 12h）。评测跑完之后
-# "卡很久" 正是这一类分支不一致 + 进程组没有显式销毁造成的。
+# 退出，剩下的 rank 就会等待通信超时。评测只交换 CPU 对象，使用 Gloo；
+# 保留长等待窗口以容纳不同 rank 的长上下文计算时差。
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -165,20 +165,58 @@ def _dist_ready() -> bool:
     return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
 
 
-def _bcast_device() -> torch.device | None:
+def _bcast_device(group=None) -> torch.device | None:
     """NCCL 后端下 broadcast_object_list 必须显式给设备，否则会走默认卡导致串扰。"""
-    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+    if dist.get_backend(group) == "nccl" and torch.cuda.is_available():
         return torch.device(f"cuda:{torch.cuda.current_device()}")
     return None
 
 
-def _broadcast_obj(obj: Any, src: int = 0) -> Any:
+def _broadcast_obj(obj: Any, src: int = 0, group=None) -> Any:
     """把 rank ``src`` 上的任意可 pickle 对象广播给所有 rank（单卡时原样返回）。"""
     if not _dist_ready():
         return obj
     box = [obj]
-    dist.broadcast_object_list(box, src=src, device=_bcast_device())
+    dist.broadcast_object_list(box, src=src, group=group, device=_bcast_device(group))
     return box[0]
+
+
+_SYNC_SEQ = 0
+
+
+def _wait_all_ranks(stage: str) -> float:
+    """所有 rank 汇合，返回本 rank 的等待秒数；等待期间定期打印仍未到达的 rank。
+
+    使用默认进程组的 Store 在 CPU 上轮询，让长计算或落盘等待期间仍有进度日志。
+    每 ``LOGKV_EVAL_SYNC_HEARTBEAT_S``（默认 300s）打印一次缺席 rank；
+    超过 ``LOGKV_EVAL_SYNC_TIMEOUT_S``（默认 7200s，<=0 不限）仍未到齐就报错。
+    所有 rank 必须按相同顺序调用（键按调用序号区分）。
+    """
+    global _SYNC_SEQ
+    if not _dist_ready():
+        return 0.0
+    _SYNC_SEQ += 1
+    key = f"logkv_eval_sync/{_SYNC_SEQ}"
+    world = _world_size()
+    store = dist.distributed_c10d._get_default_store()
+    store.set(f"{key}/rank{_global_rank()}", "1")
+    store.add(key, 1)
+    heartbeat_s = max(_env_int("LOGKV_EVAL_SYNC_HEARTBEAT_S", 300), 1)
+    timeout_s = _env_int("LOGKV_EVAL_SYNC_TIMEOUT_S", 7200)
+    t0 = time.perf_counter()
+    next_report = heartbeat_s
+    while store.add(key, 0) < world:
+        waited = time.perf_counter() - t0
+        timed_out = 0 < timeout_s <= waited
+        if timed_out or waited >= next_report:
+            missing = [r for r in range(world) if not store.check([f"{key}/rank{r}"])]
+            message = f"[{_rank_label()}] {stage}: 已等待 {waited:.0f}s，仍未到达的 rank: {missing}"
+            if timed_out:
+                raise RuntimeError(f"{message}（超过 LOGKV_EVAL_SYNC_TIMEOUT_S={timeout_s}）")
+            print(f"⏳ {message}", flush=True)
+            next_report += heartbeat_s
+        time.sleep(1.0)
+    return time.perf_counter() - t0
 
 
 def _hb(stage: str) -> None:
@@ -534,7 +572,7 @@ def _load_lit_model_checkpoint(
 
     多机场景下 rank 0 已经确认过文件存在（见 ``_resolve_checkpoint_dir``），但其它
     节点的共享盘元数据缓存可能还没刷新。此时直接抛 FileNotFoundError 会让这个 rank
-    单独退出，其余 rank 卡在后续集合通信里等到 NCCL 超时；所以非 rank0 上先轮询等待
+    单独退出，其余 rank 卡在后续集合通信里等到超时；所以非 rank0 上先轮询等待
     ``wait_s`` 秒。单进程运行时不等待，行为与之前一致（立刻报错）。
     """
     lit_path = Path(checkpoint_dir).expanduser() / "lit_model.pth"
@@ -691,7 +729,7 @@ def _probe_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path
     )
 
 
-def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
+def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None, group=None) -> Path:
     """rank 0 探测 tokenizer 目录并广播结论；失败信息也一并广播。
 
     每个 rank 自己探测时，共享盘元数据缓存不一致会让一部分 rank 找到目录、另一部分
@@ -706,7 +744,7 @@ def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None) -> Path:
         except FileNotFoundError as e:
             payload = ("err", str(e))
 
-    kind, value = _broadcast_obj(payload)
+    kind, value = _broadcast_obj(payload, group=group)
     if kind == "err":
         raise FileNotFoundError(value)
     return Path(value)
@@ -742,6 +780,7 @@ class LogKVLM(LM):
         log_kv_sink_window_mode: bool = False,
         log_kv_sink_window_sink_size: int = 4,
         log_kv_sink_window_window_size: int = 1024,
+        log_kv_sink_window_full_attention_interval: int = 0,
         log_kv_importance_pooling: bool = False,
         log_kv_importance_pooling_lambda: float = 1.0,
         log_kv_importance_pooling_temperature: float = 1.0,
@@ -765,8 +804,10 @@ class LogKVLM(LM):
         log_kv_semantic_summary_size: int = 1,
         log_kv_semantic_replay_updates: bool = False,
         tokenizer_dir: str | None = None,
+        process_group=None,
     ):
         super().__init__()
+        self.process_group = process_group
         self._device = device
         self.checkpoint_dir = checkpoint_dir
         self.log_kv_B = log_kv_B
@@ -777,6 +818,11 @@ class LogKVLM(LM):
         self.log_kv_sink_window_mode = bool(log_kv_sink_window_mode)
         self.log_kv_sink_window_sink_size = int(log_kv_sink_window_sink_size)
         self.log_kv_sink_window_window_size = int(log_kv_sink_window_window_size)
+        self.log_kv_sink_window_full_attention_interval = int(log_kv_sink_window_full_attention_interval)
+        if self.log_kv_sink_window_full_attention_interval < 0:
+            raise ValueError("log_kv_sink_window_full_attention_interval must be >= 0.")
+        if self.log_kv_sink_window_full_attention_interval and not self.log_kv_sink_window_mode:
+            raise ValueError("log_kv_sink_window_full_attention_interval requires log_kv_sink_window_mode=True.")
         self.log_kv_importance_pooling = bool(log_kv_importance_pooling)
         self.log_kv_importance_pooling_lambda = float(log_kv_importance_pooling_lambda)
         self.log_kv_importance_pooling_temperature = float(log_kv_importance_pooling_temperature)
@@ -803,7 +849,7 @@ class LogKVLM(LM):
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
 
-        resolved_tok_dir = _find_tokenizer_dir(checkpoint_dir, tokenizer_dir)
+        resolved_tok_dir = _find_tokenizer_dir(checkpoint_dir, tokenizer_dir, group=process_group)
         if is_master:
             print(f"🔤 正在加载 tokenizer: {resolved_tok_dir}")
         self.tokenizer = Tokenizer(resolved_tok_dir)
@@ -837,7 +883,10 @@ class LogKVLM(LM):
 
         mode_name = (
             "dense 标准 KV 注意力" if self.log_kv_dense_mode
-            else f"SinkWindow (S={self.log_kv_sink_window_sink_size}, W={self.log_kv_sink_window_window_size})" if self.log_kv_sink_window_mode
+            else (
+                f"SinkWindow (S={self.log_kv_sink_window_sink_size}, W={self.log_kv_sink_window_window_size}, "
+                f"full_attention_interval={self.log_kv_sink_window_full_attention_interval})"
+            ) if self.log_kv_sink_window_mode
             else "logKV 压缩注意力"
         )
         if is_master: print(f"🔧 正在初始化 Transformer ({mode_name})...")
@@ -901,6 +950,7 @@ class LogKVLM(LM):
                 batch_size=1,
                 sink_size=self.log_kv_sink_window_sink_size,
                 window_size=self.log_kv_sink_window_window_size,
+                full_attention_interval=self.log_kv_sink_window_full_attention_interval,
                 device=self._device,
                 dtype=dtype,
             )
@@ -955,21 +1005,19 @@ class LogKVLM(LM):
         if not _dist_ready():
             return local_result_list
 
-        # 各 rank 拿到的样本长度差异很大（长上下文生成尤甚），最慢的 rank 决定整体
-        # 结束时间。先显式 barrier 把"等其它 rank"的时间量出来单独打印，否则它会被
-        # 算进 all_gather 里，看上去就是"评测跑完之后莫名卡住"。
-        t0 = time.perf_counter()
-        dist.barrier()
-        wait_s = time.perf_counter() - t0
+        # 结果只有 float/bool/str，不必经 GPU/NCCL 序列化与通信。
+        # 汇合等待长上下文的负载差异；等待期间的心跳与超时见 _wait_all_ranks。
+        print(f"⏳ [{_rank_label()}] {tag} 本 rank {len(local_result_list)} 条已完成，等待其它 rank", flush=True)
+        wait_s = _wait_all_ranks(f"{tag} 汇总")
         print(
-            f"⏳ [{_rank_label()}] {tag} 本 rank {len(local_result_list)} 条已完成，"
-            f"等待其它 rank 用时 {wait_s:.1f}s",
+            f"🤝 [{_rank_label()}] {tag} 全部 rank 已就绪，等待用时 {wait_s:.1f}s；开始 Gloo 结果汇总",
             flush=True,
         )
 
         dp_size = _world_size()
         all_results_list = [None for _ in range(dp_size)]
-        dist.all_gather_object(all_results_list, local_result_list)
+        t0 = time.perf_counter()
+        dist.all_gather_object(all_results_list, local_result_list, group=self.process_group)
 
         final_results = []
         max_load = max(len(r) for r in all_results_list)
@@ -977,6 +1025,11 @@ class LogKVLM(LM):
             for rank_id in range(dp_size):
                 if i < len(all_results_list[rank_id]):
                     final_results.append(all_results_list[rank_id][i])
+        print(
+            f"✅ [{_rank_label()}] {tag} Gloo 结果汇总完成，共 {len(final_results)} 条，"
+            f"用时 {time.perf_counter() - t0:.1f}s",
+            flush=True,
+        )
         return final_results
 
     # ==========================================
@@ -1218,13 +1271,13 @@ class LogKVLM(LM):
     def tok_encode(self, string): return self.tokenizer.encode(string).tolist()
     def tok_decode(self, tokens): return self.tokenizer.decode(torch.tensor(tokens))
 
-def _resolve_checkpoint_dir(checkpoint_dir: str) -> str:
+def _resolve_checkpoint_dir(checkpoint_dir: str, group=None) -> str:
     """自动检测分段 checkpoint。若存在 step_* 子目录（含 lit_model.pth）则选最大 step，否则直接用原路径。
 
     glob + exists() 必须只由 rank 0 判定再广播：训练刚写完最后一个 step_* 时，
     其它节点的共享盘元数据缓存可能还看不到它，各 rank 各自 glob 就会选到**不同的
     checkpoint**（评测结果静默不可比），或者一部分 rank 找不到权重直接退出、把其余
-    rank 留在集合通信里等到 NCCL 超时。
+    rank 留在集合通信里等到超时。
     """
     resolved: str | None = None
     if _is_main():
@@ -1240,7 +1293,7 @@ def _resolve_checkpoint_dir(checkpoint_dir: str) -> str:
         else:
             resolved = checkpoint_dir
 
-    return _broadcast_obj(resolved)
+    return _broadcast_obj(resolved, group=group)
 
 
 @auto_expand_env_vars
@@ -1270,6 +1323,8 @@ def main(
     log_kv_sink_window_mode: bool = False,
     log_kv_sink_window_sink_size: int = 4,
     log_kv_sink_window_window_size: int = 1024,
+    # 0 keeps every layer local; 4 repeats three local layers and one full layer.
+    log_kv_sink_window_full_attention_interval: int = 0,
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
     # prefill 分块大小：块内 query 共享块首冻结的 slot 状态。2 = 严格 2-token
@@ -1384,6 +1439,9 @@ def main(
     log_kv_sink_window_mode = bool(_o("log_kv_sink_window_mode", log_kv_sink_window_mode))
     log_kv_sink_window_sink_size = int(_o("log_kv_sink_window_sink_size", log_kv_sink_window_sink_size))
     log_kv_sink_window_window_size = int(_o("log_kv_sink_window_window_size", log_kv_sink_window_window_size))
+    log_kv_sink_window_full_attention_interval = int(
+        _o("log_kv_sink_window_full_attention_interval", log_kv_sink_window_full_attention_interval)
+    )
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
@@ -1450,15 +1508,7 @@ def main(
     # 这时**不能**由 eval 销毁它，否则训练侧后续的集合通信全炸。只有 eval 自己建的
     # 才由 eval 负责销毁。
     pg_owned_here = False
-    if world_size > 1 and not dist.is_initialized():
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", timeout=timedelta(hours=12))
-        pg_owned_here = True
-    if world_size > 1:
-        _rendezvous_snapshot("eval startup after init_process_group")
-        _check_expected_world_size("eval startup after init_process_group")
-        _hb("进程组就绪（rendezvous 完成）")
-
+    torch.cuda.set_device(local_rank)
     device = f"cuda:{local_rank}"
 
     diag_active = log_kv_diag_mode not in (None, "off")
@@ -1468,6 +1518,10 @@ def main(
                 "log_kv_dense_mode=True is incompatible with log_kv_diag_mode: "
                 "LogKV diagnostics require LogStructuredKVCache slots."
             )
+    if log_kv_sink_window_full_attention_interval < 0:
+        raise ValueError("log_kv_sink_window_full_attention_interval must be >= 0.")
+    if log_kv_sink_window_full_attention_interval and not log_kv_sink_window_mode:
+        raise ValueError("log_kv_sink_window_full_attention_interval requires log_kv_sink_window_mode=True.")
     if log_kv_sink_window_mode:
         if diag_active:
             raise ValueError(
@@ -1495,6 +1549,7 @@ def main(
             print(
                 f"🧩 SinkWindow | sink_size={log_kv_sink_window_sink_size} | "
                 f"window_size={log_kv_sink_window_window_size} | "
+                f"full_attention_interval={log_kv_sink_window_full_attention_interval} | "
                 "使用 GPT.set_sink_window_cache()；忽略 log_kv_B/recent_size/prefill_block/"
                 "second_order_scale 等 LogKV 参数"
             )
@@ -1528,12 +1583,27 @@ def main(
                 "每 rank 各自累积统计量，不跨 rank 聚合"
             )
 
-    # eval_done：所有 rank 都跑完了 simple_evaluate（即全部集合通信都已结束）。
-    # 只有这时收尾 barrier 才是安全的；某个 rank 中途抛异常时必须跳过 barrier，
-    # 否则其余 rank 会干等到 NCCL 超时（12h）。
+    # 仅本 rank 正常完成时参加收尾同步；异常直接退出，不用 barrier 掩盖原始错误。
     eval_done = False
+    eval_group = None
+    eval_group_owned_here = False
     try:
-        checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir)
+        if world_size > 1 and not dist.is_initialized():
+            dist.init_process_group(backend="gloo", timeout=timedelta(hours=12))
+            pg_owned_here = True
+        if world_size > 1:
+            _rendezvous_snapshot("eval startup after init_process_group")
+            _check_expected_world_size("eval startup after init_process_group")
+            _hb("进程组就绪（rendezvous 完成）")
+        if _dist_ready():
+            if pg_owned_here:
+                eval_group = dist.group.WORLD
+            else:
+                # 训练内调用时保留 Fabric 的默认组，只创建/销毁评测自己的 CPU 组。
+                eval_group = dist.new_group(backend="gloo", timeout=timedelta(hours=12))
+                eval_group_owned_here = True
+            _hb("评测 Gloo 通信组就绪（CPU 对象通信，超时 12 小时）")
+        checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir, group=eval_group)
 
         lm_model = LogKVLM(
             checkpoint_dir,
@@ -1547,6 +1617,7 @@ def main(
             log_kv_sink_window_mode=log_kv_sink_window_mode,
             log_kv_sink_window_sink_size=log_kv_sink_window_sink_size,
             log_kv_sink_window_window_size=log_kv_sink_window_window_size,
+            log_kv_sink_window_full_attention_interval=log_kv_sink_window_full_attention_interval,
             log_kv_importance_pooling=log_kv_importance_pooling,
             log_kv_importance_pooling_lambda=log_kv_importance_pooling_lambda,
             log_kv_importance_pooling_temperature=log_kv_importance_pooling_temperature,
@@ -1570,6 +1641,7 @@ def main(
             log_kv_semantic_summary_size=log_kv_semantic_summary_size,
             log_kv_semantic_replay_updates=log_kv_semantic_replay_updates,
             tokenizer_dir=tokenizer_dir,
+            process_group=eval_group,
         )
         if world_size > 1:
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
@@ -1593,7 +1665,7 @@ def main(
                 limit=limit,
                 log_samples=log_samples,
             )
-        eval_done = True
+        _hb("simple_evaluate 已返回")
 
         # 落盘阶段：只有 rank 0 写文件（建目录、写 json/csv/xlsx）。其它 rank 什么都
         # 不做，直接到下面的 barrier 等 rank 0 写完 —— 各 rank 同时往共享盘写同名文件
@@ -1660,6 +1732,7 @@ def main(
                     "log_kv_sink_window_mode": log_kv_sink_window_mode,
                     "log_kv_sink_window_sink_size": log_kv_sink_window_sink_size,
                     "log_kv_sink_window_window_size": log_kv_sink_window_window_size,
+                    "log_kv_sink_window_full_attention_interval": log_kv_sink_window_full_attention_interval,
                     "log_kv_importance_pooling": log_kv_importance_pooling,
                     "log_kv_importance_pooling_lambda": log_kv_importance_pooling_lambda,
                     "log_kv_importance_pooling_temperature": log_kv_importance_pooling_temperature,
@@ -1748,37 +1821,30 @@ def main(
                 # 🌟 第五步：生成 CSV 结果文件
                 extract_results_to_csv(results, benchmark, output_file)
 
+        eval_done = True
     finally:
-        # ── 收尾：所有 rank 在这里汇合，然后显式销毁进程组 ──
-        # 这是"评测跑完之后要等很久"的直接修复点。之前的行为是：非 rank0 跑完
-        # simple_evaluate 就直接走到函数末尾、跑到解释器退出，而 rank 0 还在写
-        # json/csv/xlsx；进程组从头到尾没被销毁，退出时要等 NCCL watchdog 把
-        # 通信子 abort 掉才肯收敛，启动器（torchrun / ModelArts）就一直挂在
-        # "等最后一个 worker 退出"上。
-        # 现在改成：rank 0 写完 → barrier 汇合 → 一起 destroy_process_group() →
-        # 一起退出。
-        # 这里的异常一律吞掉：finally 里抛出会顶掉 try 中真正的报错，把根因藏起来。
-        if _dist_ready():
-            if eval_done:
-                t0 = time.perf_counter()
+        try:
+            if _dist_ready():
+                if eval_done:
+                    wait_s = _wait_all_ranks("收尾同步")
+                    print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {wait_s:.1f}s", flush=True)
+                else:
+                    print(f"⚠️ [{_rank_label()}] 评测未正常结束，跳过收尾 barrier", flush=True)
+        finally:
+            # 清理不能掩盖原始异常，也不能销毁训练持有的默认组。
+            if eval_group_owned_here:
                 try:
-                    dist.barrier()
-                    print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {time.perf_counter() - t0:.1f}s", flush=True)
-                except Exception as e:  # noqa: BLE001 — 收尾阶段不掩盖主异常
-                    print(f"⚠️ [{_rank_label()}] 收尾 barrier 失败（忽略）: {e}", flush=True)
-            else:
-                # 有 rank 异常退出：绝不能 barrier，否则其它 rank 等到 NCCL 超时。
-                # 直接往下销毁进程组，让对端尽快收到通信中断而不是干等 12h。
-                print(f"⚠️ [{_rank_label()}] 评测未正常结束，跳过收尾 barrier", flush=True)
-
-        if pg_owned_here and dist.is_available() and dist.is_initialized():
-            try:
-                rank_before_destroy = _global_rank()
-                dist.destroy_process_group()
-                if rank_before_destroy == 0:
-                    print("✅ 分布式进程组已销毁，评测进程可以正常退出了", flush=True)
-            except Exception as e:  # noqa: BLE001
-                print(f"⚠️ [{_rank_label()}] 销毁进程组失败（忽略）: {e}", flush=True)
+                    dist.destroy_process_group(eval_group)
+                except Exception as e:  # noqa: BLE001
+                    print(f"⚠️ [{_rank_label()}] 销毁评测 Gloo 组失败: {e}", flush=True)
+            if pg_owned_here and dist.is_available() and dist.is_initialized():
+                try:
+                    rank_before_destroy = _global_rank()
+                    dist.destroy_process_group()
+                    if rank_before_destroy == 0:
+                        print("✅ 分布式进程组已销毁，评测进程可以正常退出了", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"⚠️ [{_rank_label()}] 销毁进程组失败: {e}", flush=True)
 
 
 @auto_expand_env_vars
@@ -1829,6 +1895,7 @@ def output_from_cache(
             "log_kv_sink_window_mode": log_kv_sink_window_mode,
             "log_kv_sink_window_sink_size": log_kv_sink_window_sink_size,
             "log_kv_sink_window_window_size": log_kv_sink_window_window_size,
+            "log_kv_sink_window_full_attention_interval": log_kv_sink_window_full_attention_interval,
             "results": results,
         }
 

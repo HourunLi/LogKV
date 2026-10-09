@@ -1,0 +1,12 @@
+# Match the layer pattern and S/W used in statichybrid_stage1_train.yaml.
+# bash eval.sh exp/qwen1.7b-32k/statichybrid_stage1_eval.yaml
+config: sinkwindow_stage1_eval.yaml
+
+checkpoint_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-statichybrid-stage1
+output_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-statichybrid-stage1/evaluate
+
+log_kv_sink_window_mode: true
+log_kv_semantic_clusters: false
+log_kv_sink_window_sink_size: 16
+log_kv_sink_window_window_size: 2048
+log_kv_sink_window_full_attention_interval: 4

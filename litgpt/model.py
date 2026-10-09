@@ -658,18 +658,23 @@ class GPT(nn.Module):
         rope_cache_length: int | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        full_attention_interval: int = 0,
     ) -> None:
-        """Initialize SinkWindowKVCache for all attention layers (inference).
+        """Initialize local caches, with every Nth layer optionally full.
 
-        Storage: O(n_layer * (sink_size + window_size)), independent of
-        request length -- unlike set_kv_cache/set_log_kv_cache there is no
-        max_seq_length parameter to pass, since none is needed.
+        ``full_attention_interval=4`` gives local/local/local/full. Full
+        layers retain the entire model context; local layers retain S+W.
+        Zero preserves the all-local layout.
         """
+        if full_attention_interval < 0:
+            raise ValueError("full_attention_interval must be >= 0")
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
-        for block in self.transformer.h:
+        for layer, block in enumerate(self.transformer.h, start=1):
+            full = full_attention_interval > 0 and layer % full_attention_interval == 0
             block.attn.kv_cache = block.attn.build_sink_window_cache(
-                batch_size, sink_size, window_size, rope_cache_length, device, dtype,
+                batch_size, 0 if full else sink_size, self.max_seq_length if full else window_size,
+                rope_cache_length, device, dtype,
             )
             block.attn._log_kv_pending = None
         # Same reasoning as set_log_kv_cache: every block is on SinkWindowKVCache,
@@ -693,13 +698,17 @@ class GPT(nn.Module):
         sink_size: int,
         window_size: int,
         train_chunk_size: int | None = None,
+        full_attention_interval: int = 0,
     ) -> None:
-        """Switch every attention layer into SinkWindow training mode (no
-        cache is built -- training operates on the already-materialized
-        full-sequence q/k/v, see CausalSelfAttention._sink_window_train_forward).
+        """Use local attention except every Nth layer, which stays full causal.
+
+        No cache is built; zero keeps all layers local.
         """
-        for block in self.transformer.h:
-            block.attn.training_sink_window = True
+        if full_attention_interval < 0:
+            raise ValueError("full_attention_interval must be >= 0")
+        for layer, block in enumerate(self.transformer.h, start=1):
+            full = full_attention_interval > 0 and layer % full_attention_interval == 0
+            block.attn.training_sink_window = not full
             block.attn.sink_window_sink_size = int(sink_size)
             block.attn.sink_window_window_size = int(window_size)
             block.attn.sink_window_train_chunk_size = train_chunk_size
@@ -1423,12 +1432,14 @@ class CausalSelfAttention(nn.Module):
             out_chunk = sink_window_chunk_attention(
                 q_chunk, k_chunk_new, v_chunk_new, frozen_k, frozen_v,
                 scale=scale, enable_gqa=q.size(1) != k.size(1),
+                frozen_positions=cache.frozen_positions(),
+                query_start=cache.token_count,
+                sink_size=cache.sink_size,
+                window_size=cache.window_size,
             )
             outputs.append(out_chunk)
             # Commit AFTER attending -- the frozen read above must never
-            # include the chunk it's currently being used to score (see
-            # sinkwindow_cache.py's module docstring: this ordering is what
-            # makes "no mask needed against the frozen prefix" correct).
+            # include or overwrite keys needed by earlier queries in this chunk.
             cache.commit(k_chunk_new, v_chunk_new)
         y = torch.cat(outputs, dim=2)
         y = y.transpose(1, 2).reshape(B, T, head_size * n_head)

@@ -94,6 +94,17 @@ def test_window_ring_buffer_overwrites_oldest_after_wrap():
     assert set(frozen_k_after[0, 0, :, 0].tolist()) == {16.0, 24.0, 32.0}  # tokens 2,3,4
 
 
+@pytest.mark.parametrize("sink_size,window_size", [(0, 1), (0, 3), (2, 3), (8, 2)])
+def test_frozen_positions_match_stored_tokens(sink_size, window_size):
+    cache = _make_cache(sink_size=sink_size, window_size=window_size)
+    for count in (1, window_size, 1, window_size, window_size):
+        positions = torch.arange(cache.token_count, cache.token_count + count, dtype=torch.float32)
+        k = positions.view(1, 1, -1, 1).expand(1, 2, -1, 8)
+        cache.commit(k, k)
+        frozen_k, _ = cache.read_frozen()
+        torch.testing.assert_close(cache.frozen_positions().float(), frozen_k[0, 0, :, 0])
+
+
 def test_commit_rejects_chunk_larger_than_window_size():
     cache = _make_cache(sink_size=0, window_size=3)
     with pytest.raises(ValueError, match="window_size"):
@@ -311,7 +322,10 @@ def test_gqa_fast_path_matches_manual_repeat_interleave_reference():
     frozen_v = torch.randn(B, n_group, 3, hs)
     scale = 1.0 / math.sqrt(hs)
 
-    gqa_out = sink_window_chunk_attention(q, k_new, v_new, frozen_k, frozen_v, scale=scale, enable_gqa=True)
+    visibility = dict(frozen_positions=torch.arange(3), query_start=3, sink_size=2, window_size=4)
+    gqa_out = sink_window_chunk_attention(
+        q, k_new, v_new, frozen_k, frozen_v, scale=scale, enable_gqa=True, **visibility,
+    )
 
     rep = n_head // n_group
     manual_out = sink_window_chunk_attention(
@@ -322,5 +336,6 @@ def test_gqa_fast_path_matches_manual_repeat_interleave_reference():
         frozen_v.repeat_interleave(rep, dim=1),
         scale=scale,
         enable_gqa=False,
+        **visibility,
     )
     torch.testing.assert_close(gqa_out, manual_out, atol=1e-5, rtol=1e-4)

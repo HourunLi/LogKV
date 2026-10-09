@@ -1,0 +1,17 @@
+# Static hybrid: repeat [SinkWindow, SinkWindow, SinkWindow, full causal].
+# Qwen3-1.7B has 28 layers: full attention at layers 4, 8, ..., 28 (1-based).
+# Inherit the current SWA run's data, optimization, batch size and 200 steps.
+# Layout reference: https://arxiv.org/html/2501.18795v1#S3 (keep this model's RoPE).
+# Run: bash majob.sh exp/qwen1.7b-32k/statichybrid_stage1_train.yaml
+config: sinkwindow_stage1_train.yaml
+
+expid: qwen1.7b-32k-cpt-statichybrid-stage1
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-statichybrid-stage1
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_statichybrid_stage1
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-statichybrid-stage1
+
+log_kv_sink_window_mode: true
+log_kv_semantic_clusters: false
+log_kv_sink_window_sink_size: 16
+log_kv_sink_window_window_size: 2048
+log_kv_sink_window_full_attention_interval: 4
