@@ -49,5 +49,24 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
 unified + Alpha + Beta 为 `arc_beta_cpt100.yaml`。在训练环境、仓库根目录运行，并核对配置中的
 模型和输出路径。CPT 从 Base 初始化；若实验输出目录已有 checkpoint，`auto_resume` 会恢复它。
 
+## 性能开关与无 GPU 检查
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `LOGKV_ROUTE_OVERLAP` | `0` | attach 路由决策在 CUDA 侧流上与注意力重叠；开启前先在目标 GPU 运行 `python unused/check_route_overlap.py`，须逐位一致 |
+| `LOGKV_ROUTE_CUDA_GRAPH` | `1` | unified 路由从第 2 轮起整轮 CUDA graph 重放；`0` 逐核启动 |
+| `LOGKV_ROUTE_TILE_MB` | `1024` | unified 路由每 tile 距离矩阵目标大小；显存紧张设 `256` |
+
+无 GPU 时可用 Triton 解释器在 CPU 上运行融合路径（路由归约、融合距离、attach 核、Alpha
+分区等），与 Torch 参考逐位比较：
+
+```bash
+TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1 python -m pytest -q tests/test_alpha_log_kv.py
+python -m pytest -q tests/test_log_kv_triton_interpret.py
+```
+
+解释器不覆盖 CUDA graph、流与性能；GPU 上用 `unused/benchmark_log_kv_unified.py --route attach`
+测量路由耗时。
+
 LitGPT 通用用法见 [tutorials](tutorials/)。运行产生的 profile 和评测文件是实验产物，
 其时间、形状和代码版本须一起解读；它们不定义当前算法。

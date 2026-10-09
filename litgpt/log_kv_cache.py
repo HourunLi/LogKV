@@ -126,11 +126,16 @@ class _SemanticReplayUpdates:
                 if record[-1] is not None:
                     stream.wait_event(record[-1])
 
-    def save(self, tensor):
+    def save(self, tensor, owned=False):
+        """Keep `tensor` for replay; copy it unless the caller owns it outright.
+
+        Owned tensors are fresh temporaries that nothing writes afterwards, so
+        holding the reference keeps the values without a device copy.
+        """
         if tensor is None:
             return None
         index = len(self.tensors)
-        self.tensors.append(tensor.detach().clone())
+        self.tensors.append(tensor.detach() if owned else tensor.detach().clone())
         return index
 
 
@@ -1778,8 +1783,12 @@ class LogStructuredKVCache(nn.Module):
                 cut_records = []
                 metadata = (*metadata, cut_records)
                 kind = "append_beta"
-            self._update_actions.append((kind, metadata,
-                                         tuple(self._active_updates.save(x) for x in block)))
+            # Fresh staging rows (not views of cache buffers) are never written
+            # again, so they are kept by reference instead of copied.
+            shared = self._semantic_buffer_storages()
+            self._update_actions.append((kind, metadata, tuple(
+                self._active_updates.save(x, owned=x is not None and x.untyped_storage().data_ptr() not in shared)
+                for x in block)))
 
         self._mid_decode_state = None
         lengths = np.asarray(counts, dtype=np.int64).reshape(-1)
@@ -3802,6 +3811,36 @@ class LogStructuredKVCache(nn.Module):
     # Prefetching only hides GPU latency; tests enable it on CPU to compare paths.
     _alpha_prefetch_on_cpu = False
 
+    # Route decisions beside the attention on a side stream (CUDA, attach route).
+    _route_overlap = os.environ.get("LOGKV_ROUTE_OVERLAP", "0") == "1"
+    _ROUTE_STREAMS: dict = {}
+
+    def _route_decision_stream(self, device):
+        """High-priority side stream ordered after the previous flush, or None.
+
+        A flush's decisions read only its archived K/V and the cluster state
+        the previous flush committed, so they need not wait for the attention
+        queued since then: the host reads them back and plans the commit while
+        that attention runs. Commits return to the main stream, after it.
+        """
+        ready = getattr(self, "_route_ready", None)
+        if (not self._route_overlap or device.type != "cuda" or ready is None or self.semantic_unified_route
+                or self.semantic_legacy_route or self._semantic_hard_cap() != math.inf or self.K_max == 1
+                or not self._semantic_attach_one_transfer or getattr(self, "_semantic_scalar_dirty", None)):
+            return None
+        stream = self._ROUTE_STREAMS.get(device)
+        if stream is None:
+            stream = self._ROUTE_STREAMS[device] = torch.cuda.Stream(device, priority=-1)
+        stream.wait_event(ready)
+        return stream
+
+    def _route_mark_ready(self, device) -> None:
+        """Record where the next flush's decisions may start (end of this flush)."""
+        if self._route_overlap and device.type == "cuda":
+            if getattr(self, "_route_ready", None) is None:
+                self._route_ready = torch.cuda.Event()
+            self._route_ready.record(torch.cuda.current_stream(device))
+
     @torch.no_grad()
     def _alpha_prefetch_scores(self) -> None:
         """Score the next flush's candidate spans now, off the critical path.
@@ -3860,18 +3899,21 @@ class LogStructuredKVCache(nn.Module):
         if span_ends is None:
             raise ValueError("AlphaLogKV requires natural span boundaries")
         old_width, old_positions = self.alpha_count, self._alpha_positions
-        keys = torch.cat((self.alpha_k_raw[:, :, :old_width], k), dim=2)
-        values = torch.cat((self.alpha_v[:, :, :old_width], v), dim=2)
-        pos = torch.cat((self.alpha_pos[:, :old_width], positions), dim=1)
-        with logkv_timed("alpha_select"):
-            prefetched = self._alpha_take_prefetch(old_width, positions_host, span_ends)
-            if prefetched is not None:
-                selected = choose_spans(*prefetched, self.alpha_exact_tokens)
-            else:
-                selected = select_spans(keys, values, self._alpha_spans, self._alpha_positions,
-                                        positions_host, span_ends, old_width, self.alpha_exact_tokens,
-                                        self.alpha_span_max_tokens, beta_novelty=self.beta_novelty,
-                                        centroids=self.centroid, centroid_valid=self.alive)
+        side = self._route_decision_stream(k.device)
+        with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
+            # Snapshots: the pool is rewritten below from these sources.
+            keys = torch.cat((self.alpha_k_raw[:, :, :old_width], k), dim=2)
+            values = torch.cat((self.alpha_v[:, :, :old_width], v), dim=2)
+            pos = torch.cat((self.alpha_pos[:, :old_width], positions), dim=1)
+            with logkv_timed("alpha_select"):
+                prefetched = self._alpha_take_prefetch(old_width, positions_host, span_ends)
+                if prefetched is not None:
+                    selected = choose_spans(*prefetched, self.alpha_exact_tokens)
+                else:
+                    selected = select_spans(keys, values, self._alpha_spans, self._alpha_positions,
+                                            positions_host, span_ends, old_width, self.alpha_exact_tokens,
+                                            self.alpha_span_max_tokens, beta_novelty=self.beta_novelty,
+                                            centroids=self.centroid, centroid_valid=self.alive)
 
         def gather(rows, width, out=None):
             offsets = np.zeros((self.batch_size, width), dtype=np.int64)
@@ -3894,7 +3936,14 @@ class LogStructuredKVCache(nn.Module):
         counts = list(map(len, selected.archive))
         width = max(counts, default=0)
         fused = _triton_updates() if _fused_on(keys) else None
-        if fused is not None:
+        if side is not None:
+            # Archive rows come from the snapshots on the side stream; the pool
+            # itself is rewritten on the main stream once the queued attention,
+            # which reads it, has run (after the route's decisions).
+            with torch.cuda.stream(side):
+                if width:
+                    ak, av, ap, _ = gather(selected.archive, width)
+        elif fused is not None:
             # One index upload and one copy kernel for both destinations,
             # including zero-filled ragged rows. The cat sources do not alias
             # the exact pool we overwrite, so no cross-CTA read/write race.
@@ -3925,8 +3974,26 @@ class LogStructuredKVCache(nn.Module):
                 rows[b, :len(row)] = row
             live = np.arange(width) < np.asarray(counts)[:, None]
             archive_host = np.where(live, np.take_along_axis(host, rows, 1), 0).tolist()
-            route = self._semantic_route_unified if self.semantic_unified_route else self._semantic_route_three_phase
-            route(ak, av, ap, archive_host, record=record, token_counts=counts)
+            if self.semantic_unified_route:
+                self._semantic_route_unified(ak, av, ap, archive_host, record=record, token_counts=counts)
+            else:
+                self._semantic_route_three_phase(ak, av, ap, archive_host, record=record, token_counts=counts,
+                                                 stream=side)
+        if side is not None:
+            main = torch.cuda.current_stream(k.device)
+            main.wait_stream(side)
+            for tensor in (keys, values, pos):
+                tensor.record_stream(main)
+            keep = np.full((self.batch_size, self.alpha_exact_tokens), -1, dtype=np.int64)
+            for b, row in enumerate(selected.keep):
+                keep[b, :len(row)] = row
+            if fused is not None:
+                fused.alpha_partition(keys, values, pos, _upload(keep, k.device),
+                                      (self.alpha_k_raw, self.alpha_v, self.alpha_pos, self.alpha_valid))
+            else:
+                *_, valid = gather(selected.keep, self.alpha_exact_tokens,
+                                   out=(self.alpha_k_raw, self.alpha_v, self.alpha_pos))
+                self.alpha_valid.copy_(valid)
 
     def _semantic_commit_joins(
         self,
@@ -4382,12 +4449,22 @@ class LogStructuredKVCache(nn.Module):
         *,
         record: bool,
         token_counts: list[int] | None = None,
+        stream=None,
     ) -> None:
         """Attach route: frozen nearest-cluster joins, then orphan seeding.
 
         `token_counts` marks ragged rows (Alpha archives): offsets at or past a
         row's count are padding and are neither assigned nor written.
         """
+        if stream is not None and not (self.K_max > 1 and self._semantic_attach_one_transfer
+                                       and not self.semantic_legacy_route and self._semantic_hard_cap() == math.inf):
+            # Only the one-transfer planner splits decisions from commits; the
+            # others write on the main stream, after the side stream's inputs.
+            main = torch.cuda.current_stream(k_raw.device)
+            main.wait_stream(stream)
+            for tensor in (k_raw, v, positions):
+                tensor.record_stream(main)
+            stream = None
         if self.K_max == 1:
             if token_counts is not None:
                 raise ValueError("ragged attach routing requires K > 1")
@@ -4398,7 +4475,7 @@ class LogStructuredKVCache(nn.Module):
         if self._semantic_attach_one_transfer and not self.semantic_legacy_route and self._semantic_hard_cap() == math.inf:
             with self._semantic_deferred_scalars():
                 self._semantic_route_attach(k_raw, v, positions, positions_host, record=record,
-                                            token_counts=token_counts)
+                                            token_counts=token_counts, stream=stream)
             return
 
         winner, s_winner, direct = self._semantic_existing_assignments(k_raw, positions)
@@ -4487,7 +4564,8 @@ class LogStructuredKVCache(nn.Module):
     # two-phase host planner (the reference the tests compare against).
     _semantic_attach_one_transfer = True
 
-    def _semantic_route_attach(self, k_raw, v, positions, positions_host, *, record, token_counts=None) -> None:
+    def _semantic_route_attach(self, k_raw, v, positions, positions_host, *, record, token_counts=None,
+                               stream=None) -> None:
         """Uncapped attach route with one device-to-host transfer per flush.
 
         Same rules as the two-phase planner (`_semantic_route_orphans_fast`),
@@ -4498,6 +4576,19 @@ class LogStructuredKVCache(nn.Module):
         host groups tokens by (lane, cluster, position) with one stable sort.
         New clusters are the assigned clusters that are not alive yet.
         """
+        with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+            assign, order, counts = self._semantic_attach_decide(k_raw, positions, positions_host, token_counts)
+        if stream is not None:
+            # Commits write the ladder and centers on the main stream, after
+            # the attention queued there; the side stream's inputs stay alive.
+            main = torch.cuda.current_stream(k_raw.device)
+            main.wait_stream(stream)
+            for tensor in (k_raw, v, positions):
+                tensor.record_stream(main)
+        self._semantic_attach_commit(assign, order, counts, k_raw, v, positions, positions_host, record=record)
+
+    def _semantic_attach_decide(self, k_raw, positions, positions_host, token_counts):
+        """Final cluster per token in position order (host int8), the order and the counts."""
         n_batch, n_groups, tokens, dim = k_raw.shape
         dev = k_raw.device
         counts = (np.full(n_batch, tokens, dtype=np.int64) if token_counts is None
@@ -4520,6 +4611,25 @@ class LogStructuredKVCache(nn.Module):
         counts_t, slots_t = metadata[cut[0]:cut[1]], metadata[cut[1]:cut[2]].view(slots.shape)
         n_free_t = metadata[cut[2]:].view(n_batch, n_groups)
 
+        fused = (_triton_route() if _fused_on(dev) and not n_seed and self.semantic_capacity_beta == 0.0
+                 and k_raw.dtype in (torch.float16, torch.bfloat16, torch.float32) else None)
+        if fused is not None:
+            # Every cluster is alive (no seeds): one kernel evaluates the frozen
+            # joins and the orphans' nearest live cluster for all lanes.
+            self._semantic_sync_device_scalars()
+            assign = fused.attach_assign(
+                k_raw.detach(), positions, order_t, counts_t, self.centroid[:n_batch, :n_groups],
+                self.alive[:n_batch, :n_groups], self.p_hi_c[:n_batch, :n_groups], self.s_h[:n_batch, :n_groups],
+                self.seg_eta, self.seg_g0, self.cluster_lambda_rel,
+            ).cpu().numpy()
+        else:
+            assign = self._semantic_attach_plan_torch(k_raw, positions, order_t, counts_t, slots_t, n_free_t, n_seed)
+        return assign, order, counts
+
+    def _semantic_attach_plan_torch(self, k_raw, positions, order_t, counts_t, slots_t, n_free_t, n_seed):
+        """Reference/seeding form of the attach decisions (int8 [B, G, T], position order)."""
+        n_batch, n_groups, tokens, dim = k_raw.shape
+        dev = k_raw.device
         winner, s_winner, direct = self._semantic_existing_assignments(k_raw, positions)
         perm = order_t[:, None, :].expand(-1, n_groups, -1)
         valid = (torch.arange(tokens, device=dev)[None, :] < counts_t[:, None])[:, None, :]
@@ -4560,9 +4670,11 @@ class LogStructuredKVCache(nn.Module):
             assign = torch.cat((assign, assign.new_zeros(n_batch, n_groups, 1)), 2)
             assign.scatter_(2, torch.where(used, picked, tokens), slots_t[..., :n_seed])
             assign = assign[..., :tokens]
-        assign = assign.to(torch.int8).cpu().numpy()
+        return assign.to(torch.int8).cpu().numpy()
 
-        # Host plan: (lane, cluster, position) order from one stable sort.
+    def _semantic_attach_commit(self, assign, order, counts, k_raw, v, positions, positions_host, *, record):
+        """Commit attach decisions: one stable sort gives the (lane, cluster, position) plan."""
+        n_batch, n_groups = k_raw.shape[:2]
         lane_ids = np.repeat(np.arange(n_batch * n_groups), np.repeat(counts, n_groups))
         offsets = np.concatenate([np.tile(order[b, :counts[b]], n_groups) for b in range(n_batch)])
         clusters = np.concatenate([assign[b, :, :counts[b]].reshape(-1) for b in range(n_batch)]).astype(np.int64)
@@ -4806,6 +4918,10 @@ class LogStructuredKVCache(nn.Module):
             rounds.append((tuple(batch), tuple(specials)))
         return tuple(end_cursors), tuple(rounds)
 
+    def _semantic_buffer_storages(self) -> set[int]:
+        """Storage addresses of this cache's buffers (constant while recording)."""
+        return {buffer.untyped_storage().data_ptr() for buffer in self.buffers()}
+
     @contextlib.contextmanager
     def _semantic_update_context(self, updates, *, replay=False):
         previous = self._active_updates, self._replaying_updates
@@ -5001,7 +5117,8 @@ class LogStructuredKVCache(nn.Module):
             self._semantic_route_chunk_tree(k_raw, v, positions, positions_host, record=record_op_log)
             return
 
-        self._semantic_route_three_phase(k_raw, v, positions, positions_host, record=record_op_log)
+        self._semantic_route_three_phase(k_raw, v, positions, positions_host, record=record_op_log,
+                                         stream=self._route_decision_stream(k_raw.device))
 
 
     # ------------------------------------------------------------------
@@ -5515,10 +5632,13 @@ class LogStructuredKVCache(nn.Module):
             )
             remaining = self.recent_count - take
             if remaining > 0:
-                self.recent_k[:, :, :remaining, :] = self.recent_k[:, :, take:self.recent_count, :].clone()
-                self.recent_k_raw[:, :, :remaining, :] = self.recent_k_raw[:, :, take:self.recent_count, :].clone()
-                self.recent_v[:, :, :remaining, :] = self.recent_v[:, :, take:self.recent_count, :].clone()
-                self.recent_pos[:, :remaining] = self.recent_pos[:, take:self.recent_count].clone()
+                # Disjoint ranges (remaining <= take, the training/prefill shape)
+                # copy in place; only an overlapping shift needs a staging copy.
+                stage = (lambda x: x) if remaining <= take else torch.Tensor.clone
+                self.recent_k[:, :, :remaining, :].copy_(stage(self.recent_k[:, :, take:self.recent_count, :]))
+                self.recent_k_raw[:, :, :remaining, :].copy_(stage(self.recent_k_raw[:, :, take:self.recent_count, :]))
+                self.recent_v[:, :, :remaining, :].copy_(stage(self.recent_v[:, :, take:self.recent_count, :]))
+                self.recent_pos[:, :remaining].copy_(stage(self.recent_pos[:, take:self.recent_count]))
                 for b in range(self.batch_size):
                     self._recent_pos_host[b][:remaining] = self._recent_pos_host[b][take:self.recent_count]
                     if self.alpha_exact_tokens:
@@ -5533,6 +5653,7 @@ class LogStructuredKVCache(nn.Module):
             self.recent_pos[:, remaining:self.recent_count].zero_()
             self.recent_count = remaining
             pending -= take
+            self._route_mark_ready(self.recent_k.device)
         if self.alpha_exact_tokens and not self._replaying_updates:
             with logkv_timed("alpha_select"):
                 self._alpha_prefetch_scores()
@@ -6159,6 +6280,7 @@ class LogStructuredKVCache(nn.Module):
             self._alpha_positions = [[] for _ in range(self.batch_size)]
             self._recent_span_ends = [[False] * self.recent_capacity for _ in range(self.batch_size)]
             self._alpha_prefetch = None
+        self._route_ready = None
         self.level_k.zero_()
         self.level_v.zero_()
         self.level_w.zero_()

@@ -836,3 +836,82 @@ class UnifiedReduce:
         alive = packed[2 * lanes:2 * lanes + lanes * size].reshape(lanes, size).astype(bool)
         trace = packed[2 * lanes + lanes * size:].reshape(lanes, size, 2)
         return [trace[lane, :n] for lane, n in enumerate(merges)], alive, stuck
+
+
+@triton.jit(do_not_specialize=["G", "T", "K", "SXB", "SXG", "SXT", "SPB"])
+def _attach_assign(X, POS, ORDER, COUNTS, MU, ALIVE, PHI, SH, OUT, G, T, K, SXB, SXG, SXT, SPB, ETA, G0, LAMBDA,
+                   D: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr, BD: tl.constexpr):
+    """Attach decisions for BT tokens of one lane, in position order.
+
+    Frozen joins use the cost of `_semantic_existing_assignments` (expanded
+    squared distance plus the temporal term, live clusters only); a token
+    whose semantic distance to its winner exceeds LAMBDA * s_h joins the
+    nearest live cluster by exact squared differences instead, as an orphan
+    does when no new cluster can open. X and POS are read through strides,
+    so recent-window slices need no copy.
+    """
+    lane = tl.program_id(1).to(tl.int64)
+    b = lane // G
+    g = lane % G
+    slots = tl.program_id(0) * BT + tl.arange(0, BT)
+    valid = slots < tl.load(COUNTS + b)
+    offsets = tl.load(ORDER + b * T + slots, valid, 0)
+    pos = tl.load(POS + b * SPB + offsets, valid, 0)
+    ks = tl.arange(0, BK)
+    kin = ks < K
+    alive = (tl.load(ALIVE + lane * K + ks, kin, 0) != 0) & kin
+    phi = tl.load(PHI + lane * K + ks, kin, 0)
+    xx = tl.zeros([BT], tl.float32)
+    mm = tl.zeros([BK], tl.float32)
+    dot = tl.zeros([BT, BK], tl.float32)
+    exact = tl.zeros([BT, BK], tl.float32)
+    rows = X + b * SXB + g * SXG + offsets * SXT
+    for d0 in tl.static_range(0, D, BD):
+        dims = d0 + tl.arange(0, BD)
+        dmask = dims < D
+        x = tl.load(rows[:, None] + dims[None, :], valid[:, None] & dmask[None, :], 0.0).to(tl.float32)
+        xx += tl.sum(x * x, axis=1)
+        for c in tl.static_range(0, BK):
+            mu = tl.load(MU + (lane * K + c) * D + dims, dmask & (c < K), 0.0)
+            column = ks[None, :] == c
+            mm += tl.where(ks == c, tl.sum(mu * mu, axis=0), 0.0)
+            dot += tl.where(column, tl.sum(x * mu[None, :], axis=1)[:, None], 0.0)
+            diff = x - mu[None, :]
+            exact += tl.where(column, tl.sum(diff * diff, axis=1)[:, None], 0.0)
+    semantic = tl.maximum((xx[:, None] + mm[None, :]) - 2.0 * dot, 0.0)
+    gap = tl.maximum(pos[:, None] - phi[None, :], 0).to(tl.float32)
+    cost = semantic + ETA * (gap / (gap + G0))
+    cost = tl.where(alive[None, :], cost, float("inf"))
+    winner = tl.argmin(cost, axis=1, tie_break_left=True)
+    picked = ks[None, :] == winner[:, None]
+    s_winner = tl.sum(tl.where(picked, semantic, 0.0), axis=1)
+    direct = (tl.sum(alive.to(tl.int32), axis=0) > 0) & (s_winner <= LAMBDA * tl.load(SH + lane))
+    nearest = tl.argmin(tl.where(alive[None, :], exact, float("inf")), axis=1, tie_break_left=True)
+    assign = tl.where(direct, winner, nearest)
+    tl.store(OUT + lane * T + slots, assign.to(tl.int8), valid)
+
+
+def attach_assign(k_raw, positions, order, counts, centroid, alive, p_hi, s_h, eta, g0, lam):
+    """Final attach cluster per token (int8 [B, G, T], position order) without new clusters.
+
+    `order` [B, T] lists each row's token offsets by position and `counts` [B]
+    its valid tokens. `k_raw` [B, G, T, D] and `positions` [B, T] may be
+    strided slices whose last dimension is contiguous.
+    """
+    n_batch, n_groups, tokens, dim = k_raw.shape
+    k = centroid.size(2)
+    if k_raw.stride(-1) != 1:
+        k_raw = k_raw.contiguous()
+    if positions.stride(-1) != 1:
+        positions = positions.contiguous()
+    out = torch.full((n_batch, n_groups, tokens), -1, dtype=torch.int8, device=k_raw.device)
+    block_t = 64
+    _attach_assign[(triton.cdiv(tokens, block_t), n_batch * n_groups)](
+        k_raw, positions, order.contiguous(), counts.contiguous(),
+        centroid.float().contiguous(), alive.contiguous(), p_hi.contiguous(), s_h.float().contiguous(), out,
+        n_groups, tokens, k, k_raw.stride(0), k_raw.stride(1), k_raw.stride(2), positions.stride(0),
+        float(eta), float(g0), float(lam),
+        dim, block_t, triton.next_power_of_2(k), min(32, triton.next_power_of_2(dim)),
+        num_warps=4, enable_fp_fusion=False,
+    )
+    return out
