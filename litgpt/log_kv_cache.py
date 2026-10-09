@@ -3815,18 +3815,24 @@ class LogStructuredKVCache(nn.Module):
     _route_overlap = os.environ.get("LOGKV_ROUTE_OVERLAP", "0") == "1"
     _ROUTE_STREAMS: dict = {}
 
-    def _route_decision_stream(self, device):
+    def _route_decision_stream(self, k_raw, v):
         """High-priority side stream ordered after the previous flush, or None.
 
         A flush's decisions read only its archived K/V and the cluster state
         the previous flush committed, so they need not wait for the attention
         queued since then: the host reads them back and plans the commit while
         that attention runs. Commits return to the main stream, after it.
+        This holds only for the flush loop's own window, and only when every
+        row it archives was already in the window when the event was recorded;
+        rows appended after it (an unaligned chunk) keep the main stream.
         """
+        device = k_raw.device
         ready = getattr(self, "_route_ready", None)
         if (not self._route_overlap or device.type != "cuda" or ready is None or self.semantic_unified_route
                 or self.semantic_legacy_route or self._semantic_hard_cap() != math.inf or self.K_max == 1
-                or not self._semantic_attach_one_transfer or getattr(self, "_semantic_scalar_dirty", None)):
+                or not self._semantic_attach_one_transfer or getattr(self, "_semantic_scalar_dirty", None)
+                or k_raw.data_ptr() != self.recent_k_raw.data_ptr() or v.data_ptr() != self.recent_v.data_ptr()
+                or k_raw.size(2) > self._route_ready_rows):
             return None
         stream = self._ROUTE_STREAMS.get(device)
         if stream is None:
@@ -3840,6 +3846,7 @@ class LogStructuredKVCache(nn.Module):
             if getattr(self, "_route_ready", None) is None:
                 self._route_ready = torch.cuda.Event()
             self._route_ready.record(torch.cuda.current_stream(device))
+            self._route_ready_rows = self.recent_count
 
     @torch.no_grad()
     def _alpha_prefetch_scores(self) -> None:
@@ -3899,7 +3906,7 @@ class LogStructuredKVCache(nn.Module):
         if span_ends is None:
             raise ValueError("AlphaLogKV requires natural span boundaries")
         old_width, old_positions = self.alpha_count, self._alpha_positions
-        side = self._route_decision_stream(k.device)
+        side = self._route_decision_stream(k, v)
         with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
             # Snapshots: the pool is rewritten below from these sources.
             keys = torch.cat((self.alpha_k_raw[:, :, :old_width], k), dim=2)
@@ -5118,7 +5125,7 @@ class LogStructuredKVCache(nn.Module):
             return
 
         self._semantic_route_three_phase(k_raw, v, positions, positions_host, record=record_op_log,
-                                         stream=self._route_decision_stream(k_raw.device))
+                                         stream=self._route_decision_stream(k_raw, v))
 
 
     # ------------------------------------------------------------------
