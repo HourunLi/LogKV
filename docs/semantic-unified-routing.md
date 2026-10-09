@@ -1,10 +1,11 @@
 # 统一语义路由与增量实现
 
-本页定义 `semanticLogKV` 分支 `semantic_unified_route=true` 的当前路径；
-`arc_semantic_unified_cpt100.yaml` 已开启，`arc_semantic_fast.yaml` 单独使用时未开启。
-API 默认仍关闭。入口见 [`log_kv_cache.py`](../litgpt/log_kv_cache.py) 的
-`_semantic_route_unified`，GPU 实现在 [`log_kv_route_triton.py`](../litgpt/log_kv_route_triton.py)。
-缓存和训练语义见 [算法规格](algorithm-spec.md)。
+本页定义可选的 `semantic_unified_route=true` 路径。当前默认是 attach 路由
+（规则见 [算法规格 §3.1](algorithm-spec.md)）；unified 实验 NIAH 明显退化，保留为对照，
+`arc_semantic_unified*.yaml`、`arc_alpha_*`、`arc_beta_cpt100.yaml` 仍显式开启它。
+入口见 [`log_kv_cache.py`](../litgpt/log_kv_cache.py) 的 `_semantic_route_unified`，
+GPU 实现在 [`log_kv_route_triton.py`](../litgpt/log_kv_route_triton.py)。
+缓存和训练语义见 [共享算法规格](algorithm-spec.md)，精确片段选择见 [Alpha](alpha-logkv.md)。
 
 ## 两阶段建簇
 
@@ -18,15 +19,17 @@ C(a,b) = n_a n_b / (n_a+n_b) · ||μ_a−μ_b||²
 
 它衡量 key 空间平方误差的增量，不等于注意力或检索损失。
 
-1. **新候选**：本次 flush 待压缩的 token 从单成员候选开始。每轮取互为最低 Ward
-   代价的配对，并检查半径，直到没有可行配对。
+1. **新候选**：本次 flush 待压缩的 token 从单成员候选开始。Alpha 输入还包括被替换
+   的旧精确 token。每轮取互为最低 Ward 代价的配对，并检查半径，直到没有可行配对。
    允许 singleton，候选数不预先压到 K。
 2. **全局预算**：全部新候选与全部旧簇共同竞争，允许新—新、新—旧和旧—旧合并。
    每轮选择互不重叠配对，按代价取至多 `当前簇数−K` 对，更新中心并继续，直到不超过 K。
    此阶段不再要求候选紧凑度，因此最终簇可以比新候选宽。
 3. **实际写入**：按规划顺序先合并旧簇，再按真实位置批量写入 token。候选只保存统计量
    和归属索引，不提前平均 K/V；原始 token 以 `w=1` 进入层级，随后发生正常的层级压缩。
-   旧簇合并按位置重排现存条目，不把已压缩条目拆开。
+   Alpha 延迟归档会按位置重排受影响簇的现存条目，不把已压缩条目拆开。
+
+Alpha 的每个样本可有不同归档数量，包括0。padding 质量为0，既不参与配对，也不进入层级。
 
 ## 候选半径与配对规则
 
@@ -45,7 +48,7 @@ r_new ≤ max(r_a + β d, r_b + α d)
 逐次选择全局最低代价的串行 Ward。可选有限容量上限走全量重算；全局阶段没有可行配对时
 允许整组放宽容量上限，以保留 token 并满足 K 预算。
 
-## 默认增量路径
+## 默认增量路径：merge_passes=1
 
 每个候选/全局阶段各初始化一次 FP32 平方距离矩阵 D，之后使用 Lance–Williams 更新：
 
@@ -56,52 +59,60 @@ D(k,a′) = α D(k,a) + β D(k,b) − αβ D(a,b)
 一轮内两侧都合并时再应用一次该恒等式。实现细节：
 
 - 大矩阵先减公共原点、禁用 autocast/TF32；32 个节点以内直接计算距离。
-  距离矩阵统一将上三角镜像到下三角。CUDA 上 GEMM 之后由一个 Triton 核一次完成
-  `max(n_i+n_j−2G_ij, 0)`、截断和镜像，舍入与原 `baddbmm` 尾部相同。
+  CUDA 上 GEMM 之后由一个 Triton 核一次完成 `max(n_i+n_j−2G_ij, 0)`、截断和镜像，
+  与同一 GEMM 的未融合表达式逐位相同；其他路径用 baddbmm 后镜像上三角。
   两侧同时合并时固定展开顺序，维持逐位对称，避免偏好环导致没有互近邻。
 - 节点编号与矩阵形状保持固定，退休节点质量置0。缓存每行最低代价；只有旧最近邻已合并
   或候选被拒的行重扫，新合并行向其他行推送更小代价。
-- CUDA 每轮执行配对、预算提交、增量更新和脏行扫描。预算排序在 `_plan` 核内完成：
-  有限配对键 `(代价位<<32)|行号` 先压缩再做位序排序，等价于按代价的稳定 argsort。
-  轮次号常驻显存，从第 2 轮起整轮作为一个 CUDA graph 重放，主机每轮只剩一次 graph
-  launch；`LOGKV_ROUTE_CUDA_GRAPH=0` 恢复逐核启动。编译或捕获失败会告警并回退到
-  argsort/逐核启动，规则不变；捕获期间不分配显存。
-  每轮异步回传每组一个活跃标志，主机读取前一轮的结果，最多多排一个空轮。
-- 结束后统一读取归属 trace，重建 token→簇映射。旧簇条目排序与批量写入继续在设备端执行；
-  层级追加的逐层索引由整数组 NumPy 生成，顶层溢出对所有饱和簇批量左折叠（数值与逐条
-  合并相同），主机到设备的上传经锁页内存异步进行，不再每次同步等待已排队的核。
+- CUDA 每轮执行配对、预算提交、增量更新和脏行扫描。预算排序在 `_plan` 核内完成：有限
+  配对键 `(代价位<<32)|行号` 先压缩再做位序排序，等价于按代价的稳定 argsort；Triton 不支持
+  时回退到写入预分配缓冲的 `torch.sort`。预算提交后在设备上重建每组升序存活节点表，
+  脏行扫描（每程序 8 行 × 256 列的瓦片、向量化脏行判定、干净瓦片直接退出）和合并行
+  更新只遍历表内行列；合并行只在严格更小时才对其他行做 64 位 atomic min。最小值与遍历
+  顺序无关，逐元素运算不变，因此 trace、中心和存活距离与遍历全矩阵相同。
+- 轮次号常驻显存，一轮是固定的启动序列：从第 2 轮起整轮作为一个 CUDA graph 重放，主机
+  每轮只剩一次 graph launch（`LOGKV_ROUTE_CUDA_GRAPH=0` 恢复逐核启动；编译或捕获失败会
+  告警回退，规则不变；捕获期间不分配显存）。
+- CUDA 轮询时一次回传每组（活跃标志，存活数），经锁页内存的 NumPy 视图读取；存活最大值
+  收窄后续 grid 和行分块，已捕获的 graph 在该上界减半时按更窄的 grid 重新捕获。
+  一般每 4 轮轮询一次，最多多执行 3 个不改变结果的结束后空轮。全局阶段无半径约束，
+  每轮最多使存活数减半，在理论上不可能完成的轮次之前不轮询。
+  轮内配对与中心更新顺序不变；这是减少主机等待，与 `merge_passes=4` 的近似配对不同。
+- 结束后统一读取归属 trace，重建 token→簇映射。旧簇条目排序与批量写入继续在设备端执行。
+  Alpha 归档为空的样本不参与路由；每个 tile 的距离矩阵只按该 tile 最宽的组分配。
 - 若全局某组无互近邻，警告并仅对该组从输入重新执行全量重算；确无有限代价时仍报错。
 
 浮点递推和固定节点编号的平局规则可能改变旧版逐轮压紧编号的配对结果，
 不承诺逐位同轨迹。候选约束、最终 K 预算和质量守恒仍需成立。
 
+## 对照路径：merge_passes>1
+
+保留 Alpha 的冻结中心近似配对：候选阶段仍每轮一次扫描；无容量限制的全局阶段在增量
+轮次内部复用本轮距离，执行指定次数的互近邻扫描（Triton 与 Torch 参考实现都在设备上
+进行，中间无主机读取），已匹配端点退出后续扫描，本轮全部配对按代价一起受预算约束，
+最后统一更新中心。新合并中心要到下一轮才竞争，所以它会改变配对结果，不只是换后端。
+`4` 是现有对照值，不是默认；有限容量限制保留原配对规则（全量重算）。
+
 ## 内存与性能口径
 
-持久 KV 是固定 K 套层级；路由临时矩阵为 `O(tile·(F+K)²)`，F 是固定 flush 大小。
-它不是全上下文 `N×N` 注意力矩阵。
-每 tile 的组数以输入宽度估算，CUDA/Triton 默认 256 MiB（`LOGKV_ROUTE_TILE_MB` 可显式调大，
-tile 更少但峰值更高），其他路径 64 MiB；这只控制主要 FP32 距离矩阵的规模，
-不是所有临时张量或训练峰值的严格上限。
+持久 KV 是固定 K 套层级；路由临时矩阵为 `O(tile·(F+P+K)²)`，F 是固定 flush 大小，
+P 是固定 Alpha 精确预算。它不是全上下文 `N×N` 注意力矩阵。
+每 tile 的组数以输入宽度估算，CUDA/Triton 目标 1 GiB（`LOGKV_ROUTE_TILE_MB` 可调），其他路径
+64 MiB。batch 4×8 组、每组约 2.3K 节点只有一个 tile，距离矩阵约 0.7 GB；tile 越少，轮次、
+轮询和距离 GEMM 越少。Alpha 分支曾在 32K、batch 4 训练中因放大 tile 而 OOM，显存紧张时
+设 `LOGKV_ROUTE_TILE_MB=256`。这只控制主要 FP32 距离矩阵的规模，不是所有临时张量或训练峰值
+的严格上限。
 
-旧三阶段（attach）路由 `unified_route=false`：flush 先把每个 token 分给冻结的最近已有簇，
-其余 orphan 至多开空闲槽个新簇（最远点种子），其它 orphan 并入最近可用簇。实现上一次
-回传决策后，分桶、容量裁剪、orphan 分配和每簇按位置排序都是整数组 NumPy（一次
-lexsort），新簇一次批量建立，主机镜像在整段路由结束时一次刷新到设备；规则与逐 token
-实现一致。
-
-先用训练环境空闲 GPU 跑短路由；比较时固定 B、输入形状、后端与预热方式：
-
-```bash
-python unused/benchmark_log_kv_unified.py \
-  --device cuda --tokens 2048 --dim 128 --batch 4 --groups 8 \
-  --clusters 12 --B 128 --flushes 2 --iters 3 \
-  --profile-dir route_operator_profile \
-  > route_operator_profile.jsonl
-```
+性能检查复用 [Alpha 指南](alpha-logkv.md) 的短路由命令。去掉 `--alpha-*` 参数可检查纯
+semantic 路由；比较时固定 B、输入形状、后端与预热方式。
 
 - JSON 第一行是同步完成后的每 flush 时间与额外峰值；CUDA 检查应有
-  `reference_incremental_verified=true`。检查只证明当前实现对照，不证明检索质量。
+  `reference_incremental_verified=true`，其中包括融合距离、CUDA graph/核内排序与逐核启动/
+  argsort 的逐位比较以及 `merge_passes=4`。检查只证明当前实现对照，不证明检索质量。
+- 无 GPU 时：`TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1` 让融合路径在 CPU 上经 Triton 解释器
+  运行；`tests/test_log_kv_triton_interpret.py` 用它把归约内核、融合距离和 attach 内核与
+  Torch 参考逐位比较。解释器不覆盖 CUDA graph、流与性能。
 - 不带 profile 时，第二行的分阶段/轮数诊断会额外同步；不能替代第一行总耗时。
 - `--profile-dir` 记录最后一次 flush 的 CPU/CUDA 算子和 Python 调用。
-  阶段嵌套计时不能相加当总时间。
+  `route` 包含 `alpha_select`；阶段嵌套计时不能相加当总时间。
 - 训练 `logKV_host` 是累计主机墙钟时间，可能含 GPU 等待；短路由不能证明整步训练达到目标。

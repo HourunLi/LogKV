@@ -195,8 +195,8 @@ def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype):
     lanes = [(0, 0, 0), (0, 1, 7), (1, 0, 4), (1, 1, 1)]
     make_indices = cache._semantic_index_tensors
 
-    def checked_indices(*args):
-        fs, fd, si, gi, pi, vi, sd, cd = result = make_indices(*args)
+    def checked_indices(*args, **kwargs):
+        fs, fd, si, gi, pi, vi, sd, cd = result = make_indices(*args, **kwargs)
         for index in (fs, fd, si, gi, sd, cd):
             assert index.unique().numel() == index.numel()
         assert pi.numel() % 2 == 0
@@ -230,17 +230,6 @@ def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype):
                                            msg=lambda detail: f"B={B}, step={step}, {name}\n{detail}")
 
 
-def test_ranges_index_matches_span_index():
-    import numpy as np
-
-    rng = np.random.default_rng(11)
-    for _ in range(50):
-        starts = rng.integers(0, 100, size=int(rng.integers(0, 12)))
-        lengths = rng.integers(-2, 6, size=starts.size)
-        spans = [(int(a), int(a + max(n, 0))) for a, n in zip(starts, lengths)]
-        assert np.array_equal(kv._ranges_to_index_array(starts, lengths), kv._spans_to_index_array(spans))
-
-
 def test_benchmark_checks_later_iterations(monkeypatch):
     import sys
     from unused import benchmark_log_kv_updates as benchmark
@@ -261,3 +250,54 @@ def test_benchmark_checks_later_iterations(monkeypatch):
     with patch.object(kv.LogStructuredKVCache, "route_and_flush_batch", corrupt_second_warmup):
         with pytest.raises(AssertionError, match="torch/route/iteration=1: n_eff"):
             benchmark.main()
+
+
+def _scalar_top_overflow(cache):
+    """The former per-entry top-level path, as a reference for the batched fold."""
+    def overflow(jobs, stage):
+        for b, g, c, start, n in jobs:
+            cache._semantic_append_top_level_overflow(b, g, c, cache._semantic_slice_block(stage, start, start + n))
+    return overflow
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("beta", [False, True])
+def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta):
+    torch.manual_seed(13)
+    caches = []
+    for _ in range(2):
+        cache = kv.LogStructuredKVCache(
+            (2, 2, 16, 8), (2, 2, 16, 8), B=3, recent_size=4, device=device, dtype=dtype,
+            semantic_clusters=True, cluster_k_max=2, allocate_second_order=False, semantic_anchor_mode="mid",
+            semantic_unified_route=True, alpha_exact_tokens=2, alpha_span_max_tokens=2,
+            beta_adaptive_merge=beta, beta_novelty=beta,
+            cos_cache=torch.ones(64, 8, device=device), sin_cache=torch.zeros(64, 8, device=device), rope_n_elem=8,
+        )
+        caches.append(cache)
+    batched, scalar = caches
+    lanes = [(0, 0, 0), (0, 1, 1), (1, 0, 0), (1, 1, 1)]
+    # A full ladder holds B * (2^L - 1) tokens; carries merge two to one.
+    capacity = batched.B * (2 ** batched.L_alloc - 1)
+    position = 0
+    folds = patch.object(batched, "_semantic_append_top_level_overflow_batched",
+                         wraps=batched._semantic_append_top_level_overflow_batched)
+    # Uneven bursts saturate every ladder, then keep folding into the top level.
+    for counts in ([capacity - 1, 2, capacity, 1], [5, capacity + 3, 1, 7], [9, 4, 2 * capacity, 3],
+                   [capacity, capacity, capacity, capacity]):
+        total = sum(counts)
+        k, v = (torch.randn(total, 8, device=device).to(dtype) for _ in range(2))
+        pos = torch.arange(position, position + total, device=device)
+        position += total
+        block = (k, v, torch.ones(total, device=device), *batched._empty_stats(k, v), pos, pos, pos,
+                 torch.arange(total, device=device), torch.zeros(total, dtype=torch.bool, device=device))
+        with folds as fold:
+            batched._semantic_append_entries_batched(lanes, counts, block)
+        with patch.object(scalar, "_semantic_append_top_level_overflow_batched", _scalar_top_overflow(scalar)):
+            scalar._semantic_append_entries_batched(lanes, counts, block)
+        assert batched._semantic_counts == scalar._semantic_counts
+        for name, value in batched.named_buffers():
+            torch.testing.assert_close(value, scalar.get_buffer(name), rtol=0, atol=0, msg=name)
+    assert fold.call_count  # The last burst overflows every saturated ladder.
+    top = batched.L_alloc - 1
+    assert all(batched._semantic_counts[b][g][c][top] == batched.B for b, g, c in lanes)

@@ -11,6 +11,7 @@ import warnings
 import torch
 from torch.autograd.function import once_differentiable
 
+from litgpt.log_kv_cache import _fused_on
 from litgpt.log_kv_position import materialize_anchor_keys
 
 
@@ -26,8 +27,9 @@ def _triton_packer():
 def _pack_torch(cache, plan, k, v, dim, buffers=None, skip_pooled=False, recent_start=0):
     indices, anchors, _, valid = plan
     pooled = indices.size(-1)
+    exact = cache.alpha_count
     recent = cache.recent_count
-    length = pooled + recent + k.size(2)
+    length = pooled + exact + recent + k.size(2)
     if buffers is None:
         shape = (*k.shape[:2], length, dim)
         ka, va = k.new_empty(shape), v.new_empty(shape)
@@ -49,6 +51,17 @@ def _pack_torch(cache, plan, k, v, dim, buffers=None, skip_pooled=False, recent_
             va[:, :, :pooled, :v.size(-1)] = gather(cache.level_v).masked_fill(~valid[..., None], 0)
             weights = cache.level_w.flatten(2).gather(2, indices)
             ka[:, :, :pooled, k.size(-1)] = weights.clamp_min(1).log().masked_fill(~valid, -10000).to(k.dtype)
+        if exact:
+            valid_exact = cache.alpha_valid[:, None, :exact].expand(-1, cache.n_groups, -1)
+            anchors_exact = cache.alpha_pos[:, None, :exact, None].expand(-1, cache.n_groups, -1, -1)
+            keys = materialize_anchor_keys(cache.alpha_k_raw[:, :, :exact], anchors_exact,
+                                           cache.cos_cache, cache.sin_cache, cache.rope_n_elem).squeeze(-2)
+            ka[:, :, pooled:pooled + exact].zero_()
+            va[:, :, pooled:pooled + exact].zero_()
+            ka[:, :, pooled:pooled + exact, :k.size(-1)] = keys.masked_fill(~valid_exact[..., None], 0)
+            va[:, :, pooled:pooled + exact, :v.size(-1)] = cache.alpha_v[:, :, :exact].masked_fill(~valid_exact[..., None], 0)
+            ka[:, :, pooled:pooled + exact, k.size(-1)] = (~valid_exact).to(k.dtype) * -10000
+    pooled += exact
     # Write each source directly into the final allocation. No prefix cat or pad.
     ka[:, :, pooled + recent_start:].zero_()
     va[:, :, pooled + recent_start:].zero_()
@@ -62,11 +75,11 @@ def _pack_torch(cache, plan, k, v, dim, buffers=None, skip_pooled=False, recent_
 class _PackMidKV(torch.autograd.Function):
     @staticmethod
     def forward(ctx, k, v, cache, plan, dim, backend, buffers, skip_pooled, recent_start):
-        ctx.start = plan[0].size(-1) + cache.recent_count
+        ctx.start = plan[0].size(-1) + cache.alpha_count + cache.recent_count
         ctx.k_dim, ctx.v_dim = k.size(-1), v.size(-1)
         if buffers is not None and (k.requires_grad or v.requires_grad):
             raise ValueError("reusable decode buffers cannot hold differentiable K/V")
-        packer = _triton_packer() if k.is_cuda and backend != "torch" else None
+        packer = _triton_packer() if _fused_on(k) and backend != "torch" else None
         if backend == "triton" and packer is None:
             raise RuntimeError("Triton packing requires CUDA and an installed Triton runtime")
         if k.is_cuda and backend == "auto" and packer is None:
@@ -111,7 +124,7 @@ def pack_mid_kv(cache, plan, k, v, dim, *, backend=None, buffers=None, skip_pool
             or not 0 <= recent_start <= cache.recent_count):
         raise ValueError("prefix reuse requires a workspace and a valid recent offset")
     if buffers is not None:
-        length = plan[0].size(-1) + cache.recent_count + k.size(2)
+        length = plan[0].size(-1) + cache.alpha_count + cache.recent_count + k.size(2)
         if len(buffers) != 2 or any(buf.ndim != 4 or buf.shape[:2] != k.shape[:2] or buf.size(2) < length or buf.size(3) != dim
                or not buf.is_contiguous() or buf.dtype != k.dtype or buf.device != k.device for buf in buffers):
             raise ValueError("decode workspace does not match the packed layout")

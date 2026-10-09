@@ -48,6 +48,9 @@ export NCCL_NET_PLUGIN=none
 # 12000 截成 uint8 是 224，低 5 bit 为 0 = 无限等待：尾包丢失后永不重传，NCCL
 # 内核以 100% 利用率空等，表现为随机卡死。22 约 17s 重传一次，重试耗尽后报错。
 export NCCL_IB_TIMEOUT=22
+# LogKV 路由决策与注意力重叠（侧流）。先在目标 GPU 上运行
+# python unused/check_route_overlap.py，输出 bitwise_equal=true 后再设为 1。
+export LOGKV_ROUTE_OVERLAP=${LOGKV_ROUTE_OVERLAP:-0}
 export NCCL_NET_GDR_LEVEL=2  # Enable GPUDirect RDMA if RDMA is available # optim0129
 export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
 
@@ -121,8 +124,6 @@ import yaml
 def load(path):
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    if "log_kv_semantic_summary_size" in cfg:
-        raise SystemExit("log_kv_semantic_summary_size has been removed; delete this key.")
     if "config" in cfg:
         base = load(os.path.join(os.path.dirname(path), cfg.pop("config")))
         cfg = {**base, **cfg}
@@ -147,7 +148,7 @@ echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 # 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
 # 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_UNIFIED_ROUTE LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_REPLAY_UPDATES ENABLE_TENSORBOARD TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_UNIFIED_ROUTE LOG_KV_SEMANTIC_MERGE_PASSES LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_REPLAY_UPDATES LOG_KV_ALPHA_EXACT_TOKENS LOG_KV_ALPHA_SPAN_MAX_TOKENS LOG_KV_BETA_NOVELTY LOG_KV_BETA_ADAPTIVE_MERGE ENABLE_TENSORBOARD TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import math
 import os
 import sys
@@ -158,8 +159,6 @@ import yaml
 def load(path):
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    if "log_kv_semantic_summary_size" in cfg:
-        raise SystemExit("log_kv_semantic_summary_size has been removed; delete this key.")
     if "config" in cfg:
         base = load(os.path.join(os.path.dirname(path), cfg.pop("config")))
         cfg = {**base, **cfg}
@@ -230,10 +229,16 @@ print(
     cfg.get("log_kv_semantic_capacity_hard_cap_mult", 0.0),
     str(bool(cfg.get("log_kv_semantic_legacy_route", False))).lower(),
     str(bool(cfg.get("log_kv_semantic_unified_route", False))).lower(),
+    1 if cfg.get("log_kv_semantic_merge_passes") is None else cfg["log_kv_semantic_merge_passes"],
     cfg.get("log_kv_semantic_anchor_mode") or "multi",
     cfg.get("log_kv_semantic_pack_backend") or "auto",
     cfg.get("log_kv_semantic_centroid_backend") or "sequential",
     str(bool(cfg.get("log_kv_semantic_replay_updates", False))).lower(),
+    # Alpha/Beta default on (semantic only); YAML 0/false disables them.
+    256 if cfg.get("log_kv_alpha_exact_tokens") is None else cfg["log_kv_alpha_exact_tokens"],
+    64 if cfg.get("log_kv_alpha_span_max_tokens") is None else cfg["log_kv_alpha_span_max_tokens"],
+    str(True if cfg.get("log_kv_beta_novelty") is None else bool(cfg["log_kv_beta_novelty"])).lower(),
+    str(True if cfg.get("log_kv_beta_adaptive_merge") is None else bool(cfg["log_kv_beta_adaptive_merge"])).lower(),
     str(True if cfg.get("enable_tensorboard") is None else bool(cfg["enable_tensorboard"])).lower(),
     train_l_alloc,
     train_persistent,
@@ -374,7 +379,7 @@ done
 
 LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
 if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
-    LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_cluster_chunk_size ${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE} --log_kv_semantic_capacity_beta ${LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT} --log_kv_semantic_legacy_route ${LOG_KV_SEMANTIC_LEGACY_ROUTE} --log_kv_semantic_unified_route ${LOG_KV_SEMANTIC_UNIFIED_ROUTE} --log_kv_semantic_anchor_mode ${LOG_KV_SEMANTIC_ANCHOR_MODE} --log_kv_semantic_pack_backend ${LOG_KV_SEMANTIC_PACK_BACKEND} --log_kv_semantic_centroid_backend ${LOG_KV_SEMANTIC_CENTROID_BACKEND} --log_kv_semantic_replay_updates ${LOG_KV_SEMANTIC_REPLAY_UPDATES}"
+    LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_cluster_chunk_size ${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE} --log_kv_semantic_capacity_beta ${LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT} --log_kv_semantic_legacy_route ${LOG_KV_SEMANTIC_LEGACY_ROUTE} --log_kv_semantic_unified_route ${LOG_KV_SEMANTIC_UNIFIED_ROUTE} --log_kv_semantic_merge_passes ${LOG_KV_SEMANTIC_MERGE_PASSES} --log_kv_semantic_anchor_mode ${LOG_KV_SEMANTIC_ANCHOR_MODE} --log_kv_semantic_pack_backend ${LOG_KV_SEMANTIC_PACK_BACKEND} --log_kv_semantic_centroid_backend ${LOG_KV_SEMANTIC_CENTROID_BACKEND} --log_kv_semantic_replay_updates ${LOG_KV_SEMANTIC_REPLAY_UPDATES} --log_kv_alpha_exact_tokens ${LOG_KV_ALPHA_EXACT_TOKENS} --log_kv_alpha_span_max_tokens ${LOG_KV_ALPHA_SPAN_MAX_TOKENS} --log_kv_beta_novelty ${LOG_KV_BETA_NOVELTY} --log_kv_beta_adaptive_merge ${LOG_KV_BETA_ADAPTIVE_MERGE}"
     if [ "${LOG_KV_SEG_GAP_MAX}" != "__none__" ]; then
         LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_seg_gap_max ${LOG_KV_SEG_GAP_MAX}"
     fi

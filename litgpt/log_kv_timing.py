@@ -2,6 +2,8 @@
 
 CUDA spans include stream idle/wait time, not just kernel execution. Model-level
 forward/backward spans contain the LogKV spans; never add the two sets together.
+alpha_select covers span selection inside route (do not add that part to the
+route total again) plus the post-flush score prefetch, which runs outside route.
 """
 
 from contextlib import contextmanager
@@ -10,7 +12,7 @@ import time
 import torch
 
 
-CACHE_STAGES = ("route", "replay", "plan", "pack", "attn_fwd", "attn_bwd")
+CACHE_STAGES = ("route", "replay", "plan", "pack", "attn_fwd", "attn_bwd", "alpha_select")
 STEP_STAGES = ("data", "forward", "backward", "optimizer")
 HOST_STATS = {f"{stage}_{suffix}": 0 for stage in CACHE_STAGES + STEP_STAGES for suffix in ("s", "n")}
 _events = []

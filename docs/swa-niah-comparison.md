@@ -6,17 +6,20 @@ SWA 在 prefill 和 decode 都使用滑窗，查询位置 q 只能看到 `[q−W
 
 ## 现成脚本比较什么
 
-运行入口见 [README](../README.md)。[`compare_swa_niah.sh`](../unused/compare_swa_niah.sh)
-将 checkpoint 固定到一次解析出的实际权重目录，比较
-[`compare_niah_semantic.yaml`](../exp/qwen1.7b-32k/compare_niah_semantic.yaml) 与
-[`compare_niah_swa.yaml`](../exp/qwen1.7b-32k/compare_niah_swa.yaml)。
-前者继承 `arc_semantic_fast.yaml`，采用原 fast 路由，**没有开启统一路由**。
-当前配置为 K=12、B=128、recent=2048、mid、一阶、逐 token 入层级。
+[`compare_swa_niah.sh`](../unused/compare_swa_niah.sh) 将 checkpoint 固定到一次解析出的
+实际权重目录，比较 `compare_niah_semantic.yaml` 与 `compare_niah_swa.yaml`。
+前者继承 `arc_semantic_fast.yaml`，因此是当前默认路线：attach 路由 + Alpha + Beta。
+当前该配置为 K=12、原始 B=128（精确池从中扣除）、recent=2048、mid、一阶、逐 token 入层级。
+被比较的 checkpoint 若不是用这一路线训练的，需在两个 YAML 中写出它训练时的开关。
 
-默认单机 8 卡、32K single1/2/3；`GPUS_PER_NODE=1` 改为单卡，附加 `--limit 4` 仅用于
-检查流程。两组输出分开保存在 `swa_compare_<时间>` 下，可由 `SWA_COMPARE_OUTPUT_DIR`
-指定目录。脚本不训练、不安装依赖；使用已结束训练的权重，避免评测期间被覆写。
-当前 `eval.sh` 不透传 `swa_window_size`，SWA 必须使用专门脚本或直接配置入口。
+```bash
+bash unused/compare_swa_niah.sh '<已完成checkpoint目录>'
+```
+
+在 GPU 环境、仓库根目录执行。默认8卡、32K single1/2/3；`GPUS_PER_NODE=1` 可改为单卡，
+附加 `--limit 4` 仅用于检查流程。两组输出分开保存在 `swa_compare_<时间>` 下，
+可由 `SWA_COMPARE_OUTPUT_DIR` 指定目录。该脚本不训练、不安装依赖。
+当前 `eval.sh` 不透传 `swa_window_size`，SWA 使用上述专门脚本。
 
 ## 预算口径
 
@@ -26,11 +29,13 @@ SWA 在 prefill 和 decode 都使用滑窗，查询位置 q 只能看到 `[q−W
 因此这是**持久缓存分配预算**对齐，不是总峰值显存对齐。
 
 以结果 JSON 的 `cache_budget`、实际窗口和实际加载配置为准，不沿用旧 B=256 的窗口数值。
-空槽仍占内存，不能用有效 slot 数代替分配字节数。
+参考 LogKV 已包含 Alpha 精确池；Alpha 从“压缩存储＋最大打包工作区”扣精确槽的内部预算
+口径与此不同，见 [Alpha 预算说明](alpha-logkv.md)，不能只比较两个 B 参数就宣称同内存。
 
 ## 结果判断
 
 - 核对 checkpoint、tokenizer、任务长度、样本数、生成设置和预算，分别看 single1/2/3。
 - 记录 prompt 是否被截断。needle 在 SWA 最终窗口外不等于必然失败，信息可能经后续 token 传递。
 - 现有 `decode_ms_per_token` 包含 prefill，不能作为独立 decode 延迟。
-- 原 fast 路由的结果不能直接归因于统一路由；需要比较后者时，先明确统一路由配置与对应权重。
+- 上述脚本不自动构成 Alpha/Beta 的消融。训练与评测入口见 [README](../README.md) 和
+  [Beta 指南](beta-logkv.md)。

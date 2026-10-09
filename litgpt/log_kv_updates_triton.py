@@ -87,7 +87,94 @@ def fill(fields, stage, src, dst):
         )
 
 
-def merge_scatter(fields, stage, si, gi, pi, vi, dst, clear):
+@triton.jit(do_not_specialize=["NS", "NP", "NV", "NG"])
+def _beta_merge(F, S, O, SI, GI, PI, VI, LAYOUT, CUTS, NS, NP, NV, NG,
+                DK: tl.constexpr, DV: tl.constexpr, BD: tl.constexpr, REPLAY: tl.constexpr):
+    group = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, BD).to(tl.int64)
+    zero = tl.arange(0, 1).to(tl.int64)
+    if group < NG:
+        start = tl.load(LAYOUT + 3 * group)
+        width = tl.load(LAYOUT + 3 * group + 1)
+        dest = tl.load(LAYOUT + 3 * group + 2)
+        row = tl.arange(0, 4).to(tl.int64)
+        valid = row < width
+        index = tl.load(PI + start + row, valid, 0).to(tl.int64)
+        k = _read(F[0], S[0], SI, GI, index, NS, d, valid, DK).to(tl.float32)
+        v = _read(F[1], S[1], SI, GI, index, NS, d, valid, DV).to(tl.float32)
+        w = tl.reshape(_read(F[2], S[2], SI, GI, index, NS, zero, valid, 1), (4,)).to(tl.float32)
+        if REPLAY:
+            cut = tl.load(CUTS + group).to(tl.int32)
+        else:
+            cut = 1
+            if width == 4:
+                total = tl.maximum(tl.sum(w, 0), 1.e-12)
+                ek = tl.maximum(tl.sum(tl.sum(k * k, 1) * w, 0) / total, 1.e-12)
+                ev = tl.maximum(tl.sum(tl.sum(v * v, 1) * w, 0) / total, 1.e-12)
+                best = float("inf")
+                for option in tl.static_range(3):
+                    candidate = 2 if option == 0 else 1 if option == 1 else 3
+                    cost = 0.0
+                    for side in tl.static_range(2):
+                        member = (row < candidate) if side == 0 else (row >= candidate)
+                        ww = tl.where(member & valid, w, 0.0)
+                        mass = tl.maximum(tl.sum(ww, 0), 1.e-12)
+                        km = tl.sum(k * ww[:, None], 0) / mass
+                        vm = tl.sum(v * ww[:, None], 0) / mass
+                        dk, dv = k - km[None, :], v - vm[None, :]
+                        cost += tl.sum(tl.sum(dk * dk, 1) * ww, 0) / ek
+                        cost += tl.sum(tl.sum(dv * dv, 1) * ww, 0) / ev
+                    better = cost < best
+                    cut = tl.where(better, candidate, cut)
+                    best = tl.minimum(best, cost)
+            tl.store(CUTS + group, cut)
+        left = valid & ((width == 2) | (row < cut))
+        right = valid & (width == 4) & (row >= cut)
+        wl, wr = tl.where(left, w, 0.0), tl.where(right, w, 0.0)
+        ml, mr = tl.sum(wl, 0), tl.sum(wr, 0)
+        for side in tl.static_range(2):
+            ww = wl if side == 0 else wr
+            mass = ml if side == 0 else mr
+            write = (side == 0) | (width == 4)
+            ko = tl.sum(k * ww[:, None], 0) / tl.maximum(mass, 1.e-12)
+            vo = tl.sum(v * ww[:, None], 0) / tl.maximum(mass, 1.e-12)
+            tl.store(O[0] + (dest + side) * DK + d, ko, write & (d < DK))
+            tl.store(O[1] + (dest + side) * DV + d, vo, write & (d < DV))
+            tl.store(O[2] + dest + side, mass, write)
+        # Read each metadata field once and reduce both output segments from
+        # registers; preserve the same four-row reduction order as K/V.
+        for f in tl.static_range(3, 8):
+            x = tl.reshape(_read(F[f], S[f], SI, GI, index, NS, zero, valid, 1), (4,))
+            for side in tl.static_range(2):
+                member = left if side == 0 else right
+                mass = ml if side == 0 else mr
+                write = (side == 0) | (width == 4)
+                if f == 3:
+                    value = tl.min(tl.where(member & (w > 0), x, 9223372036854775807), 0)
+                    value = tl.where(mass > 0, value, 0)
+                elif f == 4:
+                    value = tl.max(tl.where(member & (w > 0), x, -9223372036854775807), 0)
+                    value = tl.where(mass > 0, value, 0)
+                elif f == 5:
+                    value = tl.sum(tl.where(member, x, 0), 0)
+                elif f == 6:
+                    value = tl.min(tl.where(member, x, 9223372036854775807), 0)
+                else:
+                    value = tl.min(tl.where(member, x.to(tl.int32), 1), 0)
+                tl.store(O[f] + dest + side, value, write)
+    else:
+        copy_row = (group - NG) * 8 + tl.arange(0, 8).to(tl.int64)
+        copy_live = copy_row < NV
+        copy_index = tl.load(VI + copy_row, copy_live, 0).to(tl.int64)
+        for field in tl.static_range(8):
+            copy_dim = DK if field == 0 else DV if field == 1 else 1
+            copy_value = _read(F[field], S[field], SI, GI, copy_index, NS, d, copy_live, copy_dim)
+            tl.store(O[field] + (NP + copy_row[:, None]) * copy_dim + d[None, :], copy_value,
+                     copy_live[:, None] & (d < copy_dim)[None, :])
+
+
+def merge_scatter(fields, stage, si, gi, pi, vi, dst, clear, *, beta_lengths=None, beta_cuts=None,
+                  beta_layout=None):
     f, s = tuple(fields[i] for i in _FIELDS), tuple(stage[i] for i in _FIELDS)
     pairs, survivors = pi.numel() // 2, vi.numel()
     n = pairs + survivors
@@ -97,8 +184,30 @@ def merge_scatter(fields, stage, si, gi, pi, vi, dst, clear):
                             dtype=torch.float32 if i < 2 else x.dtype) for i, x in enumerate(f))
     dk, dv = fields[0].size(1), fields[1].size(1)
     bd = triton.next_power_of_2(max(dk, dv))
-    _merge[(triton.cdiv(n, 8),)](f, s, out, si, gi, pi, vi, si.numel(), pairs, survivors,
-                               dk, dv, 8, bd, num_warps=4, enable_fp_fusion=False)
+    if beta_lengths is None:
+        _merge[(triton.cdiv(n, 8),)](f, s, out, si, gi, pi, vi, si.numel(), pairs, survivors,
+                                   dk, dv, 8, bd, num_warps=4, enable_fp_fusion=False)
+    else:
+        from litgpt.beta_log_kv import make_layout
+
+        if sum(beta_lengths) != pi.numel():
+            raise ValueError("Beta lane lengths must cover the compaction input")
+        # The cache can include this host-known layout in its existing batched
+        # index upload instead of paying another pageable transfer per level.
+        layout = make_layout(beta_lengths, pi.device) if beta_layout is None else beta_layout
+        if (layout.ndim != 2 or layout.shape[1] != 3 or layout.dtype != torch.int64
+                or layout.device != pi.device or not layout.is_contiguous()
+                or len(layout) != sum((n + 3) // 4 for n in beta_lengths)):
+            raise ValueError("Beta layout does not match the compaction lanes")
+        replay = beta_cuts is not None
+        if not replay:
+            beta_cuts = torch.empty(len(layout), dtype=torch.uint8, device=pi.device)
+        elif beta_cuts.shape != (len(layout),) or beta_cuts.dtype != torch.uint8 or beta_cuts.device != pi.device:
+            raise ValueError("recorded Beta cuts do not match the compaction layout")
+        if len(layout) or survivors:
+            _beta_merge[(len(layout) + triton.cdiv(survivors, 8),)](
+                f, s, out, si, gi, pi, vi, layout, beta_cuts, si.numel(), pairs, survivors, len(layout),
+                dk, dv, bd, replay, num_warps=4, enable_fp_fusion=False)
     if survivors + clear.numel():
         _scatter[(triton.cdiv(survivors + clear.numel(), 8),)](
             f, out, vi, dst, clear, survivors, clear.numel(), pairs, True,
@@ -107,7 +216,7 @@ def merge_scatter(fields, stage, si, gi, pi, vi, dst, clear):
     carry = [None] * 13
     for i, x in zip(_FIELDS, out):
         carry[i] = x[:pairs]
-    return tuple(carry)
+    return tuple(carry) if beta_lengths is None else (tuple(carry), beta_cuts)
 
 
 @triton.jit(do_not_specialize=["NR", "START"])
@@ -171,3 +280,49 @@ def centroid(k, mu, n_eff, metadata, start, count, *, token_tile=1):
 
 def centroid_parallel(k, mu, n_eff, metadata, start, count):
     centroid(k, mu, n_eff, metadata, start, count, token_tile=32)
+
+
+@triton.jit(do_not_specialize=["N", "P", "A"])
+def _alpha_partition(K, V, POS, INDEX, EK, EV, EP, VALID, AK, AV, AP, N, P, A,
+                     G: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+                     BT: tl.constexpr, BD: tl.constexpr):
+    """Copy exact and archived rows together; masked rows are real zero writes."""
+    b, g = tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
+    row = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
+    d = tl.arange(0, BD)
+    live = row < P + A
+    src = tl.load(INDEX + b * (P + A) + row, live, -1).to(tl.int64)
+    token = live & (src >= 0)
+    base = (b * G + g) * N + src
+    k = tl.load(K + base[:, None] * DK + d[None, :], token[:, None] & (d < DK)[None, :], 0)
+    v = tl.load(V + base[:, None] * DV + d[None, :], token[:, None] & (d < DV)[None, :], 0)
+    keep, archive = live & (row < P), live & (row >= P)
+    exact_row = (b * G + g) * P + row
+    archive_row = (b * G + g) * A + row - P
+    tl.store(EK + exact_row[:, None] * DK + d[None, :], k, keep[:, None] & (d < DK)[None, :])
+    tl.store(EV + exact_row[:, None] * DV + d[None, :], v, keep[:, None] & (d < DV)[None, :])
+    tl.store(AK + archive_row[:, None] * DK + d[None, :], k, archive[:, None] & (d < DK)[None, :])
+    tl.store(AV + archive_row[:, None] * DV + d[None, :], v, archive[:, None] & (d < DV)[None, :])
+    if g == 0:
+        pos = tl.load(POS + b * N + src, token, 0)
+        tl.store(EP + b * P + row, pos, keep)
+        tl.store(VALID + b * P + row, token, keep)
+        tl.store(AP + b * A + row - P, pos, archive)
+
+
+def alpha_partition(k, v, pos, indices, exact):
+    """Contiguous cat inputs are independent of the persistent exact outputs.
+
+    Indices are [batch, exact capacity + archive width], padded with -1.
+    No reduction or scoring occurs here: every retained value is copied exactly.
+    """
+    ek, ev, ep, valid = exact
+    b, g, n, dk = k.shape
+    p, a, dv = ek.size(2), indices.size(1) - ek.size(2), v.size(-1)
+    ak, av = k.new_empty((b, g, a, dk)), v.new_empty((b, g, a, dv))
+    ap = pos.new_empty((b, a))
+    _alpha_partition[(triton.cdiv(p + a, 16), b, g)](
+        k, v, pos, indices, ek, ev, ep, valid, ak, av, ap, n, p, a,
+        g, dk, dv, 16, triton.next_power_of_2(max(dk, dv)), num_warps=4,
+    )
+    return ak, av, ap

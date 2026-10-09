@@ -501,6 +501,61 @@ def test_deferred_op_log_matches_immediate_writes_with_uneven_lanes(device):
 
 
 @pytest.mark.parametrize('device', DEVICES)
+def test_frozen_matching_sweeps_match_reference_and_preserve_constraints(device):
+    """An independent peeling oracle, ragged groups, ties and guarded paths."""
+    cache = cache_for(semantic_merge_passes=4)
+    rng = torch.Generator().manual_seed(98)
+    mu = torch.randint(-4, 5, (3, 65, 8), generator=rng).float().to(device)
+    mu[0].zero_()
+    mass = torch.ones(3, 65, device=device)
+    mass[1, 51:] = 0
+    mass[2] = 0
+    radius = torch.zeros_like(mass)
+    d2 = (mu[:, :, None] - mu[:, None, :]).square().sum(-1)
+    cost = d2 * (mass[:, :, None] * mass[:, None, :] / (mass[:, :, None] + mass[:, None, :]).clamp_min(1))
+    cost.masked_fill_(~((mass > 0)[:, :, None] & (mass > 0)[:, None, :]), math.inf)
+    cost.diagonal(dim1=-2, dim2=-1).fill_(math.inf)
+    expected = []
+    for lane in range(3):
+        remaining = cost[lane].clone()
+        chosen = []
+        for _ in range(4):
+            pairs = cache._semantic_unified_pairs(remaining, 32)
+            chosen.extend(pairs.tolist())
+            remaining[pairs.flatten()] = math.inf
+            remaining[:, pairs.flatten()] = math.inf
+        expected.append(sorted(chosen, key=lambda pair: (float(cost[lane, pair[0], pair[1]]), pair[0])))
+    actual = cache._semantic_unified_round_pairs(mu, mass, radius, None, math.inf, True)
+    for rows, wanted in zip(actual.cpu(), expected):
+        pairs = rows[rows[:, 0] >= 0]
+        assert pairs.tolist() == wanted
+        assert pairs.unique().numel() == pairs.numel()
+    for limits, cap, overflow in ((mu.new_full((3,), .5), math.inf, False), (None, .1, True)):
+        actual = cache._semantic_unified_round_pairs(mu, mass, radius, limits, cap, overflow)
+        cache.semantic_merge_passes = 1
+        expected = cache._semantic_unified_round_pairs(mu, mass, radius, limits, cap, overflow)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        cache.semantic_merge_passes = 4
+
+
+def test_frozen_matching_reduction_reaches_budget_and_conserves_centroids():
+    import numpy as np
+    cache = cache_for(semantic_merge_passes=4)
+    torch.manual_seed(11)
+    centers = [torch.randn(n, 8) for n in (65, 19)]
+    weights = [np.arange(1, len(mu) + 1, dtype=np.float32) for mu in centers]
+    for mu, weight, (roots, traces, reduced) in zip(
+        centers, weights, cache._semantic_unified_reduce_arrays(weights, centers, max_clusters=3)
+    ):
+        assert len(roots) == 3
+        labels = cache._semantic_unified_labels(len(mu), roots, traces)
+        for c in range(3):
+            member = torch.from_numpy(labels == c)
+            w = torch.from_numpy(weight)[member]
+            torch.testing.assert_close(reduced[c], (mu[member] * w[:, None]).sum(0) / w.sum())
+
+
+@pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('candidate_pass', [False, True])
 def test_incremental_rounds_match_full_recompute_without_ties(device, candidate_pass):
     # Distinct random costs: Lance-Williams updates must reproduce every pair
@@ -629,3 +684,21 @@ def test_production_route_honours_capacity_hard_cap():
     assert 3 in calls
     assert cache.alive.sum() <= 3
     assert cache.level_w.sum().item() == 16
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_incremental_frozen_sweeps_match_full_recompute_sweeps(device):
+    # Distinct random costs: restricted rescans inside a round must reproduce
+    # the full-recompute frozen-center sweeps (merge_passes=4).
+    torch.manual_seed(223)
+    cache = cache_for(device=device, K=4, semantic_merge_passes=4)
+    groups = [np.random.RandomState(i).randint(1, 4, size=n).astype(np.float32) for i, n in enumerate([70, 33, 5, 90])]
+    centers = [torch.randn(len(w), 8, device=device) * (i + 1) for i, w in enumerate(groups)]
+    actual = cache._semantic_unified_reduce_arrays(groups, [c.clone() for c in centers], max_clusters=4)
+    expected = cache._semantic_unified_reduce_rounds(groups, [c.clone() for c in centers], max_clusters=4)
+    for (roots, traces, mu), (want_roots, want_traces, want_mu) in zip(actual, expected):
+        pairs = np.concatenate(traces) if traces else np.empty((0, 2), dtype=np.int64)
+        want = np.concatenate(want_traces) if want_traces else np.empty((0, 2), dtype=np.int64)
+        assert np.array_equal(roots, want_roots)
+        assert np.array_equal(pairs, want)
+        torch.testing.assert_close(mu, want_mu, atol=1e-5, rtol=1e-5)
