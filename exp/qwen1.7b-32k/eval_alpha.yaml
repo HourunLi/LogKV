@@ -1,4 +1,4 @@
-config: arc_alpha_cpt100.yaml
+config: arc_alpha_k12_b128.yaml
 benchmark: niah_single_2,niah_single_3
 limit: null
 metadata:

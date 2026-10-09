@@ -14,9 +14,10 @@ import pytest
 @pytest.mark.parametrize("setting, expected", [("true", "true"), ("false", "false"), ("null", "false"), (None, "false")])
 def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting, expected, anchor_mode, pack_backend):
     parent = tmp_path / "base.yaml"
+    # Unset Alpha keys must fall back to the default-on 256/64.
+    alpha = "" if setting is None else "log_kv_alpha_exact_tokens: 256\nlog_kv_alpha_span_max_tokens: 64\n"
     parent.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\n"
-                      "log_kv_cluster_k_max: 8\nlog_kv_B: 64\n"
-                      "log_kv_alpha_exact_tokens: 256\nlog_kv_alpha_span_max_tokens: 64\n"
+                      "log_kv_cluster_k_max: 8\nlog_kv_B: 64\n" + alpha +
                       f"log_kv_semantic_merge_passes: {4 if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_centroid_backend: {'parallel' if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_replay_updates: {'true' if anchor_mode == 'mid' else 'null'}\n"
@@ -64,7 +65,8 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
     for name in ("novelty", "adaptive_merge"):
         flag = "--log_kv_beta_" + name
         assert args.count(flag) == 1
-        assert args[args.index(flag) + 1] == expected
+        # Beta is on unless the YAML turns it off; routes stay off (attach) unless turned on.
+        assert args[args.index(flag) + 1] == ("false" if setting == "false" else "true")
     assert args[args.index("--log_kv_semantic_anchor_mode") + 1] == anchor_mode
     assert args[args.index("--log_kv_semantic_pack_backend") + 1] == pack_backend
 

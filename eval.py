@@ -1371,10 +1371,12 @@ def main(
     log_kv_semantic_pack_backend: str = "auto",
     log_kv_semantic_centroid_backend: str = "sequential",
     log_kv_semantic_replay_updates: bool = False,
-    log_kv_alpha_exact_tokens: int = 0,
+    # Alpha exact spans + Beta scoring/merging are on by default for semantic
+    # clusters; set log_kv_alpha_exact_tokens: 0 (or the beta flags false) to disable.
+    log_kv_alpha_exact_tokens: int = 256,
     log_kv_alpha_span_max_tokens: int = 64,
-    log_kv_beta_novelty: bool = False,
-    log_kv_beta_adaptive_merge: bool = False,
+    log_kv_beta_novelty: bool = True,
+    log_kv_beta_adaptive_merge: bool = True,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1461,6 +1463,11 @@ def main(
     log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
     log_kv_beta_novelty = bool(_o("log_kv_beta_novelty", log_kv_beta_novelty))
     log_kv_beta_adaptive_merge = bool(_o("log_kv_beta_adaptive_merge", log_kv_beta_adaptive_merge))
+    if not log_kv_semantic_clusters:
+        log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
+    if not log_kv_alpha_exact_tokens:
+        # Beta extends the Alpha exact pool; disabling Alpha disables both Beta changes.
+        log_kv_beta_novelty = log_kv_beta_adaptive_merge = False
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
     log_kv_seg_eta = float(_o("log_kv_seg_eta", log_kv_seg_eta))

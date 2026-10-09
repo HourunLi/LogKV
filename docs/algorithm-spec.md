@@ -1,21 +1,22 @@
 # SemanticLogKV / AlphaLogKV / BetaLogKV 算法规格
 
-本文描述当前 `betaLogKV` 分支的共享机制。Alpha 的片段选择与预算
-细节见 [AlphaLogKV](alpha-logkv.md)，路由内核见 [统一路由](semantic-unified-routing.md)，
-位置读出见 [Position / RoPE](position.md)。Beta 的评分与自适应压缩见
-[BetaLogKV](beta-logkv.md)。旧 Stage 0 路线图和未落地的设计不作为现行契约。
+本文描述当前分支的共享机制：attach 路由分簇 + Alpha 精确片段 + Beta。Alpha 的片段选择与
+预算见 [AlphaLogKV](alpha-logkv.md)，Beta 的评分与自适应压缩见 [BetaLogKV](beta-logkv.md)，
+可选的 unified 路由内核见 [统一路由](semantic-unified-routing.md)，位置读出见
+[Position / RoPE](position.md)。旧 Stage 0 路线图和未落地的设计不作为现行契约。
 
 ## 1. 当前入口与配置
 
-当前训练配置是 `exp/qwen1.7b-32k/arc_beta_cpt100.yaml`，依次继承
-`arc_alpha_cpt100.yaml`、`arc_semantic_unified_cpt100.yaml`、`arc_semantic_fast.yaml`、`base.yaml`。
-Python API 为兼容旧路径保留保守默认值，不能把不传参数等同于运行 Beta。
+当前训练配置是 `exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml`（`_4k` 仅把 recent
+改为 4096），继承 `arc_semantic_fast.yaml`、`base.yaml`；算法开关集中在 `arc_semantic_fast.yaml`。
+训练/评测入口（`majob.sh`、`eval.sh`、`demo.py`、`eval.py`）对未写出的键同样默认开启
+Alpha/Beta、关闭 unified；非语义簇路径自动关闭 Alpha/Beta，`alpha_exact_tokens=0` 同时关闭 Beta。
+Cache API 为兼容旧路径保留保守默认值，不能把直接构造 cache 不传参数等同于默认路线。
 
-| 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 当前 Beta 配置 |
+| 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 入口/当前配置 |
 |---|---|---|
 | `semantic_clusters` / `cluster_k_max` | `false` / `1` | `true` / `12` |
-| `semantic_unified_route` | `false` | `true` |
-| `semantic_merge_passes` | `1` | `1`，增量路由 |
+| `semantic_unified_route` | `false`（attach） | `false`（attach） |
 | `B` | `512` | 原始预算 `128`，为精确槽扣减后使用 |
 | `semantic_flush_granularity` | `2` | `2048` |
 | `semantic_anchor_mode` | `multi` | `mid` |
@@ -25,8 +26,14 @@ Python API 为兼容旧路径保留保守默认值，不能把不传参数等同
 | `beta_novelty` / `beta_adaptive_merge` | `false` / `false` | `true` / `true` |
 
 当前 `recent_size`、`train_block`、`prefill_block` 均为 `2048`，上下文长度 `32768`；
-二阶修正关闭，segment 间隔保护和 padding 关闭。Beta CPT 从配置中的 Base 权重初始化，
-若独立输出目录已有 checkpoint，`auto_resume` 会恢复该实验自己的训练状态。
+二阶修正关闭，segment 间隔保护和 padding 关闭，`seg_eta=1`、`seg_g0=2048`、
+`cluster_lambda_rel=1`、未提供 `s_h` 标定。CPT 从配置中的 Base 权重初始化，若独立输出目录
+已有 checkpoint，`auto_resume` 会恢复该实验自己的训练状态。
+
+更早实验的 YAML 显式写出各自训练时的开关，复评不受新默认值影响：纯 attach / unified 基线
+（`arc_semantic_attach_route_*`、`arc_semantic_unified_route_*`、`arc_semantic_unified.yaml`）
+关闭 Alpha/Beta；`arc_alpha_*` 为 unified + Alpha；`arc_beta_cpt100.yaml` 为 unified + Alpha + Beta；
+`base.yaml` 派生的 Stage-1（multi、二阶）关闭两者。
 
 ## 2. 存储对象与数据流
 
@@ -46,11 +53,37 @@ cache，语义路由按 `(batch, KV group)` 独立执行。
 
 数据流为：当前块进行因果 attention → 写入 recent → 溢出部分 flush → 建簇与归档。
 Alpha 在建簇前增加精确片段筛选：保留片段进入固定精确池，其余 token（含被替换的旧片段）
-进入共享路由。一个 token 不同时以精确副本和压缩副本计入 attention。
+按配置的路由（默认 attach）归档。一个 token 不同时以精确副本和压缩副本计入 attention。
 
-## 3. 统一建簇与合并
+## 3. 建簇路由
 
-当前 `semantic_unified_route=true` 不先把新 token 分配给旧簇：
+### 3.1 attach（默认，`semantic_unified_route=false`）
+
+每层、每个样本和 KV group 独立处理一次 flush 的归档 token，flush 内旧簇中心冻结：
+
+1. **直连旧簇**：对 token `x` 与每个存活簇 `c` 计算
+
+   ```text
+   gap(x,c)  = max(pos(x) − p_hi(c), 0)
+   cost(x,c) = ||x − μ_c||² + seg_eta · gap / (gap + seg_g0)
+   ```
+
+   取代价最小的簇；若其语义项 `||x − μ_c||² ≤ cluster_lambda_rel · s_h`，token 直接归入该簇。
+   可选容量惩罚和 hard cap 在当前配置中关闭。
+2. **orphan 开新簇**：未直连的 token 至多开 `空闲槽数` 个新簇。第一个种子取与其最优旧簇
+   语义距离最大的 orphan，其余按最远点依次选取；种子只是本次 flush 的临时原型。
+3. **其余 orphan**：按欧氏距离并入最近的存活簇或新种子，不再检查半径；没有空闲槽时只能
+   并入旧簇，簇因此可能变宽。整个路由不做 Ward 合并，簇数不超过 `K_max`。
+4. **写入**：每簇的 token 按位置排序，原始 K/V 以 `w=1` 批量进入层级，中心按成员均值
+   更新；新簇从其最早的 token 开始。Alpha 被替换的旧精确 token 位置可能早于簇的 `p_hi`，
+   这类簇按位置重排现存条目后重新入层级（见 [Alpha](alpha-logkv.md)）。
+
+主机侧分桶、容量裁剪、orphan 分配和每簇位置排序均为整数组 NumPy，一次决策回传；
+Alpha 的不等长归档按样本数量截断，padding 不参与分配也不写入。
+
+### 3.2 unified（可选，`semantic_unified_route=true`）
+
+unified 不先把新 token 分配给旧簇：
 
 1. 当前 flush 的每个归档 token 从单独候选开始，质量 `m=1`、半径 `r=0`。
 2. 候选仅在本批内部按半径约束合并，**不提前压到 `K_max`**，允许单 token 候选留下。
@@ -74,7 +107,7 @@ rnew <= sqrt(cluster_lambda_rel · s_h)
 ```
 
 `s_h` 可从离线标定文件按层、KV group 加载；未提供时实际为 `1`，不是在线估计的方差。
-当前 Alpha 配置未提供标定文件，`cluster_lambda_rel=1`。全局预算合并没有该半径约束，
+当前配置未提供标定文件，`cluster_lambda_rel=1`。全局预算合并没有该半径约束，
 因此预算压力下最终簇可以变宽，不能把候选半径当成最终信息损失的保证。
 
 每轮选多对互为最近邻、互不重叠的簇，按代价限制合并数量，避免低于目标簇数。
@@ -85,7 +118,7 @@ CUDA 约每 4 轮检查一次小型活动标志与存活数，结束后回传归
 `merge_passes=4` 保留冻结中心的近似对照：同一距离计算进行四次配对扫掠，再统一更新中心；
 已配对簇的合并结果到下一轮才参与竞争。这个选项会改变全局配对结果，不只是换计算后端。
 它只在无限容量的全局预算阶段使用，候选半径阶段不采用该近似。有限 hard cap 使用兼容
-重算路径；当前 Alpha 的容量惩罚与 hard cap 均关闭。
+重算路径；当前配置的容量惩罚与 hard cap 均关闭。
 
 ## 4. 簇内压缩与统计量
 
@@ -175,15 +208,16 @@ Beta 还记录每次局部压缩的切分位置；checkpoint 和 backward 直接
 ## 8. 支持边界与真实限制
 
 - 语义路径不支持 interleaved RoPE、MultiheadLatentAttention 或 importance pooling。
-  Alpha 还要求统一路由、`K_max>1`、`mid`、关闭二阶分配和 segment gap/padding。
+  Alpha 还要求 attach 或 unified 路由（不支持 legacy/chunk-tree）、`K_max>1`、`mid`、
+  关闭二阶分配和 segment gap/padding。
 - 模型入口要求共享、连续、只追加的 `input_pos`；cache 不是任意位置可覆写的存储器。
 - 半径、Ward 和固定精确池都不能保证任意远程事实无损；精确片段选择是启发式，质量结论
   需要真实检索评测，不能从 mass 守恒或随机路由基准推出。
 - flush 之间依赖前一批 cache 状态，仍按顺序推进；GPU 并行覆盖 lane、配对和批量写入。
   host 元数据经 pinned 内存异步上传，不再隐式同步 stream，回放可与已排队的注意力计算重叠；
   前向仍有片段分数回传、路由轮询与 trace 回传，不能宣称完全无同步。
-- 旧三阶段路由、legacy/chunk 路由、`multi` 和二阶修正仅是兼容或对照入口。当前 Alpha
-  配置不走这些组合；更改路由、位置近似或精确槽策略时，应保持训练与评测设置一致。
+- legacy/chunk 路由、`multi` 和二阶修正仅是兼容或对照入口；unified 是保留的对照路由。
+  更改路由、位置近似或精确槽策略时，应保持训练与评测设置一致。
 
 主要实现：`litgpt/log_kv_cache.py`、`litgpt/log_kv_route_triton.py`、`litgpt/model.py`、
 `litgpt/log_kv_pack.py`。维护时优先检查质量/mass、原始位置、预算和 forward/replay 一致性；

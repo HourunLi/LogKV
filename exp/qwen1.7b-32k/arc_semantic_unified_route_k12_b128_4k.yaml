@@ -25,3 +25,8 @@ log_kv_semantic_cluster_chunk_size: 0
 log_kv_cluster_k_max: 12
 log_kv_B: 128
 log_kv_recent_size: 4096
+
+# 该实验训练时未启用 Alpha/Beta；显式关闭，避免新默认值改变复评结果。
+log_kv_alpha_exact_tokens: 0
+log_kv_beta_novelty: false
+log_kv_beta_adaptive_merge: false
