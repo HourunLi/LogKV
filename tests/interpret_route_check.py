@@ -28,6 +28,7 @@ def main():
         fused.UnifiedReduce.sort_ok = sort
         check_rounds()
     check_pair_distances()
+    check_attach_assign()
     print("route kernels match the Torch reference")
 
 
@@ -70,6 +71,43 @@ def check_pair_distances():
         dist = ((norm[:, :, None] + norm[:, None, :]) - 2 * gram).clamp_min(0)
         expected = dist.triu() + dist.triu(1).transpose(1, 2)
         assert torch.equal(fused.pair_distances(gram.clone(), norm), expected), "fused pair distances differ"
+
+
+
+def check_attach_assign():
+    """Fused attach decisions against `_semantic_attach_plan_torch` (no seeds)."""
+    import numpy as np
+    generator = torch.Generator().manual_seed(97)
+    for dtype, dim, k_max, eta in ((torch.float32, 40, 5, 1.0), (torch.bfloat16, 64, 12, 0.0), (torch.float32, 8, 3, 2.0)):
+        n_batch, n_groups, tokens = 2, 3, 70
+        cache = LogStructuredKVCache(
+            (n_batch, n_groups, 512, dim), (n_batch, n_groups, 512, dim), B=4, recent_size=96, device="cpu",
+            dtype=dtype, semantic_clusters=True, cluster_k_max=k_max, allocate_second_order=False,
+            semantic_flush_granularity=96, seg_eta=eta, seg_g0=64.,
+            cos_cache=torch.ones(512, dim), sin_cache=torch.zeros(512, dim), rope_n_elem=dim,
+        )
+        cache.centroid.copy_(torch.randn(cache.centroid.shape, generator=generator) * 3)
+        cache.p_hi_c.copy_(torch.randint(0, 300, cache.p_hi_c.shape, generator=generator))
+        cache.s_h.fill_(dim * 6.)  # About half of the tokens join directly.
+        for alive in (torch.ones_like(cache.alive), torch.rand(cache.alive.shape, generator=generator) < .6):
+            alive[..., 0] = True
+            cache.alive.copy_(alive)
+            # A strided slice of a wider window, like the recent buffer.
+            window = torch.randn(n_batch, n_groups, tokens + 30, dim, generator=generator).to(dtype) * 3
+            k_raw = window[:, :, 5:5 + tokens]
+            pos_window = torch.stack([torch.randperm(400, generator=generator)[:tokens + 9] for _ in range(n_batch)])
+            positions = pos_window[:, 4:4 + tokens]
+            counts = np.array([tokens, 41])
+            host = positions.numpy()
+            valid = np.arange(tokens)[None, :] < counts[:, None]
+            order = np.argsort(np.where(valid, host, np.iinfo(np.int64).max), axis=1, kind="stable")
+            order_t, counts_t = torch.from_numpy(order), torch.from_numpy(counts)
+            expected = cache._semantic_attach_plan_torch(k_raw, positions, order_t, counts_t, None, None, 0)
+            actual = fused.attach_assign(k_raw, positions, order_t, counts_t, cache.centroid, cache.alive,
+                                         cache.p_hi_c, cache.s_h, eta, 64., 1.).numpy()
+            for b in range(n_batch):
+                assert np.array_equal(actual[b, :, :counts[b]], expected[b, :, :counts[b]]), \
+                    f"fused attach decisions differ (dtype={dtype}, dim={dim}, row {b})"
 
 
 if __name__ == "__main__":
