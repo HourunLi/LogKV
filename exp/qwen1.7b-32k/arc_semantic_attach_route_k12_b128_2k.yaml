@@ -1,0 +1,27 @@
+# Short unified-route CPT. This configuration currently starts from Base.
+config: arc_semantic_fast.yaml
+# For continuation from trained weights, set ckpt_dir to the actual checkpoint directory.
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
+resume_dir: null
+# Only resume this new experiment's own optimizer/step if interrupted.
+auto_resume: true
+
+expid: qwen1.7b-32k-semantic-attach-route_k12_b128_2k
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-semantic-attach-route_k12_b128_2k
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging-semantic-attach-route_k12_b128_2k
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-semantic-attach-route_k12_b128_2k
+
+max_steps: 1200
+learning_rate: 5e-6
+min_lr: 3e-6
+warmup_steps: 100
+save_interval: 400
+run_eval: ""
+
+log_kv_semantic_unified_route: false
+log_kv_semantic_legacy_route: false
+log_kv_semantic_cluster_chunk_size: 0
+
+log_kv_cluster_k_max: 12
+log_kv_B: 128
+log_kv_recent_size: 2048

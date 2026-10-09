@@ -7,7 +7,7 @@ ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-
 
 global_batch_size: 32
 micro_batch_size: 1
-max_steps: 200
+max_steps: 1200
 learning_rate: 5e-5
 weight_decay: 0.1
 num_devices: 8
