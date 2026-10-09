@@ -83,6 +83,14 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
   bash eval.sh exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 
+在目标 GPU 上对比路由与写入耗时（Gamma 只重排第 0 层，搬运的数据比旧行为少，实际收益以此为准）：
+
+```bash
+python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --B 128 --iters 3 --route attach \
+  --alpha-exact-tokens 256 --alpha-span-max-tokens 64 --beta-novelty --beta-adaptive-merge \
+  --gamma-level0-reinsert --gamma-top-merge lightest > route_gamma.jsonl
+```
+
 ## 针的去向诊断
 
 [`unused/niah_needle_trace.py`](../unused/niah_needle_trace.py) 用 lm-eval 自己的 single_2/3
