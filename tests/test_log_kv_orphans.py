@@ -125,3 +125,42 @@ def test_orphan_planning_ops_and_host_transfers_do_not_scale_with_lanes(mixed):
         assert len(transfers) == 1
         counts.append(transfers[0])
     assert counts[1] <= counts[0] * 1.1, counts
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param(
+    "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("ragged", [False, True])
+def test_one_transfer_attach_matches_two_phase_planner(device, dtype, ragged):
+    case = _case(4, device, dtype)
+    cache, keys, values, positions, host = case[:5]
+    # Shuffle positions inside each row: planning must follow positions, not offsets.
+    generator = torch.Generator().manual_seed(5)
+    perm = torch.stack([torch.randperm(keys.size(2), generator=generator) for _ in range(2)])
+    host = [[host[b][i] for i in perm[b].tolist()] for b in range(2)]
+    positions = torch.tensor(host, device=device)
+    counts = [37, 0] if ragged else None
+    caches = []
+    for one_transfer in (True, False):
+        c = deepcopy(cache)
+        c.begin_op_log()
+        transfers = []
+        original_cpu = torch.Tensor.cpu
+
+        def cpu(tensor, *args, **kwargs):
+            transfers.append(tuple(tensor.shape))
+            return original_cpu(tensor, *args, **kwargs)
+
+        with patch.object(LogStructuredKVCache, "_semantic_attach_one_transfer", one_transfer), \
+             patch.object(torch.Tensor, "cpu", cpu):
+            c._semantic_route_three_phase(keys, values, positions, host, record=True, token_counts=counts)
+        if one_transfer:
+            assert len(transfers) == 1
+        caches.append((c, c.take_op_log()))
+    (fast, (log, lengths)), (reference, (ref_log, ref_lengths)) = caches
+    for name, tensor in fast.named_buffers():
+        torch.testing.assert_close(tensor, reference.get_buffer(name), atol=0, rtol=0, msg=name)
+    for name in ("_semantic_n_total", "_semantic_alive", "_semantic_p_hi_c", "_semantic_counts", "_semantic_level0_phase"):
+        assert getattr(fast, name) == getattr(reference, name), name
+    assert torch.equal(lengths, ref_lengths) and torch.equal(log, ref_log)
