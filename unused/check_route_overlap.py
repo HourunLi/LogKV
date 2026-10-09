@@ -5,14 +5,22 @@ Runs the default route (attach + Alpha + Beta) through the real training path
 prefill-style add_recent, once with decisions on the main stream and once on
 the side stream. Outputs, gradients, every cache buffer and the host mirrors
 must match bit for bit; the JSON line also reports both wall times.
+Backward uses strict deterministic algorithms: FlashAttention's default dQ
+reduction is not bitwise reproducible, even with overlap disabled. Forward
+timings retain the normal execution mode; this setting is only for the check.
 
     python unused/check_route_overlap.py --blocks 16 --groups 8
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 import time
+
+# Set before CUDA creates a cuBLAS handle; replay may use cuBLAS under the
+# strict backward check. Respect an explicit workspace configuration.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch
 
@@ -40,9 +48,26 @@ def make_cache(args, overlap, device, batch):
 
 def compare(a, b, label):
     for name, value in a.named_buffers():
-        assert torch.equal(value, b.get_buffer(name)), f"{label}: buffer {name} differs"
+        assert_equal(value, b.get_buffer(name), f"{label}: buffer {name}")
     for name in HOST_STATE:
         assert getattr(a, name) == getattr(b, name), f"{label}: host state {name} differs"
+
+
+def assert_equal(a, b, label):
+    # Zero tolerance keeps real stream/replay errors visible, with the mismatch
+    # count and greatest absolute/relative differences in the failure report.
+    torch.testing.assert_close(a, b, rtol=0, atol=0, msg=lambda message: f"{label}: {message}")
+
+
+def backward_exact(loss):
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        # warn_only=True would still run FlashAttention's nondeterministic path.
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        loss.backward()
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
 def main():
@@ -81,14 +106,14 @@ def main():
         y = LogKVStreamTrainingAttention.apply(qi, ki, vi, cache, args.dim ** -.5, args.tokens, 0., ki, ends)
         sync()
         forward = time.perf_counter() - start
-        y.float().square().mean().backward()
+        backward_exact(y.float().square().mean())
         sync()
         report[f"train_forward_s_overlap_{overlap}"] = forward
         results.append((cache, y.detach(), qi.grad, ki.grad, vi.grad))
     (base, *tensors), (fast, *fast_tensors) = results
-    for name, a, b in zip(("y", "dq", "dk", "dv"), tensors, fast_tensors):
-        assert torch.equal(a, b), f"training: {name} differs with overlap"
     compare(base, fast, "training")
+    for name, a, b in zip(("y", "dq", "dk", "dv"), tensors, fast_tensors):
+        assert_equal(a, b, f"training: {name} differs with overlap")
 
     # Prefill path: add_recent with a busy main stream between blocks.
     caches = []
@@ -109,7 +134,8 @@ def main():
         report[f"prefill_s_overlap_{overlap}"] = time.perf_counter() - start
         caches.append(cache)
     compare(*caches, "prefill")
-    print(json.dumps({**vars(args), **report, "bitwise_equal": True,
+    print(json.dumps({**vars(args), **report, "bitwise_equal": True, "deterministic_backward": True,
+                      "torch": torch.__version__,
                       "hardware": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"}),
           flush=True)
 

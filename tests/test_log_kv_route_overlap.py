@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from litgpt.log_kv_cache import LogStructuredKVCache
@@ -68,3 +69,43 @@ def test_ready_event_records_the_window_rows(monkeypatch):
     cache._route_ready, cache.recent_count = event, 5
     cache._route_mark_ready(CUDA)
     assert recorded == ["main"] and cache._route_ready_rows == 5
+
+
+@pytest.mark.parametrize("enabled,warn_only", [(False, False), (True, True)])
+@pytest.mark.parametrize("fail", [False, True])
+def test_checker_backward_is_deterministic_and_restores_mode(enabled, warn_only, fail):
+    from unused.check_route_overlap import backward_exact
+
+    original = (torch.are_deterministic_algorithms_enabled(),
+                torch.is_deterministic_algorithms_warn_only_enabled())
+    try:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        x = torch.tensor([2.], requires_grad=True)
+
+        def check_mode(grad):
+            assert torch.are_deterministic_algorithms_enabled()
+            assert not torch.is_deterministic_algorithms_warn_only_enabled()
+            if fail:
+                raise RuntimeError("backward failed")
+            return grad
+
+        x.register_hook(check_mode)
+        if fail:
+            with pytest.raises(RuntimeError, match="backward failed"):
+                backward_exact(x.square().sum())
+        else:
+            backward_exact(x.square().sum())
+            assert torch.equal(x.grad, torch.tensor([4.]))
+        assert torch.are_deterministic_algorithms_enabled() == enabled
+        assert torch.is_deterministic_algorithms_warn_only_enabled() == warn_only
+    finally:
+        torch.use_deterministic_algorithms(original[0], warn_only=original[1])
+
+
+def test_checker_keeps_zero_tolerance_and_reports_error():
+    from unused.check_route_overlap import assert_equal
+
+    reference = torch.tensor([1.])
+    changed = torch.nextafter(reference, torch.tensor([2.]))
+    with pytest.raises(AssertionError, match="(?s)training: dq.*Mismatched elements"):
+        assert_equal(reference, changed, "training: dq")

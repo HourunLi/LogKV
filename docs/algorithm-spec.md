@@ -94,6 +94,8 @@ Alpha 的不等长归档按样本数量截断，padding 不参与分配也不写
 行留在主流。
 默认关闭：先在目标 GPU 上运行 `python unused/check_route_overlap.py`，训练与预填充两条路径
 的输出、梯度、缓存与主机镜像逐位一致后再开启。
+该脚本仅在反向检查时开启严格确定性算法，排除 FlashAttention 默认反向归约的非确定性；
+仍以零容差比较，失败会报告差异数量与最大误差。该设置不改变正常训练的算法开关。
 
 ### 3.2 unified（可选，`semantic_unified_route=true`）
 
