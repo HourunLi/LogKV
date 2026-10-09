@@ -9,7 +9,9 @@ EXP = Path(__file__).resolve().parents[1] / "exp" / "qwen1.7b-32k"
 # Script/CLI fallbacks for keys a YAML leaves unset (majob.sh, eval.sh, demo.py, eval.py).
 DEFAULTS = dict(log_kv_alpha_exact_tokens=256, log_kv_beta_novelty=True, log_kv_beta_adaptive_merge=True,
                 log_kv_semantic_unified_route=False, log_kv_semantic_anchor_mode="multi",
-                log_kv_second_order_scale=1.0, log_kv_cluster_k_max=1)
+                log_kv_second_order_scale=1.0, log_kv_cluster_k_max=1,
+                log_kv_gamma_level0_reinsert=True, log_kv_gamma_top_merge="lightest", log_kv_gamma_level_slack=2)
+LEGACY_GAMMA = dict(log_kv_gamma_level0_reinsert=False, log_kv_gamma_top_merge="fold", log_kv_gamma_level_slack=2)
 
 
 def resolve(path):
@@ -64,3 +66,33 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
     assert cfg["log_kv_alpha_exact_tokens"] == alpha
     assert cfg["log_kv_beta_novelty"] is beta and cfg["log_kv_beta_adaptive_merge"] is beta
     assert bool(cfg["log_kv_semantic_unified_route"]) is unified
+
+
+GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml"))
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_gamma_experiments_and_the_hub_use_gamma(name):
+    """Earlier experiments keep the ladder they were trained with; new ones inherit Gamma."""
+    cfg = effective(name)
+    gamma = {key: cfg[key] for key in LEGACY_GAMMA}
+    # The SWA comparison harness follows the current default route by design.
+    if name in GAMMA or name == "arc_semantic_fast.yaml" or name.startswith("compare_niah_"):
+        assert gamma["log_kv_gamma_level0_reinsert"] is True and gamma["log_kv_gamma_top_merge"] == "lightest"
+    else:
+        assert gamma == LEGACY_GAMMA, name
+
+
+@pytest.mark.parametrize("name, exact, slack, budget", [
+    ("arc_gamma_k12_b128_2k.yaml", 256, 2, 128),
+    ("arc_gamma_k12_b256_2k.yaml", 256, 2, 256),
+    ("arc_gamma_k12_b128_p1024_2k.yaml", 1024, 2, 128),
+    ("arc_gamma_k12_b128_slack0_2k.yaml", 256, 0, 128),
+])
+def test_gamma_experiments(name, exact, slack, budget):
+    cfg = effective(name)
+    assert cfg["log_kv_semantic_unified_route"] is False and int(cfg["log_kv_cluster_k_max"]) == 12
+    assert cfg["log_kv_beta_novelty"] is True and cfg["log_kv_beta_adaptive_merge"] is True
+    assert cfg["log_kv_alpha_exact_tokens"] == exact and cfg["log_kv_gamma_level_slack"] == slack
+    assert int(cfg["log_kv_B"]) == budget and int(cfg["log_kv_recent_size"]) == 2048
+    assert cfg["expid"] == "qwen1.7b-32k-" + name[len("arc_"):-len(".yaml")]

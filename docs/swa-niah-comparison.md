@@ -8,9 +8,10 @@ SWA 在 prefill 和 decode 都使用滑窗，查询位置 q 只能看到 `[q−W
 
 [`compare_swa_niah.sh`](../unused/compare_swa_niah.sh) 将 checkpoint 固定到一次解析出的
 实际权重目录，比较 `compare_niah_semantic.yaml` 与 `compare_niah_swa.yaml`。
-前者继承 `arc_semantic_fast.yaml`，因此是当前默认路线：attach 路由 + Alpha + Beta。
+前者继承 `arc_semantic_fast.yaml`，因此是当前默认路线：attach 路由 + Alpha + Beta + Gamma。
 当前该配置为 K=12、原始 B=128（精确池从中扣除）、recent=2048、mid、一阶、逐 token 入层级。
-被比较的 checkpoint 若不是用这一路线训练的，需在两个 YAML 中写出它训练时的开关。
+被比较的 checkpoint 若不是用这一路线训练的，需在两个 YAML 中写出它训练时的开关；Gamma 之前
+训练的 checkpoint 需写 `log_kv_gamma_level0_reinsert: false` 与 `log_kv_gamma_top_merge: fold`。
 
 ```bash
 bash unused/compare_swa_niah.sh '<已完成checkpoint目录>'

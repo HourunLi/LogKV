@@ -23,8 +23,11 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
                       f"log_kv_semantic_replay_updates: {'true' if anchor_mode == 'mid' else 'null'}\n"
                       f"log_kv_semantic_anchor_mode: {anchor_mode}\nlog_kv_semantic_pack_backend: {pack_backend}\n")
     if setting is not None:
+        top = {"true": "lightest", "false": "fold"}.get(setting, "null")
         parent.write_text(parent.read_text() + f"log_kv_semantic_{route}: {setting}\n"
-                          f"log_kv_beta_novelty: {setting}\nlog_kv_beta_adaptive_merge: {setting}\n")
+                          f"log_kv_beta_novelty: {setting}\nlog_kv_beta_adaptive_merge: {setting}\n"
+                          f"log_kv_gamma_level0_reinsert: {setting}\nlog_kv_gamma_top_merge: {top}\n"
+                          f"log_kv_gamma_level_slack: {1 if setting == 'false' else 'null'}\n")
     config = tmp_path / "run.yaml"
     config.write_text("config: base.yaml\n")
     source = (Path(__file__).resolve().parents[1] / script).read_text()
@@ -67,6 +70,12 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
         assert args.count(flag) == 1
         # Beta is on unless the YAML turns it off; routes stay off (attach) unless turned on.
         assert args[args.index(flag) + 1] == ("false" if setting == "false" else "true")
+    # Gamma is on unless the YAML restores the earlier ladder; slack keeps its two spare levels.
+    for flag, value in (("--log_kv_gamma_level0_reinsert", "false" if setting == "false" else "true"),
+                        ("--log_kv_gamma_top_merge", "fold" if setting == "false" else "lightest"),
+                        ("--log_kv_gamma_level_slack", "1" if setting == "false" else "2")):
+        assert args.count(flag) == 1
+        assert args[args.index(flag) + 1] == value
     assert args[args.index("--log_kv_semantic_anchor_mode") + 1] == anchor_mode
     assert args[args.index("--log_kv_semantic_pack_backend") + 1] == pack_backend
 

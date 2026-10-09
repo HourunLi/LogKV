@@ -717,6 +717,9 @@ class LogStructuredKVCache(nn.Module):
         alpha_span_max_tokens: int = 64,
         beta_novelty: bool = False,
         beta_adaptive_merge: bool = False,
+        gamma_level0_reinsert: bool = False,
+        gamma_top_merge: str = "fold",
+        gamma_level_slack: int = 2,
     ) -> None:
         super().__init__()
 
@@ -735,6 +738,15 @@ class LogStructuredKVCache(nn.Module):
         self.alpha_span_max_tokens = int(alpha_span_max_tokens)
         self.beta_novelty = bool(beta_novelty)
         self.beta_adaptive_merge = bool(beta_adaptive_merge)
+        # Gamma: delayed Alpha evictions re-sort only level 0; the saturated top
+        # level merges its lightest adjacent pair; optional spare-level count.
+        self.gamma_level0_reinsert = bool(gamma_level0_reinsert)
+        self.gamma_top_merge = str(gamma_top_merge)
+        self.gamma_level_slack = int(gamma_level_slack)
+        if self.gamma_top_merge not in ("fold", "lightest"):
+            raise ValueError("gamma_top_merge must be 'fold' or 'lightest'")
+        if not 0 <= self.gamma_level_slack <= 8:
+            raise ValueError("gamma_level_slack must be in [0, 8]")
         self.alpha_count = 0
         if (self.beta_novelty or self.beta_adaptive_merge) and not self.alpha_exact_tokens:
             raise ValueError("BetaLogKV requires the Alpha exact-span cache (alpha_exact_tokens > 0)")
@@ -853,7 +865,8 @@ class LogStructuredKVCache(nn.Module):
             self.register_buffer("cos_cache", cos_cache.to(device=device), persistent=False)
             self.register_buffer("sin_cache", sin_cache.to(device=device), persistent=False)
             self.slot_k_dim = int(cos_cache.size(1)) + k_dim - self.rope_n_elem
-            # §5.12: K_max changes ladder budget. +2 is the v1 safety margin.
+            # §5.12: K_max changes ladder budget. +2 is the v1 safety margin;
+            # Gamma may spend fewer spare levels on a wider B' (same bytes, below).
             self.max_levels = max(2, math.ceil(math.log2(max_seq_length / max(self.K_max * B, 1) + 1.0)) + 2)
         else:
             self.cluster_lambda_rel = 1.0
@@ -876,18 +889,23 @@ class LogStructuredKVCache(nn.Module):
             # levels needed; total levels = carry + 1 write level.
             self.max_levels = max(2, math.ceil(math.log2(max((max_seq_length + 1) / denom, 1))) + 1)
         self.L_alloc = self.max_levels
-        if self.alpha_exact_tokens:
-            # Pay for exact K/V and metadata from the ladder, never from the
-            # recent window (which would shorten the training/prefill blocks).
-            # Include the maximum reusable packed decode workspace as well.
+        slack = self.gamma_level_slack if self.semantic_clusters else 2
+        if self.alpha_exact_tokens or slack != 2:
+            # `B` names the bytes of the classic ladder (B slots, two spare
+            # levels). Pay for exact K/V and metadata from it, never from the
+            # recent window (which would shorten the training/prefill blocks),
+            # and spend fewer spare levels on a wider B'. Include the maximum
+            # reusable packed decode workspace as well.
             element = torch.empty((), dtype=dtype).element_size()
             packed_dim = ((max(k_dim + 1, v_dim) + 7) // 8) * 8
             entry_bytes = (k_dim + v_dim + 2 * packed_dim) * element + 41
             exact_bytes = self.alpha_exact_tokens * (n_groups * (k_dim + v_dim + 2 * packed_dim) * element + 9)
             baseline = n_groups * self.K_max * self.L_alloc * (B * entry_bytes + 2)
             self.alpha_baseline_B = B
-            for candidate in range(B - 1, 1, -1):
-                levels = max(2, math.ceil(math.log2(max_seq_length / (self.K_max * candidate) + 1.0)) + 2)
+            # With two spare levels no width >= B fits once exact bytes are paid.
+            top = B - 1 if slack == 2 else 4 * B
+            for candidate in range(top, 1, -1):
+                levels = max(2, math.ceil(math.log2(max_seq_length / (self.K_max * candidate) + 1.0)) + slack)
                 needed = n_groups * self.K_max * levels * (candidate * entry_bytes + 2) + exact_bytes
                 if needed <= baseline:
                     B = self.B = candidate
@@ -1657,6 +1675,9 @@ class LogStructuredKVCache(nn.Module):
         """
         ell = self.L_alloc - 1
         for i in range(incoming[0].size(0)):
+            if self.gamma_top_merge == "lightest":
+                self._semantic_top_merge_lightest(b, g, c, self._semantic_entry_from_block(incoming, i))
+                continue
             merged = self._semantic_merge_entries(
                 self._semantic_slot_entry(b, g, c, ell, 0),
                 self._semantic_slot_entry(b, g, c, ell, 1),
@@ -1666,6 +1687,78 @@ class LogStructuredKVCache(nn.Module):
                 b, g, c, ell, self._semantic_entry_from_block(incoming, i), top_level=True
             )
             self._set_semantic_level_count(b, g, c, ell, self.B)
+
+    def _semantic_top_merge_lightest(self, b: int, g: int, c: int, incoming: tuple[torch.Tensor, ...]) -> None:
+        """Gamma top level, one entry: merge the lightest adjacent pair, close the gap, append.
+
+        The pair with the smallest combined mass merges (ties: the oldest), so
+        a saturated top level coarsens evenly instead of folding everything
+        older into slot 0.
+        """
+        ell = self.L_alloc - 1
+        w = self.level_w[b, g, c, ell, :self.B]
+        i = int((w[:-1] + w[1:]).argmin())
+        merged = self._semantic_merge_entries(
+            self._semantic_slot_entry(b, g, c, ell, i),
+            self._semantic_slot_entry(b, g, c, ell, i + 1),
+        )
+        tail = self._semantic_slice_block(self._semantic_level_block(b, g, c, ell, self.B), i + 2)
+        self._semantic_write_slot(b, g, c, ell, i, merged)
+        if i + 2 < self.B:
+            self._semantic_write_block(b, g, c, ell, i + 1, tail)
+        self._semantic_write_slot(b, g, c, ell, self.B - 1, incoming)
+        self._set_semantic_level_count(b, g, c, ell, self.B)
+
+    def _semantic_top_level_lightest_batched(self, jobs, stage) -> None:
+        """Gamma top-level overflow for many saturated ladders at once, without host syncs.
+
+        Per staged entry and lane, the adjacent pair with the smallest combined
+        mass merges (ties: the oldest), later slots shift left and the entry
+        takes the last slot. Each step runs for every lane still overflowing;
+        merged rows round to the cache dtypes like stored slots, so values match
+        `_semantic_top_merge_lightest`.
+        """
+        fields = self._semantic_flat_level_fields()
+        dev = fields[0].device
+        B, top = self.B, self.L_alloc - 1
+        # Longest overflows first: the lanes still merging at step t are a prefix.
+        jobs = sorted(jobs, key=lambda job: -job[4])
+        n = len(jobs)
+        m = np.asarray([job[4] for job in jobs], dtype=np.int64)
+        rows = np.asarray([self._semantic_lane_base(b, g, c) + top * B for b, g, c, _, _ in jobs], dtype=np.int64)
+        offsets = np.cumsum(m) - m
+        live = [int((m > t).sum()) for t in range(int(m.max()))]
+        staged_rows = _ranges_to_index_array(np.asarray([job[3] for job in jobs], dtype=np.int64), m)
+        step_rows = np.concatenate([offsets[:k] + t for t, k in enumerate(live)])
+        fs, fg, nx = _upload_indices(dev, ((rows[:, None] + np.arange(B)).reshape(-1), staged_rows, step_rows))
+        level = [f.index_select(0, fs).view(n, B, *f.shape[1:]) if f is not None else None for f in fields]
+        incoming = [x.index_select(0, fg).to(f.dtype) if f is not None else None for f, x in zip(fields, stage)]
+        column = torch.arange(B, device=dev)
+        start = 0
+        for k in live:
+            lane = torch.arange(k, device=dev)
+            w = level[2][:k]
+            i = (w[:, :-1] + w[:, 1:]).argmin(dim=1)
+            pairs = tuple(torch.stack((x[:k][lane, i], x[:k][lane, i + 1]), dim=1).flatten(0, 1)
+                          if x is not None else None for x in level)
+            merged = self._semantic_merge_block_pairs(pairs)
+            # Column j takes j before the pair, the merged row at i, j + 1 after it
+            # and the staged entry last.
+            source = torch.where(column[None, :] < i[:, None], column[None, :], (column[None, :] + 1).clamp_max(B - 1))
+            step = nx[start:start + k]
+            start += k
+            for idx, (f, x) in enumerate(zip(fields, level)):
+                if x is None:
+                    continue
+                gather = source.view(k, B, *([1] * (x.dim() - 2))).expand(k, B, *x.shape[2:])
+                shifted = torch.gather(x[:k], 1, gather)
+                shifted[lane, i] = merged[idx].to(f.dtype)
+                shifted[:, B - 1] = incoming[idx].index_select(0, step)
+                level[idx] = torch.cat((shifted, x[k:]), dim=0)
+        for f, x in zip(fields, level):
+            if f is not None:
+                f.index_copy_(0, fs, x.reshape(n * B, *x.shape[2:]))
+        self.level_imp.view(-1).index_fill_(0, fs, 0)
 
     def _semantic_append_top_level_overflow_batched(self, jobs, stage) -> None:
         """Top-level overflow for many saturated ladders at once, without host syncs.
@@ -1679,6 +1772,9 @@ class LogStructuredKVCache(nn.Module):
         to the cache dtypes after each step like the stored slot, so values
         match the scalar path.
         """
+        if self.gamma_top_merge == "lightest":
+            self._semantic_top_level_lightest_batched(jobs, stage)
+            return
         fields = self._semantic_flat_level_fields()
         dev = fields[0].device
         B, top = self.B, self.L_alloc - 1
@@ -1960,6 +2056,9 @@ class LogStructuredKVCache(nn.Module):
             if count < self.B:
                 self._semantic_write_slot(b, g, c, ell, count, incoming)
                 self._set_semantic_level_count(b, g, c, ell, count + 1)
+                return
+            if ell == self.L_alloc - 1 and self.gamma_top_merge == "lightest":
+                self._semantic_top_merge_lightest(b, g, c, incoming)
                 return
 
             merged = self._semantic_merge_entries(
@@ -2472,6 +2571,28 @@ class LogStructuredKVCache(nn.Module):
         running = running.cummax(0).values - (segment << shift)
         merge = torch.argsort(((segment >> 1) << shift) + running, stable=True)
         return perm[merge]
+
+    def _semantic_clear_level0(self, lanes):
+        """Empty level 0 of independent clusters; upper levels and cluster scalars stay.
+
+        Gamma reinsertion gathers these rows first and re-appends them sorted
+        with the delayed tokens, so carries land on the untouched upper levels.
+        """
+        if not lanes:
+            return
+        if self._update_actions is not None:
+            self._update_actions.append(("clear_level0_batch", tuple(lanes), ()))
+        self._mid_decode_state = None
+        ids = np.fromiter(((b * self.n_groups + g) * self.K_max + c for b, g, c in lanes),
+                          dtype=np.int64, count=len(lanes))
+        rows = _upload(ids * self.L_alloc, self.level_k.device)
+        fields = ["level_k", "level_v", "level_w", "level_imp", "level_p_lo", "level_p_hi",
+                  "level_sum_wp", "level_order", "pad_mask"]
+        if self.allocate_second_order:
+            fields += ["level_sigma_u", "level_sigma2", "level_gamma_a", "level_gamma_b", "level_gamma"]
+        for name in fields:
+            getattr(self, name).flatten(0, 3).index_fill_(0, rows, 0)
+        self._set_semantic_level_counts(lanes, np.arange(len(lanes)), 0, np.zeros(len(lanes), dtype=np.int64))
 
     def _semantic_clear_clusters(self, lanes):
         """Clear independent clusters with one indexed fill per field."""
@@ -3694,6 +3815,12 @@ class LogStructuredKVCache(nn.Module):
         Host work is whole-array NumPy, and the position order is one device
         stable sort keyed by (lane, position) instead of reading ladder
         positions back: old entries never lie past their cluster's p_hi.
+
+        Legacy: every level of an affected cluster is gathered, sorted with the
+        new tokens and re-appended from level 0, so already merged entries are
+        merged again on every flush. Gamma (``gamma_level0_reinsert``): only
+        level 0 is re-sorted with the new tokens and re-appended; upper levels
+        keep their entries and receive ordinary carries.
         """
         if not jobs:
             return
@@ -3720,7 +3847,10 @@ class LogStructuredKVCache(nn.Module):
         lane_c = np.fromiter((c for _, _, c, _ in delayed), dtype=np.int64, count=nd)
         lane_id = (lane_b * self.n_groups + lane_g) * self.K_max + lane_c
         level_counts = np.array([self._semantic_counts[b][g][c] for b, g, c, _ in delayed], dtype=np.int64)
-        span_start = (lane_id * n_levels)[:, None] * self.B + np.arange(n_levels) * self.B
+        reinsert = self.gamma_level0_reinsert
+        if reinsert:
+            level_counts = level_counts[:, :1]
+        span_start = (lane_id * n_levels)[:, None] * self.B + np.arange(level_counts.shape[1]) * self.B
         src = _spans_to_index_array(np.stack((span_start, span_start + level_counts), -1).reshape(-1, 2))
         old_counts = level_counts.sum(1)
         counts = old_counts + new_len
@@ -3733,9 +3863,13 @@ class LogStructuredKVCache(nn.Module):
         lane_major = np.where(rank < old_n, (np.cumsum(old_counts) - old_counts)[segment] + rank,
                               len(src) + (np.cumsum(new_len) - new_len)[segment] + rank - old_n)
         n_src, n_new, n_all = len(src), len(new_off), len(rank)
+        # Re-appended rows take fresh arrival orders; Gamma continues each lane's
+        # level-0 phase because its upper levels keep their earlier orders.
+        phase0 = (np.array([self._semantic_level0_phase[b][g][c] for b, g, c, _ in delayed], dtype=np.int64)
+                  if reinsert else np.zeros(nd, dtype=np.int64))
         # One upload for gathers, ordering, phases and centroid metadata.
         packed = _upload(np.concatenate((src, lane_b[new_owner], lane_g[new_owner], new_off, lane_id, new_len,
-                                         lane_major, segment, rank)), k_raw.device)
+                                         lane_major, segment, rank + phase0[segment])), k_raw.device)
         cut = np.cumsum([n_src, 3 * n_new, nd, nd, n_all, n_all])
         src_t = packed[:cut[0]]
         bi, gi, ti = packed[cut[0]:cut[1]].view(3, n_new).unbind(0)
@@ -3760,14 +3894,18 @@ class LogStructuredKVCache(nn.Module):
         updated = (pre[:, None] * mu[ids] + sums) / (pre + lengths_t)[:, None]
         lanes = [job[:3] for job in delayed]
         totals = [self._semantic_n_total[b][g][c] + n for (b, g, c), n in zip(lanes, new_len.tolist())]
-        self._semantic_clear_clusters(lanes)
+        if reinsert:
+            self._semantic_clear_level0(lanes)
+        else:
+            self._semantic_clear_clusters(lanes)
         mu.index_copy_(0, ids, updated)
         ne.index_copy_(0, ids, pre + lengths_t)
+        phases = (phase0 + counts).tolist()
         counts = counts.tolist()
         self._set_semantic_scalars("alive", lanes, [True] * nd)
         self._set_semantic_scalars("n_total", lanes, totals)
         self._set_semantic_scalars("p_hi_c", lanes, highs)
-        self._set_semantic_scalars("level0_phase", lanes, counts)
+        self._set_semantic_scalars("level0_phase", lanes, phases)
         for b, g, _ in lanes:
             self._semantic_ward_dirty[b][g] = True
         # Ordinary and delayed lanes are disjoint and the delayed rows were
@@ -4963,6 +5101,7 @@ class LogStructuredKVCache(nn.Module):
                          self.K_max, self.B, self.L_alloc, self.recent_size, self.semantic_flush_granularity,
                          self.alpha_exact_tokens, self.alpha_span_max_tokens,
                          self.beta_novelty, self.beta_adaptive_merge,
+                         self.gamma_level0_reinsert, self.gamma_top_merge, self.gamma_level_slack,
                          tuple(map(tuple, kwargs.get("span_ends") or ())))
             if self._replaying_updates:
                 if not replay or key not in updates.flushes:
@@ -4985,6 +5124,8 @@ class LogStructuredKVCache(nn.Module):
                             self._semantic_clear_cluster(*metadata)
                         elif kind == "clear_batch":
                             self._semantic_clear_clusters(metadata)
+                        elif kind == "clear_level0_batch":
+                            self._semantic_clear_level0(metadata)
                         else:
                             block = tuple(updates.tensors[i] if i is not None else None for i in indices)
                             if ready is not None:
@@ -6936,6 +7077,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             cache.semantic_unified_route, cache.semantic_merge_passes,
             cache.alpha_exact_tokens, cache.alpha_span_max_tokens, ctx.span_ends,
             cache.beta_novelty, cache.beta_adaptive_merge,
+            cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack,
         )
         checkpoint_log = checkpoint_route_replay(cache, signature)
         updates = (_SemanticReplayUpdates() if checkpoint_log is None else checkpoint_log[4]) if cache.semantic_replay_updates else None
@@ -7012,7 +7154,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         ctx.update_config = (cache.semantic_centroid_backend,
                              cache.semantic_replay_updates, cache.semantic_unified_route, cache.semantic_merge_passes,
                              cache.alpha_exact_tokens, cache.alpha_span_max_tokens,
-                             cache.beta_novelty, cache.beta_adaptive_merge)
+                             cache.beta_novelty, cache.beta_adaptive_merge,
+                             cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack)
         ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors,
                               *(updates.tensors if updates is not None else ()))
         ctx.has_attention_plans = cache.semantic_clusters
@@ -7042,7 +7185,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
         if ctx.update_config != (cache.semantic_centroid_backend,
                                  cache.semantic_replay_updates, cache.semantic_unified_route, cache.semantic_merge_passes,
                                  cache.alpha_exact_tokens, cache.alpha_span_max_tokens,
-                                 cache.beta_novelty, cache.beta_adaptive_merge):
+                                 cache.beta_novelty, cache.beta_adaptive_merge,
+                                 cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack):
             raise RuntimeError("semantic update configuration changed between forward and backward")
         updates = (_SemanticReplayUpdates(ctx.update_flushes, saved[ctx.update_tensor_offset:])
                    if ctx.update_flushes is not None else None)

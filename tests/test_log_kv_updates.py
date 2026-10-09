@@ -263,7 +263,8 @@ def _scalar_top_overflow(cache):
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("beta", [False, True])
-def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta):
+@pytest.mark.parametrize("top_merge", ["fold", "lightest"])
+def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta, top_merge):
     torch.manual_seed(13)
     caches = []
     for _ in range(2):
@@ -271,7 +272,7 @@ def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta):
             (2, 2, 16, 8), (2, 2, 16, 8), B=3, recent_size=4, device=device, dtype=dtype,
             semantic_clusters=True, cluster_k_max=2, allocate_second_order=False, semantic_anchor_mode="mid",
             semantic_unified_route=True, alpha_exact_tokens=2, alpha_span_max_tokens=2,
-            beta_adaptive_merge=beta, beta_novelty=beta,
+            beta_adaptive_merge=beta, beta_novelty=beta, gamma_top_merge=top_merge,
             cos_cache=torch.ones(64, 8, device=device), sin_cache=torch.zeros(64, 8, device=device), rope_n_elem=8,
         )
         caches.append(cache)
@@ -301,3 +302,52 @@ def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta):
     assert fold.call_count  # The last burst overflows every saturated ladder.
     top = batched.L_alloc - 1
     assert all(batched._semantic_counts[b][g][c][top] == batched.B for b, g, c in lanes)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_lightest_top_merge_matches_scalar_and_stays_balanced(device, dtype):
+    """Gamma's top level: batched == per-entry reference, and no slot hoards the old mass."""
+    torch.manual_seed(17)
+    caches = {}
+    for top_merge in ("fold", "lightest"):
+        for path in ("batched", "scalar"):
+            caches[top_merge, path] = kv.LogStructuredKVCache(
+                (2, 2, 64, 8), (2, 2, 64, 8), B=8, recent_size=4, device=device, dtype=dtype,
+                semantic_clusters=True, cluster_k_max=2, allocate_second_order=False, semantic_anchor_mode="mid",
+                gamma_top_merge=top_merge,
+                cos_cache=torch.ones(64, 8, device=device), sin_cache=torch.zeros(64, 8, device=device), rope_n_elem=8,
+            )
+    reference = caches["fold", "batched"]
+    lanes = [(0, 0, 0), (0, 1, 1), (1, 0, 0), (1, 1, 1)]
+    capacity = reference.B * (2 ** reference.L_alloc - 1)
+    position = 0
+    for counts in ([capacity - 1, 2, capacity, 1], [5, capacity + 3, 1, 7], [9, 4, 2 * capacity, 3],
+                   [3 * capacity, capacity, capacity, 2 * capacity]):
+        total = sum(counts)
+        k, v = (torch.randn(total, 8, device=device).to(dtype) for _ in range(2))
+        pos = torch.arange(position, position + total, device=device)
+        position += total
+        block = (k, v, torch.ones(total, device=device), *reference._empty_stats(k, v), pos, pos, pos,
+                 torch.arange(total, device=device), torch.zeros(total, dtype=torch.bool, device=device))
+        for (top_merge, path), cache in caches.items():
+            if path == "batched":
+                cache._semantic_append_entries_batched(lanes, counts, block)
+            else:
+                with patch.object(cache, "_semantic_append_top_level_overflow_batched", _scalar_top_overflow(cache)):
+                    cache._semantic_append_entries_batched(lanes, counts, block)
+    for top_merge in ("fold", "lightest"):
+        batched, scalar = caches[top_merge, "batched"], caches[top_merge, "scalar"]
+        assert batched._semantic_counts == scalar._semantic_counts
+        for name, value in batched.named_buffers():
+            torch.testing.assert_close(value, scalar.get_buffer(name), rtol=0, atol=0, msg=f"{top_merge}: {name}")
+    top = reference.L_alloc - 1
+    for top_merge in ("fold", "lightest"):
+        cache = caches[top_merge, "batched"]
+        assert torch.equal(cache.level_w.sum(), reference.level_w.sum())  # Mass is conserved either way.
+        w = torch.stack([cache.level_w[b, g, c, top] for b, g, c in lanes])
+        share = w.amax(-1) / w.sum(-1)  # Mass held by the heaviest top-level slot.
+        if top_merge == "lightest":
+            assert float(share.max()) <= 0.25  # Close to 1/B: coarsened evenly.
+        else:
+            assert float(share.min()) >= 0.5 and bool((w.argmax(-1) == 0).all())  # Piled into slot 0.

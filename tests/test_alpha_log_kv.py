@@ -120,9 +120,11 @@ def test_fused_exact_partition_copies_payload_and_padding(archive_width, dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("route", ROUTES)
-def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta, route):
+@pytest.mark.parametrize("gamma", [False, True])
+def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta, route, gamma):
     torch.manual_seed(17)
-    c = cache_for(dtype=dtype, device=device, route=route, beta_novelty=beta, beta_adaptive_merge=beta)
+    c = cache_for(dtype=dtype, device=device, route=route, beta_novelty=beta, beta_adaptive_merge=beta,
+                  gamma_level0_reinsert=gamma, gamma_top_merge="lightest" if gamma else "fold")
     baseline = cache_for(dtype=dtype, device=device, route=route, alpha_exact_tokens=0)
     payload_bytes = lambda cache: sum(x.numel() * x.element_size() for x in cache.buffers())
     assert payload_bytes(c) <= payload_bytes(baseline)
@@ -161,9 +163,10 @@ def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta, ro
 
 
 @pytest.mark.parametrize("route", ROUTES)
-def test_ordinary_and_delayed_joins_share_one_ladder_append(route):
+@pytest.mark.parametrize("gamma", [False, True])
+def test_ordinary_and_delayed_joins_share_one_ladder_append(route, gamma):
     torch.manual_seed(5)
-    c = cache_for(route=route, beta_novelty=True, beta_adaptive_merge=True)
+    c = cache_for(route=route, beta_novelty=True, beta_adaptive_merge=True, gamma_level0_reinsert=gamma)
     c.begin_op_log()
     commit, append = c._alpha_commit_joins, c._semantic_append_entries_batched
     checked = []
@@ -195,8 +198,9 @@ def test_ordinary_and_delayed_joins_share_one_ladder_append(route):
     assert checked
 
 
-def test_delayed_archive_updates_hi_and_preserves_original_weighted_positions():
-    c = cache_for()
+@pytest.mark.parametrize("gamma", [False, True])
+def test_delayed_archive_updates_hi_and_preserves_original_weighted_positions(gamma):
+    c = cache_for(gamma_level0_reinsert=gamma)
     k = torch.randn(2, 2, 8, 8)
     with torch.no_grad():
         c._semantic_new_clusters([(0, 0, 0, 0)], k, k, torch.tensor([[40] * 8, [0] * 8]), [[40] * 8, [0] * 8], record=False)
@@ -281,13 +285,15 @@ def test_alpha_rejects_routes_and_layouts_it_cannot_archive_into(overrides):
 
 @pytest.mark.parametrize("route,merge_passes", [("attach", 1), ("unified", 1), ("unified", 4)])
 @pytest.mark.parametrize("beta", [False, True])
-def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(route, merge_passes, beta):
+@pytest.mark.parametrize("gamma", [False, True])
+def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(route, merge_passes, beta, gamma):
     torch.manual_seed(31)
     originals = [torch.randn(2, 2, 40, 8) for _ in range(3)]
     results, grads = [], []
     ends = boundaries(40)
     for lowmem in (False, True):
-        c = cache_for(route=route, semantic_merge_passes=merge_passes, beta_novelty=beta, beta_adaptive_merge=beta)
+        c = cache_for(route=route, semantic_merge_passes=merge_passes, beta_novelty=beta, beta_adaptive_merge=beta,
+                      gamma_level0_reinsert=gamma, gamma_top_merge="lightest" if gamma else "fold")
         q, k, v = [x.clone().requires_grad_() for x in originals]
         if lowmem:
             y = LogKVStreamTrainingAttention.apply(q, k, v, c, .3, 8, 0., k, ends)

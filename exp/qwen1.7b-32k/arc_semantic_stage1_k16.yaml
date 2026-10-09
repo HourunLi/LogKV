@@ -48,3 +48,8 @@ log_kv_semantic_flush_granularity: 1024
 log_kv_alpha_exact_tokens: 0
 log_kv_beta_novelty: false
 log_kv_beta_adaptive_merge: false
+
+# Gamma 之前的实验：保持旧梯子行为，复评与训练时一致（延迟归档整簇重入层级、顶层左折叠）。
+log_kv_gamma_level0_reinsert: false
+log_kv_gamma_top_merge: fold
+log_kv_gamma_level_slack: 2

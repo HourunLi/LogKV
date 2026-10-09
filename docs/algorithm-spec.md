@@ -1,16 +1,17 @@
-# SemanticLogKV / AlphaLogKV / BetaLogKV 算法规格
+# SemanticLogKV / AlphaLogKV / BetaLogKV / GammaLogKV 算法规格
 
-本文描述当前分支的共享机制：attach 路由分簇 + Alpha 精确片段 + Beta。Alpha 的片段选择与
+本文描述当前分支的共享机制：attach 路由分簇 + Alpha 精确片段 + Beta + Gamma。Alpha 的片段选择与
 预算见 [AlphaLogKV](alpha-logkv.md)，Beta 的评分与自适应压缩见 [BetaLogKV](beta-logkv.md)，
+Gamma 的延迟归档与顶层合并见 [GammaLogKV](gamma-logkv.md)，
 可选的 unified 路由内核见 [统一路由](semantic-unified-routing.md)，位置读出见
 [Position / RoPE](position.md)。旧 Stage 0 路线图和未落地的设计不作为现行契约。
 
 ## 1. 当前入口与配置
 
-当前训练配置是 `exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml`（`_4k` 仅把 recent
-改为 4096），继承 `arc_semantic_fast.yaml`、`base.yaml`；算法开关集中在 `arc_semantic_fast.yaml`。
-训练/评测入口（`majob.sh`、`eval.sh`、`demo.py`、`eval.py`）对未写出的键同样默认开启
-Alpha/Beta、关闭 unified；非语义簇路径自动关闭 Alpha/Beta，`alpha_exact_tokens=0` 同时关闭 Beta。
+当前训练配置是 `exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml`，继承 `arc_semantic_fast.yaml`、
+`base.yaml`；算法开关集中在 `arc_semantic_fast.yaml`。训练/评测入口（`majob.sh`、`eval.sh`、
+`demo.py`、`eval.py`）对未写出的键同样默认开启 Alpha/Beta/Gamma、关闭 unified；非语义簇路径
+自动关闭 Alpha/Beta，`alpha_exact_tokens=0` 同时关闭 Beta（Gamma 的第 0 层重排随之无作用）。
 Cache API 为兼容旧路径保留保守默认值，不能把直接构造 cache 不传参数等同于默认路线。
 
 | 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 入口/当前配置 |
@@ -24,6 +25,7 @@ Cache API 为兼容旧路径保留保守默认值，不能把直接构造 cache 
 | `semantic_replay_updates` | `false` | `true` |
 | `alpha_exact_tokens` / `alpha_span_max_tokens` | `0` / `64` | `256` / `64` |
 | `beta_novelty` / `beta_adaptive_merge` | `false` / `false` | `true` / `true` |
+| `gamma_level0_reinsert` / `gamma_top_merge` / `gamma_level_slack` | `false` / `fold` / `2` | `true` / `lightest` / `2` |
 
 当前 `recent_size`、`train_block`、`prefill_block` 均为 `2048`，上下文长度 `32768`；
 二阶修正关闭，segment 间隔保护和 padding 关闭，`seg_eta=1`、`seg_g0=2048`、
@@ -33,7 +35,8 @@ Cache API 为兼容旧路径保留保守默认值，不能把直接构造 cache 
 更早实验的 YAML 显式写出各自训练时的开关，复评不受新默认值影响：纯 attach / unified 基线
 （`arc_semantic_attach_route_*`、`arc_semantic_unified_route_*`、`arc_semantic_unified.yaml`）
 关闭 Alpha/Beta；`arc_alpha_*` 为 unified + Alpha；`arc_beta_cpt100.yaml` 为 unified + Alpha + Beta；
-`base.yaml` 派生的 Stage-1（multi、二阶）关闭两者。
+`base.yaml` 派生的 Stage-1（multi、二阶）关闭两者；`arc_attach_alpha_beta_*` 为 Gamma 之前的
+attach + Alpha + Beta。这些 YAML 都显式写回旧梯子（`gamma_level0_reinsert: false`、`gamma_top_merge: fold`）。
 
 ## 2. 存储对象与数据流
 
@@ -75,8 +78,9 @@ Alpha 在建簇前增加精确片段筛选：保留片段进入固定精确池�
 3. **其余 orphan**：按欧氏距离并入最近的存活簇或新种子，不再检查半径；没有空闲槽时只能
    并入旧簇，簇因此可能变宽。整个路由不做 Ward 合并，簇数不超过 `K_max`。
 4. **写入**：每簇的 token 按位置排序，原始 K/V 以 `w=1` 批量进入层级，中心按成员均值
-   更新；新簇从其最早的 token 开始。Alpha 被替换的旧精确 token 位置可能早于簇的 `p_hi`，
-   这类簇按位置重排现存条目后重新入层级（见 [Alpha](alpha-logkv.md)）。
+   更新；新簇从其最早的 token 开始。Alpha 被替换的旧精确 token 位置可能早于簇的 `p_hi`：
+   Gamma 只把这类簇的第 0 层与新 token 一起按位置重排后追加，上层条目不动；旧行为把整簇
+   全部条目重新入层级（见 [Gamma](gamma-logkv.md)）。
 
 实现（无有限 hard cap、非 legacy 时）：所有组按位置序在设备上完成上述判定，只回传每个
 token 的最终簇号（int8），主机用一次稳定排序得到（组，簇，位置）提交计划；不在存活集合里
@@ -143,7 +147,8 @@ CUDA 约每 4 轮检查一次小型活动标志与存活数，结束后回传归
 会报错，应删除，不能继续通过设成 `1` 启用新行为。
 
 每簇每层最多 `B′` 个 entry，层满时把最老内容按时间顺序相邻配对、加权合并后向上进位。
-顶层饱和时继续合并最老内容，保持预算和 mass，不因容量直接删除 token。
+顶层饱和时继续合并以保持预算和 mass，不因容量直接删除 token：Gamma 每来一条合并质量和最小的
+相邻对（并列取最老），旧行为把 slot 0 与 slot 1 左折叠，最老内容会堆进一个越来越重的条目。
 Beta 在非顶层批量进位中，把同一 lane 内连续四个待合并 entry 切为两组：
 比较 `2|2`、`1|3`、`3|1` 的归一化 K/V 失真，保留代价最低者；不足四个的两条尾部仍二合一。
 预算、进位条目数和下列加权统计规则不变；这里的连续指簇内 entry 顺序，不是连续原文 token。
@@ -192,7 +197,7 @@ flush 后失效。更详细的位置约定见 [Position / RoPE](position.md)。
 语义层数根据配置上限 `N` 分配：
 
 ```text
-L = max(2, ceil(log2(N/(K_max·B′)+1)) + 2)
+L = max(2, ceil(log2(N/(K_max·B′)+1)) + slack)        # slack = gamma_level_slack，默认 2
 persistent entries per batch/group = K_max·L·B′
 ```
 
@@ -200,7 +205,8 @@ persistent entries per batch/group = K_max·L·B′
 为 `O(log N)`。不要把 `K_max` 也随 `log N` 增长后仍宣称同一复杂度。该结论不包含模型
 权重、RoPE 表、输入/output 张量或训练图，也不表示运行中自动扩展配置上限。
 
-Alpha 从原 `B` 对应的预算扣出精确池，重新计算有效 `B′` 与 `L`。比较口径包含持久 KV、
+`B` 始终表示两层余量的经典梯子的字节。Alpha 从中扣出精确池；`slack≠2` 时在同一字节内取
+最大的 `B′`（`slack 0`、K=12、32K、P=256 时 B′=218、4 层），然后重新计算有效 `B′` 与 `L`。比较口径包含持久 KV、
 相关元数据和最大复用 pack 工作区，不缩短 recent；具体公式和实际预算见
 [AlphaLogKV](alpha-logkv.md)。路由临时距离矩阵按 lane 分块，单块为 `O(F²)`，其中 `F`
 是固定 flush 候选规模；这类临时峰值仍须计入实际显存测量。
