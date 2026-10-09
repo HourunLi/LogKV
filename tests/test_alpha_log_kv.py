@@ -15,9 +15,12 @@ from litgpt.log_kv_pack import pack_mid_kv
 from litgpt.model import GPT, Block
 
 
-def cache_for(device="cpu", dtype=torch.float32, **overrides):
+ROUTES = ["attach", "unified"]
+
+
+def cache_for(device="cpu", dtype=torch.float32, route="attach", **overrides):
     args = dict(B=8, recent_size=8, semantic_clusters=True, cluster_k_max=4,
-                semantic_unified_route=True, semantic_merge_passes=1, semantic_anchor_mode="mid", allocate_second_order=False,
+                semantic_unified_route=route == "unified", semantic_merge_passes=1, semantic_anchor_mode="mid", allocate_second_order=False,
                 semantic_replay_updates=True, semantic_flush_granularity=8,
                 cos_cache=torch.ones(128, 8, device=device), sin_cache=torch.zeros(128, 8, device=device),
                 rope_n_elem=8, alpha_exact_tokens=8, alpha_span_max_tokens=4)
@@ -116,10 +119,11 @@ def test_fused_exact_partition_copies_payload_and_padding(archive_width, dtype):
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"))])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("beta", [False, True])
-def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta):
+@pytest.mark.parametrize("route", ROUTES)
+def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta, route):
     torch.manual_seed(17)
-    c = cache_for(dtype=dtype, device=device, beta_novelty=beta, beta_adaptive_merge=beta)
-    baseline = cache_for(dtype=dtype, device=device, alpha_exact_tokens=0)
+    c = cache_for(dtype=dtype, device=device, route=route, beta_novelty=beta, beta_adaptive_merge=beta)
+    baseline = cache_for(dtype=dtype, device=device, route=route, alpha_exact_tokens=0)
     payload_bytes = lambda cache: sum(x.numel() * x.element_size() for x in cache.buffers())
     assert payload_bytes(c) <= payload_bytes(baseline)
     assert c.alpha_budget_bytes[1] <= c.alpha_budget_bytes[0]
@@ -142,6 +146,11 @@ def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta):
                 assert len(set(positions.tolist())) == len(positions)
                 assert not set(positions.tolist()) & set(c._recent_pos_host[b][:c.recent_count])
                 torch.testing.assert_close(c.alpha_k_raw[b, :, :len(positions)], k[b, :, positions], rtol=0, atol=0)
+            # Delayed archival keeps each live cluster's p_hi/n_total consistent with its ladder.
+            live = c.level_w.sum(-1).sum(-1) > 0
+            assert torch.equal(live, c.alive)
+            assert (c.level_p_hi.amax((-1, -2)).masked_fill(~live, 0) <= c.p_hi_c.masked_fill(~live, 0)).all()
+            torch.testing.assert_close(c.level_w.sum((-1, -2)), c.n_total.to(c.level_w.dtype))
         assert joins.call_count
     for level, exact, recent, source in ((c.level_k, c.alpha_k_raw, c.recent_k_raw, k),
                                           (c.level_v, c.alpha_v, c.recent_v, v)):
@@ -151,9 +160,10 @@ def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta):
         torch.testing.assert_close(total, source.float().sum(2), atol=.12 if dtype == torch.bfloat16 else 3e-5, rtol=.01)
 
 
-def test_ordinary_and_delayed_joins_share_one_ladder_append():
+@pytest.mark.parametrize("route", ROUTES)
+def test_ordinary_and_delayed_joins_share_one_ladder_append(route):
     torch.manual_seed(5)
-    c = cache_for(beta_novelty=True, beta_adaptive_merge=True)
+    c = cache_for(route=route, beta_novelty=True, beta_adaptive_merge=True)
     c.begin_op_log()
     commit, append = c._alpha_commit_joins, c._semantic_append_entries_batched
     checked = []
@@ -201,7 +211,7 @@ def test_delayed_archive_updates_hi_and_preserves_original_weighted_positions():
 @pytest.mark.parametrize("merge_passes", [1, 4])
 def test_ragged_archive_excludes_padding_and_preserves_empty_lanes(merge_passes):
     torch.manual_seed(71)
-    c = cache_for(semantic_merge_passes=merge_passes)
+    c = cache_for(route="unified", semantic_merge_passes=merge_passes)
     expected_mass = torch.zeros(2, 2)
     expected_sum = torch.zeros(2, 2, 8)
     # One lane per tile also exercises a whole empty tile, not only padding
@@ -221,15 +231,63 @@ def test_ragged_archive_excludes_padding_and_preserves_empty_lanes(merge_passes)
             assert (c.alive.sum(-1) <= c.K_max).all()
 
 
-@pytest.mark.parametrize("merge_passes", [1, 4])
+def test_attach_ragged_archive_excludes_padding_and_inserts_old_positions():
+    torch.manual_seed(73)
+    c = cache_for(route="attach")
+    expected_mass = torch.zeros(2, 2)
+    expected_sum = torch.zeros(2, 2, 8)
+    delayed = c._alpha_commit_joins
+    with patch.object(c, "_alpha_commit_joins", wraps=delayed) as joins, torch.no_grad():
+        # Later flushes archive older positions, as evicted exact spans do.
+        for step, counts in enumerate(([0, 1], [7, 0], [1, 7], [0, 0], [5, 3])):
+            k = torch.randn(2, 2, 7, 8)
+            pos = torch.arange(40 - 7 * step, 33 - 7 * step, -1).expand(2, -1)
+            for b, count in enumerate(counts):
+                expected_mass[b] += count
+                expected_sum[b] += k[b, :, :count].sum(1)
+                k[b, :, count:] = 10000  # Padding must never become an entry.
+            with c._semantic_deferred_scalars():
+                c._semantic_route_three_phase(k, k, pos, pos.tolist(), record=False, token_counts=counts)
+            torch.testing.assert_close(c.level_w.sum((2, 3, 4)), expected_mass)
+            torch.testing.assert_close(c.n_total.sum(-1).float(), expected_mass)
+            actual = (c.level_k.float() * c.level_w[..., None]).sum((2, 3, 4))
+            torch.testing.assert_close(actual, expected_sum, atol=3e-6, rtol=3e-5)
+            assert (c.alive.sum(-1) <= c.K_max).all()
+            assert (c.level_p_hi.amax((-1, -2)) <= c.p_hi_c).all()
+    assert joins.call_count
+
+
+def test_alpha_flush_routes_by_configured_route():
+    k = torch.randn(2, 2, 24, 8)
+    ends = boundaries(24)
+    for route, used, unused in (("attach", "_semantic_route_three_phase", "_semantic_route_unified"),
+                                ("unified", "_semantic_route_unified", "_semantic_route_three_phase")):
+        c = cache_for(route=route)
+        with patch.object(c, unused, side_effect=AssertionError(unused)), \
+             patch.object(c, used, wraps=getattr(c, used)) as called:
+            for start in range(0, 24, 8):
+                c.add_recent(k[:, :, start:start + 8], k[:, :, start:start + 8], k_raw=k[:, :, start:start + 8],
+                             span_ends=[row[start:start + 8] for row in ends])
+        assert called.call_count
+        assert all(call.kwargs["token_counts"] is not None for call in called.call_args_list)
+
+
+@pytest.mark.parametrize("overrides", [dict(semantic_legacy_route=True), dict(semantic_cluster_chunk_size=4),
+                                       dict(semantic_anchor_mode="multi"), dict(cluster_k_max=1)])
+def test_alpha_rejects_routes_and_layouts_it_cannot_archive_into(overrides):
+    with pytest.raises(ValueError):
+        cache_for(**overrides)
+
+
+@pytest.mark.parametrize("route,merge_passes", [("attach", 1), ("unified", 1), ("unified", 4)])
 @pytest.mark.parametrize("beta", [False, True])
-def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(merge_passes, beta):
+def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(route, merge_passes, beta):
     torch.manual_seed(31)
     originals = [torch.randn(2, 2, 40, 8) for _ in range(3)]
     results, grads = [], []
     ends = boundaries(40)
     for lowmem in (False, True):
-        c = cache_for(semantic_merge_passes=merge_passes, beta_novelty=beta, beta_adaptive_merge=beta)
+        c = cache_for(route=route, semantic_merge_passes=merge_passes, beta_novelty=beta, beta_adaptive_merge=beta)
         q, k, v = [x.clone().requires_grad_() for x in originals]
         if lowmem:
             y = LogKVStreamTrainingAttention.apply(q, k, v, c, .3, 8, 0., k, ends)
@@ -289,14 +347,16 @@ def test_packing_includes_exact_rope_mask_and_current_gradients(device, dtype):
 
 
 @pytest.mark.parametrize("beta", [False, True])
-def test_model_checkpoint_and_odd_prefill_decode(beta):
+@pytest.mark.parametrize("route", ROUTES)
+def test_model_checkpoint_and_odd_prefill_decode(beta, route):
     torch.manual_seed(55)
     config = Config(block_size=64, n_layer=2, n_embd=32, n_head=4, n_query_groups=2,
                     vocab_size=41, padding_multiple=1, rotary_percentage=1.)
     original = GPT(config)
     models = [deepcopy(original), deepcopy(original)]
     kwargs = dict(batch_size=2, B=8, recent_size=8, second_order_scale=0., semantic_clusters=True,
-                  cluster_k_max=4, semantic_unified_route=True, semantic_merge_passes=1, semantic_flush_granularity=8,
+                  cluster_k_max=4, semantic_unified_route=route == "unified", semantic_merge_passes=1,
+                  semantic_flush_granularity=8,
                   semantic_anchor_mode="mid", allocate_second_order=False, semantic_replay_updates=True,
                   alpha_exact_tokens=8, alpha_span_max_tokens=4, beta_novelty=beta, beta_adaptive_merge=beta)
     for model in models:
