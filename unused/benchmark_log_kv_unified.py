@@ -277,6 +277,8 @@ def main():
     for name, default in [('tokens', 2048), ('dim', 128), ('batch', 1), ('groups', 1),
                           ('clusters', 12), ('B', 256), ('flushes', 2), ('iters', 3)]:
         p.add_argument('--' + name, type=int, default=default)
+    p.add_argument('--route', choices=('unified', 'attach'), default='unified',
+                   help='Archive route; attach is the default training route (stage diagnostics cover unified only)')
     p.add_argument('--merge-passes', type=int, default=1, help='Frozen-center global matching sweeps (1 = original)')
     p.add_argument('--alpha-exact-tokens', type=int, default=0)
     p.add_argument('--alpha-span-max-tokens', type=int, default=64)
@@ -297,7 +299,7 @@ def main():
     shape = (args.batch, args.groups, n, args.dim)
     cache = LogStructuredKVCache(
         shape, shape, B=args.B, recent_size=args.tokens, semantic_flush_granularity=args.tokens,
-        semantic_clusters=True, cluster_k_max=args.clusters, semantic_unified_route=True,
+        semantic_clusters=True, cluster_k_max=args.clusters, semantic_unified_route=args.route == 'unified',
         semantic_anchor_mode='mid', semantic_centroid_backend='parallel', allocate_second_order=False,
         semantic_merge_passes=args.merge_passes,
         alpha_exact_tokens=args.alpha_exact_tokens, alpha_span_max_tokens=args.alpha_span_max_tokens,

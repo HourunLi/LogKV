@@ -663,9 +663,11 @@ class LogStructuredKVCache(nn.Module):
         if self.alpha_exact_tokens < 0:
             raise ValueError("alpha_exact_tokens must be >= 0")
         if self.alpha_exact_tokens:
-            if not (semantic_clusters and semantic_unified_route and semantic_anchor_mode == "mid"
+            if not (semantic_clusters and semantic_anchor_mode == "mid"
                     and not allocate_second_order and cluster_k_max > 1):
-                raise ValueError("AlphaLogKV requires unified semantic routing, K > 1, mid anchors and no second-order allocation")
+                raise ValueError("AlphaLogKV requires semantic clusters, K > 1, mid anchors and no second-order allocation")
+            if semantic_legacy_route or semantic_cluster_chunk_size:
+                raise ValueError("AlphaLogKV archives through the attach or unified route; legacy/chunk-tree routing is not supported")
             if (seg_gap_max is not None and math.isfinite(seg_gap_max)) or seg_block_level:
                 raise ValueError("AlphaLogKV requires disabled segment gaps/padding for delayed archival")
             if not 1 <= self.alpha_span_max_tokens <= self.alpha_exact_tokens:
@@ -3656,7 +3658,8 @@ class LogStructuredKVCache(nn.Module):
                 rows[b, :len(row)] = row
             live = np.arange(width) < np.asarray(counts)[:, None]
             archive_host = np.where(live, np.take_along_axis(host, rows, 1), 0).tolist()
-            self._semantic_route_unified(ak, av, ap, archive_host, record=record, token_counts=counts)
+            route = self._semantic_route_unified if self.semantic_unified_route else self._semantic_route_three_phase
+            route(ak, av, ap, archive_host, record=record, token_counts=counts)
 
     def _semantic_commit_joins(
         self,
@@ -4109,41 +4112,62 @@ class LogStructuredKVCache(nn.Module):
         positions_host: list[list[int]],
         *,
         record: bool,
+        token_counts: list[int] | None = None,
     ) -> None:
+        """Attach route: frozen nearest-cluster joins, then orphan seeding.
+
+        `token_counts` marks ragged rows (Alpha archives): offsets at or past a
+        row's count are padding and are neither assigned nor written.
+        """
         if self.K_max == 1:
+            if token_counts is not None:
+                raise ValueError("ragged attach routing requires K > 1")
             self._semantic_route_k1_batch(k_raw, v, positions, positions_host, record=record)
+            return
+        if token_counts is not None and not any(token_counts):
             return
 
         winner, s_winner, direct = self._semantic_existing_assignments(k_raw, positions)
 
-        # Phase 1/3a: transfer all frozen decisions once, bucket on the host, and
-        # commit every (b, g, cluster) bucket in ONE batched ladder append. No
-        # nonzero, no .item(), and no per-cluster indexing chain.
-        assignments = winner.masked_fill(~direct, -1).cpu().tolist()
-        orphans = [[[] for _ in range(k_raw.size(1))] for _ in range(k_raw.size(0))]
+        # Phase 1/3a: transfer all frozen decisions once and bucket them with
+        # whole-array NumPy: per lane, one stable sort groups tokens by cluster
+        # (ascending offsets), padding first, then unassigned tokens. No
+        # per-token Python.
+        n_batch, n_groups, tokens = k_raw.shape[:3]
+        n_lanes, width = n_batch * n_groups, self.K_max + 2
+        assign = winner.masked_fill(~direct, -1).cpu().numpy().reshape(n_batch, n_groups, tokens)
+        if token_counts is not None:
+            pad = np.arange(tokens)[None, :] >= np.asarray(token_counts, dtype=np.int64)[:, None]
+            assign[np.broadcast_to(pad[:, None, :], assign.shape)] = -2
+        assign = assign.reshape(n_lanes, tokens)
+        order = np.argsort(assign, axis=1, kind="stable")
+        counts = np.bincount((np.arange(n_lanes)[:, None] * width + assign + 2).ravel(),
+                             minlength=n_lanes * width).reshape(n_lanes, width)
+        starts = np.cumsum(counts, axis=1) - counts
+        orphans = [[None] * n_groups for _ in range(n_batch)]
         cap = self._semantic_hard_cap()
-        jobs: list[tuple[int, int, int, tuple[int, ...]]] = []
-        for b in range(k_raw.size(0)):
-            for g in range(k_raw.size(1)):
-                buckets = [[] for _ in range(self.K_max)]
-                for i, c in enumerate(assignments[b][g]):
-                    if c < 0:
-                        orphans[b][g].append(i)
-                    else:
-                        buckets[c].append(i)
-                for c, offsets in enumerate(buckets):
-                    if cap != math.inf:
-                        room = max(0, int(cap) - self._semantic_n_total[b][g][c])
-                        orphans[b][g].extend(offsets[room:])
-                        offsets = offsets[:room]
-                    if offsets:
-                        jobs.append((b, g, c, tuple(offsets)))
+        jobs: list[tuple[int, int, int, np.ndarray]] = []
+        for lane in range(n_lanes):
+            b, g = divmod(lane, n_groups)
+            row = order[lane]
+            lane_orphans = [row[starts[lane, 1]:starts[lane, 1] + counts[lane, 1]]]
+            for c in np.flatnonzero(counts[lane, 2:]).tolist():
+                offsets = row[starts[lane, c + 2]:starts[lane, c + 2] + counts[lane, c + 2]]
+                if cap != math.inf:
+                    room = max(0, int(cap) - self._semantic_n_total[b][g][c])
+                    lane_orphans.append(offsets[room:])
+                    offsets = offsets[:room]
+                if len(offsets):
+                    jobs.append((b, g, c, offsets))
+            orphans[b][g] = np.concatenate(lane_orphans)
         if not self.semantic_legacy_route:
             # Plan both phases before writing: an early orphan can join the
-            # same cluster as a later direct token in this flush.
-            self._semantic_route_orphans_fast(
-                orphans, k_raw, v, positions, positions_host, s_winner, jobs, record=record
-            )
+            # same cluster as a later direct token in this flush. Host mirrors
+            # stay authoritative; device twins refresh once at the end.
+            with self._semantic_deferred_scalars():
+                self._semantic_route_orphans_fast(
+                    orphans, k_raw, v, positions, positions_host, s_winner, jobs, record=record
+                )
             return
 
         self._semantic_commit_joins(jobs, k_raw, v, positions, positions_host, record=record)
@@ -4187,13 +4211,13 @@ class LogStructuredKVCache(nn.Module):
 
     def _semantic_route_orphans_fast(
         self,
-        orphans: list[list[list[int]]],
+        orphans: list[list[list[int] | np.ndarray]],
         k_raw: torch.Tensor,
         v: torch.Tensor,
         positions: torch.Tensor,
         positions_host: list[list[int]],
         s_winner: torch.Tensor,
-        direct_jobs: list[tuple[int, int, int, tuple[int, ...]]],
+        direct_jobs: list[tuple[int, int, int, tuple[int, ...] | np.ndarray]],
         *,
         record: bool,
     ) -> None:
@@ -4203,18 +4227,30 @@ class LogStructuredKVCache(nn.Module):
         seeds are temporary routing prototypes, not early ladder writes. At
         most n_free clusters are opened; other orphans join their nearest
         available cluster without per-token Ward merges.
+
+        Host work is whole-array NumPy: orphan position sorts, the assignment
+        of every non-seed orphan, and one lexsort that orders each cluster's
+        tokens by position (direct tokens before orphans on ties, as the
+        per-bucket stable sort did). New clusters open in one batched call.
+        With Alpha, the commit inserts delayed exact evictions by position.
         """
-        buckets = {(b, g, c): list(offsets) for b, g, c, offsets in direct_jobs}
-        new_clusters: set[tuple[int, int, int]] = set()
         cap = self._semantic_hard_cap()
+        n_groups = k_raw.size(1)
+        host_pos = np.asarray(positions_host, dtype=np.int64)
+        direct = {(b, g, c): np.asarray(offsets, dtype=np.int64) for b, g, c, offsets in direct_jobs}
         lanes = []
         for b in range(k_raw.size(0)):
-            for g in range(k_raw.size(1)):
-                orph = sorted(orphans[b][g], key=lambda i: positions_host[b][i])
-                if orph:
+            for g in range(n_groups):
+                orph = np.asarray(orphans[b][g], dtype=np.int64)
+                if len(orph):
+                    orph = orph[np.argsort(host_pos[b, orph], kind="stable")]
                     free = self._semantic_free_clusters(b, g)[:len(orph)]
                     lanes.append((b, g, orph, free))
 
+        # Orphan bucket parts: (lane, cluster, offset, rank). A seed ranks
+        # first in its new cluster; other orphans rank by their orph order.
+        parts: list[tuple[np.ndarray, ...]] = []
+        new_clusters: set[tuple[int, int]] = set()
         if lanes:
             # Only orphan-bearing lanes participate. Padding is bounded by the
             # flush size; no [lanes, tokens, clusters, head_dim] distance tensor.
@@ -4228,9 +4264,8 @@ class LogStructuredKVCache(nn.Module):
                 candidates[row, self._semantic_live_clusters(b, g) + free] = True
                 seed_slots.extend((row, c, j) for j, c in enumerate(free))
             dev = k_raw.device
-            bg = torch.tensor([(b, g) for b, g, _, _ in lanes], device=dev)
-            bi, gi = bg.unbind(-1)
-            idx = torch.as_tensor(offsets, device=dev)
+            bi, gi = _upload(np.asarray([(b, g) for b, g, _, _ in lanes], dtype=np.int64), dev).unbind(-1)
+            idx = _upload(offsets, dev)
             valid = idx >= 0
             idx = idx.clamp_min(0)
             x = k_raw[bi[:, None], gi[:, None], idx].float()
@@ -4251,53 +4286,73 @@ class LogStructuredKVCache(nn.Module):
                     picks.append(nxt)
                     dist = torch.minimum(dist, (x - x[rows, nxt].unsqueeze(1)).square().sum(-1))
                 picked = torch.stack(picks, dim=1)
-                sr, sc, sj = torch.tensor(seed_slots, device=dev).unbind(-1)
+                sr, sc, sj = _upload(np.asarray(seed_slots, dtype=np.int64).reshape(-1, 3), dev).unbind(-1)
                 mu[sr, sc] = x[sr, picked[sr, sj]]
 
             distances = torch.cdist(x, mu)
-            distances.masked_fill_(~torch.as_tensor(candidates, device=dev)[:, None, :], float("inf"))
+            distances.masked_fill_(~_upload(candidates, dev)[:, None, :], float("inf"))
             choices = distances.argmin(-1) if cap == math.inf else distances.argsort(dim=-1, stable=True).flatten(1)
             # One device-to-host transfer for ALL seeds and assignments. No
             # device scalar extraction or host round trip inside a lane loop.
-            decisions = torch.cat((picked, choices), dim=1).cpu().tolist()
+            decisions = torch.cat((picked, choices), dim=1).cpu().numpy()
             for row, (b, g, orph, free) in enumerate(lanes):
+                lane = b * n_groups + g
                 result = decisions[row]
-                seeded = set(result[:len(free)])
-                for c, t in zip(free, result):
-                    new_clusters.add((b, g, c))
-                    buckets[b, g, c] = [orph[t]]
-                if cap != math.inf:
+                seeds = result[:len(free)]
+                seeded = np.zeros(len(orph), dtype=np.bool_)
+                seeded[seeds] = True
+                for c in free:
+                    new_clusters.add((lane, c))
+                    direct.pop((b, g, c), None)
+                parts.append((np.full(len(free), lane), np.asarray(free, dtype=np.int64), orph[seeds],
+                              np.full(len(free), -1)))
+                rest = np.flatnonzero(~seeded)
+                if cap == math.inf:
+                    chosen = result[n_seed + rest]
+                else:
+                    sizes = {key[2]: len(value) for key, value in direct.items() if key[:2] == (b, g)}
                     room = {
-                        c: max(0, int(cap) - self._semantic_n_total[b][g][c] - len(buckets.get((b, g, c), ())))
+                        c: max(0, int(cap) - self._semantic_n_total[b][g][c] - (1 if c in free else sizes.get(c, 0)))
                         for c in self._semantic_live_clusters(b, g) + free
                     }
-                for t, i in enumerate(orph):
-                    if t in seeded:
-                        continue
-                    if cap == math.inf:
-                        c = result[n_seed + t]
-                    else:
+                    chosen = np.empty(len(rest), dtype=np.int64)
+                    for n, t in enumerate(rest.tolist()):
                         start = n_seed + t * self.K_max
-                        order = result[start:start + self.K_max]
+                        order = result[start:start + self.K_max].tolist()
                         # ponytail: when all clusters are full, exceed the cap
                         # at the nearest one to preserve tokens; strict rejection
                         # would need a separate caller-visible overflow policy.
                         c = next((c for c in order if room.get(c, 0) > 0), order[0])
                         room[c] -= 1
-                    buckets.setdefault((b, g, c), []).append(i)
+                        chosen[n] = c
+                parts.append((np.full(len(rest), lane), chosen.astype(np.int64), orph[rest], rest))
 
-        jobs: list[tuple[int, int, int, tuple[int, ...]]] = []
-        for (b, g, c), offsets in sorted(buckets.items()):
-            ordered = sorted(offsets, key=lambda i: positions_host[b][i])
-            if (b, g, c) in new_clusters:
-                first, *ordered = ordered
-                self._semantic_new_cluster(
-                    b, g, c, positions_host[b][first], k_raw[b, g, first], v[b, g, first],
-                    positions[b, first], record=record,
-                )
-            if ordered:
-                jobs.append((b, g, c, tuple(ordered)))
-        self._semantic_commit_joins(jobs, k_raw, v, positions, positions_host, record=record)
+        # Direct tokens rank before orphans (rank < 0 - n); then one lexsort
+        # orders every bucket by (lane, cluster, position, rank).
+        for (b, g, c), offsets in direct.items():
+            parts.append((np.full(len(offsets), b * n_groups + g), np.full(len(offsets), c), offsets,
+                          np.arange(len(offsets)) - (len(offsets) + 1) - host_pos.shape[1]))
+        new_jobs, jobs = [], []
+        if parts:
+            lane_a, c_a, off_a, rank_a = (np.concatenate(x).astype(np.int64) for x in zip(*parts))
+            pos_a = host_pos[lane_a // n_groups, off_a]
+            order = np.lexsort((rank_a, pos_a, c_a, lane_a))
+            lane_a, c_a, off_a = lane_a[order], c_a[order], off_a[order]
+            cut = np.flatnonzero((lane_a[1:] != lane_a[:-1]) | (c_a[1:] != c_a[:-1])) + 1
+            for lo, hi in zip([0] + cut.tolist(), cut.tolist() + [len(off_a)]):
+                lane, c = int(lane_a[lo]), int(c_a[lo])
+                b, g = divmod(lane, n_groups)
+                if (lane, c) in new_clusters:
+                    new_jobs.append((b, g, c, int(off_a[lo])))
+                    lo += 1
+                if hi > lo:
+                    jobs.append((b, g, c, tuple(off_a[lo:hi].tolist())))
+        if new_jobs:
+            self._semantic_new_clusters(new_jobs, k_raw, v, positions, positions_host, record=record)
+        # A new cluster starts at its earliest token, so only Alpha's delayed
+        # evictions into existing clusters can precede a cluster's p_hi.
+        commit = self._alpha_commit_joins if self.alpha_exact_tokens else self._semantic_commit_joins
+        commit(jobs, k_raw, v, positions, positions_host, record=record)
 
     @staticmethod
     def _semantic_build_replay_plan(host_log, cursors, positions_host, n_groups, n_tokens):
