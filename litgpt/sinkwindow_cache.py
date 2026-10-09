@@ -22,17 +22,11 @@ treats that column as an already-valid old position -- a silent correctness
 bug, and one this cache's ``window_size`` (much smaller than a 32K prompt)
 would hit on essentially every real prefill.
 
-The fix is architectural, not a patch: this module never builds a mask
-indexed by physical storage slot at all. Whatever sink+window content is
-already resident before a chunk is committed is *unconditionally* visible to
-every query in that chunk (it strictly precedes the chunk by construction --
-chunks are only committed into storage *after* being attended to), so
-attention is computed as ``[fully-visible frozen prefix] + [causal within
-the new chunk]`` -- the same two-part structure
-``litgpt.log_kv_cache.log_kv_chunk_attention`` already uses for LogKV's own
-chunked commits. Physical slot order inside the frozen prefix is irrelevant
-(softmax is a sum over independently-scored keys, order-invariant), so no
-per-slot position bookkeeping is needed for correctness.
+Chunks are committed only AFTER attention. The absolute position of each
+frozen ring slot is recovered from the token count, so both the frozen
+prefix and the new chunk use the same per-query window boundary as training.
+An old token can leave the visible window halfway through a chunk, even
+though its cache slot is not overwritten until the chunk is committed.
 """
 
 from __future__ import annotations
@@ -148,8 +142,8 @@ class SinkWindowKVCache(nn.Module):
 
     def read_frozen(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Currently-resident sink+window content, concatenated along the
-        sequence dim. Order among the returned positions is unspecified and
-        irrelevant for correctness -- see module docstring.
+        sequence dim. ``frozen_positions`` returns the matching positions in
+        the same physical order, including after the ring buffer wraps.
         """
         parts_k: list[torch.Tensor] = []
         parts_v: list[torch.Tensor] = []
@@ -168,7 +162,21 @@ class SinkWindowKVCache(nn.Module):
             empty_k = self.sink_k.new_zeros(self.batch_size, self.n_groups, 0, self.k_dim)
             empty_v = self.sink_v.new_zeros(self.batch_size, self.n_groups, 0, self.v_dim)
             return empty_k, empty_v
+        if len(parts_k) == 1:
+            return parts_k[0], parts_v[0]
         return torch.cat(parts_k, dim=-2), torch.cat(parts_v, dim=-2)
+
+    def frozen_positions(self) -> torch.Tensor:
+        """Recover real positions in read_frozen's physical storage order."""
+        device = self.window_k.device
+        sink = torch.arange(self.sink_filled, device=device)
+        window = torch.arange(self.window_filled, device=device)
+        if self.window_filled == self.window_size:
+            write_head = (self.token_count - self.sink_size) % self.window_size
+            window = self.token_count - self.window_size + (window - write_head) % self.window_size
+        else:
+            window = self.sink_size + window
+        return torch.cat((sink, window))
 
     def commit(self, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
         """Commit T newly-computed post-RoPE k/v into sink and/or window
@@ -249,10 +257,13 @@ def sink_window_chunk_attention(
     frozen_v: torch.Tensor,
     *,
     scale: float,
+    frozen_positions: torch.Tensor,
+    query_start: int,
+    sink_size: int,
+    window_size: int,
     enable_gqa: bool = True,
 ) -> torch.Tensor:
-    """Inference-time chunk attention: [frozen prefix, fully visible] +
-    [current chunk, causal]. Mirrors log_kv_chunk_attention's structure.
+    """Apply the training visibility rule to frozen and new keys together.
 
     All tensors are (B, n_query_groups or n_head, T, head_size). Call this
     BEFORE committing k_chunk_new/v_chunk_new into the cache (frozen_k/v must
@@ -260,22 +271,18 @@ def sink_window_chunk_attention(
     """
     Tc = q_chunk.size(-2)
     device = q_chunk.device
-    n_frozen = frozen_k.size(-2)
-
-    q_idx = torch.arange(Tc, device=device).view(-1, 1)
-    k_idx = torch.arange(Tc, device=device).view(1, -1)
-    causal_chunk = k_idx <= q_idx
-
-    if n_frozen > 0:
-        k_all = torch.cat([frozen_k, k_chunk_new], dim=-2)
-        v_all = torch.cat([frozen_v, v_chunk_new], dim=-2)
-        visible = torch.cat(
-            [torch.ones(Tc, n_frozen, dtype=torch.bool, device=device), causal_chunk],
-            dim=-1,
+    if frozen_k.size(-2) == 0 and Tc <= window_size:
+        # Initial full-attention prefill can use Flash SDPA without a T*T mask.
+        return F.scaled_dot_product_attention(
+            q_chunk, k_chunk_new, v_chunk_new, is_causal=True, scale=scale, enable_gqa=enable_gqa,
         )
-    else:
-        k_all, v_all = k_chunk_new, v_chunk_new
-        visible = causal_chunk
+
+    k_all = torch.cat([frozen_k, k_chunk_new], dim=-2)
+    v_all = torch.cat([frozen_v, v_chunk_new], dim=-2)
+    query_positions = torch.arange(query_start, query_start + Tc, device=device)
+    q_pos = query_positions.view(-1, 1)
+    k_pos = torch.cat((frozen_positions, query_positions)).view(1, -1)
+    visible = (k_pos <= q_pos) & ((k_pos < sink_size) | (q_pos - k_pos < window_size))
 
     attn_mask = torch.zeros(Tc, visible.size(-1), dtype=q_chunk.dtype, device=device)
     attn_mask.masked_fill_(~visible, float("-inf"))

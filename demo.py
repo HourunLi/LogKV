@@ -92,12 +92,12 @@ def _normal_path(path: str | os.PathLike) -> Path:
         return Path(os.path.abspath(p))
 
 
-def _check_sink_window_mode_compatible(log_kv_sink_window_mode: bool, log_kv_semantic_clusters: bool) -> None:
-    """Reject the one combination that would silently ignore a whole YAML
-    block: SinkWindow mode skips enable_log_kv_training() entirely (calls
-    enable_sink_window_training() instead), so no LogStructuredKVCache is
-    ever built and every log_kv_semantic_* param would do nothing.
-    """
+def _check_sink_window_mode_compatible(
+    log_kv_sink_window_mode: bool,
+    log_kv_semantic_clusters: bool,
+    log_kv_sink_window_full_attention_interval: int = 0,
+) -> None:
+    """Reject attention settings that would otherwise be silently ignored."""
     if log_kv_sink_window_mode and log_kv_semantic_clusters:
         raise ValueError(
             "log_kv_sink_window_mode=True and log_kv_semantic_clusters=True are contradictory: "
@@ -105,6 +105,10 @@ def _check_sink_window_mode_compatible(log_kv_sink_window_mode: bool, log_kv_sem
             "is ever built and every log_kv_semantic_* param is silently ignored. Set "
             "log_kv_semantic_clusters: false in the YAML for a SinkWindow-mode run."
         )
+    if log_kv_sink_window_full_attention_interval < 0:
+        raise ValueError("log_kv_sink_window_full_attention_interval must be >= 0.")
+    if log_kv_sink_window_full_attention_interval and not log_kv_sink_window_mode:
+        raise ValueError("log_kv_sink_window_full_attention_interval requires log_kv_sink_window_mode=True.")
 
 
 def _dump_resolved_config(fabric: L.Fabric, save_path: str | os.PathLike, resolved: dict) -> None:
@@ -535,6 +539,8 @@ def main(
     log_kv_sink_window_mode: bool = False,
     log_kv_sink_window_sink_size: int = 4,
     log_kv_sink_window_window_size: int = 1024,
+    # 0: every layer uses SinkWindow; 4: repeat SinkWindow x3, full causal x1.
+    log_kv_sink_window_full_attention_interval: int = 0,
     # ── Log-structured KV cache (always on, unless log_kv_sink_window_mode=True) ──
     # This script IS the logKV adaptation phase: training always simulates the
     # compressed-KV streaming attention so the model learns to read merged
@@ -658,6 +664,9 @@ def main(
     log_kv_sink_window_mode = bool(_o("log_kv_sink_window_mode", log_kv_sink_window_mode))
     log_kv_sink_window_sink_size = int(_o("log_kv_sink_window_sink_size", log_kv_sink_window_sink_size))
     log_kv_sink_window_window_size = int(_o("log_kv_sink_window_window_size", log_kv_sink_window_window_size))
+    log_kv_sink_window_full_attention_interval = int(
+        _o("log_kv_sink_window_full_attention_interval", log_kv_sink_window_full_attention_interval)
+    )
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_train_block = _o("log_kv_train_block", log_kv_train_block)
@@ -730,7 +739,9 @@ def main(
             "nothing would be written to save_path. Set save_ckpt: true in the YAML "
             "(or set run_eval: '' to skip the post-training eval)."
         )
-    _check_sink_window_mode_compatible(log_kv_sink_window_mode, log_kv_semantic_clusters)
+    _check_sink_window_mode_compatible(
+        log_kv_sink_window_mode, log_kv_semantic_clusters, log_kv_sink_window_full_attention_interval
+    )
 
     # 1. Set seeds
     set_random_seeds(42)
@@ -896,6 +907,7 @@ def main(
             log_kv_sink_window_mode=log_kv_sink_window_mode,
             log_kv_sink_window_sink_size=log_kv_sink_window_sink_size,
             log_kv_sink_window_window_size=log_kv_sink_window_window_size,
+            log_kv_sink_window_full_attention_interval=log_kv_sink_window_full_attention_interval,
             log_kv_B=log_kv_B,
             log_kv_recent_size=log_kv_recent_size,
             log_kv_prefill_block=log_kv_prefill_block,
@@ -1045,10 +1057,12 @@ def main(
             sink_size=log_kv_sink_window_sink_size,
             window_size=log_kv_sink_window_window_size,
             train_chunk_size=log_kv_sink_window_window_size,
+            full_attention_interval=log_kv_sink_window_full_attention_interval,
         )
         fabric.print(
             f"SinkWindow training ENABLED: sink_size={log_kv_sink_window_sink_size}, "
-            f"window_size={log_kv_sink_window_window_size}"
+            f"window_size={log_kv_sink_window_window_size}, "
+            f"full_attention_interval={log_kv_sink_window_full_attention_interval}"
         )
     else:
         # Always simulate the logKV compressed-KV streaming attention during

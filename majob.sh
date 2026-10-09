@@ -44,7 +44,8 @@ export NVTE_CUDA_INCLUDE_DIR=/usr/local/cuda-12.8/include # must turn on when mu
 
 export NCCL_NVLS_ENABLE=0
 export NCCL_NET_PLUGIN=none
-export NCCL_IB_TIMEOUT=12000
+# IB timeout is an exponent (4.096 us * 2^value), not milliseconds.
+export NCCL_IB_TIMEOUT=${NCCL_IB_TIMEOUT:-20}
 export NCCL_NET_GDR_LEVEL=2  # Enable GPUDirect RDMA if RDMA is available # optim0129
 export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
 
@@ -138,11 +139,10 @@ fi
 echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 
 # ==============================================================================
-# 🧩 logKV 专属：从训练 YAML（跟随 'config:' 继承）提取 logKV 设置，
-# 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
-# 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
+# 从训练 YAML（跟随 'config:' 继承）提取注意力设置，
+# 让评测沿用训练时的 LogKV、SinkWindow 或 static hybrid 路线。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_SUMMARY_SIZE LOG_KV_SEMANTIC_REPLAY_UPDATES ENABLE_TENSORBOARD TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_SUMMARY_SIZE LOG_KV_SEMANTIC_REPLAY_UPDATES LOG_KV_SINK_WINDOW_MODE LOG_KV_SINK_WINDOW_SINK_SIZE LOG_KV_SINK_WINDOW_WINDOW_SIZE LOG_KV_SINK_WINDOW_FULL_ATTENTION_INTERVAL ENABLE_TENSORBOARD TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import math
 import os
 import sys
@@ -227,6 +227,10 @@ print(
     cfg.get("log_kv_semantic_centroid_backend") or "sequential",
     1 if cfg.get("log_kv_semantic_summary_size") is None else cfg["log_kv_semantic_summary_size"],
     str(bool(cfg.get("log_kv_semantic_replay_updates", False))).lower(),
+    str(bool(cfg.get("log_kv_sink_window_mode", False))).lower(),
+    4 if cfg.get("log_kv_sink_window_sink_size") is None else cfg["log_kv_sink_window_sink_size"],
+    1024 if cfg.get("log_kv_sink_window_window_size") is None else cfg["log_kv_sink_window_window_size"],
+    0 if cfg.get("log_kv_sink_window_full_attention_interval") is None else cfg["log_kv_sink_window_full_attention_interval"],
     str(True if cfg.get("enable_tensorboard") is None else bool(cfg["enable_tensorboard"])).lower(),
     train_l_alloc,
     train_persistent,
@@ -366,6 +370,7 @@ for RAW_TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
 done
 
 LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
+LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_sink_window_mode ${LOG_KV_SINK_WINDOW_MODE} --log_kv_sink_window_sink_size ${LOG_KV_SINK_WINDOW_SINK_SIZE} --log_kv_sink_window_window_size ${LOG_KV_SINK_WINDOW_WINDOW_SIZE} --log_kv_sink_window_full_attention_interval ${LOG_KV_SINK_WINDOW_FULL_ATTENTION_INTERVAL}"
 if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
     LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_cluster_chunk_size ${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE} --log_kv_semantic_capacity_beta ${LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT} --log_kv_semantic_legacy_route ${LOG_KV_SEMANTIC_LEGACY_ROUTE} --log_kv_semantic_anchor_mode ${LOG_KV_SEMANTIC_ANCHOR_MODE} --log_kv_semantic_pack_backend ${LOG_KV_SEMANTIC_PACK_BACKEND} --log_kv_semantic_centroid_backend ${LOG_KV_SEMANTIC_CENTROID_BACKEND} --log_kv_semantic_summary_size ${LOG_KV_SEMANTIC_SUMMARY_SIZE} --log_kv_semantic_replay_updates ${LOG_KV_SEMANTIC_REPLAY_UPDATES}"
     if [ "${LOG_KV_SEG_GAP_MAX}" != "__none__" ]; then
@@ -387,6 +392,7 @@ else
     echo "⚠️ 未在候选目录中找到 tokenizer.json/tokenizer.model: ${TOKENIZER_CANDIDATES}"
     echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
 fi
+echo "SinkWindow: mode=${LOG_KV_SINK_WINDOW_MODE}, S=${LOG_KV_SINK_WINDOW_SINK_SIZE}, W=${LOG_KV_SINK_WINDOW_WINDOW_SIZE}, full_attention_interval=${LOG_KV_SINK_WINDOW_FULL_ATTENTION_INTERVAL}"
 echo "🧩 logKV train config: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, tree_chunk=${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE}, capacity_beta=${LOG_KV_SEMANTIC_CAPACITY_BETA}, hard_cap_mult=${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND}, centroid=${LOG_KV_SEMANTIC_CENTROID_BACKEND}, summary=${LOG_KV_SEMANTIC_SUMMARY_SIZE}, replay_updates=${LOG_KV_SEMANTIC_REPLAY_UPDATES})"
 echo "🧮 semantic budget: K=${LOG_KV_CLUSTER_K_MAX},B=${LOG_KV_B} -> L_alloc=${TRAIN_L_ALLOC}, persistent_entries=${TRAIN_PERSISTENT}, readout_S=${TRAIN_S}"
 if [ -n "${DIAG_ARGS}" ]; then

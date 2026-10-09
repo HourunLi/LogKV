@@ -47,7 +47,8 @@ export NVTE_CUDA_INCLUDE_DIR=/usr/local/cuda-12.8/include
 
 export NCCL_NVLS_ENABLE=0
 export NCCL_NET_PLUGIN=none
-export NCCL_IB_TIMEOUT=12000
+# IB timeout is an exponent (4.096 us * 2^value), not milliseconds.
+export NCCL_IB_TIMEOUT=${NCCL_IB_TIMEOUT:-20}
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_MIN_NCHANNELS=4
 
@@ -184,6 +185,10 @@ emit("LOG_KV_B", value_or("log_kv_B", 512))
 emit("LOG_KV_RECENT", value_or("log_kv_recent_size", 1024))
 emit("LOG_KV_PREFILL", value_or("log_kv_prefill_block", 256))
 emit("LOG_KV_SECOND_ORDER_SCALE", value_or("log_kv_second_order_scale", 1.0))
+emit("LOG_KV_SINK_WINDOW_MODE", str(bool(cfg.get("log_kv_sink_window_mode", False))).lower())
+emit("LOG_KV_SINK_WINDOW_SINK_SIZE", value_or("log_kv_sink_window_sink_size", 4))
+emit("LOG_KV_SINK_WINDOW_WINDOW_SIZE", value_or("log_kv_sink_window_window_size", 1024))
+emit("LOG_KV_SINK_WINDOW_FULL_ATTENTION_INTERVAL", value_or("log_kv_sink_window_full_attention_interval", 0))
 emit("LOG_KV_SEMANTIC", str(bool(cfg.get("log_kv_semantic_clusters", False))).lower())
 emit("LOG_KV_SEMANTIC_LEGACY_ROUTE", str(bool(cfg.get("log_kv_semantic_legacy_route", False))).lower())
 emit("LOG_KV_SEMANTIC_ANCHOR_MODE", value_or("log_kv_semantic_anchor_mode", "multi"))
@@ -307,6 +312,12 @@ for TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
 done
 
 LOG_KV_ARG_LIST=(--log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}")
+LOG_KV_ARG_LIST+=(
+    --log_kv_sink_window_mode "${LOG_KV_SINK_WINDOW_MODE}"
+    --log_kv_sink_window_sink_size "${LOG_KV_SINK_WINDOW_SINK_SIZE}"
+    --log_kv_sink_window_window_size "${LOG_KV_SINK_WINDOW_WINDOW_SIZE}"
+    --log_kv_sink_window_full_attention_interval "${LOG_KV_SINK_WINDOW_FULL_ATTENTION_INTERVAL}"
+)
 if [ -n "${LOG_KV_SECOND_ORDER_SCALE}" ]; then
     LOG_KV_ARG_LIST+=(--log_kv_second_order_scale "${LOG_KV_SECOND_ORDER_SCALE}")
 fi
@@ -346,6 +357,7 @@ fi
 
 echo "Checkpoint: ${SAVE_DIR}"
 echo "Output dir: ${EVAL_OUTPUT_DIR}"
+echo "SinkWindow: mode=${LOG_KV_SINK_WINDOW_MODE}, S=${LOG_KV_SINK_WINDOW_SINK_SIZE}, W=${LOG_KV_SINK_WINDOW_WINDOW_SIZE}, full_attention_interval=${LOG_KV_SINK_WINDOW_FULL_ATTENTION_INTERVAL}"
 echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND})"
 if [ -n "${DIAG_ARGS}" ]; then
     echo "Extra eval args: ${DIAG_ARGS}"
