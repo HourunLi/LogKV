@@ -684,3 +684,21 @@ def test_production_route_honours_capacity_hard_cap():
     assert 3 in calls
     assert cache.alive.sum() <= 3
     assert cache.level_w.sum().item() == 16
+
+
+@pytest.mark.parametrize('device', DEVICES)
+def test_incremental_frozen_sweeps_match_full_recompute_sweeps(device):
+    # Distinct random costs: restricted rescans inside a round must reproduce
+    # the full-recompute frozen-center sweeps (merge_passes=4).
+    torch.manual_seed(223)
+    cache = cache_for(device=device, K=4, semantic_merge_passes=4)
+    groups = [np.random.RandomState(i).randint(1, 4, size=n).astype(np.float32) for i, n in enumerate([70, 33, 5, 90])]
+    centers = [torch.randn(len(w), 8, device=device) * (i + 1) for i, w in enumerate(groups)]
+    actual = cache._semantic_unified_reduce_arrays(groups, [c.clone() for c in centers], max_clusters=4)
+    expected = cache._semantic_unified_reduce_rounds(groups, [c.clone() for c in centers], max_clusters=4)
+    for (roots, traces, mu), (want_roots, want_traces, want_mu) in zip(actual, expected):
+        pairs = np.concatenate(traces) if traces else np.empty((0, 2), dtype=np.int64)
+        want = np.concatenate(want_traces) if want_traces else np.empty((0, 2), dtype=np.int64)
+        assert np.array_equal(roots, want_roots)
+        assert np.array_equal(pairs, want)
+        torch.testing.assert_close(mu, want_mu, atol=1e-5, rtol=1e-5)
