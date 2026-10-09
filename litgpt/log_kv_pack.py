@@ -11,6 +11,7 @@ import warnings
 import torch
 from torch.autograd.function import once_differentiable
 
+from litgpt.log_kv_cache import _fused_on
 from litgpt.log_kv_position import materialize_anchor_keys
 
 
@@ -78,7 +79,7 @@ class _PackMidKV(torch.autograd.Function):
         ctx.k_dim, ctx.v_dim = k.size(-1), v.size(-1)
         if buffers is not None and (k.requires_grad or v.requires_grad):
             raise ValueError("reusable decode buffers cannot hold differentiable K/V")
-        packer = _triton_packer() if k.is_cuda and backend != "torch" else None
+        packer = _triton_packer() if _fused_on(k) and backend != "torch" else None
         if backend == "triton" and packer is None:
             raise RuntimeError("Triton packing requires CUDA and an installed Triton runtime")
         if k.is_cuda and backend == "auto" and packer is None:

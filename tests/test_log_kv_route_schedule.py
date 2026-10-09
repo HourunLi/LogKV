@@ -17,6 +17,7 @@ def test_cuda_schedule_polls_four_rounds_at_a_time_without_cuda(stop_round):
     mu = SimpleNamespace(device=device, size=lambda axis: size)
     cache = object.__new__(LogStructuredKVCache)
     torch.nn.Module.__init__(cache)
+    cache.semantic_merge_passes = 1
     event = Mock()
 
     class Reducer:
@@ -92,6 +93,7 @@ def test_status_polls_skip_rounds_that_cannot_finish_and_narrow_launches(limited
     mu = SimpleNamespace(device=device, size=lambda axis: size)
     cache = object.__new__(LogStructuredKVCache)
     torch.nn.Module.__init__(cache)
+    cache.semantic_merge_passes = 1
     event = Mock()
 
     class Reducer:

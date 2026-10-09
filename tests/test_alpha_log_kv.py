@@ -387,3 +387,33 @@ def test_model_checkpoint_and_odd_prefill_decode(beta, route):
         assert c.token_count == 18
         assert block.attn._log_kv_pending is None
         assert (c.level_w.sum((2, 3, 4)) + c.alpha_valid.sum(-1)[:, None] + c.recent_count == 18).all()
+
+
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize("beta", [False, True])
+def test_score_prefetch_reproduces_on_demand_selection(route, beta):
+    torch.manual_seed(91)
+    k, v = torch.randn(2, 2, 96, 8), torch.randn(2, 2, 96, 8)
+    ends = boundaries(96)
+    caches, hits = [], []
+    for prefetch in (False, True):
+        c = cache_for(route=route, beta_novelty=beta, beta_adaptive_merge=beta)
+        used, original = [], c._alpha_take_prefetch
+
+        def take(*args):
+            result = original(*args)
+            used.append(result is not None)
+            return result
+
+        with patch.object(LogStructuredKVCache, "_alpha_prefetch_on_cpu", prefetch), \
+             patch.object(c, "_alpha_take_prefetch", side_effect=take):
+            for start in range(0, 96, 8):
+                c.add_recent(k[:, :, start:start + 8], v[:, :, start:start + 8], k_raw=k[:, :, start:start + 8],
+                             span_ends=[row[start:start + 8] for row in ends])
+        hits.append(sum(used))
+        caches.append(c)
+    assert hits[0] == 0 and hits[1] > 0
+    for name, value in caches[0].named_buffers():
+        torch.testing.assert_close(value, caches[1].get_buffer(name), rtol=0, atol=0, msg=name)
+    assert caches[0]._alpha_spans == caches[1]._alpha_spans
+    assert caches[0]._alpha_positions == caches[1]._alpha_positions

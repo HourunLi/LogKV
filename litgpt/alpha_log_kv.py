@@ -53,6 +53,19 @@ def _new_runs(new_pos, ends, pending, pending_pos, max_span):
     return pending_closed, starts, stops, closed
 
 
+@dataclass
+class SpanCut:
+    """Candidate whole spans of one flush; host data only."""
+    candidates: list  # Per row: (spans as (token ranges, old, closed), positions of [pool | flush]).
+    token_rows: list  # Per row: flat token indices of the spans, in span order.
+    length_rows: list  # Per row: span lengths.
+
+
+def _empty_selection(rows):
+    return SpanSelection([[] for _ in range(rows)], [[] for _ in range(rows)],
+                         [[] for _ in range(rows)], [[] for _ in range(rows)])
+
+
 def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width, budget, max_span,
                  *, beta_novelty=False, centroids=None, centroid_valid=None):
     """Indices refer to [padded old pool | current flush], shared across KV groups.
@@ -61,10 +74,17 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
     Scoring makes one batched GPU pass and one small score transfer per flush.
     Beta scores novelty against the old centroids captured before this flush.
     """
-    from litgpt.log_kv_cache import _spans_to_index_array, _upload
+    cut = cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span)
+    if cut is None:
+        return _empty_selection(len(ends))
+    scores = score_spans(k, v, cut, beta_novelty=beta_novelty, centroids=centroids, centroid_valid=centroid_valid)
+    return choose_spans(cut, scores.cpu().tolist(), budget)
 
-    if beta_novelty and (centroids is None or centroid_valid is None):
-        raise ValueError("Beta span scoring requires centroids and centroid_valid from before the flush")
+
+def cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span):
+    """Whole candidate spans per row (host only); None when there are none."""
+    from litgpt.log_kv_cache import _spans_to_index_array
+
     candidates, token_rows, length_rows = [], [], []
     for spans, old_pos, new_pos, boundaries in zip(old_spans, old_positions, new_positions, ends):
         # A span is (token ranges, old, closed); ranges are [start, stop) pairs.
@@ -97,9 +117,19 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
         candidates.append((row, all_pos))
         token_rows.append(tokens)
         length_rows.append(lengths)
+    if not any(length_rows):
+        return None
+    return SpanCut(candidates, token_rows, length_rows)
+
+
+def score_spans(k, v, cut, *, beta_novelty=False, centroids=None, centroid_valid=None):
+    """Device tensor of span scores in candidate order; nothing is read back."""
+    from litgpt.log_kv_cache import _upload
+
+    if beta_novelty and (centroids is None or centroid_valid is None):
+        raise ValueError("Beta span scoring requires centroids and centroid_valid from before the flush")
+    token_rows, length_rows = cut.token_rows, cut.length_rows
     sizes = [len(lengths) for lengths in length_rows]
-    if not sum(sizes):
-        return SpanSelection([[] for _ in ends], [[] for _ in ends], [[] for _ in ends], [[] for _ in ends])
     tokens = np.concatenate(token_rows)
     lengths = np.concatenate([np.asarray(row, dtype=np.int64) for row in length_rows])
     token_batch = np.repeat(np.arange(len(token_rows)), [len(row) for row in token_rows])
@@ -141,10 +171,14 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
         novelty = nearest / key_energy.clamp_min(1e-12)
         scores = scores * .5 + novelty / (1 + novelty)
         scores = scores.topk(min(2, k.size(1)), dim=-1).values.mean(-1)
-    host_scores = scores.cpu().tolist()
+    return scores
+
+
+def choose_spans(cut, host_scores, budget):
+    """Bounded whole-span greedy from host scores in candidate order."""
     keep, archive, output_spans, output_positions = [], [], [], []
     offset = 0
-    for (row, positions), tokens, size in zip(candidates, token_rows, length_rows):
+    for (row, positions), tokens, size in zip(cut.candidates, cut.token_rows, cut.length_rows):
         mandatory = {i for i, (_, _, closed) in enumerate(row) if not closed}
         room = budget - sum(size[i] for i in mandatory)
         density = [host_scores[offset + i] * (1.1 if old else 1.) for i, (_, old, _) in enumerate(row)]
