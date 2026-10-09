@@ -65,7 +65,8 @@ TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1 python -m pytest -q tests/test_alpha_log_k
 python -m pytest -q tests/test_log_kv_triton_interpret.py
 ```
 
-解释器不覆盖 CUDA graph、流与性能；GPU 上用 `unused/benchmark_log_kv_unified.py --route attach`
+解释器把 fp32→bf16 转换截断而非就近舍入（CUDA 与 Torch 为就近舍入），因此 bf16 的 op-log 回放
+用例在解释器下标为预期失败。解释器不覆盖 CUDA graph、流与性能；GPU 上用 `unused/benchmark_log_kv_unified.py --route attach`
 测量路由耗时。
 
 LitGPT 通用用法见 [tutorials](tutorials/)。运行产生的 profile 和评测文件是实验产物，
