@@ -44,6 +44,34 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
 多卡评测各 rank 汇合时每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印仍未到达的 rank，
 超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
 
+### KV 槽位压缩率
+
+`eval.sh` 默认同时报告有效 KV 槽位压缩，无需重新训练或增加开关。先用 4 条 32K 样本检查输出：
+
+```bash
+DIAG_ARGS='--limit 4 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+  bash eval.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml niah_single_2 none
+```
+
+每次模型调用结束、重置缓存之前统计。令 `S` 为全部层、batch、KV groups 的有效存储条目总数，
+包含层级缓存、recent（含注意力层暂存、待提交的尾 token）和 Alpha 精确池（未闭合片段已在池内），排除无效 padding。
+`D` 是相同层数、batch、KV groups 下，已进入模型的真实 token 数对应的 dense 槽位总数：
+
+| 输出字段 | 定义 | 含义 |
+|---|---|---|
+| `kv_retention_ratio` | `S / D` | 保留比例，越低越省 |
+| `kv_saving_ratio` | `1 - S / D` | 节省比例，越高越省 |
+| `kv_compression_factor` | `D / S` | 压缩倍数，例如保留 25% 即 4 倍 |
+
+控制台打印全部 rank 的汇总；结果 JSON 的 `kv_compression` 保存汇总、按调用类型分组及逐次明细，
+同目录的 `*.kv_compression.csv` 保存明细。汇总使用 `ΣS / ΣD`，不直接平均各样本比例；选择题每个
+选项、rolling PPL 每个窗口各算一次模型调用。生成任务的分母为截断后的 prompt 加已回填的生成
+token 数，**不包含最后一个尚未写入 KV 的输出 token**。这是请求结束时的快照，不是 prefill
+结束值或生成期间的平均值；短输入可能尚未发生压缩，需结合明细中的 `processed_tokens` 解读。
+
+此处统计存储条目，`multi` 的虚拟 attention 锚点不重复计数。槽位比例不是显存比例：预分配空位、
+元数据、额外 K 副本、打包工作区及临时峰值不在该指标内；原有 `cache_budget` 仍仅报告持久缓冲预算。
+
 更早实验的 YAML 显式写出训练时的开关，复评不受新默认值影响：纯 attach / unified 基线为
 `arc_semantic_attach_route_*`、`arc_semantic_unified_route_*`；unified + Alpha 为 `arc_alpha_*`；
 unified + Alpha + Beta 为 `arc_beta_cpt100.yaml`。在训练环境、仓库根目录运行，并核对配置中的

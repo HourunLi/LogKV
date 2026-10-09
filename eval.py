@@ -348,6 +348,7 @@ from litgpt.tokenizer import Tokenizer
 from lm_eval import evaluator
 from lm_eval.api.model import LM
 from litgpt.generate.base import generate as litgpt_generate
+from litgpt.kv_compression import cache_compression_snapshot, summarize_compression
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
 from litgpt.ruler_patch import apply_patch
 apply_patch()
@@ -896,6 +897,7 @@ class LogKVLM(LM):
         # 推理时延指标收集
         self.gen_metrics: list[dict] = []      # generate_until
         self.ppl_metrics: list[dict] = []      # loglikelihood
+        self.compression_metrics: list[dict] = []
 
         # Eval cache is built lazily once and reset per request (see
         # _set_eval_cache) — never re-allocated per sample.
@@ -1051,7 +1053,9 @@ class LogKVLM(LM):
     # ==========================================
     # 🌟 核心 1：PPL 与 选择题评测
     # ==========================================
-    def _score_tokens(self, ctx_enc: list[int], cont_enc: list[int]) -> tuple[float, bool]:
+    def _score_tokens(
+        self, ctx_enc: list[int], cont_enc: list[int], *, request_type: str = "loglikelihood"
+    ) -> tuple[float, bool]:
         """Forward (context + continuation) and return
         ``(sum log p(continuation | context), is_greedy)``.
 
@@ -1094,6 +1098,11 @@ class LogKVLM(LM):
                 # bf16, the sliced tensor is (cont_len + 1) x vocab.
                 logits = self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
                 t1 = time.perf_counter()
+                self.compression_metrics.append({
+                    "request_type": request_type, "rank": _global_rank(),
+                    "context_len": ctx_len, "cont_len": len(cont_enc),
+                    **cache_compression_snapshot(self.model, seq_len),
+                })
             finally:
                 # In-place state reset (defensive: the next request resets again
                 # via _set_eval_cache). Keeping the buffers avoids re-allocation.
@@ -1211,6 +1220,12 @@ class LogKVLM(LM):
                         eos_id=self.tokenizer.eos_id,
                     )
                     t1 = time.perf_counter()
+                    # The last output token has not been forwarded into the cache.
+                    self.compression_metrics.append({
+                        "request_type": "generate_until", "rank": dp_rank, "sample_id": sample_id,
+                        "prompt_len": prompt_len, "generated_tokens": int(out.numel()) - prompt_len,
+                        **cache_compression_snapshot(self.model, int(out.numel()) - 1),
+                    })
                 finally:
                     self._reset_eval_cache()
 
@@ -1266,7 +1281,7 @@ class LogKVLM(LM):
                     ctx = [self.tokenizer.bos_id]
                 else:
                     ctx = [tokens[start - 1]]
-                logprob, _ = self._score_tokens(ctx, chunk)
+                logprob, _ = self._score_tokens(ctx, chunk, request_type="loglikelihood_rolling")
                 total_logprob += logprob
 
             results.append(total_logprob)
@@ -1660,12 +1675,36 @@ def main(
                 log_samples=True,
             )
         _hb("simple_evaluate 已返回")
+        compression_samples = lm_model.all_gather_results(lm_model.compression_metrics, tag="KV compression")
 
         # 落盘阶段：只有 rank 0 写文件（建目录、写 json/csv/xlsx）。其它 rank 什么都
         # 不做，直接到下面的 barrier 等 rank 0 写完 —— 各 rank 同时往共享盘写同名文件
         # 会互相截断，而 mkdir/exists 各判各的又会引入分支不一致。
         if _is_main():
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            compression_summary = summarize_compression(compression_samples)
+            compression_report = {
+                "measurement_point": "request_end_before_cache_reset",
+                "slot_definition": "valid stored KV entries across all layers, batches and KV groups; "
+                                   "includes recent, deferred tokens and Alpha pending spans; excludes padding, "
+                                   "virtual attention anchors and workspace",
+                "summary": compression_summary,
+                "by_request_type": {
+                    kind: summarize_compression([row for row in compression_samples if row["request_type"] == kind])
+                    for kind in sorted({row["request_type"] for row in compression_samples})
+                },
+                "samples": compression_samples,
+            }
+            if compression_summary["request_count"]:
+                print(
+                    f"🧮 KV 槽位压缩（全部 rank，{compression_summary['request_count']} 次调用，结束时快照）: "
+                    f"保留比例 {compression_summary['kv_retention_ratio']:.2%}，"
+                    f"节省比例 {compression_summary['kv_saving_ratio']:.2%}，"
+                    f"压缩倍数 {compression_summary['kv_compression_factor']:.2f}x",
+                    flush=True,
+                )
+            else:
+                print("🧮 KV 槽位压缩: 本次没有模型调用，未产生可统计数据", flush=True)
 
             # 🌟 诊断汇总（score/value oracle 归因；见 litgpt.log_kv_diag）：每次调用
             # 对应一个 (task 类型, mode) 组合，独立落一份 JSON —— 不与常规 results 合并，
@@ -1725,6 +1764,7 @@ def main(
                     "log_kv_dense_mode": log_kv_dense_mode,
                     "swa_window_size": lm_model.swa_window_size,
                     "cache_budget": lm_model.cache_budget,
+                    "kv_compression": compression_report,
                     "log_kv_B": log_kv_B,
                     "log_kv_recent_size": log_kv_recent_size,
                     "log_kv_prefill_block": log_kv_prefill_block,
@@ -1766,6 +1806,15 @@ def main(
                 else:
                     output_file = base / f"eval_results_{ts}.json"
                 output_file.parent.mkdir(parents=True, exist_ok=True)
+
+                if compression_samples:
+                    compression_csv = output_file.with_suffix(".kv_compression.csv")
+                    columns = list(dict.fromkeys(key for row in compression_samples for key in row))
+                    with open(compression_csv, "w", encoding="utf-8", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=columns)
+                        writer.writeheader()
+                        writer.writerows(compression_samples)
+                    print(f"📊 KV 槽位压缩明细已保存至 {compression_csv}")
 
                 try:
                     with open(output_file, "w", encoding="utf-8") as f:
