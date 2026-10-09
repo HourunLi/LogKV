@@ -2,8 +2,8 @@
 
 Beta 基于 Alpha，同时开启两项改动：精确片段评分加入旧簇新颖度，层级压缩选择局部失真最小的切分。
 保持 `K=12`、精确池 `P=256`、片段上限 `64`、原预算 `B=128`、recent/flush `2048`，
-继续使用 unified 增量路由 `merge_passes=1`。精确池的预算扣款、自然边界和整段替换沿用
-[Alpha](alpha-logkv.md)，共享机制见 [算法规格](algorithm-spec.md)。
+默认与 attach 路由分簇组合；unified 路由（`merge_passes=1`）保留为对照。精确池的预算扣款、
+自然边界和整段替换沿用 [Alpha](alpha-logkv.md)，共享机制与两种路由见 [算法规格](algorithm-spec.md)。
 
 ## 精确片段评分
 
@@ -47,25 +47,28 @@ C(t) = Σ_X Σ_{A∈{[0,t),[t,4)}} Σ_{i∈A} w_i ||X_i−μ_X(A)||² / max(E_X,
 CUDA 一阶路径用融合 kernel 并行处理四元组，并在同一 launch 读取存活条目；后续统一写回，
 避免覆盖尚未读出的源槽。代价计算使用 FP32。CPU/不支持的布局复用 Torch 参考路径。
 切分布局与当前层原有索引共用一次上传，左右输出复用读取的元数据。各层调度对全部 lane
-整体计算，回放也走同一路径。共享路由约每 4 轮检查一次结束标志与存活数，行扫描只遍历
+整体计算，回放也走同一路径。unified 路由约每 4 轮检查一次结束标志与存活数，行扫描只遍历
 存活节点，GPU 仍逐轮更新中心；此调度优化不等同于 `merge_passes=4` 近似配对。
 切分会增加少量运算，实际开销需要目标 GPU 测量，不能据此宣称 step 更快。
 
 ## 预算与回放
 
-- 两个开关默认 API 值均为 `false`；Beta YAML 同时设为 `true`。关闭两项即恢复 Alpha 行为。
+- 两个开关的 Cache API 默认值为 `false`；训练/评测入口和 `arc_semantic_fast.yaml` 默认 `true`。
+  关闭两项即恢复 Alpha 行为；`log_kv_alpha_exact_tokens: 0` 会同时关闭两项。
 - 不增加持久 KV 张量，不改变有效 `B′` 的计算；精确池、未闭合尾段和复用打包缓冲仍按
   Alpha 口径计入预算，持久推理 KV 保持 `O(log N)`。
 - 推理只需要当前批的评分、切分和临时工作区。训练额外记录每组一个 `uint8` 切分值，
   与已有写入记录一起释放；训练总内存本来就不受推理 KV 的 `O(log N)` 约束。
 - checkpoint 重算与 backward 复用前向的精确片段选择和切分；没有重新打分、路由或选切分。
-  仍要求 Alpha 的 unified、mid、一阶、关闭 segment padding，训练必须开启 update replay。
+  仍要求 Alpha 的路由（attach 或 unified）、mid、一阶、关闭 segment padding，
+  训练必须开启 update replay。
 
 ## 最小运行入口
 
-[训练配置](../exp/qwen1.7b-32k/arc_beta_cpt100.yaml) 从 Base 初始化，使用独立的
-`qwen1.7b-32k-beta-cpt100` 输出目录；该目录已有 checkpoint 时 `auto_resume` 恢复它。
-训练与评测均沿用两个开关：
+[默认训练配置](../exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml)（attach + Alpha + Beta）
+从 Base 初始化，使用独立输出目录，训练超参与 `arc_semantic_attach_route_k12_b128_2k` 基线一致；
+`_4k` 版本仅把 recent 改为 4096。该目录已有 checkpoint 时 `auto_resume` 恢复它。
+`arc_beta_cpt100.yaml` 保留早先 unified + Beta 的 100 步实验。训练与评测均沿用两个开关：
 
 ```yaml
 log_kv_beta_novelty: true
@@ -75,14 +78,15 @@ log_kv_beta_adaptive_merge: true
 先在训练环境做短 CUDA 检查，覆盖融合更新、质量/位置、精确池和回放：
 
 ```bash
-python -m pytest tests/test_beta_log_kv.py tests/test_alpha_log_kv.py tests/test_log_kv_route_schedule.py -q
+python -m pytest tests/test_beta_log_kv.py tests/test_alpha_log_kv.py tests/test_log_kv_orphans.py \
+  tests/test_log_kv_route_schedule.py -q
 ```
 
 再使用相同输入规模测一次短路由，确认额外开销可接受：
 
 ```bash
 python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --B 128 --iters 3 \
-  --alpha-exact-tokens 256 --alpha-span-max-tokens 64 --merge-passes 1 \
+  --route attach --alpha-exact-tokens 256 --alpha-span-max-tokens 64 \
   --beta-novelty --beta-adaptive-merge --profile-dir route_operator_profile_beta > route_beta.jsonl
 ```
 
@@ -93,14 +97,14 @@ profile 另标注 `exact_select`、`exact_partition`、`ladder_merge_scatter`，
 
 ```bash
 BENCHMARKS=none NIAH_BENCHMARKS=none \
-  bash majob.sh exp/qwen1.7b-32k/arc_beta_cpt100.yaml
+  bash majob.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml
 ```
 
 训练后仅评测 32K single2/3：
 
 ```bash
 DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
-  bash eval.sh exp/qwen1.7b-32k/eval_beta.yaml niah_single_2,niah_single_3 none
+  bash eval.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 
 `eval.sh` 从 `save_path` 加载训练产物；第三参数 `none` 关闭默认追加的多长度 NIAH。

@@ -542,10 +542,12 @@ def main(
     log_kv_semantic_pack_backend: str = "auto",
     log_kv_semantic_centroid_backend: str = "sequential",
     log_kv_semantic_replay_updates: bool = False,
-    log_kv_alpha_exact_tokens: int = 0,
+    # Alpha exact spans + Beta scoring/merging are on by default for semantic
+    # clusters; set log_kv_alpha_exact_tokens: 0 (or the beta flags false) to disable.
+    log_kv_alpha_exact_tokens: int = 256,
     log_kv_alpha_span_max_tokens: int = 64,
-    log_kv_beta_novelty: bool = False,
-    log_kv_beta_adaptive_merge: bool = False,
+    log_kv_beta_novelty: bool = True,
+    log_kv_beta_adaptive_merge: bool = True,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
     # ── Eval ──
@@ -635,6 +637,11 @@ def main(
     log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
     log_kv_beta_novelty = bool(_o("log_kv_beta_novelty", log_kv_beta_novelty))
     log_kv_beta_adaptive_merge = bool(_o("log_kv_beta_adaptive_merge", log_kv_beta_adaptive_merge))
+    if not log_kv_semantic_clusters:
+        log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
+    if not log_kv_alpha_exact_tokens:
+        # Beta extends the Alpha exact pool; disabling Alpha disables both Beta changes.
+        log_kv_beta_novelty = log_kv_beta_adaptive_merge = False
     log_kv_profile_steps = _o("log_kv_profile_steps", log_kv_profile_steps)
     if log_kv_profile_steps is not None and (
         not isinstance(log_kv_profile_steps, (list, tuple))

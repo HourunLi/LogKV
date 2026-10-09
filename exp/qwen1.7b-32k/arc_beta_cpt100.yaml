@@ -1,10 +1,27 @@
-# Beta: Base initialization, independent output and both bounded algorithm changes.
-config: arc_alpha_cpt100.yaml
+# Beta（unified 路由）对照：Base 初始化、独立 100 步 CPT。保留用于复现/复评既有
+# qwen1.7b-32k-beta-cpt100 产物；当前默认路线见 arc_attach_alpha_beta_k12_b128_2k.yaml。
+config: arc_semantic_fast.yaml
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
+resume_dir: null
+auto_resume: true
 expid: qwen1.7b-32k-beta-cpt100
 save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-beta-cpt100
 merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_beta_cpt100
 tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-beta-cpt100
 
-# Keep Alpha's 256 exact tokens, 64-token span cap and incremental unified route.
+max_steps: 100
+learning_rate: 5e-6
+min_lr: 5e-6
+warmup_steps: 10
+save_interval: 50
+run_eval: ""
+
+# 训练时使用 unified 增量路由；Alpha 256/64 与 Beta 两项开关沿用 arc_semantic_fast.yaml。
+log_kv_semantic_unified_route: true
+log_kv_semantic_legacy_route: false
+log_kv_semantic_cluster_chunk_size: 0
+log_kv_semantic_merge_passes: 1
+log_kv_alpha_exact_tokens: 256
+log_kv_alpha_span_max_tokens: 64
 log_kv_beta_novelty: true
 log_kv_beta_adaptive_merge: true

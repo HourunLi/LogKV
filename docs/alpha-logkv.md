@@ -1,13 +1,14 @@
 # AlphaLogKV：有限预算的精确片段
 
-本文保留 Alpha 基线定义。当前 Beta 配置沿用这里的分段、替换和预算，
+本文保留 Alpha 基线定义。当前默认路线（attach + Alpha + Beta）沿用这里的分段、替换和预算，
 评分与簇内压缩的两项改动见 [BetaLogKV](beta-logkv.md)。
 
 Alpha 在 SemanticLogKV 的 recent window 与压缩层之间增加可替换的精确池。
-默认关闭；[训练配置](../exp/qwen1.7b-32k/arc_alpha_cpt100.yaml) 开启每层每条样本
-`P=256` 个精确 token、片段上限 `64`。同层 KV groups 共用所选位置，各层独立选择。
-压缩槽的表示与注意力见 [算法规格](algorithm-spec.md)，归档后的分簇与合并见
-[统一路由](semantic-unified-routing.md)；本文只定义 Alpha 增量。
+训练/评测入口对语义簇默认开启，[默认配置](../exp/qwen1.7b-32k/arc_semantic_fast.yaml) 显式写出
+每层每条样本 `P=256` 个精确 token、片段上限 `64`；`log_kv_alpha_exact_tokens: 0` 关闭
+（同时关闭 Beta）。同层 KV groups 共用所选位置，各层独立选择。压缩槽的表示与注意力见
+[算法规格](algorithm-spec.md)，归档后的分簇见其中的 attach（默认）与
+[unified](semantic-unified-routing.md) 路由；本文只定义 Alpha 增量。
 
 ## 片段与分数
 
@@ -43,7 +44,8 @@ K、V 两项权重均为 1。打分使用 FP32 批量归约；每次 flush 一�
 - 精确池保留各 token 的原始 K/V 和位置，均值只用于打分。读出按原始位置施加 RoPE，
   质量权重为 1，与压缩槽共同参加一次注意力；不需要额外检索注意力。
 - 已提交 token 在 recent、精确池、压缩层之间仅有一个语义归属，不添加重复副本。
-  本次未入选的新 token 与被替换的旧片段一起执行统一路由。
+  本次未入选的新 token 与被替换的旧片段一起按配置的路由归档（默认 attach）；
+  两种路由都接受各样本不等长的归档批，padding 不参与分配。
 - 延迟归档可能早于簇内现存位置：只对受影响簇按位置重排条目，然后重新入层级。
   被淘汰片段分散到各簇，这条路径很常见；排序在设备上按（簇，位置）稳定排序完成，
   不回读层级位置。簇的 `p_hi` 不小于其现存条目位置，因此新 `p_hi` 只需新 token 位置。
@@ -51,8 +53,9 @@ K、V 两项权重均为 1。打分使用 FP32 批量归约；每次 flush 一�
 - padding 不参与归档、质量计数或注意力。精确池收集直接写入预分配缓冲，打包复用
   现有 Triton kernel。`alpha_select` 已包含在 `route` 计时中，不要重复相加。
 
-默认 `log_kv_semantic_merge_passes: 1` 使用新增量路由；设为 `4` 保留冻结中心的
-近似配对对照。Alpha 不另建配对算法，具体路径与有限 hard cap 的回退规则见统一路由文档。
+attach 直接把归档 token 交给冻结中心的直连/orphan 规则，写入时按位置插入延迟 token。
+使用 unified 时，`log_kv_semantic_merge_passes: 1` 为增量路由，`4` 保留冻结中心的近似配对
+对照。Alpha 不另建配对算法，两种路由的具体规则见算法规格与统一路由文档。
 
 ## 同预算与复杂度
 
@@ -77,19 +80,19 @@ C_exact = P×[G×(d_k + d_v + 2d_p)×e + 9]
 
 ## 训练、推理与最小运行入口
 
-Alpha 要求 unified、`K>1`、mid、一阶、关闭 segment gap/padding；训练还要求
-`semantic_replay_updates=true`。训练与推理走相同选择/归档规则；checkpoint 重算与反向
+Alpha 要求 attach 或 unified 路由（legacy/chunk-tree 会报错）、`K>1`、mid、一阶、
+关闭 segment gap/padding；训练还要求 `semantic_replay_updates=true`。训练与推理走相同选择/归档规则；checkpoint 重算与反向
 使用记录的精确池状态和写入操作，不重新打分或路由。没有入层级前的 summary 均值压缩。
 
-当前配置从 **Qwen3-1.7B-Base** 开始 100 步 CPT，独立输出到
-`qwen1.7b-32k-alpha-cpt100`；该实验若已有 checkpoint，`auto_resume` 会恢复它。
-簇上限 12、原预算 B=128；recent、flush、train/prefill block 均为 2048。
+当前默认路线的训练与评测命令见 [BetaLogKV](beta-logkv.md) 与 [README](../README.md)。
+只开 Alpha、不开 Beta 的既有实验是 `arc_alpha_k12_b128*.yaml`、`arc_alpha_k16_b128.yaml`
+（unified 路由，YAML 显式关闭 Beta），簇上限、原预算和 recent 见各文件名。
 
 训练环境中，只训练、不触发 `majob.sh` 默认的全套后续评测：
 
 ```bash
 BENCHMARKS=none NIAH_BENCHMARKS=none \
-  bash majob.sh exp/qwen1.7b-32k/arc_alpha_cpt100.yaml
+  bash majob.sh exp/qwen1.7b-32k/arc_alpha_k12_b128.yaml
 ```
 
 训练完成后，仅评测 32K single2/3：
@@ -107,7 +110,7 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
 
 ```bash
 python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --B 128 --iters 3 \
-  --alpha-exact-tokens 256 --alpha-span-max-tokens 64 --merge-passes 1 \
+  --route unified --alpha-exact-tokens 256 --alpha-span-max-tokens 64 --merge-passes 1 \
   --profile-dir route_operator_profile_alpha > route_alpha.jsonl
 ```
 

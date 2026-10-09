@@ -47,3 +47,8 @@ log_kv_semantic_s_h_path: null
 log_kv_semantic_flush_granularity: 1024
 log_kv_semantic_capacity_beta: 0.0
 log_kv_semantic_capacity_hard_cap_mult: 0.0
+
+# Stage-1 基线（multi 锚点、二阶修正）不支持 Alpha/Beta；arc_semantic_fast.yaml 起重新开启。
+log_kv_alpha_exact_tokens: 0
+log_kv_beta_novelty: false
+log_kv_beta_adaptive_merge: false

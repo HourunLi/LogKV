@@ -1,0 +1,23 @@
+# 当前默认路线：attach 路由分簇 + Alpha 精确片段 + Beta（新颖度评分、簇内四进二压缩）。
+# 算法开关沿用 arc_semantic_fast.yaml 的默认值；训练超参与 attach_route_k12_b128_4k 基线一致。
+config: arc_semantic_fast.yaml
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
+resume_dir: null
+# Only resume this new experiment's own optimizer/step if interrupted.
+auto_resume: true
+
+expid: qwen1.7b-32k-attach-alpha-beta_k12_b128_4k
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-attach-alpha-beta_k12_b128_4k
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging-attach-alpha-beta_k12_b128_4k
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-attach-alpha-beta_k12_b128_4k
+
+max_steps: 1200
+learning_rate: 5e-6
+min_lr: 3e-6
+warmup_steps: 100
+save_interval: 400
+run_eval: ""
+
+log_kv_cluster_k_max: 12
+log_kv_B: 128  # 原始字节预算；精确池从中扣除，日志 effective_B 为实际值
+log_kv_recent_size: 4096

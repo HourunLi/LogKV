@@ -1,8 +1,10 @@
 # 统一语义路由与增量实现
 
-本页定义 `semantic_unified_route=true` 的当前路径。Alpha 配置已开启；
-API 默认仍关闭。入口见 [`log_kv_cache.py`](../litgpt/log_kv_cache.py) 的
-`_semantic_route_unified`，GPU 实现在 [`log_kv_route_triton.py`](../litgpt/log_kv_route_triton.py)。
+本页定义可选的 `semantic_unified_route=true` 路径。当前默认是 attach 路由
+（规则见 [算法规格 §3.1](algorithm-spec.md)）；unified 实验 NIAH 明显退化，保留为对照，
+`arc_semantic_unified*.yaml`、`arc_alpha_*`、`arc_beta_cpt100.yaml` 仍显式开启它。
+入口见 [`log_kv_cache.py`](../litgpt/log_kv_cache.py) 的 `_semantic_route_unified`，
+GPU 实现在 [`log_kv_route_triton.py`](../litgpt/log_kv_route_triton.py)。
 缓存和训练语义见 [共享算法规格](algorithm-spec.md)，精确片段选择见 [Alpha](alpha-logkv.md)。
 
 ## 两阶段建簇

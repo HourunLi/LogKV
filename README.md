@@ -1,28 +1,53 @@
-# BetaLogKV
+# SemanticLogKV（attach + Alpha + Beta）
 
-基于 LitGPT 的流式 KV 压缩：新 token 在 flush 后形成语义候选，与旧簇统一合并；
-每个簇维护有界层级缓存。Alpha 在同一缓存预算内保留可替换的短片段精确槽，
-尝试减少孤立事实被均值压缩的损失。目标是固定簇数与窗口大小下 O(log N) 的推理 KV 存储。
-Beta 在 Alpha 上增加旧簇新颖度评分，以及簇内局部四进二的自适应切分；不增加持久 KV 预算。
+基于 LitGPT 的流式 KV 压缩：flush 时把新 token 用 attach 路由分给冻结中心的旧簇，
+远离所有旧簇的 orphan 开新簇；每个簇维护有界层级缓存。Alpha 在同一缓存预算内保留可替换的
+短片段精确槽，尝试减少孤立事实被均值压缩的损失；Beta 在 Alpha 上增加旧簇新颖度评分，
+以及簇内局部四进二的自适应切分，不增加持久 KV 预算。目标是固定簇数与窗口大小下
+O(log N) 的推理 KV 存储。
 
-当前配置：K=12、recent/flush=2048、精确池256 token、片段上限64 token、mid anchor、
-一阶 attention、增量 Ward 路由。精确池从原 B=128 的预算中扣除，实际 B 由代码计算。
-精确槽的选择是启发式，尚不能宣称改善 NIAH single2/3 或达到某个训练速度目标。
+当前默认：attach 路由、K=12、recent/flush=2048、精确池 256 token、片段上限 64 token、
+Beta 两项开启、mid anchor、一阶 attention。精确池从原 B=128 的预算中扣除，实际 B 由代码计算。
+训练/评测入口对语义簇默认开启 Alpha/Beta、关闭 unified；YAML 写
+`log_kv_alpha_exact_tokens: 0` 关闭 Alpha 与 Beta，`log_kv_beta_*: false` 只关 Beta，
+`log_kv_semantic_unified_route: true` 切回 unified 对照。这一组合（attach + Alpha + Beta）
+本身尚无评测结果；精确槽选择是启发式，收益需实测确认。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
+| [共享算法规格](docs/algorithm-spec.md) | 缓存结构、attach / unified 路由、层级压缩、训推边界 |
+| [Alpha 精确片段算法](docs/alpha-logkv.md) | 分段、打分、替换、预算，以及延迟归档 |
 | [Beta 算法与运行入口](docs/beta-logkv.md) | 新颖度评分、低失真切分、回放约束、训练与评测 |
-| [共享算法规格](docs/algorithm-spec.md) | 缓存结构、两阶段路由、层级压缩、训推边界 |
-| [Alpha 精确片段算法](docs/alpha-logkv.md) | 分段、打分、替换、预算，以及训练和评测入口 |
-| [统一路由实现](docs/semantic-unified-routing.md) | Ward/半径公式、增量更新、并行和数值约束 |
+| [统一路由实现](docs/semantic-unified-routing.md) | 可选 unified 路由的 Ward/半径公式、增量更新和数值约束 |
 | [位置与注意力](docs/position.md) | pre-RoPE 内容、mid/multi 锚点、质量偏置 |
 | [全程 SWA 对照](docs/swa-niah-comparison.md) | 同权重、同持久缓存字节预算的比较口径 |
 
-当前训练、32K single2/3 评测和短路由检查的命令见 [Beta 指南](docs/beta-logkv.md)。
-在训练环境、仓库根目录运行，并核对配置中的模型和输出路径。当前 CPT 从 Base 初始化；
-若实验输出目录已有 checkpoint，`auto_resume` 会恢复它。
+## 运行入口
+
+默认训练配置是 `exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml`（`_4k` 为 recent 4096），
+算法开关集中在其父配置 `arc_semantic_fast.yaml`。只训练、不触发默认的全套后续评测：
+
+```bash
+BENCHMARKS=none NIAH_BENCHMARKS=none \
+  bash majob.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml
+```
+
+训练后仅评测 32K single2/3（`eval.sh` 从 YAML 的 `save_path` 加载产物，不转发 YAML metadata）：
+
+```bash
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+  bash eval.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml niah_single_2,niah_single_3 none
+```
+
+多卡评测各 rank 汇合时每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印仍未到达的 rank，
+超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
+
+更早实验的 YAML 显式写出训练时的开关，复评不受新默认值影响：纯 attach / unified 基线为
+`arc_semantic_attach_route_*`、`arc_semantic_unified_route_*`；unified + Alpha 为 `arc_alpha_*`；
+unified + Alpha + Beta 为 `arc_beta_cpt100.yaml`。在训练环境、仓库根目录运行，并核对配置中的
+模型和输出路径。CPT 从 Base 初始化；若实验输出目录已有 checkpoint，`auto_resume` 会恢复它。
 
 LitGPT 通用用法见 [tutorials](tutorials/)。运行产生的 profile 和评测文件是实验产物，
 其时间、形状和代码版本须一起解读；它们不定义当前算法。
