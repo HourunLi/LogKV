@@ -314,6 +314,10 @@ def main():
     p.add_argument('--alpha-span-max-tokens', type=int, default=64)
     p.add_argument('--beta-novelty', action='store_true')
     p.add_argument('--beta-adaptive-merge', action='store_true')
+    p.add_argument('--gamma-level0-reinsert', action='store_true',
+                   help='Gamma: delayed Alpha evictions re-sort only ladder level 0')
+    p.add_argument('--gamma-top-merge', choices=('fold', 'lightest'), default='fold')
+    p.add_argument('--gamma-level-slack', type=int, default=2)
     args = p.parse_args()
     if min(args.tokens, args.dim, args.batch, args.groups, args.clusters, args.B, args.flushes, args.iters) < 1:
         p.error('all sizes and iteration counts must be positive')
@@ -334,6 +338,8 @@ def main():
         semantic_merge_passes=args.merge_passes,
         alpha_exact_tokens=args.alpha_exact_tokens, alpha_span_max_tokens=args.alpha_span_max_tokens,
         beta_novelty=args.beta_novelty, beta_adaptive_merge=args.beta_adaptive_merge,
+        gamma_level0_reinsert=args.gamma_level0_reinsert, gamma_top_merge=args.gamma_top_merge,
+        gamma_level_slack=args.gamma_level_slack,
         device=device, dtype=dtype, cos_cache=torch.ones(n, args.dim, device=device),
         sin_cache=torch.zeros(n, args.dim, device=device), rope_n_elem=args.dim,
     )
