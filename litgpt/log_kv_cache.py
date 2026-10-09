@@ -4395,6 +4395,11 @@ class LogStructuredKVCache(nn.Module):
             return
         if token_counts is not None and not any(token_counts):
             return
+        if self._semantic_attach_one_transfer and not self.semantic_legacy_route and self._semantic_hard_cap() == math.inf:
+            with self._semantic_deferred_scalars():
+                self._semantic_route_attach(k_raw, v, positions, positions_host, record=record,
+                                            token_counts=token_counts)
+            return
 
         winner, s_winner, direct = self._semantic_existing_assignments(k_raw, positions)
 
@@ -4478,6 +4483,110 @@ class LogStructuredKVCache(nn.Module):
                     self._semantic_new_cluster(b, g, c, token_idx, k_raw[b, g, i], v[b, g, i], pos, record=record)
                     batch_clusters.append(c)
 
+    # Uncapped attach planning on the device with one readback; False keeps the
+    # two-phase host planner (the reference the tests compare against).
+    _semantic_attach_one_transfer = True
+
+    def _semantic_route_attach(self, k_raw, v, positions, positions_host, *, record, token_counts=None) -> None:
+        """Uncapped attach route with one device-to-host transfer per flush.
+
+        Same rules as the two-phase planner (`_semantic_route_orphans_fast`),
+        evaluated for every lane on the device in position order: frozen
+        nearest-cluster joins, farthest-point seeds for up to `free` new
+        clusters per lane, and nearest live-or-seed cluster for the other
+        orphans. Only the final cluster of each token (int8) is read back; the
+        host groups tokens by (lane, cluster, position) with one stable sort.
+        New clusters are the assigned clusters that are not alive yet.
+        """
+        n_batch, n_groups, tokens, dim = k_raw.shape
+        dev = k_raw.device
+        counts = (np.full(n_batch, tokens, dtype=np.int64) if token_counts is None
+                  else np.asarray(token_counts, dtype=np.int64))
+        host_pos = np.asarray(positions_host, dtype=np.int64)
+        # Position order per row (stable); padding sorts last.
+        valid_host = np.arange(tokens)[None, :] < counts[:, None]
+        order = np.argsort(np.where(valid_host, host_pos, np.iinfo(np.int64).max), axis=1, kind="stable")
+        free = [[self._semantic_free_clusters(b, g) for g in range(n_groups)] for b in range(n_batch)]
+        n_seed = max(len(row) for lane in free for row in lane)
+        slots = np.full((n_batch, n_groups, max(n_seed, 1)), self.K_max, dtype=np.int64)
+        n_free = np.zeros((n_batch, n_groups), dtype=np.int64)
+        for b, lane in enumerate(free):
+            for g, row in enumerate(lane):
+                slots[b, g, :len(row)] = row
+                n_free[b, g] = len(row)
+        metadata = _upload(np.concatenate((order.reshape(-1), counts, slots.reshape(-1), n_free.reshape(-1))), dev)
+        cut = np.cumsum([order.size, n_batch, slots.size])
+        order_t = metadata[:cut[0]].view(n_batch, tokens)
+        counts_t, slots_t = metadata[cut[0]:cut[1]], metadata[cut[1]:cut[2]].view(slots.shape)
+        n_free_t = metadata[cut[2]:].view(n_batch, n_groups)
+
+        winner, s_winner, direct = self._semantic_existing_assignments(k_raw, positions)
+        perm = order_t[:, None, :].expand(-1, n_groups, -1)
+        valid = (torch.arange(tokens, device=dev)[None, :] < counts_t[:, None])[:, None, :]
+        direct = direct.gather(2, perm) & valid
+        orphan = valid & ~direct
+        assign = winner.gather(2, perm).masked_fill(~direct, -1)
+        x = k_raw.detach().gather(2, perm[..., None].expand(-1, -1, -1, dim)).float()
+        # One spare row per lane takes the writes of unused seed slots.
+        mu = torch.cat((self.centroid[:n_batch, :n_groups].float(), x.new_zeros(n_batch, n_groups, 1, dim)), 2)
+        candidates = torch.cat((self.alive[:n_batch, :n_groups], self.alive.new_zeros(n_batch, n_groups, 1)), 2)
+        if n_seed:
+            def distance_to(t):
+                return (x - x.gather(2, t[..., None, None].expand(-1, -1, 1, dim))).square().sum(-1)
+
+            nxt = s_winner.gather(2, perm).masked_fill(~orphan, -float("inf")).argmax(-1)
+            picks = [nxt]
+            dist = distance_to(nxt).masked_fill_(~orphan, -float("inf"))
+            for _ in range(n_seed - 1):
+                # Mask previous picks even for identical keys, so each
+                # newly opened cluster reserves a distinct orphan token.
+                dist.scatter_(2, nxt[..., None], -float("inf"))
+                nxt = dist.argmax(-1)
+                picks.append(nxt)
+                dist = torch.minimum(dist, distance_to(nxt))
+            picked = torch.stack(picks, -1)
+            used = torch.arange(n_seed, device=dev) < torch.minimum(n_free_t, orphan.sum(-1))[..., None]
+            target = torch.where(used, slots_t[..., :n_seed], self.K_max)
+            mu.scatter_(2, target[..., None].expand(-1, -1, -1, dim),
+                        x.gather(2, picked[..., None].expand(-1, -1, -1, dim)))
+            candidates.scatter_(2, target, True)
+        # Exact differences, as in the two-phase planner.
+        distances = torch.cdist(x.flatten(0, 1), mu[:, :, :self.K_max].flatten(0, 1),
+                                compute_mode="donot_use_mm_for_euclid_dist").view(n_batch, n_groups, tokens, -1)
+        distances.masked_fill_(~candidates[:, :, None, :self.K_max], float("inf"))
+        assign = torch.where(orphan, distances.argmin(-1), assign)
+        if n_seed:
+            # A seed opens its own cluster; unused picks land in a spare column.
+            assign = torch.cat((assign, assign.new_zeros(n_batch, n_groups, 1)), 2)
+            assign.scatter_(2, torch.where(used, picked, tokens), slots_t[..., :n_seed])
+            assign = assign[..., :tokens]
+        assign = assign.to(torch.int8).cpu().numpy()
+
+        # Host plan: (lane, cluster, position) order from one stable sort.
+        lane_ids = np.repeat(np.arange(n_batch * n_groups), np.repeat(counts, n_groups))
+        offsets = np.concatenate([np.tile(order[b, :counts[b]], n_groups) for b in range(n_batch)])
+        clusters = np.concatenate([assign[b, :, :counts[b]].reshape(-1) for b in range(n_batch)]).astype(np.int64)
+        if not len(clusters):
+            return
+        sort = np.argsort(lane_ids * (self.K_max + 1) + clusters, kind="stable")
+        lane_ids, clusters, offsets = lane_ids[sort], clusters[sort], offsets[sort]
+        bounds = np.flatnonzero((lane_ids[1:] != lane_ids[:-1]) | (clusters[1:] != clusters[:-1])) + 1
+        new_jobs, jobs = [], []
+        for lo, hi in zip([0] + bounds.tolist(), bounds.tolist() + [len(clusters)]):
+            b, g = divmod(int(lane_ids[lo]), n_groups)
+            c = int(clusters[lo])
+            if not self._semantic_alive[b][g][c]:
+                new_jobs.append((b, g, c, int(offsets[lo])))
+                lo += 1
+            if hi > lo:
+                jobs.append((b, g, c, tuple(offsets[lo:hi].tolist())))
+        if new_jobs:
+            self._semantic_new_clusters(new_jobs, k_raw, v, positions, positions_host, record=record)
+        # A new cluster starts at its earliest token, so only Alpha's delayed
+        # evictions into existing clusters can precede a cluster's p_hi.
+        commit = self._alpha_commit_joins if self.alpha_exact_tokens else self._semantic_commit_joins
+        commit(jobs, k_raw, v, positions, positions_host, record=record)
+
     def _semantic_route_orphans_fast(
         self,
         orphans: list[list[list[int] | np.ndarray]],
@@ -4558,7 +4667,9 @@ class LogStructuredKVCache(nn.Module):
                 sr, sc, sj = _upload(np.asarray(seed_slots, dtype=np.int64).reshape(-1, 3), dev).unbind(-1)
                 mu[sr, sc] = x[sr, picked[sr, sj]]
 
-            distances = torch.cdist(x, mu)
+            # Exact differences, not the GEMM expansion: the bits must not
+            # depend on how many lanes or orphans share this call.
+            distances = torch.cdist(x, mu, compute_mode="donot_use_mm_for_euclid_dist")
             distances.masked_fill_(~_upload(candidates, dev)[:, None, :], float("inf"))
             choices = distances.argmin(-1) if cap == math.inf else distances.argsort(dim=-1, stable=True).flatten(1)
             # One device-to-host transfer for ALL seeds and assignments. No
