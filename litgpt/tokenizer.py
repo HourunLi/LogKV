@@ -2,6 +2,7 @@
 
 import json
 import warnings
+from functools import cached_property
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
@@ -11,6 +12,23 @@ from litgpt.utils import fix_and_load_json
 
 
 class Tokenizer:
+    @cached_property
+    def alpha_span_boundary_ids(self) -> tuple[int, ...]:
+        """Natural ends only; a colon or identifier hyphen never closes a span.
+
+        Token-local punctuation is a cheap boundary heuristic, not a parser.
+        Build once at setup, never decode strings inside a layer/flush.
+        """
+        result = []
+        for i in range(self.vocab_size):
+            text = self.processor.decode([i])
+            tail = text.rstrip(' \t\r\"\'”’)]}')
+            if tail and tail[-1] in '.!?;。！？；\n':
+                result.append(i)
+        if self.eos_id is not None:
+            result.append(self.eos_id)
+        return tuple(sorted(set(result)))
+
     def __init__(self, checkpoint_dir: Path | str) -> None:
         checkpoint_dir = Path(checkpoint_dir)
         if not checkpoint_dir.exists():

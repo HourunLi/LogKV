@@ -23,7 +23,21 @@ from unittest.mock import patch
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from litgpt.log_kv_cache import LogStructuredKVCache, _UnifiedReduceTorch, _triton_route
+from litgpt.log_kv_cache import LogStructuredKVCache, _UnifiedReduceTorch, _triton_route, _triton_updates
+
+
+def cache_mass(cache):
+    mass = cache.level_w.sum((2, 3, 4))
+    if cache.alpha_exact_tokens:
+        mass = mass + cache.alpha_valid.sum(-1)[:, None]
+    return mass
+
+
+def flush_route(cache, k, v, pos, host):
+    # Synthetic punctuation only: this benchmarks mechanics, not selection quality.
+    ends = [[(p + b * 7) % max(1, cache.alpha_span_max_tokens // 2) == 0 for p in row]
+            for b, row in enumerate(host)] if cache.alpha_exact_tokens else None
+    cache.route_and_flush_batch(k, v, pos, positions_host=host, span_ends=ends)
 
 
 def check_round_pairs(cache, device):
@@ -87,11 +101,12 @@ def check_pair_distances(device):
 def check_incremental_reduce(device):
     """Fused incremental rounds against the Torch reference on the same device.
 
-    The global pass is elementwise-identical and must match bit for bit. The
-    candidate pass sums exact squared differences in a different order, so it
-    compares partitions; random inputs make exact bound ties negligible. The
-    fused reducer runs twice: as configured (CUDA graph replay, in-kernel sort)
-    and with eager launches plus argsort.
+    The global pass (one sweep or frozen sweeps) is elementwise-identical and
+    must match bit for bit. The candidate pass sums exact squared differences
+    in a different order, so it compares partitions; random inputs make exact
+    bound ties negligible. The fused reducer runs twice: as configured (CUDA
+    graph replay, in-kernel sort, live-bound recapture) and with eager launches
+    plus argsort.
     """
     fused = _triton_route()
     generator = torch.Generator(device=device).manual_seed(95)
@@ -111,17 +126,21 @@ def check_incremental_reduce(device):
         mask = torch.arange(size, device=device)[None, :] < count[:, None]
         mu = mu * mask[..., None]
         mass = torch.randint(1, 4, (4, size), device=device, generator=generator).float() * mask
-        for limits, target in ((None, 3), (mu.new_tensor([1., 2., 30., .1]), 1)):
+        # passes > 1 covers the frozen-center sweeps (merge_passes=4).
+        for limits, target, passes in ((None, 3, 1), (None, 3, 4), (mu.new_tensor([1., 2., 30., .1]), 1, 1)):
             results = []
             for reducer_type, eager in ((_UnifiedReduceTorch, False), (fused.UnifiedReduce, False),
                                         (fused.UnifiedReduce, True)):
                 state = mu.clone()
                 dist = LogStructuredKVCache._semantic_unified_pair_matrix(state)
-                reducer = reducer_type(dist, state, mass.clone(), count, limits, target)
+                reducer = reducer_type(dist, state, mass.clone(), count, limits, target, passes)
                 if eager:
                     reducer.sort, reducer.graph = False, False
                 for round_ in range(1, 2 * size + 8):
-                    if not bool(reducer.step(round_).any()):
+                    flag = reducer.step(round_)
+                    if not eager and hasattr(reducer, 'limit_live') and round_ % 2 == 0:
+                        reducer.limit_live(int(reducer.count.max()))  # Exercises graph recapture.
+                    if not bool(flag.any()):
                         break
                 # Symmetry guarantees a mutual pair whenever a finite cost exists.
                 assert torch.equal(dist, dist.transpose(1, 2)), 'incremental distance matrix lost symmetry'
@@ -195,12 +214,12 @@ def profile_route(cache, inputs, device, directory):
     def prepare():
         cache.reset_parameters()
         for k, v, pos, host in inputs[:-1]:
-            cache.route_and_flush_batch(k, v, pos, positions_host=host)
+            flush_route(cache, k, v, pos, host)
         sync()
 
     def flush():
         k, v, pos, host = inputs[-1]
-        cache.route_and_flush_batch(k, v, pos, positions_host=host)
+        flush_route(cache, k, v, pos, host)
 
     def annotated(fn, label):
         def wrapped(*a, **kw):
@@ -217,16 +236,26 @@ def profile_route(cache, inputs, device, directory):
         activities.append(torch.profiler.ProfilerActivity.CUDA)
     # No per-stage synchronization or pair-count readbacks in this capture.
     with ExitStack() as stack:
+        if cache.alpha_exact_tokens:
+            from litgpt import alpha_log_kv
+
+            stack.enter_context(patch.object(alpha_log_kv, 'select_spans', annotated(alpha_log_kv.select_spans, 'exact_select')))
+            updates = _triton_updates() if device.type == 'cuda' else None
+            if updates is not None:
+                stack.enter_context(patch.object(updates, 'alpha_partition', annotated(updates.alpha_partition, 'exact_partition')))
+                stack.enter_context(patch.object(updates, 'merge_scatter', annotated(updates.merge_scatter, 'ladder_merge_scatter')))
         for method, label in (
             ('_semantic_unified_reduce_device', 'reduce'),
             ('_semantic_unified_round', 'merge_round'),
             ('_semantic_unified_pair_matrix', 'pair_matrix'),
-            # Full-recompute stages; only the capacity-capped fallback runs them.
+            # Full-recompute stages: finite capacity or the stalled-lane fallback.
             ('_semantic_unified_round_pairs', 'pair_search'),
             ('_semantic_unified_merge_pack', 'merge_pack'),
             ('_semantic_ward_merge_batch', 'old_kv_merge'),
             ('_semantic_new_clusters', 'new_cluster_write'),
             ('_semantic_commit_joins', 'batched_write'),
+            ('_alpha_route_flush', 'alpha_select_and_archive'),
+            ('_alpha_commit_joins', 'alpha_archive'),
         ):
             stack.enter_context(patch.object(cache, method, annotated(getattr(cache, method), label)))
         with torch.profiler.profile(activities=activities, record_shapes=True) as prof:
@@ -261,7 +290,7 @@ def profile_route(cache, inputs, device, directory):
     report.write('\nPython call sites, sorted by cumulative time:\n')
     pstats.Stats(python_profile, stream=report).strip_dirs().sort_stats('cumtime').print_stats(30)
     expected = len(inputs) * inputs[0][0].size(2)
-    torch.testing.assert_close(cache.level_w.sum((2, 3, 4)),
+    torch.testing.assert_close(cache_mass(cache),
                                torch.full(inputs[0][0].shape[:2], float(expected), device=device), rtol=0, atol=0)
     (out / 'route_summary.txt').write_text(report.getvalue())
     return {'profile_summary': str(out / 'route_summary.txt'),
@@ -278,6 +307,13 @@ def main():
     for name, default in [('tokens', 2048), ('dim', 128), ('batch', 1), ('groups', 1),
                           ('clusters', 12), ('B', 256), ('flushes', 2), ('iters', 3)]:
         p.add_argument('--' + name, type=int, default=default)
+    p.add_argument('--route', choices=('unified', 'attach'), default='unified',
+                   help='Archive route; attach is the default training route (stage diagnostics cover unified only)')
+    p.add_argument('--merge-passes', type=int, default=1, help='Frozen-center global matching sweeps (1 = original)')
+    p.add_argument('--alpha-exact-tokens', type=int, default=0)
+    p.add_argument('--alpha-span-max-tokens', type=int, default=64)
+    p.add_argument('--beta-novelty', action='store_true')
+    p.add_argument('--beta-adaptive-merge', action='store_true')
     args = p.parse_args()
     if min(args.tokens, args.dim, args.batch, args.groups, args.clusters, args.B, args.flushes, args.iters) < 1:
         p.error('all sizes and iteration counts must be positive')
@@ -293,8 +329,11 @@ def main():
     shape = (args.batch, args.groups, n, args.dim)
     cache = LogStructuredKVCache(
         shape, shape, B=args.B, recent_size=args.tokens, semantic_flush_granularity=args.tokens,
-        semantic_clusters=True, cluster_k_max=args.clusters, semantic_unified_route=True,
+        semantic_clusters=True, cluster_k_max=args.clusters, semantic_unified_route=args.route == 'unified',
         semantic_anchor_mode='mid', semantic_centroid_backend='parallel', allocate_second_order=False,
+        semantic_merge_passes=args.merge_passes,
+        alpha_exact_tokens=args.alpha_exact_tokens, alpha_span_max_tokens=args.alpha_span_max_tokens,
+        beta_novelty=args.beta_novelty, beta_adaptive_merge=args.beta_adaptive_merge,
         device=device, dtype=dtype, cos_cache=torch.ones(n, args.dim, device=device),
         sin_cache=torch.zeros(n, args.dim, device=device), rope_n_elem=args.dim,
     )
@@ -322,11 +361,11 @@ def main():
 
     def run():
         for step, (k, v, pos, host) in enumerate(inputs):
-            cache.route_and_flush_batch(k, v, pos, positions_host=host)
+            flush_route(cache, k, v, pos, host)
         return args.flushes * args.tokens
 
     def validate(mass):
-        torch.testing.assert_close(cache.level_w.sum((2, 3, 4)),
+        torch.testing.assert_close(cache_mass(cache),
                                    torch.full((args.batch, args.groups), float(mass), device=device), rtol=0, atol=0)
         assert (cache.alive.sum(-1) <= args.clusters).all()
 
@@ -352,7 +391,10 @@ def main():
                           'route_median_s_per_flush': statistics.median(times) / args.flushes,
                           'peak_extra_MiB': max(peaks) if device.type == 'cuda' else None,
                           'route_backend': 'triton' if fused else 'torch',
+                          'pairing_rule': 'frozen_mnn' if args.merge_passes > 1 else 'mnn',
                           'route_group_tile': cache._semantic_unified_tile(args.batch * args.groups, args.tokens, device),
+                          'effective_B': cache.B, 'exact_count': cache.alpha_count,
+                          'reference_checks_scope': 'shared_unified_route_and_pairwise_updates',
                           'reference_pairs_verified': True if fused else None,
                           'reference_updates_verified': True if fused else None,
                           'reference_incremental_verified': True if fused else None,
@@ -367,17 +409,25 @@ def main():
         rounds, phase = [], ['']
         reduce = cache._semantic_unified_reduce_device
         merge_round = cache._semantic_unified_round
+        pairs = cache._semantic_unified_round_pairs
 
         def reduce_timed(*a, **kw):
             phase[0] = 'candidates' if kw.get('radius_limits') is not None else 'global_merge'
             return timed(phase[0], reduce)(*a, **kw)
 
         def round_counted(reducer, round_):
-            before = reducer.count.cpu()
+            before = reducer.count.cpu().clone()
             result = merge_round(reducer, round_)
             merged = (before - reducer.count.cpu()).tolist()
             rounds.append({'phase': phase[0], 'matrix_size': reducer.mass.size(1), 'round': round_,
                            'merged_pairs_per_group': merged})
+            return result
+
+        def pairs_counted(mu, *a, **kw):
+            result = pairs(mu, *a, **kw)
+            sizes = (result[..., 0] >= 0).sum(-1).cpu().tolist()
+            rounds.append({'phase': phase[0], 'matrix_size': mu.size(1),
+                           'proposed_pairs_per_group': sizes})
             return result
 
         def timed(name, fn):
@@ -394,6 +444,7 @@ def main():
         with ExitStack() as stack:
             stack.enter_context(patch.object(cache, '_semantic_unified_reduce_device', reduce_timed))
             stack.enter_context(patch.object(cache, '_semantic_unified_round', round_counted))
+            stack.enter_context(patch.object(cache, '_semantic_unified_round_pairs', pairs_counted))
             for name, stage in [('_semantic_ward_merge_batch', 'old_kv_merge'),
                                 ('_semantic_new_clusters', 'new_cluster_write'),
                                 ('_semantic_commit_joins', 'batched_write')]:

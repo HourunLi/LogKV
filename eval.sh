@@ -58,6 +58,9 @@ export NCCL_NET_PLUGIN=none
 # 12000 截成 uint8 是 224，低 5 bit 为 0 = 无限等待：尾包丢失后永不重传，NCCL
 # 内核以 100% 利用率空等，表现为随机卡死。22 约 17s 重传一次，重试耗尽后报错。
 export NCCL_IB_TIMEOUT=22
+# LogKV 路由决策与注意力重叠（侧流）。先在目标 GPU 上运行
+# python unused/check_route_overlap.py，输出 bitwise_equal=true 后再设为 1。
+export LOGKV_ROUTE_OVERLAP=${LOGKV_ROUTE_OVERLAP:-0}
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_MIN_NCHANNELS=4
 
@@ -143,8 +146,6 @@ def expand(value):
 def load(path):
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    if "log_kv_semantic_summary_size" in cfg:
-        raise SystemExit("log_kv_semantic_summary_size has been removed; delete this key.")
     if "config" in cfg:
         base_path = os.path.join(os.path.dirname(path), cfg.pop("config"))
         base = load(base_path)
@@ -199,10 +200,16 @@ emit("LOG_KV_SECOND_ORDER_SCALE", value_or("log_kv_second_order_scale", 1.0))
 emit("LOG_KV_SEMANTIC", str(bool(cfg.get("log_kv_semantic_clusters", False))).lower())
 emit("LOG_KV_SEMANTIC_LEGACY_ROUTE", str(bool(cfg.get("log_kv_semantic_legacy_route", False))).lower())
 emit("LOG_KV_SEMANTIC_UNIFIED_ROUTE", str(bool(cfg.get("log_kv_semantic_unified_route", False))).lower())
+emit("LOG_KV_SEMANTIC_MERGE_PASSES", int(value_or("log_kv_semantic_merge_passes", 1)))
 emit("LOG_KV_SEMANTIC_ANCHOR_MODE", value_or("log_kv_semantic_anchor_mode", "multi"))
 emit("LOG_KV_SEMANTIC_PACK_BACKEND", value_or("log_kv_semantic_pack_backend", "auto"))
 emit("LOG_KV_SEMANTIC_CENTROID_BACKEND", value_or("log_kv_semantic_centroid_backend", "sequential"))
 emit("LOG_KV_SEMANTIC_REPLAY_UPDATES", str(bool(cfg.get("log_kv_semantic_replay_updates", False))).lower())
+# Alpha/Beta default on (semantic only); YAML 0/false disables them.
+emit("LOG_KV_ALPHA_EXACT_TOKENS", int(value_or("log_kv_alpha_exact_tokens", 256)))
+emit("LOG_KV_ALPHA_SPAN_MAX_TOKENS", int(value_or("log_kv_alpha_span_max_tokens", 64)))
+emit("LOG_KV_BETA_NOVELTY", str(bool(value_or("log_kv_beta_novelty", True))).lower())
+emit("LOG_KV_BETA_ADAPTIVE_MERGE", str(bool(value_or("log_kv_beta_adaptive_merge", True))).lower())
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
 emit("LOG_KV_CLUSTER_LAMBDA_REL", value_or("log_kv_cluster_lambda_rel", 1.0))
 emit("LOG_KV_SEG_ETA", value_or("log_kv_seg_eta", 1.0))
@@ -327,10 +334,15 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
         --log_kv_semantic_clusters true
         --log_kv_semantic_legacy_route "${LOG_KV_SEMANTIC_LEGACY_ROUTE}"
         --log_kv_semantic_unified_route "${LOG_KV_SEMANTIC_UNIFIED_ROUTE}"
+        --log_kv_semantic_merge_passes "${LOG_KV_SEMANTIC_MERGE_PASSES}"
         --log_kv_semantic_anchor_mode "${LOG_KV_SEMANTIC_ANCHOR_MODE}"
         --log_kv_semantic_pack_backend "${LOG_KV_SEMANTIC_PACK_BACKEND}"
         --log_kv_semantic_centroid_backend "${LOG_KV_SEMANTIC_CENTROID_BACKEND}"
         --log_kv_semantic_replay_updates "${LOG_KV_SEMANTIC_REPLAY_UPDATES}"
+        --log_kv_alpha_exact_tokens "${LOG_KV_ALPHA_EXACT_TOKENS}"
+        --log_kv_alpha_span_max_tokens "${LOG_KV_ALPHA_SPAN_MAX_TOKENS}"
+        --log_kv_beta_novelty "${LOG_KV_BETA_NOVELTY}"
+        --log_kv_beta_adaptive_merge "${LOG_KV_BETA_ADAPTIVE_MERGE}"
         --log_kv_cluster_k_max "${LOG_KV_CLUSTER_K_MAX}"
         --log_kv_cluster_lambda_rel "${LOG_KV_CLUSTER_LAMBDA_REL}"
         --log_kv_seg_eta "${LOG_KV_SEG_ETA}"

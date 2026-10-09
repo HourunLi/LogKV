@@ -1,53 +1,73 @@
-# SemanticLogKV
+# SemanticLogKV（attach + Alpha + Beta）
 
-基于 LitGPT 的流式 KV 压缩：统一路由让本次 flush 的 token 先形成语义候选，
-再与已有簇合并；每个簇维护有界层级缓存。压缩存储 RoPE 前的内容均值与位置统计，
-读出时施加位置旋转。在固定簇数、层宽与 recent window 下，推理 KV 存储为 O(log N)。
+基于 LitGPT 的流式 KV 压缩：flush 时把新 token 用 attach 路由分给冻结中心的旧簇，
+远离所有旧簇的 orphan 开新簇；每个簇维护有界层级缓存。Alpha 在同一缓存预算内保留可替换的
+短片段精确槽，尝试减少孤立事实被均值压缩的损失；Beta 在 Alpha 上增加旧簇新颖度评分，
+以及簇内局部四进二的自适应切分，不增加持久 KV 预算。目标是固定簇数与窗口大小下
+O(log N) 的推理 KV 存储。
 
-当前统一路由训练入口是
-[`arc_semantic_unified_cpt100.yaml`](exp/qwen1.7b-32k/arc_semantic_unified_cpt100.yaml)：
-K=12、B=128、recent/flush=2048、mid anchor、一阶 attention、增量 Ward 路由。
-新 token 逐个进入层级，没有预先 summary 均值压缩。
-`arc_semantic_fast.yaml` 保留原 fast 路由，二者不要混作同一实验。
+当前默认：attach 路由、K=12、recent/flush=2048、精确池 256 token、片段上限 64 token、
+Beta 两项开启、mid anchor、一阶 attention。精确池从原 B=128 的预算中扣除，实际 B 由代码计算。
+训练/评测入口对语义簇默认开启 Alpha/Beta、关闭 unified；YAML 写
+`log_kv_alpha_exact_tokens: 0` 关闭 Alpha 与 Beta，`log_kv_beta_*: false` 只关 Beta，
+`log_kv_semantic_unified_route: true` 切回 unified 对照。这一组合（attach + Alpha + Beta）
+本身尚无评测结果；精确槽选择是启发式，收益需实测确认。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [算法规格](docs/algorithm-spec.md) | 缓存结构、两阶段路由、层级压缩、训练回放 |
-| [统一路由实现](docs/semantic-unified-routing.md) | Ward/半径公式、增量更新、并行与数值约束 |
+| [共享算法规格](docs/algorithm-spec.md) | 缓存结构、attach / unified 路由、层级压缩、训推边界 |
+| [Alpha 精确片段算法](docs/alpha-logkv.md) | 分段、打分、替换、预算，以及延迟归档 |
+| [Beta 算法与运行入口](docs/beta-logkv.md) | 新颖度评分、低失真切分、回放约束、训练与评测 |
+| [统一路由实现](docs/semantic-unified-routing.md) | 可选 unified 路由的 Ward/半径公式、增量更新和数值约束 |
 | [位置与注意力](docs/position.md) | pre-RoPE 内容、mid/multi 锚点、质量偏置 |
 | [全程 SWA 对照](docs/swa-niah-comparison.md) | 同权重、同持久缓存字节预算的比较口径 |
 
-## 训练环境入口
+## 运行入口
 
-在仓库根目录运行。当前 CPT 配置的实际初始权重是 **Qwen3-1.7B-Base**，训练 100 步；
-已有本实验 checkpoint 时，`auto_resume` 恢复训练。运行前核对 YAML 中的训练环境路径。
-只训练，关闭 `majob.sh` 默认的后续全套评测：
+默认训练配置是 `exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml`（`_4k` 为 recent 4096），
+算法开关集中在其父配置 `arc_semantic_fast.yaml`。只训练、不触发默认的全套后续评测：
 
 ```bash
 BENCHMARKS=none NIAH_BENCHMARKS=none \
-  bash majob.sh exp/qwen1.7b-32k/arc_semantic_unified_cpt100.yaml
+  bash majob.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml
 ```
 
-完成后，只评测本次训练产物的 32K single2/3：
+训练后仅评测 32K single2/3（`eval.sh` 从 YAML 的 `save_path` 加载产物，不转发 YAML metadata）：
 
 ```bash
 DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
-  bash eval.sh exp/qwen1.7b-32k/arc_semantic_unified_cpt100.yaml niah_single_2,niah_single_3 none
+  bash eval.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 
-`eval.sh` 从 `save_path` 解析实际 checkpoint；它不转发 YAML metadata，故此处显式指定
-单档长度。第三参数 `none` 关闭默认追加的 single1/2/3 六档评测。
 多卡评测各 rank 汇合时每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印仍未到达的 rank，
 超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
-这里沿用训练 YAML；现有 `eval.yaml` 的 B=256，且未开启 unified/mid，不适用于这组对照。
 
-已完成权重的全程 SWA 配对比较使用专门入口；其语义组是原 fast 路由，详见对照文档：
+更早实验的 YAML 显式写出训练时的开关，复评不受新默认值影响：纯 attach / unified 基线为
+`arc_semantic_attach_route_*`、`arc_semantic_unified_route_*`；unified + Alpha 为 `arc_alpha_*`；
+unified + Alpha + Beta 为 `arc_beta_cpt100.yaml`。在训练环境、仓库根目录运行，并核对配置中的
+模型和输出路径。CPT 从 Base 初始化；若实验输出目录已有 checkpoint，`auto_resume` 会恢复它。
+
+## 性能开关与无 GPU 检查
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `LOGKV_ROUTE_OVERLAP` | `0` | attach 路由决策在 CUDA 侧流上与注意力重叠；开启前先在目标 GPU 运行 `python unused/check_route_overlap.py`，须逐位一致 |
+| `LOGKV_ROUTE_CUDA_GRAPH` | `1` | unified 路由从第 2 轮起整轮 CUDA graph 重放；`0` 逐核启动 |
+| `LOGKV_ROUTE_TILE_MB` | `1024` | unified 路由每 tile 距离矩阵目标大小；显存紧张设 `256` |
+
+无 GPU 时可用 Triton 解释器在 CPU 上运行融合路径（路由归约、融合距离、attach 核、Alpha
+分区等），与 Torch 参考逐位比较：
 
 ```bash
-bash unused/compare_swa_niah.sh '<已完成checkpoint目录>'
+TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1 python -m pytest -q tests/test_alpha_log_kv.py
+python -m pytest -q tests/test_log_kv_triton_interpret.py
 ```
 
-LitGPT 通用用法见 [tutorials](tutorials/)。profile 和评测输出是实验产物，必须结合
-输入形状与代码版本解读；旧测速不能代表当前实现，合成路由基准不能证明检索收益。
+解释器把 fp32→bf16 转换截断而非就近舍入（CUDA 与 Torch 为就近舍入），因此 bf16 的 op-log 回放
+用例在解释器下标为预期失败。解释器不覆盖 CUDA graph、流与性能；GPU 上用 `unused/benchmark_log_kv_unified.py --route attach`
+测量路由耗时。
+
+LitGPT 通用用法见 [tutorials](tutorials/)。运行产生的 profile 和评测文件是实验产物，
+其时间、形状和代码版本须一起解读；它们不定义当前算法。

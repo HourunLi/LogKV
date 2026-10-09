@@ -1,0 +1,6 @@
+config: arc_alpha_k12_b128.yaml
+benchmark: niah_single_2,niah_single_3
+limit: null
+metadata:
+  pretrained: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
+  max_seq_lengths: [32768]

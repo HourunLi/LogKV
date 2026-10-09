@@ -50,3 +50,8 @@ max_seq_lengths: 32768
 metadata:
   pretrained: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-logKV-semantic-fast
   max_seq_lengths: [32768]
+
+# 旧 multi 锚点配置不支持 Alpha/Beta；显式关闭。
+log_kv_alpha_exact_tokens: 0
+log_kv_beta_novelty: false
+log_kv_beta_adaptive_merge: false

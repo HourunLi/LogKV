@@ -114,8 +114,8 @@ def test_checkpoint_saved_updates_match_reference_gradients_and_release(device):
     outputs, grads, refs = [], [], []
     save = _SemanticReplayUpdates.save
 
-    def watch(tape, tensor):
-        idx = save(tape, tensor)
+    def watch(tape, tensor, owned=False):
+        idx = save(tape, tensor, owned)
         if idx is not None:
             refs.append(weakref.ref(tape.tensors[idx]))
         return idx

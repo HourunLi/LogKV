@@ -59,7 +59,8 @@ def test_host_counts_span_accumulation_and_reset_without_cuda_calls():
         assert result["attn_fwd_n"] == 32  # forward and backward reconstruction
         assert result["attn_bwd_n"] == 16
         assert result["attn_s"] == result["plan_s"] + result["pack_s"]
-        assert all(result[stage + "_s"] > 0 for stage in timing.CACHE_STAGES)
+        assert all(result[stage + "_s"] > 0 for stage in timing.CACHE_STAGES if stage != "alpha_select")
+        assert result["alpha_select_n"] == 0
         cleared = timing.logkv_take_host_stats()
         assert all(cleared[stage + "_n"] == 0 for stage in timing.CACHE_STAGES + timing.STEP_STAGES)
 

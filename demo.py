@@ -537,10 +537,17 @@ def main(
     # per-cluster ladder walk. Kept for A/B against the fast path only.
     log_kv_semantic_legacy_route: bool = False,
     log_kv_semantic_unified_route: bool = False,
+    log_kv_semantic_merge_passes: int = 1,
     log_kv_semantic_anchor_mode: str = "multi",
     log_kv_semantic_pack_backend: str = "auto",
     log_kv_semantic_centroid_backend: str = "sequential",
     log_kv_semantic_replay_updates: bool = False,
+    # Alpha exact spans + Beta scoring/merging are on by default for semantic
+    # clusters; set log_kv_alpha_exact_tokens: 0 (or the beta flags false) to disable.
+    log_kv_alpha_exact_tokens: int = 256,
+    log_kv_alpha_span_max_tokens: int = 64,
+    log_kv_beta_novelty: bool = True,
+    log_kv_beta_adaptive_merge: bool = True,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
     # ── Eval ──
@@ -567,11 +574,6 @@ def main(
             raise ValueError(
                 "eval_log_kv_* YAML keys are no longer supported; train and eval share the same LogKV config. "
                 f"Remove: {', '.join(_banned)}"
-            )
-        if "log_kv_semantic_summary_size" in _yaml:
-            raise ValueError(
-                "log_kv_semantic_summary_size has been removed; delete this key. "
-                "KV entries now remain per-token before ladder compaction."
             )
         _valid = set(inspect.signature(main).parameters)
         for _k in _yaml:
@@ -631,6 +633,15 @@ def main(
     log_kv_semantic_pack_backend = _o("log_kv_semantic_pack_backend", log_kv_semantic_pack_backend)
     log_kv_semantic_centroid_backend = _o("log_kv_semantic_centroid_backend", log_kv_semantic_centroid_backend)
     log_kv_semantic_replay_updates = bool(_o("log_kv_semantic_replay_updates", log_kv_semantic_replay_updates))
+    log_kv_alpha_exact_tokens = int(_o("log_kv_alpha_exact_tokens", log_kv_alpha_exact_tokens))
+    log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
+    log_kv_beta_novelty = bool(_o("log_kv_beta_novelty", log_kv_beta_novelty))
+    log_kv_beta_adaptive_merge = bool(_o("log_kv_beta_adaptive_merge", log_kv_beta_adaptive_merge))
+    if not log_kv_semantic_clusters:
+        log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
+    if not log_kv_alpha_exact_tokens:
+        # Beta extends the Alpha exact pool; disabling Alpha disables both Beta changes.
+        log_kv_beta_novelty = log_kv_beta_adaptive_merge = False
     log_kv_profile_steps = _o("log_kv_profile_steps", log_kv_profile_steps)
     if log_kv_profile_steps is not None and (
         not isinstance(log_kv_profile_steps, (list, tuple))
@@ -665,6 +676,7 @@ def main(
     log_kv_semantic_unified_route = bool(
         _o("log_kv_semantic_unified_route", log_kv_semantic_unified_route)
     )
+    log_kv_semantic_merge_passes = int(_o("log_kv_semantic_merge_passes", log_kv_semantic_merge_passes))
     activation_checkpointing = bool(_o("activation_checkpointing", activation_checkpointing))
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
@@ -857,10 +869,15 @@ def main(
             log_kv_semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
             log_kv_semantic_legacy_route=log_kv_semantic_legacy_route,
             log_kv_semantic_unified_route=log_kv_semantic_unified_route,
+            log_kv_semantic_merge_passes=log_kv_semantic_merge_passes,
             log_kv_semantic_anchor_mode=log_kv_semantic_anchor_mode,
             log_kv_semantic_pack_backend=log_kv_semantic_pack_backend,
             log_kv_semantic_centroid_backend=log_kv_semantic_centroid_backend,
             log_kv_semantic_replay_updates=log_kv_semantic_replay_updates,
+            log_kv_alpha_exact_tokens=log_kv_alpha_exact_tokens,
+            log_kv_alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
+            log_kv_beta_novelty=log_kv_beta_novelty,
+            log_kv_beta_adaptive_merge=log_kv_beta_adaptive_merge,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -976,6 +993,9 @@ def main(
 
     # Always simulate the logKV compressed-KV streaming attention during
     # training — this script only supports the logKV adaptation route.
+    if log_kv_alpha_exact_tokens:
+        from litgpt.tokenizer import Tokenizer
+        model.set_alpha_span_boundary_ids(Tokenizer(tok_dir).alpha_span_boundary_ids)
     model.enable_log_kv_training(
         batch_size=micro_batch_size,
         max_seq_length=context_length,
@@ -1006,10 +1026,15 @@ def main(
         semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
         semantic_legacy_route=log_kv_semantic_legacy_route,
         semantic_unified_route=log_kv_semantic_unified_route,
+        semantic_merge_passes=log_kv_semantic_merge_passes,
         semantic_anchor_mode=log_kv_semantic_anchor_mode,
         semantic_pack_backend=log_kv_semantic_pack_backend,
         semantic_centroid_backend=log_kv_semantic_centroid_backend,
         semantic_replay_updates=log_kv_semantic_replay_updates,
+        alpha_exact_tokens=log_kv_alpha_exact_tokens,
+        alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
+        beta_novelty=log_kv_beta_novelty,
+        beta_adaptive_merge=log_kv_beta_adaptive_merge,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
@@ -1032,9 +1057,13 @@ def main(
         f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
         f"legacy_route={log_kv_semantic_legacy_route}, "
         f"unified_route={log_kv_semantic_unified_route}, "
+        f"merge_passes={log_kv_semantic_merge_passes}, "
         f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
         f"centroid={log_kv_semantic_centroid_backend}, "
-        f"replay_updates={log_kv_semantic_replay_updates})"
+        f"replay_updates={log_kv_semantic_replay_updates}, "
+        f"alpha_exact={log_kv_alpha_exact_tokens}, alpha_span_max={log_kv_alpha_span_max_tokens}, "
+        f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
+        f"effective_B={model.transformer.h[0].attn.kv_cache.B})"
     )
 
     gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
