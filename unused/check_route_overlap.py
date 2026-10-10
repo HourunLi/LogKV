@@ -1,6 +1,6 @@
 """GPU check for LOGKV_ROUTE_OVERLAP: overlapped route decisions must change nothing.
 
-Runs the default route (attach + Alpha + Beta) through the real training path
+Runs the default route (attach + Alpha + Beta + Gamma) through the real training path
 (LogKVStreamTrainingAttention forward, then backward replay) and through
 prefill-style add_recent, once with decisions on the main stream and once on
 the side stream. Outputs, gradients, every cache buffer and the host mirrors
@@ -39,6 +39,7 @@ def make_cache(args, overlap, device, batch):
         cluster_k_max=args.clusters, semantic_anchor_mode="mid", semantic_centroid_backend="parallel",
         allocate_second_order=False, semantic_replay_updates=True, alpha_exact_tokens=args.exact,
         alpha_span_max_tokens=args.span, beta_novelty=True, beta_adaptive_merge=True,
+        gamma_level0_reinsert=True, gamma_top_merge="lightest",
         device=device, dtype=torch.bfloat16, cos_cache=torch.ones(n, args.dim, device=device),
         sin_cache=torch.zeros(n, args.dim, device=device), rope_n_elem=args.dim,
     )
