@@ -1,6 +1,7 @@
 """Exact reference checks for fused cache writes and ordered centroid updates."""
 
 from copy import deepcopy
+import os
 from unittest.mock import patch
 
 import pytest
@@ -10,6 +11,14 @@ import litgpt.log_kv_cache as kv
 
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/Triton")
+# With TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1 the fused kernels run on CPU, but the
+# interpreter truncates fp32->bf16 while CUDA Triton and Torch round to nearest.
+INTERPRETED = os.environ.get("TRITON_INTERPRET") == "1" and os.environ.get("LOGKV_TRITON_CPU") == "1"
+
+
+def _expect_interpreter_bf16(dtype, device="cpu"):
+    if INTERPRETED and dtype == torch.bfloat16 and device == "cpu":
+        pytest.xfail("the Triton interpreter truncates fp32->bf16; CUDA Triton and Torch round to nearest")
 
 
 def cache_for(device, dtype, B=3, dim=8, groups=2, vdim=None):
@@ -92,6 +101,7 @@ def test_fused_ladder_carry_survivors_and_clears(dtype, B, dim, vdim):
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fused_route_replay_output_and_gradients(dtype, device):
+    _expect_interpreter_bf16(dtype, device)
     # The CPU case also validates this fixture when CUDA tests are skipped.
     if device == "cuda":
         assert kv._triton_updates() is not None
@@ -189,6 +199,7 @@ def test_centroid_feature_warps_read_same_old_count(dtype, dim):
 @pytest.mark.parametrize("B", [2, 3, 64])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype):
+    _expect_interpreter_bf16(dtype)
     torch.manual_seed(713)
     cache = cache_for("cpu", dtype, B=B)
     reference = deepcopy(cache)
