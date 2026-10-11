@@ -347,6 +347,7 @@ from litgpt.model import GPT
 from litgpt.tokenizer import Tokenizer
 from lm_eval import evaluator
 from lm_eval.api.model import LM
+from lm_eval.tasks import TaskManager
 from litgpt.generate.base import generate as litgpt_generate
 from litgpt.kv_compression import cache_compression_snapshot, summarize_compression
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
@@ -1668,6 +1669,11 @@ def main(
             results = evaluator.simple_evaluate(
                 model=lm_model,
                 tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
+                # 内置任务之外再注册 eval_tasks/（如多针 NIAH）；传入 task_manager 后
+                # metadata 只经由它到达任务。
+                task_manager=TaskManager(
+                    include_path=str(Path(__file__).resolve().parent / "eval_tasks"), metadata=metadata
+                ),
                 confirm_run_unsafe_code=True,
                 batch_size=1,
                 metadata=metadata,
