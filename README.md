@@ -44,6 +44,32 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
 多卡评测各 rank 汇合时每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印仍未到达的 rank，
 超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
 
+### 多针 NIAH（RULER）
+
+lm-eval 自带的 RULER 多针任务可直接作为任务名传入：`niah_multikey_1/2/3`（多个 key 只问其一，
+2/3 的草堆全是干扰针）、`niah_multivalue`（同一 key 4 个值）、`niah_multiquery`（4 个 key 全问）。
+`eval_tasks/niah_multi/` 补充针数可变的版本，`eval.py` 自动注册：
+
+| 任务 | 针 | 生成预留 `max_gen_toks`（N=2/8/16/32） |
+|---|---|---|
+| `niah_multivalue_n{2,8,16,32}` | 同一 key 的 N 个值 | 128 / 128 / 256 / 512 |
+| `niah_multiquery_n{2,8,16,32}` | N 个 key 全部提问 | 128 / 192 / 384 / 768 |
+
+N=1、N=4 即 `niah_single_2` 与内置 `niah_multivalue`/`niah_multiquery`（同一生成器与 essay 草堆）。
+评分沿用 RULER：每条样本答出的针占比，再按长度平均。样本按生成预留缩短 prompt，避免 eval.py 为留出
+生成空间而左截断；放不下全部针、问题和预留的长度会跳过并告警。metadata 的 `niah_num_samples`
+（默认 500）设每个长度的样本数；`--limit` 只取最前面的样本，多长度时只会落在第一个长度。
+
+```bash
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768],"niah_num_samples":100}' \
+  bash eval.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml \
+  niah_multivalue_n2,niah_multivalue,niah_multivalue_n8,niah_multivalue_n16,niah_multivalue_n32 none
+```
+
+长度超过训练 `context_length` 时，还要在 `DIAG_ARGS` 加 `--config_overrides {"block_size":131072}`
+（按最大长度取值）：eval.py 的长度上限取 checkpoint 记录的 `block_size`，超出部分会被左截断。
+essay 草堆总量有限，1M 时可能不足，此时会告警，该长度的分数对应更短的上下文。
+
 ### KV 槽位压缩率
 
 `eval.sh` 默认同时报告有效 KV 槽位压缩，无需重新训练或增加开关。先用 4 条 32K 样本检查输出：
