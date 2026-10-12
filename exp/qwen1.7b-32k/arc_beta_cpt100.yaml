@@ -7,7 +7,7 @@ auto_resume: true
 expid: qwen1.7b-32k-beta-cpt100
 save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-beta-cpt100
 merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_beta_cpt100
-tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-beta-cpt100
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb/tb-32k-beta-cpt100
 
 max_steps: 100
 learning_rate: 5e-6
