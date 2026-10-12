@@ -22,6 +22,7 @@ class SpanSelection:
     archive: list[list[int]]
     spans: list[list[tuple[int, bool]]]
     positions: list[list[int]]
+    archive_positions: list[np.ndarray]  # Positions of `archive`, row by row.
 
 
 def _new_runs(new_pos, ends, pending, pending_pos, max_span):
@@ -66,19 +67,27 @@ def _new_runs(new_pos, ends, pending, pending_pos, max_span):
 
 @dataclass
 class SpanCut:
-    """Candidate whole spans of one flush; host data only."""
-    candidates: list  # Per row: (spans as (token ranges, old, closed), positions of [pool | flush]).
+    """Candidate whole spans of one flush; host NumPy data only.
+
+    Per row, candidates are the pool's closed spans, then the pending pool
+    span and the new runs; the pending span is a candidate of its own when a
+    position jump closed it, otherwise it heads the first new run.
+    """
+    positions: list  # Per row: positions of [padded old pool | flush].
     token_rows: list  # Per row: flat token indices of the spans, in span order.
     length_rows: list  # Per row: span lengths.
+    old_rows: list  # Per row: closed spans already in the pool (they get the 1.1x bonus).
+    closed_rows: list  # Per row: False only for the final unfinished span.
 
 
 def _empty_selection(rows):
     return SpanSelection([[] for _ in range(rows)], [[] for _ in range(rows)],
-                         [[] for _ in range(rows)], [[] for _ in range(rows)])
+                         [[] for _ in range(rows)], [[] for _ in range(rows)],
+                         [np.empty(0, dtype=np.int64) for _ in range(rows)])
 
 
 class _CueRow:
-    __slots__ = ("seen", "head_ids", "head_ends", "cues", "region", "pos", "slot", "chunks")
+    __slots__ = ("seen", "head_ids", "head_ends", "cues", "region", "pos", "slot", "chunks", "weights")
 
     def __init__(self):
         self.seen = 0
@@ -86,6 +95,7 @@ class _CueRow:
         self.cues, self.region = None, 0
         self.pos = self.slot = np.empty(0, dtype=np.int64)
         self.chunks = []
+        self.weights = {}  # stop -> per-cue weight; every layer archives the same blocks
 
     def add(self, ids, ends, tokens):
         start, self.seen = self.seen, self.seen + len(ids)
@@ -176,8 +186,12 @@ class CueStream:
         if not len(pos):
             return values
         n = len(state.cues)
-        counts = np.bincount(slot[:np.searchsorted(pos, stop)], minlength=n)
-        weight = np.maximum(np.log((stop + 1 + CUE_PRIOR) / (counts + 1)) - CUE_TAU, 0.)
+        weight = state.weights.get(stop)
+        if weight is None:
+            counts = np.bincount(slot[:np.searchsorted(pos, stop)], minlength=n)
+            weight = np.maximum(np.log((stop + 1 + CUE_PRIOR) / (counts + 1)) - CUE_TAU, 0.)
+            if stop <= state.seen:  # Later tokens can no longer change these counts.
+                state.weights[stop] = weight
         positions = np.asarray(positions, dtype=np.int64)
         at = np.minimum(np.searchsorted(pos, positions), len(pos) - 1)
         hit = (pos[at] == positions) & (positions >= state.region)
@@ -189,14 +203,9 @@ class CueStream:
 
 def add_cue_values(cut, host_scores, stream, stops):
     """Host scores plus each span's cue value; ``stops[b]`` ends row b's archived block."""
-    scores, offset = list(host_scores), 0
-    for b, ((_, positions), tokens, lengths) in enumerate(zip(cut.candidates, cut.token_rows, cut.length_rows)):
-        if lengths:
-            values = stream.span_values(b, positions[tokens], lengths, stops[b])
-            for i, value in enumerate(values.tolist()):
-                scores[offset + i] += value
-        offset += len(lengths)
-    return scores
+    values = [stream.span_values(b, positions[tokens], lengths, stops[b])
+              for b, (positions, tokens, lengths) in enumerate(zip(cut.positions, cut.token_rows, cut.length_rows))]
+    return (np.asarray(host_scores, dtype=np.float64) + np.concatenate(values)).tolist() if values else list(host_scores)
 
 
 def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width, budget, max_span,
@@ -220,48 +229,53 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
 
 def cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span):
     """Whole candidate spans per row (host only); None when there are none."""
-    from litgpt.log_kv_cache import _spans_to_index_array
-
-    candidates, token_rows, length_rows = [], [], []
+    positions, token_rows, length_rows, old_rows, closed_rows = [], [], [], [], []
     for spans, old_pos, new_pos, boundaries in zip(old_spans, old_positions, new_positions, ends):
-        # A span is (token ranges, old, closed); ranges are [start, stop) pairs.
-        row, offset, pending = [], 0, None
-        for length, closed in spans:
-            if closed:
-                row.append(([(offset, offset + length)], True, True))
-            else:
-                pending = (offset, offset + length)
-            offset += length
+        # Pool spans are (length, closed) and tile [0, pool length); the last
+        # unfinished one is pending.
+        pool = np.asarray(spans, dtype=np.int64).reshape(-1, 2)
+        sizes, done = pool[:, 0], pool[:, 1] != 0
+        new_pos = np.asarray(new_pos, dtype=np.int64)  # Host rows are lists: convert once.
         all_pos = np.zeros(old_width + len(new_pos), dtype=np.int64)
         all_pos[:len(old_pos)] = old_pos
         all_pos[old_width:] = new_pos
-        pending_len = 0 if pending is None else pending[1] - pending[0]
+        open_spans = np.flatnonzero(~done)
+        pending_start = pending_len = 0
+        if len(open_spans):
+            last = int(open_spans[-1])
+            pending_start, pending_len = int(sizes[:last].sum()), int(sizes[last])
         pending_closed, starts, stops, closed = _new_runs(
-            new_pos, boundaries, pending_len, int(all_pos[pending[1] - 1]) if pending_len else 0, max_span)
+            new_pos, boundaries, pending_len, int(all_pos[pending_start + pending_len - 1]) if pending_len else 0,
+            max_span)
+        runs = stops - starts
         if pending_closed:
-            row.append(([pending], False, True))
-        bounds = (starts + old_width).tolist(), (stops + old_width).tolist(), closed.tolist()
-        for i, (start, stop, done) in enumerate(zip(*bounds)):
-            ranges = [(start, stop)]
-            if not i and pending_len and not pending_closed:
-                ranges.insert(0, pending)
-            row.append((ranges, False, done))
-        if pending_len and not pending_closed and not len(starts):
-            row.append(([pending], False, False))
-        ranges = [r for span, _, _ in row for r in span]
-        tokens = _spans_to_index_array(ranges)
-        lengths = [sum(stop - start for start, stop in span) for span, _, _ in row]
-        candidates.append((row, all_pos))
+            runs, closed = np.concatenate(([pending_len], runs)), np.concatenate(([True], closed))
+        elif pending_len and len(runs):
+            runs[0] += pending_len
+        elif pending_len:
+            runs, closed = np.array([pending_len]), np.array([False])
+        # Every token appears once: closed pool spans, the pending span, the flush.
+        tokens = np.concatenate((np.flatnonzero(np.repeat(done, sizes)),
+                                 np.arange(pending_start, pending_start + pending_len),
+                                 np.arange(old_width, old_width + len(new_pos))))
+        n_old = int(done.sum())
+        positions.append(all_pos)
         token_rows.append(tokens)
-        length_rows.append(lengths)
-    if not any(length_rows):
+        length_rows.append(np.concatenate((sizes[done], runs)))
+        old_rows.append(np.arange(n_old + len(runs)) < n_old)
+        closed_rows.append(np.concatenate((np.ones(n_old, dtype=bool), closed)))
+    if not any(len(lengths) for lengths in length_rows):
         return None
-    return SpanCut(candidates, token_rows, length_rows)
+    return SpanCut(positions, token_rows, length_rows, old_rows, closed_rows)
 
 
 def score_spans(k, v, cut, *, beta_novelty=False, centroids=None, centroid_valid=None):
-    """Device tensor of span scores in candidate order; nothing is read back."""
-    from litgpt.log_kv_cache import _upload
+    """Device tensor of span scores in candidate order; nothing is read back.
+
+    CUDA (and the Triton interpreter) scores every span in one fused kernel;
+    the PyTorch form below is the reference it follows up to rounding.
+    """
+    from litgpt.log_kv_cache import _fused_on, _triton_alpha, _upload
 
     if beta_novelty and (centroids is None or centroid_valid is None):
         raise ValueError("Beta span scoring requires centroids and centroid_valid from before the flush")
@@ -269,6 +283,13 @@ def score_spans(k, v, cut, *, beta_novelty=False, centroids=None, centroid_valid
     sizes = [len(lengths) for lengths in length_rows]
     tokens = np.concatenate(token_rows)
     lengths = np.concatenate([np.asarray(row, dtype=np.int64) for row in length_rows])
+    fused = _triton_alpha() if _fused_on(k) else None
+    if fused is not None:
+        # One upload: token indices, then each span's start, length and row.
+        metadata = _upload(np.concatenate((tokens, np.cumsum(lengths) - lengths, lengths,
+                                           np.repeat(np.arange(len(sizes)), sizes))), k.device)
+        return fused.span_scores(k, v, metadata[:len(tokens)], metadata[len(tokens):].view(3, -1),
+                                 centroids if beta_novelty else None, centroid_valid if beta_novelty else None)
     token_batch = np.repeat(np.arange(len(token_rows)), [len(row) for row in token_rows])
     parts = [token_batch, tokens, lengths]
     if beta_novelty:
@@ -313,13 +334,16 @@ def score_spans(k, v, cut, *, beta_novelty=False, centroids=None, centroid_valid
 
 def choose_spans(cut, host_scores, budget):
     """Bounded whole-span greedy from host scores in candidate order."""
-    keep, archive, output_spans, output_positions = [], [], [], []
+    keep, archive, output_spans, output_positions, archive_positions = [], [], [], [], []
     offset = 0
-    for (row, positions), tokens, size in zip(cut.candidates, cut.token_rows, cut.length_rows):
-        mandatory = {i for i, (_, _, closed) in enumerate(row) if not closed}
+    for positions, tokens, lengths, old_spans, closed_spans in zip(
+            cut.positions, cut.token_rows, cut.length_rows, cut.old_rows, cut.closed_rows):
+        n = len(lengths)
+        size, old, closed = lengths.tolist(), old_spans.tolist(), closed_spans.tolist()
+        mandatory = {i for i in range(n) if not closed[i]}
         room = budget - sum(size[i] for i in mandatory)
-        density = [host_scores[offset + i] * (1.1 if old else 1.) for i, (_, old, _) in enumerate(row)]
-        chosen = mandatory | {i for i, (_, old, _) in enumerate(row) if old}
+        density = [score * 1.1 if pooled else score for score, pooled in zip(host_scores[offset:offset + n], old)]
+        chosen = mandatory | {i for i in range(n) if old[i]}
         room -= sum(size[i] for i in chosen - mandatory)
         victims = lambda: sorted(chosen - mandatory, key=lambda i: (density[i], -i))
         # Make room for the bounded unfinished tail first.
@@ -330,7 +354,7 @@ def choose_spans(cut, host_scores, budget):
             room += size[i]
         # ponytail: bounded whole-span swaps, not an exact knapsack solver.
         # A short new span must pay for EVERY token in the whole spans evicted.
-        ranked = sorted((i for i in range(len(row)) if i not in chosen), key=lambda i: (-density[i], i))
+        ranked = sorted((i for i in range(n) if i not in chosen), key=lambda i: (-density[i], i))
         victim_order = None
         for i in ranked:
             length = size[i]
@@ -352,12 +376,13 @@ def choose_spans(cut, host_scores, budget):
                 room = available - length
                 victim_order = None
         selected = sorted(chosen)
-        kept = np.zeros(len(row), dtype=bool)
+        kept = np.zeros(n, dtype=bool)
         kept[selected] = True
-        kept = np.repeat(kept, size)
+        kept = np.repeat(kept, lengths)
         keep.append(tokens[kept].tolist())
         archive.append(tokens[~kept].tolist())
-        output_spans.append([(size[i], row[i][2]) for i in selected])
+        output_spans.append([(size[i], closed[i]) for i in selected])
         output_positions.append(positions[tokens[kept]].tolist())
-        offset += len(row)
-    return SpanSelection(keep, archive, output_spans, output_positions)
+        archive_positions.append(positions[tokens[~kept]])
+        offset += n
+    return SpanSelection(keep, archive, output_spans, output_positions, archive_positions)

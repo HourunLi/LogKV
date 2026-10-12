@@ -78,6 +78,70 @@ def test_vectorized_span_runs_match_token_loop():
             _token_loop_runs(new_pos, ends, pending, pending_pos, max_span)
 
 
+def _span_loop_cut(old_spans, old_positions, new_positions, ends, old_width, max_span):
+    """The per-span candidate loop `cut_spans` vectorizes: (ranges, old, closed) per span."""
+    from litgpt.alpha_log_kv import _new_runs
+
+    rows = []
+    for spans, old_pos, new_pos, boundaries in zip(old_spans, old_positions, new_positions, ends):
+        row, offset, pending = [], 0, None
+        for length, closed in spans:
+            if closed:
+                row.append(([(offset, offset + length)], True, True))
+            else:
+                pending = (offset, offset + length)
+            offset += length
+        all_pos = [*old_pos, *[0] * (old_width - len(old_pos)), *new_pos]
+        pending_len = 0 if pending is None else pending[1] - pending[0]
+        pending_closed, starts, stops, closed = _new_runs(
+            new_pos, boundaries, pending_len, all_pos[pending[1] - 1] if pending_len else 0, max_span)
+        if pending_closed:
+            row.append(([pending], False, True))
+        for i, (start, stop, done) in enumerate(zip(starts.tolist(), stops.tolist(), closed.tolist())):
+            ranges = [(start + old_width, stop + old_width)]
+            if not i and pending_len and not pending_closed:
+                ranges.insert(0, pending)
+            row.append((ranges, False, done))
+        if pending_len and not pending_closed and not len(starts):
+            row.append(([pending], False, False))
+        rows.append((row, all_pos))
+    return rows
+
+
+def test_vectorized_span_cut_matches_span_loop():
+    from litgpt.alpha_log_kv import choose_spans, cut_spans
+
+    generator = torch.Generator().manual_seed(12)
+    randint = lambda low, high: int(torch.randint(low, high, (), generator=generator))
+    for _ in range(300):
+        max_span, count = randint(1, 8), randint(0, 16)
+        old_spans, old_positions, ends = [], [], []
+        for _ in range(randint(1, 4)):
+            # Random closed flags, including an unfinished span before the last.
+            spans = [(randint(0, max_span + 2), bool(randint(0, 4))) for _ in range(randint(0, 6))]
+            old_spans.append(spans)
+            old_positions.append(list(range(sum(n for n, _ in spans))))
+            ends.append((torch.rand(count, generator=generator) < .3).tolist())
+        steps = 1 + (torch.rand(count, generator=generator) < .15).long() * torch.randint(1, 4, (count,), generator=generator)
+        new_positions = [(100 + steps.cumsum(0)).tolist()] * len(old_spans)
+        width = max(map(len, old_positions))
+        cut = cut_spans(old_spans, old_positions, new_positions, ends, width, max_span)
+        rows = _span_loop_cut(old_spans, old_positions, new_positions, ends, width, max_span)
+        if not any(row for row, _ in rows):
+            assert cut is None
+            continue
+        for b, (row, all_pos) in enumerate(rows):
+            assert cut.positions[b].tolist() == all_pos
+            assert cut.token_rows[b].tolist() == [t for ranges, _, _ in row for a, z in ranges for t in range(a, z)]
+            assert cut.length_rows[b].tolist() == [sum(z - a for a, z in ranges) for ranges, _, _ in row]
+            assert cut.old_rows[b].tolist() == [old for _, old, _ in row]
+            assert cut.closed_rows[b].tolist() == [closed for _, _, closed in row]
+        scores = torch.rand(sum(len(row) for row, _ in rows), generator=generator).tolist()
+        selection = choose_spans(cut, scores, randint(0, 12))
+        for b, (archive, positions) in enumerate(zip(selection.archive, selection.archive_positions)):
+            assert positions.tolist() == [cut.positions[b][t] for t in archive]
+
+
 def test_spans_are_whole_and_pending_crosses_flush_and_cap():
     k = torch.randn(1, 2, 7, 8)
     result = select_spans(k, k, [[(2, False)]], [[0, 1]], [[2, 3, 4, 5, 6]],

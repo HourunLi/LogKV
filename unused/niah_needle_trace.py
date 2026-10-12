@@ -123,7 +123,7 @@ class Tracer:
         if cues is not None:
             host = al.add_cue_values(cut, host, *cues)
         layer = self.layer_of.get(id(self.current), -1)
-        row, all_pos = cut.candidates[0]
+        all_pos, old = cut.positions[0], cut.old_rows[0]
         tokens = cut.token_rows[0]
         lengths = list(cut.length_rows[0])
         span_pos = np.split(all_pos[tokens], np.cumsum(lengths)[:-1])
@@ -135,12 +135,12 @@ class Tracer:
                 chosen[i] = 1e30
         selection = al.choose_spans(cut, chosen, budget)
         if layer >= 0:
-            self._record(layer, k, v, cut, row, span_pos, lengths, host, needle_spans, needle_tokens,
+            self._record(layer, k, v, cut, old, span_pos, lengths, host, needle_spans, needle_tokens,
                          selection, centroids, centroid_valid, beta_novelty)
         return selection
 
     @torch.no_grad()
-    def _record(self, layer, k, v, cut, row, span_pos, lengths, host, needle_spans, needle_tokens,
+    def _record(self, layer, k, v, cut, old, span_pos, lengths, host, needle_spans, needle_tokens,
                 selection, centroids, centroid_valid, beta_novelty):
         tokens = torch.as_tensor(cut.token_rows[0], device=k.device)
         positions = np.concatenate(span_pos)
@@ -179,12 +179,12 @@ class Tracer:
             torch.as_tensor(surprisal, dtype=torch.float32, device=k.device)[None], lengths))
         length_t = torch.as_tensor(lengths, dtype=torch.float32, device=k.device)
         # choose_spans favours spans already in the pool by 1.1x; rank every score the same way.
-        bonus = torch.as_tensor([1.1 if old else 1.0 for _, old, _ in row], device=k.device)
+        bonus = torch.as_tensor(np.where(old, 1.1, 1.0), dtype=torch.float32, device=k.device)
         needle_len = int(sum(lengths[i] for i in needle_spans))
         kept = set(selection.keep[0])
         entry = {
             "flush_end": int(positions.max()), "candidates": len(lengths),
-            "needle_old": bool(any(row[i][1] for i in needle_spans)),
+            "needle_old": bool(old[needle_spans].any()),
             "needle_kept": bool(needle_tokens) and needle_tokens <= kept, "needle_len": needle_len,
             "ranks": {}, "tokens_needed": {},
         }

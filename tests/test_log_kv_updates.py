@@ -198,24 +198,31 @@ def test_centroid_feature_warps_read_same_old_count(dtype, dim):
 
 @pytest.mark.parametrize("B", [2, 3, 64])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype):
+@pytest.mark.parametrize("expand_on_device", [False, True])
+def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype, expand_on_device):
     _expect_interpreter_bf16(dtype)
     torch.manual_seed(713)
     cache = cache_for("cpu", dtype, B=B)
+    # CUDA uploads only the index ranges and expands them on the device.
+    cache._semantic_expand_on_device = lambda device: expand_on_device
     reference = deepcopy(cache)
     lanes = [(0, 0, 0), (0, 1, 7), (1, 0, 4), (1, 1, 1)]
     make_indices = cache._semantic_index_tensors
 
     def checked_indices(*args, **kwargs):
-        fs, fd, si, gi, pi, vi, sd, cd = result = make_indices(*args, **kwargs)
-        for index in (fs, fd, si, gi, sd, cd):
-            assert index.unique().numel() == index.numel()
-        assert pi.numel() % 2 == 0
-        # Each pool row participates in exactly one pair OR survives.
-        torch.testing.assert_close(torch.cat((pi, vi)).sort().values,
-                                   torch.arange(si.numel() + gi.numel()))
-        destinations = torch.cat((sd, cd))
-        assert destinations.unique().numel() == destinations.numel()
+        # One call plans every level: eight index tensors per level.
+        result = make_indices(*args, **kwargs)
+        assert len(result) % 8 == 0
+        for level in range(0, len(result), 8):
+            fs, fd, si, gi, pi, vi, sd, cd = result[level:level + 8]
+            for index in (fs, fd, si, gi, sd, cd):
+                assert index.unique().numel() == index.numel()
+            assert pi.numel() % 2 == 0
+            # Each pool row participates in exactly one pair OR survives.
+            torch.testing.assert_close(torch.cat((pi, vi)).sort().values,
+                                       torch.arange(si.numel() + gi.numel()))
+            destinations = torch.cat((sd, cd))
+            assert destinations.unique().numel() == destinations.numel()
         return result
 
     mass = 0.

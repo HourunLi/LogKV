@@ -96,7 +96,7 @@ unified + Alpha + Beta 为 `arc_beta_cpt100.yaml`；attach + Alpha + Beta（Gamm
 | `LOGKV_ROUTE_TILE_MB` | `1024` | unified 路由每 tile 距离矩阵目标大小；显存紧张设 `256` |
 
 无 GPU 时可用 Triton 解释器在 CPU 上运行融合路径（路由归约、融合距离、attach 核、Alpha
-分区等），与 Torch 参考逐位比较：
+分区与片段打分、join 暂存与清空等），与 Torch 参考比较（片段打分按舍入容差，其余逐位）：
 
 ```bash
 TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1 python -m pytest -q tests/test_alpha_log_kv.py

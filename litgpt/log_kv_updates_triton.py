@@ -87,6 +87,105 @@ def fill(fields, stage, src, dst):
         )
 
 
+@triton.jit(do_not_specialize=["N", "NL", "START"])
+def _stage(F, O, K, V, POS, TB, TG, TT, LROW, PERM, ORDER, N, NL, START,
+           SKB, SKG, SKT, SVB, SVG, SVT, SPB,
+           TAIL: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr):
+    """Staging row START + r: token r, or with TAIL, entry PERM[r] of [ladder rows | tokens]."""
+    r = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
+    live = r < N
+    if TAIL:
+        j = tl.load(PERM + r, live, 0).to(tl.int64)
+        ladder = live & (j < NL)
+        row = tl.load(LROW + j, ladder, 0).to(tl.int64)
+        t = j - NL
+    else:
+        ladder = r < 0
+        row = r
+        t = r
+    token = live & ~ladder
+    b = tl.load(TB + t, token, 0).to(tl.int64)
+    g = tl.load(TG + t, token, 0).to(tl.int64)
+    s = tl.load(TT + t, token, 0).to(tl.int64)
+    pos = tl.load(POS + b * SPB + s, token, 0)
+    order = tl.load(ORDER + r, live, 0)
+    out = START + r
+    d = tl.arange(0, BD).to(tl.int64)
+    for f in tl.static_range(8):
+        dim = DK if f == 0 else DV if f == 1 else 1
+        mask = (d < dim)[None, :]
+        stored = tl.load(F[f] + row[:, None] * dim + d[None, :], ladder[:, None] & mask, 0)
+        # A token enters with unit weight at its own position, unpadded.
+        if f == 0:
+            fresh = tl.load(K + (b * SKB + g * SKG + s * SKT)[:, None] + d[None, :], token[:, None] & mask, 0)
+        elif f == 1:
+            fresh = tl.load(V + (b * SVB + g * SVG + s * SVT)[:, None] + d[None, :], token[:, None] & mask, 0)
+        elif f == 2:
+            fresh = tl.full([BT, 1], 1.0, tl.float32)
+        elif f < 6:
+            fresh = pos[:, None]
+        else:
+            fresh = tl.zeros([BT, 1], tl.int32)
+        kind = O[f].dtype.element_ty
+        value = tl.where(ladder[:, None], stored.to(kind), fresh.to(kind))
+        if f == 6:
+            value = order[:, None].to(kind) + tl.zeros([BT, BD], kind)
+        tl.store(O[f] + out[:, None] * dim + d[None, :], value, live[:, None] & mask)
+
+
+def stage(out, fields, k, v, positions, tokens, order, *, start=0, ladder_rows=None, perm=None):
+    """Write first-order staging rows [start, start + len(order)) of `out`.
+
+    Row r is token (tokens[0][r], tokens[1][r], tokens[2][r]) with unit weight
+    at its own position, or with `perm`, entry perm[r] of [ladder rows
+    `ladder_rows` of the flat `fields` | those tokens]. Its order is order[r].
+    Values convert exactly: every staging dtype contains its sources'.
+    """
+    n = order.numel()
+    if not n:
+        return
+    if k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ValueError("staged K/V rows must have a contiguous last dimension")
+    if positions.stride(-1) != 1:
+        positions = positions.contiguous()
+    o, f = tuple(out[i] for i in _FIELDS), tuple(fields[i] for i in _FIELDS)
+    tb, tg, tt = tokens
+    tail = perm is not None
+    dk, dv = fields[0].size(1), fields[1].size(1)
+    _stage[(triton.cdiv(n, 8),)](
+        f, o, k, v, positions, tb, tg, tt, ladder_rows if tail else tb, perm if tail else tb, order,
+        n, ladder_rows.numel() if tail else 0, start,
+        k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2), positions.stride(0),
+        tail, dk, dv, 8, triton.next_power_of_2(max(dk, dv)), num_warps=4, enable_fp_fusion=False,
+    )
+
+
+@triton.jit(do_not_specialize=["N"])
+def _clear(F, IMP, ROWS, N, W: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr, BT: tl.constexpr,
+           BD: tl.constexpr):
+    """Zero W consecutive slots from each ROWS start in the 8 first-order fields and importance."""
+    r = tl.program_id(0).to(tl.int64) * BT + tl.arange(0, BT)
+    live = r < N * W
+    row = tl.load(ROWS + r // W, live, 0).to(tl.int64) + r % W
+    d = tl.arange(0, BD).to(tl.int64)
+    for f in tl.static_range(8):
+        dim = DK if f == 0 else DV if f == 1 else 1
+        mask = live[:, None] & (d < dim)[None, :]
+        tl.store(F[f] + row[:, None] * dim + d[None, :], tl.zeros([BT, BD], F[f].dtype.element_ty), mask)
+    tl.store(IMP + row, tl.zeros([BT], IMP.dtype.element_ty), live)
+
+
+def clear(fields, importance, starts, width):
+    """`index_fill_(0)` of `width` slots from each flat row in `starts`, one launch for all fields."""
+    if starts.numel():
+        f = tuple(fields[i] for i in _FIELDS)
+        dk, dv = fields[0].size(1), fields[1].size(1)
+        _clear[(triton.cdiv(starts.numel() * width, 16),)](
+            f, importance, starts, starts.numel(), width, dk, dv, 16, triton.next_power_of_2(max(dk, dv)),
+            num_warps=4,
+        )
+
+
 @triton.jit(do_not_specialize=["NS", "NP", "NV", "NG"])
 def _beta_merge(F, S, O, SI, GI, PI, VI, LAYOUT, CUTS, NS, NP, NV, NG,
                 DK: tl.constexpr, DV: tl.constexpr, BD: tl.constexpr, REPLAY: tl.constexpr):
