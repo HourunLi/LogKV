@@ -174,6 +174,36 @@ python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --B
   --gamma-level0-reinsert --gamma-top-merge lightest --gamma-cue-tokens 64 > route_gamma.jsonl
 ```
 
+## 每次 flush 的主机开销
+
+训练按层、按 2048 token 的块推进，每块一次 flush。这一步 GPU 计算量小，耗时主要在主机：
+PyTorch 算子与 Triton 启动、NumPy 规划，以及两次回读（片段分数、attach 决策；训练里分数在上一次
+flush 后已预取）。当前默认 Gamma 路线（attach、Beta、Gamma 梯子与 cue）的主机路径：
+
+- 候选片段由整数组切出；一个 Triton 核给全部片段打分（各 KV group 的方差比与 Beta 新颖度）。
+- 选择结果直接带出归档行的位置；attach 的分组、空闲簇枚举与 run 元数据都是整数组运算。
+- 普通 join 与延迟行共用一个暂存块，由同一个核分两次写入（延迟行在清空第 0 层之前）；清空所有
+  条目字段一次启动。
+- 层级追加先在主机规划全部层，所有层的索引一次上传；CUDA 上只上传区间（每次 flush 约一千个，
+  而不是约十万个下标），在设备上按主机已知的大小展开，不回读。
+- cue 的逐 cue 权重按归档块终点计算一次，供所有层复用。
+
+在 CPU 上用 Triton 解释器跑融合路径、扣除解释器执行核的时间，4 核机器，不含 profiler：
+
+| 每次 flush 的输入 | 主机时间 |
+|---|---|
+| 512 token，8 个 KV group，B=128，K=12，P=64，约 12 token 的自然片段，片段分数与位置无关（多数 flush 有延迟 join），cue 64 | 10.8 ms |
+| 256 token，8 个 KV group，B=128，K=12，P=64，每 32 token 一个边界的合成块状键（保留的总是块尾片段，几乎没有延迟 join），cue 64 | 5.8 ms |
+
+这里小张量算子在 CPU 上很便宜，GPU 上每个 PyTorch 算子和每次 Triton 启动的主机开销更大。按次数计
+（512 token、2 个 KV group、dim 32、B=32、P=64、bf16），每次 flush 约 32 个 PyTorch 算子、17 次
+Triton 启动、约 13 次主机到设备上传、2 次回读。
+
+GPU 上的实际收益以训练日志为准：`logKV_host` 的 `route`、`replay` 分阶段计时，或在 YAML 里设
+`log_kv_profile_steps: [3, 4, 5]` 记录 CUDA 计时。训练形状下（一次 flush 归档整个窗口块）可以让
+路由决策与注意力重叠（`LOGKV_ROUTE_OVERLAP=1`），开启前先在目标 GPU 上运行
+`python unused/check_route_overlap.py`，须逐位一致。
+
 ## 针的去向诊断
 
 [`unused/niah_needle_trace.py`](../unused/niah_needle_trace.py) 用 lm-eval 自己的 single_2/3
@@ -190,4 +220,6 @@ python unused/niah_needle_trace.py --config exp/qwen1.7b-32k/eval_gamma_cue.yaml
 测试：`tests/test_gamma_log_kv.py`（修复前后的梯子形状、上层条目不被改写、同字节余量层），
 `tests/test_gamma_cues.py`（区域截断、去重与阈值、因果与分块不变、针留在精确池、模型接线与回放签名），
 `tests/test_alpha_log_kv.py`（守恒、延迟归档、反向回放与预取，覆盖 Gamma 与 cue 开关），
-`tests/test_log_kv_updates.py`（顶层两种合并的批量与逐条路径一致）。
+`tests/test_log_kv_updates.py`（顶层两种合并的批量与逐条路径一致），
+`tests/interpret_update_check.py`（经 `tests/test_log_kv_triton_interpret.py` 在解释器上比较片段打分、
+暂存与清空核，以及整段 Gamma 轨迹）。

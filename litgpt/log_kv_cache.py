@@ -354,6 +354,15 @@ def _triton_route():
         return None
 
 
+@lru_cache(maxsize=1)
+def _triton_alpha():
+    try:
+        from litgpt import alpha_log_kv_triton
+        return alpha_log_kv_triton
+    except ImportError:
+        return None
+
+
 def _spans_to_index_array(spans: list[tuple[int, int]]) -> np.ndarray:
     """Concatenate half-open ``[start, stop)`` ranges into one int64 array."""
     if len(spans) == 0:
@@ -1833,30 +1842,51 @@ class LogStructuredKVCache(nn.Module):
                 f.index_copy_(0, tail, x.index_select(0, rs))
         self.level_imp.view(-1).index_fill_(0, fs, 0)
 
+    @staticmethod
+    def _semantic_expand_on_device(device) -> bool:
+        """CUDA expands index ranges itself; on the host NumPy beats `repeat_interleave`."""
+        return torch.device(device).type == "cuda"
+
     def _semantic_index_tensors(
-        self, device: torch.device, *span_lists: list[tuple[int, int]], extra: np.ndarray | None = None,
+        self, device: torch.device, *range_lists, extra: np.ndarray | None = None,
     ) -> list[torch.Tensor]:
         """Build several range-derived index tensors with ONE host->device copy.
 
-        ``torch.tensor(<python list>, device="cuda")`` is a blocking pageable
-        transfer, and building the list costs more on the host than the kernels
-        it feeds save. Every index here is a concatenation of contiguous ranges,
-        so numpy builds them ~35x faster and they travel together.
+        Every index here is a concatenation of contiguous ``[start, stop)``
+        ranges. On CUDA only the ranges travel (a few thousand per flush
+        instead of about a hundred thousand indices) and the device expands
+        them with sizes known on the host, so nothing is read back. `extra`
+        rides along as is.
         """
-        arrays = [_spans_to_index_array(spans) for spans in span_lists]
-        if extra is not None:
-            arrays.append(extra.reshape(-1))
-        sizes = [int(a.size) for a in arrays]
-        total = sum(sizes)
-        if total == 0:
+        bounds = [np.asarray(ranges, dtype=np.int64).reshape(-1, 2) for ranges in range_lists]
+        spans = np.concatenate(bounds) if bounds else np.empty((0, 2), dtype=np.int64)
+        lengths = np.maximum(spans[:, 1] - spans[:, 0], 0)
+        totals = np.concatenate(([0], np.cumsum(lengths)))
+        sizes = np.diff(totals[np.cumsum([0] + [len(b) for b in bounds])]).tolist()
+        total = int(totals[-1])
+        has_extra = extra is not None
+        extra = np.asarray(extra if has_extra else (), dtype=np.int64).reshape(-1)
+        if not total and not len(extra):
             empty = torch.empty(0, dtype=torch.long, device=device)
-            return [empty] * len(arrays)
-        flat = _upload(np.concatenate(arrays) if len(arrays) > 1 else arrays[0], device)
+            return [empty] * (len(sizes) + has_extra)
+        if self._semantic_expand_on_device(device):
+            live = lengths > 0
+            # Index i of a range is its start plus i: shift each start by its output offset.
+            packed = _upload(np.concatenate((spans[live, 0] - totals[:-1][live], lengths[live], extra)), device)
+            n = int(live.sum())
+            flat = (torch.repeat_interleave(packed[:n], packed[n:2 * n], output_size=total)
+                    + torch.arange(total, device=packed.device))
+            extra_t = packed[2 * n:]
+        else:
+            flat = _upload(np.concatenate((_ranges_to_index_array(spans[:, 0], lengths), extra)), device)
+            extra_t = flat[total:]
         out: list[torch.Tensor] = []
         off = 0
-        for n in sizes:
-            out.append(flat[off:off + n])
-            off += n
+        for size in sizes:
+            out.append(flat[off:off + size])
+            off += size
+        if has_extra:
+            out.append(extra_t)
         return out
 
     def _semantic_append_entries_batched(
@@ -1910,17 +1940,18 @@ class LogStructuredKVCache(nn.Module):
                  and all(x is None or x.is_contiguous() for x in block) else None)
         # Lanes are distinct, so each level is scheduled for all lanes at once
         # from a snapshot of the host counts, with one NumPy pass per level.
+        # Every level is planned before any launch: carries are host-known
+        # (each level halves its overflow), so all indices move in one copy.
         B = self.B
         lane_ids = np.asarray(lanes, dtype=np.int64).reshape(-1, 3)
         bases = ((lane_ids[:, 0] * self.n_groups + lane_ids[:, 1]) * self.K_max + lane_ids[:, 2]) * self.L_alloc * B
         level_counts = np.array([self._semantic_counts[b][g][c] for b, g, c in lanes], dtype=np.int64)
-        stage = block
         offsets = (np.cumsum(lengths) - lengths)[active]
         lengths = lengths[active]
-
+        steps, ranges, layouts = [], [], []
         for ell in range(self.L_alloc):
             if not len(active):
-                return
+                break
             top = ell == self.L_alloc - 1
             base = bases[active] + ell * B
             filled = level_counts[active, ell]
@@ -1934,6 +1965,8 @@ class LogStructuredKVCache(nn.Module):
             self._set_semantic_level_counts(lanes, active[done], ell, filled[done])
             over = ~done
             overflow_top = list(zip(active[over].tolist(), offsets[over].tolist(), lengths[over].tolist())) if top else []
+            if overflow_top:
+                self._set_semantic_level_counts(lanes, active[over], ell, np.full(int(over.sum()), B))
             carry_mask = np.zeros_like(over) if top else over
             # The pool is [gathered storage rows] ++ [gathered staging rows], so
             # staging positions shift by the total storage row count.
@@ -1956,22 +1989,30 @@ class LogStructuredKVCache(nn.Module):
             pair_idx = np.stack((store_off, store_off + ps, stage_off, stage_off + n_pair_rows - ps), -1)
             surv_idx = np.stack((store_off + ps, store_off + B,
                                  stage_off + np.maximum(0, n_pair_rows - B), stage_off + m), -1)
-            pair_idx, surv_idx = pair_idx.reshape(-1, 2), surv_idx.reshape(-1, 2)
-
-            beta_lengths, beta_layout = None, None
+            beta_lengths, layout_rows = None, 0
             if self.beta_adaptive_merge and n_recs:
                 beta_lengths = n_pair_rows.tolist()
                 if fused is not None:
                     from litgpt.beta_log_kv import make_layout
 
-                    beta_layout = make_layout(beta_lengths, "cpu").numpy()
-            indices = self._semantic_index_tensors(
-                dev, fill_src, fill_dst, store_rows, stage_rows,
-                pair_idx, surv_idx, surv_dst, clear_dst, extra=beta_layout,
-            )
-            fs, fd, si, gi, pi, vi, sd, cd = indices[:8]
-            if beta_layout is not None:
-                beta_layout = indices[8].view(-1, 3)
+                    layouts.append(make_layout(beta_lengths, "cpu").numpy())
+                    layout_rows = len(layouts[-1])
+            ranges += [fill_src, fill_dst, store_rows, stage_rows, pair_idx, surv_idx, surv_dst, clear_dst]
+            steps.append((ell, overflow_top, n_recs, beta_lengths, layout_rows))
+            if not n_recs:
+                break
+            active, lengths = active[carry_mask], carry_n
+            offsets = np.cumsum(lengths) - lengths
+
+        indices = self._semantic_index_tensors(dev, *ranges, extra=np.concatenate(layouts) if layouts else None)
+        layout_start = 0
+        stage = block
+        for step, (ell, overflow_top, n_recs, beta_lengths, layout_rows) in enumerate(steps):
+            fs, fd, si, gi, pi, vi, sd, cd = indices[8 * step:8 * step + 8]
+            beta_layout = None
+            if layout_rows:
+                beta_layout = indices[-1][3 * layout_start:3 * (layout_start + layout_rows)].view(-1, 3)
+                layout_start += layout_rows
 
             # Fill first: an overflowing lane's pooled rows include the slots this
             # very step just topped up.
@@ -1987,7 +2028,6 @@ class LogStructuredKVCache(nn.Module):
                 # One batched left fold for every saturated lane (no host syncs).
                 self._semantic_append_top_level_overflow_batched(
                     [(*lanes[i], start, n) for i, start, n in overflow_top], stage)
-                self._set_semantic_level_counts(lanes, active[over], ell, np.full(int(over.sum()), B))
 
             if not n_recs:
                 return
@@ -2031,8 +2071,6 @@ class LogStructuredKVCache(nn.Module):
                 cut_records.append((ell, self._active_updates.save(cuts)))
 
             stage = carry
-            active, lengths = active[carry_mask], carry_n
-            offsets = np.cumsum(lengths) - lengths
 
     def _semantic_append_entry_block(self, b: int, g: int, c: int, block: tuple[torch.Tensor, ...]) -> None:
         self._semantic_append_entries_batched([(b, g, c)], [block[0].size(0)], block)
@@ -2595,30 +2633,36 @@ class LogStructuredKVCache(nn.Module):
         self._mid_decode_state = None
         ids = np.fromiter(((b * self.n_groups + g) * self.K_max + c for b, g, c in lanes),
                           dtype=np.int64, count=len(lanes))
-        rows = _upload(ids * self.L_alloc, self.level_k.device)
+        self._semantic_clear_rows(ids * self.L_alloc, 1)
+        self._set_semantic_level_counts(lanes, np.arange(len(lanes)), 0, np.zeros(len(lanes), dtype=np.int64))
+
+    def _semantic_clear_rows(self, rows, levels):
+        """Zero `levels` consecutive (b, g, c, level) rows from each start in every entry field."""
+        fused = (_triton_updates() if _fused_on(self.level_k) and not self.allocate_second_order else None)
+        if fused is not None:
+            # One launch for all fields, slot by slot.
+            fused.clear(self._semantic_flat_level_fields(), self.level_imp.view(-1),
+                        _upload(rows * self.B, self.level_k.device), levels * self.B)
+            return
+        rows = _upload((rows[:, None] + np.arange(levels)).reshape(-1), self.level_k.device)
         fields = ["level_k", "level_v", "level_w", "level_imp", "level_p_lo", "level_p_hi",
                   "level_sum_wp", "level_order", "pad_mask"]
         if self.allocate_second_order:
             fields += ["level_sigma_u", "level_sigma2", "level_gamma_a", "level_gamma_b", "level_gamma"]
         for name in fields:
             getattr(self, name).flatten(0, 3).index_fill_(0, rows, 0)
-        self._set_semantic_level_counts(lanes, np.arange(len(lanes)), 0, np.zeros(len(lanes), dtype=np.int64))
 
     def _semantic_clear_clusters(self, lanes):
-        """Clear independent clusters with one indexed fill per field."""
+        """Clear independent clusters: every entry field, their Ward costs and host mirrors."""
         if not lanes:
             return
         if self._update_actions is not None:
             self._update_actions.append(("clear_batch", tuple(lanes), ()))
         self._mid_decode_state = None
-        ids = _upload(np.fromiter(((b * self.n_groups + g) * self.K_max + c for b, g, c in lanes),
-                                  dtype=np.int64, count=len(lanes)), self.level_k.device)
-        fields = ["level_k", "level_v", "level_w", "level_imp", "level_p_lo", "level_p_hi",
-                  "level_sum_wp", "level_order", "pad_mask"]
-        if self.allocate_second_order:
-            fields += ["level_sigma_u", "level_sigma2", "level_gamma_a", "level_gamma_b", "level_gamma"]
-        for name in fields:
-            getattr(self, name).flatten(0, 2).index_fill_(0, ids, 0)
+        flat = np.fromiter(((b * self.n_groups + g) * self.K_max + c for b, g, c in lanes),
+                           dtype=np.int64, count=len(lanes))
+        self._semantic_clear_rows(flat * self.L_alloc, self.L_alloc)
+        ids = _upload(flat, self.level_k.device)
         ward = self.ward_cost.flatten(0, 1)
         ward[ids // self.K_max, ids % self.K_max, :] = float("inf")
         ward[ids // self.K_max, :, ids % self.K_max] = float("inf")
@@ -3886,16 +3930,27 @@ class LogStructuredKVCache(nn.Module):
         ids, lengths_t = packed[cut[1]:cut[2]], packed[cut[2]:cut[3]]
         lane_major_t, segment_t, phase_t = packed[cut[3]:cut[4]], packed[cut[4]:cut[5]], packed[cut[5]:]
         fields = self._semantic_flat_level_fields()
-        nk, nv, np_ = k_raw[bi, gi, ti], v[bi, gi, ti], positions[bi, ti]
-        new = (nk, nv, self.level_w.new_ones(n_new), *self._empty_stats(nk, nv),
-               np_, np_, np_, self.level_order.new_zeros(n_new), self.pad_mask.new_zeros(n_new))
-        combined = tuple(torch.cat((field[src_t], value), 0) if field is not None else None
-                         for field, value in zip(fields, new))
+        nk, np_ = k_raw[bi, gi, ti], positions[bi, ti]
         # Positions are nonnegative and below 2**40; the lane id leads the key.
-        key = (segment_t << 40) | combined[8].index_select(0, lane_major_t)
+        key = (segment_t << 40) | torch.cat((fields[8][src_t], np_)).index_select(0, lane_major_t)
         order = lane_major_t.index_select(0, torch.argsort(key, stable=True))
-        # Delayed rows as (source, row index) pairs; the phases are final.
-        tail = tuple(None if x is None else (x, order) for x in combined[:11]) + ((phase_t, None), (combined[12], order))
+        # One staging block: the ordinary joins' rows, then the delayed rows in
+        # (lane, position) order with final phases. The delayed rows are staged
+        # here, before the clear below empties their source slots.
+        n_head = int(lengths[~late].sum())
+        block = self._semantic_stage_block(n_head + n_all, k_raw.dtype, v.dtype)
+        fused = self._semantic_fused_stage(k_raw, v)
+        if fused is not None:
+            fused.stage(block, fields, k_raw, v, positions, (bi, gi, ti), phase_t, start=n_head,
+                        ladder_rows=src_t, perm=order)
+        else:
+            nv = v[bi, gi, ti]
+            new = (nk, nv, self.level_w.new_ones(n_new), *self._empty_stats(nk, nv),
+                   np_, np_, np_, self.level_order.new_zeros(n_new), self.pad_mask.new_zeros(n_new))
+            for i, (out, field, value) in enumerate(zip(block, fields, new)):
+                if out is not None:
+                    source, index = (phase_t, None) if i == 11 else (torch.cat((field[src_t], value), 0), order)
+                    self._semantic_tail_rows(source, index, out[n_head:])
         new_start = np.cumsum(new_len) - new_len
         highs = np.maximum(p_hi[late], np.maximum.reduceat(new_pos, new_start)).tolist()
         sums = torch.segment_reduce(nk.float(), "sum", lengths=lengths_t, unsafe=True)
@@ -3919,14 +3974,13 @@ class LogStructuredKVCache(nn.Module):
         for b, g, _ in lanes:
             self._semantic_ward_dirty[b][g] = True
         # Ordinary and delayed lanes are disjoint and the delayed rows were
-        # gathered before the clear, so one batched ladder append serves both.
+        # staged before the clear, so one batched ladder append serves both.
         # Ordinary op rows still precede the delayed ones within each lane.
         if ordinary:
             self._semantic_commit_joins(ordinary, k_raw, v, positions, positions_host, record=record,
-                                        tail=(lanes, counts, tail))
+                                        tail=(lanes, counts, block))
         else:
-            self._semantic_append_entries_batched(lanes, counts, tuple(
-                None if part is None else self._semantic_tail_rows(*part) for part in tail))
+            self._semantic_append_entries_batched(lanes, counts, block)
         if record:
             rows = np.empty((n_new, 4), dtype=np.int64)
             rows[:, 0], rows[:, 1], rows[:, 2], rows[:, 3] = LOG_KV_OP_JOIN, lane_c[new_owner], 0, new_pos
@@ -3946,15 +4000,24 @@ class LogStructuredKVCache(nn.Module):
             return torch.index_select(source, 0, index, out=out)
         return out.copy_(source.index_select(0, index))
 
-    @classmethod
-    def _semantic_stack_rows(cls, head, part):
-        """Head rows then tail rows in one staging tensor; dtypes promote exactly."""
-        source, index = part
-        rows = source.size(0) if index is None else index.numel()
-        out = head.new_empty((head.size(0) + rows, *head.shape[1:]), dtype=torch.promote_types(head.dtype, source.dtype))
-        out[:head.size(0)].copy_(head)
-        cls._semantic_tail_rows(source, index, out[head.size(0):])
-        return out
+    def _semantic_stage_block(self, rows, k_dtype, v_dtype):
+        """Empty staging rows for every entry field.
+
+        Each dtype holds both a stored entry and a fresh token of that field
+        exactly, as concatenating them would promote.
+        """
+        token = (k_dtype, v_dtype, None, k_dtype, k_dtype, k_dtype, v_dtype, k_dtype,
+                 torch.int64, torch.int64, torch.int64, torch.int64, None)
+        return tuple(None if field is None else field.new_empty(
+            (rows, *field.shape[1:]), dtype=field.dtype if kind is None else torch.promote_types(field.dtype, kind))
+            for field, kind in zip(self._semantic_flat_level_fields(), token))
+
+    def _semantic_fused_stage(self, k_raw, v):
+        """The update kernels when they can stage first-order rows from `k_raw`/`v`, else None."""
+        if (not _fused_on(k_raw) or self.allocate_second_order
+                or k_raw.stride(-1) != 1 or v.stride(-1) != 1):
+            return None
+        return _triton_updates()
 
     # Prefetching only hides GPU latency; tests enable it on CPU to compare paths.
     _alpha_prefetch_on_cpu = False
@@ -4065,7 +4128,7 @@ class LogStructuredKVCache(nn.Module):
         from litgpt.alpha_log_kv import add_cue_values, choose_spans, select_spans
         if span_ends is None:
             raise ValueError("AlphaLogKV requires natural span boundaries")
-        old_width, old_positions = self.alpha_count, self._alpha_positions
+        old_width = self.alpha_count
         cues = self._gamma_cues(positions_host) if self.gamma_cue_tokens else None
         side = self._route_decision_stream(k, v)
         with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
@@ -4135,18 +4198,12 @@ class LogStructuredKVCache(nn.Module):
         self.alpha_count = max(map(len, selected.keep), default=0)
         self._alpha_spans, self._alpha_positions = selected.spans, selected.positions
         if width:
-            # [old pool | flush] host positions, gathered for the archive rows.
-            host = np.zeros((self.batch_size, old_width + k.size(2)), dtype=np.int64)
-            for b, old in enumerate(old_positions):
-                host[b, :len(old)] = old
-            host[:, old_width:] = positions_host
-            rows = np.zeros((self.batch_size, width), dtype=np.int64)
-            for b, row in enumerate(selected.archive):
-                rows[b, :len(row)] = row
-            live = np.arange(width) < np.asarray(counts)[:, None]
-            archive_host = np.where(live, np.take_along_axis(host, rows, 1), 0).tolist()
+            # Archived rows' host positions, zero-padded; the attach route takes one array.
+            archive_host = np.zeros((self.batch_size, width), dtype=np.int64)
+            for b, row in enumerate(selected.archive_positions):
+                archive_host[b, :len(row)] = row
             if self.semantic_unified_route:
-                self._semantic_route_unified(ak, av, ap, archive_host, record=record, token_counts=counts)
+                self._semantic_route_unified(ak, av, ap, archive_host.tolist(), record=record, token_counts=counts)
             else:
                 self._semantic_route_three_phase(ak, av, ap, archive_host, record=record, token_counts=counts,
                                                  stream=side)
@@ -4184,8 +4241,8 @@ class LogStructuredKVCache(nn.Module):
         alignment and the hard cap keep the exact host-side rules the per-cluster
         path used -- the difference is that every lane's entries land in a single
         staging block, so one batched ladder append and one batched centroid
-        update serve all of them. An optional `tail` of (lanes, counts, row
-        sources) for other, already prepared lanes joins that ladder append.
+        update serve all of them. An optional `tail` of (lanes, counts, staging
+        block) for other, already staged lanes joins that ladder append.
         """
         if not jobs:
             return
@@ -4306,8 +4363,8 @@ class LogStructuredKVCache(nn.Module):
         total = int(lengths.sum())
         rank = np.arange(total, dtype=np.int64) - starts[owner]
         lane_ids = batch * n_groups + group
-        runs = [[0, int(flat), int(count), False]
-                for flat, count in zip(lane_ids * self.K_max + cluster, lengths)]
+        runs = np.stack((np.zeros_like(lengths), lane_ids * self.K_max + cluster, lengths,
+                         np.zeros_like(lengths)), -1)
         last = pos[starts + lengths - 1]
         # Lanes are unique here (the batched append requires it), so totals can
         # be read from the mirror up front.
@@ -4393,7 +4450,7 @@ class LogStructuredKVCache(nn.Module):
         blk_tok_at: list[int] | np.ndarray,
         blk_tok_src: list[int] | np.ndarray,
         order_vals: list[int] | np.ndarray,
-        runs: list[list],
+        runs: list[list] | np.ndarray,
         pending_ops: list[tuple[int, int, list[tuple[int, int, int, int]]]],
         total: int,
         k_raw: torch.Tensor,
@@ -4406,8 +4463,8 @@ class LogStructuredKVCache(nn.Module):
 
         Shared by forward routing and op-log replay: the two differ only in how
         the plan is derived, never in how it lands. A `tail` of (lanes, counts,
-        (source, row index) per field) is staged after these rows and shares
-        the ladder append; centroid updates stay with the joined lanes.
+        staging block) holds other lanes' rows after these rows' slots; they
+        share the ladder append, and centroid updates stay with the joined lanes.
         """
         dev = k_raw.device
         if not lanes:
@@ -4424,15 +4481,14 @@ class LogStructuredKVCache(nn.Module):
         batch, group = np.divmod(lane, k_raw.size(1))
         # Include centroid metadata in the staging upload. Runs targeting the
         # same cluster keep their ordinal order; no device-to-host inspection.
+        # Runs are (ordinal, cluster, count, new segment) rows.
+        runs = np.asarray(runs, dtype=np.int64).reshape(-1, 4)
         nr = len(runs)
-        starts = np.cumsum([0] + [r[2] for r in runs[:-1]], dtype=np.int64)
-        run_order = sorted(range(nr), key=lambda j: runs[j][0])
-        ranges = []
-        for offset, j in enumerate(run_order):
-            ordinal = runs[j][0]
-            if not ranges or ranges[-1][0] != ordinal:
-                ranges.append([ordinal, offset, 0])
-            ranges[-1][2] += 1
+        starts = np.cumsum(runs[:, 2]) - runs[:, 2]
+        run_order = np.argsort(runs[:, 0], kind="stable")
+        ordinals = runs[run_order, 0]
+        first = np.flatnonzero(np.concatenate(([nr > 0], ordinals[1:] != ordinals[:-1])))
+        ranges = list(zip(ordinals[first].tolist(), first.tolist(), np.diff(np.append(first, nr)).tolist()))
         meta_offset = 4 * n_tok + len(order_vals) + nr
         packed = np.empty(meta_offset + 5 * nr, dtype=np.int64)
         packed[:n_tok] = blk_tok_at
@@ -4440,52 +4496,64 @@ class LogStructuredKVCache(nn.Module):
         packed[2 * n_tok:3 * n_tok] = group
         packed[3 * n_tok:4 * n_tok] = token
         packed[4 * n_tok:4 * n_tok + len(order_vals)] = order_vals
-        packed[4 * n_tok + len(order_vals):meta_offset] = [r[2] for r in runs]
+        packed[4 * n_tok + len(order_vals):meta_offset] = runs[:, 2]
         meta = packed[meta_offset:].reshape(5, nr)
-        meta[0] = [runs[j][1] for j in run_order]
+        meta[0] = runs[run_order, 1]
         meta[1] = run_order
         meta[2] = starts[run_order]
-        meta[3] = [runs[j][2] for j in run_order]
-        meta[4] = np.asarray([self.seg_forget if runs[j][3] else 1.0 for j in run_order],
-                             dtype=np.float32).view(np.int32)
+        meta[3] = runs[run_order, 2]
+        meta[4] = np.where(runs[run_order, 3] != 0, np.float32(self.seg_forget),
+                           np.float32(1.0)).astype(np.float32).view(np.int32)
         packed_t = _upload(packed, dev)
         at = packed_t[:n_tok]
         bi, gi, ti = packed_t[n_tok:4 * n_tok].view(3, n_tok).unbind(0)
         order_t = packed_t[4 * n_tok:4 * n_tok + len(order_vals)]
         run_lengths = packed_t[4 * n_tok + len(order_vals):meta_offset]
         metadata = packed_t[meta_offset:].view(5, nr)
-        k_sel = k_raw.detach()[bi, gi, ti]
-        v_sel = v.detach()[bi, gi, ti]
-        p_sel = positions[bi, ti].to(torch.int64)
-
-        # Both planners append token rows in increasing staging order. With
-        # no pads, `at` is the identity: gathered payloads ARE the staging block.
-        # All staging fields are read-only until copied to separate cache fields.
-        if n_tok == total:
-            block_k, block_v, block_p = k_sel, v_sel, p_sel
-            block_w = self.level_w.new_ones(total)
-            block_pad = self.pad_mask.new_zeros(total)
+        if tail is not None:
+            # The tail's staging block already holds its rows after ours.
+            append_lanes, append_counts, block = list(lanes) + list(tail[0]), list(lane_counts) + list(tail[1]), tail[2]
+            if n_tok != total:
+                raise RuntimeError("a join tail cannot follow padded rows")
+            fused = self._semantic_fused_stage(k_raw, v)
+            if fused is not None:
+                fused.stage(block, self._semantic_flat_level_fields(), k_raw, v, positions, (bi, gi, ti), order_t)
+                k_sel = block[0][:n_tok]
+            else:
+                k_sel = k_raw.detach()[bi, gi, ti]
+                v_sel = v.detach()[bi, gi, ti]
+                p_sel = positions[bi, ti].to(torch.int64)
+                head = (k_sel, v_sel, self.level_w.new_ones(total), *self._empty_stats(k_sel, v_sel),
+                        p_sel, p_sel, p_sel, order_t, self.pad_mask.new_zeros(total))
+                for out, value in zip(block, head):
+                    if out is not None:
+                        out[:n_tok].copy_(value)
         else:
-            block_k = self.level_k.new_zeros(total, self.k_dim).index_copy_(0, at, k_sel)
-            block_v = self.level_v.new_zeros(total, self.v_dim).index_copy_(0, at, v_sel)
-            block_p = self.level_p_lo.new_zeros(total).index_copy_(0, at, p_sel)
-            block_w = self.level_w.new_zeros(total).index_fill_(0, at, 1.0)
-            block_pad = self.pad_mask.new_ones(total).index_fill_(0, at, False)
-        block = (
-            block_k, block_v, block_w,
-            *self._empty_stats(block_k, block_v),
-            block_p, block_p, block_p,
-            order_t,
-            block_pad,
-        )
-        if tail is None:
-            self._semantic_append_entries_batched(lanes, lane_counts, block)
-        else:
-            tail_lanes, tail_counts, tail_rows = tail
-            self._semantic_append_entries_batched(
-                list(lanes) + list(tail_lanes), list(lane_counts) + list(tail_counts),
-                tuple(None if head is None else self._semantic_stack_rows(head, part)
-                      for head, part in zip(block, tail_rows)))
+            append_lanes, append_counts = lanes, lane_counts
+            k_sel = k_raw.detach()[bi, gi, ti]
+            v_sel = v.detach()[bi, gi, ti]
+            p_sel = positions[bi, ti].to(torch.int64)
+            # Both planners append token rows in increasing staging order. With
+            # no pads, `at` is the identity: gathered payloads ARE the staging block.
+            # All staging fields are read-only until copied to separate cache fields.
+            if n_tok == total:
+                block_k, block_v, block_p = k_sel, v_sel, p_sel
+                block_w = self.level_w.new_ones(total)
+                block_pad = self.pad_mask.new_zeros(total)
+            else:
+                block_k = self.level_k.new_zeros(total, self.k_dim).index_copy_(0, at, k_sel)
+                block_v = self.level_v.new_zeros(total, self.v_dim).index_copy_(0, at, v_sel)
+                block_p = self.level_p_lo.new_zeros(total).index_copy_(0, at, p_sel)
+                block_w = self.level_w.new_zeros(total).index_fill_(0, at, 1.0)
+                block_pad = self.pad_mask.new_ones(total).index_fill_(0, at, False)
+            block = (
+                block_k, block_v, block_w,
+                *self._empty_stats(block_k, block_v),
+                block_p, block_p, block_p,
+                order_t,
+                block_pad,
+            )
+        self._semantic_append_entries_batched(append_lanes, append_counts, block)
 
         # Keep the increasing-token sum order: atomic/tree reductions can
         # perturb centroid routing. The CUDA loop fuses that sum with the update.
@@ -4768,14 +4836,13 @@ class LogStructuredKVCache(nn.Module):
         # Position order per row (stable); padding sorts last.
         valid_host = np.arange(tokens)[None, :] < counts[:, None]
         order = np.argsort(np.where(valid_host, host_pos, np.iinfo(np.int64).max), axis=1, kind="stable")
-        free = [[self._semantic_free_clusters(b, g) for g in range(n_groups)] for b in range(n_batch)]
-        n_seed = max(len(row) for lane in free for row in lane)
-        slots = np.full((n_batch, n_groups, max(n_seed, 1)), self.K_max, dtype=np.int64)
-        n_free = np.zeros((n_batch, n_groups), dtype=np.int64)
-        for b, lane in enumerate(free):
-            for g, row in enumerate(lane):
-                slots[b, g, :len(row)] = row
-                n_free[b, g] = len(row)
+        # Free clusters per lane in index order, padded with K_max.
+        alive = np.asarray(self._semantic_alive, dtype=bool)[:n_batch, :n_groups]
+        n_free = (~alive).sum(-1).astype(np.int64)
+        n_seed = int(n_free.max(initial=0))
+        width = max(n_seed, 1)
+        slots = np.where(np.arange(width) < n_free[..., None],
+                         np.argsort(alive, axis=-1, kind="stable")[..., :width], self.K_max)
         metadata = _upload(np.concatenate((order.reshape(-1), counts, slots.reshape(-1), n_free.reshape(-1))), dev)
         cut = np.cumsum([order.size, n_batch, slots.size])
         order_t = metadata[:cut[0]].view(n_batch, tokens)
@@ -4853,16 +4920,19 @@ class LogStructuredKVCache(nn.Module):
             return
         sort = np.argsort(lane_ids * (self.K_max + 1) + clusters, kind="stable")
         lane_ids, clusters, offsets = lane_ids[sort], clusters[sort], offsets[sort]
-        bounds = np.flatnonzero((lane_ids[1:] != lane_ids[:-1]) | (clusters[1:] != clusters[:-1])) + 1
-        new_jobs, jobs = [], []
-        for lo, hi in zip([0] + bounds.tolist(), bounds.tolist() + [len(clusters)]):
-            b, g = divmod(int(lane_ids[lo]), n_groups)
-            c = int(clusters[lo])
-            if not self._semantic_alive[b][g][c]:
-                new_jobs.append((b, g, c, int(offsets[lo])))
-                lo += 1
-            if hi > lo:
-                jobs.append((b, g, c, tuple(offsets[lo:hi].tolist())))
+        starts = np.flatnonzero(np.concatenate(([True], (lane_ids[1:] != lane_ids[:-1])
+                                                | (clusters[1:] != clusters[:-1]))))
+        stops = np.append(starts[1:], len(clusters))
+        b, g = np.divmod(lane_ids[starts], n_groups)
+        c = clusters[starts]
+        # A cluster that is not alive yet opens at its earliest token.
+        new = ~np.asarray(self._semantic_alive, dtype=bool)[b, g, c]
+        new_jobs = list(zip(b[new].tolist(), g[new].tolist(), c[new].tolist(), offsets[starts[new]].tolist()))
+        starts = starts + new
+        joined = stops > starts
+        # Offsets stay NumPy slices (position order); the commits batch them as arrays.
+        jobs = list(zip(b[joined].tolist(), g[joined].tolist(), c[joined].tolist(),
+                        [offsets[lo:hi] for lo, hi in zip(starts[joined].tolist(), stops[joined].tolist())]))
         if new_jobs:
             self._semantic_new_clusters(new_jobs, k_raw, v, positions, positions_host, record=record)
         # A new cluster starts at its earliest token, so only Alpha's delayed
