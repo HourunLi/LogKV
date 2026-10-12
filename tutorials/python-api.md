@@ -1,6 +1,10 @@
 # LitGPT Python API
 
-This is a work-in-progress draft describing the current LitGPT Python API (experimental and subject to change).
+本页描述 [当前 `LLM` 实现](../litgpt/api.py) 的通用 API。SemanticLogKV 的配置与训练/评测
+由 [项目入口](../README.md) 定义；`LLM.benchmark()` 与
+[项目评测指标](../docs/evaluation-metrics.md) 的计时边界不同，不能直接合并统计。
+
+The examples below describe the current LitGPT Python API; method signatures in `litgpt/api.py` are the source of truth.
 
 
 ## Model loading
