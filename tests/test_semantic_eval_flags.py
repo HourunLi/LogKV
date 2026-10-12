@@ -27,7 +27,8 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
         parent.write_text(parent.read_text() + f"log_kv_semantic_{route}: {setting}\n"
                           f"log_kv_beta_novelty: {setting}\nlog_kv_beta_adaptive_merge: {setting}\n"
                           f"log_kv_gamma_level0_reinsert: {setting}\nlog_kv_gamma_top_merge: {top}\n"
-                          f"log_kv_gamma_level_slack: {1 if setting == 'false' else 'null'}\n")
+                          f"log_kv_gamma_level_slack: {1 if setting == 'false' else 'null'}\n"
+                          f"log_kv_gamma_cue_tokens: {0 if setting == 'false' else 'null'}\n")
     config = tmp_path / "run.yaml"
     config.write_text("config: base.yaml\n")
     source = (Path(__file__).resolve().parents[1] / script).read_text()
@@ -70,10 +71,11 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
         assert args.count(flag) == 1
         # Beta is on unless the YAML turns it off; routes stay off (attach) unless turned on.
         assert args[args.index(flag) + 1] == ("false" if setting == "false" else "true")
-    # Gamma is on unless the YAML restores the earlier ladder; slack keeps its two spare levels.
+    # Gamma is on unless the YAML restores the earlier ladder and scores; slack keeps two spare levels.
     for flag, value in (("--log_kv_gamma_level0_reinsert", "false" if setting == "false" else "true"),
                         ("--log_kv_gamma_top_merge", "fold" if setting == "false" else "lightest"),
-                        ("--log_kv_gamma_level_slack", "1" if setting == "false" else "2")):
+                        ("--log_kv_gamma_level_slack", "1" if setting == "false" else "2"),
+                        ("--log_kv_gamma_cue_tokens", "0" if setting == "false" else "64")):
         assert args.count(flag) == 1
         assert args[args.index(flag) + 1] == value
     assert args[args.index("--log_kv_semantic_anchor_mode") + 1] == anchor_mode

@@ -65,8 +65,8 @@ CUDA 一阶路径用融合 kernel 并行处理四元组，并在同一 launch �
 
 ## 最小运行入口
 
-当前默认训练配置是 Gamma 的 [`arc_gamma_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml)
-（attach + Alpha + Beta + Gamma，见 [Gamma](gamma-logkv.md)）。Gamma 之前的
+当前默认训练配置是 Gamma 的 [`arc_gamma_cue_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml)
+（attach + Alpha + Beta + Gamma，含精确池 cue 选择，见 [Gamma](gamma-logkv.md)）。Gamma 之前的
 [`arc_attach_alpha_beta_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml)
 从 Base 初始化，训练超参与 `arc_semantic_attach_route_k12_b128_2k` 基线一致，`_4k` 版本仅把 recent
 改为 4096，并显式写回旧梯子。该目录已有 checkpoint 时 `auto_resume` 恢复它。

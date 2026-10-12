@@ -2,16 +2,16 @@
 
 本文描述当前分支的共享机制：attach 路由分簇 + Alpha 精确片段 + Beta + Gamma。Alpha 的片段选择与
 预算见 [AlphaLogKV](alpha-logkv.md)，Beta 的评分与自适应压缩见 [BetaLogKV](beta-logkv.md)，
-Gamma 的延迟归档与顶层合并见 [GammaLogKV](gamma-logkv.md)，
+Gamma 的延迟归档、顶层合并与精确池 cue 选择见 [GammaLogKV](gamma-logkv.md)，
 可选的 unified 路由内核见 [统一路由](semantic-unified-routing.md)，位置读出见
 [Position / RoPE](position.md)。旧 Stage 0 路线图和未落地的设计不作为现行契约。
 
 ## 1. 当前入口与配置
 
-当前训练配置是 `exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml`，继承 `arc_semantic_fast.yaml`、
+当前训练配置是 `exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml`，继承 `arc_semantic_fast.yaml`、
 `base.yaml`；算法开关集中在 `arc_semantic_fast.yaml`。训练/评测入口（`majob.sh`、`eval.sh`、
 `demo.py`、`eval.py`）对未写出的键同样默认开启 Alpha/Beta/Gamma、关闭 unified；非语义簇路径
-自动关闭 Alpha/Beta，`alpha_exact_tokens=0` 同时关闭 Beta（Gamma 的第 0 层重排随之无作用）。
+自动关闭 Alpha/Beta，`alpha_exact_tokens=0` 同时关闭 Beta 与 cue（Gamma 的第 0 层重排随之无作用）。
 Cache API 为兼容旧路径保留保守默认值，不能把直接构造 cache 不传参数等同于默认路线。
 
 | 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 入口/当前配置 |
@@ -26,6 +26,7 @@ Cache API 为兼容旧路径保留保守默认值，不能把直接构造 cache 
 | `alpha_exact_tokens` / `alpha_span_max_tokens` | `0` / `64` | `256` / `64` |
 | `beta_novelty` / `beta_adaptive_merge` | `false` / `false` | `true` / `true` |
 | `gamma_level0_reinsert` / `gamma_top_merge` / `gamma_level_slack` | `false` / `fold` / `2` | `true` / `lightest` / `2` |
+| `gamma_cue_tokens` | `0` | `64` |
 
 当前 `recent_size`、`train_block`、`prefill_block` 均为 `2048`，上下文长度 `32768`；
 二阶修正关闭，segment 间隔保护和 padding 关闭，`seg_eta=1`、`seg_g0=2048`、
@@ -36,7 +37,8 @@ Cache API 为兼容旧路径保留保守默认值，不能把直接构造 cache 
 （`arc_semantic_attach_route_*`、`arc_semantic_unified_route_*`、`arc_semantic_unified.yaml`）
 关闭 Alpha/Beta；`arc_alpha_*` 为 unified + Alpha；`arc_beta_cpt100.yaml` 为 unified + Alpha + Beta；
 `base.yaml` 派生的 Stage-1（multi、二阶）关闭两者；`arc_attach_alpha_beta_*` 为 Gamma 之前的
-attach + Alpha + Beta。这些 YAML 都显式写回旧梯子（`gamma_level0_reinsert: false`、`gamma_top_merge: fold`）。
+attach + Alpha + Beta。这些 YAML 都显式写回旧梯子（`gamma_level0_reinsert: false`、`gamma_top_merge: fold`）
+并关闭 cue（`gamma_cue_tokens: 0`）；只带梯子修正的 `arc_gamma_k12_*` 也关闭 cue。
 
 ## 2. 存储对象与数据流
 

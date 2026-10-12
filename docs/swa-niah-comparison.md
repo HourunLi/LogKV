@@ -11,7 +11,8 @@ SWA 在 prefill 和 decode 都使用滑窗，查询位置 q 只能看到 `[q−W
 前者继承 `arc_semantic_fast.yaml`，因此是当前默认路线：attach 路由 + Alpha + Beta + Gamma。
 当前该配置为 K=12、原始 B=128（精确池从中扣除）、recent=2048、mid、一阶、逐 token 入层级。
 被比较的 checkpoint 若不是用这一路线训练的，需在两个 YAML 中写出它训练时的开关；Gamma 之前
-训练的 checkpoint 需写 `log_kv_gamma_level0_reinsert: false` 与 `log_kv_gamma_top_merge: fold`。
+训练的 checkpoint 需写 `log_kv_gamma_level0_reinsert: false` 与 `log_kv_gamma_top_merge: fold`，
+不带 cue 训练的需写 `log_kv_gamma_cue_tokens: 0`（cue 只改变精确池的选择，也可以有意只在评测时打开）。
 
 ```bash
 bash unused/compare_swa_niah.sh '<已完成checkpoint目录>'

@@ -23,3 +23,5 @@ log_kv_cluster_k_max: 12
 log_kv_recent_size: 2048
 log_kv_B: 128
 log_kv_alpha_exact_tokens: 1024
+# 早于 Gamma cue 的梯子实验：保持 K/V 片段分数，与已开始的训练一致。
+log_kv_gamma_cue_tokens: 0

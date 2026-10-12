@@ -354,7 +354,14 @@ def test_packing_includes_exact_rope_mask_and_current_gradients(device, dtype):
 
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("route", ROUTES)
-def test_model_checkpoint_and_odd_prefill_decode(beta, route):
+@pytest.mark.parametrize("cues", [0, 6])
+def test_model_checkpoint_and_odd_prefill_decode(beta, route, cues):
+    # Zero thresholds give these short streams cue evidence, so cues change selection.
+    with patch("litgpt.alpha_log_kv.CUE_TAU", 0.), patch("litgpt.alpha_log_kv.CUE_FLOOR", 0.):
+        _model_checkpoint_and_odd_prefill_decode(beta, route, cues)
+
+
+def _model_checkpoint_and_odd_prefill_decode(beta, route, cues):
     torch.manual_seed(55)
     config = Config(block_size=64, n_layer=2, n_embd=32, n_head=4, n_query_groups=2,
                     vocab_size=41, padding_multiple=1, rotary_percentage=1.)
@@ -364,9 +371,10 @@ def test_model_checkpoint_and_odd_prefill_decode(beta, route):
                   cluster_k_max=4, semantic_unified_route=route == "unified", semantic_merge_passes=1,
                   semantic_flush_granularity=8,
                   semantic_anchor_mode="mid", allocate_second_order=False, semantic_replay_updates=True,
-                  alpha_exact_tokens=8, alpha_span_max_tokens=4, beta_novelty=beta, beta_adaptive_merge=beta)
+                  alpha_exact_tokens=8, alpha_span_max_tokens=4, beta_novelty=beta, beta_adaptive_merge=beta,
+                  gamma_cue_tokens=cues)
     for model in models:
-        model.set_alpha_span_boundary_ids([0, 3, 7])
+        model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7])
         model.enable_log_kv_training(train_block=8, **kwargs)
     apply_activation_checkpointing(models[1], check_fn=lambda m: isinstance(m, Block))
     enable_logkv_checkpoint_replay(models[1], Block)
@@ -383,7 +391,7 @@ def test_model_checkpoint_and_odd_prefill_decode(beta, route):
     for a, b in zip([losses[0]] + grads[0], [losses[1]] + grads[1]):
         torch.testing.assert_close(a, b, atol=2e-6, rtol=2e-5)
     model = original.eval()
-    model.set_alpha_span_boundary_ids([0, 3, 7])
+    model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7])
     model.set_log_kv_cache(prefill_block=8, **{k: v for k, v in kwargs.items() if k != "allocate_second_order"})
     with torch.no_grad():
         model(xs[0][:, :17], input_pos=torch.arange(17))
@@ -397,13 +405,21 @@ def test_model_checkpoint_and_odd_prefill_decode(beta, route):
 
 @pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.parametrize("beta", [False, True])
-def test_score_prefetch_reproduces_on_demand_selection(route, beta):
+@pytest.mark.parametrize("cues", [0, 4])
+@patch("litgpt.alpha_log_kv.CUE_TAU", 0.)  # Short streams then carry cue evidence.
+@patch("litgpt.alpha_log_kv.CUE_FLOOR", 0.)
+def test_score_prefetch_reproduces_on_demand_selection(route, beta, cues):
+    from litgpt.alpha_log_kv import CueStream
     torch.manual_seed(91)
     k, v = torch.randn(2, 2, 96, 8), torch.randn(2, 2, 96, 8)
     ends = boundaries(96)
+    ids = torch.randint(24, (2, 96)).numpy()  # A small vocabulary, so cues recur.
     caches, hits = [], []
     for prefetch in (False, True):
-        c = cache_for(route=route, beta_novelty=beta, beta_adaptive_merge=beta)
+        c = cache_for(route=route, beta_novelty=beta, beta_adaptive_merge=beta, gamma_cue_tokens=cues)
+        if cues:
+            c.cue_stream = CueStream(cues)
+            c.cue_stream.ingest(ids, [[2 * e for e in row] for row in ends], [0, 0])
         used, original = [], c._alpha_take_prefetch
 
         def take(*args):

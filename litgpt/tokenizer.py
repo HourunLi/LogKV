@@ -29,6 +29,16 @@ class Tokenizer:
             result.append(self.eos_id)
         return tuple(sorted(set(result)))
 
+    @cached_property
+    def alpha_line_end_ids(self) -> tuple[int, ...]:
+        """Span ends that also end a line (Gamma cues cut the opening region there)."""
+        result = []
+        for i in self.alpha_span_boundary_ids:
+            text = self.processor.decode([i]) if i != self.eos_id else "\n"
+            if text.rstrip(' \t\"\'”’)]}').endswith(('\n', '\r')):
+                result.append(i)
+        return tuple(result)
+
     def __init__(self, checkpoint_dir: Path | str) -> None:
         checkpoint_dir = Path(checkpoint_dir)
         if not checkpoint_dir.exists():

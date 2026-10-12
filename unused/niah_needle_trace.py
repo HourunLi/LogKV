@@ -14,6 +14,7 @@ YAML. For each sample it reports:
     novelty_tok  per-token distance to the nearest live centroid, top quarter of the span's tokens
     instruction  per-token max cosine to the instruction prefix keys, top quarter of the span
     rarity       running in-document unigram surprisal of the token ids, top quarter of the span
+    cue          Gamma's cue value alone (64 opening tokens), whether or not the config enables cues
 - with --oracle, the needle span is forced into the exact pool at the chosen layers, which bounds
   what better selection can buy.
 
@@ -44,7 +45,8 @@ from litgpt.log_kv_cache import LogStructuredKVCache  # noqa: E402
 
 NEEDLE_RE = re.compile(r"One of the special magic (?:numbers|uuids) for (\S+) is: (\S+)\.")
 INSTRUCTION_END = "\n"  # The RULER instruction is the first line of the prompt.
-SCORES = ("cache", "variance", "novelty_tok", "instruction", "rarity")
+SCORES = ("cache", "variance", "novelty_tok", "instruction", "rarity", "cue")
+CUE_TOKENS = 64  # The diagnostic cue score's opening region (the cache uses its own setting).
 _ACTIVE: list = [None]  # The tracer the class-level patches report to.
 
 
@@ -68,12 +70,15 @@ class Tracer:
         self.oracle_spec = oracle
         self.layer_of: dict[int, int] = {}
         self.current = None
-        self.reset_sample(set(), 0, np.zeros(0, dtype=np.int64))
+        self.reset_sample(set(), 0, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64))
 
-    def reset_sample(self, needle: set[int], instruction_len: int, ids: np.ndarray):
+    def reset_sample(self, needle: set[int], instruction_len: int, ids: np.ndarray, kinds: np.ndarray):
         self.needle, self.instruction_len, self.ids = needle, instruction_len, ids
         self.instruction_keys: dict[int, torch.Tensor] = {}
         self.flushes: dict[int, list[dict]] = {}
+        self.cues = al.CueStream(CUE_TOKENS)
+        if len(ids):
+            self.cues.ingest(ids[None], kinds[None], [0])
 
     def oracle(self, layer: int) -> bool:
         spec = self.oracle_spec
@@ -108,13 +113,15 @@ class Tracer:
         al.select_spans = lambda *args, **kwargs: _ACTIVE[0].select(*args, **kwargs)
 
     def select(self, k, v, old_spans, old_positions, new_positions, ends, old_width, budget, max_span,
-               *, beta_novelty=False, centroids=None, centroid_valid=None):
+               *, beta_novelty=False, centroids=None, centroid_valid=None, cues=None):
         cut = al.cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span)
         if cut is None:
             return al._empty_selection(len(ends))
         scores = al.score_spans(k, v, cut, beta_novelty=beta_novelty, centroids=centroids,
                                 centroid_valid=centroid_valid)
         host = scores.float().cpu().tolist()
+        if cues is not None:
+            host = al.add_cue_values(cut, host, *cues)
         layer = self.layer_of.get(id(self.current), -1)
         row, all_pos = cut.candidates[0]
         tokens = cut.token_rows[0]
@@ -160,6 +167,11 @@ class Tracer:
         if layer in self.instruction_keys:
             sim = torch.nn.functional.normalize(x, dim=-1) @ self.instruction_keys[layer].transpose(1, 2)
             scores["instruction"] = _top_groups(_top_quarter(sim.amax(-1), lengths))
+        cache = self.current
+        stop = (cache._recent_pos_host[0][cache.recent_count - 1] + 1 if cache.recent_count else 0)
+        stop = max(stop, int(positions.max()) + 1)
+        cue = al.add_cue_values(cut, [0.0] * sum(len(r) for r in cut.length_rows), self.cues, [stop])
+        scores["cue"] = torch.tensor(cue[:len(lengths)], device=k.device)
         seen = self.ids[: int(positions.max()) + 1]
         counts = np.bincount(seen, minlength=int(self.ids.max()) + 1)
         distinct = max(int((counts > 0).sum()), 1)
@@ -222,10 +234,10 @@ def locate(prompt, offsets):
     return needle, value, match.group(2), s / max(len(prompt), 1)
 
 
-def trace_sample(model, tracer, ids, offsets, prompt, answers, decode, generate, reset, max_new):
+def trace_sample(model, tracer, ids, offsets, prompt, answers, decode, generate, reset, max_new, kinds):
     needle, value_tokens, value, depth = locate(prompt, offsets)
     instruction_len = next((i for i, (a, b) in enumerate(offsets) if prompt[a:b].count(INSTRUCTION_END)), 0) + 1
-    tracer.reset_sample(set(needle), instruction_len, np.asarray(ids, dtype=np.int64))
+    tracer.reset_sample(set(needle), instruction_len, np.asarray(ids, dtype=np.int64), kinds)
     snapshot = {}
     forward = model.forward
 
@@ -316,6 +328,10 @@ def main():
     if not getattr(lm, "log_kv_alpha_exact_tokens", 0):
         print("note: Alpha is off in this config; only needle fate is traced")
     tracer = Tracer(args.oracle)
+    # Boundary kinds for the diagnostic cue score: 1 span end, 2 line end.
+    kind_of = np.zeros(max(lm.tokenizer.vocab_size, lm.config.padded_vocab_size), dtype=np.int64)
+    kind_of[list(lm.tokenizer.alpha_span_boundary_ids)] = 1
+    kind_of[list(lm.tokenizer.alpha_line_end_ids)] = 2
 
     def generate(prompt, max_new):
         lm._set_eval_cache()
@@ -336,7 +352,8 @@ def main():
             offsets = [(0, 0)] * shift + [tuple(o) for o in encoded["offset_mapping"]]
             with torch.no_grad():
                 record = trace_sample(lm.model, tracer, ids, offsets, prompt, sample["outputs"],
-                                      lm.tokenizer.decode, generate, lm._reset_eval_cache, args.max_new)
+                                      lm.tokenizer.decode, generate, lm._reset_eval_cache, args.max_new,
+                                      kind_of[np.asarray(ids, dtype=np.int64)])
             record.update(task=args.task, length=args.length, oracle=args.oracle, index=sample["index"])
             out.write(json.dumps(record) + "\n")
             out.flush()

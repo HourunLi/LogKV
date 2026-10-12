@@ -10,7 +10,8 @@ EXP = Path(__file__).resolve().parents[1] / "exp" / "qwen1.7b-32k"
 DEFAULTS = dict(log_kv_alpha_exact_tokens=256, log_kv_beta_novelty=True, log_kv_beta_adaptive_merge=True,
                 log_kv_semantic_unified_route=False, log_kv_semantic_anchor_mode="multi",
                 log_kv_second_order_scale=1.0, log_kv_cluster_k_max=1,
-                log_kv_gamma_level0_reinsert=True, log_kv_gamma_top_merge="lightest", log_kv_gamma_level_slack=2)
+                log_kv_gamma_level0_reinsert=True, log_kv_gamma_top_merge="lightest", log_kv_gamma_level_slack=2,
+                log_kv_gamma_cue_tokens=64)
 LEGACY_GAMMA = dict(log_kv_gamma_level0_reinsert=False, log_kv_gamma_top_merge="fold", log_kv_gamma_level_slack=2)
 
 
@@ -29,6 +30,7 @@ def effective(name):
         out["log_kv_alpha_exact_tokens"] = 0
     if not out["log_kv_alpha_exact_tokens"]:
         out["log_kv_beta_novelty"] = out["log_kv_beta_adaptive_merge"] = False
+        out["log_kv_gamma_cue_tokens"] = 0
     return out
 
 
@@ -81,6 +83,33 @@ def test_only_gamma_experiments_and_the_hub_use_gamma(name):
         assert gamma["log_kv_gamma_level0_reinsert"] is True and gamma["log_kv_gamma_top_merge"] == "lightest"
     else:
         assert gamma == LEGACY_GAMMA, name
+
+
+CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "eval_gamma_cue.yaml"]
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_cue_experiments_and_the_hub_use_cues(name):
+    """Earlier experiments, the Gamma ladder runs included, keep the span scores they were trained with."""
+    cfg = effective(name)
+    if name in CUE or name == "arc_semantic_fast.yaml" or name.startswith("compare_niah_"):
+        assert cfg["log_kv_gamma_cue_tokens"] == 64, name
+    else:
+        assert cfg["log_kv_gamma_cue_tokens"] == 0, name
+
+
+def test_cue_experiments():
+    run = effective("arc_gamma_cue_k12_b128_2k.yaml")
+    ladder = effective("arc_gamma_k12_b128_2k.yaml")
+    # The training run differs from the Gamma ladder run only by the cue switch and its names.
+    names = ("expid", "save_path", "merged_state_staging_dir", "tensorboard_root", "log_kv_gamma_cue_tokens")
+    assert {k: v for k, v in run.items() if k not in names} == {k: v for k, v in ladder.items() if k not in names}
+    assert run["expid"] == "qwen1.7b-32k-gamma_cue_k12_b128_2k"
+    # Eval-only: the trained Alpha/Beta checkpoint, its ladder, and cues on.
+    evaluated, trained = effective("eval_gamma_cue.yaml"), effective("arc_attach_alpha_beta_k12_b128_2k.yaml")
+    assert evaluated["save_path"] == trained["save_path"]
+    assert {k: evaluated[k] for k in LEGACY_GAMMA} == LEGACY_GAMMA
+    assert evaluated["benchmark"] == "niah_single_2,niah_single_3"
 
 
 @pytest.mark.parametrize("name, exact, slack, budget", [

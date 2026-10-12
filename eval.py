@@ -788,6 +788,7 @@ class LogKVLM(LM):
         log_kv_gamma_level0_reinsert: bool = False,
         log_kv_gamma_top_merge: str = "fold",
         log_kv_gamma_level_slack: int = 2,
+        log_kv_gamma_cue_tokens: int = 0,
         tokenizer_dir: str | None = None,
         process_group=None,
     ):
@@ -837,6 +838,7 @@ class LogKVLM(LM):
         self.log_kv_gamma_level0_reinsert = bool(log_kv_gamma_level0_reinsert)
         self.log_kv_gamma_top_merge = str(log_kv_gamma_top_merge)
         self.log_kv_gamma_level_slack = int(log_kv_gamma_level_slack)
+        self.log_kv_gamma_cue_tokens = int(log_kv_gamma_cue_tokens)
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -879,7 +881,10 @@ class LogKVLM(LM):
         if is_master: print(f"🔧 正在初始化 Transformer ({mode_name})...")
         self.model = GPT(self.config).to(device).bfloat16()
         if log_kv_alpha_exact_tokens:
-            self.model.set_alpha_span_boundary_ids(self.tokenizer.alpha_span_boundary_ids)
+            self.model.set_alpha_span_boundary_ids(
+                self.tokenizer.alpha_span_boundary_ids,
+                self.tokenizer.alpha_line_end_ids if self.log_kv_gamma_cue_tokens else None,
+            )
 
         if is_master: print(f"🔄 正在加载权重...")
         checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
@@ -975,6 +980,7 @@ class LogKVLM(LM):
             gamma_level0_reinsert=self.log_kv_gamma_level0_reinsert,
             gamma_top_merge=self.log_kv_gamma_top_merge,
             gamma_level_slack=self.log_kv_gamma_level_slack,
+            gamma_cue_tokens=self.log_kv_gamma_cue_tokens,
         )
         if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
@@ -1019,7 +1025,8 @@ class LogKVLM(LM):
         if getattr(first, "semantic_clusters", False):
             self.cache_budget.update(effective_B=first.B, levels=first.L_alloc,
                                      gamma_level0_reinsert=first.gamma_level0_reinsert,
-                                     gamma_top_merge=first.gamma_top_merge, gamma_level_slack=first.gamma_level_slack)
+                                     gamma_top_merge=first.gamma_top_merge, gamma_level_slack=first.gamma_level_slack,
+                                     gamma_cue_tokens=getattr(first, "gamma_cue_tokens", 0))
         if _is_main():
             print(f"🧮 persistent cache budget (excluding shared RoPE / transient workspace): {self.cache_budget}")
 
@@ -1412,6 +1419,10 @@ def main(
     log_kv_gamma_level0_reinsert: bool = True,
     log_kv_gamma_top_merge: str = "lightest",
     log_kv_gamma_level_slack: int = 2,
+    # Gamma cues (on by default): exact-pool selection also values spans that repeat
+    # rare tokens of the stream's opening region (up to this many tokens, cut at its
+    # last line end); 0 keeps the K/V-only span scores.
+    log_kv_gamma_cue_tokens: int = 64,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1501,11 +1512,13 @@ def main(
     log_kv_gamma_level0_reinsert = bool(_o("log_kv_gamma_level0_reinsert", log_kv_gamma_level0_reinsert))
     log_kv_gamma_top_merge = str(_o("log_kv_gamma_top_merge", log_kv_gamma_top_merge))
     log_kv_gamma_level_slack = int(_o("log_kv_gamma_level_slack", log_kv_gamma_level_slack))
+    log_kv_gamma_cue_tokens = int(_o("log_kv_gamma_cue_tokens", log_kv_gamma_cue_tokens))
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
-        # Beta extends the Alpha exact pool; disabling Alpha disables both Beta changes.
+        # Beta and Gamma cues score the Alpha exact pool; disabling Alpha disables them.
         log_kv_beta_novelty = log_kv_beta_adaptive_merge = False
+        log_kv_gamma_cue_tokens = 0
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
     log_kv_seg_eta = float(_o("log_kv_seg_eta", log_kv_seg_eta))
@@ -1603,7 +1616,7 @@ def main(
                 f"replay_updates={log_kv_semantic_replay_updates}, "
                 f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
                 f"gamma_level0_reinsert={log_kv_gamma_level0_reinsert}, gamma_top_merge={log_kv_gamma_top_merge}, "
-                f"gamma_level_slack={log_kv_gamma_level_slack})"
+                f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens})"
             )
         if diag_active:
             print(
@@ -1677,6 +1690,7 @@ def main(
             log_kv_gamma_level0_reinsert=log_kv_gamma_level0_reinsert,
             log_kv_gamma_top_merge=log_kv_gamma_top_merge,
             log_kv_gamma_level_slack=log_kv_gamma_level_slack,
+            log_kv_gamma_cue_tokens=log_kv_gamma_cue_tokens,
             tokenizer_dir=tokenizer_dir,
             process_group=eval_group,
         )
@@ -1828,6 +1842,7 @@ def main(
                     "log_kv_gamma_level0_reinsert": log_kv_gamma_level0_reinsert,
                     "log_kv_gamma_top_merge": log_kv_gamma_top_merge,
                     "log_kv_gamma_level_slack": log_kv_gamma_level_slack,
+                    "log_kv_gamma_cue_tokens": log_kv_gamma_cue_tokens,
                     "results": results,
                 }
 
