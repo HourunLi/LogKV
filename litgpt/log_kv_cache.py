@@ -4049,16 +4049,16 @@ class LogStructuredKVCache(nn.Module):
         return cut, scores.tolist()
 
     def _gamma_cues(self, positions_host):
-        """(cue stream, per-row visible end) for this flush's selection."""
+        """(cue stream, per-row end of the archived block) for this flush's selection.
+
+        Evidence counts tokens up to the end of the block being archived, not
+        the recent window: the window's end depends on how input was chunked
+        (2048-token prefill vs. token-by-token decode), the block's end does not.
+        """
         if self.cue_stream is None:
             raise RuntimeError("gamma_cue_tokens needs the model's CueStream; set_log_kv_cache and "
                                "enable_log_kv_training attach it")
-        stops = []
-        for b, flushed in enumerate(positions_host):
-            # Everything this cache has seen: the recent window ends at or after the flush.
-            seen = self._recent_pos_host[b][self.recent_count - 1] + 1 if self.recent_count else 0
-            stops.append(max(seen, flushed[-1] + 1 if len(flushed) else 0))
-        return self.cue_stream, stops
+        return self.cue_stream, [flushed[-1] + 1 if len(flushed) else 0 for flushed in positions_host]
 
     @torch.no_grad()
     def _alpha_route_flush(self, k, v, positions, positions_host, span_ends, *, record):

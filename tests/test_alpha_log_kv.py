@@ -357,7 +357,8 @@ def test_packing_includes_exact_rope_mask_and_current_gradients(device, dtype):
 @pytest.mark.parametrize("cues", [0, 6])
 def test_model_checkpoint_and_odd_prefill_decode(beta, route, cues):
     # Zero thresholds give these short streams cue evidence, so cues change selection.
-    with patch("litgpt.alpha_log_kv.CUE_TAU", 0.), patch("litgpt.alpha_log_kv.CUE_FLOOR", 0.):
+    with patch("litgpt.alpha_log_kv.CUE_TAU", 0.), patch("litgpt.alpha_log_kv.CUE_FLOOR", 0.), \
+         patch("litgpt.alpha_log_kv.CUE_PRIOR", 0):
         _model_checkpoint_and_odd_prefill_decode(beta, route, cues)
 
 
@@ -366,7 +367,7 @@ def _model_checkpoint_and_odd_prefill_decode(beta, route, cues):
     config = Config(block_size=64, n_layer=2, n_embd=32, n_head=4, n_query_groups=2,
                     vocab_size=41, padding_multiple=1, rotary_percentage=1.)
     original = GPT(config)
-    models = [deepcopy(original), deepcopy(original)]
+    models = [deepcopy(original), deepcopy(original), deepcopy(original)]
     kwargs = dict(batch_size=2, B=8, recent_size=8, second_order_scale=0., semantic_clusters=True,
                   cluster_k_max=4, semantic_unified_route=route == "unified", semantic_merge_passes=1,
                   semantic_flush_granularity=8,
@@ -378,7 +379,12 @@ def _model_checkpoint_and_odd_prefill_decode(beta, route, cues):
         model.enable_log_kv_training(train_block=8, **kwargs)
     apply_activation_checkpointing(models[1], check_fn=lambda m: isinstance(m, Block))
     enable_logkv_checkpoint_replay(models[1], Block)
-    xs = [torch.randint(41, (2, n)) for n in (24, 32)]
+    # Long enough that later chunks attend pools the cues changed.
+    xs = [torch.randint(41, (2, n)) for n in (40, 48)]
+    reference = models.pop()
+    reference.enable_log_kv_training(train_block=8, **{**kwargs, "gamma_cue_tokens": 0})
+    with torch.no_grad():
+        without_cues = torch.stack([reference(x).square().mean() for x in xs])
     losses, grads = [], []
     for model in models:
         ys = [model(x).square().mean() for x in xs]
@@ -390,6 +396,7 @@ def _model_checkpoint_and_odd_prefill_decode(beta, route, cues):
         grads.append([p.grad.clone() for p in model.parameters()])
     for a, b in zip([losses[0]] + grads[0], [losses[1]] + grads[1]):
         torch.testing.assert_close(a, b, atol=2e-6, rtol=2e-5)
+    assert (losses[0] != without_cues).all() if cues else torch.equal(losses[0], without_cues)
     model = original.eval()
     model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7])
     model.set_log_kv_cache(prefill_block=8, **{k: v for k, v in kwargs.items() if k != "allocate_second_order"})
@@ -408,6 +415,7 @@ def _model_checkpoint_and_odd_prefill_decode(beta, route, cues):
 @pytest.mark.parametrize("cues", [0, 4])
 @patch("litgpt.alpha_log_kv.CUE_TAU", 0.)  # Short streams then carry cue evidence.
 @patch("litgpt.alpha_log_kv.CUE_FLOOR", 0.)
+@patch("litgpt.alpha_log_kv.CUE_PRIOR", 0)
 def test_score_prefetch_reproduces_on_demand_selection(route, beta, cues):
     from litgpt.alpha_log_kv import CueStream
     torch.manual_seed(91)

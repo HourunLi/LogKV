@@ -8,9 +8,12 @@ import torch
 
 # A cue seen in more than 1% of the stream so far carries no evidence, and a
 # span's evidence counts only above CUE_FLOOR nats; the cap keeps exp finite.
+# Frequencies count CUE_PRIOR extra tokens without the cue, so the first
+# blocks of a stream are not judged on a few hundred tokens alone.
 CUE_TAU = math.log(100.)
 CUE_FLOOR = 4.
 CUE_CAP = 30.
+CUE_PRIOR = 2048
 
 
 @dataclass
@@ -127,9 +130,10 @@ class CueStream:
 
     A row's cues are the token ids of its opening region: the first
     ``tokens`` positions cut after their last line end, else after their last
-    span end (whole when neither occurs). Evidence is read as of a position, so
-    a layer-major prefill gives every layer what a token-by-token stream would.
-    State grows with the cue occurrences only.
+    span end (whole when neither occurs). Evidence is read as of a position
+    (the cache passes the end of the block it archives), so layer-major
+    prefill, any prefill block and token-by-token decode select alike. State
+    grows with the cue occurrences only.
     """
 
     def __init__(self, tokens: int) -> None:
@@ -158,20 +162,22 @@ class CueStream:
         """``max(exp(evidence) - exp(CUE_FLOOR), 0) / length`` per span, as of ``stop``.
 
         Evidence sums, over the distinct cues a span holds outside the opening
-        region, how many nats rarer than 1% of the first ``stop`` positions each
-        one is. The floor leaves spans with weak evidence at their K/V score.
+        region, how many nats rarer than 1% of the first ``stop`` positions (plus
+        CUE_PRIOR) each one is. The floor leaves spans with weak evidence at
+        their K/V score. Before ``stop`` covers the opening region, every value
+        is 0: the region must not depend on tokens after ``stop``.
         """
         lengths = np.asarray(lengths, dtype=np.int64)
         values = np.zeros(len(lengths))
         state = self._rows[row] if row < len(self._rows) else None
-        if state is None or state.cues is None or not len(lengths):
+        if state is None or state.cues is None or stop < self.tokens or not len(lengths):
             return values
         pos, slot = state.occurrences()
         if not len(pos):
             return values
         n = len(state.cues)
         counts = np.bincount(slot[:np.searchsorted(pos, stop)], minlength=n)
-        weight = np.maximum(np.log((stop + 1) / (counts + 1)) - CUE_TAU, 0.)
+        weight = np.maximum(np.log((stop + 1 + CUE_PRIOR) / (counts + 1)) - CUE_TAU, 0.)
         positions = np.asarray(positions, dtype=np.int64)
         at = np.minimum(np.searchsorted(pos, positions), len(pos) - 1)
         hit = (pos[at] == positions) & (positions >= state.region)
@@ -182,7 +188,7 @@ class CueStream:
 
 
 def add_cue_values(cut, host_scores, stream, stops):
-    """Host scores plus each span's cue value; ``stops`` are the rows' visible ends."""
+    """Host scores plus each span's cue value; ``stops[b]`` ends row b's archived block."""
     scores, offset = list(host_scores), 0
     for b, ((_, positions), tokens, lengths) in enumerate(zip(cut.candidates, cut.token_rows, cut.length_rows)):
         if lengths:

@@ -167,9 +167,8 @@ class Tracer:
         if layer in self.instruction_keys:
             sim = torch.nn.functional.normalize(x, dim=-1) @ self.instruction_keys[layer].transpose(1, 2)
             scores["instruction"] = _top_groups(_top_quarter(sim.amax(-1), lengths))
-        cache = self.current
-        stop = (cache._recent_pos_host[0][cache.recent_count - 1] + 1 if cache.recent_count else 0)
-        stop = max(stop, int(positions.max()) + 1)
+        # As in the cache: evidence as of the end of the block being archived.
+        stop = int(positions.max()) + 1
         cue = al.add_cue_values(cut, [0.0] * sum(len(r) for r in cut.length_rows), self.cues, [stop])
         scores["cue"] = torch.tensor(cue[:len(lengths)], device=k.device)
         seen = self.ids[: int(positions.max()) + 1]
