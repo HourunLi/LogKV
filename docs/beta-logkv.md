@@ -114,4 +114,6 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
 
 实现入口：[评分](../litgpt/alpha_log_kv.py)、[压缩参考](../litgpt/beta_log_kv.py)、
 [CUDA 更新](../litgpt/log_kv_updates_triton.py)、[缓存与回放](../litgpt/log_kv_cache.py)。
-本地 CPU 检查不能确认 CUDA 编译或 A800 性能；NIAH/LongBench 收益尚待实际评测。
+本地 CPU 检查不能确认 CUDA 编译或 A800 性能；质量收益需由对应配置的实际评测确认。
+常规运行已自动记录训练吞吐、推理 prefill/decode 时延与 CUDA 峰值；字段和边界见
+[评测指标](evaluation-metrics.md)。这些是测量入口，不是 Beta 已提升质量或速度的证据。

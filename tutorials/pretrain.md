@@ -1,5 +1,8 @@
 # Pretrain LLMs with LitGPT
 
+本页是通用 LitGPT 预训练教程。SemanticLogKV 的流式 CPT 使用根目录 `majob.sh` /
+`demo.py`，配置继承、恢复训练和限制见 [项目入口](../README.md#运行入口)；本页命令不自动启用该路线。
+
 
 This document explains how to pretrain LLMs using LitGPT.
 

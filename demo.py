@@ -23,6 +23,7 @@ import re
 import inspect
 import shutil
 import glob
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -90,6 +91,34 @@ def _normal_path(path: str | os.PathLike) -> Path:
         return p.resolve()
     except OSError:
         return Path(os.path.abspath(p))
+
+
+def _training_speed_metrics(fabric, *, elapsed_s: float, tokens: int, samples: int) -> dict:
+    """Sum actual work, use the slowest rank's step time and largest device peak."""
+    counts = torch.tensor([tokens, samples], dtype=torch.int64, device=fabric.device)
+    is_cuda = fabric.device.type == "cuda"
+    spans = torch.tensor([
+        elapsed_s,
+        torch.cuda.max_memory_allocated(fabric.device) if is_cuda else 0,
+        torch.cuda.max_memory_reserved(fabric.device) if is_cuda else 0,
+    ], dtype=torch.float64, device=fabric.device)
+    if fabric.world_size > 1:
+        counts = fabric.all_reduce(counts, reduce_op="sum")
+        spans = fabric.all_reduce(spans, reduce_op="max")
+    total_tokens, total_samples = counts.tolist()
+    step_time, peak_allocated, peak_reserved = spans.tolist()
+    metrics = {
+        "train/step_time_s": step_time,
+        "train/tokens": total_tokens,
+        "train/samples": total_samples,
+        "train/tokens_per_sec": total_tokens / step_time,
+        "train/tokens_per_sec_per_device": total_tokens / step_time / fabric.world_size,
+        "train/samples_per_sec": total_samples / step_time,
+    }
+    if is_cuda:
+        metrics["train/peak_memory_allocated_bytes"] = int(peak_allocated)
+        metrics["train/peak_memory_reserved_bytes"] = int(peak_reserved)
+    return metrics
 
 
 def _checkpoint_exists(path: Path) -> bool:
@@ -1071,8 +1100,8 @@ def main(
     step_active = False
     fabric.print(
         f"LogKV timing: host counters every optimizer step; CUDA profile steps={sorted(profile_steps)}. "
-        "Console/TensorBoard timings are rank 0 only. CUDA spans include stream waits; "
-        "forward/backward totals contain the LogKV breakdown."
+        "Stage breakdowns are rank 0 only; throughput uses all ranks and synchronized step boundaries. "
+        "CUDA spans include stream waits; forward/backward totals contain the LogKV breakdown."
     )
     step_stats = MicroStepMeanStats()
     if global_step > 0:
@@ -1085,9 +1114,22 @@ def main(
         loaded_data_epoch = loaded_data_epoch.item()
     data_epoch = int(loaded_data_epoch)
     loader_iter = iter(dataloader)
+    run_start_step = global_step
+    run_time_s = 0.0
+    run_tokens = 0
+    speed_log_path = _normal_path(save_path) / "training_metrics.jsonl"
+    if fabric.global_rank == 0:
+        speed_log_path.parent.mkdir(parents=True, exist_ok=True)
+    fabric.print(f"Training speed metrics: {speed_log_path} (appended; cumulative values cover this run only)")
 
     while global_step < max_steps and not training_finished:
         if not step_active:
+            if fabric.device.type == "cuda":
+                torch.cuda.synchronize(fabric.device)
+                torch.cuda.reset_peak_memory_stats(fabric.device)
+            if fabric.world_size > 1:
+                fabric.barrier()  # Keep rank-0 logging and checkpoint I/O outside the next measured step.
+            step_tokens = step_samples = 0
             step_start_time = time.perf_counter()
             logkv_begin_step(profile_cuda=global_step + 1 in profile_steps, device=fabric.device)
             step_active = True
@@ -1106,6 +1148,8 @@ def main(
 
         is_accumulating = (micro_batch_idx + 1) % gradient_accumulation_steps != 0
         micro_batch_idx += 1
+        step_tokens += inputs.numel()
+        step_samples += inputs.size(0)
         current_second_order_scale = get_log_kv_second_order_scale(
             global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
         )
@@ -1135,8 +1179,20 @@ def main(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            kv = logkv_take_host_stats()  # CUDA synchronization only on selected steps.
+            kv = logkv_take_host_stats()
+            if fabric.device.type == "cuda" and not kv["cuda_profiled"]:
+                torch.cuda.synchronize(fabric.device)
             step_time = time.perf_counter() - step_start_time
+            speed_metrics = _training_speed_metrics(
+                fabric, elapsed_s=step_time, tokens=step_tokens, samples=step_samples,
+            )
+            run_time_s += speed_metrics["train/step_time_s"]
+            run_tokens += speed_metrics["train/tokens"]
+            speed_metrics.update({
+                "train/run_time_s": run_time_s,
+                "train/run_tokens": run_tokens,
+                "train/run_tokens_per_sec": run_tokens / run_time_s,
+            })
             now = datetime.now()
             avgs = step_stats.averages()
             metrics_txt = " | ".join(f"{k}: {v:.4f}" for k, v in sorted(avgs.items()))
@@ -1151,8 +1207,17 @@ def main(
                 f"{metrics_txt}"
                 f"2nd_scale: {current_second_order_scale:.4f} | "
                 f"{kv_txt}"
-                f"Time: {step_time:.2f}s"
+                f"Time (slowest rank): {speed_metrics['train/step_time_s']:.2f}s | "
+                f"tokens/s: {speed_metrics['train/tokens_per_sec']:.1f} global, "
+                f"{speed_metrics['train/tokens_per_sec_per_device']:.1f}/device | "
+                f"run: {run_time_s:.1f}s, {speed_metrics['train/run_tokens_per_sec']:.1f} tokens/s"
             )
+            if "train/peak_memory_allocated_bytes" in speed_metrics:
+                fabric.print(
+                    f"Peak CUDA memory (largest rank): "
+                    f"{speed_metrics['train/peak_memory_allocated_bytes'] / 2**30:.2f} GiB allocated, "
+                    f"{speed_metrics['train/peak_memory_reserved_bytes'] / 2**30:.2f} GiB reserved"
+                )
             fabric.print("step_host (inclusive): " + " | ".join(
                 f"{stage} {kv[stage + '_s']:.3f}s" for stage in STEP_STAGES
             ))
@@ -1171,8 +1236,15 @@ def main(
                 if kv["cuda_profiled"] and stage != "data":
                     timing_metrics[f"train/{prefix}_cuda_{stage}_s"] = kv[f"{stage}_cuda_s"]
             timing_metrics["train/logkv_host_attn_state_s"] = kv["attn_s"]
+            timing_metrics.update(speed_metrics)
             if fabric.global_rank == 0:
                 fabric.log_dict(timing_metrics, step=global_step + 1)
+                with speed_log_path.open("a", encoding="utf-8") as speed_log:
+                    speed_log.write(json.dumps({
+                        "step": global_step + 1, "run_start_step": run_start_step,
+                        "timestamp": now.isoformat(), "world_size": fabric.world_size,
+                        **timing_metrics,
+                    }) + "\n")
             for name, val in avgs.items():
                 fabric.log(f"train/{name}", val, step=global_step + 1)
             fabric.log("train/learning_rate", current_lr, step=global_step + 1)

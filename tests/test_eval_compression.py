@@ -30,7 +30,8 @@ class Tokenizer:
 def wrapper_class():
     # Import just the real methods, avoiding eval.py's GPU/HF runtime setup.
     source = Path(__file__).resolve().parents[1] / "eval.py"
-    cls = next(node for node in ast.parse(source.read_text()).body
+    tree = ast.parse(source.read_text())
+    cls = next(node for node in tree.body
                if isinstance(node, ast.ClassDef) and node.name == "LogKVLM")
     names = {"_score_tokens", "generate_until", "loglikelihood_rolling", "_reset_eval_cache"}
     cls.bases, cls.decorator_list = [], []
@@ -43,7 +44,10 @@ def wrapper_class():
         _rank_label=lambda: "CPU", _tqdm_position=lambda: 0,
         _request_sample_id=lambda req, **kwargs: kwargs["global_request_index"],
     )
-    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), scope)
+    helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {
+        "_synchronize_inference_device", "_reset_inference_peak_memory", "_inference_peak_memory",
+    }]
+    exec(compile(ast.Module(body=helpers + [cls], type_ignores=[]), str(source), "exec"), scope)
     old_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     yield scope["LogKVLM"]
@@ -100,6 +104,9 @@ def test_score_snapshot_precedes_reset_and_preserves_score(wrapper_class, backen
     assert record["request_type"] == "loglikelihood"
     assert {key: record[key] for key in expected_snapshot} == expected_snapshot
     assert record["processed_tokens"] == seq_len
+    speed, = lm.ppl_metrics
+    assert speed["forward_time_s"] > 0
+    assert speed["forward_tokens_per_sec"] == pytest.approx(seq_len / speed["forward_time_s"])
     if seq_len == 5:
         assert record["kv_retention_ratio"] == record["kv_compression_factor"] == 1
     else:
@@ -125,6 +132,17 @@ def test_generation_excludes_unforwarded_last_token(wrapper_class, backend, eos_
     record, = lm.compression_metrics
     assert record["request_type"] == "generate_until"
     assert record["generated_tokens"] == generated_count
+    speed, = lm.gen_metrics
+    assert speed["generated_tokens"] == generated_count
+    assert speed["decode_tokens"] == generated_count - 1
+    assert speed["total_time_s"] == pytest.approx(speed["prefill_time_s"] + speed["decode_time_s"])
+    assert speed["ttft_ms"] > 0
+    assert speed["peak_memory_allocated_bytes"] is None
+    if generated_count == 1:
+        assert speed["decode_time_s"] == 0
+        assert speed["decode_tokens_per_sec"] is speed["decode_ms_per_token"] is None
+    else:
+        assert speed["decode_tokens_per_sec"] == pytest.approx((generated_count - 1) / speed["decode_time_s"])
     assert record["processed_tokens"] == len(prompt) + generated_count - 1
     assert record["dense_slots"] == record["processed_tokens"] * 2
     assert record["retained_slots"] == record["dense_slots"]
@@ -143,3 +161,51 @@ def test_rolling_reports_each_window_with_rolling_request_type(wrapper_class):
     assert all(record["request_type"] == "loglikelihood_rolling" for record in lm.compression_metrics)
     assert all(record["kv_retention_ratio"] == 1 for record in lm.compression_metrics)
     assert_cache_reset(lm)
+
+
+def test_speed_summary_weights_tokens_by_time_and_handles_empty_decode():
+    source = Path(__file__).resolve().parents[1] / "eval.py"
+    helper = next(node for node in ast.parse(source.read_text()).body
+                  if isinstance(node, ast.FunctionDef) and node.name == "summarize_inference_metrics")
+    scope = {}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), str(source), "exec"), scope)
+    summarize = scope["summarize_inference_metrics"]
+    memory = dict(peak_memory_allocated_bytes=None, peak_memory_reserved_bytes=None)
+    rows = [
+        dict(prompt_len=100, generated_tokens=1, decode_tokens=0,
+             prefill_time_s=1., decode_time_s=0., total_time_s=1., **memory),
+        dict(prompt_len=900, generated_tokens=11, decode_tokens=10,
+             prefill_time_s=3., decode_time_s=2., total_time_s=5., **memory),
+    ]
+    summary = summarize(rows, [dict(total_seq_len=40, forward_time_s=2., **memory)])
+    gen = summary["generation"]
+    assert gen["prefill_tokens_per_sec"] == 250  # Not mean(100, 300).
+    assert gen["decode_tokens_per_sec"] == 5
+    assert gen["gen_tokens_per_sec"] == 2
+    assert gen["decode_ms_per_token"] == 200
+    assert gen["avg_ttft_ms"] == 2000
+    assert summary["scoring"]["forward_tokens_per_sec"] == 20
+    assert summarize(rows[:1], [])["generation"]["decode_tokens_per_sec"] is None
+    assert summarize([], [])["generation"]["prefill_tokens_per_sec"] is None
+    assert summarize([], [])["scoring"]["requests"] == 0
+
+
+@pytest.mark.parametrize("eos_id,expected_count", [(0, 1), (None, 3)])
+def test_generation_timing_has_exact_stage_boundaries(monkeypatch, eos_id, expected_count):
+    import litgpt.generate.base as generation
+
+    clock = [10.]
+
+    def next_token(model, input_pos, x, **kwargs):
+        clock[0] += 4. if x.numel() > 1 else 2.
+        return torch.tensor([0])
+
+    monkeypatch.setattr(generation, "next_token", next_token)
+    monkeypatch.setattr(generation.time, "perf_counter", lambda: clock[0])
+    model = SimpleNamespace(max_seq_length=8, modules=lambda: [])
+    timing = {"old": "discarded"}
+    out = generation.generate(model, torch.tensor([1, 2]), 5, eos_id=eos_id, timing=timing)
+    assert out.tolist() == [1, 2] + [0] * expected_count
+    assert timing == dict(prefill_time_s=4., decode_time_s=2. * (expected_count - 1),
+                          total_time_s=4. + 2. * (expected_count - 1),
+                          generated_tokens=expected_count, decode_tokens=expected_count - 1)

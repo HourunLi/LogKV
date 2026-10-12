@@ -211,6 +211,10 @@ Alpha 从原 `B` 对应的预算扣出精确池，重新计算有效 `B′` 与 
 精确因果 attention；写入 cache 的状态 detach。梯度只沿当前块的 Q/K/V 传播，不穿过
 历史缓存和路由选择。因此它对应固定 `train_block` 下的流式训练目标，不等于 dense 训练。
 
+当前论文实验将 CPT 适配作为方法组成部分，但 attach 分配、Alpha 选择与 Beta 切分仍是
+启发式规则，不是可学习路由器。CPT 更新模型表示；不能把训练收益直接归因于语义分簇。
+完整方法与机制诊断的比较约定见 [Baseline 选型](baselines.md)。
+
 反向重置 cache，使用前向记录重放并逐块重算 attention；activation checkpoint 重算也复用
 同一次前向的路由。当前 `semantic_replay_updates=true` 还保存 detached 的实际写入 K/V、
 小型状态与更新动作，使重放复用同一批量写入结果，避免重新分簇、选择精确片段和浮点轨迹
@@ -240,3 +244,5 @@ Beta 还记录每次局部压缩的切分位置；checkpoint 和 backward 直接
 主要实现：`litgpt/log_kv_cache.py`、`litgpt/log_kv_route_triton.py`、`litgpt/model.py`、
 `litgpt/log_kv_pack.py`。维护时优先检查质量/mass、原始位置、预算和 forward/replay 一致性；
 性能数值必须注明设备、输入规模和是否包含 profiler 开销。
+有效槽位、持久分配字节和 CUDA 峰值各有不同边界，统一见
+[评测指标与性能口径](evaluation-metrics.md)，不能互相替代。

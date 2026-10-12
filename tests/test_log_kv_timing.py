@@ -3,6 +3,7 @@
 from unittest.mock import Mock, patch
 import ast
 import inspect
+import json
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -100,7 +101,7 @@ def test_cuda_events_are_consumed_once_at_step_end_and_disabled_afterwards():
         assert sync.call_count == 1
 
 
-def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time():
+def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time(tmp_path):
     # Execute the actual training loop without loading datasets/model checkpoints.
     source = ast.parse((Path(__file__).resolve().parents[1] / "demo.py").read_text())
     main = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == "main")
@@ -123,7 +124,7 @@ def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time():
         return path
 
     fabric = Mock()
-    fabric.device, fabric.global_rank = torch.device("cpu"), 0
+    fabric.device, fabric.global_rank, fabric.world_size = torch.device("cpu"), 0, 1
     fabric.no_backward_sync.side_effect = lambda *args, **kwargs: nullcontext()
     fabric.backward.side_effect = lambda loss: advance(2)
     model = Mock(side_effect=forward)
@@ -145,8 +146,12 @@ def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time():
         CACHE_STAGES=timing.CACHE_STAGES, STEP_STAGES=timing.STEP_STAGES,
         save_ckpt=True, save_interval=3, save_path="unused", _unique_save_dir=lambda path: path,
         _save_training_checkpoint=save,
+        torch=torch, json=json, run_start_step=2, run_time_s=0., run_tokens=0,
+        speed_log_path=tmp_path / "training_metrics.jsonl",
     )
-    exec(compile(ast.Module(body=[loop], type_ignores=[]), "demo.py", "exec"), scope)
+    speed_helper = next(node for node in source.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "_training_speed_metrics")
+    exec(compile(ast.Module(body=[speed_helper, loop], type_ignores=[]), "demo.py", "exec"), scope)
     assert selections == [True, False]  # resumed global steps 3 and 4
     assert scope["global_step"] == 4 and not scope["step_active"]
     assert clock[0] == 218  # two 9-second steps plus two 100-second checkpoint writes
@@ -155,6 +160,37 @@ def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time():
         assert metrics["train/step_host_s"] == 9
         assert metrics["train/step_forward_calls"] == metrics["train/step_backward_calls"] == 2
         assert metrics["train/step_optimizer_calls"] == 1
+        assert metrics["train/tokens"] == 8  # Both micro-batches, not the configured global batch size.
+        assert metrics["train/samples"] == 2
+        assert metrics["train/tokens_per_sec"] == pytest.approx(8 / 9)
+        assert metrics["train/tokens_per_sec_per_device"] == pytest.approx(8 / 9)
+    rows = [json.loads(line) for line in scope["speed_log_path"].read_text().splitlines()]
+    assert [row["step"] for row in rows] == [3, 4]
+    assert rows[-1]["train/run_time_s"] == 18
+    assert rows[-1]["train/run_tokens"] == 16
+    assert rows[-1]["run_start_step"] == 2
+
+
+def test_training_speed_uses_actual_global_tokens_and_slowest_rank():
+    source = ast.parse((Path(__file__).resolve().parents[1] / "demo.py").read_text())
+    helper = next(node for node in source.body
+                  if isinstance(node, ast.FunctionDef) and node.name == "_training_speed_metrics")
+    scope = {"torch": torch}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), "demo.py", "exec"), scope)
+
+    def reduce(value, reduce_op):
+        if reduce_op == "sum":
+            return value + value.new_tensor([12, 3])
+        assert reduce_op == "max"
+        return torch.maximum(value, value.new_tensor([4., 0., 0.]))
+
+    fabric = SimpleNamespace(device=torch.device("cpu"), world_size=2, all_reduce=reduce)
+    metrics = scope["_training_speed_metrics"](fabric, elapsed_s=2., tokens=8, samples=2)
+    assert metrics["train/tokens"] == 20
+    assert metrics["train/step_time_s"] == 4
+    assert metrics["train/tokens_per_sec"] == 5
+    assert metrics["train/tokens_per_sec_per_device"] == 2.5
+    assert metrics["train/samples_per_sec"] == 1.25
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
