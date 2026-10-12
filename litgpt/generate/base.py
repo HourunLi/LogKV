@@ -137,6 +137,7 @@ def generate_fn(
     stop_tokens: tuple[list[int], ...] = (),
     include_prompt: bool,
     include_eos: bool,
+    timing: dict | None = None,
 ) -> Iterator[torch.Tensor]:
     """
     Generates tokens for a single prompt.
@@ -151,6 +152,8 @@ def generate_fn(
         stop_tokens: A tuple of stop sequences. If any of the sequences are generated, the generation stops early before max_returned_tokens.
         include_prompt: Whether to output the prompt tokens.
         include_eos: Whether to output the stop tokens if generation stops early.
+        timing: Optional output dict with wall times through the last computed token, including EOS.
+            Stream consumer pauses count toward decode time; consume continuously for benchmarking.
     """
 
     prompt_size = prompt.size(0)
@@ -165,6 +168,12 @@ def generate_fn(
     # Yield the prompt if include_prompt is True
     if include_prompt:
         yield prompt
+
+    if timing is not None:
+        timing.clear()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        generation_start = time.perf_counter()
 
     stop_progress = [0] * len(stop_tokens)
     yielded_idx = 0
@@ -193,6 +202,17 @@ def generate_fn(
         )
         tokens.append(token)
         int_token = token.item()
+        if timing is not None:
+            # item() already waits for this token; no extra synchronization per decode step.
+            elapsed = time.perf_counter() - generation_start
+            if prefill_token:
+                timing["prefill_time_s"] = elapsed
+            timing.update(
+                total_time_s=elapsed,
+                decode_time_s=elapsed - timing["prefill_time_s"],
+                generated_tokens=current_idx + 1,
+                decode_tokens=current_idx,
+            )
 
         # Check for stop sequences
         # For each stop sequence, we keep a running total of how many are matched in stop_progress.
@@ -380,6 +400,7 @@ def generate(
     top_p: float = 1.0,
     eos_id: int | None = None,
     include_prompt: bool = True,
+    timing: dict | None = None,
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
@@ -407,6 +428,7 @@ def generate(
             or https://huyenchip.com/2024/01/16/sampling.html#top_p
         eos_id: If specified, stop generating any more token once the <eos> token is triggered.
         include_prompt: If true (default) prepends the prompt (after applying the prompt style) to the output.
+        timing: Optional output dict for prefill (through first token), decode, total seconds and token counts.
     """
 
     token_list = list(
@@ -420,6 +442,7 @@ def generate(
             top_k=top_k,
             top_p=top_p,
             stop_tokens=(([eos_id],) if eos_id is not None else ()),
+            timing=timing,
         )
     )
 

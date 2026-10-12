@@ -1,5 +1,8 @@
 # Inference
 
+本页介绍通用生成接口，不自动启用 SemanticLogKV。压缩模型的当前评测入口见
+[项目 README](../README.md#运行入口)，缓存和时延指标见 [指标口径](../docs/evaluation-metrics.md)。
+
 We demonstrate how to run inference (next token prediction) with the GPT base model in the [`litgpt generate`](../litgpt/generate/base.py) command:
 
 ```bash

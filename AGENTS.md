@@ -3,6 +3,8 @@
 当前算法入口是 [README](README.md)、[共享算法规格](docs/algorithm-spec.md) 和
 [Alpha 精确片段算法](docs/alpha-logkv.md)。以当前源码和实际加载的 YAML 为准，
 不要把旧分支、旧实验的参数或分数当成当前默认。
+评测字段只在 [指标口径](docs/evaluation-metrics.md) 定义；论文候选与源码核实状态见
+[Baseline 选型](docs/baselines.md)，候选列表不代表已接入或已复现。
 
 - 默认中文，先给结论。只询问会改变实现选择的信息，常规可逆工作直接推进。
 - 当前默认路线是 attach 路由 + Alpha + Beta（入口参数与 `arc_semantic_fast.yaml` 默认开启）；
@@ -13,3 +15,5 @@
 - 优先已有工具和小检查。训练使用 `majob.sh`，评测使用 `eval.sh`；不要默认建议全量扫参或重训。
 - 文档只保留当前实现、必要公式、运行入口和明确限制；历史推导通过 Git 查找。
   不把运行得到的 profile/评测产物当作过时文档删除。
+- 论文选型记录区分已实现、已核实公开源码、待验证假设与实验结果；外部仓库状态注明日期。
+  通用 LitGPT 教程不定义 SemanticLogKV 默认值；不把权重量化当成 KV 量化对照。

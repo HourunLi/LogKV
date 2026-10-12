@@ -1,5 +1,9 @@
 # Contributing to LitGPT
 
+本仓库的 SemanticLogKV 工作先遵循 [AGENTS.md](AGENTS.md) 和 [当前算法文档](docs/algorithm-spec.md)。
+下文保留上游 LitGPT 贡献指南；上游社区链接和 `main` 分支流程不定义本研究分支的实验配置。
+先运行与修改相关的小检查；文档修改核对源码、配置、链接即可，不默认启动全套训练或测试。
+
 We welcome all contributions, regardless of your level of experience or hardware. Whether it's a bug fix, a new feature, or an improvement to the docs — we appreciate your help!
 
 ## How to contribute

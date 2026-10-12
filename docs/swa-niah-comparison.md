@@ -36,6 +36,10 @@ bash unused/compare_swa_niah.sh '<已完成checkpoint目录>'
 
 - 核对 checkpoint、tokenizer、任务长度、样本数、生成设置和预算，分别看 single1/2/3。
 - 记录 prompt 是否被截断。needle 在 SWA 最终窗口外不等于必然失败，信息可能经后续 token 传递。
-- 现有 `decode_ms_per_token` 包含 prefill，不能作为独立 decode 延迟。
+- 当前 `decode_ms_per_token` 只计首 token 之后的 decode；TTFT 包含 prefill 与首次采样。
+  旧结果中的同名字段可能包含 prefill，不能与新字段直接混算；定义与迁移口径见
+  [评测指标](evaluation-metrics.md)。
+- 同权重切换缓存是机制诊断，不替代论文中训练适配成本匹配的外部比较；选型见
+  [Baseline 记录](baselines.md)。
 - 上述脚本不自动构成 Alpha/Beta 的消融。训练与评测入口见 [README](../README.md) 和
   [Beta 指南](beta-logkv.md)。

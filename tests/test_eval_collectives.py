@@ -10,6 +10,7 @@ from datetime import timedelta
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -61,6 +62,8 @@ def _worker():
             [f"sample-{i}-中文" for i in range(world - 1)],
             [float(i) + 0.5 for i in range(world * 2 + 1)],
             [],
+            [{"generation": [{"rank": i, "generated_tokens": i + 1}], "scoring": []}
+             for i in range(world)],
             [(float(i) + 0.25, i % 2 == 0) for i in range(world * 9157 + min(4, world - 1))],
         ]
         eval_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=30))
@@ -96,7 +99,12 @@ def _worker():
 
 
 def test_eval_collectives():
-    command = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
+    # Explicit loopback avoids hostname/IPv6 reverse lookup in the standalone rendezvous.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    command = [sys.executable, "-m", "torch.distributed.run", "--nnodes=1",
+               "--master-addr=127.0.0.1", f"--master-port={port}",
                "--nproc-per-node=3", "--max-restarts=0", str(Path(__file__).resolve())]
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, start_new_session=True) as process:
