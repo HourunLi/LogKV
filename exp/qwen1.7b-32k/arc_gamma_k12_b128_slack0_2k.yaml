@@ -10,7 +10,7 @@ auto_resume: true
 expid: qwen1.7b-32k-gamma_k12_b128_slack0_2k
 save_path: /workspace/ckpt-logKV/qwen1.7b-32k-gamma_k12_b128_slack0_2k
 merged_state_staging_dir: /workspace/ckpt-logKV/_fsdp_staging-gamma_k12_b128_slack0_2k
-tensorboard_root: /workspace/tb-32k-gamma_k12_b128_slack0_2k
+tensorboard_root: /workspace/tb/tb-32k-gamma_k12_b128_slack0_2k
 
 max_steps: 1200
 learning_rate: 5e-6

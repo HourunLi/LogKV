@@ -9,7 +9,7 @@ auto_resume: true
 expid: qwen1.7b-32k-semantic-attach-route_k12_b128_4k
 save_path: /workspace/ckpt-logKV/qwen1.7b-32k-semantic-attach-route_k12_b128_4k
 merged_state_staging_dir: /workspace/ckpt-logKV/_fsdp_staging-semantic-attach-route_k12_b128_4k
-tensorboard_root: /workspace/tb-32k-semantic-attach-route_k12_b128_4k
+tensorboard_root: /workspace/tb/tb-32k-semantic-attach-route_k12_b128_4k
 
 max_steps: 1200
 learning_rate: 5e-6
