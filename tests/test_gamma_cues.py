@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from litgpt.alpha_log_kv import CUE_CAP, CUE_FLOOR, CUE_TAU, CueStream, add_cue_values, cut_spans
+from litgpt.alpha_log_kv import CUE_CAP, CUE_FLOOR, CUE_PRIOR, CUE_TAU, CueStream, add_cue_values, cut_spans
 from litgpt.config import Config
 from litgpt.log_kv_cache import LogStructuredKVCache
 from litgpt.model import GPT
@@ -32,6 +32,8 @@ def test_cue_region_ends_at_the_last_line_end_else_span_end_else_whole_head():
     assert stream._rows[0].region == 6
     stream.ingest(ids, np.zeros((1, 10)), [0])
     assert stream._rows[0].region == 8
+    # The region is used only once a decision's stop covers it, even if later tokens arrived.
+    assert stream.span_values(0, np.arange(4, 8), [4], 7).tolist() == [0.]
     with pytest.raises(ValueError, match="expects position 10"):
         stream.ingest(ids, np.zeros((1, 10)), [12])
     with pytest.raises(ValueError, match=">= 1"):
@@ -68,7 +70,7 @@ def test_cue_evidence_sums_distinct_rare_cues_outside_the_region():
 
     def weight(token, stop=stop):
         count = int((ids[:stop] == token).sum())
-        return max(np.log((stop + 1) / (count + 1)) - CUE_TAU, 0.)
+        return max(np.log((stop + 1 + CUE_PRIOR) / (count + 1)) - CUE_TAU, 0.)
 
     # 101 twice and 102 once: two distinct cues; 103 at 18000 is not yet seen at this stop.
     assert values[0] == pytest.approx(_value(weight(101) + weight(102), 8)) and values[0] > 0
@@ -82,8 +84,8 @@ def test_cue_evidence_sums_distinct_rare_cues_outside_the_region():
     # Later occurrences count once seen: 103 recurs at 18000, which lowers its weight after that.
     later = stream.span_values(0, spans[3], [8], 19_000)
     assert int((ids[:19_000] == 103).sum()) == 2
-    assert later[0] == pytest.approx(_value(np.log(19_001 / 3) - CUE_TAU, 8))
-    assert later[0] < _value(np.log(19_001 / 2) - CUE_TAU, 8)
+    assert later[0] == pytest.approx(_value(np.log((19_001 + CUE_PRIOR) / 3) - CUE_TAU, 8))
+    assert later[0] < _value(np.log((19_001 + CUE_PRIOR) / 2) - CUE_TAU, 8)
 
 
 def test_cue_values_are_causal_and_independent_of_forward_chunking():
@@ -107,13 +109,16 @@ def test_cue_values_are_causal_and_independent_of_forward_chunking():
 
 
 def test_cue_value_is_capped_and_unstarted_rows_score_zero():
-    stream = CueStream(4)
-    head = np.array([[1, 2, 3, 4]])
-    stream.ingest(head, np.array([[0, 0, 0, 2]]), [0])
-    stream.ingest(np.full((1, 100_000), 99), np.zeros((1, 100_000)), [4])
-    stream.ingest(np.array([[1, 2, 3, 4]]), np.zeros((1, 4)), [100_004])
-    values = stream.span_values(0, np.arange(100_004, 100_008), [4], 100_008)
-    assert np.isfinite(values).all() and 0 < values[0] <= np.exp(CUE_CAP) / 4
+    stream = CueStream(16)
+    head = np.arange(1, 17)[None]  # Sixteen distinct cues; the line end closes the region.
+    kinds = np.zeros((1, 16), dtype=np.int64)
+    kinds[0, -1] = 2
+    stream.ingest(head, kinds, [0])
+    stream.ingest(np.full((1, 100_000), 99), np.zeros((1, 100_000)), [16])
+    stream.ingest(head, np.zeros((1, 16)), [100_016])
+    values = stream.span_values(0, np.arange(100_016, 100_032), [16], 100_032)
+    # Sixteen cues of about 6.3 nats each: far above the cap.
+    assert values[0] == pytest.approx((np.exp(CUE_CAP) - np.exp(CUE_FLOOR)) / 16)
     assert stream.span_values(1, np.arange(4), [4], 8).tolist() == [0.]
     short = CueStream(64)
     short.ingest(head, np.zeros((1, 4)), [0])  # The opening region is not complete yet.
@@ -175,6 +180,74 @@ def test_cues_keep_the_span_that_repeats_the_opening_in_the_exact_pool(route):
         assert (mass == n).all()
     assert all(set(needle) <= row for row in kept[32])
     assert not any(set(needle) <= row for row in kept[0])
+
+
+@patch("litgpt.alpha_log_kv.CUE_TAU", 0.)  # Short streams then carry cue evidence.
+@patch("litgpt.alpha_log_kv.CUE_FLOOR", 0.)
+@patch("litgpt.alpha_log_kv.CUE_PRIOR", 0)
+def test_cue_evidence_does_not_depend_on_how_input_is_chunked():
+    """Prefill blocks and token-by-token decode archive the same blocks with the same evidence."""
+    import litgpt.alpha_log_kv as al
+    n = 96
+    rng = np.random.default_rng(1)
+    ids = rng.integers(5, 12, (2, n))
+    kinds = np.zeros((2, n), dtype=np.int64)
+    kinds[:, 3] = 2
+    ends = rng.random((2, n)) < .3
+    ends[:, 3] = True
+    torch.manual_seed(3)
+    k, v = torch.randn(2, 2, n, 8), torch.randn(2, 2, n, 8)
+    results = []
+    for chunk in (8, 2, 1):
+        c = LogStructuredKVCache((2, 2, 128, 8), (2, 2, 128, 8), B=8, recent_size=8, semantic_clusters=True,
+                                 cluster_k_max=4, semantic_anchor_mode="mid", allocate_second_order=False,
+                                 semantic_replay_updates=True, semantic_flush_granularity=8,
+                                 cos_cache=torch.ones(128, 8), sin_cache=torch.zeros(128, 8), rope_n_elem=8,
+                                 alpha_exact_tokens=8, alpha_span_max_tokens=4, gamma_cue_tokens=4)
+        c.cue_stream = CueStream(4)
+        c.cue_stream.ingest(ids, kinds, [0, 0])
+        stops, original = [], al.add_cue_values
+
+        def spy(cut, scores, stream, rows):
+            stops.append(list(rows))
+            return original(cut, scores, stream, rows)
+
+        with patch.object(al, "add_cue_values", side_effect=spy), torch.no_grad():
+            for s in range(0, n, chunk):
+                c.add_recent(k[:, :, s:s + chunk], v[:, :, s:s + chunk], k_raw=k[:, :, s:s + chunk],
+                             span_ends=ends[:, s:s + chunk].tolist())
+        results.append((stops, c._alpha_positions))
+    # Every decision reads evidence as of the end of the block it archives.
+    assert results[0][0] == [[end, end] for end in range(8, n - 7, 8)]
+    assert results[0] == results[1] == results[2]
+
+
+@patch("litgpt.alpha_log_kv.CUE_TAU", 0.)
+@patch("litgpt.alpha_log_kv.CUE_FLOOR", 0.)
+@patch("litgpt.alpha_log_kv.CUE_PRIOR", 0)
+def test_model_prefill_and_token_streaming_keep_the_same_exact_spans_with_cues():
+    def pools(cues, stream_tokens):
+        torch.manual_seed(5)
+        config = Config(block_size=128, n_layer=2, n_embd=32, n_head=4, n_query_groups=2, vocab_size=41,
+                        padding_multiple=1, rotary_percentage=1.)
+        model = GPT(config).eval()
+        model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7])
+        model.set_log_kv_cache(batch_size=2, B=8, recent_size=8, prefill_block=8, second_order_scale=0.,
+                               semantic_clusters=True, cluster_k_max=4, semantic_flush_granularity=8,
+                               semantic_anchor_mode="mid", semantic_replay_updates=True, alpha_exact_tokens=8,
+                               alpha_span_max_tokens=4, gamma_cue_tokens=cues)
+        x = torch.randint(8, 20, (2, 64), generator=torch.Generator().manual_seed(105))
+        x[:, 2] = 7  # The opening region is the first line: three tokens.
+        with torch.no_grad():
+            if stream_tokens:
+                for t in range(64):
+                    model(x[:, t:t + 1], input_pos=torch.tensor([t]))
+            else:
+                model(x, input_pos=torch.arange(64))
+        return [block.attn.kv_cache._alpha_positions for block in model.transformer.h]
+
+    assert pools(4, False) == pools(4, True)
+    assert pools(4, False)[0] != pools(0, False)[0]  # Cues change what is kept.
 
 
 def test_cue_switch_is_validated_and_needs_the_model_stream():
