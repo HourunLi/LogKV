@@ -68,6 +68,21 @@ rank 的耗时，平均每卡值再除以卡数。计时同步 GPU，包含取�
 明细选取相同长度、预热后的记录。边界同步和跨卡统计有少量开销，不逐 decode token
 增加同步，不自动执行额外训练或评测。
 
+## NIAH 任务分数
+
+RULER 的 `niah_*` 任务（含 [`eval_tasks/niah_multi/`](../eval_tasks/niah_multi/) 的多针任务）按请求长度
+给分，结果键为长度字符串（如 `32768,none`）：
+
+```text
+样本分数 = 输出中出现的参考答案数 / 参考答案数      （转小写后按子串匹配）
+长度分数 = 同一 max_length 的样本分数均值
+```
+
+- 只计召回、不罚多答：输出多列数字不扣分，含干扰针的 `niah_multikey_*` 需结合样本输出判断。
+- RULER 给每条样本补一个 `4096` 键；没有 4096 长度的样本时该值为 `-1`，不是分数。
+- `max_length` 是请求长度，样本实际长度在 `length` 字段（prompt token 数加生成预留）。essay 草堆不足时
+  `length` 明显短于 `max_length`；多针任务放不下全部针的长度被跳过。两种情况都会告警。
+
 ## 输出文件与可追溯性
 
 | 产物 | 内容与限制 |
@@ -117,6 +132,8 @@ XLSX 导出依赖 pandas 和可用的 Excel writer；导出失败会告警，不
 - [评测入口](../eval.py)：`cache_compression_snapshot`、`summarize_inference_metrics`、结果汇集与导出。
 - [生成计时](../litgpt/generate/base.py)：`generate_fn` 的首 token 和后续 token 时间。
 - [训练入口](../demo.py)：`_training_speed_metrics` 与 optimizer step 边界。
+- [多针 NIAH 任务](../eval_tasks/niah_multi/niah_multi.py)：生成预留、长度跳过与草堆不足告警；
+  [任务测试](../tests/test_niah_multi_tasks.py)覆盖注册、样本生成与召回计分。
 - [压缩与速度测试](../tests/test_eval_compression.py)、[多卡汇集测试](../tests/test_eval_collectives.py)、
   [训练计时测试](../tests/test_log_kv_timing.py)。
 

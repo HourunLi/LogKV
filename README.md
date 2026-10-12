@@ -58,10 +58,11 @@ lm-eval 自带的 RULER 多针任务可直接作为任务名传入：`niah_multi
 | `niah_multivalue_n{2,8,16,32}` | 同一 key 的 N 个值 | 128 / 128 / 256 / 512 |
 | `niah_multiquery_n{2,8,16,32}` | N 个 key 全部提问 | 128 / 192 / 384 / 768 |
 
-N=1、N=4 即 `niah_single_2` 与内置 `niah_multivalue`/`niah_multiquery`（同一生成器与 essay 草堆）。
-评分沿用 RULER：每条样本答出的针占比，再按长度平均。样本按生成预留缩短 prompt，避免 eval.py 为留出
+N=1、N=4 即 `niah_single_2` 与内置 `niah_multivalue`/`niah_multiquery`（同一生成器与 essay 草堆），
+分数口径见 [NIAH 任务分数](docs/evaluation-metrics.md#niah-任务分数)。样本按生成预留缩短 prompt，避免 eval.py 为留出
 生成空间而左截断；放不下全部针、问题和预留的长度会跳过并告警。metadata 的 `niah_num_samples`
 （默认 500）设每个长度的样本数；`--limit` 只取最前面的样本，多长度时只会落在第一个长度。
+RULER 以 500 词为步长添加草堆：针数较多时 1K–2K 的草堆很少甚至为空，多针结果宜从 4K 起看。
 
 ```bash
 DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768],"niah_num_samples":100}' \
