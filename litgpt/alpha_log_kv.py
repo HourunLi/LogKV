@@ -1,8 +1,16 @@
-"""Bounded whole-span selection. Scores are compression-risk proxies, not labels."""
+"""Bounded whole-span selection. Scores are compression-risk proxies, not labels;
+Gamma's optional cue evidence adds a lexical relevance proxy."""
+import math
 from dataclasses import dataclass
 
 import numpy as np
 import torch
+
+# A cue seen in more than 1% of the stream so far carries no evidence, and a
+# span's evidence counts only above CUE_FLOOR nats; the cap keeps exp finite.
+CUE_TAU = math.log(100.)
+CUE_FLOOR = 4.
+CUE_CAP = 30.
 
 
 @dataclass
@@ -66,19 +74,142 @@ def _empty_selection(rows):
                          [[] for _ in range(rows)], [[] for _ in range(rows)])
 
 
+class _CueRow:
+    __slots__ = ("seen", "head_ids", "head_ends", "cues", "region", "pos", "slot", "chunks")
+
+    def __init__(self):
+        self.seen = 0
+        self.head_ids, self.head_ends = [], []
+        self.cues, self.region = None, 0
+        self.pos = self.slot = np.empty(0, dtype=np.int64)
+        self.chunks = []
+
+    def add(self, ids, ends, tokens):
+        start, self.seen = self.seen, self.seen + len(ids)
+        if self.cues is not None:
+            self.record(ids, start)
+            return
+        # Until the head is full, every token so far is in it (start == len(head_ids)).
+        take = tokens - start
+        self.head_ids.extend(ids[:take].tolist())
+        self.head_ends.extend(ends[:take].tolist())
+        if len(self.head_ids) < tokens:
+            return
+        head = np.asarray(self.head_ids, dtype=np.int64)
+        kinds = np.asarray(self.head_ends, dtype=np.int64)
+        # The region ends at the last line end in the head, else the last span end.
+        closed = np.flatnonzero(kinds == 2)
+        if not len(closed):
+            closed = np.flatnonzero(kinds)
+        self.region = int(closed[-1]) + 1 if len(closed) else tokens
+        self.cues = np.unique(head[:self.region])
+        self.record(head, 0)
+        self.record(ids[take:], tokens)
+
+    def record(self, ids, start):
+        if not len(ids):
+            return
+        slot = np.minimum(np.searchsorted(self.cues, ids), len(self.cues) - 1)
+        hit = self.cues[slot] == ids
+        if hit.any():
+            self.chunks.append((np.flatnonzero(hit) + start, slot[hit]))
+
+    def occurrences(self):
+        if self.chunks:
+            self.pos = np.concatenate([self.pos, *(pos for pos, _ in self.chunks)])
+            self.slot = np.concatenate([self.slot, *(slot for _, slot in self.chunks)])
+            self.chunks = []
+        return self.pos, self.slot
+
+
+class CueStream:
+    """Where each row's opening tokens (cues) recur; host only, shared by all layers.
+
+    A row's cues are the token ids of its opening region: the first
+    ``tokens`` positions cut after their last line end, else after their last
+    span end (whole when neither occurs). Evidence is read as of a position, so
+    a layer-major prefill gives every layer what a token-by-token stream would.
+    State grows with the cue occurrences only.
+    """
+
+    def __init__(self, tokens: int) -> None:
+        if tokens < 1:
+            raise ValueError("cue tokens must be >= 1")
+        self.tokens = int(tokens)
+        self._rows: list[_CueRow] = []
+
+    def ingest(self, ids, ends, starts) -> None:
+        """Append one forward's tokens per row; a row restarts at position 0.
+
+        ``ends`` per token: 0 inside a span, 1 at a span end, 2 at a line end.
+        """
+        ids = np.asarray(ids, dtype=np.int64)
+        ends = np.asarray(ends, dtype=np.int64)
+        while len(self._rows) < len(ids):
+            self._rows.append(_CueRow())
+        for b, (row_ids, row_ends, start) in enumerate(zip(ids, ends, starts)):
+            if start == 0:
+                self._rows[b] = _CueRow()
+            elif start != self._rows[b].seen:
+                raise ValueError(f"cue stream row {b} expects position {self._rows[b].seen}, got {start}")
+            self._rows[b].add(row_ids, row_ends, self.tokens)
+
+    def span_values(self, row, positions, lengths, stop):
+        """``max(exp(evidence) - exp(CUE_FLOOR), 0) / length`` per span, as of ``stop``.
+
+        Evidence sums, over the distinct cues a span holds outside the opening
+        region, how many nats rarer than 1% of the first ``stop`` positions each
+        one is. The floor leaves spans with weak evidence at their K/V score.
+        """
+        lengths = np.asarray(lengths, dtype=np.int64)
+        values = np.zeros(len(lengths))
+        state = self._rows[row] if row < len(self._rows) else None
+        if state is None or state.cues is None or not len(lengths):
+            return values
+        pos, slot = state.occurrences()
+        if not len(pos):
+            return values
+        n = len(state.cues)
+        counts = np.bincount(slot[:np.searchsorted(pos, stop)], minlength=n)
+        weight = np.maximum(np.log((stop + 1) / (counts + 1)) - CUE_TAU, 0.)
+        positions = np.asarray(positions, dtype=np.int64)
+        at = np.minimum(np.searchsorted(pos, positions), len(pos) - 1)
+        hit = (pos[at] == positions) & (positions >= state.region)
+        pairs = np.unique(np.repeat(np.arange(len(lengths)), lengths)[hit] * n + slot[at[hit]])
+        evidence = np.bincount(pairs // n, weights=weight[pairs % n], minlength=len(lengths))
+        value = np.exp(np.minimum(evidence, CUE_CAP)) - math.exp(CUE_FLOOR)
+        return np.maximum(value, 0.) / np.maximum(lengths, 1)
+
+
+def add_cue_values(cut, host_scores, stream, stops):
+    """Host scores plus each span's cue value; ``stops`` are the rows' visible ends."""
+    scores, offset = list(host_scores), 0
+    for b, ((_, positions), tokens, lengths) in enumerate(zip(cut.candidates, cut.token_rows, cut.length_rows)):
+        if lengths:
+            values = stream.span_values(b, positions[tokens], lengths, stops[b])
+            for i, value in enumerate(values.tolist()):
+                scores[offset + i] += value
+        offset += len(lengths)
+    return scores
+
+
 def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width, budget, max_span,
-                 *, beta_novelty=False, centroids=None, centroid_valid=None):
+                 *, beta_novelty=False, centroids=None, centroid_valid=None, cues=None):
     """Indices refer to [padded old pool | current flush], shared across KV groups.
 
     A final unfinished span is mandatory until a boundary or the length cap.
     Scoring makes one batched GPU pass and one small score transfer per flush.
     Beta scores novelty against the old centroids captured before this flush.
+    ``cues`` is an optional ``(CueStream, stops)`` pair (Gamma).
     """
     cut = cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span)
     if cut is None:
         return _empty_selection(len(ends))
     scores = score_spans(k, v, cut, beta_novelty=beta_novelty, centroids=centroids, centroid_valid=centroid_valid)
-    return choose_spans(cut, scores.cpu().tolist(), budget)
+    scores = scores.cpu().tolist()
+    if cues is not None:
+        scores = add_cue_values(cut, scores, *cues)
+    return choose_spans(cut, scores, budget)
 
 
 def cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span):

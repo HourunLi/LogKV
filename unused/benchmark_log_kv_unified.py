@@ -20,9 +20,11 @@ import sys
 import time
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from litgpt.alpha_log_kv import CueStream
 from litgpt.log_kv_cache import LogStructuredKVCache, _UnifiedReduceTorch, _triton_route, _triton_updates
 
 
@@ -318,6 +320,8 @@ def main():
                    help='Gamma: delayed Alpha evictions re-sort only ladder level 0')
     p.add_argument('--gamma-top-merge', choices=('fold', 'lightest'), default='fold')
     p.add_argument('--gamma-level-slack', type=int, default=2)
+    p.add_argument('--gamma-cue-tokens', type=int, default=0,
+                   help='Gamma cues: score exact spans against this many opening tokens of synthetic Zipf ids')
     args = p.parse_args()
     if min(args.tokens, args.dim, args.batch, args.groups, args.clusters, args.B, args.flushes, args.iters) < 1:
         p.error('all sizes and iteration counts must be positive')
@@ -339,10 +343,17 @@ def main():
         alpha_exact_tokens=args.alpha_exact_tokens, alpha_span_max_tokens=args.alpha_span_max_tokens,
         beta_novelty=args.beta_novelty, beta_adaptive_merge=args.beta_adaptive_merge,
         gamma_level0_reinsert=args.gamma_level0_reinsert, gamma_top_merge=args.gamma_top_merge,
-        gamma_level_slack=args.gamma_level_slack,
+        gamma_level_slack=args.gamma_level_slack, gamma_cue_tokens=args.gamma_cue_tokens,
         device=device, dtype=dtype, cos_cache=torch.ones(n, args.dim, device=device),
         sin_cache=torch.zeros(n, args.dim, device=device), rope_n_elem=args.dim,
     )
+    if args.gamma_cue_tokens:
+        # Synthetic Zipf ids so that some opening tokens recur; mechanics and host cost only.
+        ids = np.random.default_rng(17).zipf(1.3, size=(args.batch, n)) % 50000
+        kinds = np.zeros_like(ids)
+        kinds[:, args.gamma_cue_tokens // 2] = 2
+        cache.cue_stream = CueStream(args.gamma_cue_tokens)
+        cache.cue_stream.ingest(ids, kinds, [0] * args.batch)
     fused = device.type == 'cuda' and _triton_route() is not None
     if fused:
         check_round_pairs(cache, device)

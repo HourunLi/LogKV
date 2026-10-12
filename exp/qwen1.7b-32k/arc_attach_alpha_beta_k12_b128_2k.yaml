@@ -26,3 +26,4 @@ log_kv_recent_size: 2048
 log_kv_gamma_level0_reinsert: false
 log_kv_gamma_top_merge: fold
 log_kv_gamma_level_slack: 2
+log_kv_gamma_cue_tokens: 0

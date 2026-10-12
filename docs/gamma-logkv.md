@@ -1,15 +1,18 @@
-# GammaLogKV：修正延迟归档，并把梯子容量留给分辨率
+# GammaLogKV：梯子修正与精确池的开头提示词（cue）选择
 
 Gamma 建立在 attach + Alpha + Beta 之上（见 [Alpha](alpha-logkv.md)、[Beta](beta-logkv.md)），
-不改变路由、精确片段选择或 Beta 评分，只改变条目在层级（梯子）里怎样合并。三个开关：
+不改变路由。前三个开关只改变条目在层级（梯子）里怎样合并；第四个开关在精确池选择片段时，
+给重复了流开头区域里稀有 token 的片段加分（第 4 节）。四个开关：
 
 | 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 入口 / `arc_semantic_fast.yaml` | 作用 |
 |---|---|---|---|
 | `gamma_level0_reinsert` | `false` | `true` | Alpha 延迟归档只重排第 0 层 |
 | `gamma_top_merge` | `fold` | `lightest` | 顶层饱和时合并质量和最小的相邻对 |
 | `gamma_level_slack` | `2` | `2` | 余量层数；小于 2 时用同样字节换更宽的 B′ |
+| `gamma_cue_tokens` | `0` | `64` | 开头区域长度；精确池按 cue 证据给片段加分，`0` 关闭 |
 
-Gamma 之前的实验 YAML 显式写回旧行为（`false` / `fold` / `2`），复评与训练时一致。
+Gamma 之前的实验 YAML 显式写回旧行为（`false` / `fold` / `2` / `0`）；早于 cue 的四个 Gamma
+梯子实验（`arc_gamma_k12_*`）写 `gamma_cue_tokens: 0`。复评都与训练时一致。
 
 ## 1. 延迟归档只重排第 0 层
 
@@ -59,6 +62,81 @@ L = max(2, ceil(log2(N / (K·B′) + 1)) + slack)
 更多，`kv_compression_factor` 下降，持久分配字节不变。偏斜簇会更早填满顶层，因此必须与
 `gamma_top_merge: lightest` 一起使用；默认不启用。
 
+## 4. 精确池选择：开头提示词（cue）
+
+**问题。** 32K、P=256 时，每次 flush 要从约 80 个候选片段里只留约 8 个，旧片段只有 1.1 倍加成。
+分数不随时间变化时，精确池会收敛到全文得分最高的约 1% 片段：针要在约 1100 个片段中排进前
+8 左右。片段内方差比 R 与 Beta 新颖度都不指向针；在下文的代理评测中，用随机数代替这类分数时，
+针在末尾仍被精确保留的样本只有 3/40，文档内 token 稀有度单独使用也只有 3–5/40。
+
+**规则。**
+
+- 开头区域：每条序列的前 M=`gamma_cue_tokens` 个 token，截到其中最后一个换行结束处；没有换行
+  则截到最后一个片段结束处；都没有则取全部 M 个。区域里出现的不同 token id 称为 cue。RULER 的
+  指令行（`A special magic number is hidden within the following text. … afterwards.\n`）正是
+  这个区域：lm-eval 把文章里的空白压成单个空格，正文没有换行。
+- 证据：决策时本缓存已见到 n 个 token（recent 窗口末尾位置 + 1），某个 cue 在其中出现 c 次。
+  区域外的候选片段对它包含的每个**不同** cue 累加 `max(0, ln((n+1)/(c+1)) − ln 100)`；出现
+  频率高于 1% 的 cue 不提供证据。
+- 价值：`max(exp(证据) − exp(4), 0) / 片段长度`（证据上限 30），加到 K/V 分数（R 或 Beta 分数，
+  约在 0 到 2 之间）上，再进入原有的整段贪心（含旧片段 1.1 倍）。指数相当于把证据当作对数几率；
+  证据不足 4 nats 的片段保持原分数。针同时重复指令里两个稀有词（"special magic"），32K 时证据约
+  6–7 nats，价值是 K/V 分数的几倍到几十倍，进入并留在精确池。
+
+**性质。**
+
+- 只依赖 token id，所有层得到相同的 cue 价值，同一个针在各层同时保留；各层的 K/V 分数仍各自不同。
+- 证据按"决策时已见到的位置"计数，逐层整段 prefill 与逐 token 流式得到相同结果（有测试）。
+- 主机端计算：模型每次前向把 token id、边界类型和起始位置一次拷回主机，交给全模型共享的
+  `CueStream`（`litgpt/alpha_log_kv.py`）。不增加 KV，推理 KV 仍为 `O(log N)`；主机状态是开头区域
+  和 cue 的出现记录，与 cue 在流中的出现次数成正比。
+- 选择只在前向发生；反向与 checkpoint 重算回放记录的动作，不重新选择；开关写入回放签名。
+  分数预取的仍是 K/V 分数，cue 价值在决策时加上，预取与现算的选择一致（有测试）。
+- 换行表来自分词器（`alpha_line_end_ids`），入口在开启 cue 时把它与边界表一起装入模型；
+  不提供换行表时，区域截到最后一个片段结束处。
+
+**代理评测（不是模型准确率）。** lm-eval 的 RULER 模板与针格式、Paul Graham 文章作干草堆、Qwen
+预分词正则作 token 代理（不是 BPE），仓库里的 `cut_spans`、`choose_spans` 与 `CueStream`，
+flush 与 recent 各 2048、片段上限 64；K/V 分数用每个片段固定的随机数 U(0.3, 1.0) 代替。统计针所在
+片段在末尾是否仍完整地留在精确池或 recent 中，每组 40 个样本、深度均匀，P=256（括号内为 P=128，
+相同时省略）：
+
+| 干草堆 / 前导（约 28K 代理 token） | 针 | 无 cue | M=48 | M=64 | M=128 |
+|---|---|---|---|---|---|
+| 随机起点 | number / uuid | 3 / 3 | 40 / 40 | 40 / 40 | 40 / 40 |
+| 从第一篇文章开头（同 lm-eval） | number / uuid | 3 / 3 | 40 / 40 | 40 / 40 | 40 / 40 |
+| 加 38 个代理 token 的聊天模板式前导 | number / uuid | 3 / 3 | 3 / 3 | 40 (39) / 40 (39) | 40 (39) / 40 (39) |
+
+随机起点、M=64 的更短上下文：约 14K token 时无 cue 6 / 6、有 cue 40 / 40；约 7K token 时无 cue
+12 (11) / 12 (11)、有 cue 40 / 40。聊天前导一组的指令在第 64 个代理 token 结束，说明区域必须覆盖
+指令末尾的换行：M=48 时区域停在前导里，cue 不含 "special"、"magic"。
+
+**对普通文本的影响。** 开头没有指令时，开头区域就是正文的第一段，后文重复其中稀有词的片段同样
+会加分。代理中（16 段约 30K token 的文章拼接，保留换行，M=64、P=256）约 5% 的候选片段价值提高
+超过 0.1，但精确池只保留约 1% 的片段，最终的池子与不开 cue 时几乎完全不同（Jaccard 约 0.03）：
+池里是与开头话题相关的片段，不再是 K/V 分数最高的片段。这对困惑度和其他任务的影响没有测过；
+默认训练配置开启 cue，模型在这种池子上训练。需要对照时写 `log_kv_gamma_cue_tokens: 0`。
+
+**限制。**
+
+- 词面启发式：依赖开头的指令点名要记住的内容。问题只放在末尾的任务（如 RULER QA）不受益；
+  词形变化（number / numbers）不算命中。
+- 代理里没有模型：K/V 分数是随机数，token 是预分词而非 Qwen BPE。准确率要在 GPU 上评测。
+- M 必须覆盖到指令末尾的换行。默认 64 覆盖 base 模型 RULER 的指令（约 28 个 token），以及
+  不超过约 35 个 token 的前导；带系统提示的聊天模板等更长前导需调大 M。
+
+**配置。** 默认训练配置 [`arc_gamma_cue_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml)
+与 `arc_gamma_k12_b128_2k` 只差 cue。成本最低的第一个实验是只评测、不重训：
+[`eval_gamma_cue.yaml`](../exp/qwen1.7b-32k/eval_gamma_cue.yaml) 用已训练的 attach + Alpha + Beta
+checkpoint（B=128，旧梯子）只打开 cue；换 B=256 的 checkpoint 改其 `config:` 一行。
+
+```bash
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+  bash eval.sh exp/qwen1.7b-32k/eval_gamma_cue.yaml niah_single_2,niah_single_3 none
+
+BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
+```
+
 ## 与槽位压缩率统计的关系
 
 `eval.sh` 报告的 `kv_compression` 统计**存活**条目。旧行为因重复合并而条目偏少，报告的压缩倍数
@@ -69,12 +147,13 @@ L = max(2, ceil(log2(N / (K·B′) + 1)) + slack)
 
 - 不增加持久张量，推理 KV 仍为 `O(log N)`；Gamma 重排的数据只有第 0 层，比旧行为（整簇）少。
 - 训练要求与 Alpha 相同（attach 或 unified、mid、一阶、`semantic_replay_updates=true`）。
-- Gamma 之前的 checkpoint 是在旧梯子上训练的。可以在评测 YAML 里覆盖三项开关来复评，但
-  训练与评测不一致；结论以 Gamma 重训为准。
+- Gamma 之前的 checkpoint 是在旧梯子上训练的。可以在评测 YAML 里覆盖梯子三项开关来复评，但
+  训练与评测不一致；结论以 Gamma 重训为准。cue 只改变精确池选哪些片段，评测时单独打开的
+  偏差小得多（`eval_gamma_cue.yaml`）。
 
-默认训练配置是 [`arc_gamma_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml)。
-同目录还有 B=256 对照（`_b256_2k`）、同字节精确池 P=1024（`_b128_p1024_2k`，B′ 125→116）
-和 `level_slack: 0`（`_b128_slack0_2k`）：
+默认训练配置是 [`arc_gamma_cue_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml)。
+不带 cue 的梯子实验有 B=128（`arc_gamma_k12_b128_2k`）、B=256 对照（`_b256_2k`）、同字节精确池
+P=1024（`_b128_p1024_2k`，B′ 125→116）和 `level_slack: 0`（`_b128_slack0_2k`）：
 
 ```bash
 BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml
@@ -83,26 +162,29 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
   bash eval.sh exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 
-在目标 GPU 上对比路由与写入耗时（Gamma 只重排第 0 层，搬运的数据比旧行为少，实际收益以此为准）：
+在目标 GPU 上对比路由与写入耗时（Gamma 只重排第 0 层，搬运的数据比旧行为少，实际收益以此为准；
+`--gamma-cue-tokens 64` 用合成 Zipf token id 计入 cue 的主机开销）：
 
 ```bash
 python unused/benchmark_log_kv_unified.py --device cuda --batch 4 --groups 8 --B 128 --iters 3 --route attach \
   --alpha-exact-tokens 256 --alpha-span-max-tokens 64 --beta-novelty --beta-adaptive-merge \
-  --gamma-level0-reinsert --gamma-top-merge lightest > route_gamma.jsonl
+  --gamma-level0-reinsert --gamma-top-merge lightest --gamma-cue-tokens 64 > route_gamma.jsonl
 ```
 
 ## 针的去向诊断
 
 [`unused/niah_needle_trace.py`](../unused/niah_needle_trace.py) 用 lm-eval 自己的 single_2/3
 样本，按实验 YAML 构建同一模型与缓存，逐层报告针在精确池、recent 还是梯子条目（及其 w），
-针所在片段在现有评分与几种诊断评分下的排名、需要多大的精确池才能留住，以及 `--oracle all`
-强制保留针时的准确率上限。追踪期间关闭分数预取，选择规则不变（`--oracle` 除外）。
+针所在片段在现有评分（开启 cue 时含 cue 价值）与几种诊断评分下的排名、需要多大的精确池才能
+留住，以及 `--oracle all` 强制保留针时的准确率上限。诊断评分 `cue` 是单独的 cue 价值（开头 64 个
+token），配置未开启 cue 时也会报告。追踪期间关闭分数预取，选择规则不变（`--oracle` 除外）。
 
 ```bash
-python unused/niah_needle_trace.py --config exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml \
+python unused/niah_needle_trace.py --config exp/qwen1.7b-32k/eval_gamma_cue.yaml \
   --hf-tokenizer <Qwen3-1.7B-Base 目录> --task niah_single_2 --samples 16
 ```
 
 测试：`tests/test_gamma_log_kv.py`（修复前后的梯子形状、上层条目不被改写、同字节余量层），
-`tests/test_alpha_log_kv.py`（守恒、延迟归档与反向回放，覆盖 Gamma 开关），
+`tests/test_gamma_cues.py`（区域截断、去重与阈值、因果与分块不变、针留在精确池、模型接线与回放签名），
+`tests/test_alpha_log_kv.py`（守恒、延迟归档、反向回放与预取，覆盖 Gamma 与 cue 开关），
 `tests/test_log_kv_updates.py`（顶层两种合并的批量与逐条路径一致）。

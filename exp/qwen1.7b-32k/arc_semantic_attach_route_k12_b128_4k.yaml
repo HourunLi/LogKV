@@ -35,3 +35,4 @@ log_kv_beta_adaptive_merge: false
 log_kv_gamma_level0_reinsert: false
 log_kv_gamma_top_merge: fold
 log_kv_gamma_level_slack: 2
+log_kv_gamma_cue_tokens: 0

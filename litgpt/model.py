@@ -188,7 +188,11 @@ class GPT(nn.Module):
             table = getattr(self, "alpha_span_boundaries", None)
             if table is None:
                 raise RuntimeError("AlphaLogKV needs set_alpha_span_boundary_ids() before forward")
-            span_kwargs["span_ends"] = table[idx].detach().cpu().tolist()
+            stream = getattr(self, "log_kv_cue_stream", None)
+            if stream is None:
+                span_kwargs["span_ends"] = table[idx].detach().cpu().tolist()
+            else:
+                span_kwargs["span_ends"] = self._ingest_cues(stream, idx, table[idx], input_pos)
         x = self.transformer.wte(idx)  # token embeddings of shape (B, T, n_embd)
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
@@ -228,11 +232,46 @@ class GPT(nn.Module):
         else:
             return clamp_head(self.lm_head(x))  # (B, T, padded_vocab_size)
 
-    def set_alpha_span_boundary_ids(self, ids) -> None:
-        """Install the tokenizer's fixed natural-boundary lookup once per model."""
-        table = torch.zeros(self.config.padded_vocab_size, device=self.transformer.wte.weight.device, dtype=torch.bool)
+    def set_alpha_span_boundary_ids(self, ids, line_end_ids=None) -> None:
+        """Install the tokenizer's fixed natural-boundary lookup once per model.
+
+        ``line_end_ids`` (tokens ending a line) let Gamma's cue stream cut the
+        opening region at its last line end; without them it uses span ends.
+        """
+        device = self.transformer.wte.weight.device
+        table = torch.zeros(self.config.padded_vocab_size, device=device, dtype=torch.bool)
         table[list(ids)] = True
         self.register_buffer("alpha_span_boundaries", table, persistent=False)
+        lines = None
+        if line_end_ids is not None:
+            lines = torch.zeros(self.config.padded_vocab_size, device=device, dtype=torch.bool)
+            lines[list(line_end_ids)] = True
+        self.register_buffer("alpha_line_ends", lines, persistent=False)
+
+    def _attach_cue_stream(self, tokens: int) -> None:
+        """One CueStream per model, shared by every layer's cache (Gamma cues)."""
+        from litgpt.alpha_log_kv import CueStream
+
+        self.log_kv_cue_stream = CueStream(tokens) if tokens else None
+        for block in self.transformer.h:
+            block.attn.kv_cache.cue_stream = self.log_kv_cue_stream
+
+    def _ingest_cues(self, stream, idx, ends, input_pos) -> list[list[bool]]:
+        """Feed this forward's tokens to the cue stream; returns the host span ends.
+
+        One device-to-host copy carries ids, boundary kinds and start positions.
+        """
+        lines = getattr(self, "alpha_line_ends", None)
+        kinds = ends.long() if lines is None else ends.long() * (1 + lines[idx].long())
+        ids = idx.long()
+        if input_pos is None:
+            starts = ids.new_zeros(ids.size(0), 1)
+        else:
+            starts = input_pos[..., :1].to(ids).expand(ids.size(0), 1)
+        host = torch.cat((ids, kinds, starts), dim=1).cpu().numpy()
+        T = idx.size(1)
+        stream.ingest(host[:, :T], host[:, T:2 * T], host[:, 2 * T].tolist())
+        return (host[:, T:2 * T] > 0).tolist()
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -334,6 +373,7 @@ class GPT(nn.Module):
         dtype: torch.dtype | None = None,
     ) -> None:
         self._alpha_enabled = False
+        self.log_kv_cue_stream = None
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
 
@@ -361,6 +401,7 @@ class GPT(nn.Module):
 
     def clear_kv_cache(self) -> None:
         self._alpha_enabled = False
+        self.log_kv_cue_stream = None
         self.mask_cache = None
         for block in self.transformer.h:
             block.attn.kv_cache = None
@@ -416,6 +457,7 @@ class GPT(nn.Module):
         gamma_level0_reinsert: bool = False,
         gamma_top_merge: str = "fold",
         gamma_level_slack: int = 2,
+        gamma_cue_tokens: int = 0,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -514,12 +556,14 @@ class GPT(nn.Module):
                 gamma_level0_reinsert=gamma_level0_reinsert,
                 gamma_top_merge=gamma_top_merge,
                 gamma_level_slack=gamma_level_slack,
+                gamma_cue_tokens=gamma_cue_tokens,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
             block.attn._log_kv_pending = None
             block.attn.log_kv_prefill_block = prefill_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
+        self._attach_cue_stream(gamma_cue_tokens)
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
         # holding stale O(N^2) bool tensors in GPU memory. With every block on
@@ -591,6 +635,7 @@ class GPT(nn.Module):
         gamma_level0_reinsert: bool = False,
         gamma_top_merge: str = "fold",
         gamma_level_slack: int = 2,
+        gamma_cue_tokens: int = 0,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -680,6 +725,7 @@ class GPT(nn.Module):
                 gamma_level0_reinsert=gamma_level0_reinsert,
                 gamma_top_merge=gamma_top_merge,
                 gamma_level_slack=gamma_level_slack,
+                gamma_cue_tokens=gamma_cue_tokens,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -687,10 +733,12 @@ class GPT(nn.Module):
             block.attn._log_kv_pending = None
             block.attn.log_kv_train_block = train_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
+        self._attach_cue_stream(gamma_cue_tokens)
 
     def disable_log_kv_training(self) -> None:
         """Turn off logKV training mode and drop the caches."""
         self._alpha_enabled = False
+        self.log_kv_cue_stream = None
         for block in self.transformer.h:
             block.attn.training_log_kv = False
             block.attn.kv_cache = None
@@ -1480,6 +1528,7 @@ class CausalSelfAttention(nn.Module):
         gamma_level0_reinsert: bool = False,
         gamma_top_merge: str = "fold",
         gamma_level_slack: int = 2,
+        gamma_cue_tokens: int = 0,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1552,6 +1601,7 @@ class CausalSelfAttention(nn.Module):
             gamma_level0_reinsert=gamma_level0_reinsert,
             gamma_top_merge=gamma_top_merge,
             gamma_level_slack=gamma_level_slack,
+            gamma_cue_tokens=gamma_cue_tokens,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,

@@ -555,6 +555,10 @@ def main(
     log_kv_gamma_level0_reinsert: bool = True,
     log_kv_gamma_top_merge: str = "lightest",
     log_kv_gamma_level_slack: int = 2,
+    # Gamma cues (on by default): exact-pool selection also values spans that repeat
+    # rare tokens of the stream's opening region (up to this many tokens, cut at its
+    # last line end); 0 keeps the K/V-only span scores.
+    log_kv_gamma_cue_tokens: int = 64,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
     # ── Eval ──
@@ -647,11 +651,13 @@ def main(
     log_kv_gamma_level0_reinsert = bool(_o("log_kv_gamma_level0_reinsert", log_kv_gamma_level0_reinsert))
     log_kv_gamma_top_merge = str(_o("log_kv_gamma_top_merge", log_kv_gamma_top_merge))
     log_kv_gamma_level_slack = int(_o("log_kv_gamma_level_slack", log_kv_gamma_level_slack))
+    log_kv_gamma_cue_tokens = int(_o("log_kv_gamma_cue_tokens", log_kv_gamma_cue_tokens))
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
-        # Beta extends the Alpha exact pool; disabling Alpha disables both Beta changes.
+        # Beta and Gamma cues score the Alpha exact pool; disabling Alpha disables them.
         log_kv_beta_novelty = log_kv_beta_adaptive_merge = False
+        log_kv_gamma_cue_tokens = 0
     log_kv_profile_steps = _o("log_kv_profile_steps", log_kv_profile_steps)
     if log_kv_profile_steps is not None and (
         not isinstance(log_kv_profile_steps, (list, tuple))
@@ -891,6 +897,7 @@ def main(
             log_kv_gamma_level0_reinsert=log_kv_gamma_level0_reinsert,
             log_kv_gamma_top_merge=log_kv_gamma_top_merge,
             log_kv_gamma_level_slack=log_kv_gamma_level_slack,
+            log_kv_gamma_cue_tokens=log_kv_gamma_cue_tokens,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -1008,7 +1015,11 @@ def main(
     # training — this script only supports the logKV adaptation route.
     if log_kv_alpha_exact_tokens:
         from litgpt.tokenizer import Tokenizer
-        model.set_alpha_span_boundary_ids(Tokenizer(tok_dir).alpha_span_boundary_ids)
+        boundary_tokenizer = Tokenizer(tok_dir)
+        model.set_alpha_span_boundary_ids(
+            boundary_tokenizer.alpha_span_boundary_ids,
+            boundary_tokenizer.alpha_line_end_ids if log_kv_gamma_cue_tokens else None,
+        )
     model.enable_log_kv_training(
         batch_size=micro_batch_size,
         max_seq_length=context_length,
@@ -1051,6 +1062,7 @@ def main(
         gamma_level0_reinsert=log_kv_gamma_level0_reinsert,
         gamma_top_merge=log_kv_gamma_top_merge,
         gamma_level_slack=log_kv_gamma_level_slack,
+        gamma_cue_tokens=log_kv_gamma_cue_tokens,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
@@ -1080,7 +1092,7 @@ def main(
         f"alpha_exact={log_kv_alpha_exact_tokens}, alpha_span_max={log_kv_alpha_span_max_tokens}, "
         f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
         f"gamma_level0_reinsert={log_kv_gamma_level0_reinsert}, gamma_top_merge={log_kv_gamma_top_merge}, "
-        f"gamma_level_slack={log_kv_gamma_level_slack}, "
+        f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens}, "
         f"effective_B={model.transformer.h[0].attn.kv_cache.B}, levels={model.transformer.h[0].attn.kv_cache.L_alloc})"
     )
 

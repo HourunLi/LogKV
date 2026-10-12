@@ -22,9 +22,11 @@ import time
 # strict backward check. Respect an explicit workspace configuration.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from litgpt.alpha_log_kv import CueStream
 from litgpt.log_kv_cache import LogStructuredKVCache, LogKVStreamTrainingAttention
 
 HOST_STATE = ("_semantic_counts", "_semantic_alive", "_semantic_n_total", "_semantic_p_hi_c",
@@ -39,11 +41,18 @@ def make_cache(args, overlap, device, batch):
         cluster_k_max=args.clusters, semantic_anchor_mode="mid", semantic_centroid_backend="parallel",
         allocate_second_order=False, semantic_replay_updates=True, alpha_exact_tokens=args.exact,
         alpha_span_max_tokens=args.span, beta_novelty=True, beta_adaptive_merge=True,
-        gamma_level0_reinsert=True, gamma_top_merge="lightest",
+        gamma_level0_reinsert=True, gamma_top_merge="lightest", gamma_cue_tokens=args.cue,
         device=device, dtype=torch.bfloat16, cos_cache=torch.ones(n, args.dim, device=device),
         sin_cache=torch.zeros(n, args.dim, device=device), rope_n_elem=args.dim,
     )
     cache._route_overlap = overlap
+    if args.cue:
+        # Synthetic Zipf token ids so that some opening tokens recur (the default route has cues on).
+        ids = np.random.default_rng(7).zipf(1.3, size=(batch, n)) % 50000
+        kinds = np.zeros_like(ids)
+        kinds[:, args.cue // 2] = 2
+        cache.cue_stream = CueStream(args.cue)
+        cache.cue_stream.ingest(ids, kinds, [0] * batch)
     return cache
 
 
@@ -74,7 +83,7 @@ def backward_exact(loss):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name, default in [("blocks", 8), ("tokens", 2048), ("dim", 128), ("groups", 8), ("heads", 16),
-                          ("clusters", 12), ("B", 128), ("exact", 256), ("span", 64)]:
+                          ("clusters", 12), ("B", 128), ("exact", 256), ("span", 64), ("cue", 64)]:
         p.add_argument("--" + name, type=int, default=default)
     p.add_argument("--device", default="cuda", help="cpu only dry-runs the harness: no streams, nothing overlaps")
     args = p.parse_args()
