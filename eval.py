@@ -737,6 +737,73 @@ def _find_tokenizer_dir(checkpoint_dir: str, tokenizer_dir: str | None, group=No
     return Path(value)
 
 
+def _synchronize_inference_device(device) -> None:
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _reset_inference_peak_memory(device) -> None:
+    if torch.device(device).type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def _inference_peak_memory(device) -> dict:
+    if torch.device(device).type != "cuda":
+        return {"peak_memory_allocated_bytes": None, "peak_memory_reserved_bytes": None}
+    return {
+        "peak_memory_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_memory_reserved_bytes": torch.cuda.max_memory_reserved(device),
+    }
+
+
+def summarize_inference_metrics(gen_metrics: list[dict], ppl_metrics: list[dict]) -> dict:
+    """Pool token counts and stage times across requests, never average their rates."""
+    def rate(tokens, seconds):
+        return tokens / seconds if tokens > 0 and seconds > 0 else None
+
+    def peak_memory(rows):
+        return {
+            key: max((row[key] for row in rows if row[key] is not None), default=None)
+            for key in ("peak_memory_allocated_bytes", "peak_memory_reserved_bytes")
+        }
+
+    prompt_tokens = sum(row["prompt_len"] for row in gen_metrics)
+    generated_tokens = sum(row["generated_tokens"] for row in gen_metrics)
+    decode_tokens = sum(row["decode_tokens"] for row in gen_metrics)
+    total_time = sum(row["total_time_s"] for row in gen_metrics)
+    prefill_time = sum(row["prefill_time_s"] for row in gen_metrics)
+    decode_time = sum(row["decode_time_s"] for row in gen_metrics)
+    forward_tokens = sum(row["total_seq_len"] for row in ppl_metrics)
+    forward_time = sum(row["forward_time_s"] for row in ppl_metrics)
+    return {
+        "throughput_scope": "Effective single-device throughput: sum(tokens) / sum(request stage seconds) across all ranks; not aggregate cluster throughput.",
+        "timing_scope": "Model calls only, excluding tokenization, cache setup/reset, result gathering, and file output. Prefill includes first-token sampling; decode excludes the first generated token. Generation counts include EOS; no warmup requests are discarded.",
+        "memory_scope": "Maximum per-request CUDA allocator peak across ranks, including resident model and cache; not KV-only memory or total device memory. CPU values are null.",
+        "generation": {
+            "requests": len(gen_metrics),
+            "prompt_tokens": prompt_tokens,
+            "generated_tokens": generated_tokens,
+            "decode_tokens": decode_tokens,
+            "total_time_s": total_time,
+            "prefill_time_s": prefill_time,
+            "decode_time_s": decode_time,
+            "avg_ttft_ms": 1000 * prefill_time / len(gen_metrics) if gen_metrics else None,
+            "prefill_tokens_per_sec": rate(prompt_tokens, prefill_time),
+            "decode_tokens_per_sec": rate(decode_tokens, decode_time),
+            "gen_tokens_per_sec": rate(generated_tokens, total_time),
+            "decode_ms_per_token": 1000 * decode_time / decode_tokens if decode_tokens else None,
+            **peak_memory(gen_metrics),
+        },
+        "scoring": {
+            "requests": len(ppl_metrics),
+            "input_tokens": forward_tokens,
+            "forward_time_s": forward_time,
+            "forward_tokens_per_sec": rate(forward_tokens, forward_time),
+            **peak_memory(ppl_metrics),
+        },
+    }
+
+
 class LogKVLM(LM):
     """LM wrapper that scores and generates through LogKV, SWA, or dense KV cache.
 
@@ -1092,13 +1159,17 @@ class LogKVLM(LM):
             # the same positions for the native full cache.
             self._set_eval_cache()
             try:
+                _synchronize_inference_device(self._device)
+                _reset_inference_peak_memory(self._device)
                 t0 = time.perf_counter()
                 input_pos = torch.arange(seq_len, device=self._device, dtype=torch.int64)
                 # lm_head_start: materialize logits only for the scoring span
                 # [ctx_len-1, seq_len) — full-sequence logits at 32K are ~10 GB
                 # bf16, the sliced tensor is (cont_len + 1) x vocab.
                 logits = self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
+                _synchronize_inference_device(self._device)
                 t1 = time.perf_counter()
+                peak_memory = _inference_peak_memory(self._device)
                 self.compression_metrics.append({
                     "request_type": request_type, "rank": _global_rank(),
                     "context_len": ctx_len, "cont_len": len(cont_enc),
@@ -1110,9 +1181,13 @@ class LogKVLM(LM):
                 self._reset_eval_cache()
 
         self.ppl_metrics.append({
+            "rank": _global_rank(), "request_type": request_type,
             "total_seq_len": seq_len, "context_len": ctx_len,
             "cont_len": len(cont_enc),
-            "forward_time_ms": round((t1 - t0) * 1000, 2),
+            "forward_time_s": t1 - t0,
+            "forward_time_ms": (t1 - t0) * 1000,
+            "forward_tokens_per_sec": seq_len / (t1 - t0) if t1 > t0 else None,
+            **peak_memory,
         })
 
         # ``logits`` starts at position ctx_len-1 (lm_head_start); its first
@@ -1210,7 +1285,9 @@ class LogKVLM(LM):
                 # 建一次、按请求原地重置，不逐样本重分配 — 见 _set_eval_cache。
                 self._set_eval_cache()
                 try:
-                    t0 = time.perf_counter()
+                    _synchronize_inference_device(self._device)
+                    _reset_inference_peak_memory(self._device)
+                    timing = {}
                     out = litgpt_generate(
                         self.model,
                         prompt_tensor,
@@ -1219,8 +1296,10 @@ class LogKVLM(LM):
                         top_k=top_k,
                         top_p=top_p,
                         eos_id=self.tokenizer.eos_id,
+                        timing=timing,
                     )
-                    t1 = time.perf_counter()
+                    _synchronize_inference_device(self._device)
+                    peak_memory = _inference_peak_memory(self._device)
                     # The last output token has not been forwarded into the cache.
                     self.compression_metrics.append({
                         "request_type": "generate_until", "rank": dp_rank, "sample_id": sample_id,
@@ -1233,12 +1312,23 @@ class LogKVLM(LM):
             # 截取新生成的部分并解码
             generated_tokens = out[prompt_tensor.size(0):]
             gen_len = generated_tokens.size(0)
-            total_time_s = t1 - t0
+            total_time_s = timing["total_time_s"]
+            prefill_time_s = timing["prefill_time_s"]
+            decode_time_s = timing["decode_time_s"]
+            decode_tokens = timing["decode_tokens"]
             self.gen_metrics.append({
+                "rank": dp_rank, "sample_id": sample_id,
                 "prompt_len": prompt_len, "generated_tokens": gen_len,
-                "total_time_s": round(total_time_s, 4),
-                "decode_ms_per_token": round(total_time_s / max(gen_len, 1) * 1000, 2),
-                "gen_tokens_per_sec": round(gen_len / total_time_s, 2) if total_time_s > 0 else 0,
+                "total_time_s": total_time_s,
+                "prefill_time_s": prefill_time_s,
+                "ttft_ms": prefill_time_s * 1000,
+                "prefill_tokens_per_sec": prompt_len / prefill_time_s if prefill_time_s > 0 else None,
+                "decode_time_s": decode_time_s,
+                "decode_tokens": decode_tokens,
+                "decode_ms_per_token": decode_time_s / decode_tokens * 1000 if decode_tokens else None,
+                "decode_tokens_per_sec": decode_tokens / decode_time_s if decode_tokens and decode_time_s > 0 else None,
+                "gen_tokens_per_sec": gen_len / total_time_s if total_time_s > 0 else None,
+                **peak_memory,
             })
 
             decoded = self.tokenizer.decode(generated_tokens)
@@ -1682,12 +1772,28 @@ def main(
             )
         _hb("simple_evaluate 已返回")
         compression_samples = lm_model.all_gather_results(lm_model.compression_metrics, tag="KV compression")
+        speed_samples = lm_model.all_gather_results(
+            [{"generation": lm_model.gen_metrics, "scoring": lm_model.ppl_metrics}], tag="inference speed",
+        )
 
         # 落盘阶段：只有 rank 0 写文件（建目录、写 json/csv/xlsx）。其它 rank 什么都
         # 不做，直接到下面的 barrier 等 rank 0 写完 —— 各 rank 同时往共享盘写同名文件
         # 会互相截断，而 mkdir/exists 各判各的又会引入分支不一致。
         if _is_main():
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            gen_metrics = [row for rank in speed_samples for row in rank["generation"]]
+            ppl_metrics = [row for rank in speed_samples for row in rank["scoring"]]
+            inference_summary = summarize_inference_metrics(gen_metrics, ppl_metrics)
+            inference_report = {
+                **inference_summary,
+                "world_size": world_size,
+                "generate_until": gen_metrics,
+                "loglikelihood": ppl_metrics,
+            }
+            for kind in ("generation", "scoring"):
+                if inference_summary[kind]["requests"]:
+                    print(f"⏱ 推理速度（{kind}，全部 rank 样本，单设备有效吞吐）: "
+                          + json.dumps(inference_summary[kind], ensure_ascii=False), flush=True)
             compression_summary = summarize_compression(compression_samples)
             compression_report = {
                 "measurement_point": "request_end_before_cache_reset",
@@ -1771,6 +1877,7 @@ def main(
                     "swa_window_size": lm_model.swa_window_size,
                     "cache_budget": lm_model.cache_budget,
                     "kv_compression": compression_report,
+                    "inference_metrics": inference_report,
                     "log_kv_B": log_kv_B,
                     "log_kv_recent_size": log_kv_recent_size,
                     "log_kv_prefill_block": log_kv_prefill_block,
@@ -1842,22 +1949,26 @@ def main(
                 try:
                     import pandas as pd
                     with pd.ExcelWriter(inference_xlsx) as writer:
-                        if lm_model.gen_metrics:
-                            gen_df = pd.DataFrame(lm_model.gen_metrics)
+                        pd.DataFrame([
+                            {"request_type": kind, **inference_summary[kind]}
+                            for kind in ("generation", "scoring")
+                        ]).to_excel(writer, sheet_name="speed_summary", index=False)
+                        if gen_metrics:
+                            gen_df = pd.DataFrame(gen_metrics)
                             gen_df.to_excel(writer, sheet_name="generate_until", index=False)
                             # 按 prompt 长度分桶统计
                             gen_df["prompt_bucket"] = pd.cut(gen_df["prompt_len"],
                                 bins=[0, 1024, 4096, 8192, 16384, 32768, 999999],
                                 labels=["0-1K", "1K-4K", "4K-8K", "8K-16K", "16K-32K", "32K+"])
-                            summary = gen_df.groupby("prompt_bucket", observed=False).agg(
-                                count=("prompt_len", "count"),
-                                avg_prompt_len=("prompt_len", "mean"),
-                                avg_decode_ms_tok=("decode_ms_per_token", "mean"),
-                                avg_gen_tok_sec=("gen_tokens_per_sec", "mean"),
-                            ).round(2).reset_index()
+                            summary = pd.DataFrame([
+                                {"prompt_bucket": str(bucket), **summarize_inference_metrics(
+                                    rows.to_dict("records"), [],
+                                )["generation"]}
+                                for bucket, rows in gen_df.groupby("prompt_bucket", observed=True)
+                            ])
                             summary.to_excel(writer, sheet_name="gen_by_bucket", index=False)
-                        if lm_model.ppl_metrics:
-                            ppl_df = pd.DataFrame(lm_model.ppl_metrics)
+                        if ppl_metrics:
+                            ppl_df = pd.DataFrame(ppl_metrics)
                             ppl_df.to_excel(writer, sheet_name="loglikelihood", index=False)
                     print(f"📊 推理时延指标已保存至 {inference_xlsx}")
                 except Exception as e:
