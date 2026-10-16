@@ -356,6 +356,37 @@ apply_patch()
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
 
+def _unreadable_dataset_infos(root, dataset):
+    """Cached ``dataset_info.json`` files of ``dataset`` that are not valid JSON.
+
+    Offline, ``datasets`` reads every cached version of the dataset to pick a
+    configuration, so one broken file fails the whole load without naming it.
+    """
+    try:
+        from datasets.naming import camelcase_to_snakecase
+    except ImportError:  # Diagnostics only; the cache itself needs datasets.
+        camelcase_to_snakecase = str.lower
+    name = camelcase_to_snakecase(str(dataset).rstrip("/").split("/")[-1])
+    root = Path(root)
+    try:
+        entries = [entry for entry in root.iterdir() if entry.name == name or entry.name.endswith("___" + name)]
+    except OSError as exc:
+        return [dict(path=str(root), error=f"{type(exc).__name__}: {exc}")]
+    broken = []
+    for entry in sorted(entries):
+        # <dataset>/<config>/<version>/<hash>/dataset_info.json
+        for info in sorted(entry.glob("*/*/*/dataset_info.json")):
+            try:
+                json.loads(info.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                lines = exc.doc.splitlines()
+                broken.append(dict(path=str(info), error=str(exc),
+                                   context=lines[max(0, exc.lineno - 3):exc.lineno + 1]))
+            except (OSError, UnicodeDecodeError) as exc:
+                broken.append(dict(path=str(info), error=f"{type(exc).__name__}: {exc}"))
+    return broken
+
+
 def _walk_cache_path(path):
     """lstat each component of ``path`` in order and stop at the first one that cannot be entered.
 
@@ -517,6 +548,13 @@ def _trace_hf_cache_resolution():
         cache_misses.clear()
         try:
             return original_load(*args, **kwargs)
+        except json.JSONDecodeError:
+            path = args[0] if args else kwargs.get("path")
+            root = Path(kwargs.get("cache_dir") or cfg.HF_DATASETS_CACHE).expanduser()
+            emit("dataset_info_unreadable", dataset=path, cache_root=str(root),
+                 files=_unreadable_dataset_infos(root, path),
+                 fix="repair or re-copy the listed dataset_info.json; a duplicate hash directory may be removed")
+            raise
         except (ConnectionError, FileNotFoundError):
             path = args[0] if args else kwargs.get("path")
             if not (cfg.HF_DATASETS_OFFLINE and isinstance(path, str) and path.count("/") == 1
