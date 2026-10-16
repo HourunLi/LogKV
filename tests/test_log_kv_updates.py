@@ -283,6 +283,8 @@ def _scalar_top_overflow(cache):
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("top_merge", ["fold", "lightest"])
 def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta, top_merge):
+    if top_merge == "lightest":
+        _expect_interpreter_bf16(dtype, device)  # The fused top-level kernel rounds merged K/V.
     torch.manual_seed(13)
     caches = []
     for _ in range(2):
@@ -326,6 +328,7 @@ def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta, top
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_lightest_top_merge_matches_scalar_and_stays_balanced(device, dtype):
     """Gamma's top level: batched == per-entry reference, and no slot hoards the old mass."""
+    _expect_interpreter_bf16(dtype, device)  # The fused top-level kernel rounds merged K/V.
     torch.manual_seed(17)
     caches = {}
     for top_merge in ("fold", "lightest"):
