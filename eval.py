@@ -361,6 +361,7 @@ def _unreadable_dataset_infos(root, dataset):
 
     Offline, ``datasets`` reads every cached version of the dataset to pick a
     configuration, so one broken file fails the whole load without naming it.
+    Size and modification time tell a cut-short copy, and when it was written.
     """
     try:
         from datasets.naming import camelcase_to_snakecase
@@ -378,12 +379,19 @@ def _unreadable_dataset_infos(root, dataset):
         for info in sorted(entry.glob("*/*/*/dataset_info.json")):
             try:
                 json.loads(info.read_text(encoding="utf-8"))
+                continue
             except json.JSONDecodeError as exc:
                 lines = exc.doc.splitlines()
                 broken.append(dict(path=str(info), error=str(exc),
                                    context=lines[max(0, exc.lineno - 3):exc.lineno + 1]))
             except (OSError, UnicodeDecodeError) as exc:
                 broken.append(dict(path=str(info), error=f"{type(exc).__name__}: {exc}"))
+            try:
+                stat = info.stat()
+                broken[-1].update(size=stat.st_size, modified=time.strftime(
+                    "%Y-%m-%d %H:%M:%S %z", time.localtime(stat.st_mtime)))
+            except OSError:
+                pass
     return broken
 
 
