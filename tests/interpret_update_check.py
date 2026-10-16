@@ -1,7 +1,8 @@
-"""Fused Alpha span scores, join staging and slot clears vs PyTorch on CPU.
+"""Fused Alpha span scores, join staging, slot clears and top-level merges vs PyTorch on CPU.
 
 Run with TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1 (tests/test_log_kv_triton_interpret.py does).
 """
+import copy
 from unittest.mock import patch
 
 import numpy as np
@@ -16,6 +17,8 @@ def main():
     assert kv._fused_on(torch.device("cpu")), "run with TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1"
     check_span_scores()
     check_stage_and_clear()
+    check_top_lightest()
+    check_top_level_bursts()
     check_cache_trajectory()
     print("update kernels match the Torch reference")
 
@@ -101,6 +104,90 @@ def check_stage_and_clear():
         for i, (actual, want) in enumerate(zip(list(fields) + [imp], expected + [expected_imp])):
             if want is not None:
                 assert torch.equal(actual, want), f"cleared field {i} differs (dtype={dtype})"
+
+
+def check_top_lightest():
+    """Saturated Gamma top levels: the one-program-per-level kernel against the batched PyTorch steps.
+
+    Masses repeat, so ties (the oldest pair merges) are exercised. Merge decisions
+    and metadata are exact in every dtype; bf16 K/V differ only by the
+    interpreter's truncating fp32->bf16 casts (CUDA rounds to nearest, like Torch).
+    """
+    for dtype, stage_dtype, B in ((torch.float32, torch.float32, 2), (torch.float32, torch.float32, 5),
+                                  (torch.bfloat16, torch.float32, 5), (torch.bfloat16, torch.bfloat16, 4)):
+        generator = torch.Generator().manual_seed(B)
+        cache = kv.LogStructuredKVCache(
+            (2, 3, 512, 8), (2, 3, 512, 6), B=B, recent_size=16, dtype=dtype, semantic_clusters=True,
+            cluster_k_max=3, allocate_second_order=False, semantic_flush_granularity=16, gamma_top_merge="lightest",
+            cos_cache=torch.ones(512, 8), sin_cache=torch.zeros(512, 8), rope_n_elem=8)
+        fields = cache._semantic_flat_level_fields()
+        n = fields[0].size(0)
+
+        def rows(count, dims, low):
+            k, v = torch.randn(count, dims[0], generator=generator), torch.randn(count, dims[1], generator=generator)
+            lo = torch.randint(0, 900, (count,), generator=generator)
+            return (k, v, torch.randint(low, 6, (count,), generator=generator).float(), lo,
+                    lo + torch.randint(0, 50, (count,), generator=generator),
+                    torch.randint(0, 9999, (count,), generator=generator),
+                    torch.randint(0, 99, (count,), generator=generator), torch.rand(count, generator=generator) < .3)
+
+        for i, x in zip(fused._FIELDS, rows(n, (8, 6), 0)):
+            fields[i].copy_(x)
+        cache.level_imp.copy_(torch.rand(cache.level_imp.shape, generator=generator))
+        stage = [None] * 13
+        for i, x in zip(fused._FIELDS, rows(60, (8, 6), 1)):
+            stage[i] = x.to(stage_dtype) if i < 2 else x
+        stage = tuple(stage)
+        # Lanes overflow by 1 up to 5B entries; one lane per (b, g, c).
+        jobs = [(0, 0, 1, 0, 1), (0, 2, 0, 1, 12), (1, 1, 2, 13, 3), (1, 2, 1, 20, 7), (1, 0, 0, 30, 25)]
+        reference = copy.deepcopy(cache)
+        reference._semantic_top_level_lightest_batched(jobs, stage)
+        cache._semantic_top_level_lightest_batched(jobs, stage, fused)
+        for (name, actual), (_, expected) in zip(cache.named_buffers(), reference.named_buffers()):
+            if dtype == torch.bfloat16 and name in ("level_k", "level_v"):
+                torch.testing.assert_close(actual, expected, rtol=2 ** -6, atol=2 ** -6, msg=f"top level {name} ({dtype})")
+            else:
+                assert torch.equal(actual, expected), f"top level {name} differs (B={B}, {dtype}, stage {stage_dtype})"
+
+
+def check_top_level_bursts():
+    """Bursts that keep Gamma top levels saturated, through the cache's own append path."""
+    def run(use_kernel):
+        torch.manual_seed(13)
+        cache = kv.LogStructuredKVCache(
+            (2, 2, 16, 8), (2, 2, 16, 8), B=3, recent_size=4, semantic_clusters=True, cluster_k_max=2,
+            allocate_second_order=False, semantic_anchor_mode="mid", semantic_unified_route=True,
+            alpha_exact_tokens=2, alpha_span_max_tokens=2, beta_adaptive_merge=True, beta_novelty=True,
+            gamma_top_merge="lightest", cos_cache=torch.ones(64, 8), sin_cache=torch.zeros(64, 8), rope_n_elem=8)
+        lanes = [(0, 0, 0), (0, 1, 1), (1, 0, 0), (1, 1, 1)]
+        capacity = cache.B * (2 ** cache.L_alloc - 1)
+        steps = []
+        overflow = kv.LogStructuredKVCache._semantic_top_level_lightest_batched
+
+        def spy(self, jobs, stage, kernel=None):
+            assert kernel is fused, "the append path did not hand the fused kernels to the top level"
+            steps.append(max(job[4] for job in jobs))
+            return overflow(self, jobs, stage, kernel if use_kernel else None)
+
+        position = 0
+        with patch.object(kv.LogStructuredKVCache, "_semantic_top_level_lightest_batched", spy):
+            for counts in ([capacity - 1, 2, capacity, 1], [5, capacity + 3, 1, 7], [9, 4, 2 * capacity, 3],
+                           [3 * capacity, capacity, capacity, 2 * capacity]):
+                total = sum(counts)
+                k, v = torch.randn(total, 8), torch.randn(total, 8)
+                pos = torch.arange(position, position + total)
+                position += total
+                block = (k, v, torch.ones(total), *cache._empty_stats(k, v), pos, pos, pos,
+                         torch.arange(total), torch.zeros(total, dtype=torch.bool))
+                cache._semantic_append_entries_batched(lanes, counts, block)
+        return cache, steps
+
+    reference, steps = run(False)
+    actual, _ = run(True)
+    assert len(steps) >= 3 and max(steps) > reference.B, f"the bursts did not keep top levels saturated: {steps}"
+    assert actual._semantic_counts == reference._semantic_counts
+    for (name, a), (_, b) in zip(actual.named_buffers(), reference.named_buffers()):
+        assert torch.equal(a, b), f"cache buffer {name} differs between the fused and PyTorch top-level overflow"
 
 
 def check_cache_trajectory():

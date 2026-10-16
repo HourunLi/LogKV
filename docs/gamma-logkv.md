@@ -48,7 +48,11 @@ Gamma 只取第 0 层的条目与本次 token 一起按 `p_lo` 稳定排序，�
 越来越重的条目（测试中占顶层质量的 72–88%，带 `log w` 的注意力偏置）。Gamma 合并质量和最小的
 相邻对（并列取最老的），再左移后续条目、把新条目放在最后，顶层各条目质量保持相近（同一测试中
 最重条目只占 16–18%）。32K、两层余量时顶层通常不饱和，这一项主要影响更长序列和更少余量层。
-批量实现对所有仍在溢出的簇每步做一次 argmin、合并和移位，没有主机同步，与逐条参考路径逐位一致。
+
+一次 flush 让 m 个条目进入某个饱和顶层时，要按顺序做 m 步，每步依赖上一步的结果。实现里槽位
+只记行号：合并结果写回这一对中较老的那一行，后续槽位左移的是行号，不搬整行 K/V。CUDA 一阶路径
+用一次 Triton 启动处理所有饱和顶层，每个顶层由一个程序跑完全部 m 步；其他路径按批量 PyTorch
+逐步执行同样的行池。两条路径都没有主机同步，结果与逐条参考路径逐位一致。
 
 ## 3. 余量层数（可选）
 
@@ -61,6 +65,21 @@ L = max(2, ceil(log2(N / (K·B′) + 1)) + slack)
 `slack 0` 为 B′=218、4 层。上表中老内容的 w 约减半，代价是存活条目约多 45%：每步注意力的条目
 更多，`kv_compression_factor` 下降，持久分配字节不变。偏斜簇会更早填满顶层，因此必须与
 `gamma_top_merge: lightest` 一起使用；默认不启用。
+
+`slack 0` 时，偏斜簇的顶层在 32K 以内就会写满。合成偏斜簇（8 个 KV group，簇权重
+`exp(−3c/K)`）从第 7 次 flush（约 14K token）起每次都有顶层合并，到 32K 时 96 个顶层中有 31 个
+写满，每次 flush 最长的顶层要连续做约 65 步。这一步融合前每步约 230 个 PyTorch 算子，每层每次
+flush 约 1.5 万个，是同一次 flush 其余路由与写入的 7 倍以上；训练时前向、checkpoint 重算和
+反向回放各执行一遍。现在 CUDA 上是一次启动；PyTorch 路径每步约 95 个算子（下面的基准用
+`--device cpu` 时，每次 flush 平均 341 → 273 ms）。在目标 GPU 上对比：
+
+```bash
+python unused/benchmark_log_kv_unified.py --device cuda --groups 8 --B 128 --flushes 15 --iters 3 --route attach \
+  --pattern clustered --cluster-skew 3 --alpha-exact-tokens 256 --alpha-span-max-tokens 64 \
+  --beta-novelty --beta-adaptive-merge --gamma-level0-reinsert --gamma-top-merge lightest --gamma-level-slack 0
+```
+
+输出里的 `saturated_top_levels` 是结束时写满的顶层数，`levels` 是层数。
 
 ## 4. 精确池选择：开头提示词（cue）
 
@@ -222,4 +241,4 @@ python unused/niah_needle_trace.py --config exp/qwen1.7b-32k/eval_gamma_cue.yaml
 `tests/test_alpha_log_kv.py`（守恒、延迟归档、反向回放与预取，覆盖 Gamma 与 cue 开关），
 `tests/test_log_kv_updates.py`（顶层两种合并的批量与逐条路径一致），
 `tests/interpret_update_check.py`（经 `tests/test_log_kv_triton_interpret.py` 在解释器上比较片段打分、
-暂存与清空核，以及整段 Gamma 轨迹）。
+暂存与清空核、饱和顶层的最轻对合并核，以及整段 Gamma 轨迹）。

@@ -272,7 +272,7 @@ def test_benchmark_checks_later_iterations(monkeypatch):
 
 def _scalar_top_overflow(cache):
     """The former per-entry top-level path, as a reference for the batched fold."""
-    def overflow(jobs, stage):
+    def overflow(jobs, stage, fused=None):
         for b, g, c, start, n in jobs:
             cache._semantic_append_top_level_overflow(b, g, c, cache._semantic_slice_block(stage, start, start + n))
     return overflow

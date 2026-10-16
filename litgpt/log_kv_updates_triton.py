@@ -318,6 +318,127 @@ def merge_scatter(fields, stage, si, gi, pi, vi, dst, clear, *, beta_lengths=Non
     return tuple(carry) if beta_lengths is None else (tuple(carry), beta_cuts)
 
 
+@triton.jit(do_not_specialize=["N"])
+def _top_lightest(F, S, P, IDS, WS, IMP, META, N, B: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+                  BB: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr):
+    """One saturated top level per program: m lightest-pair merges, each followed by an append.
+
+    The lane's pool P holds its B level rows, then its m staged rows. Slots name
+    pool rows, so a merge rewrites one row (the older of the pair) and shifts B
+    ids instead of B rows; slot order stays pool order, as in the reference.
+    Slot ids and masses live in registers; each step passes them through IDS/WS
+    once to read the left-shifted copies. Steps are sequential, so one warp runs
+    a lane and reductions stay in-warp.
+    """
+    lane = tl.program_id(0).to(tl.int64)
+    top = tl.load(META + lane)
+    start = tl.load(META + N + lane)
+    m = tl.load(META + 2 * N + lane).to(tl.int32)
+    pool = tl.load(META + 3 * N + lane)
+    d = tl.arange(0, BD).to(tl.int64)
+    r = tl.arange(0, BT).to(tl.int64)
+    # Staged rows enter in the storage dtypes, like the reference's `.to(f.dtype)`.
+    for r0 in range(0, B + m, BT):
+        row = r0 + r
+        level = row < B
+        staged = (row >= B) & (row < B + m)
+        for f in tl.static_range(8):
+            dim = DK if f == 0 else DV if f == 1 else 1
+            mask = (d < dim)[None, :]
+            a = tl.load(F[f] + (top + row)[:, None] * dim + d[None, :], level[:, None] & mask, 0)
+            s = tl.load(S[f] + (start + row - B)[:, None] * dim + d[None, :], staged[:, None] & mask, 0)
+            value = tl.where(level[:, None], a, s.to(F[f].dtype.element_ty))
+            tl.store(P[f] + (pool + row)[:, None] * dim + d[None, :], value, (level | staged)[:, None] & mask)
+    tl.debug_barrier()
+    j = tl.arange(0, BB)
+    first = j < B
+    ids = j
+    w = tl.load(P[2] + pool + j, first, 0.0)
+    scratch = lane * BB + j
+    for t in range(m):
+        tl.store(IDS + scratch, ids, first)
+        tl.store(WS + scratch, w, first)
+        tl.debug_barrier()  # Also orders the previous step's merged row before its reads.
+        later = j < B - 1
+        nxt = tl.load(IDS + scratch + 1, later, 0)
+        wn = tl.load(WS + scratch + 1, later, 0.0)
+        # Masses are >= 0, so float bits order like values: one min over
+        # (pair mass bits, slot) finds the first minimal pair, as `argmin`.
+        key = ((w + wn).to(tl.int32, bitcast=True).to(tl.int64) << 32) | j.to(tl.int64)
+        i = (tl.min(tl.where(later, key, 9223372036854775807), 0) & 0xFFFFFFFF).to(tl.int32)
+        pick = j == i
+        ia = pool + tl.sum(tl.where(pick, ids, 0), 0).to(tl.int64)
+        ib = pool + tl.sum(tl.where(pick, nxt, 0), 0).to(tl.int64)
+        wa = tl.sum(tl.where(pick, w, 0.0), 0)
+        wb = tl.sum(tl.where(pick, wn, 0.0), 0)
+        # The pair merges into the older row: read both rows, then write.
+        alpha = tl.div_rn(wa, tl.maximum(wa + wb, 1.e-8))
+        ka = tl.load(P[0] + ia * DK + d, d < DK, 0).to(tl.float32)
+        kb = tl.load(P[0] + ib * DK + d, d < DK, 0).to(tl.float32)
+        va = tl.load(P[1] + ia * DV + d, d < DV, 0).to(tl.float32)
+        vb = tl.load(P[1] + ib * DV + d, d < DV, 0).to(tl.float32)
+        both = (wa > 0) & (wb > 0)
+        lo_a, lo_b = tl.load(P[3] + ia), tl.load(P[3] + ib)
+        hi_a, hi_b = tl.load(P[4] + ia), tl.load(P[4] + ib)
+        lo = tl.where(both, tl.minimum(lo_a, lo_b), tl.where(wa > 0, lo_a, lo_b))
+        hi = tl.where(both, tl.maximum(hi_a, hi_b), tl.where(wa > 0, hi_a, hi_b))
+        sum_wp = tl.load(P[5] + ia) + tl.load(P[5] + ib)
+        order = tl.minimum(tl.load(P[6] + ia), tl.load(P[6] + ib))
+        pad = tl.load(P[7] + ia) & tl.load(P[7] + ib)
+        tl.debug_barrier()
+        tl.store(P[0] + ia * DK + d, (alpha * ka + (1.0 - alpha) * kb).to(P[0].dtype.element_ty), d < DK)
+        tl.store(P[1] + ia * DV + d, (alpha * va + (1.0 - alpha) * vb).to(P[1].dtype.element_ty), d < DV)
+        tl.store(P[2] + ia, wa + wb)
+        tl.store(P[3] + ia, lo)
+        tl.store(P[4] + ia, hi)
+        tl.store(P[5] + ia, sum_wp)
+        tl.store(P[6] + ia, order)
+        tl.store(P[7] + ia, pad)
+        # Slots before the pair keep their rows, the pair's slot names the merged
+        # row, later slots shift left and the staged entry takes the last slot.
+        incoming = tl.load(P[2] + pool + B + t)
+        ids = tl.where(j < i, ids, tl.where(pick, (ia - pool).to(tl.int32), tl.where(later, nxt, B + t)))
+        w = tl.where(j < i, w, tl.where(pick, wa + wb, tl.where(later, wn, incoming)))
+        tl.debug_barrier()  # Every thread has read this step's shifted copies.
+    tl.store(IDS + scratch, ids, first)
+    tl.debug_barrier()
+    for r0 in range(0, B, BT):
+        row = r0 + r
+        live = row < B
+        src = pool + tl.load(IDS + lane * BB + row, live, 0).to(tl.int64)
+        for f in tl.static_range(8):
+            dim = DK if f == 0 else DV if f == 1 else 1
+            mask = live[:, None] & (d < dim)[None, :]
+            value = tl.load(P[f] + src[:, None] * dim + d[None, :], mask, 0)
+            tl.store(F[f] + (top + row)[:, None] * dim + d[None, :], value, mask)
+        tl.store(IMP + top + row, tl.zeros([BT], IMP.dtype.element_ty), live)
+
+
+def top_lightest(fields, importance, stage, meta, pool_rows, width):
+    """Gamma's lightest-pair overflow of saturated top levels, one program per level.
+
+    `meta` [4, n] (int64) holds each level's flat row of slot 0, its first
+    staged row in `stage`, its staged count m >= 1 and its offset in a pool of
+    `pool_rows` = sum(width + m) rows. Per staged row, the adjacent pair with the
+    smallest combined mass merges (ties: the oldest), later slots shift left
+    and the row takes the last slot; merged K/V round to the storage dtype each
+    step. Importance of the written slots is cleared.
+    """
+    n = meta.size(1)
+    if not n:
+        return
+    f, s = tuple(fields[i] for i in _FIELDS), tuple(stage[i] for i in _FIELDS)
+    pool = tuple(x.new_empty((pool_rows, *x.shape[1:])) for x in f)
+    bb = triton.next_power_of_2(width)
+    ids = torch.empty((n, bb), dtype=torch.int32, device=meta.device)
+    masses = torch.empty((n, bb), dtype=torch.float32, device=meta.device)
+    dk, dv = fields[0].size(1), fields[1].size(1)
+    _top_lightest[(n,)](
+        f, s, pool, ids, masses, importance, meta.contiguous(), n, width, dk, dv, bb, 8,
+        triton.next_power_of_2(max(dk, dv)), num_warps=1, enable_fp_fusion=False,
+    )
+
+
 @triton.jit(do_not_specialize=["NR", "START"])
 def _centroid(K, MU, NE, OUT_MU, OUT_NE, META, NR, START, D: tl.constexpr, BD: tl.constexpr, BT: tl.constexpr = 1):
     row = tl.program_id(0).to(tl.int64)
