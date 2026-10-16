@@ -97,6 +97,32 @@ def test_path_walk_names_the_component_that_blocks_traversal():
             assert steps[-1]["listing_of"] == str(root)
 
 
+def test_unreadable_dataset_info_is_named_with_its_context():
+    import tempfile
+    source = Path(__file__).resolve().parents[1] / "eval.py"
+    node = next(n for n in ast.parse(source.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == "_unreadable_dataset_infos")
+    scope = dict(json=json, Path=Path)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
+    find = scope["_unreadable_dataset_infos"]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        good = root / "allenai___social_i_qa" / "default" / "0.1.0" / "aaaa" / "dataset_info.json"
+        bad = root / "allenai___social_i_qa" / "default" / "0.1.0" / "bbbb" / "dataset_info.json"
+        other = root / "other___dataset" / "default" / "0.1.0" / "cccc" / "dataset_info.json"
+        for info in (good, bad, other):
+            info.parent.mkdir(parents=True)
+        good.write_text('{"config_name": "default"}')
+        # A trailing comma; Python 3.10 reports "Expecting property name enclosed in double quotes".
+        bad.write_text('{\n    "config_name": "default",\n}')
+        other.write_text("not json")
+        found = find(root, "allenai/social_i_qa")
+        assert [item["path"] for item in found] == [str(bad)]
+        # Python 3.10 points at the brace, 3.13 at the comma; the context shows both.
+        assert found[0]["context"][-2:] == ['    "config_name": "default",', "}"]
+        assert find(root / "missing", "allenai/social_i_qa")[0]["error"].startswith("FileNotFoundError")
+
+
 def test_eval_launch_uses_selected_python_for_both_jobs():
     source = (Path(__file__).resolve().parents[1] / "eval.sh").read_text()
     start = source.index('if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then')
@@ -120,5 +146,6 @@ torchrun() { echo WRONG_INTERPRETER; return 99; }
 if __name__ == "__main__":
     test_cache_failure_is_visible_and_original_behavior_is_preserved()
     test_path_walk_names_the_component_that_blocks_traversal()
+    test_unreadable_dataset_info_is_named_with_its_context()
     test_eval_launch_uses_selected_python_for_both_jobs()
     print("HF cache diagnostic check passed")
