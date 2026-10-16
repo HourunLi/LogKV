@@ -72,8 +72,15 @@ def test_truncated_dataset_info_is_rebuilt_exactly(tmp_path, cut):
     assert broken.returncode and "Expecting property name enclosed in double quotes" in broken.stderr
 
     assert [p for p, _ in repair.scan(tmp_path)] == [path]
-    result = subprocess.run([sys.executable, str(TOOL), str(path), "--write"], capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
+    # By path, or as REPAIR_HF_CACHE=1 runs it: scan the cache, write, then load offline.
+    command = ([str(path), "--write"] if cut == "inside the last split"
+               else ["--scan", str(tmp_path), "--write", "--check"])
+    result = subprocess.run([sys.executable, str(TOOL), *command], capture_output=True, text=True,
+                            env=dict(os.environ, HF_HOME=str(tmp_path / "hf_home")))
+    assert result.returncode == 0, result.stdout + result.stderr
+    if "--check" in command:
+        assert "offline load_dataset('cais/mmlu', 'world_religions'): {'test': 172, 'validation': 20, 'dev': 5}" \
+            in result.stdout
     assert json.loads(path.read_text(encoding="utf-8")) == json.loads(original)
     assert list(json.loads(path.read_text(encoding="utf-8"))) == list(json.loads(original))
     assert path.with_name("dataset_info.json.truncated").read_text(encoding="utf-8") == original[:end]

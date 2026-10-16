@@ -515,6 +515,17 @@ echo "================================================="
 echo "🎯 [Node ${NODE_RANK}] 写入 Barrier 文件，等待所有 ${NUM_NODES} 个节点就绪..."
 echo "================================================="
 
+# REPAIR_HF_CACHE=1：节点 0 先修复共享 HF 缓存（与 eval.py 的 HF_DATASETS_CACHE 相同）里不可读的
+# dataset_info.json，原件留作 *.truncated；修完才写本节点的 barrier，其他节点因此在修复结束后才开始评测。
+HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache}
+if [ "${REPAIR_HF_CACHE:-0}" = "1" ] && [ "${NODE_RANK}" = "0" ]; then
+    echo "🛠 [Node 0] 修复 ${HF_DATASETS_ROOT} 下不可读的 dataset_info.json"
+    if ! "${PYTHON_BIN}" unused/repair_dataset_info.py --scan "${HF_DATASETS_ROOT}" --write --check; then
+        echo "❌ [Node 0] HF 缓存修复失败（见上方输出），不进入评测。"
+        exit 1
+    fi
+fi
+
 # 每个节点写自己的独立 barrier 文件（文件存在性比文件内容跨节点可见更快）
 touch "${BARRIER_DIR}/node_${NODE_RANK}"
 

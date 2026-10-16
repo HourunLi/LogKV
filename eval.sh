@@ -412,6 +412,18 @@ if ! ensure_checkpoint_tokenizer; then
     exit 1
 fi
 
+# REPAIR_HF_CACHE=1: node 0 first repairs unreadable dataset_info.json files in the shared HF cache
+# (eval.py's HF_DATASETS_CACHE), keeping originals as *.truncated. Its barrier file comes after, so the
+# other nodes start evaluating only once the repair is done.
+HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache}
+if [ "${REPAIR_HF_CACHE:-0}" = "1" ] && [ "${NODE_RANK}" = "0" ]; then
+    echo "Node 0: repairing unreadable dataset_info.json under ${HF_DATASETS_ROOT}"
+    if ! "${PYTHON_BIN}" unused/repair_dataset_info.py --scan "${HF_DATASETS_ROOT}" --write --check; then
+        echo "ERROR: HF cache repair failed (see above); not starting eval."
+        exit 1
+    fi
+fi
+
 BARRIER_DIR="${SAVE_DIR}/.eval_only_barrier_d"
 mkdir -p "${BARRIER_DIR}"
 touch "${BARRIER_DIR}/node_${NODE_RANK}"

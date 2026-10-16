@@ -102,7 +102,7 @@ def test_unreadable_dataset_info_is_named_with_its_context():
     source = Path(__file__).resolve().parents[1] / "eval.py"
     node = next(n for n in ast.parse(source.read_text()).body
                 if isinstance(n, ast.FunctionDef) and n.name == "_unreadable_dataset_infos")
-    scope = dict(json=json, Path=Path)
+    scope = dict(json=json, Path=Path, time=__import__("time"))
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
     find = scope["_unreadable_dataset_infos"]
     with tempfile.TemporaryDirectory() as tmp:
@@ -120,7 +120,32 @@ def test_unreadable_dataset_info_is_named_with_its_context():
         assert [item["path"] for item in found] == [str(bad)]
         # Python 3.10 points at the brace, 3.13 at the comma; the context shows both.
         assert found[0]["context"][-2:] == ['    "config_name": "default",', "}"]
+        # Size and time say whether a copy was cut short, and when it was written.
+        assert found[0]["size"] == bad.stat().st_size and found[0]["modified"][:4].isdigit()
         assert find(root / "missing", "allenai/social_i_qa")[0]["error"].startswith("FileNotFoundError")
+
+
+def test_repair_hf_cache_runs_on_node_zero_before_its_barrier():
+    import tempfile
+    root = Path(__file__).resolve().parents[1]
+    for script in ("majob.sh", "eval.sh"):
+        source = (root / script).read_text()
+        start = source.index("HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-")
+        block = source[start:source.index("\nfi\n", start) + 4]
+        assert source.index(block) < source.index('touch "${BARRIER_DIR}/node_${NODE_RANK}"'), script
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp, "calls")
+            stub = Path(tmp, "python")
+            stub.write_text(f'#!/bin/sh\necho "$@" >> {log}\nexit "${{STUB_STATUS:-0}}"\n')
+            stub.chmod(0o755)
+            run = lambda **env: subprocess.run(["bash", "-c", block + "\necho reached"], capture_output=True,
+                                               text=True, env=dict(os.environ, PYTHON_BIN=str(stub), **env))
+            assert "reached" in run(NODE_RANK="0").stdout and not log.exists()  # Off by default.
+            assert "reached" in run(NODE_RANK="1", REPAIR_HF_CACHE="1").stdout and not log.exists()
+            assert "reached" in run(NODE_RANK="0", REPAIR_HF_CACHE="1", HF_DATASETS_ROOT="/cache").stdout
+            assert log.read_text() == "unused/repair_dataset_info.py --scan /cache --write --check\n"
+            failed = run(NODE_RANK="0", REPAIR_HF_CACHE="1", STUB_STATUS="1")
+            assert failed.returncode == 1 and "reached" not in failed.stdout, script
 
 
 def test_eval_launch_uses_selected_python_for_both_jobs():
@@ -147,5 +172,6 @@ if __name__ == "__main__":
     test_cache_failure_is_visible_and_original_behavior_is_preserved()
     test_path_walk_names_the_component_that_blocks_traversal()
     test_unreadable_dataset_info_is_named_with_its_context()
+    test_repair_hf_cache_runs_on_node_zero_before_its_barrier()
     test_eval_launch_uses_selected_python_for_both_jobs()
     print("HF cache diagnostic check passed")

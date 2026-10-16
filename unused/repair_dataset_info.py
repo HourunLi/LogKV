@@ -16,7 +16,8 @@ the original is kept as ``dataset_info.json.truncated``.
 
     python unused/repair_dataset_info.py <cache>/cais___mmlu/world_religions/0.0.0/<hash>/dataset_info.json
     python unused/repair_dataset_info.py <same path> --write --check
-    python unused/repair_dataset_info.py --scan /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
+    python unused/repair_dataset_info.py --scan /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache \\
+        [--write --check]   # every unreadable file under the cache (majob.sh / eval.sh: REPAIR_HF_CACHE=1)
 """
 
 import argparse
@@ -258,7 +259,8 @@ def check(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("paths", nargs="*", help="truncated dataset_info.json files")
-    parser.add_argument("--scan", metavar="CACHE_ROOT", help="list unreadable dataset_info.json files under a datasets cache")
+    parser.add_argument("--scan", metavar="CACHE_ROOT",
+                        help="find unreadable dataset_info.json files under a datasets cache and repair them too")
     parser.add_argument("--template", help="readable dataset_info.json of a sibling config for keys the prefix lost")
     parser.add_argument("--write", action="store_true", help="replace the file (the original becomes *.truncated)")
     parser.add_argument("--check", action="store_true", help="after --write, load the config offline from the cache")
@@ -266,13 +268,15 @@ def main():
     if args.check:
         # Before anything imports datasets: the check must read the cache, never the Hub.
         os.environ["HF_DATASETS_OFFLINE"] = os.environ["HF_HUB_OFFLINE"] = "1"
+    paths = list(args.paths)
     if args.scan:
         found = list(scan(args.scan))
         for path, exc in found:
             print(f"{path}: {type(exc).__name__}: {exc}")
         print(f"{len(found)} unreadable dataset_info.json under {args.scan}")
+        paths += [str(path) for path, _ in found if str(path) not in paths]
     status = 0
-    for path in args.paths:
+    for path in paths:
         try:
             info, report = rebuild(path, args.template)
         except (OSError, ValueError) as exc:
@@ -298,7 +302,12 @@ def main():
             raise RuntimeError(f"{path} does not read back as written")
         print(f"wrote {path} ({len(text)} characters); original kept as {backup}")
         if args.check:
-            name, config, rows = check(path)
+            try:
+                name, config, rows = check(path)
+            except Exception as exc:  # Report and go on; the exit status says it failed.
+                print(f"{path}: offline load still fails: {type(exc).__name__}: {exc}", file=sys.stderr)
+                status = 1
+                continue
             print(f"offline load_dataset({name!r}, {config!r}): {rows}")
     return status
 
