@@ -305,6 +305,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--device', default='cuda')
     p.add_argument('--pattern', choices=('random', 'clustered'), default='random')
+    p.add_argument('--cluster-skew', type=float, default=0.,
+                   help='clustered pattern: draw cluster c with weight exp(-skew * c / clusters); skewed clusters '
+                        'saturate top levels sooner (with --gamma-level-slack 0 within 32K)')
     p.add_argument('--profile-dir', help='Write CPU/CUDA operator tables, trace and Python profile; replaces stage diagnostics')
     for name, default in [('tokens', 2048), ('dim', 128), ('batch', 1), ('groups', 1),
                           ('clusters', 12), ('B', 256), ('flushes', 2), ('iters', 3)]:
@@ -366,7 +369,11 @@ def main():
     for step in range(args.flushes):
         k = torch.randn(args.batch, args.groups, args.tokens, args.dim, device=device, dtype=dtype)
         if args.pattern == 'clustered':
-            labels = torch.randint(args.clusters, k.shape[:-1], device=device)
+            if args.cluster_skew:
+                weights = torch.exp(-args.cluster_skew * torch.arange(args.clusters, device=device) / args.clusters)
+                labels = torch.multinomial(weights, k.shape[:-1].numel(), replacement=True).view(k.shape[:-1])
+            else:
+                labels = torch.randint(args.clusters, k.shape[:-1], device=device)
             k = .03 * k + prototypes.gather(2, labels[..., None].expand_as(k))
         pos = torch.arange(step * args.tokens, (step + 1) * args.tokens, device=device)
         host = [list(range(step * args.tokens, (step + 1) * args.tokens))] * args.batch
@@ -410,7 +417,9 @@ def main():
                           'route_backend': 'triton' if fused else 'torch',
                           'pairing_rule': 'frozen_mnn' if args.merge_passes > 1 else 'mnn',
                           'route_group_tile': cache._semantic_unified_tile(args.batch * args.groups, args.tokens, device),
-                          'effective_B': cache.B, 'exact_count': cache.alpha_count,
+                          'effective_B': cache.B, 'levels': cache.L_alloc, 'exact_count': cache.alpha_count,
+                          'saturated_top_levels': sum(c[-1] == cache.B for row in cache._semantic_counts
+                                                      for lane in row for c in lane),
                           'reference_checks_scope': 'shared_unified_route_and_pairwise_updates',
                           'reference_pairs_verified': True if fused else None,
                           'reference_updates_verified': True if fused else None,

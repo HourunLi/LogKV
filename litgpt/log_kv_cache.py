@@ -1567,6 +1567,15 @@ class LogStructuredKVCache(nn.Module):
             return self._semantic_slice_block(block, 0, 0)
         a = tuple(x[: 2 * n_pairs: 2] if x is not None else None for x in block)
         z = tuple(x[1: 2 * n_pairs: 2] if x is not None else None for x in block)
+        if not self.second_order:
+            # compact()'s first-order arithmetic, elementwise and in the same order.
+            w = a[2] + z[2]
+            alpha = (a[2] / w.clamp(min=1e-8)).unsqueeze(-1)
+            k = alpha * a[0] + (1 - alpha) * z[0]
+            v = alpha * a[1] + (1 - alpha) * z[1]
+            p_lo, p_hi, sum_wp = merge_anchors(a[8], a[9], a[10], z[8], z[9], z[10], a[2], z[2])
+            return (k, v, w, *self._empty_stats(k, v, w), p_lo, p_hi, sum_wp,
+                    torch.minimum(a[11], z[11]), a[12] & z[12])
         base = (
             a[0].view(n_pairs, 1, 1, -1),
             a[1].view(n_pairs, 1, 1, -1),
@@ -1728,18 +1737,27 @@ class LogStructuredKVCache(nn.Module):
         self._semantic_write_slot(b, g, c, ell, self.B - 1, incoming)
         self._set_semantic_level_count(b, g, c, ell, self.B)
 
-    def _semantic_top_level_lightest_batched(self, jobs, stage) -> None:
+    def _semantic_top_level_lightest_batched(self, jobs, stage, fused=None) -> None:
         """Gamma top-level overflow for many saturated ladders at once, without host syncs.
 
         Per staged entry and lane, the adjacent pair with the smallest combined
         mass merges (ties: the oldest), later slots shift left and the entry
         takes the last slot. Each step runs for every lane still overflowing;
         merged rows round to the cache dtypes like stored slots, so values match
-        `_semantic_top_merge_lightest`.
+        `_semantic_top_merge_lightest`. With `fused`, one program per lane runs
+        all of its steps and one launch serves every lane.
         """
         fields = self._semantic_flat_level_fields()
         dev = fields[0].device
         B, top = self.B, self.L_alloc - 1
+        if fused is not None:
+            m = np.asarray([job[4] for job in jobs], dtype=np.int64)
+            rows = np.asarray([self._semantic_lane_base(b, g, c) + top * B for b, g, c, _, _ in jobs], dtype=np.int64)
+            starts = np.asarray([job[3] for job in jobs], dtype=np.int64)
+            sizes = m + B
+            meta = _upload(np.concatenate((rows, starts, m, np.cumsum(sizes) - sizes)), dev).view(4, len(jobs))
+            fused.top_lightest(fields, self.level_imp.view(-1), stage, meta, int(sizes.sum()), B)
+            return
         # Longest overflows first: the lanes still merging at step t are a prefix.
         jobs = sorted(jobs, key=lambda job: -job[4])
         n = len(jobs)
@@ -1748,38 +1766,38 @@ class LogStructuredKVCache(nn.Module):
         offsets = np.cumsum(m) - m
         live = [int((m > t).sum()) for t in range(int(m.max()))]
         staged_rows = _ranges_to_index_array(np.asarray([job[3] for job in jobs], dtype=np.int64), m)
-        step_rows = np.concatenate([offsets[:k] + t for t, k in enumerate(live)])
+        # The pool holds every lane's level (row lane * B + slot), then the staged
+        # rows. Slots name pool rows and a merge rewrites the older row of its
+        # pair, so a step moves B ids per lane instead of B rows of every field.
+        step_rows = np.concatenate([n * B + offsets[:k] + t for t, k in enumerate(live)])
         fs, fg, nx = _upload_indices(dev, ((rows[:, None] + np.arange(B)).reshape(-1), staged_rows, step_rows))
-        level = [f.index_select(0, fs).view(n, B, *f.shape[1:]) if f is not None else None for f in fields]
-        incoming = [x.index_select(0, fg).to(f.dtype) if f is not None else None for f, x in zip(fields, stage)]
+        pool = [torch.cat((f.index_select(0, fs), x.index_select(0, fg).to(f.dtype))) if f is not None else None
+                for f, x in zip(fields, stage)]
+        ids = torch.arange(n * B, device=dev).view(n, B)
         column = torch.arange(B, device=dev)
         start = 0
         for k in live:
-            lane = torch.arange(k, device=dev)
-            w = level[2][:k]
-            i = (w[:, :-1] + w[:, 1:]).argmin(dim=1)
-            pairs = tuple(torch.stack((x[:k][lane, i], x[:k][lane, i + 1]), dim=1).flatten(0, 1)
-                          if x is not None else None for x in level)
-            merged = self._semantic_merge_block_pairs(pairs)
-            # Column j takes j before the pair, the merged row at i, j + 1 after it
-            # and the staged entry last.
-            source = torch.where(column[None, :] < i[:, None], column[None, :], (column[None, :] + 1).clamp_max(B - 1))
-            step = nx[start:start + k]
+            current = ids[:k]
+            w = pool[2][current]
+            i = (w[:, :-1] + w[:, 1:]).argmin(dim=1, keepdim=True)
+            pair = torch.cat((current.gather(1, i), current.gather(1, i + 1)), dim=1)
+            merged = self._semantic_merge_block_pairs(
+                tuple(x.index_select(0, pair.view(-1)) if x is not None else None for x in pool))
+            for x, y in zip(pool, merged):
+                if x is not None:
+                    x.index_copy_(0, pair[:, 0], y.to(x.dtype))
+            # Slot j keeps its row before the pair, names the merged row at i,
+            # takes slot j + 1's row after it and the staged entry last.
+            shifted = torch.cat((current[:, 1:], nx[start:start + k, None]), dim=1)
             start += k
-            for idx, (f, x) in enumerate(zip(fields, level)):
-                if x is None:
-                    continue
-                gather = source.view(k, B, *([1] * (x.dim() - 2))).expand(k, B, *x.shape[2:])
-                shifted = torch.gather(x[:k], 1, gather)
-                shifted[lane, i] = merged[idx].to(f.dtype)
-                shifted[:, B - 1] = incoming[idx].index_select(0, step)
-                level[idx] = torch.cat((shifted, x[k:]), dim=0)
-        for f, x in zip(fields, level):
+            ids[:k] = torch.where(column < i, current, torch.where(column == i, pair[:, :1], shifted))
+        ids = ids.view(-1)
+        for f, x in zip(fields, pool):
             if f is not None:
-                f.index_copy_(0, fs, x.reshape(n * B, *x.shape[2:]))
+                f.index_copy_(0, fs, x.index_select(0, ids))
         self.level_imp.view(-1).index_fill_(0, fs, 0)
 
-    def _semantic_append_top_level_overflow_batched(self, jobs, stage) -> None:
+    def _semantic_append_top_level_overflow_batched(self, jobs, stage, fused=None) -> None:
         """Top-level overflow for many saturated ladders at once, without host syncs.
 
         `jobs` holds (b, g, c, start, m): m staged rows from `start` overflow a
@@ -1792,7 +1810,7 @@ class LogStructuredKVCache(nn.Module):
         match the scalar path.
         """
         if self.gamma_top_merge == "lightest":
-            self._semantic_top_level_lightest_batched(jobs, stage)
+            self._semantic_top_level_lightest_batched(jobs, stage, fused)
             return
         fields = self._semantic_flat_level_fields()
         dev = fields[0].device
@@ -2027,7 +2045,7 @@ class LogStructuredKVCache(nn.Module):
             if overflow_top:
                 # One batched left fold for every saturated lane (no host syncs).
                 self._semantic_append_top_level_overflow_batched(
-                    [(*lanes[i], start, n) for i, start, n in overflow_top], stage)
+                    [(*lanes[i], start, n) for i, start, n in overflow_top], stage, fused)
 
             if not n_recs:
                 return
