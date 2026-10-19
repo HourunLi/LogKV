@@ -556,7 +556,14 @@ DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa_e,longbench_gov_rep
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
 BENCHMARKS=${BENCHMARKS:-${DEFAULT_BENCHMARKS}}
-NIAH_BENCHMARKS=${NIAH_BENCHMARKS:-niah_single_1,niah_single_2,niah_single_3}
+# 全部捞针评测：RULER 单针（single_1/2/3）、lm-eval 自带的多针，以及 eval_tasks/niah_cue 里改写提示的
+# cue 适用边界变体。NIAH_BENCHMARKS=none 跳过；只跑一部分时写逗号分隔的任务名。
+DEFAULT_NIAH_BENCHMARKS="niah_single_1,niah_single_2,niah_single_3"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_multikey_1,niah_multikey_2,niah_multikey_3,niah_multivalue,niah_multiquery"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_1_qend,niah_single_1_preamble,niah_single_1_paraphrase"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_qend,niah_single_2_preamble,niah_single_2_paraphrase"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_3_qend,niah_single_3_preamble,niah_single_3_paraphrase"
+NIAH_BENCHMARKS=${NIAH_BENCHMARKS:-${DEFAULT_NIAH_BENCHMARKS}}
 
 # NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度
 # max_seq_lengths 可根据模型实际最大上下文调整

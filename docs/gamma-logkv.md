@@ -171,20 +171,20 @@ BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_gamma_cu
 - RULER 多针（lm-eval 自带）：`niah_multikey_1`（文章干草堆里 4 根同格式的针，只问其中一根）、
   `niah_multikey_2` / `niah_multikey_3`（干草堆全由同格式的针组成，开头指令里的词在全文都不稀有）、
   `niah_multivalue`（同一个 key 的 4 个值）、`niah_multiquery`（一次问 4 个 key）。
-- 提示扰动（[`eval_tasks/niah_cue`](../eval_tasks/niah_cue/niah_cue_utils.py)，`eval.py` 自动加载）：
-  与 single_2 / single_3 相同的干草堆、针、深度与评分，只改提示。`_qend` 去掉开头指令，只在末尾提问；
-  `_preamble` 在 RULER 指令前加约 90 个 token 的前导，超过 64 个 token 的 cue 区域；`_paraphrase`
-  的开头指令不含针里的任何稀有词。
+- 提示扰动（[`eval_tasks/niah_cue`](../eval_tasks/niah_cue/niah_cue_utils.py)，`eval.py` 自动加载，
+  tag `niah_cue`）：与 single_1 / single_2 / single_3 相同的干草堆、针、深度与评分，只改提示。`_qend`
+  去掉开头指令，只在末尾提问；`_preamble` 在 RULER 指令前加约 90 个 token 的前导，超过 64 个 token 的
+  cue 区域；`_paraphrase` 的开头指令不含针里的任何稀有词。
 
-同一组任务分别评测 cue checkpoint 与不带 cue 的对照（如 `arc_gamma_k12_b128_2k.yaml`）；
-`--limit 100` 先看每个任务前 100 条，去掉即为全部 500 条：
+`majob.sh` 训练后的 NIAH 阶段与 `eval.sh` 的第三个参数默认跑全部 17 个捞针任务（single 3 个、多针 5 个、
+提示扰动 9 个，`DEFAULT_NIAH_BENCHMARKS`），每个任务在 1K–32K 六个长度上各 500 条，约为原先只跑
+single_1/2/3 的 5.7 倍；`NIAH_BENCHMARKS=<逗号分隔的任务>`（`eval.sh` 为第三个参数）只跑一部分。
+同一组任务分别评测 cue checkpoint 与不带 cue 的对照（如 `arc_gamma_k12_b128_2k.yaml`）；只看 32K、
+每个任务先看前 100 条（去掉 `--limit` 即为全部 500 条）：
 
 ```bash
-NIAH_TASKS=niah_single_2,niah_single_3,niah_multikey_1,niah_multikey_2,niah_multikey_3,niah_multivalue,niah_multiquery
-NIAH_TASKS=$NIAH_TASKS,niah_single_2_qend,niah_single_2_preamble,niah_single_2_paraphrase
-NIAH_TASKS=$NIAH_TASKS,niah_single_3_qend,niah_single_3_preamble,niah_single_3_paraphrase
 DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
-  bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml "$NIAH_TASKS" none
+  bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml none
 ```
 
 ## 与槽位压缩率统计的关系
@@ -269,5 +269,6 @@ python unused/niah_needle_trace.py --config exp/qwen1.7b-32k/eval_gamma_cue.yaml
 `tests/test_alpha_log_kv.py`（守恒、延迟归档、反向回放与预取，覆盖 Gamma 与 cue 开关），
 `tests/test_log_kv_updates.py`（顶层两种合并的批量与逐条路径一致），
 `tests/test_niah_cue_tasks.py`（提示扰动任务只改提示、经 `eval.py` 的任务索引加载并收到 metadata），
+`tests/test_eval_cache_diag.py`（两个启动脚本默认跑同一份全部捞针任务），
 `tests/interpret_update_check.py`（经 `tests/test_log_kv_triton_interpret.py` 在解释器上比较片段打分、
 暂存与清空核、饱和顶层的最轻对合并核，以及整段 Gamma 轨迹）。
