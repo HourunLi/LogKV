@@ -545,7 +545,7 @@ echo "✅ [Node ${NODE_RANK}] 所有 ${NUM_NODES} 个节点已就绪，启动评
 sleep 30
 
 # 拼接 benchmark 列表（避免换行空格被解析进 task 名）。支持用环境变量覆盖；
-# BENCHMARKS=none 可跳过主评测，只跑 NIAH 诊断。
+# BENCHMARKS=none（或 NIAH_ONLY=1）跳过主评测，只跑 NIAH。
 DEFAULT_BENCHMARKS="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa,longbench_dureader,longbench_gov_report,longbench_hotpotqa"
@@ -565,6 +565,30 @@ DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_qend,niah_sing
 DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_3_qend,niah_single_3_preamble,niah_single_3_paraphrase"
 NIAH_BENCHMARKS=${NIAH_BENCHMARKS:-${DEFAULT_NIAH_BENCHMARKS}}
 
+# 任务列表去掉空白和多余逗号；none / skip / off / false / 0 或只剩空白都表示跳过该阶段，
+# 不会把空值交给 eval.py（否则 --benchmark 没有参数）。NIAH_ONLY=1 跳过主评测、只跑 NIAH。
+normalize_benchmarks() {
+    local value
+    value=$(printf '%s' "$1" | tr -d '[:space:]' | tr -s ',' | sed -e 's/^,//' -e 's/,$//')
+    case "$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')" in
+        ""|none|skip|off|false|0) echo none ;;
+        *) echo "${value}" ;;
+    esac
+}
+BENCHMARKS=$(normalize_benchmarks "${BENCHMARKS}")
+NIAH_BENCHMARKS=$(normalize_benchmarks "${NIAH_BENCHMARKS}")
+if [ "${NIAH_ONLY:-0}" = "1" ]; then
+    BENCHMARKS=none
+fi
+for TASK_LIST in "${BENCHMARKS}" "${NIAH_BENCHMARKS}"; do
+    case "${TASK_LIST}" in
+        -*) echo "❌ 任务列表 '${TASK_LIST}' 以 - 开头：eval.py 的参数请放进 DIAG_ARGS，不要写在任务列表的位置。"
+            exit 1 ;;
+    esac
+done
+echo "🧭 [Node ${NODE_RANK}] 主评测: ${BENCHMARKS}"
+echo "🧭 [Node ${NODE_RANK}] NIAH 评测: ${NIAH_BENCHMARKS}"
+
 # NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度
 # max_seq_lengths 可根据模型实际最大上下文调整
 META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
@@ -581,7 +605,7 @@ if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
         --master_port=${EVAL_MASTER_PORT} \
         eval.py \
         --checkpoint_dir ${SAVE_DIR} \
-        --benchmark ${BENCHMARKS} \
+        --benchmark "${BENCHMARKS}" \
         --output_path "${EVAL_OUTPUT_DIR}" \
         ${EVAL_LOG_KV_ARGS} \
         ${DIAG_ARGS} \
@@ -605,7 +629,7 @@ if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
         --master_port=${NIAH_MASTER_PORT} \
         eval.py \
         --checkpoint_dir ${SAVE_DIR} \
-        --benchmark ${NIAH_BENCHMARKS} \
+        --benchmark "${NIAH_BENCHMARKS}" \
         --metadata "${META}" \
         --output_path "${EVAL_OUTPUT_DIR}" \
         ${EVAL_LOG_KV_ARGS} \
