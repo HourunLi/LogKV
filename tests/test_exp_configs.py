@@ -11,7 +11,7 @@ DEFAULTS = dict(log_kv_alpha_exact_tokens=256, log_kv_beta_novelty=True, log_kv_
                 log_kv_semantic_unified_route=False, log_kv_semantic_anchor_mode="multi",
                 log_kv_second_order_scale=1.0, log_kv_cluster_k_max=1,
                 log_kv_gamma_level0_reinsert=True, log_kv_gamma_top_merge="lightest", log_kv_gamma_level_slack=2,
-                log_kv_gamma_cue_tokens=64)
+                log_kv_gamma_cue_tokens=64, log_kv_gamma_literals=False)
 LEGACY_GAMMA = dict(log_kv_gamma_level0_reinsert=False, log_kv_gamma_top_merge="fold", log_kv_gamma_level_slack=2)
 
 
@@ -31,6 +31,7 @@ def effective(name):
     if not out["log_kv_alpha_exact_tokens"]:
         out["log_kv_beta_novelty"] = out["log_kv_beta_adaptive_merge"] = False
         out["log_kv_gamma_cue_tokens"] = 0
+        out["log_kv_gamma_literals"] = False
     return out
 
 
@@ -70,7 +71,9 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
     assert bool(cfg["log_kv_semantic_unified_route"]) is unified
 
 
-GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml"))
+# Eval-only literal runs re-evaluate Gamma checkpoints with the ladder they were trained with.
+GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + ["eval_gamma_literal.yaml",
+                                                               "eval_gamma_literal_nocue.yaml"]
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
@@ -86,7 +89,9 @@ def test_only_gamma_experiments_and_the_hub_use_gamma(name):
 
 
 CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
-       "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", "eval_gamma_cue.yaml"]
+       "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", "eval_gamma_cue.yaml",
+       "arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml"]
+LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml"]
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
@@ -97,6 +102,20 @@ def test_only_cue_experiments_and_the_hub_use_cues(name):
         assert cfg["log_kv_gamma_cue_tokens"] == 64, name
     else:
         assert cfg["log_kv_gamma_cue_tokens"] == 0, name
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_literal_experiments_use_literals(name):
+    assert effective(name)["log_kv_gamma_literals"] is (name in LITERAL), name
+
+
+def test_literal_experiments():
+    # Eval-only: each trained checkpoint with its own ladder and cue setting, literals on.
+    for name, trained in (("eval_gamma_literal.yaml", "arc_gamma_cue_k12_b128_2k.yaml"),
+                          ("eval_gamma_literal_nocue.yaml", "arc_gamma_k12_b128_2k.yaml")):
+        evaluated, base = effective(name), effective(trained)
+        assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {"log_kv_gamma_literals"}
+    assert effective("eval_gamma_literal_nocue.yaml")["log_kv_gamma_cue_tokens"] == 0
 
 
 def test_cue_experiments():
@@ -135,6 +154,7 @@ def test_gamma_experiments(name, exact, slack, budget):
     ("arc_gamma_cue_k12_b128_p1024_2k.yaml", "arc_gamma_k12_b128_p1024_2k.yaml", {"log_kv_gamma_cue_tokens"}),
     ("arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
      {"log_kv_gamma_level_slack"}),
+    ("arc_gamma_cue_literal_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_gamma_literals"}),
 ])
 def test_combined_cue_experiments_differ_from_their_parents_only_by_the_named_switches(name, parent, switches):
     names = {"expid", "save_path", "merged_state_staging_dir", "tensorboard_root"}

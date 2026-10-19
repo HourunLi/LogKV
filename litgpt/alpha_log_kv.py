@@ -1,6 +1,8 @@
 """Bounded whole-span selection. Scores are compression-risk proxies, not labels;
-Gamma's optional cue evidence adds a lexical relevance proxy."""
+Gamma's optional cue evidence adds a lexical relevance proxy, and its optional
+literal evidence a lexical incompressibility proxy."""
 import math
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,6 +16,14 @@ CUE_TAU = math.log(100.)
 CUE_FLOOR = 4.
 CUE_CAP = 30.
 CUE_PRIOR = 2048
+# Gamma literals: a literal's symbols are its ASCII digits and the runs of at
+# most 3 letters between two digits (hex and code fragments). Their adaptive
+# order-0 code length measures how random they are: a random 7-digit string
+# codes to about 18 nats, a year or 1,000,000 to about 9-10. The first
+# occurrence of a literal coding above LITERAL_FLOOR nats gains value as a cue
+# does, from the same exp form and cap.
+LITERAL_FLOOR = 12.
+_LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
 
 
 @dataclass
@@ -201,8 +211,182 @@ class CueStream:
         return np.maximum(value, 0.) / np.maximum(lengths, 1)
 
 
+def literal_code(text):
+    """(adaptive order-0 code length in nats, symbols) of a literal's text.
+
+    Symbols are the ASCII digits and the runs of at most 3 letters that sit
+    between two digits; other letters belong to ordinary words. The code uses a
+    0.5 prior over 10 symbols, or 36 once a letter is a symbol, so repeated
+    digits code short and random ones long. Text without a digit codes to 0.
+    """
+    runs = _LITERAL_RUNS.findall(text)
+    symbols = []
+    for i, run in enumerate(runs):
+        if run.isdigit():
+            symbols.append(run)
+        elif len(run) <= 3 and 0 < i < len(runs) - 1 and runs[i - 1].isdigit() and runs[i + 1].isdigit():
+            symbols.extend(run.lower())
+    alphabet = 10 if all(c.isdigit() for c in symbols) else 36
+    counts, code = {}, 0.
+    for i, c in enumerate(symbols):
+        code -= math.log((counts.get(c, 0) + .5) / (i + .5 * alphabet))
+        counts[c] = counts.get(c, 0) + 1
+    return code, "".join(symbols)
+
+
+class _LiteralRow:
+    __slots__ = ("seen", "prev_lit", "lo", "hi", "code", "ids", "first", "open_lo", "open_ids", "arrays")
+
+    def __init__(self):
+        self.seen, self.prev_lit = 0, False
+        # Closed runs holding a digit, in stream order; a repeat codes to 0.
+        self.lo, self.hi, self.code, self.ids = [], [], [], []
+        self.first = {}  # symbols -> start of their first closed occurrence
+        self.open_lo, self.open_ids = 0, []  # the last run, which the next token may extend
+        self.arrays = None
+
+
+class LiteralStream:
+    """First occurrences of random-looking literals; host only, shared by all layers.
+
+    A literal is a run of tokens made of ASCII letters, digits and ``-_.,:/+#``
+    with no whitespace inside: it ends at any other token and restarts at a
+    token led by whitespace, so numbers inside CJK text or prose stand alone.
+    Only runs holding a digit are kept, with their token ids, so state grows
+    with the literals in the stream. Values are read as of a position (the
+    cache passes the end of the block it archives): a run that continues past
+    it counts with its tokens before it, so layer-major prefill, any prefill
+    block and token-by-token decode select alike.
+    """
+
+    CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.,:/+#")
+
+    def __init__(self, texts) -> None:
+        self.texts = list(texts)
+        if not self.texts:
+            raise ValueError("LiteralStream needs the tokenizer's token texts")
+        n = len(self.texts)
+        bodies = [t.lstrip() for t in self.texts]
+        self.lit = np.fromiter((bool(t) and self.CHARS.issuperset(t) for t in bodies), dtype=bool, count=n)
+        self.lead = np.fromiter((t[:1].isspace() for t in self.texts), dtype=bool, count=n)
+        self.digit = self.lit & np.fromiter((any("0" <= c <= "9" for c in t) for t in bodies), dtype=bool, count=n)
+        self._rows: list[_LiteralRow] = []
+
+    def _tables(self, ids):
+        inside = ids < len(self.texts)
+        at = np.where(inside, ids, 0)
+        return inside & self.lit[at], inside & self.digit[at], ~inside | self.lead[at]
+
+    def ingest(self, ids, starts) -> None:
+        """Append one forward's tokens per row; a row restarts at position 0."""
+        ids = np.asarray(ids, dtype=np.int64)
+        while len(self._rows) < len(ids):
+            self._rows.append(_LiteralRow())
+        for b, (row_ids, start) in enumerate(zip(ids, starts)):
+            if start == 0:
+                self._rows[b] = _LiteralRow()
+            elif start != self._rows[b].seen:
+                raise ValueError(f"literal stream row {b} expects position {self._rows[b].seen}, got {start}")
+            self._add(self._rows[b], row_ids)
+
+    def _add(self, state, ids):
+        if not len(ids):
+            return
+        start, state.seen = state.seen, state.seen + len(ids)
+        lit, digit, lead = self._tables(ids)
+        begin = lit & (lead | ~np.concatenate(([state.prev_lit], lit[:-1])))
+        state.prev_lit = bool(lit[-1])
+        # The open run continues up to the first token that is not a literal or starts one.
+        stops = np.flatnonzero(~lit | begin)
+        head = int(stops[0]) if len(stops) else len(ids)
+        state.open_ids.extend(ids[:head].tolist())
+        if not len(stops):
+            return
+        self._close(state, state.open_lo, state.open_ids)
+        state.open_ids = []
+        firsts = np.flatnonzero(begin)
+        if not len(firsts):
+            return
+        # Non-literal tokens between runs hold no digit, so these are digits per run.
+        held = np.add.reduceat(digit.astype(np.int64), firsts)
+        ends = stops[np.minimum(np.searchsorted(stops, firsts, side="right"), len(stops) - 1)]
+        closed = ends > firsts
+        for j in np.flatnonzero((held > 0) & closed):
+            self._close(state, start + int(firsts[j]), ids[firsts[j]:ends[j]].tolist())
+        if not closed[-1]:  # The last run reaches the end of this forward.
+            state.open_lo, state.open_ids = start + int(firsts[-1]), ids[firsts[-1]:].tolist()
+
+    def _code(self, state, lo, run):
+        """Code of a run, 0 unless its symbols occur here for the first time."""
+        if not run or not self._tables(np.asarray(run, dtype=np.int64))[1].any():
+            return None
+        code, symbols = literal_code("".join(self.texts[i] for i in run))
+        return code if state.first.get(symbols, lo) >= lo else 0., symbols
+
+    def _close(self, state, lo, run):
+        coded = self._code(state, lo, run)
+        if coded is None:
+            return
+        code, symbols = coded
+        state.first.setdefault(symbols, lo)
+        state.lo.append(lo)
+        state.hi.append(lo + len(run))
+        state.code.append(code)
+        state.ids.append(run)
+        state.arrays = None
+
+    def span_values(self, row, positions, lengths, stop):
+        """``max(exp(code) - exp(LITERAL_FLOOR), 0) / length`` per span, as of ``stop``.
+
+        A span's code is the largest among the literals it touches that occur
+        there for the first time; a repeat of an earlier literal codes to 0.
+        """
+        lengths = np.asarray(lengths, dtype=np.int64)
+        values = np.zeros(len(lengths))
+        state = self._rows[row] if row < len(self._rows) else None
+        positions = np.asarray(positions, dtype=np.int64)
+        if state is None or not len(lengths) or not len(positions):
+            return values
+        if state.arrays is None:
+            state.arrays = (np.asarray(state.lo, dtype=np.int64), np.asarray(state.hi, dtype=np.int64),
+                            np.asarray(state.code, dtype=np.float64))
+        lo, hi, code = state.arrays
+        n = int(np.searchsorted(lo, stop))  # Runs that start before stop.
+        lo, hi, code = lo[:n], hi[:n].copy(), code[:n].copy()
+        # A closed run, or the open one, that continues past stop counts its tokens before it.
+        if n and hi[-1] > stop:
+            coded = self._code(state, int(lo[-1]), state.ids[n - 1][:stop - int(lo[-1])])
+            hi[-1], code[-1] = stop, (0. if coded is None else coded[0])
+        if state.open_ids and state.open_lo < stop:
+            coded = self._code(state, state.open_lo, state.open_ids[:stop - state.open_lo])
+            if coded is not None:
+                lo, hi = np.append(lo, state.open_lo), np.append(hi, stop)
+                code = np.append(code, coded[0])
+        if not len(lo):
+            return values
+        at = np.searchsorted(lo, positions, side="right") - 1
+        inside = (at >= 0) & (positions < hi[np.maximum(at, 0)])
+        token_code = np.where(inside, code[np.maximum(at, 0)], 0.)
+        best = np.maximum.reduceat(token_code, np.cumsum(lengths) - lengths)
+        value = np.exp(np.minimum(best, CUE_CAP)) - math.exp(LITERAL_FLOOR)
+        return np.maximum(value, 0.) / np.maximum(lengths, 1)
+
+
+class SummedValues:
+    """Span values of several Gamma streams added together (cue and literal)."""
+
+    def __init__(self, streams) -> None:
+        self.streams = tuple(streams)
+
+    def span_values(self, row, positions, lengths, stop):
+        return sum(stream.span_values(row, positions, lengths, stop) for stream in self.streams)
+
+
 def add_cue_values(cut, host_scores, stream, stops):
-    """Host scores plus each span's cue value; ``stops[b]`` ends row b's archived block."""
+    """Host scores plus each span's Gamma value; ``stops[b]`` ends row b's archived block.
+
+    ``stream`` is a CueStream, a LiteralStream or their SummedValues.
+    """
     values = [stream.span_values(b, positions[tokens], lengths, stops[b])
               for b, (positions, tokens, lengths) in enumerate(zip(cut.positions, cut.token_rows, cut.length_rows))]
     return (np.asarray(host_scores, dtype=np.float64) + np.concatenate(values)).tolist() if values else list(host_scores)
@@ -215,7 +399,7 @@ def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width,
     A final unfinished span is mandatory until a boundary or the length cap.
     Scoring makes one batched GPU pass and one small score transfer per flush.
     Beta scores novelty against the old centroids captured before this flush.
-    ``cues`` is an optional ``(CueStream, stops)`` pair (Gamma).
+    ``cues`` is an optional ``(stream, stops)`` pair (Gamma cues and/or literals).
     """
     cut = cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span)
     if cut is None:

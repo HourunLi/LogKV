@@ -58,5 +58,8 @@ log_kv_gamma_level_slack: 2
 # Gamma cue（默认开启）：精确池选片段时，片段若重复流开头区域（前 64 个 token，截到其中最后
 # 一个换行处）里在全文仍稀有的 token，按证据加分；0 = 只用 K/V 片段分数。旧实验 YAML 显式写 0。
 log_kv_gamma_cue_tokens: 64
+# Gamma 字面量（默认关闭）：精确池选片段时，片段若含随机字面量（数字串、数字与短字母混写的编码）
+# 在流中的首次出现，按其自适应编码长度加分。只在 arc_gamma_*literal* 与 eval_gamma_literal* 中打开。
+log_kv_gamma_literals: false
 log_kv_seg_gap_max: null  # Alpha 延迟归档要求关闭 segment gap/padding
 log_kv_seg_block_level: 0

@@ -730,6 +730,7 @@ class LogStructuredKVCache(nn.Module):
         gamma_top_merge: str = "fold",
         gamma_level_slack: int = 2,
         gamma_cue_tokens: int = 0,
+        gamma_literals: bool = False,
     ) -> None:
         super().__init__()
 
@@ -766,6 +767,13 @@ class LogStructuredKVCache(nn.Module):
             raise ValueError("gamma_cue_tokens must be >= 0")
         if self.gamma_cue_tokens and not alpha_exact_tokens:
             raise ValueError("gamma_cue_tokens scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
+        # Gamma literals: spans holding the first occurrence of a random-looking
+        # literal (digit strings, codes) gain exact-pool value; the model owns
+        # the shared LiteralStream like the CueStream.
+        self.gamma_literals = bool(gamma_literals)
+        self.literal_stream = None
+        if self.gamma_literals and not alpha_exact_tokens:
+            raise ValueError("gamma_literals scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
         self.alpha_count = 0
         if (self.beta_novelty or self.beta_adaptive_merge) and not self.alpha_exact_tokens:
             raise ValueError("BetaLogKV requires the Alpha exact-span cache (alpha_exact_tokens > 0)")
@@ -4130,16 +4138,27 @@ class LogStructuredKVCache(nn.Module):
         return cut, scores.tolist()
 
     def _gamma_cues(self, positions_host):
-        """(cue stream, per-row end of the archived block) for this flush's selection.
+        """(value stream, per-row end of the archived block) for this flush's selection.
 
+        The stream is the model's CueStream, its LiteralStream, or both summed.
         Evidence counts tokens up to the end of the block being archived, not
         the recent window: the window's end depends on how input was chunked
         (2048-token prefill vs. token-by-token decode), the block's end does not.
         """
-        if self.cue_stream is None:
-            raise RuntimeError("gamma_cue_tokens needs the model's CueStream; set_log_kv_cache and "
-                               "enable_log_kv_training attach it")
-        return self.cue_stream, [flushed[-1] + 1 if len(flushed) else 0 for flushed in positions_host]
+        from litgpt.alpha_log_kv import SummedValues
+        streams = []
+        if self.gamma_cue_tokens:
+            if self.cue_stream is None:
+                raise RuntimeError("gamma_cue_tokens needs the model's CueStream; set_log_kv_cache and "
+                                   "enable_log_kv_training attach it")
+            streams.append(self.cue_stream)
+        if self.gamma_literals:
+            if self.literal_stream is None:
+                raise RuntimeError("gamma_literals needs the model's LiteralStream; set_log_kv_cache and "
+                                   "enable_log_kv_training attach it")
+            streams.append(self.literal_stream)
+        stream = streams[0] if len(streams) == 1 else SummedValues(streams)
+        return stream, [flushed[-1] + 1 if len(flushed) else 0 for flushed in positions_host]
 
     @torch.no_grad()
     def _alpha_route_flush(self, k, v, positions, positions_host, span_ends, *, record):
@@ -4147,7 +4166,7 @@ class LogStructuredKVCache(nn.Module):
         if span_ends is None:
             raise ValueError("AlphaLogKV requires natural span boundaries")
         old_width = self.alpha_count
-        cues = self._gamma_cues(positions_host) if self.gamma_cue_tokens else None
+        cues = self._gamma_cues(positions_host) if self.gamma_cue_tokens or self.gamma_literals else None
         side = self._route_decision_stream(k, v)
         with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
             # Snapshots: the pool is rewritten below from these sources.
@@ -5216,7 +5235,7 @@ class LogStructuredKVCache(nn.Module):
                          self.alpha_exact_tokens, self.alpha_span_max_tokens,
                          self.beta_novelty, self.beta_adaptive_merge,
                          self.gamma_level0_reinsert, self.gamma_top_merge, self.gamma_level_slack,
-                         self.gamma_cue_tokens, tuple(map(tuple, kwargs.get("span_ends") or ())))
+                         self.gamma_cue_tokens, self.gamma_literals, tuple(map(tuple, kwargs.get("span_ends") or ())))
             if self._replaying_updates:
                 if not replay or key not in updates.flushes:
                     raise RuntimeError("missing semantic update record; rerouting is not allowed")
@@ -7192,6 +7211,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             cache.alpha_exact_tokens, cache.alpha_span_max_tokens, ctx.span_ends,
             cache.beta_novelty, cache.beta_adaptive_merge,
             cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack, cache.gamma_cue_tokens,
+            cache.gamma_literals,
         )
         checkpoint_log = checkpoint_route_replay(cache, signature)
         updates = (_SemanticReplayUpdates() if checkpoint_log is None else checkpoint_log[4]) if cache.semantic_replay_updates else None
@@ -7270,7 +7290,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                              cache.alpha_exact_tokens, cache.alpha_span_max_tokens,
                              cache.beta_novelty, cache.beta_adaptive_merge,
                              cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack,
-                             cache.gamma_cue_tokens)
+                             cache.gamma_cue_tokens, cache.gamma_literals)
         ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors,
                               *(updates.tensors if updates is not None else ()))
         ctx.has_attention_plans = cache.semantic_clusters
@@ -7302,7 +7322,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                                  cache.alpha_exact_tokens, cache.alpha_span_max_tokens,
                                  cache.beta_novelty, cache.beta_adaptive_merge,
                                  cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack,
-                                 cache.gamma_cue_tokens):
+                                 cache.gamma_cue_tokens, cache.gamma_literals):
             raise RuntimeError("semantic update configuration changed between forward and backward")
         updates = (_SemanticReplayUpdates(ctx.update_flushes, saved[ctx.update_tensor_offset:])
                    if ctx.update_flushes is not None else None)

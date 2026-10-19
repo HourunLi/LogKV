@@ -24,7 +24,7 @@ attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启�
 | [共享算法规格](docs/algorithm-spec.md) | 缓存结构、attach / unified 路由、层级压缩、训推边界 |
 | [Alpha 精确片段算法](docs/alpha-logkv.md) | 分段、打分、替换、预算，以及延迟归档 |
 | [Beta 算法与运行入口](docs/beta-logkv.md) | 新颖度评分、低失真切分、回放约束、训练与评测 |
-| [Gamma 梯子修正与 cue](docs/gamma-logkv.md) | 延迟归档只重排第 0 层、顶层最轻对合并、同字节余量层、精确池的开头提示词选择、针的去向诊断 |
+| [Gamma 梯子修正与 cue](docs/gamma-logkv.md) | 延迟归档只重排第 0 层、顶层最轻对合并、同字节余量层、精确池的开头提示词与字面量选择、针的去向诊断 |
 | [统一路由实现](docs/semantic-unified-routing.md) | 可选 unified 路由的 Ward/半径公式、增量更新和数值约束 |
 | [位置与注意力](docs/position.md) | pre-RoPE 内容、mid/multi 锚点、质量偏置 |
 | [全程 SWA 对照](docs/swa-niah-comparison.md) | 同权重、同持久缓存字节预算的比较口径 |
@@ -34,7 +34,8 @@ attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启�
 默认训练配置是 `exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml`，算法开关集中在其父配置
 `arc_semantic_fast.yaml`。同目录不带 cue 的 `arc_gamma_k12_*` 是梯子修正的对照（B=256、精确池 1024、
 `level_slack: 0` 等）；`arc_gamma_cue_k12_b128_p1024*_2k` 在同字节下把 cue 与 P=1024（及 `level_slack: 0`）组合；
-`eval_gamma_cue.yaml` 只在评测时给已训练的 checkpoint 打开 cue。cue 在多针与改写提示下的适用边界评测见
+`eval_gamma_cue.yaml` 只在评测时给已训练的 checkpoint 打开 cue。精确池的字面量选择（随机数字串、编码的
+首次出现）默认关闭：`eval_gamma_literal*.yaml` 只在评测时打开，`arc_gamma_cue_literal_k12_b128_2k.yaml` 在 cue 之上训练。cue 在多针与改写提示下的适用边界评测见
 [Gamma 文档](docs/gamma-logkv.md)（RULER 多针任务与 `eval_tasks/niah_cue`；两个启动脚本的 NIAH 阶段默认跑全部
 17 个捞针任务）。只训练、
 不触发默认的全套后续评测：
