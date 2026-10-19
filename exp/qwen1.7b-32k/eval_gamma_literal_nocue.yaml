@@ -1,0 +1,4 @@
+# 只在评测时打开 Gamma 字面量：复评已训练的不带 cue 的梯子 checkpoint（arc_gamma_k12_b128_2k，
+# cue 保持 0，不重训），单独看字面量对精确池选择的作用。
+config: arc_gamma_k12_b128_2k.yaml
+log_kv_gamma_literals: true

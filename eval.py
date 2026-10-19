@@ -847,6 +847,7 @@ class LogKVLM(LM):
         log_kv_gamma_top_merge: str = "fold",
         log_kv_gamma_level_slack: int = 2,
         log_kv_gamma_cue_tokens: int = 0,
+        log_kv_gamma_literals: bool = False,
         tokenizer_dir: str | None = None,
         process_group=None,
     ):
@@ -897,6 +898,7 @@ class LogKVLM(LM):
         self.log_kv_gamma_top_merge = str(log_kv_gamma_top_merge)
         self.log_kv_gamma_level_slack = int(log_kv_gamma_level_slack)
         self.log_kv_gamma_cue_tokens = int(log_kv_gamma_cue_tokens)
+        self.log_kv_gamma_literals = bool(log_kv_gamma_literals)
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -942,6 +944,7 @@ class LogKVLM(LM):
             self.model.set_alpha_span_boundary_ids(
                 self.tokenizer.alpha_span_boundary_ids,
                 self.tokenizer.alpha_line_end_ids if self.log_kv_gamma_cue_tokens else None,
+                self.tokenizer.gamma_literal_texts if self.log_kv_gamma_literals else None,
             )
 
         if is_master: print(f"🔄 正在加载权重...")
@@ -1039,6 +1042,7 @@ class LogKVLM(LM):
             gamma_top_merge=self.log_kv_gamma_top_merge,
             gamma_level_slack=self.log_kv_gamma_level_slack,
             gamma_cue_tokens=self.log_kv_gamma_cue_tokens,
+            gamma_literals=self.log_kv_gamma_literals,
         )
         if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
@@ -1084,7 +1088,8 @@ class LogKVLM(LM):
             self.cache_budget.update(effective_B=first.B, levels=first.L_alloc,
                                      gamma_level0_reinsert=first.gamma_level0_reinsert,
                                      gamma_top_merge=first.gamma_top_merge, gamma_level_slack=first.gamma_level_slack,
-                                     gamma_cue_tokens=getattr(first, "gamma_cue_tokens", 0))
+                                     gamma_cue_tokens=getattr(first, "gamma_cue_tokens", 0),
+                                     gamma_literals=getattr(first, "gamma_literals", False))
         if _is_main():
             print(f"🧮 persistent cache budget (excluding shared RoPE / transient workspace): {self.cache_budget}")
 
@@ -1481,6 +1486,9 @@ def main(
     # rare tokens of the stream's opening region (up to this many tokens, cut at its
     # last line end); 0 keeps the K/V-only span scores.
     log_kv_gamma_cue_tokens: int = 64,
+    # Gamma literals (off by default): exact-pool selection also values spans holding the
+    # first occurrence of a random-looking literal (digit strings, codes).
+    log_kv_gamma_literals: bool = False,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1571,12 +1579,14 @@ def main(
     log_kv_gamma_top_merge = str(_o("log_kv_gamma_top_merge", log_kv_gamma_top_merge))
     log_kv_gamma_level_slack = int(_o("log_kv_gamma_level_slack", log_kv_gamma_level_slack))
     log_kv_gamma_cue_tokens = int(_o("log_kv_gamma_cue_tokens", log_kv_gamma_cue_tokens))
+    log_kv_gamma_literals = bool(_o("log_kv_gamma_literals", log_kv_gamma_literals))
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
-        # Beta and Gamma cues score the Alpha exact pool; disabling Alpha disables them.
+        # Beta and Gamma cues and literals score the Alpha exact pool; disabling Alpha disables them.
         log_kv_beta_novelty = log_kv_beta_adaptive_merge = False
         log_kv_gamma_cue_tokens = 0
+        log_kv_gamma_literals = False
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
     log_kv_seg_eta = float(_o("log_kv_seg_eta", log_kv_seg_eta))
@@ -1674,7 +1684,8 @@ def main(
                 f"replay_updates={log_kv_semantic_replay_updates}, "
                 f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
                 f"gamma_level0_reinsert={log_kv_gamma_level0_reinsert}, gamma_top_merge={log_kv_gamma_top_merge}, "
-                f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens})"
+                f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens}, "
+                f"gamma_literals={log_kv_gamma_literals})"
             )
         if diag_active:
             print(
@@ -1749,6 +1760,7 @@ def main(
             log_kv_gamma_top_merge=log_kv_gamma_top_merge,
             log_kv_gamma_level_slack=log_kv_gamma_level_slack,
             log_kv_gamma_cue_tokens=log_kv_gamma_cue_tokens,
+            log_kv_gamma_literals=log_kv_gamma_literals,
             tokenizer_dir=tokenizer_dir,
             process_group=eval_group,
         )
@@ -1902,6 +1914,7 @@ def main(
                     "log_kv_gamma_top_merge": log_kv_gamma_top_merge,
                     "log_kv_gamma_level_slack": log_kv_gamma_level_slack,
                     "log_kv_gamma_cue_tokens": log_kv_gamma_cue_tokens,
+                    "log_kv_gamma_literals": log_kv_gamma_literals,
                     "results": results,
                 }
 

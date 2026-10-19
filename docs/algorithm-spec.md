@@ -2,7 +2,7 @@
 
 本文描述当前分支的共享机制：attach 路由分簇 + Alpha 精确片段 + Beta + Gamma。Alpha 的片段选择与
 预算见 [AlphaLogKV](alpha-logkv.md)，Beta 的评分与自适应压缩见 [BetaLogKV](beta-logkv.md)，
-Gamma 的延迟归档、顶层合并与精确池 cue 选择见 [GammaLogKV](gamma-logkv.md)，
+Gamma 的延迟归档、顶层合并与精确池 cue、字面量选择见 [GammaLogKV](gamma-logkv.md)，
 可选的 unified 路由内核见 [统一路由](semantic-unified-routing.md)，位置读出见
 [Position / RoPE](position.md)。旧 Stage 0 路线图和未落地的设计不作为现行契约。
 
@@ -27,6 +27,7 @@ Cache API 为兼容旧路径保留保守默认值，不能把直接构造 cache 
 | `beta_novelty` / `beta_adaptive_merge` | `false` / `false` | `true` / `true` |
 | `gamma_level0_reinsert` / `gamma_top_merge` / `gamma_level_slack` | `false` / `fold` / `2` | `true` / `lightest` / `2` |
 | `gamma_cue_tokens` | `0` | `64` |
+| `gamma_literals` | `false` | `false` |
 
 当前 `recent_size`、`train_block`、`prefill_block` 均为 `2048`，上下文长度 `32768`；
 二阶修正关闭，segment 间隔保护和 padding 关闭，`seg_eta=1`、`seg_g0=2048`、

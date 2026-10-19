@@ -1,8 +1,9 @@
-# GammaLogKV：梯子修正与精确池的开头提示词（cue）选择
+# GammaLogKV：梯子修正与精确池的 cue、字面量选择
 
 Gamma 建立在 attach + Alpha + Beta 之上（见 [Alpha](alpha-logkv.md)、[Beta](beta-logkv.md)），
-不改变路由。前三个开关只改变条目在层级（梯子）里怎样合并；第四个开关在精确池选择片段时，
-给重复了流开头区域里稀有 token 的片段加分（第 4 节）。四个开关：
+不改变路由。前三个开关只改变条目在层级（梯子）里怎样合并；后两个开关在精确池选择片段时加分：
+重复了流开头区域里稀有 token 的片段（cue，第 4 节），以及含随机字面量首次出现的片段（第 5 节）。
+五个开关：
 
 | 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 入口 / `arc_semantic_fast.yaml` | 作用 |
 |---|---|---|---|
@@ -10,6 +11,7 @@ Gamma 建立在 attach + Alpha + Beta 之上（见 [Alpha](alpha-logkv.md)、[Be
 | `gamma_top_merge` | `fold` | `lightest` | 顶层饱和时合并质量和最小的相邻对 |
 | `gamma_level_slack` | `2` | `2` | 余量层数；小于 2 时用同样字节换更宽的 B′ |
 | `gamma_cue_tokens` | `0` | `64` | 开头区域长度；精确池按 cue 证据给片段加分，`0` 关闭 |
+| `gamma_literals` | `false` | `false` | 精确池给含随机字面量（数字串、编码）首次出现的片段加分 |
 
 Gamma 之前的实验 YAML 显式写回旧行为（`false` / `fold` / `2` / `0`）；早于 cue 的四个 Gamma
 梯子实验（`arc_gamma_k12_*`）写 `gamma_cue_tokens: 0`。复评都与训练时一致。
@@ -189,6 +191,88 @@ DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu
   bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml none
 ```
 
+## 5. 精确池选择：字面量（不可压缩度）
+
+**问题。** cue 依赖开头的指令点名要记住的内容：问题只放在末尾（`_qend`）、指令被改写
+（`_paraphrase`）或被前导挤出开头区域（`_preamble`）时，它不提供证据。字面量不看查询，看的是
+片段进入梯子后损失有多大：梯子把同簇 token 求均值，随机数字串和编码合并后无法还原，
+文中也没有别处重复它们。
+
+**规则。**
+
+- 字面量：由 ASCII 字母、数字和 `-_.,:/+#` 组成、中间没有空白的一串 token；遇到其他 token
+  结束，遇到以空白开头的 token 重新开始，所以中文或正文里的数字各自成段。只保留含数字的字面量。
+- 符号：字面量里的数字，以及夹在两个数字之间、不超过 3 个字母的字母段（十六进制与编码片段）；
+  其他字母属于普通单词，不计。
+- 编码长度：符号序列的自适应零阶编码长度 `E = Σ_i −ln((n_i(c_i)+0.5)/(i+0.5A))`，`n_i(c)` 为
+  前 i 个符号中 c 出现的次数，A=10（只有数字）或 36（含字母）。随机 7 位数约 18 nats，年份与
+  `1,000,000` 约 9–10 nats，uuid 超过 100 nats；日期（`2024-10-19` 约 19）、IP、电话号码等长数字串
+  也高于下限。
+- 首次出现：以符号串为键（`4,829,173` 与 `4829173` 相同），只有它在流中第一次出现的那段计编码
+  长度，重复出现计 0。后文再引用它时，第一次出现的片段不降分。
+- 价值：`max(exp(min(E, 30)) − exp(12), 0) / 片段长度`，E 取片段触及的首次出现字面量中最大的
+  编码长度。与 cue 价值同形；两者都开时相加，再加到 K/V 分数上进入原有整段贪心（含旧片段 1.1 倍）。
+
+**性质。**
+
+- 只依赖 token id 与分词器逐 token 解码的文本（`Tokenizer.gamma_literal_texts`，启动时解码一次；
+  SentencePiece 式词首片段单独解码会丢掉空格，这里补回），所有层得到相同的价值。
+- 价值按归档块的末尾位置读取：跨过该位置的字面量只计它之前的 token。逐层整段 prefill、
+  不同 `prefill_block`、逐 token 流式做出相同的选择（流与逐 token 参考实现逐位比较，并有模型级测试）。
+- 主机端计算：模型每次前向把 token id 交给全模型共享的 `LiteralStream`（`litgpt/alpha_log_kv.py`），
+  只保存含数字的字面量及其 token id，状态与字面量的出现次数成正比；不增加 KV，推理 KV 仍为
+  `O(log N)`。下面的代理中，约 28K token 的一行接收约 7 ms，每次选择约 0.1 ms。
+- 选择只在前向发生；反向与 checkpoint 重算回放记录的动作；开关写入回放签名。
+
+**代理评测（不是模型准确率）。** 与第 4 节相同的代理（RULER 模板与针格式、Paul Graham 文章、
+Qwen 预分词正则作 token 代理，K/V 分数用每个片段固定的随机数代替），约 28K 代理 token，用仓库里的
+`cut_spans`、`choose_spans`、`add_cue_values` 与 `LiteralStream`。"原模板"即 RULER 模板，"qend"
+去掉开头指令、只在末尾提问。单针 40 个样本、深度均匀；多针 20 个样本、深度随机；数字为全部针都在
+末尾精确保留（精确池或 recent）的样本数，P=256：
+
+| 针 / 模板 | 无 | cue | 字面量 | cue + 字面量 |
+|---|---|---|---|---|
+| 1 个 number / 原模板 | 3 | 40 | 40 | 40 |
+| 1 个 number / qend | 3 | 3 | 40 | 40 |
+| 1 个 uuid / 原模板 | 3 | 40 | 40 | 40 |
+| 1 个 uuid / qend | 3 | 5 | 40 | 40 |
+| 4 个 number / qend | 0 | 0 | 20 | 19 |
+| 4 个 uuid / qend | 0 | 1 | 20 | 20 |
+| 8 个 number / qend | 0 | 0 | 20 | 20 |
+| 8 个 uuid / 原模板或 qend | 0 | 0 | 0（每样本留住 67% 的针） | 0（67%） |
+
+8 个 uuid 针约 350 个代理 token，超过 P=256；P=1024 时为 20/20。只用文档内 token 统计的版本
+（稀有度、只出现一次的 token、超额自信息之和）对数字针无效（qend、P=256 时 3/40）：随机数字每个
+token 约 ln10 nats，与正文 token 相当，起作用的是字面量自身的随机性。
+
+**对普通文本的影响。** 同一代理中不含针的文章拼接，末尾精确池与只用 K/V 分数时的 Jaccard 为
+0.73（P=256）/ 0.78（P=1024）；开 cue 时为 0.05 / 0.10。字面量只替换含随机数字串的少数片段，
+文章里的脚注编号、数字与单词粘连（如 `2008Technology`）也会被选中。对困惑度与其他任务的影响没有测过。
+
+**限制。**
+
+- 词面启发式，只覆盖含数字的字面量；纯字母的人名、地名等事实不在内。
+- 文中数字很多时（表格、日志）字面量相互竞争，价值又远高于 cue 价值，会挤掉 cue 选中的不含数字的片段；
+  由同格式针组成的干草堆（`niah_multikey_2/3`）里每根针都是新字面量，精确池装不下，帮不到被问到的那一根。
+- 少数随机数字串编码长度接近下限（如 `1810111` 约 12.3 nats）。
+- 代理里没有模型；准确率要在 GPU 上评测。
+
+**配置。** 默认关闭（Cache API 与入口均为 `false`，`arc_semantic_fast.yaml` 显式写 `false`），
+已有实验不受影响。只评测、不重训（只改变精确池选择，与 cue 的 `eval_gamma_cue.yaml` 同理）：
+[`eval_gamma_literal.yaml`](../exp/qwen1.7b-32k/eval_gamma_literal.yaml) 在 cue checkpoint
+（`arc_gamma_cue_k12_b128_2k`）上再开字面量；
+[`eval_gamma_literal_nocue.yaml`](../exp/qwen1.7b-32k/eval_gamma_literal_nocue.yaml) 在不带 cue 的
+梯子 checkpoint（`arc_gamma_k12_b128_2k`）上只开字面量。训练配置
+[`arc_gamma_cue_literal_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_literal_k12_b128_2k.yaml)
+与 cue 默认配置只差字面量。
+
+```bash
+DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+  NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_literal.yaml
+
+BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_literal_k12_b128_2k.yaml
+```
+
 ## 与槽位压缩率统计的关系
 
 `eval.sh` 报告的 `kv_compression` 统计**存活**条目。旧行为因重复合并而条目偏少，报告的压缩倍数
@@ -200,8 +284,8 @@ DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu
 - 不增加持久张量，推理 KV 仍为 `O(log N)`；Gamma 重排的数据只有第 0 层，比旧行为（整簇）少。
 - 训练要求与 Alpha 相同（attach 或 unified、mid、一阶、`semantic_replay_updates=true`）。
 - Gamma 之前的 checkpoint 是在旧梯子上训练的。可以在评测 YAML 里覆盖梯子三项开关来复评，但
-  训练与评测不一致；结论以 Gamma 重训为准。cue 只改变精确池选哪些片段，评测时单独打开的
-  偏差小得多（`eval_gamma_cue.yaml`）。
+  训练与评测不一致；结论以 Gamma 重训为准。cue 与字面量只改变精确池选哪些片段，评测时单独打开的
+  偏差小得多（`eval_gamma_cue.yaml`、`eval_gamma_literal*.yaml`）。
 
 默认训练配置是 [`arc_gamma_cue_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml)。
 不带 cue 的梯子实验有 B=128（`arc_gamma_k12_b128_2k`）、B=256 对照（`_b256_2k`）、同字节精确池
@@ -259,7 +343,8 @@ GPU 上的实际收益以训练日志为准：`logKV_host` 的 `route`、`replay
 样本，按实验 YAML 构建同一模型与缓存，逐层报告针在精确池、recent 还是梯子条目（及其 w），
 针所在片段在现有评分（开启 cue 时含 cue 价值）与几种诊断评分下的排名、需要多大的精确池才能
 留住，以及 `--oracle all` 强制保留针时的准确率上限。诊断评分 `cue` 是单独的 cue 价值（开头 64 个
-token），配置未开启 cue 时也会报告。追踪期间关闭分数预取，选择规则不变（`--oracle` 除外）。
+token），配置未开启 cue 时也会报告；`literal` 同理，是单独的字面量价值。追踪期间关闭分数预取，
+选择规则不变（`--oracle` 除外）。
 
 ```bash
 python unused/niah_needle_trace.py --config exp/qwen1.7b-32k/eval_gamma_cue.yaml \
@@ -268,6 +353,8 @@ python unused/niah_needle_trace.py --config exp/qwen1.7b-32k/eval_gamma_cue.yaml
 
 测试：`tests/test_gamma_log_kv.py`（修复前后的梯子形状、上层条目不被改写、同字节余量层），
 `tests/test_gamma_cues.py`（区域截断、去重与阈值、因果与分块不变、针留在精确池、模型接线与回放签名），
+`tests/test_gamma_literals.py`（编码长度、首次出现、与参考实现逐位一致且不依赖分块、随机数针留在精确池、
+cue 与字面量相加、模型接线与回放签名），
 `tests/test_alpha_log_kv.py`（守恒、延迟归档、反向回放与预取，覆盖 Gamma 与 cue 开关），
 `tests/test_log_kv_updates.py`（顶层两种合并的批量与逐条路径一致），
 `tests/test_niah_cue_tasks.py`（提示扰动任务只改提示、经 `eval.py` 的任务索引加载并收到 metadata），

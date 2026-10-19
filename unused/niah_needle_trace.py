@@ -15,6 +15,7 @@ YAML. For each sample it reports:
     instruction  per-token max cosine to the instruction prefix keys, top quarter of the span
     rarity       running in-document unigram surprisal of the token ids, top quarter of the span
     cue          Gamma's cue value alone (64 opening tokens), whether or not the config enables cues
+    literal      Gamma's literal value alone, whether or not the config enables literals
 - with --oracle, the needle span is forced into the exact pool at the chosen layers, which bounds
   what better selection can buy.
 
@@ -45,7 +46,7 @@ from litgpt.log_kv_cache import LogStructuredKVCache  # noqa: E402
 
 NEEDLE_RE = re.compile(r"One of the special magic (?:numbers|uuids) for (\S+) is: (\S+)\.")
 INSTRUCTION_END = "\n"  # The RULER instruction is the first line of the prompt.
-SCORES = ("cache", "variance", "novelty_tok", "instruction", "rarity", "cue")
+SCORES = ("cache", "variance", "novelty_tok", "instruction", "rarity", "cue", "literal")
 CUE_TOKENS = 64  # The diagnostic cue score's opening region (the cache uses its own setting).
 _ACTIVE: list = [None]  # The tracer the class-level patches report to.
 
@@ -66,8 +67,9 @@ def _top_groups(per_group):
 class Tracer:
     """Wraps Alpha selection; records needle ranks and optionally forces the needle in."""
 
-    def __init__(self, oracle: str):
+    def __init__(self, oracle: str, literal_texts=None):
         self.oracle_spec = oracle
+        self.literal_texts = literal_texts
         self.layer_of: dict[int, int] = {}
         self.current = None
         self.reset_sample(set(), 0, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64))
@@ -77,8 +79,11 @@ class Tracer:
         self.instruction_keys: dict[int, torch.Tensor] = {}
         self.flushes: dict[int, list[dict]] = {}
         self.cues = al.CueStream(CUE_TOKENS)
+        self.literals = al.LiteralStream(self.literal_texts) if self.literal_texts else None
         if len(ids):
             self.cues.ingest(ids[None], kinds[None], [0])
+            if self.literals is not None:
+                self.literals.ingest(ids[None], [0])
 
     def oracle(self, layer: int) -> bool:
         spec = self.oracle_spec
@@ -171,6 +176,9 @@ class Tracer:
         stop = int(positions.max()) + 1
         cue = al.add_cue_values(cut, [0.0] * sum(len(r) for r in cut.length_rows), self.cues, [stop])
         scores["cue"] = torch.tensor(cue[:len(lengths)], device=k.device)
+        if self.literals is not None:
+            literal = al.add_cue_values(cut, [0.0] * sum(len(r) for r in cut.length_rows), self.literals, [stop])
+            scores["literal"] = torch.tensor(literal[:len(lengths)], device=k.device)
         seen = self.ids[: int(positions.max()) + 1]
         counts = np.bincount(seen, minlength=int(self.ids.max()) + 1)
         distinct = max(int((counts > 0).sum()), 1)
@@ -326,7 +334,7 @@ def main():
     ev, lm = build_lm(args)
     if not getattr(lm, "log_kv_alpha_exact_tokens", 0):
         print("note: Alpha is off in this config; only needle fate is traced")
-    tracer = Tracer(args.oracle)
+    tracer = Tracer(args.oracle, lm.tokenizer.gamma_literal_texts)
     # Boundary kinds for the diagnostic cue score: 1 span end, 2 line end.
     kind_of = np.zeros(max(lm.tokenizer.vocab_size, lm.config.padded_vocab_size), dtype=np.int64)
     kind_of[list(lm.tokenizer.alpha_span_boundary_ids)] = 1

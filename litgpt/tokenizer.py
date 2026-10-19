@@ -39,6 +39,23 @@ class Tokenizer:
                 result.append(i)
         return tuple(result)
 
+    @cached_property
+    def gamma_literal_texts(self) -> tuple[str, ...]:
+        """Each token id decoded alone, for Gamma literals (built once at setup).
+
+        A SentencePiece-style word-initial piece (leading U+2581) loses its space
+        when decoded alone; it is put back, since literal runs restart there.
+        """
+        texts = []
+        for i in range(self.vocab_size):
+            text = self.processor.decode([i])
+            piece = (self.processor.id_to_token(i) if self.backend == "huggingface"
+                     else self.processor.id_to_piece(i)) or ""
+            if piece.startswith("\u2581") and not text[:1].isspace():
+                text = " " + text
+            texts.append(text)
+        return tuple(texts)
+
     def __init__(self, checkpoint_dir: Path | str) -> None:
         checkpoint_dir = Path(checkpoint_dir)
         if not checkpoint_dir.exists():
