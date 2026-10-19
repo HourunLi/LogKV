@@ -312,11 +312,12 @@ ORDERED_COLUMNS = [
     "niah_single_1", "niah_single_2", "niah_single_3", "AVG_NIAH",
     # RULER 多针（lm-eval 自带）与 cue 适用边界的提示扰动（eval_tasks/niah_cue），均取 32K。
     "niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery", "AVG_NIAH_multi",
+    "niah_single_1_qend", "niah_single_1_preamble", "niah_single_1_paraphrase",
     "niah_single_2_qend", "niah_single_2_preamble", "niah_single_2_paraphrase",
     "niah_single_3_qend", "niah_single_3_preamble", "niah_single_3_paraphrase", "AVG_NIAH_cue"
 ]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
-NIAH_CUE = [f"niah_single_{n}_{v}" for n in (2, 3) for v in ("qend", "preamble", "paraphrase")]
+NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 
 RAW_TO_TARGET_MAP = {
     "boolq": "BoolQ", "piqa": "PIQA", "social_iqa": "SIQA", "hellaswag": "HellaSwag",

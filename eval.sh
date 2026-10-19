@@ -5,6 +5,7 @@
 #
 # Usage:
 #   bash eval.sh <training_yaml_or_eval_yaml> [benchmark_csv|none] [niah_csv|none]
+#   (niah_csv defaults to every NIAH task: DEFAULT_NIAH_BENCHMARKS below)
 #
 # Examples:
 #   bash eval.sh exp/qwen1.7b-32k/arc.yaml
@@ -458,7 +459,14 @@ if [ -z "${BENCHMARKS}" ]; then
     BENCHMARKS=${DEFAULT_BENCHMARKS}
 fi
 
-NIAH_BENCHMARKS=${3:-niah_single_1,niah_single_2,niah_single_3}
+# Every needle-in-a-haystack eval: RULER single needles, lm-eval's multi-needle tasks and the
+# cue-boundary prompt variants in eval_tasks/niah_cue. Pass none to skip, or a comma list for a subset.
+DEFAULT_NIAH_BENCHMARKS="niah_single_1,niah_single_2,niah_single_3"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_multikey_1,niah_multikey_2,niah_multikey_3,niah_multivalue,niah_multiquery"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_1_qend,niah_single_1_preamble,niah_single_1_paraphrase"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_qend,niah_single_2_preamble,niah_single_2_paraphrase"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_3_qend,niah_single_3_preamble,niah_single_3_paraphrase"
+NIAH_BENCHMARKS=${3:-${DEFAULT_NIAH_BENCHMARKS}}
 META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
 MAIN_METADATA_ARGS=()
 if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* ]]; then

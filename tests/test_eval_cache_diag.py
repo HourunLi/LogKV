@@ -148,6 +148,31 @@ def test_repair_hf_cache_runs_on_node_zero_before_its_barrier():
             assert failed.returncode == 1 and "reached" not in failed.stdout, script
 
 
+def test_both_launchers_default_to_every_niah_task():
+    root = Path(__file__).resolve().parents[1]
+    variants = sorted(p.stem for p in (root / "eval_tasks" / "niah_cue").glob("niah_*.yaml"))
+    ruler = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2",
+             "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
+    try:  # lm-eval's own RULER needle tasks, when it is installed here.
+        import lm_eval.tasks
+        found = sorted(p.stem for p in (Path(lm_eval.tasks.__file__).parent / "ruler").glob("niah_*.yaml"))
+        assert found == sorted(ruler)
+    except ImportError:
+        pass
+    assert len(variants) == 9
+    defaults = {}
+    for script in ("majob.sh", "eval.sh"):
+        source = (root / script).read_text()
+        lines = [line for line in source.splitlines() if line.startswith("DEFAULT_NIAH_BENCHMARKS=")]
+        result = subprocess.run(["bash", "-c", "\n".join(lines) + '\necho "$DEFAULT_NIAH_BENCHMARKS"'],
+                                capture_output=True, text=True, check=True)
+        defaults[script] = result.stdout.strip().split(",")
+        assert "NIAH_BENCHMARKS:-${DEFAULT_NIAH_BENCHMARKS}" in source or \
+            "NIAH_BENCHMARKS=${3:-${DEFAULT_NIAH_BENCHMARKS}}" in source, script
+    assert defaults["majob.sh"] == defaults["eval.sh"]
+    assert sorted(defaults["eval.sh"]) == sorted(ruler + variants) and len(set(defaults["eval.sh"])) == 17
+
+
 def test_eval_launch_uses_selected_python_for_both_jobs():
     source = (Path(__file__).resolve().parents[1] / "eval.sh").read_text()
     start = source.index('if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then')
@@ -173,5 +198,6 @@ if __name__ == "__main__":
     test_path_walk_names_the_component_that_blocks_traversal()
     test_unreadable_dataset_info_is_named_with_its_context()
     test_repair_hf_cache_runs_on_node_zero_before_its_barrier()
+    test_both_launchers_default_to_every_niah_task()
     test_eval_launch_uses_selected_python_for_both_jobs()
     print("HF cache diagnostic check passed")
