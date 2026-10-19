@@ -309,8 +309,14 @@ ORDERED_COLUMNS = [
     "2wikimqa_e", "gov_report_e", "hotpotqa_e", "lcc_e", "multi_news_e", "MFQA_en_e", 
     "passage_count_e", "passage_retrieval_en_e", "qasper_e", "repobench-p_e", "samsum_e", 
     "trec_e", "triviaqa_e", "AVG_LBe", "AVG_LBe_wo", "AVG_all",
-    "niah_single_1", "niah_single_2", "niah_single_3", "AVG_NIAH"
+    "niah_single_1", "niah_single_2", "niah_single_3", "AVG_NIAH",
+    # RULER 多针（lm-eval 自带）与 cue 适用边界的提示扰动（eval_tasks/niah_cue），均取 32K。
+    "niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery", "AVG_NIAH_multi",
+    "niah_single_2_qend", "niah_single_2_preamble", "niah_single_2_paraphrase",
+    "niah_single_3_qend", "niah_single_3_preamble", "niah_single_3_paraphrase", "AVG_NIAH_cue"
 ]
+NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
+NIAH_CUE = [f"niah_single_{n}_{v}" for n in (2, 3) for v in ("qend", "preamble", "paraphrase")]
 
 RAW_TO_TARGET_MAP = {
     "boolq": "BoolQ", "piqa": "PIQA", "social_iqa": "SIQA", "hellaswag": "HellaSwag",
@@ -335,7 +341,8 @@ TARGET_METRIC_MAP = {
     "ceval-valid": "acc", "mmlu": "acc", "ifeval": "prompt_level_strict_acc",
     "truthfulqa_gen": "rouge1_max", "truthfulqa_mc1": "acc", "truthfulqa_mc2": "acc",
     "SWDE": "f1", "FDA": "f1", "TriviaQA": "exact_match", "NQ": "exact_match", "DROP": "f1", "SQUAD": "exact_match",
-    "niah_single_1": "32768", "niah_single_2": "32768", "niah_single_3": "32768" 
+    "niah_single_1": "32768", "niah_single_2": "32768", "niah_single_3": "32768",
+    **{task: "32768" for task in NIAH_MULTI + NIAH_CUE},
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
@@ -352,8 +359,12 @@ AVG_GROUPS = {
     # 注：如果你需要计算 w/o（比如去掉代码或篇章检索），可以在下面的列表里删掉对应的名称
     "AVG_LB_wo": ["gov_report", "hotpotqa", "Qasper", "MFQA_zh", "MFQA_en", "musique", "narrativeqa", "samsum", "triviaqa", "trec", "lsht", "multi_news", "qmsum", "dureader", "2wikimqa", "vcsum"], 
     "AVG_LBe": ["2wikimqa_e", "gov_report_e", "hotpotqa_e", "lcc_e", "multi_news_e", "MFQA_en_e", "passage_count_e", "passage_retrieval_en_e", "qasper_e", "repobench-p_e", "samsum_e", "trec_e", "triviaqa_e"],
-    "AVG_NIAH": ["niah_single_1", "niah_single_2", "niah_single_3"]
+    "AVG_NIAH": ["niah_single_1", "niah_single_2", "niah_single_3"],
+    "AVG_NIAH_multi": NIAH_MULTI,
+    "AVG_NIAH_cue": NIAH_CUE,
 }
+# 新增的诊断组不计入 AVG_all，旧结果与新结果的总平均保持可比。
+DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue"}
 
 # ==============================================================================
 # 3. 解析与计算核心代码
@@ -397,7 +408,8 @@ for avg_col, sub_tasks in AVG_GROUPS.items():
     final_df[avg_col] = final_df[valid_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
 
 # 计算全局汇总平均 AVG_all (综合所有分组子任务的基础列)
-all_base_tasks = list(set([task for group_tasks in AVG_GROUPS.values() for task in group_tasks]))
+all_base_tasks = list(set([task for group, group_tasks in AVG_GROUPS.items() if group not in DIAGNOSTIC_GROUPS
+                           for task in group_tasks]))
 valid_base_tasks = [t for t in all_base_tasks if t in final_df.columns]
 final_df['AVG_all'] = final_df[valid_base_tasks].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
 

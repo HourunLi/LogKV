@@ -347,6 +347,18 @@ from litgpt.model import GPT
 from litgpt.tokenizer import Tokenizer
 from lm_eval import evaluator
 from lm_eval.api.model import LM
+
+# Repository tasks (e.g. eval_tasks/niah_cue) beside lm-eval's own.
+EVAL_TASKS_DIR = Path(__file__).resolve().parent / "eval_tasks"
+
+
+def _task_manager(metadata):
+    """lm-eval's task index plus ``eval_tasks/``, carrying ``metadata`` as ``simple_evaluate`` would."""
+    from lm_eval.tasks import TaskManager
+
+    if not EVAL_TASKS_DIR.is_dir() or "metadata" not in inspect.signature(TaskManager).parameters:
+        return None  # simple_evaluate builds its own, with lm-eval's tasks only.
+    return TaskManager(include_path=str(EVAL_TASKS_DIR), metadata=dict(metadata or {}))
 from litgpt.generate.base import generate as litgpt_generate
 from litgpt.kv_compression import cache_compression_snapshot, summarize_compression
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
@@ -1756,6 +1768,7 @@ def main(
             results = evaluator.simple_evaluate(
                 model=lm_model,
                 tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
+                task_manager=_task_manager(metadata),
                 confirm_run_unsafe_code=True,
                 batch_size=1,
                 metadata=metadata,

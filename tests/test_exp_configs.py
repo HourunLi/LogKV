@@ -85,7 +85,8 @@ def test_only_gamma_experiments_and_the_hub_use_gamma(name):
         assert gamma == LEGACY_GAMMA, name
 
 
-CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "eval_gamma_cue.yaml"]
+CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
+       "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", "eval_gamma_cue.yaml"]
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
@@ -117,6 +118,8 @@ def test_cue_experiments():
     ("arc_gamma_k12_b256_2k.yaml", 256, 2, 256),
     ("arc_gamma_k12_b128_p1024_2k.yaml", 1024, 2, 128),
     ("arc_gamma_k12_b128_slack0_2k.yaml", 256, 0, 128),
+    ("arc_gamma_cue_k12_b128_p1024_2k.yaml", 1024, 2, 128),
+    ("arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", 1024, 0, 128),
 ])
 def test_gamma_experiments(name, exact, slack, budget):
     cfg = effective(name)
@@ -125,3 +128,15 @@ def test_gamma_experiments(name, exact, slack, budget):
     assert cfg["log_kv_alpha_exact_tokens"] == exact and cfg["log_kv_gamma_level_slack"] == slack
     assert int(cfg["log_kv_B"]) == budget and int(cfg["log_kv_recent_size"]) == 2048
     assert cfg["expid"] == "qwen1.7b-32k-" + name[len("arc_"):-len(".yaml")]
+
+
+@pytest.mark.parametrize("name, parent, switches", [
+    ("arc_gamma_cue_k12_b128_p1024_2k.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_alpha_exact_tokens"}),
+    ("arc_gamma_cue_k12_b128_p1024_2k.yaml", "arc_gamma_k12_b128_p1024_2k.yaml", {"log_kv_gamma_cue_tokens"}),
+    ("arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
+     {"log_kv_gamma_level_slack"}),
+])
+def test_combined_cue_experiments_differ_from_their_parents_only_by_the_named_switches(name, parent, switches):
+    names = {"expid", "save_path", "merged_state_staging_dir", "tensorboard_root"}
+    run, base = effective(name), effective(parent)
+    assert {k for k in set(run) | set(base) if run.get(k) != base.get(k)} - names == switches
