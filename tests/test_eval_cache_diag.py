@@ -173,6 +173,39 @@ def test_both_launchers_default_to_every_niah_task():
     assert sorted(defaults["eval.sh"]) == sorted(ruler + variants) and len(set(defaults["eval.sh"])) == 17
 
 
+def test_task_selection_skips_blank_or_none_stages_and_supports_niah_only():
+    root = Path(__file__).resolve().parents[1]
+
+    def select(script, env=(), args=()):
+        source = (root / script).read_text()
+        block = source[source.index('DEFAULT_BENCHMARKS="boolq'):source.index("\nMETA=")]
+        result = subprocess.run(["bash", "-c", block + '\necho "MAIN=$BENCHMARKS"; echo "NIAH=$NIAH_BENCHMARKS"',
+                                 script, *args], capture_output=True, text=True,
+                                env={"PATH": os.environ["PATH"], "NODE_RANK": "0", **dict(env)})
+        lines = dict(line.split("=", 1) for line in result.stdout.splitlines() if line[:5] in ("MAIN=", "NIAH="))
+        return result.returncode, lines.get("MAIN"), lines.get("NIAH"), result.stdout
+
+    for script, as_env in (("majob.sh", True), ("eval.sh", False)):
+        def run(main=None, niah=None, **env):
+            if as_env:
+                env.update({k: v for k, v in (("BENCHMARKS", main), ("NIAH_BENCHMARKS", niah)) if v is not None})
+                return select(script, env)
+            return select(script, env, ["config.yaml", main or "", niah or ""])  # eval.sh <yaml> <main> <niah>
+
+        code, main, niah, _ = run()
+        assert code == 0 and main.startswith("boolq,piqa") and niah.startswith("niah_single_1,"), script
+        assert run(main="none")[1] == "none" and run(main="none")[2] == niah
+        assert run(NIAH_ONLY="1")[1:3] == ("none", niah), script
+        assert run(main=" ", niah="NONE")[1:3] == ("none", "none"), script
+        assert run(main=" piqa, ,boolq ,", niah="niah_single_2 ,niah_single_3")[1:3] == (
+            "piqa,boolq", "niah_single_2,niah_single_3"), script
+        code, _, _, out = run(main="--limit")
+        assert code == 1 and "DIAG_ARGS" in out, script
+    for script in ("majob.sh", "eval.sh"):
+        source = (root / script).read_text()
+        assert '--benchmark "${BENCHMARKS}"' in source and '--benchmark "${NIAH_BENCHMARKS}"' in source
+
+
 def test_eval_launch_uses_selected_python_for_both_jobs():
     source = (Path(__file__).resolve().parents[1] / "eval.sh").read_text()
     start = source.index('if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then')
@@ -199,5 +232,6 @@ if __name__ == "__main__":
     test_unreadable_dataset_info_is_named_with_its_context()
     test_repair_hf_cache_runs_on_node_zero_before_its_barrier()
     test_both_launchers_default_to_every_niah_task()
+    test_task_selection_skips_blank_or_none_stages_and_supports_niah_only()
     test_eval_launch_uses_selected_python_for_both_jobs()
     print("HF cache diagnostic check passed")

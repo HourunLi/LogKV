@@ -179,6 +179,8 @@ BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_gamma_cu
 `majob.sh` 训练后的 NIAH 阶段与 `eval.sh` 的第三个参数默认跑全部 17 个捞针任务（single 3 个、多针 5 个、
 提示扰动 9 个，`DEFAULT_NIAH_BENCHMARKS`），每个任务在 1K–32K 六个长度上各 500 条，约为原先只跑
 single_1/2/3 的 5.7 倍；`NIAH_BENCHMARKS=<逗号分隔的任务>`（`eval.sh` 为第三个参数）只跑一部分。
+只跑 NIAH、跳过主评测：两个脚本都用 `NIAH_ONLY=1`（`majob.sh` 遇到已完成的 checkpoint 会跳过训练）；
+`BENCHMARKS=none` 或 `eval.sh <yaml> none` 等价。任务列表里的空白会被去掉，空列表按跳过处理。
 同一组任务分别评测 cue checkpoint 与不带 cue 的对照（如 `arc_gamma_k12_b128_2k.yaml`）；只看 32K、
 每个任务先看前 100 条（去掉 `--limit` 即为全部 500 条）：
 

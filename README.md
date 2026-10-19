@@ -44,6 +44,13 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
   bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
 ```
 
+训练完成后只跑捞针评测（默认全部 17 个 NIAH 任务；`majob.sh` 遇到已完成的 checkpoint 会跳过训练）：
+
+```bash
+NIAH_ONLY=1 bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
+NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
+```
+
 训练后仅评测 32K single2/3（`eval.sh` 从 YAML 的 `save_path` 加载产物，不转发 YAML metadata）：
 
 ```bash

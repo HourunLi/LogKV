@@ -6,6 +6,7 @@
 # Usage:
 #   bash eval.sh <training_yaml_or_eval_yaml> [benchmark_csv|none] [niah_csv|none]
 #   (niah_csv defaults to every NIAH task: DEFAULT_NIAH_BENCHMARKS below)
+#   NIAH only: bash eval.sh <yaml> none   or   NIAH_ONLY=1 bash eval.sh <yaml>
 #
 # Examples:
 #   bash eval.sh exp/qwen1.7b-32k/arc.yaml
@@ -467,6 +468,30 @@ DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_1_qend,niah_sing
 DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_qend,niah_single_2_preamble,niah_single_2_paraphrase"
 DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_3_qend,niah_single_3_preamble,niah_single_3_paraphrase"
 NIAH_BENCHMARKS=${3:-${DEFAULT_NIAH_BENCHMARKS}}
+
+# Task lists lose whitespace and stray commas; none / skip / off / false / 0 or nothing left skips that
+# stage instead of handing eval.py an empty --benchmark. NIAH_ONLY=1 skips the main stage.
+normalize_benchmarks() {
+    local value
+    value=$(printf '%s' "$1" | tr -d '[:space:]' | tr -s ',' | sed -e 's/^,//' -e 's/,$//')
+    case "$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')" in
+        ""|none|skip|off|false|0) echo none ;;
+        *) echo "${value}" ;;
+    esac
+}
+BENCHMARKS=$(normalize_benchmarks "${BENCHMARKS}")
+NIAH_BENCHMARKS=$(normalize_benchmarks "${NIAH_BENCHMARKS}")
+if [ "${NIAH_ONLY:-0}" = "1" ]; then
+    BENCHMARKS=none
+fi
+for TASK_LIST in "${BENCHMARKS}" "${NIAH_BENCHMARKS}"; do
+    case "${TASK_LIST}" in
+        -*) echo "ERROR: task list '${TASK_LIST}' starts with '-': put eval.py options in DIAG_ARGS, not in the task arguments."
+            exit 1 ;;
+    esac
+done
+echo "Main benchmarks: ${BENCHMARKS}"
+echo "NIAH benchmarks: ${NIAH_BENCHMARKS}"
 META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
 MAIN_METADATA_ARGS=()
 if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* ]]; then
