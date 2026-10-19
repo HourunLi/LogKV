@@ -33,7 +33,9 @@ attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启�
 
 默认训练配置是 `exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml`，算法开关集中在其父配置
 `arc_semantic_fast.yaml`。同目录不带 cue 的 `arc_gamma_k12_*` 是梯子修正的对照（B=256、精确池 1024、
-`level_slack: 0` 等）；`eval_gamma_cue.yaml` 只在评测时给已训练的 checkpoint 打开 cue。只训练、
+`level_slack: 0` 等）；`arc_gamma_cue_k12_b128_p1024*_2k` 在同字节下把 cue 与 P=1024（及 `level_slack: 0`）组合；
+`eval_gamma_cue.yaml` 只在评测时给已训练的 checkpoint 打开 cue。cue 在多针与改写提示下的适用边界评测见
+[Gamma 文档](docs/gamma-logkv.md)（RULER 多针任务与 `eval_tasks/niah_cue`）。只训练、
 不触发默认的全套后续评测：
 
 ```bash
