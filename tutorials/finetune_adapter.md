@@ -12,7 +12,7 @@ LLaMA-Adapter v2 extends the original LLaMA-Adapter idea by adding trainable bia
 
 The steps here only need to be done once:
 
-1. Follow the instructions in the [README](../README.md) to install the dependencies.
+1. Follow the [development setup](../CONTRIBUTING.md#development-setup) to install the dependencies.
 2. Download and convert the weights following our [guide](download_model_weights.md).
 
 LitGPT provides common datasets for finetuning, such as Alpaca, LIMA, Dolly, and more.

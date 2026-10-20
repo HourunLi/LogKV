@@ -10,10 +10,10 @@
 
 You can evaluate LitGPT using [EleutherAI's lm-eval](https://github.com/EleutherAI/lm-evaluation-harness) framework with a large number of different evaluation tasks.
 
-You need to install the `lm-eval` framework first:
+From the repository root, install the evaluation dependencies pinned by `pyproject.toml`:
 
 ```bash
-pip install lm_eval
+pip install -e ".[extra]"
 ```
 
 &nbsp;

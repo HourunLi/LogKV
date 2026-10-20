@@ -82,5 +82,6 @@ python -m pytest -q tests/test_log_kv_triton_interpret.py
 用例在解释器下标为预期失败。解释器不覆盖 CUDA graph、流与性能；GPU 上用 `unused/benchmark_log_kv_unified.py --route attach`
 测量路由耗时。
 
-LitGPT 通用用法见 [教程索引](tutorials/README.md)；通用 CLI 不自动启用本项目压缩路线。运行产生的 profile 和评测文件是实验产物，
+LitGPT 通用用法见 [教程索引](tutorials/README.md)；通用 CLI 不自动启用本项目压缩路线。
+运行产生的 profile 和评测文件是实验产物，
 其时间、形状和代码版本须一起解读；它们不定义当前算法。

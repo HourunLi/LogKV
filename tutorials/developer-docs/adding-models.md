@@ -32,7 +32,7 @@ Then, install it with the "editable" mode for development:
 
 ```bash
 cd litgpt
-pip install -e ".[all]"
+pip install -e ".[extra,test]"
 ```
 
 &nbsp;

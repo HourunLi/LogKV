@@ -6,7 +6,7 @@ If you are interested in parameter-efficient finetuning, check out [finetune_ada
 
 The steps here only need to be done once:
 
-1. Follow the instructions in the [README](../README.md) to install the dependencies.
+1. Follow the [development setup](../CONTRIBUTING.md#development-setup) to install the dependencies.
 2. Download and convert the weights following our [guide](download_model_weights.md).
 
 LitGPT provides common datasets for finetuning, such as Alpaca, LIMA, Dolly, and more.
@@ -50,9 +50,8 @@ Note that `mps` as the accelerator will be picked up automatically by Fabric whe
 You can test the finetuned model with your own instructions by running:
 
 ```bash
-litgpt generate tiiuae/falcon-7b \
-    --prompt "Recommend a movie to watch on the weekend." \
-    --finetuned_path out/full/my-model-finetuned/lit_model_finetuned.pth
+litgpt generate out/full/my-model-finetuned/final \
+    --prompt "Recommend a movie to watch on the weekend."
 ```
 
 Output:

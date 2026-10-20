@@ -31,7 +31,7 @@ However, it is also possible, and even common, to use and deploy models with Lit
 LitGPT is available as a Python library from the PyPI package repository, and we recommend installing it using Python's `pip` installer module, including all required package dependencies:
 
 ```bash
-pip install 'litgpt[all]'
+pip install 'litgpt[extra]'
 ```
 
 Alternatively, if you are a researcher or developer planning to make changes to LitGPT, you can clone the GitHub repository and install it from a local folder as follows:
@@ -39,7 +39,7 @@ Alternatively, if you are a researcher or developer planning to make changes to 
 ```
 git clone https://github.com/Lightning-AI/litgpt.git
 cd litgpt
-pip install -e '.[all]'
+pip install -e '.[extra]'
 ```
 
 
