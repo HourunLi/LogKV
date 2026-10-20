@@ -7,7 +7,8 @@ import numpy as np
 import pytest
 import torch
 
-from litgpt.alpha_log_kv import CUE_CAP, CUE_FLOOR, CUE_PRIOR, CUE_TAU, CueStream, add_cue_values, cut_spans
+from litgpt.alpha_log_kv import (CUE_CAP, CUE_FLOOR, CUE_MAX_COUNT, CUE_PRIOR, CUE_TAU, CueStream, add_cue_values,
+                                 cut_spans)
 from litgpt.config import Config
 from litgpt.log_kv_cache import LogStructuredKVCache
 from litgpt.model import GPT
@@ -304,3 +305,79 @@ def test_cue_tokens_bind_training_replay():
     c.gamma_cue_tokens = 0
     with pytest.raises(RuntimeError, match="configuration changed"):
         y.sum().backward()
+
+
+def test_cue_guard_needs_a_line_ended_opening():
+    ids = np.arange(10, 20)[None]
+    for kinds, cues in (([0, 1, 0, 2, 0, 1, 0, 0, 0, 0], [10, 11, 12, 13]), ([0, 1, 0, 0, 0, 1, 0, 0, 0, 0], [])):
+        stream = CueStream(8, guard=True)
+        stream.ingest(ids, np.array([kinds]), [0])
+        stream.ingest(np.array([[10, 11, 12, 13] * 3]), np.zeros((1, 12)), [10])
+        assert stream._rows[0].cues.tolist() == cues
+        values = stream.span_values(0, np.arange(10, 22), [4, 4, 4], 22)
+        assert (values > 0).all() if cues else (values == 0).all()
+    # Without the guard, the same unended head falls back to its last span end.
+    plain = CueStream(8)
+    plain.ingest(ids, np.array([[0, 1, 0, 0, 0, 1, 0, 0, 0, 0]]), [0])
+    assert plain._rows[0].region == 6
+
+
+def test_cue_guard_drops_cues_counted_more_than_the_cap():
+    ids, kinds = _stream_tokens()
+    ids[5_000:5_000 + 8 * (CUE_MAX_COUNT - 1):8] = 102  # 102 now occurs CUE_MAX_COUNT + 1 times
+    guarded, plain = CueStream(16, guard=True), CueStream(16)
+    for stream in (guarded, plain):
+        stream.ingest(ids[None], kinds[None], [0])
+    span = np.arange(9998, 10_006)  # holds 101 (3 times so far) and 102
+    stop = 15_000
+    assert int((ids[:stop] == 102).sum()) == CUE_MAX_COUNT + 1 and int((ids[:stop] == 101).sum()) <= CUE_MAX_COUNT
+
+    def weight(token):
+        count = int((ids[:stop] == token).sum())
+        return max(np.log((stop + 1 + CUE_PRIOR) / (count + 1)) - CUE_TAU, 0.)
+
+    assert plain.span_values(0, span, [8], stop)[0] == pytest.approx(_value(weight(101) + weight(102), 8))
+    assert guarded.span_values(0, span, [8], stop)[0] == pytest.approx(_value(weight(101), 8))
+
+
+def test_cue_guard_is_validated_bound_to_replay_and_must_match_the_stream():
+    with pytest.raises(ValueError, match="requires gamma_cue_tokens"):
+        _alpha_cache(0, gamma_cue_guard=True)
+    c = _alpha_cache(8, gamma_cue_guard=True)
+    c.cue_stream = CueStream(8)  # unguarded stream, guarded cache
+    k = torch.randn(2, 2, 48, 8)
+    with pytest.raises(RuntimeError, match="guard does not match"), torch.no_grad():
+        for s in range(0, 48, 16):
+            c.add_recent(k[:, :, s:s + 16], k[:, :, s:s + 16], k_raw=k[:, :, s:s + 16],
+                         span_ends=[[i % 5 == 4 for i in range(16)]] * 2)
+    c = _alpha_cache(8, gamma_cue_guard=True)
+    c.cue_stream = CueStream(8, guard=True)
+    ids = np.arange(100)[None].repeat(2, 0)
+    c.cue_stream.ingest(ids, np.zeros_like(ids), [0, 0])
+    from litgpt.log_kv_cache import LogKVStreamTrainingAttention
+    q, k, v = [torch.randn(2, 2, 48, 8, requires_grad=True) for _ in range(3)]
+    ends = [[i % 5 == 4 for i in range(48)]] * 2
+    y = LogKVStreamTrainingAttention.apply(q, k, v, c, .3, 16, 0., k, ends)
+    c.gamma_cue_guard = False
+    with pytest.raises(RuntimeError, match="configuration changed"):
+        y.sum().backward()
+
+
+def test_model_attaches_a_guarded_stream():
+    torch.manual_seed(5)
+    config = Config(block_size=64, n_layer=2, n_embd=32, n_head=4, n_query_groups=2,
+                    vocab_size=41, padding_multiple=1, rotary_percentage=1.)
+    model = GPT(config).eval()
+    model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7])
+    model.set_log_kv_cache(batch_size=2, B=8, recent_size=8, prefill_block=8, second_order_scale=0.,
+                           semantic_clusters=True, cluster_k_max=4, semantic_flush_granularity=8,
+                           semantic_anchor_mode="mid", semantic_replay_updates=True, alpha_exact_tokens=8,
+                           alpha_span_max_tokens=4, gamma_cue_tokens=6, gamma_cue_guard=True)
+    assert model.log_kv_cue_stream.guard
+    assert all(block.attn.kv_cache.gamma_cue_guard for block in model.transformer.h)
+    x = torch.randint(8, 41, (2, 24))
+    x[0, 2] = 7  # Row 0 has a line end in its head; row 1 only span ends.
+    x[1, 1] = 3
+    with torch.no_grad():
+        model(x, input_pos=torch.arange(24))
+    assert len(model.log_kv_cue_stream._rows[0].cues) == 3 and len(model.log_kv_cue_stream._rows[1].cues) == 0

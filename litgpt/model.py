@@ -249,11 +249,11 @@ class GPT(nn.Module):
             lines[list(line_end_ids)] = True
         self.register_buffer("alpha_line_ends", lines, persistent=False)
 
-    def _attach_gamma_streams(self, cue_tokens: int, literals: bool) -> None:
+    def _attach_gamma_streams(self, cue_tokens: int, literals: bool, cue_guard: bool = False) -> None:
         """One CueStream and one LiteralStream per model, shared by every layer's cache."""
         from litgpt.alpha_log_kv import CueStream, LiteralStream
 
-        self.log_kv_cue_stream = CueStream(cue_tokens) if cue_tokens else None
+        self.log_kv_cue_stream = CueStream(cue_tokens, guard=cue_guard) if cue_tokens else None
         self.log_kv_literal_stream = None
         if literals:
             texts = getattr(self, "alpha_literal_texts", None)
@@ -471,6 +471,7 @@ class GPT(nn.Module):
         gamma_level_slack: int = 2,
         gamma_cue_tokens: int = 0,
         gamma_literals: bool = False,
+        gamma_cue_guard: bool = False,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -571,13 +572,14 @@ class GPT(nn.Module):
                 gamma_level_slack=gamma_level_slack,
                 gamma_cue_tokens=gamma_cue_tokens,
                 gamma_literals=gamma_literals,
+                gamma_cue_guard=gamma_cue_guard,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
             block.attn._log_kv_pending = None
             block.attn.log_kv_prefill_block = prefill_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
-        self._attach_gamma_streams(gamma_cue_tokens, gamma_literals)
+        self._attach_gamma_streams(gamma_cue_tokens, gamma_literals, gamma_cue_guard)
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
         # holding stale O(N^2) bool tensors in GPU memory. With every block on
@@ -651,6 +653,7 @@ class GPT(nn.Module):
         gamma_level_slack: int = 2,
         gamma_cue_tokens: int = 0,
         gamma_literals: bool = False,
+        gamma_cue_guard: bool = False,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -742,6 +745,7 @@ class GPT(nn.Module):
                 gamma_level_slack=gamma_level_slack,
                 gamma_cue_tokens=gamma_cue_tokens,
                 gamma_literals=gamma_literals,
+                gamma_cue_guard=gamma_cue_guard,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -749,7 +753,7 @@ class GPT(nn.Module):
             block.attn._log_kv_pending = None
             block.attn.log_kv_train_block = train_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
-        self._attach_gamma_streams(gamma_cue_tokens, gamma_literals)
+        self._attach_gamma_streams(gamma_cue_tokens, gamma_literals, gamma_cue_guard)
 
     def disable_log_kv_training(self) -> None:
         """Turn off logKV training mode and drop the caches."""
@@ -1546,6 +1550,7 @@ class CausalSelfAttention(nn.Module):
         gamma_level_slack: int = 2,
         gamma_cue_tokens: int = 0,
         gamma_literals: bool = False,
+        gamma_cue_guard: bool = False,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1620,6 +1625,7 @@ class CausalSelfAttention(nn.Module):
             gamma_level_slack=gamma_level_slack,
             gamma_cue_tokens=gamma_cue_tokens,
             gamma_literals=gamma_literals,
+            gamma_cue_guard=gamma_cue_guard,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,
