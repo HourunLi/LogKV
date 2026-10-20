@@ -52,7 +52,7 @@ In order to start pretraining litgpt on it, you need to read, tokenize, and writ
 First, install additional dependencies for preprocessing:
 
 ```bash
-pip install '.[all]'
+pip install '.[extra]'
 ```
 
 You will need to have the tokenizer config available:

@@ -13,7 +13,7 @@ You can pretrain models in LitGPT using the `litgpt pretrain` API starting with 
 
 &nbsp;
 > [!TIP]
-> To install all required dependencies before pretraining, first run `pip install "litgpt[all]"`.
+> To install all required dependencies before pretraining, first run `pip install "litgpt[extra]"`.
 &nbsp;
 
 ```bash

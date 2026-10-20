@@ -9,7 +9,7 @@ We demonstrate this method by instruction-finetuning LitGPT StableLM 3B on the [
 
 The steps here only need to be done once:
 
-1. Follow the instructions in the [README](../README.md) to install the dependencies.
+1. Follow the [development setup](../CONTRIBUTING.md#development-setup) to install the dependencies.
 2. Download and convert the weights and save them in the `./checkpoints` folder.
    Weights can be downloaded following the instructions in the [download_model_weights](download_model_weights.md) documentation:
 
@@ -76,7 +76,7 @@ For additional benchmarks and resource requirements, please see the [Resource Ta
 You can test the finetuned model with your own instructions by running:
 
 ```bash
-litgpt generate "out/lora/final" \
+litgpt generate "out/finetune/lora/final" \
   --prompt "Recommend a movie to watch on the weekend."
 ```
 
@@ -86,7 +86,7 @@ Output:
 I would recommend the movie The Martian (2015). It is a sci-fi movie starring Matt Damon that follows the story of...
 ```
 
-If your GPU supports `bfloat16`, you can additionally pass `--precision "bf16-true"` to bring the memory consumption down to ~7.6 GB for StableLM-3B (versus ~15.2  GB for `--precision "32-full"`). In addition, you may use quantization methods, for example `--precision "bf16-true" --quantize "bnb.nf4"` brings the memory consumption further down to ~4.4 GB for StableLM-3B.
+If your GPU supports `bfloat16`, you can additionally pass `--precision "bf16-true"` to bring the memory consumption down to ~7.6 GB for StableLM-3B (versus ~15.2  GB for `--precision "32-true"`). In addition, you may use quantization methods, for example `--precision "bf16-true" --quantize "bnb.nf4"` brings the memory consumption further down to ~4.4 GB for StableLM-3B.
 
 &nbsp;
 
@@ -146,9 +146,9 @@ This file exclusively contains the LoRA weights, which are much smaller than the
 If desired, there is the option to merge these LoRA weights manually into the original model's checkpoint, which creates a full `lit_model.pth` checkpoint.
 The advantage of this merging process is to streamline inference operations, as it eliminates the need to dynamically incorporate the LoRA weights during runtime, which can improve inference speed.
 
-For example, after finetuning produced a checkpoint folder `out/lora/step-002000`, merge it as follows:
+For example, after finetuning produced a checkpoint folder `out/finetune/lora/step-002000`, merge it as follows:
 
 ```bash
-litgpt merge_lora "out/lora/step-002000"
+litgpt merge_lora "out/finetune/lora/step-002000"
 ```
 The command above creates a full `lit_model.pth` checkpoint file.

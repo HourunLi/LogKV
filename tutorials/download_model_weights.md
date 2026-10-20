@@ -72,7 +72,7 @@ To see all supported models, run the following command:
 litgpt download list
 ```
 
-The output is shown below:
+An example output is shown below; use the command above for the list in your checkout:
 
 ```
 allenai/OLMo-1B-hf

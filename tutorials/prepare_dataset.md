@@ -23,7 +23,7 @@ Below is a table of all datasets that are currently supported in LitGPT:
 
 The steps here only need to be done once before preparing the finetuning datasets in the following subsections:
 
-1. Follow the instructions in the [README](../README.md) to install the dependencies.
+1. Follow the [development setup](../CONTRIBUTING.md#development-setup) to install the dependencies.
 2. Download and convert the weights following our [guide](download_model_weights.md).
 
 For the following examples, we will focus on finetuning with the `litgpt finetune_lora` command and use a Falcon 7B model.
