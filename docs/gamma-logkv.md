@@ -148,6 +148,11 @@ U(0.3, 1.0) 代替。统计针所在片段在末尾是否仍完整地留在精�
 - 代理里没有模型：K/V 分数是随机数，token 是预分词而非 Qwen BPE。准确率要在 GPU 上评测。
 - M 必须覆盖到指令末尾的换行。默认 64 覆盖 base 模型 RULER 的指令（约 28 个 token），以及
   不超过约 35 个 token 的前导；带系统提示的聊天模板等更长前导需调大 M。
+- 开头是正文时 cue 会占满精确池。32K 实测（cue + P=1024 的 checkpoint）：`niah_single_3_qend` 为 0.17，
+  而开头指令不含针词的 `_paraphrase` 为 0.49；`_preamble` 居中（0.35）。代理中 P=1024 时 cue 价值高于 2
+  （K/V 分数的上限）的片段占末尾精确池的比例：qend 99%、preamble 65%、paraphrase 2%：qend 的开头区域
+  是第一篇文章的开头，片段重复其中的话题词就得到远超 K/V 分数的价值，K/V 分数本可留住的 uuid 进不了池。
+  数字针（single_2 各变体约 0.2）不受 P 影响，K/V 分数本来就不偏向它们。
 
 **配置。** 默认训练配置 [`arc_gamma_cue_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml)
 与 `arc_gamma_k12_b128_2k` 只差 cue。成本最低的第一个实验是只评测、不重训：
@@ -262,7 +267,9 @@ token 约 ln10 nats，与正文 token 相当，起作用的是字面量自身的
 [`eval_gamma_literal.yaml`](../exp/qwen1.7b-32k/eval_gamma_literal.yaml) 在 cue checkpoint
 （`arc_gamma_cue_k12_b128_2k`）上再开字面量；
 [`eval_gamma_literal_nocue.yaml`](../exp/qwen1.7b-32k/eval_gamma_literal_nocue.yaml) 在不带 cue 的
-梯子 checkpoint（`arc_gamma_k12_b128_2k`）上只开字面量。训练配置
+梯子 checkpoint（`arc_gamma_k12_b128_2k`）上只开字面量；
+[`eval_gamma_literal_p1024_slack0.yaml`](../exp/qwen1.7b-32k/eval_gamma_literal_p1024_slack0.yaml) 在
+cue + P=1024 + `level_slack: 0` 的 checkpoint 上再开字面量。训练配置
 [`arc_gamma_cue_literal_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_literal_k12_b128_2k.yaml)
 与 cue 默认配置只差字面量。
 

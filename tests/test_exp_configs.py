@@ -72,8 +72,7 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
 
 
 # Eval-only literal runs re-evaluate Gamma checkpoints with the ladder they were trained with.
-GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + ["eval_gamma_literal.yaml",
-                                                               "eval_gamma_literal_nocue.yaml"]
+GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(p.name for p in EXP.glob("eval_gamma_literal*.yaml"))
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
@@ -90,8 +89,9 @@ def test_only_gamma_experiments_and_the_hub_use_gamma(name):
 
 CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
        "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", "eval_gamma_cue.yaml",
-       "arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml"]
-LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml"]
+       "arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_p1024_slack0.yaml"]
+LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml",
+           "eval_gamma_literal_p1024_slack0.yaml"]
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
@@ -112,7 +112,8 @@ def test_only_literal_experiments_use_literals(name):
 def test_literal_experiments():
     # Eval-only: each trained checkpoint with its own ladder and cue setting, literals on.
     for name, trained in (("eval_gamma_literal.yaml", "arc_gamma_cue_k12_b128_2k.yaml"),
-                          ("eval_gamma_literal_nocue.yaml", "arc_gamma_k12_b128_2k.yaml")):
+                          ("eval_gamma_literal_nocue.yaml", "arc_gamma_k12_b128_2k.yaml"),
+                          ("eval_gamma_literal_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml")):
         evaluated, base = effective(name), effective(trained)
         assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {"log_kv_gamma_literals"}
     assert effective("eval_gamma_literal_nocue.yaml")["log_kv_gamma_cue_tokens"] == 0
