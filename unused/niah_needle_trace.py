@@ -15,6 +15,7 @@ YAML. For each sample it reports:
     instruction  per-token max cosine to the instruction prefix keys, top quarter of the span
     rarity       running in-document unigram surprisal of the token ids, top quarter of the span
     cue          Gamma's cue value alone (64 opening tokens), whether or not the config enables cues
+    cue_guard    the same with the cue guard (line-ended opening, cues counted at most 16 times)
     literal      Gamma's literal value alone, whether or not the config enables literals
 - with --oracle, the needle span is forced into the exact pool at the chosen layers, which bounds
   what better selection can buy.
@@ -46,7 +47,7 @@ from litgpt.log_kv_cache import LogStructuredKVCache  # noqa: E402
 
 NEEDLE_RE = re.compile(r"One of the special magic (?:numbers|uuids) for (\S+) is: (\S+)\.")
 INSTRUCTION_END = "\n"  # The RULER instruction is the first line of the prompt.
-SCORES = ("cache", "variance", "novelty_tok", "instruction", "rarity", "cue", "literal")
+SCORES = ("cache", "variance", "novelty_tok", "instruction", "rarity", "cue", "cue_guard", "literal")
 CUE_TOKENS = 64  # The diagnostic cue score's opening region (the cache uses its own setting).
 _ACTIVE: list = [None]  # The tracer the class-level patches report to.
 
@@ -79,9 +80,11 @@ class Tracer:
         self.instruction_keys: dict[int, torch.Tensor] = {}
         self.flushes: dict[int, list[dict]] = {}
         self.cues = al.CueStream(CUE_TOKENS)
+        self.guarded = al.CueStream(CUE_TOKENS, guard=True)
         self.literals = al.LiteralStream(self.literal_texts) if self.literal_texts else None
         if len(ids):
             self.cues.ingest(ids[None], kinds[None], [0])
+            self.guarded.ingest(ids[None], kinds[None], [0])
             if self.literals is not None:
                 self.literals.ingest(ids[None], [0])
 
@@ -176,6 +179,8 @@ class Tracer:
         stop = int(positions.max()) + 1
         cue = al.add_cue_values(cut, [0.0] * sum(len(r) for r in cut.length_rows), self.cues, [stop])
         scores["cue"] = torch.tensor(cue[:len(lengths)], device=k.device)
+        guarded = al.add_cue_values(cut, [0.0] * sum(len(r) for r in cut.length_rows), self.guarded, [stop])
+        scores["cue_guard"] = torch.tensor(guarded[:len(lengths)], device=k.device)
         if self.literals is not None:
             literal = al.add_cue_values(cut, [0.0] * sum(len(r) for r in cut.length_rows), self.literals, [stop])
             scores["literal"] = torch.tensor(literal[:len(lengths)], device=k.device)
