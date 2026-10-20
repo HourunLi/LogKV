@@ -549,12 +549,18 @@ def test_eval_hands_each_prompt_question_to_the_model():
     source = Path(__file__).resolve().parents[1] / "eval.py"
     cls = next(n for n in ast.parse(source.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "LogKVLM")
     cls.bases, cls.decorator_list = [], []
-    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_set_gamma_query"]
-    scope = {}
+    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef)
+                and n.name in ("_query_line_end_table", "_set_gamma_query")]
+    scope = {"np": np}
     exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), scope)
     lm, handed = scope["LogKVLM"](), []
     lm.model = SimpleNamespace(set_gamma_queries=handed.append)
-    lm._query_line_ends = np.zeros(200, dtype=bool)
-    lm._query_line_ends[7] = True
+    # Qwen: vocab_size (151643) leaves out added tokens; <|endoftext|> (151643) ends a line.
+    lm.tokenizer = SimpleNamespace(vocab_size=151_643, alpha_line_end_ids=(7, 151_643))
+    lm.config = SimpleNamespace(padded_vocab_size=151_936)
+    lm._query_line_ends = lm._query_line_end_table()
+    assert len(lm._query_line_ends) == 151_936 and lm._query_line_ends[[7, 151_643]].all()
+    assert lm._query_line_ends.sum() == 2
     lm._set_gamma_query(torch.tensor(list(range(100, 190)) + [7, 11, 12, 13]))
-    assert [q.tolist() for q in handed[0]] == [[11, 12, 13]]
+    lm._set_gamma_query(torch.tensor([151_643, 11, 151_900, 151_643, 12]))
+    assert [q.tolist() for q, in handed] == [[11, 12, 13], [11, 151_900, 151_643, 12]]
