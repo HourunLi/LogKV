@@ -1003,10 +1003,7 @@ class LogKVLM(LM):
             )
         # Query-aware cue: host table of line-ending tokens, built once; each request's
         # question is cut from the last CUE_QUERY_TOKENS prompt ids only.
-        self._query_line_ends = None
-        if self.log_kv_gamma_query_cue:
-            self._query_line_ends = np.zeros(self.tokenizer.vocab_size, dtype=bool)
-            self._query_line_ends[list(self.tokenizer.alpha_line_end_ids)] = True
+        self._query_line_ends = self._query_line_end_table() if self.log_kv_gamma_query_cue else None
 
         if is_master: print(f"🔄 正在加载权重...")
         checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
@@ -1317,6 +1314,17 @@ class LogKVLM(LM):
     # ==========================================
     # 🌟 核心 2：自回归生成任务 (LongBench)
     # ==========================================
+    def _query_line_end_table(self):
+        """Line-ending tokens over every id the model embeds.
+
+        ``tokenizer.vocab_size`` leaves out added tokens, and the end-of-text
+        token (a line end) is one of them.
+        """
+        ends = list(self.tokenizer.alpha_line_end_ids)
+        table = np.zeros(max(self.config.padded_vocab_size, max(ends, default=-1) + 1), dtype=bool)
+        table[ends] = True
+        return table
+
     def _set_gamma_query(self, prompt_tensor) -> None:
         """Hand this request's closing question to the query-aware cue (one small host copy)."""
         from litgpt.alpha_log_kv import CUE_QUERY_TOKENS, query_region
