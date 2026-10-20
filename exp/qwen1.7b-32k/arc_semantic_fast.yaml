@@ -64,5 +64,8 @@ log_kv_gamma_literals: false
 # Gamma cue 保护（默认关闭）：开头区域不以换行结束时不用 cue，出现超过 16 次的 cue 词不计证据。
 # 只在 eval_gamma_cue_guard* 中打开。
 log_kv_gamma_cue_guard: false
+# Gamma 查询感知 cue（默认关闭，仅评测生成任务）：每个 prompt 末尾的问题（最后 64 个 token，从其中第一个换行之后起）
+# 也作为 cue；开启时字面量价值降到 cue 之下一档。只在 eval_gamma_query* 中打开。
+log_kv_gamma_query_cue: false
 log_kv_seg_gap_max: null  # Alpha 延迟归档要求关闭 segment gap/padding
 log_kv_seg_block_level: 0

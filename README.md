@@ -36,7 +36,8 @@ attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启�
 `level_slack: 0` 等）；`arc_gamma_cue_k12_b128_p1024*_2k` 在同字节下把 cue 与 P=1024（及 `level_slack: 0`）组合；
 `eval_gamma_cue.yaml` 只在评测时给已训练的 checkpoint 打开 cue。精确池的字面量选择（随机数字串、编码的
 首次出现）默认关闭：`eval_gamma_literal*.yaml` 只在评测时打开，`arc_gamma_cue_literal_k12_b128_2k.yaml` 在 cue 之上训练。
-cue 保护（开头须以换行结束、出现超过 16 次的 cue 词不计）默认关闭，`eval_gamma_cue_guard*.yaml` 只在评测时打开。cue 在多针与改写提示下的适用边界评测见
+cue 保护（开头须以换行结束、出现超过 16 次的 cue 词不计）默认关闭，`eval_gamma_cue_guard*.yaml` 只在评测时打开。
+查询感知 cue（生成请求 prompt 末尾的问题也作为 cue，字面量降到 cue 之下一档）默认关闭，`eval_gamma_query*.yaml` 只在评测时打开。cue 在多针与改写提示下的适用边界评测见
 [Gamma 文档](docs/gamma-logkv.md)（RULER 多针任务与 `eval_tasks/niah_cue`；两个启动脚本的 NIAH 阶段默认跑全部
 17 个捞针任务）。只训练、
 不触发默认的全套后续评测：

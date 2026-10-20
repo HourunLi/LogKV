@@ -21,6 +21,10 @@ CUE_PRIOR = 2048
 # evidence. A word that points at needles recurs about as often as there are
 # needles; the topic words of an ordinary opening recur dozens of times.
 CUE_MAX_COUNT = 16
+# Query-aware cue (optional): when the whole prompt is known before prefill, the
+# tokens of its closing question are cues too. The query region is the last
+# CUE_QUERY_TOKENS prompt tokens, starting after the first line end among them.
+CUE_QUERY_TOKENS = 64
 # Gamma literals: a literal's symbols are its ASCII digits and the runs of at
 # most 3 letters between two digits (hex and code fragments). Their adaptive
 # order-0 code length measures how random they are: a random 7-digit string
@@ -28,6 +32,11 @@ CUE_MAX_COUNT = 16
 # occurrence of a literal coding above LITERAL_FLOOR nats gains value as a cue
 # does, from the same exp form and cap.
 LITERAL_FLOOR = 12.
+# With the query cue on, literal values sit one tier below cue values: the code
+# is shifted so the literal floor meets CUE_FLOOR and capped at LITERAL_TIER_CAP,
+# so a span with more cue evidence than that outranks every literal, while a
+# random 7-digit number (at the cap) still ranks above K/V scores.
+LITERAL_TIER_CAP = 6.
 _LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
 
 
@@ -101,20 +110,28 @@ def _empty_selection(rows):
                          [np.empty(0, dtype=np.int64) for _ in range(rows)])
 
 
-class _CueRow:
-    __slots__ = ("seen", "head_ids", "head_ends", "cues", "region", "pos", "slot", "chunks", "weights")
+_NO_IDS = np.empty(0, dtype=np.int64)
 
-    def __init__(self):
+
+class _CueRow:
+    __slots__ = ("seen", "head_ids", "head_ends", "cues", "query", "region", "pos", "slot", "chunks", "weights")
+
+    def __init__(self, query=_NO_IDS):
         self.seen = 0
         self.head_ids, self.head_ends = [], []
         self.cues, self.region = None, 0
-        self.pos = self.slot = np.empty(0, dtype=np.int64)
+        self.query = query  # sorted, unique question ids of this request (query-aware cue)
+        self.pos = self.slot = _NO_IDS
         self.chunks = []
         self.weights = {}  # stop -> per-cue weight; every layer archives the same blocks
 
     def add(self, ids, ends, tokens, guard=False):
         start, self.seen = self.seen, self.seen + len(ids)
         if self.cues is not None:
+            self.record(ids, start)
+            return
+        if not tokens:  # No opening region: the question alone, from position 0.
+            self.cues = self.query
             self.record(ids, start)
             return
         # Until the head is full, every token so far is in it (start == len(head_ids)).
@@ -126,15 +143,16 @@ class _CueRow:
         head = np.asarray(self.head_ids, dtype=np.int64)
         kinds = np.asarray(self.head_ends, dtype=np.int64)
         # The region ends at the last line end in the head, else the last span end;
-        # with the guard, a head without a line end has no cues.
+        # with the guard, a head without a line end adds no cues of its own.
         closed = np.flatnonzero(kinds == 2)
         if not len(closed) and guard:
-            self.region, self.cues = tokens, np.empty(0, dtype=np.int64)
-            return
-        if not len(closed):
-            closed = np.flatnonzero(kinds)
-        self.region = int(closed[-1]) + 1 if len(closed) else tokens
-        self.cues = np.unique(head[:self.region])
+            self.region, region_cues = tokens, _NO_IDS
+        else:
+            if not len(closed):
+                closed = np.flatnonzero(kinds)
+            self.region = int(closed[-1]) + 1 if len(closed) else tokens
+            region_cues = head[:self.region]
+        self.cues = np.union1d(region_cues, self.query)  # sorted and unique: each cue counts once
         self.record(head, 0)
         self.record(ids[take:], tokens)
 
@@ -167,14 +185,27 @@ class CueStream:
     With ``guard``, a head without a line end has no cues (an instruction
     ends its line; an ordinary opening of collapsed text does not), and a cue
     counted more than CUE_MAX_COUNT times gives no evidence.
+
+    Query-aware cue: ``set_queries`` gives each row the token ids of its
+    request's question (``query_region``), consumed when the row restarts at
+    position 0; they join the row's cues. ``tokens=0`` keeps the question only.
     """
 
     def __init__(self, tokens: int, guard: bool = False) -> None:
-        if tokens < 1:
-            raise ValueError("cue tokens must be >= 1")
+        if tokens < 0:
+            raise ValueError("cue tokens must be >= 0")
         self.tokens = int(tokens)
         self.guard = bool(guard)
         self._rows: list[_CueRow] = []
+        self._queries: dict[int, np.ndarray] = {}  # row -> question ids for its next request
+
+    def set_queries(self, queries) -> None:
+        """Question token ids per row (None for none) for each row's next request."""
+        for b, ids in enumerate(queries):
+            if ids is None:
+                self._queries.pop(b, None)
+            else:
+                self._queries[b] = np.unique(np.asarray(ids, dtype=np.int64))
 
     def ingest(self, ids, ends, starts) -> None:
         """Append one forward's tokens per row; a row restarts at position 0.
@@ -187,7 +218,7 @@ class CueStream:
             self._rows.append(_CueRow())
         for b, (row_ids, row_ends, start) in enumerate(zip(ids, ends, starts)):
             if start == 0:
-                self._rows[b] = _CueRow()
+                self._rows[b] = _CueRow(self._queries.pop(b, _NO_IDS))
             elif start != self._rows[b].seen:
                 raise ValueError(f"cue stream row {b} expects position {self._rows[b].seen}, got {start}")
             self._rows[b].add(row_ids, row_ends, self.tokens, self.guard)
@@ -228,6 +259,21 @@ class CueStream:
         return np.maximum(value, 0.) / np.maximum(lengths, 1)
 
 
+def query_region(ids, line_end, tokens=CUE_QUERY_TOKENS):
+    """Token ids of a prompt's closing question, for the query-aware cue.
+
+    The last ``tokens`` ids, starting after the first line end among them (all
+    of them when there is none, or when only the last token ends a line).
+    ``line_end`` is a boolean table over the vocabulary. Host only, O(tokens).
+    """
+    tail = np.asarray(ids, dtype=np.int64)[-tokens:]
+    inside = tail < len(line_end)
+    ends = np.flatnonzero(inside & line_end[np.where(inside, tail, 0)])
+    if len(ends) and ends[0] + 1 < len(tail):
+        tail = tail[ends[0] + 1:]
+    return tail
+
+
 def literal_code(text):
     """(adaptive order-0 code length in nats, symbols) of a literal's text.
 
@@ -252,7 +298,7 @@ def literal_code(text):
 
 
 class _LiteralRow:
-    __slots__ = ("seen", "prev_lit", "lo", "hi", "code", "ids", "first", "open_lo", "open_ids", "arrays")
+    __slots__ = ("seen", "prev_lit", "lo", "hi", "code", "ids", "first", "open_lo", "open_ids", "arrays", "at_stop")
 
     def __init__(self):
         self.seen, self.prev_lit = 0, False
@@ -261,6 +307,26 @@ class _LiteralRow:
         self.first = {}  # symbols -> start of their first closed occurrence
         self.open_lo, self.open_ids = 0, []  # the last run, which the next token may extend
         self.arrays = None
+        # stop -> (n, last, open) from _cut: every layer reads the same stops, and in
+        # whole-prompt prefill all of them come after a single ingest. O(1) per stop.
+        self.at_stop = {}
+
+
+_LITERAL_TABLES: dict = {}  # id(texts) -> (texts, lit, digit, lead): one decode per vocabulary
+
+
+def _literal_tables(texts, chars):
+    hit = _LITERAL_TABLES.get(id(texts))
+    if hit is not None and hit[0] is texts:
+        return hit[1:]
+    n = len(texts)
+    bodies = [t.lstrip() for t in texts]
+    lit = np.fromiter((bool(t) and chars.issuperset(t) for t in bodies), dtype=bool, count=n)
+    lead = np.fromiter((t[:1].isspace() for t in texts), dtype=bool, count=n)
+    digit = lit & np.fromiter((any("0" <= c <= "9" for c in t) for t in bodies), dtype=bool, count=n)
+    _LITERAL_TABLES.clear()  # One tokenizer per process; drop tables of a replaced vocabulary.
+    _LITERAL_TABLES[id(texts)] = (texts, lit, digit, lead)
+    return lit, digit, lead
 
 
 class LiteralStream:
@@ -274,19 +340,19 @@ class LiteralStream:
     cache passes the end of the block it archives): a run that continues past
     it counts with its tokens before it, so layer-major prefill, any prefill
     block and token-by-token decode select alike.
+
+    ``below_cue`` (query-aware cue on) puts literal values one tier below cue
+    values (LITERAL_TIER_CAP).
     """
 
     CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.,:/+#")
 
-    def __init__(self, texts) -> None:
-        self.texts = list(texts)
+    def __init__(self, texts, below_cue: bool = False) -> None:
+        self.texts = texts if isinstance(texts, tuple) else tuple(texts)
         if not self.texts:
             raise ValueError("LiteralStream needs the tokenizer's token texts")
-        n = len(self.texts)
-        bodies = [t.lstrip() for t in self.texts]
-        self.lit = np.fromiter((bool(t) and self.CHARS.issuperset(t) for t in bodies), dtype=bool, count=n)
-        self.lead = np.fromiter((t[:1].isspace() for t in self.texts), dtype=bool, count=n)
-        self.digit = self.lit & np.fromiter((any("0" <= c <= "9" for c in t) for t in bodies), dtype=bool, count=n)
+        self.lit, self.digit, self.lead = _literal_tables(self.texts, self.CHARS)
+        self.below_cue = bool(below_cue)
         self._rows: list[_LiteralRow] = []
 
     def _tables(self, ids):
@@ -351,42 +417,73 @@ class LiteralStream:
         state.code.append(code)
         state.ids.append(run)
         state.arrays = None
+        state.at_stop.clear()
 
     def span_values(self, row, positions, lengths, stop):
         """``max(exp(code) - exp(LITERAL_FLOOR), 0) / length`` per span, as of ``stop``.
 
         A span's code is the largest among the literals it touches that occur
         there for the first time; a repeat of an earlier literal codes to 0.
+        Below the cue: ``max(exp(min(code - LITERAL_FLOOR + CUE_FLOOR,
+        LITERAL_TIER_CAP)) - exp(CUE_FLOOR), 0) / length``, the same floor.
         """
         lengths = np.asarray(lengths, dtype=np.int64)
         values = np.zeros(len(lengths))
         state = self._rows[row] if row < len(self._rows) else None
-        positions = np.asarray(positions, dtype=np.int64)
         if state is None or not len(lengths) or not len(positions):
             return values
+        cut = state.at_stop.get(stop)
+        if cut is None:
+            cut = self._cut(state, stop)
+            if stop <= state.seen:  # Later tokens can no longer change this cut.
+                state.at_stop[stop] = cut
+        n, last, opened = cut
+        if not n and opened is None:
+            return values
+        positions = np.asarray(positions, dtype=np.int64)
+        if n:
+            lo, hi, code = state.arrays
+            at = np.searchsorted(lo[:n], positions, side="right") - 1
+            inside = at >= 0
+            at = np.maximum(at, 0)
+            code_at = code[at]  # a copy
+            if last is not None:
+                code_at[at == n - 1] = last
+            token_code = np.where(inside & (positions < np.minimum(hi[at], stop)), code_at, 0.)
+        else:
+            token_code = np.zeros(len(positions))
+        if opened is not None:
+            token_code[(positions >= state.open_lo) & (positions < stop)] = opened
+        best = np.maximum.reduceat(token_code, np.cumsum(lengths) - lengths)
+        if self.below_cue:
+            value = np.exp(np.minimum(best - (LITERAL_FLOOR - CUE_FLOOR), LITERAL_TIER_CAP)) - math.exp(CUE_FLOOR)
+        else:
+            value = np.exp(np.minimum(best, CUE_CAP)) - math.exp(LITERAL_FLOOR)
+        return np.maximum(value, 0.) / np.maximum(lengths, 1)
+
+    def _cut(self, state, stop):
+        """The literal runs as of ``stop``: a run past it counts its tokens before it.
+
+        Returns ``(n, last, open)``: closed runs ``[0, n)`` start before ``stop``;
+        ``last`` recodes run ``n - 1`` when it continues past ``stop`` (else
+        None); ``open`` codes the open run's tokens before ``stop`` (None when
+        it has none or no digit). Span values read the closed runs' arrays in
+        place, so a cut never copies them.
+        """
         if state.arrays is None:
             state.arrays = (np.asarray(state.lo, dtype=np.int64), np.asarray(state.hi, dtype=np.int64),
                             np.asarray(state.code, dtype=np.float64))
-        lo, hi, code = state.arrays
+        lo, hi, _ = state.arrays
         n = int(np.searchsorted(lo, stop))  # Runs that start before stop.
-        lo, hi, code = lo[:n], hi[:n].copy(), code[:n].copy()
-        # A closed run, or the open one, that continues past stop counts its tokens before it.
-        if n and hi[-1] > stop:
-            coded = self._code(state, int(lo[-1]), state.ids[n - 1][:stop - int(lo[-1])])
-            hi[-1], code[-1] = stop, (0. if coded is None else coded[0])
-        if state.open_ids and state.open_lo < stop:
+        last = opened = None
+        if n and hi[n - 1] > stop:  # A closed run continues past stop.
+            coded = self._code(state, int(lo[n - 1]), state.ids[n - 1][:stop - int(lo[n - 1])])
+            last = 0. if coded is None else coded[0]
+        if state.open_ids and state.open_lo < stop:  # So does the open run.
             coded = self._code(state, state.open_lo, state.open_ids[:stop - state.open_lo])
             if coded is not None:
-                lo, hi = np.append(lo, state.open_lo), np.append(hi, stop)
-                code = np.append(code, coded[0])
-        if not len(lo):
-            return values
-        at = np.searchsorted(lo, positions, side="right") - 1
-        inside = (at >= 0) & (positions < hi[np.maximum(at, 0)])
-        token_code = np.where(inside, code[np.maximum(at, 0)], 0.)
-        best = np.maximum.reduceat(token_code, np.cumsum(lengths) - lengths)
-        value = np.exp(np.minimum(best, CUE_CAP)) - math.exp(LITERAL_FLOOR)
-        return np.maximum(value, 0.) / np.maximum(lengths, 1)
+                opened = coded[0]
+        return n, last, opened
 
 
 class SummedValues:

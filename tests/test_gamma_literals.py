@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 import torch
 
-from litgpt.alpha_log_kv import (CUE_CAP, LITERAL_FLOOR, CueStream, LiteralStream, SummedValues, add_cue_values,
-                                 cut_spans, literal_code)
+from litgpt.alpha_log_kv import (CUE_CAP, CUE_FLOOR, LITERAL_FLOOR, LITERAL_TIER_CAP, CueStream, LiteralStream,
+                                 SummedValues, add_cue_values, cut_spans, literal_code)
 from litgpt.config import Config
 from litgpt.log_kv_cache import LogStructuredKVCache
 from litgpt.model import GPT
@@ -132,6 +132,47 @@ def test_summed_values_add_cue_and_literal_values_in_candidate_order():
     assert [i for i, value in enumerate(parts[1]) if value > 0] == [1, 2, 5, 6]
 
 
+def test_literal_values_sit_one_tier_below_cues_with_the_query_cue():
+    five = [" ", "4", "8", "2", "9", "1"]
+    ids = _ids([" wab"] * 4, five, ["."], [" wac"] * 3, [" ", "6", "0", "5", "3", "7", "1", "9"], ["."], [" wad"] * 4,
+               [" ", "1", "9", "9", "5"])
+    plain, tiered = LiteralStream(TEXTS), LiteralStream(TEXTS, below_cue=True)
+    lengths = [4, 7, 3, 9, 4, 5]
+    for stream in (plain, tiered):
+        stream.ingest(ids[None], [0])
+    got = tiered.span_values(0, np.arange(len(ids)), lengths, len(ids))
+    codes = [0., literal_code("48291")[0], 0., literal_code("6053719")[0], 0., literal_code("1995")[0]]
+    assert LITERAL_FLOOR < codes[1] < LITERAL_FLOOR + LITERAL_TIER_CAP - CUE_FLOOR < codes[3] and codes[5] < LITERAL_FLOOR
+    expect = [max(math.exp(min(c - LITERAL_FLOOR + CUE_FLOOR, LITERAL_TIER_CAP)) - math.exp(CUE_FLOOR), 0.) / n
+              for c, n in zip(codes, lengths)]
+    assert got == pytest.approx(expect) and got[1] > 0 and got[3] == pytest.approx(
+        (math.exp(LITERAL_TIER_CAP) - math.exp(CUE_FLOOR)) / 9)
+    # The same literals pass the same floor in both tiers.
+    assert ((plain.span_values(0, np.arange(len(ids)), lengths, len(ids)) > 0) == (got > 0)).all()
+
+
+def test_literal_cuts_are_cached_per_stop_without_copying_the_runs():
+    number = [" ", "4", "8", "2", "9", "1", "7", "3"]
+    ids = _ids([" wab"] * 3, number, ["."], [" wac"] * 3, number[:4])
+    stream = LiteralStream(TEXTS)
+    stream.ingest(ids[None, :8], [0])  # The number is still open at 8.
+    row = stream._rows[0]
+    first = stream.span_values(0, np.arange(8), [8], 8)
+    assert row.at_stop[8] == (0, None, pytest.approx(literal_code("4829")[0]))
+    stream.span_values(0, np.arange(8), [8], 30)
+    assert 30 not in row.at_stop  # Past the tokens seen: later tokens could change it.
+    stream.ingest(ids[None, 8:], [8])  # Closes the number (cache dropped), then opens its prefix again.
+    assert row.at_stop == {}
+    np.testing.assert_array_equal(stream.span_values(0, np.arange(8), [8], 8), first)
+    n, last, opened = row.at_stop[8]
+    assert (n, opened) == (1, None) and last == pytest.approx(literal_code("4829")[0])
+    whole = LiteralStream(TEXTS)
+    whole.ingest(ids[None], [0])
+    for stop in (8, 12, len(ids)):
+        np.testing.assert_array_equal(stream.span_values(0, np.arange(stop), [stop], stop),
+                                      whole.span_values(0, np.arange(stop), [stop], stop))
+
+
 def _alpha_cache(literals, cues=0, **overrides):
     args = dict(B=8, recent_size=16, semantic_clusters=True, cluster_k_max=4, semantic_anchor_mode="mid",
                 allocate_second_order=False, semantic_replay_updates=True, semantic_flush_granularity=16,
@@ -192,6 +233,13 @@ def test_literal_switch_is_validated_and_needs_the_model_stream():
     stream, stops = both._gamma_cues([np.arange(16), np.arange(8)])
     assert isinstance(stream, SummedValues) and stops == [16, 8]
     assert stream.streams == (both.cue_stream, both.literal_stream)
+    # With the query-aware cue, the literal stream must sit below the cue.
+    queried = _alpha_cache(True, gamma_query_cue=True)
+    queried.cue_stream, queried.literal_stream = CueStream(0), LiteralStream(TEXTS)
+    with pytest.raises(RuntimeError, match="tier does not match"):
+        queried._gamma_cues([np.arange(16), np.arange(8)])
+    queried.literal_stream = LiteralStream(TEXTS, below_cue=True)
+    assert queried._gamma_cues([np.arange(16), np.arange(8)])[0].streams[1].below_cue
 
 
 def _model(vocab=len(TEXTS)):
@@ -254,6 +302,11 @@ def test_model_feeds_one_shared_literal_stream_and_needs_the_token_texts():
     assert model.log_kv_literal_stream is None
     model.set_log_kv_cache(prefill_block=8, **KWARGS)
     assert model.log_kv_literal_stream is None and model.transformer.h[0].attn.kv_cache.literal_stream is None
+    model.set_log_kv_cache(prefill_block=8, gamma_literals=True, gamma_query_cue=True, **KWARGS)
+    assert model.log_kv_literal_stream.below_cue and model.log_kv_cue_stream.tokens == 0
+    # Every stream built from the same token texts shares one table build.
+    assert model.log_kv_literal_stream.lit is LiteralStream(model.alpha_literal_texts).lit
+    assert not LiteralStream(TEXTS).below_cue
 
 
 def test_literals_bind_training_replay():

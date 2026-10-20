@@ -899,6 +899,7 @@ class LogKVLM(LM):
         log_kv_gamma_cue_tokens: int = 0,
         log_kv_gamma_literals: bool = False,
         log_kv_gamma_cue_guard: bool = False,
+        log_kv_gamma_query_cue: bool = False,
         tokenizer_dir: str | None = None,
         process_group=None,
     ):
@@ -952,6 +953,7 @@ class LogKVLM(LM):
         self.log_kv_gamma_cue_tokens = int(log_kv_gamma_cue_tokens)
         self.log_kv_gamma_literals = bool(log_kv_gamma_literals)
         self.log_kv_gamma_cue_guard = bool(log_kv_gamma_cue_guard)
+        self.log_kv_gamma_query_cue = bool(log_kv_gamma_query_cue)
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -999,6 +1001,12 @@ class LogKVLM(LM):
                 self.tokenizer.alpha_line_end_ids if self.log_kv_gamma_cue_tokens else None,
                 self.tokenizer.gamma_literal_texts if self.log_kv_gamma_literals else None,
             )
+        # Query-aware cue: host table of line-ending tokens, built once; each request's
+        # question is cut from the last CUE_QUERY_TOKENS prompt ids only.
+        self._query_line_ends = None
+        if self.log_kv_gamma_query_cue:
+            self._query_line_ends = np.zeros(self.tokenizer.vocab_size, dtype=bool)
+            self._query_line_ends[list(self.tokenizer.alpha_line_end_ids)] = True
 
         if is_master: print(f"🔄 正在加载权重...")
         checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
@@ -1097,6 +1105,7 @@ class LogKVLM(LM):
             gamma_cue_tokens=self.log_kv_gamma_cue_tokens,
             gamma_literals=self.log_kv_gamma_literals,
             gamma_cue_guard=self.log_kv_gamma_cue_guard,
+            gamma_query_cue=self.log_kv_gamma_query_cue,
         )
         if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
@@ -1144,7 +1153,8 @@ class LogKVLM(LM):
                                      gamma_top_merge=first.gamma_top_merge, gamma_level_slack=first.gamma_level_slack,
                                      gamma_cue_tokens=getattr(first, "gamma_cue_tokens", 0),
                                      gamma_literals=getattr(first, "gamma_literals", False),
-                                     gamma_cue_guard=getattr(first, "gamma_cue_guard", False))
+                                     gamma_cue_guard=getattr(first, "gamma_cue_guard", False),
+                                     gamma_query_cue=getattr(first, "gamma_query_cue", False))
         if _is_main():
             print(f"🧮 persistent cache budget (excluding shared RoPE / transient workspace): {self.cache_budget}")
 
@@ -1307,6 +1317,13 @@ class LogKVLM(LM):
     # ==========================================
     # 🌟 核心 2：自回归生成任务 (LongBench)
     # ==========================================
+    def _set_gamma_query(self, prompt_tensor) -> None:
+        """Hand this request's closing question to the query-aware cue (one small host copy)."""
+        from litgpt.alpha_log_kv import CUE_QUERY_TOKENS, query_region
+
+        tail = prompt_tensor[-CUE_QUERY_TOKENS:].tolist()
+        self.model.set_gamma_queries([query_region(tail, self._query_line_ends)])
+
     def generate_until(self, requests):
         dp_rank = _global_rank()
         dp_size = _world_size()
@@ -1350,6 +1367,9 @@ class LogKVLM(LM):
                 # 🧩 长上下文生成使用所选 cache（LogKV slot cache 或 dense KV）。
                 # 建一次、按请求原地重置，不逐样本重分配 — 见 _set_eval_cache。
                 self._set_eval_cache()
+                if (getattr(self, "_query_line_ends", None) is not None
+                        and getattr(self.model, "log_kv_cue_stream", None) is not None):
+                    self._set_gamma_query(prompt_tensor)
                 try:
                     t0 = time.perf_counter()
                     out = litgpt_generate(
@@ -1549,6 +1569,9 @@ def main(
     # Gamma cue guard (off by default): cues need an opening region that ends at a line end,
     # and a cue counted more than 16 times gives no evidence. Only with cues on.
     log_kv_gamma_cue_guard: bool = False,
+    # Gamma query-aware cue (off by default): the closing question of each generation prompt
+    # (its last 64 tokens, after their first line end) is a cue too; literals then rank below cues.
+    log_kv_gamma_query_cue: bool = False,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1641,6 +1664,7 @@ def main(
     log_kv_gamma_cue_tokens = int(_o("log_kv_gamma_cue_tokens", log_kv_gamma_cue_tokens))
     log_kv_gamma_literals = bool(_o("log_kv_gamma_literals", log_kv_gamma_literals))
     log_kv_gamma_cue_guard = bool(_o("log_kv_gamma_cue_guard", log_kv_gamma_cue_guard))
+    log_kv_gamma_query_cue = bool(_o("log_kv_gamma_query_cue", log_kv_gamma_query_cue))
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
@@ -1648,7 +1672,8 @@ def main(
         log_kv_beta_novelty = log_kv_beta_adaptive_merge = False
         log_kv_gamma_cue_tokens = 0
         log_kv_gamma_literals = False
-    if not log_kv_gamma_cue_tokens:
+        log_kv_gamma_query_cue = False
+    if not (log_kv_gamma_cue_tokens or log_kv_gamma_query_cue):
         log_kv_gamma_cue_guard = False  # the guard only acts on cues
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
@@ -1748,7 +1773,8 @@ def main(
                 f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
                 f"gamma_level0_reinsert={log_kv_gamma_level0_reinsert}, gamma_top_merge={log_kv_gamma_top_merge}, "
                 f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens}, "
-                f"gamma_literals={log_kv_gamma_literals}, gamma_cue_guard={log_kv_gamma_cue_guard})"
+                f"gamma_literals={log_kv_gamma_literals}, gamma_cue_guard={log_kv_gamma_cue_guard}, "
+                f"gamma_query_cue={log_kv_gamma_query_cue})"
             )
         if diag_active:
             print(
@@ -1825,6 +1851,7 @@ def main(
             log_kv_gamma_cue_tokens=log_kv_gamma_cue_tokens,
             log_kv_gamma_literals=log_kv_gamma_literals,
             log_kv_gamma_cue_guard=log_kv_gamma_cue_guard,
+            log_kv_gamma_query_cue=log_kv_gamma_query_cue,
             tokenizer_dir=tokenizer_dir,
             process_group=eval_group,
         )
@@ -1981,6 +2008,7 @@ def main(
                     "log_kv_gamma_cue_tokens": log_kv_gamma_cue_tokens,
                     "log_kv_gamma_literals": log_kv_gamma_literals,
                     "log_kv_gamma_cue_guard": log_kv_gamma_cue_guard,
+                    "log_kv_gamma_query_cue": log_kv_gamma_query_cue,
                     "results": results,
                 }
 

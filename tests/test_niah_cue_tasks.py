@@ -51,7 +51,8 @@ def test_variants_change_only_the_prompt_around_the_haystack(ruler):
         opening = text[:text.index(needle[0])]
         if name.endswith("qend"):
             haystack = "The grass is green." if name.startswith("niah_single_1") else "Paul wrote"
-            assert text.startswith(haystack) and "special magic" not in opening
+            # RULER draws the depth from the global random state; depth 0 puts the needle first.
+            assert text.replace(needle[0], "", 1).lstrip().startswith(haystack) and "special magic" not in opening
         elif name.endswith("preamble"):
             assert text.startswith(utils.PREAMBLE + f"A special magic {kind} is hidden within the following text.")
             assert len(utils.PREAMBLE.split()) >= 70  # Longer than the 64-token cue region in any tokenizer.
