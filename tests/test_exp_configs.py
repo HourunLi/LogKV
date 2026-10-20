@@ -11,7 +11,8 @@ DEFAULTS = dict(log_kv_alpha_exact_tokens=256, log_kv_beta_novelty=True, log_kv_
                 log_kv_semantic_unified_route=False, log_kv_semantic_anchor_mode="multi",
                 log_kv_second_order_scale=1.0, log_kv_cluster_k_max=1,
                 log_kv_gamma_level0_reinsert=True, log_kv_gamma_top_merge="lightest", log_kv_gamma_level_slack=2,
-                log_kv_gamma_cue_tokens=64, log_kv_gamma_literals=False, log_kv_gamma_cue_guard=False)
+                log_kv_gamma_cue_tokens=64, log_kv_gamma_literals=False, log_kv_gamma_cue_guard=False,
+                log_kv_gamma_query_cue=False)
 LEGACY_GAMMA = dict(log_kv_gamma_level0_reinsert=False, log_kv_gamma_top_merge="fold", log_kv_gamma_level_slack=2)
 
 
@@ -31,8 +32,8 @@ def effective(name):
     if not out["log_kv_alpha_exact_tokens"]:
         out["log_kv_beta_novelty"] = out["log_kv_beta_adaptive_merge"] = False
         out["log_kv_gamma_cue_tokens"] = 0
-        out["log_kv_gamma_literals"] = False
-    if not out["log_kv_gamma_cue_tokens"]:
+        out["log_kv_gamma_literals"] = out["log_kv_gamma_query_cue"] = False
+    if not (out["log_kv_gamma_cue_tokens"] or out["log_kv_gamma_query_cue"]):
         out["log_kv_gamma_cue_guard"] = False
     return out
 
@@ -75,7 +76,8 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
 
 # Eval-only literal runs re-evaluate Gamma checkpoints with the ladder they were trained with.
 GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
-    p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml") for p in EXP.glob(pattern))
+    p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml", "eval_gamma_query*.yaml")
+    for p in EXP.glob(pattern))
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
@@ -94,11 +96,15 @@ CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
        "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", "eval_gamma_cue.yaml",
        "arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_p1024_slack0.yaml",
        "eval_gamma_cue_guard.yaml", "eval_gamma_cue_guard_p1024_slack0.yaml",
-       "eval_gamma_cue_guard_literal_p1024_slack0.yaml"]
+       "eval_gamma_cue_guard_literal_p1024_slack0.yaml", "eval_gamma_query_p1024_slack0.yaml",
+       "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml"]
+QUERY = ["eval_gamma_query_p1024_slack0.yaml", "eval_gamma_query_literal_p1024_slack0.yaml",
+         "eval_gamma_query_literal.yaml"]
 LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml",
-           "eval_gamma_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_literal_p1024_slack0.yaml"]
+           "eval_gamma_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_literal_p1024_slack0.yaml",
+           "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml"]
 GUARD = ["eval_gamma_cue_guard.yaml", "eval_gamma_cue_guard_p1024_slack0.yaml",
-         "eval_gamma_cue_guard_literal_p1024_slack0.yaml"]
+         "eval_gamma_cue_guard_literal_p1024_slack0.yaml", *QUERY]
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
@@ -121,12 +127,23 @@ def test_only_cue_guard_experiments_use_the_guard(name):
     assert effective(name)["log_kv_gamma_cue_guard"] is (name in GUARD), name
 
 
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_query_cue_evaluations_see_the_question(name):
+    assert effective(name)["log_kv_gamma_query_cue"] is (name in QUERY), name
+
+
 @pytest.mark.parametrize("name, trained, switches", [
     ("eval_gamma_cue_guard.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_gamma_cue_guard"}),
     ("eval_gamma_cue_guard_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml",
      {"log_kv_gamma_cue_guard"}),
     ("eval_gamma_cue_guard_literal_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml",
      {"log_kv_gamma_cue_guard", "log_kv_gamma_literals"}),
+    ("eval_gamma_query_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml",
+     {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
+    ("eval_gamma_query_literal_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml",
+     {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue", "log_kv_gamma_literals"}),
+    ("eval_gamma_query_literal.yaml", "arc_gamma_cue_k12_b128_2k.yaml",
+     {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue", "log_kv_gamma_literals"}),
 ])
 def test_cue_guard_evaluations_reuse_their_checkpoint(name, trained, switches):
     evaluated, base = effective(name), effective(trained)

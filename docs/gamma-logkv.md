@@ -1,9 +1,9 @@
 # GammaLogKV：梯子修正与精确池的 cue、字面量选择
 
 Gamma 建立在 attach + Alpha + Beta 之上（见 [Alpha](alpha-logkv.md)、[Beta](beta-logkv.md)），
-不改变路由。前三个开关只改变条目在层级（梯子）里怎样合并；后两个开关在精确池选择片段时加分：
-重复了流开头区域里稀有 token 的片段（cue，第 4 节，可加保护），以及含随机字面量首次出现的片段（第 5 节）。
-六个开关：
+不改变路由。前三个开关只改变条目在层级（梯子）里怎样合并；其余开关在精确池选择片段时加分：
+重复了流开头区域里稀有 token 的片段（cue，第 4 节，可加保护；评测时可把 prompt 末尾的问题也作为 cue），
+以及含随机字面量首次出现的片段（第 5 节）。七个开关：
 
 | 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 入口 / `arc_semantic_fast.yaml` | 作用 |
 |---|---|---|---|
@@ -12,6 +12,7 @@ Gamma 建立在 attach + Alpha + Beta 之上（见 [Alpha](alpha-logkv.md)、[Be
 | `gamma_level_slack` | `2` | `2` | 余量层数；小于 2 时用同样字节换更宽的 B′ |
 | `gamma_cue_tokens` | `0` | `64` | 开头区域长度；精确池按 cue 证据给片段加分，`0` 关闭 |
 | `gamma_cue_guard` | `false` | `false` | cue 保护：开头区域须以换行结束，出现超过 16 次的 cue 不计证据 |
+| `gamma_query_cue` | `false` | `false` | 查询感知 cue：生成请求 prompt 末尾的问题也作为 cue；字面量价值降到 cue 之下一档 |
 | `gamma_literals` | `false` | `false` | 精确池给含随机字面量（数字串、编码）首次出现的片段加分 |
 
 Gamma 之前的实验 YAML 显式写回旧行为（`false` / `fold` / `2` / `0`）；早于 cue 的四个 Gamma
@@ -184,6 +185,62 @@ DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu
   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_cue_guard_p1024_slack0.yaml
 ```
 
+**查询感知 cue（`gamma_query_cue`，可选，只用于评测）。** 问题在末尾（`_qend`）或开头指令不含针词
+（`_paraphrase`）时，开头区域给不出指向针的 cue。生成请求的整段 prompt 在 prefill 之前已经到手，
+问题就在它的末尾，开启后问题里的词也作为 cue：
+
+- 问题区域：prompt 最后 `CUE_QUERY_TOKENS = 64` 个 token，从其中第一个换行之后开始（RULER 模板的
+  问题前有换行）；没有换行、或只有最后一个 token 是换行时取整段 64 个。`eval.py` 在每个生成请求的
+  prefill 之前只把这 64 个 id 拷到主机，用 `query_region` 截取，经 `model.set_gamma_queries` 交给
+  CueStream。这一行下一次从位置 0 开始时取用一次，不会带到后面的请求。
+- 问题里的 token 与开头区域的 cue 取并集（每个 cue 只计一次），证据、权重、下限、上限与保护规则不变；
+  `gamma_cue_tokens: 0` 时只用问题，从位置 0 起都计证据。问题本身在 recent 里，归档时计数只来自正文：
+  针格式里反复出现的 special、magic、number 超过 16 次后不计（应与保护一起开），区分针的是 key 里的词。
+- 字面量降一档：开启后字面量价值为 `max(exp(min(E − 8, 6)) − exp(4), 0) / 片段长度`。下限仍是
+  E > 12 nats；上限等于 cue 证据 6 nats 的价值，所以 cue 证据超过 6 nats 的片段排在任何字面量片段之前，
+  而随机 7 位数（已到上限）在最长 64 个 token 的片段里仍有约 5.4，高于 K/V 分数（不超过 2）。
+  不降档时，同格式针组成的干草堆里每根针都是新字面量、价值都到上限，会挤掉问题指向的那一根。
+- 只在主机上运行：每个请求一次 64 个 id 的拷贝与一次并集；权重按归档块末尾缓存、各层共用；不增加 KV，
+  推理 KV 仍为 `O(log N)`。训练与 loglikelihood 请求没有问题，cue 与不开时相同（字面量的档位除外）。
+
+**代理评测（不是模型准确率）。** 与第 4、5 节相同的代理（P=256，约 28K 代理 token；问题前有换行，
+与 RULER 模板一致），用仓库里的 `CueStream`、`query_region` 与 `LiteralStream`。"问题"一列是 64 个 token
+的开头 cue 加保护再加问题。数字为针在末尾精确保留的样本数（共 40）：
+
+| 干草堆 / 模板 / 针 | 无 | cue+保护 | 字面量 | cue+保护+字面量 | 问题 | 问题+字面量 |
+|---|---|---|---|---|---|---|
+| 文章 / 原模板 / number | 3 | 40 | 40 | 40 | 40 | 40 |
+| 文章 / 原模板 / uuid | 4 | 40 | 40 | 40 | 40 | 40 |
+| 文章 / qend / number | 4 | 4 | 40 | 40 | 40 | 40 |
+| 文章 / qend / uuid | 4 | 4 | 40 | 40 | 40 | 40 |
+| 文章 / paraphrase / number | 3 | 3 | 40 | 40 | 40 | 40 |
+| 文章 / paraphrase / uuid | 3 | 3 | 40 | 40 | 40 | 40 |
+| 文章 / preamble / number | 4 | 4 | 40 | 40 | 40 | 40 |
+| 文章 / preamble / uuid | 4 | 4 | 40 | 40 | 40 | 40 |
+| 同格式针 / 原模板 / number | 2 | 2 | 3 | 3 | 40 | 40 |
+| 同格式针 / 原模板 / uuid | 1 | 1 | 1 | 1 | 40 | 40 |
+
+"同格式针"是 `niah_multikey_2/3` 式的干草堆：全文都是同格式的针，只有 key 不同，只有问题能指出是哪一根。
+不含针的文章上，末尾精确池与只用 K/V 分数时的 Jaccard（20 个样本）：P=256 时 cue+保护 0.57、加问题 0.47、
+问题+字面量 0.29（只开字面量 0.66）；P=1024 时为 0.60 / 0.50 / 0.41（0.75）。问题里较少见的词
+（如 mentioned、provided）在正文中出现不超过 16 次时也会给片段加分。代理里没有模型，K/V 分数是随机数；
+准确率要在 GPU 上评测。
+
+这是查询感知的压缩：缓存在 prefill 之前看到了问题（与用 prompt 末尾观察窗口选择 KV 的方法同类），
+结果要与不看问题的设置分开报告。问题在缓存建好之后才出现时（多轮对话、同一文档多次提问）不起作用。
+默认关闭；只改变精确池选择，可以只评测：
+[`eval_gamma_query_p1024_slack0.yaml`](../exp/qwen1.7b-32k/eval_gamma_query_p1024_slack0.yaml)
+（cue + P=1024 + `level_slack: 0` 的 checkpoint，加保护与问题）、
+[`eval_gamma_query_literal_p1024_slack0.yaml`](../exp/qwen1.7b-32k/eval_gamma_query_literal_p1024_slack0.yaml)
+（同一 checkpoint 再开字面量）与
+[`eval_gamma_query_literal.yaml`](../exp/qwen1.7b-32k/eval_gamma_query_literal.yaml)（P=256 的 cue checkpoint，
+保护、问题与字面量）。
+
+```bash
+DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+  NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_query_literal_p1024_slack0.yaml
+```
+
 **配置。** 默认训练配置 [`arc_gamma_cue_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml)
 与 `arc_gamma_k12_b128_2k` 只差 cue。成本最低的第一个实验是只评测、不重训：
 [`eval_gamma_cue.yaml`](../exp/qwen1.7b-32k/eval_gamma_cue.yaml) 用已训练的 attach + Alpha + Beta
@@ -247,6 +304,7 @@ DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu
   长度，重复出现计 0。后文再引用它时，第一次出现的片段不降分。
 - 价值：`max(exp(min(E, 30)) − exp(12), 0) / 片段长度`，E 取片段触及的首次出现字面量中最大的
   编码长度。与 cue 价值同形；两者都开时相加，再加到 K/V 分数上进入原有整段贪心（含旧片段 1.1 倍）。
+  开查询感知 cue 时改为降一档的形式（第 4 节）。
 
 **性质。**
 
@@ -289,6 +347,7 @@ token 约 ln10 nats，与正文 token 相当，起作用的是字面量自身的
 - 词面启发式，只覆盖含数字的字面量；纯字母的人名、地名等事实不在内。
 - 文中数字很多时（表格、日志）字面量相互竞争，价值又远高于 cue 价值，会挤掉 cue 选中的不含数字的片段；
   由同格式针组成的干草堆（`niah_multikey_2/3`）里每根针都是新字面量，精确池装不下，帮不到被问到的那一根。
+  开查询感知 cue 时字面量降到 cue 之下一档（第 4 节）。
 - 少数随机数字串编码长度接近下限（如 `1810111` 约 12.3 nats）。
 - 代理里没有模型；准确率要在 GPU 上评测。
 
@@ -322,7 +381,8 @@ BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_gamma_cu
 - 训练要求与 Alpha 相同（attach 或 unified、mid、一阶、`semantic_replay_updates=true`）。
 - Gamma 之前的 checkpoint 是在旧梯子上训练的。可以在评测 YAML 里覆盖梯子三项开关来复评，但
   训练与评测不一致；结论以 Gamma 重训为准。cue 与字面量只改变精确池选哪些片段，评测时单独打开的
-  偏差小得多（`eval_gamma_cue.yaml`、`eval_gamma_literal*.yaml`）。
+  偏差小得多（`eval_gamma_cue.yaml`、`eval_gamma_literal*.yaml`、`eval_gamma_cue_guard*.yaml`、
+  `eval_gamma_query*.yaml`）。
 
 默认训练配置是 [`arc_gamma_cue_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml)。
 不带 cue 的梯子实验有 B=128（`arc_gamma_k12_b128_2k`）、B=256 对照（`_b256_2k`）、同字节精确池
@@ -380,7 +440,8 @@ GPU 上的实际收益以训练日志为准：`logKV_host` 的 `route`、`replay
 样本，按实验 YAML 构建同一模型与缓存，逐层报告针在精确池、recent 还是梯子条目（及其 w），
 针所在片段在现有评分（开启 cue 时含 cue 价值）与几种诊断评分下的排名、需要多大的精确池才能
 留住，以及 `--oracle all` 强制保留针时的准确率上限。诊断评分 `cue` 是单独的 cue 价值（开头 64 个
-token），配置未开启 cue 时也会报告；`cue_guard` 是加保护后的 cue 价值，`literal` 是单独的字面量价值。追踪期间关闭分数预取，
+token），配置未开启 cue 时也会报告；`cue_guard` 是加保护后的 cue 价值，`query_cue` 是加保护并把
+样本末尾的问题也作为 cue 的价值，`literal` 是单独的字面量价值。追踪期间关闭分数预取，
 选择规则不变（`--oracle` 除外）。
 
 ```bash
@@ -389,9 +450,11 @@ python unused/niah_needle_trace.py --config exp/qwen1.7b-32k/eval_gamma_cue.yaml
 ```
 
 测试：`tests/test_gamma_log_kv.py`（修复前后的梯子形状、上层条目不被改写、同字节余量层），
-`tests/test_gamma_cues.py`（区域截断、去重与阈值、因果与分块不变、针留在精确池、保护的两条规则、模型接线与回放签名），
+`tests/test_gamma_cues.py`（区域截断、去重与阈值、因果与分块不变、针留在精确池、保护的两条规则、
+问题区域截取、问题与开头取并集且只用于下一个请求、问题指向的片段留在精确池、评测把问题交给模型、
+模型接线与回放签名），
 `tests/test_gamma_literals.py`（编码长度、首次出现、与参考实现逐位一致且不依赖分块、随机数针留在精确池、
-cue 与字面量相加、模型接线与回放签名），
+cue 与字面量相加、降档公式、按归档块末尾缓存、模型接线与回放签名），
 `tests/test_alpha_log_kv.py`（守恒、延迟归档、反向回放与预取，覆盖 Gamma 与 cue 开关），
 `tests/test_log_kv_updates.py`（顶层两种合并的批量与逐条路径一致），
 `tests/test_niah_cue_tasks.py`（提示扰动任务只改提示、经 `eval.py` 的任务索引加载并收到 metadata），

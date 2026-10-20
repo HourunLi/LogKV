@@ -249,21 +249,37 @@ class GPT(nn.Module):
             lines[list(line_end_ids)] = True
         self.register_buffer("alpha_line_ends", lines, persistent=False)
 
-    def _attach_gamma_streams(self, cue_tokens: int, literals: bool, cue_guard: bool = False) -> None:
-        """One CueStream and one LiteralStream per model, shared by every layer's cache."""
+    def _attach_gamma_streams(self, cue_tokens: int, literals: bool, cue_guard: bool = False,
+                              query_cue: bool = False) -> None:
+        """One CueStream and one LiteralStream per model, shared by every layer's cache.
+
+        With the query-aware cue the CueStream also exists without an opening
+        region (``CueStream(0)``), and literal values sit one tier below cues.
+        """
         from litgpt.alpha_log_kv import CueStream, LiteralStream
 
-        self.log_kv_cue_stream = CueStream(cue_tokens, guard=cue_guard) if cue_tokens else None
+        self.log_kv_query_cue = bool(query_cue)
+        self.log_kv_cue_stream = CueStream(cue_tokens, guard=cue_guard) if cue_tokens or query_cue else None
         self.log_kv_literal_stream = None
         if literals:
             texts = getattr(self, "alpha_literal_texts", None)
             if texts is None:
                 raise RuntimeError("gamma_literals needs the tokenizer's token texts: pass "
                                    "literal_texts to set_alpha_span_boundary_ids()")
-            self.log_kv_literal_stream = LiteralStream(texts)
+            self.log_kv_literal_stream = LiteralStream(texts, below_cue=query_cue)
         for block in self.transformer.h:
             block.attn.kv_cache.cue_stream = self.log_kv_cue_stream
             block.attn.kv_cache.literal_stream = self.log_kv_literal_stream
+
+    def set_gamma_queries(self, queries) -> None:
+        """Question token ids per batch row for the next request (query-aware cue).
+
+        ``alpha_log_kv.query_region`` cuts them from the prompt; they are used
+        once, when the row's next forward starts at position 0.
+        """
+        if not getattr(self, "log_kv_query_cue", False) or getattr(self, "log_kv_cue_stream", None) is None:
+            raise RuntimeError("set_gamma_queries needs gamma_query_cue in set_log_kv_cache")
+        self.log_kv_cue_stream.set_queries(queries)
 
     def _ingest_cues(self, idx, ends, input_pos) -> list[list[bool]]:
         """Feed this forward's tokens to the Gamma streams; returns the host span ends.
@@ -472,6 +488,7 @@ class GPT(nn.Module):
         gamma_cue_tokens: int = 0,
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
+        gamma_query_cue: bool = False,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -573,13 +590,14 @@ class GPT(nn.Module):
                 gamma_cue_tokens=gamma_cue_tokens,
                 gamma_literals=gamma_literals,
                 gamma_cue_guard=gamma_cue_guard,
+                gamma_query_cue=gamma_query_cue,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
             block.attn._log_kv_pending = None
             block.attn.log_kv_prefill_block = prefill_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
-        self._attach_gamma_streams(gamma_cue_tokens, gamma_literals, gamma_cue_guard)
+        self._attach_gamma_streams(gamma_cue_tokens, gamma_literals, gamma_cue_guard, gamma_query_cue)
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
         # holding stale O(N^2) bool tensors in GPU memory. With every block on
@@ -654,6 +672,7 @@ class GPT(nn.Module):
         gamma_cue_tokens: int = 0,
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
+        gamma_query_cue: bool = False,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -746,6 +765,7 @@ class GPT(nn.Module):
                 gamma_cue_tokens=gamma_cue_tokens,
                 gamma_literals=gamma_literals,
                 gamma_cue_guard=gamma_cue_guard,
+                gamma_query_cue=gamma_query_cue,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -753,7 +773,7 @@ class GPT(nn.Module):
             block.attn._log_kv_pending = None
             block.attn.log_kv_train_block = train_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
-        self._attach_gamma_streams(gamma_cue_tokens, gamma_literals, gamma_cue_guard)
+        self._attach_gamma_streams(gamma_cue_tokens, gamma_literals, gamma_cue_guard, gamma_query_cue)
 
     def disable_log_kv_training(self) -> None:
         """Turn off logKV training mode and drop the caches."""
@@ -1551,6 +1571,7 @@ class CausalSelfAttention(nn.Module):
         gamma_cue_tokens: int = 0,
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
+        gamma_query_cue: bool = False,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1626,6 +1647,7 @@ class CausalSelfAttention(nn.Module):
             gamma_cue_tokens=gamma_cue_tokens,
             gamma_literals=gamma_literals,
             gamma_cue_guard=gamma_cue_guard,
+            gamma_query_cue=gamma_query_cue,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,

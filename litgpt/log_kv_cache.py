@@ -732,6 +732,7 @@ class LogStructuredKVCache(nn.Module):
         gamma_cue_tokens: int = 0,
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
+        gamma_query_cue: bool = False,
     ) -> None:
         super().__init__()
 
@@ -768,10 +769,15 @@ class LogStructuredKVCache(nn.Module):
             raise ValueError("gamma_cue_tokens must be >= 0")
         if self.gamma_cue_tokens and not alpha_exact_tokens:
             raise ValueError("gamma_cue_tokens scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
+        # Query-aware cue: the question of each request joins the model's CueStream
+        # (CueStream(0) when there is no opening region).
+        self.gamma_query_cue = bool(gamma_query_cue)
+        if self.gamma_query_cue and not alpha_exact_tokens:
+            raise ValueError("gamma_query_cue scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
         # The model's CueStream applies the guard; the cache checks it matches.
         self.gamma_cue_guard = bool(gamma_cue_guard)
-        if self.gamma_cue_guard and not self.gamma_cue_tokens:
-            raise ValueError("gamma_cue_guard guards Gamma cues; it requires gamma_cue_tokens > 0")
+        if self.gamma_cue_guard and not (self.gamma_cue_tokens or self.gamma_query_cue):
+            raise ValueError("gamma_cue_guard guards Gamma cues; it requires gamma_cue_tokens > 0 or gamma_query_cue")
         # Gamma literals: spans holding the first occurrence of a random-looking
         # literal (digit strings, codes) gain exact-pool value; the model owns
         # the shared LiteralStream like the CueStream.
@@ -4152,17 +4158,19 @@ class LogStructuredKVCache(nn.Module):
         """
         from litgpt.alpha_log_kv import SummedValues
         streams = []
-        if self.gamma_cue_tokens:
+        if self.gamma_cue_tokens or self.gamma_query_cue:
             if self.cue_stream is None:
-                raise RuntimeError("gamma_cue_tokens needs the model's CueStream; set_log_kv_cache and "
-                                   "enable_log_kv_training attach it")
-            if self.cue_stream.guard != self.gamma_cue_guard:
-                raise RuntimeError("the model's CueStream guard does not match gamma_cue_guard")
+                raise RuntimeError("gamma_cue_tokens and gamma_query_cue need the model's CueStream; "
+                                   "set_log_kv_cache and enable_log_kv_training attach it")
+            if self.cue_stream.guard != self.gamma_cue_guard or self.cue_stream.tokens != self.gamma_cue_tokens:
+                raise RuntimeError("the model's CueStream does not match gamma_cue_tokens / gamma_cue_guard")
             streams.append(self.cue_stream)
         if self.gamma_literals:
             if self.literal_stream is None:
                 raise RuntimeError("gamma_literals needs the model's LiteralStream; set_log_kv_cache and "
                                    "enable_log_kv_training attach it")
+            if self.literal_stream.below_cue != self.gamma_query_cue:
+                raise RuntimeError("the model's LiteralStream tier does not match gamma_query_cue")
             streams.append(self.literal_stream)
         stream = streams[0] if len(streams) == 1 else SummedValues(streams)
         return stream, [flushed[-1] + 1 if len(flushed) else 0 for flushed in positions_host]
@@ -4173,7 +4181,8 @@ class LogStructuredKVCache(nn.Module):
         if span_ends is None:
             raise ValueError("AlphaLogKV requires natural span boundaries")
         old_width = self.alpha_count
-        cues = self._gamma_cues(positions_host) if self.gamma_cue_tokens or self.gamma_literals else None
+        cues = (self._gamma_cues(positions_host)
+                if self.gamma_cue_tokens or self.gamma_query_cue or self.gamma_literals else None)
         side = self._route_decision_stream(k, v)
         with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
             # Snapshots: the pool is rewritten below from these sources.
@@ -5242,7 +5251,7 @@ class LogStructuredKVCache(nn.Module):
                          self.alpha_exact_tokens, self.alpha_span_max_tokens,
                          self.beta_novelty, self.beta_adaptive_merge,
                          self.gamma_level0_reinsert, self.gamma_top_merge, self.gamma_level_slack,
-                         self.gamma_cue_tokens, self.gamma_literals, self.gamma_cue_guard,
+                         self.gamma_cue_tokens, self.gamma_literals, self.gamma_cue_guard, self.gamma_query_cue,
                          tuple(map(tuple, kwargs.get("span_ends") or ())))
             if self._replaying_updates:
                 if not replay or key not in updates.flushes:
@@ -7219,7 +7228,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             cache.alpha_exact_tokens, cache.alpha_span_max_tokens, ctx.span_ends,
             cache.beta_novelty, cache.beta_adaptive_merge,
             cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack, cache.gamma_cue_tokens,
-            cache.gamma_literals, cache.gamma_cue_guard,
+            cache.gamma_literals, cache.gamma_cue_guard, cache.gamma_query_cue,
         )
         checkpoint_log = checkpoint_route_replay(cache, signature)
         updates = (_SemanticReplayUpdates() if checkpoint_log is None else checkpoint_log[4]) if cache.semantic_replay_updates else None
@@ -7298,7 +7307,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                              cache.alpha_exact_tokens, cache.alpha_span_max_tokens,
                              cache.beta_novelty, cache.beta_adaptive_merge,
                              cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack,
-                             cache.gamma_cue_tokens, cache.gamma_literals, cache.gamma_cue_guard)
+                             cache.gamma_cue_tokens, cache.gamma_literals, cache.gamma_cue_guard,
+                             cache.gamma_query_cue)
         ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors,
                               *(updates.tensors if updates is not None else ()))
         ctx.has_attention_plans = cache.semantic_clusters
@@ -7330,7 +7340,8 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                                  cache.alpha_exact_tokens, cache.alpha_span_max_tokens,
                                  cache.beta_novelty, cache.beta_adaptive_merge,
                                  cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack,
-                                 cache.gamma_cue_tokens, cache.gamma_literals, cache.gamma_cue_guard):
+                                 cache.gamma_cue_tokens, cache.gamma_literals, cache.gamma_cue_guard,
+                                 cache.gamma_query_cue):
             raise RuntimeError("semantic update configuration changed between forward and backward")
         updates = (_SemanticReplayUpdates(ctx.update_flushes, saved[ctx.update_tensor_offset:])
                    if ctx.update_flushes is not None else None)

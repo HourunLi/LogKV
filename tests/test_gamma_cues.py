@@ -1,5 +1,7 @@
 """Gamma cues: exact-pool selection values spans that repeat rare tokens of the stream's opening."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,7 +10,7 @@ import pytest
 import torch
 
 from litgpt.alpha_log_kv import (CUE_CAP, CUE_FLOOR, CUE_MAX_COUNT, CUE_PRIOR, CUE_TAU, CueStream, add_cue_values,
-                                 cut_spans)
+                                 cut_spans, query_region)
 from litgpt.config import Config
 from litgpt.log_kv_cache import LogStructuredKVCache
 from litgpt.model import GPT
@@ -37,8 +39,8 @@ def test_cue_region_ends_at_the_last_line_end_else_span_end_else_whole_head():
     assert stream.span_values(0, np.arange(4, 8), [4], 7).tolist() == [0.]
     with pytest.raises(ValueError, match="expects position 10"):
         stream.ingest(ids, np.zeros((1, 10)), [12])
-    with pytest.raises(ValueError, match=">= 1"):
-        CueStream(0)
+    with pytest.raises(ValueError, match=">= 0"):
+        CueStream(-1)
 
 
 def _stream_tokens(n=20_000, seed=0):
@@ -346,7 +348,7 @@ def test_cue_guard_is_validated_bound_to_replay_and_must_match_the_stream():
     c = _alpha_cache(8, gamma_cue_guard=True)
     c.cue_stream = CueStream(8)  # unguarded stream, guarded cache
     k = torch.randn(2, 2, 48, 8)
-    with pytest.raises(RuntimeError, match="guard does not match"), torch.no_grad():
+    with pytest.raises(RuntimeError, match="does not match"), torch.no_grad():
         for s in range(0, 48, 16):
             c.add_recent(k[:, :, s:s + 16], k[:, :, s:s + 16], k_raw=k[:, :, s:s + 16],
                          span_ends=[[i % 5 == 4 for i in range(16)]] * 2)
@@ -381,3 +383,178 @@ def test_model_attaches_a_guarded_stream():
     with torch.no_grad():
         model(x, input_pos=torch.arange(24))
     assert len(model.log_kv_cue_stream._rows[0].cues) == 3 and len(model.log_kv_cue_stream._rows[1].cues) == 0
+
+
+def test_query_region_is_the_closing_question_after_the_first_line_end_of_its_tail():
+    line_end = np.zeros(50, dtype=bool)
+    line_end[7] = True
+    ids = list(range(20, 40)) + [7, 41, 42, 43, 7, 44, 45]
+    assert query_region(ids, line_end, tokens=8).tolist() == [41, 42, 43, 7, 44, 45]
+    assert query_region(ids[:20], line_end, tokens=8).tolist() == list(range(32, 40))  # no line end: all
+    assert query_region(ids[:21], line_end, tokens=8).tolist() == list(range(33, 40)) + [7]  # only the last
+    assert query_region([7, 3, 99], line_end).tolist() == [3, 99]  # short prompt; ids past the table
+    assert query_region(np.array([], dtype=np.int64), line_end).tolist() == []
+
+
+def test_query_cues_join_the_opening_once_and_only_for_the_next_request():
+    ids = np.arange(10, 20)[None]
+    kinds = np.array([[0, 1, 0, 2, 0, 0, 0, 0, 0, 0]])
+    stream = CueStream(8)
+    stream.set_queries([[31, 13, 30, 31]])
+    stream.ingest(ids, kinds, [0])
+    assert stream._rows[0].cues.tolist() == [10, 11, 12, 13, 30, 31]  # sorted, each cue once
+    stream.ingest(ids, kinds, [0])  # The next request has no question.
+    assert stream._rows[0].cues.tolist() == [10, 11, 12, 13]
+    stream.set_queries([[30]])
+    stream.set_queries([None])  # None withdraws it.
+    stream.ingest(ids, kinds, [0])
+    assert stream._rows[0].cues.tolist() == [10, 11, 12, 13]
+    # Without an opening region the question is the only cue, from position 0.
+    only = CueStream(0)
+    only.set_queries([[31, 30], None])
+    only.ingest(np.repeat(ids, 2, 0), np.zeros((2, 10)), [0, 0])
+    assert only._rows[0].cues.tolist() == [30, 31] and only._rows[0].region == 0
+    assert len(only._rows[1].cues) == 0
+    assert only.span_values(1, np.arange(4), [4], 10).tolist() == [0.]
+    # The guard drops an opening without a line end but keeps the question.
+    guarded = CueStream(8, guard=True)
+    guarded.set_queries([[30]])
+    guarded.ingest(ids, np.zeros((1, 10)), [0])
+    assert guarded._rows[0].cues.tolist() == [30] and guarded._rows[0].region == 8
+
+
+def test_query_cue_values_spans_that_repeat_the_question():
+    ids, kinds = _stream_tokens()
+    ids[[6, 10_001, 10_004]] = [200, 201, 200]  # Question words at the start and in one span.
+    ids[6_000:6_000 + 8 * CUE_MAX_COUNT:8] = 202  # A question word counted CUE_MAX_COUNT times before.
+    ids[12_002] = 202
+    stream = CueStream(0, guard=True)
+    stream.set_queries([[200, 201, 202, 203]])
+    stream.ingest(ids[None], kinds[None], [0])
+    spans = [np.arange(9998, 10_006), np.arange(0, 8), np.arange(11_998, 12_006), np.arange(12_400, 12_408)]
+    stop = 15_000
+    values = stream.span_values(0, np.concatenate(spans), [8] * 4, stop)
+
+    def weight(token):
+        count = int((ids[:stop] == token).sum())
+        return max(np.log((stop + 1 + CUE_PRIOR) / (count + 1)) - CUE_TAU, 0.) if count <= CUE_MAX_COUNT else 0.
+
+    assert values[0] == pytest.approx(_value(weight(200) + weight(201), 8)) and values[0] > 0
+    # Without an opening region, the stream's first tokens are evidence too.
+    assert values[1] == pytest.approx(_value(weight(200), 8)) and values[1] > 0
+    assert int((ids[:stop] == 202).sum()) == CUE_MAX_COUNT + 1 and values[2] == 0
+    assert values[3] == 0
+
+
+def test_query_cue_values_do_not_depend_on_how_input_is_chunked():
+    ids, kinds = _stream_tokens(seed=3)
+    question = [ids[10_000], ids[10_002], 777]
+    whole, chunked = CueStream(16, guard=True), CueStream(16, guard=True)
+    whole.set_queries([question, None])
+    whole.ingest(np.stack([ids, ids[::-1]]), np.stack([kinds, kinds[::-1]]), [0, 0])
+    chunked.set_queries([question, None])
+    for a, b in ((0, 1), (1, 9), (9, 17), (17, 1200), (1200, len(ids))):
+        chunked.ingest(np.stack([ids[a:b], ids[::-1][a:b]]), np.stack([kinds[a:b], kinds[::-1][a:b]]), [a, a])
+    positions, lengths = np.arange(9960, 10_060), [4] * 25
+    for row in (0, 1):
+        np.testing.assert_array_equal(whole.span_values(row, positions, lengths, 12_000),
+                                      chunked.span_values(row, positions, lengths, 12_000))
+    assert whole.span_values(0, positions, lengths, 12_000).max() > 0
+
+
+def test_query_cues_keep_the_span_that_repeats_the_question_in_the_exact_pool():
+    torch.manual_seed(7)
+    n = 4000
+    rng = np.random.default_rng(7)
+    ids = 5_000 + rng.permutation(n)
+    ends = np.zeros(n, dtype=bool)
+    ends[rng.choice(np.arange(8, n), 480, replace=False)] = True
+    needle = list(range(3000, 3006))
+    ids[needle] = [20, 12, 21, 14, 22, 15]
+    ends[needle[0] - 1] = ends[needle[-1]] = True
+    ends[needle[0]:needle[-1]] = False
+    k, v = torch.randn(2, 2, n, 8), torch.randn(2, 2, n, 8)
+    kept = {}
+    for question in (None, [12, 14, 15, 99]):
+        c = _alpha_cache(0, gamma_query_cue=True, gamma_cue_guard=True)
+        c.cue_stream = CueStream(0, guard=True)
+        c.cue_stream.set_queries([question, question])
+        c.cue_stream.ingest(np.stack([ids, ids]), np.zeros((2, n)), [0, 0])
+        with torch.no_grad():
+            for s in range(0, n, 16):
+                c.add_recent(k[:, :, s:s + 16], v[:, :, s:s + 16], k_raw=k[:, :, s:s + 16],
+                             span_ends=[ends[s:s + 16].tolist()] * 2)
+        kept[question is not None] = [set(row) for row in c._alpha_positions]
+    assert all(set(needle) <= row for row in kept[True])
+    assert not any(set(needle) <= row for row in kept[False])
+
+
+def test_query_cue_is_validated_bound_to_replay_and_must_match_the_stream():
+    with pytest.raises(ValueError, match="requires alpha_exact_tokens"):
+        _alpha_cache(0, gamma_query_cue=True, alpha_exact_tokens=0, beta_novelty=False, beta_adaptive_merge=False)
+    _alpha_cache(0, gamma_query_cue=True, gamma_cue_guard=True)  # The question alone is enough for the guard.
+    k = torch.randn(2, 2, 48, 8)
+    for stream, message in ((None, "CueStream"), (CueStream(8), "does not match")):
+        c = _alpha_cache(0, gamma_query_cue=True)
+        c.cue_stream = stream
+        with pytest.raises(RuntimeError, match=message), torch.no_grad():
+            for s in range(0, 48, 16):
+                c.add_recent(k[:, :, s:s + 16], k[:, :, s:s + 16], k_raw=k[:, :, s:s + 16],
+                             span_ends=[[i % 5 == 4 for i in range(16)]] * 2)
+    c = _alpha_cache(0, gamma_query_cue=True)
+    c.cue_stream = CueStream(0)
+    c.cue_stream.set_queries([[3, 4], [5]])
+    ids = np.arange(100)[None].repeat(2, 0)
+    c.cue_stream.ingest(ids, np.zeros_like(ids), [0, 0])
+    from litgpt.log_kv_cache import LogKVStreamTrainingAttention
+    q, k, v = [torch.randn(2, 2, 48, 8, requires_grad=True) for _ in range(3)]
+    ends = [[i % 5 == 4 for i in range(48)]] * 2
+    y = LogKVStreamTrainingAttention.apply(q, k, v, c, .3, 16, 0., k, ends)
+    c.gamma_query_cue = False
+    with pytest.raises(RuntimeError, match="configuration changed"):
+        y.sum().backward()
+
+
+def test_model_hands_each_request_its_question():
+    torch.manual_seed(5)
+    config = Config(block_size=64, n_layer=2, n_embd=32, n_head=4, n_query_groups=2,
+                    vocab_size=41, padding_multiple=1, rotary_percentage=1.)
+    model = GPT(config).eval()
+    model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7])
+    with pytest.raises(RuntimeError, match="gamma_query_cue"):
+        model.set_gamma_queries([[30]])
+    kwargs = dict(batch_size=2, B=8, recent_size=8, prefill_block=8, second_order_scale=0., semantic_clusters=True,
+                  cluster_k_max=4, semantic_flush_granularity=8, semantic_anchor_mode="mid",
+                  semantic_replay_updates=True, alpha_exact_tokens=8, alpha_span_max_tokens=4)
+    model.set_log_kv_cache(gamma_cue_guard=True, gamma_query_cue=True, **kwargs)
+    stream = model.log_kv_cue_stream
+    assert stream.tokens == 0 and stream.guard
+    assert all(block.attn.kv_cache.cue_stream is stream for block in model.transformer.h)
+    model.set_gamma_queries([[31, 30], None])
+    x = torch.randint(8, 41, (2, 24))
+    with torch.no_grad():
+        model(x, input_pos=torch.arange(24))
+    assert stream._rows[0].cues.tolist() == [30, 31] and len(stream._rows[1].cues) == 0
+    model.reset_log_kv_cache()
+    with torch.no_grad():
+        model(x[:, :9], input_pos=torch.arange(9))  # The next request has no question.
+    assert len(stream._rows[0].cues) == 0
+    model.set_log_kv_cache(gamma_cue_tokens=6, **kwargs)
+    with pytest.raises(RuntimeError, match="gamma_query_cue"):
+        model.set_gamma_queries([[30]])
+
+
+def test_eval_hands_each_prompt_question_to_the_model():
+    # Exercise the real eval method without importing GPU/HF evaluation dependencies.
+    source = Path(__file__).resolve().parents[1] / "eval.py"
+    cls = next(n for n in ast.parse(source.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "LogKVLM")
+    cls.bases, cls.decorator_list = [], []
+    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_set_gamma_query"]
+    scope = {}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), scope)
+    lm, handed = scope["LogKVLM"](), []
+    lm.model = SimpleNamespace(set_gamma_queries=handed.append)
+    lm._query_line_ends = np.zeros(200, dtype=bool)
+    lm._query_line_ends[7] = True
+    lm._set_gamma_query(torch.tensor(list(range(100, 190)) + [7, 11, 12, 13]))
+    assert [q.tolist() for q in handed[0]] == [[11, 12, 13]]
