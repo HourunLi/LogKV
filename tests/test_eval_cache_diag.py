@@ -16,7 +16,7 @@ def test_cache_failure_is_visible_and_original_behavior_is_preserved():
     node = next(n for n in ast.parse(source.read_text()).body
                 if isinstance(n, ast.FunctionDef) and n.name == "_trace_hf_cache_resolution")
     scope = dict(contextlib=contextlib, os=os, json=json, Path=Path,
-                 __file__=str(source), _global_rank=lambda: 7)
+                 __file__=str(source), _global_rank=lambda: 7, _eval_verbose=lambda: False)
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
     result = object()
     failure = PermissionError("cannot enumerate cached configurations")
@@ -56,7 +56,7 @@ def test_cache_failure_is_visible_and_original_behavior_is_preserved():
             raise AssertionError("diagnostic swallowed the original exception")
         assert Factory.get_module is original
     events = [json.loads(line.removeprefix("[hf-cache] ")) for line in output.getvalue().splitlines()]
-    assert [event["event"] for event in events] == ["runtime", "runtime", "local_cache_failure"]
+    assert [event["event"] for event in events] == ["local_cache_failure"]
     assert events[-1]["rank"] == 7
     assert events[-1]["effective_cache_dir"] == "/explicit/cache"
     assert "PermissionError: cannot enumerate cached configurations" in events[-1]["traceback"]

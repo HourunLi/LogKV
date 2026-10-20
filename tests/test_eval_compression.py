@@ -32,15 +32,15 @@ def wrapper_class():
     source = Path(__file__).resolve().parents[1] / "eval.py"
     cls = next(node for node in ast.parse(source.read_text()).body
                if isinstance(node, ast.ClassDef) and node.name == "LogKVLM")
-    names = {"_score_tokens", "generate_until", "loglikelihood_rolling", "_reset_eval_cache"}
+    names = {"_score_tokens", "generate_until", "loglikelihood_rolling", "_reset_eval_cache", "_warn_truncation"}
     cls.bases, cls.decorator_list = [], []
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
     scope = dict(
         torch=torch, time=time, litgpt_generate=generate,
         cache_compression_snapshot=cache_compression_snapshot,
-        tqdm=SimpleNamespace(tqdm=lambda items, **kwargs: items),
+        _eval_progress=lambda items, desc: items, _eval_verbose=lambda: False,
         _global_rank=lambda: 0, _world_size=lambda: 1, _local_rank=lambda: 0,
-        _rank_label=lambda: "CPU", _tqdm_position=lambda: 0,
+        _rank_label=lambda: "CPU",
         _request_sample_id=lambda req, **kwargs: kwargs["global_request_index"],
     )
     exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), scope)
@@ -66,6 +66,7 @@ def make_lm(wrapper_class, backend, block_size=32):
     lm._set_eval_cache = lm._reset_eval_cache
     lm.all_gather_results = lambda items, tag: items
     lm.compression_metrics, lm.ppl_metrics, lm.gen_metrics = [], [], []
+    lm._truncation_counts = {}
     lm.max_gen_toks = 3
     return lm
 
