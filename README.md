@@ -59,7 +59,17 @@ DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihou
   bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 
-多卡评测各 rank 汇合时每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印仍未到达的 rank，
+评测默认只由全局 rank 0 输出阶段信息与低频进度（每 30s，另含起止），进度标明是本 rank 的分片；
+全部 rank 汇总完成后再报告总条数，最终指标和结果文件不变。关闭 lm-eval 内部进度条及 INFO 日志，
+截断警告保留每 rank 首次详情和本轮次数汇总，其它异常诊断保留。排查多卡问题时恢复详细输出：
+
+```bash
+LOGKV_EVAL_VERBOSE=1 bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
+```
+
+该环境变量也适用于 `majob.sh` 的评测阶段和直接运行 `eval.py`。
+多卡评测各 rank 汇合时仍每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印缺席 rank，
+保留每个等待进程的低频心跳，避免 ModelArts 将等待误判为卡死。
 超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
 
 ### KV 槽位压缩率

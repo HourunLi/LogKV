@@ -24,7 +24,7 @@ import torch.distributed as dist
 def _load_collectives():
     source = Path(__file__).resolve().parents[1] / "eval.py"
     tree = ast.parse(source.read_text())
-    names = {"_dist_ready", "_bcast_device", "_broadcast_obj", "_env_int", "_wait_all_ranks"}
+    names = {"_dist_ready", "_bcast_device", "_broadcast_obj", "_env_int", "_wait_all_ranks", "_eval_verbose", "_eval_print"}
     # all_gather_results meets the other ranks through _wait_all_ranks and its sequence counter.
     nodes = [node for node in tree.body if (isinstance(node, ast.FunctionDef) and node.name in names)
              or (isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["_SYNC_SEQ"])]
@@ -33,6 +33,7 @@ def _load_collectives():
                       and node.name == "all_gather_results"))
     scope = dict(torch=torch, dist=dist, time=time, timedelta=timedelta, Any=Any,
                  os=os, _world_size=dist.get_world_size, _global_rank=dist.get_rank,
+                 _is_main=lambda: dist.get_rank() == 0,
                  _rank_label=lambda: f"rank {dist.get_rank()}")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     return scope
@@ -49,7 +50,7 @@ def _worker():
     scope = _load_collectives()
     gather, broadcast = scope["all_gather_results"], scope["_broadcast_obj"]
     local = [(1.25, False)]
-    assert gather(SimpleNamespace(process_group=None), local) is local
+    assert gather(SimpleNamespace(process_group=None, _truncation_counts={}), local) is local
     assert broadcast(local) is local
     dist.init_process_group("gloo", timeout=timedelta(seconds=30))
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -72,7 +73,7 @@ def _worker():
                 for case_id, expected in enumerate(cases):
                     if group is eval_group and repeat == 0 and case_id == 0 and rank == 0:
                         time.sleep(0.2)
-                    actual = gather(SimpleNamespace(process_group=group), expected[rank::world],
+                    actual = gather(SimpleNamespace(process_group=group, _truncation_counts={}), expected[rank::world],
                                     tag=f"{group_name}/{repeat}/{case_id}")
                     assert actual == expected, (rank, group_name, case_id, actual)
                     for got, want in zip(actual, expected):

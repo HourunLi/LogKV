@@ -22,6 +22,7 @@ import re
 import csv
 import glob
 import json
+import logging
 import time
 import inspect
 import contextlib
@@ -76,10 +77,62 @@ def _rank_label() -> str:
     return f"GlobalRank {_global_rank()}/{_world_size()} (local {_local_rank()})"
 
 
-def _tqdm_position() -> int:
-    # Use global rank so aggregated multi-node stdout gets one tqdm row per
-    # process instead of collapsing every node onto local ranks 0..7.
-    return _global_rank()
+def _eval_verbose() -> bool:
+    return os.environ.get("LOGKV_EVAL_VERBOSE", "0") == "1"
+
+
+def _eval_print(*args, **kwargs) -> None:
+    if _is_main() or _eval_verbose():
+        print(*args, **kwargs)
+
+
+def _eval_progress(items, desc: str):
+    """Report rank 0's shard at most every 30s; never synchronize model calls."""
+    if _eval_verbose():
+        yield from tqdm.tqdm(items, desc=f"{desc} {_rank_label()}", position=_global_rank())
+        return
+    if not _is_main():
+        yield from items
+        return
+    total = len(items)
+    label = f"{desc} [{_rank_label()} 分片]"
+    started = last_report = time.perf_counter()
+    print(f"⏳ {label}: 0/{total}", flush=True)
+    for completed, item in enumerate(items, 1):
+        yield item
+        now = time.perf_counter()
+        if completed == total or now - last_report >= 30:
+            print(f"⏳ {label}: {completed}/{total}，已用 {now - started:.0f}s", flush=True)
+            last_report = now
+
+
+@contextlib.contextmanager
+def _harness_logging():
+    """Silence harness progress/INFO only during evaluation, preserving warnings and errors."""
+    if _eval_verbose():
+        yield
+        return
+    names = ("lm_eval", "datasets", "huggingface_hub", "transformers")
+    loggers = {logging.getLogger(name) for name in names}
+    loggers.update(logger for name, logger in logging.Logger.manager.loggerDict.copy().items()
+                   if isinstance(logger, logging.Logger) and name.startswith(tuple(n + "." for n in names)))
+    levels = {logger: logger.level for logger in loggers}
+    original_init = tqdm.tqdm.__init__
+
+    def quiet_init(self, *args, **kwargs):
+        kwargs["disable"] = True
+        original_init(self, *args, **kwargs)
+
+    try:
+        for logger in loggers:
+            logger.setLevel(max(logger.getEffectiveLevel(), logging.WARNING))
+        # lm-eval imports tqdm in multiple modules, including locally during bootstrap.
+        tqdm.tqdm.__init__ = quiet_init
+        yield
+    finally:
+        tqdm.tqdm.__init__ = original_init
+        for logger, level in levels.items():
+            logger.setLevel(level)
 
 
 def _request_sample_id(req: Any, *, global_request_index: int, rank: int) -> str:
@@ -142,6 +195,8 @@ def _check_expected_world_size(stage: str) -> None:
 
 
 def _rendezvous_snapshot(stage: str) -> None:
+    if not _eval_verbose():
+        return
     import socket
 
     ts = datetime.now().strftime("%H:%M:%S")
@@ -222,16 +277,11 @@ def _wait_all_ranks(stage: str) -> float:
 
 
 def _hb(stage: str) -> None:
-    """无条件心跳打印（所有 rank，不受 is_main 限制），排查多机卡死用。
-
-    标记 dist.init_process_group / 模型加载完成这类一次性里程碑（真正的逐条
-    计算进度由 loglikelihood/generate_until 里每个 rank 各自的 tqdm 负责，
-    不需要在这里重复打印）。带 hostname，方便从日志里按 rank 分组核对。
-    """
+    """阶段里程碑默认只打印主进程；详细模式带上所有 rank。"""
     import socket
     host = socket.gethostname()
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"💓 [{ts}][{_rank_label()}][{host}] {stage}", flush=True)
+    _eval_print(f"💓 [{ts}][{_rank_label()}][{host}] {stage}", flush=True)
 
 
 class SafeJSONEncoder(json.JSONEncoder):
@@ -302,9 +352,6 @@ def extract_results_to_csv(results: dict, benchmark: str, output_path: Path) -> 
     except Exception as e:
         print(f"❌ 保存 CSV 失败: {e}")
 
-# if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
-print("设置HF_DATASETS_CACHE环境变量...")
-
 BASE = '/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache'
 os.environ['HF_HOME'] = BASE
 os.environ['HF_DATASETS_CACHE'] = f'{BASE}/hf_cache'
@@ -323,15 +370,16 @@ os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 
 # 每个 rank 各自独立加载一遍数据集，HF datasets 的 "Found the latest cached
 # dataset configuration ..." 日志和内部 tqdm 进度条会被重复打印 rank 份，
-# 跟评测本身的计算进度混在一起。这里关掉，只留下面每个 rank 自己的计算进度。
+# 跟评测本身的计算进度混在一起。这里关掉，计算进度由 _eval_progress 报告。
 os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
 import datasets.config as _hf_datasets_config
 import huggingface_hub.constants as _hf_hub_constants
 
-print(f"[{_rank_label()}] 环境变量 datasets: {os.environ.get('HF_DATASETS_CACHE')}", flush=True)
-print(f"[{_rank_label()}] 库实际使用 datasets: {_hf_datasets_config.HF_DATASETS_CACHE}", flush=True)
-print(f"[{_rank_label()}] 环境变量 hub: {os.environ.get('HF_HUB_CACHE')}", flush=True)
-print(f"[{_rank_label()}] 库实际使用 hub: {_hf_hub_constants.HF_HUB_CACHE}", flush=True)
+if _eval_verbose():
+    print(f"[{_rank_label()}] 环境变量 datasets: {os.environ.get('HF_DATASETS_CACHE')}", flush=True)
+    print(f"[{_rank_label()}] 库实际使用 datasets: {_hf_datasets_config.HF_DATASETS_CACHE}", flush=True)
+    print(f"[{_rank_label()}] 环境变量 hub: {os.environ.get('HF_HUB_CACHE')}", flush=True)
+    print(f"[{_rank_label()}] 库实际使用 hub: {_hf_hub_constants.HF_HUB_CACHE}", flush=True)
 
 try:
     import datasets as _hf_datasets
@@ -510,6 +558,8 @@ def _trace_hf_cache_resolution():
     identity = dict(rank=_global_rank(), host=socket.gethostname(), pid=os.getpid(), python=sys.executable)
 
     def emit(event, **details):
+        if event == "runtime" and not _eval_verbose():
+            return
         # One line per event keeps rank and exception together in aggregated logs.
         print("[hf-cache] " + json.dumps(dict(event=event, **identity, **details),
                                         ensure_ascii=False, default=str), file=sys.stderr, flush=True)
@@ -642,7 +692,7 @@ def _parse_csv_ints(s: str) -> list[int]:
 
 def _filter_config_dict(d: dict[str, Any]) -> dict[str, Any]:
     dropped = sorted(k for k in d if k not in _CONFIG_FIELDS)
-    if dropped:
+    if dropped and (_is_main() or _eval_verbose()):
         print(f"[eval] 过滤掉非 Config 字段: {dropped}")
     return {k: v for k, v in d.items() if k in _CONFIG_FIELDS}
 
@@ -864,6 +914,7 @@ class LogKVLM(LM):
             raise ValueError("swa_window_size must be >= 0 and cannot be combined with dense mode")
         self.swa_window_size = swa_window_size
         self.cache_budget = {}
+        self._truncation_counts = {}
         if swa_window_size:
             config_overrides = {**(config_overrides or {}), "sliding_window_size": swa_window_size,
                                 "sliding_window_indices": None}
@@ -1102,15 +1153,25 @@ class LogKVLM(LM):
     # ==========================================
     # 🌟 分布式结果收集
     # ==========================================
+    def _warn_truncation(self, kind: str, kept: int) -> None:
+        count = self._truncation_counts.get(kind, 0) + 1
+        self._truncation_counts[kind] = count
+        if count == 1 or _eval_verbose():
+            print(f"⚠️ [{_rank_label()}] {kind}: 触发截断，保留 context/prompt 长度 {kept}；"
+                  "本轮截断总数将在汇总时报告", flush=True)
+
     def all_gather_results(self, local_result_list: list, tag: str = ""):
+        for kind, count in self._truncation_counts.items():
+            print(f"⚠️ [{_rank_label()}] {kind}: 本 rank 本轮共截断 {count} 次", flush=True)
+        self._truncation_counts.clear()
         if not _dist_ready():
             return local_result_list
 
         # 结果只有 float/bool/str，不必经 GPU/NCCL 序列化与通信。
         # 汇合等待长上下文的负载差异；等待期间的心跳与超时见 _wait_all_ranks。
-        print(f"⏳ [{_rank_label()}] {tag} 本 rank {len(local_result_list)} 条已完成，等待其它 rank", flush=True)
+        _eval_print(f"⏳ [{_rank_label()}] {tag} 本 rank {len(local_result_list)} 条已完成，等待其它 rank", flush=True)
         wait_s = _wait_all_ranks(f"{tag} 汇总")
-        print(
+        _eval_print(
             f"🤝 [{_rank_label()}] {tag} 全部 rank 已就绪，等待用时 {wait_s:.1f}s；开始 Gloo 结果汇总",
             flush=True,
         )
@@ -1126,7 +1187,7 @@ class LogKVLM(LM):
             for rank_id in range(dp_size):
                 if i < len(all_results_list[rank_id]):
                     final_results.append(all_results_list[rank_id][i])
-        print(
+        _eval_print(
             f"✅ [{_rank_label()}] {tag} Gloo 结果汇总完成，共 {len(final_results)} 条，"
             f"用时 {time.perf_counter() - t0:.1f}s",
             flush=True,
@@ -1147,8 +1208,6 @@ class LogKVLM(LM):
         the continuation is left-truncated to its last ``max_len - 1`` tokens —
         scoring is then partial but the forward stays in bounds.
         """
-        rank_label = _rank_label()
-
         # 🌟 安全阀：如果 题干 + 选项 > max_seq_length，必须切掉题干最前面的部分
         max_len = self.model.max_seq_length
         if len(ctx_enc) + len(cont_enc) > max_len:
@@ -1158,7 +1217,7 @@ class LogKVLM(LM):
                 ctx_enc = []
             else:
                 ctx_enc = ctx_enc[-keep_ctx_len:]
-            print(f"⚠️ [{rank_label}] 警告: 触发截断，剩余 context 长度: {len(ctx_enc)}")
+            self._warn_truncation(request_type, len(ctx_enc))
 
         if len(ctx_enc) == 0:
             ctx_enc = [self.tokenizer.bos_id]
@@ -1227,9 +1286,7 @@ class LogKVLM(LM):
         local_requests = requests[dp_rank::dp_size]
         results = []
 
-        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
-        desc = f"loglikelihood GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
-        for req in tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position()):
+        for req in _eval_progress(local_requests, "loglikelihood"):
             context, continuation = req.args[0], req.args[1]
 
             ctx_enc = self.tokenizer.encode(context).tolist()
@@ -1253,9 +1310,7 @@ class LogKVLM(LM):
         local_requests = requests[dp_rank::dp_size]
         results = []
 
-        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
-        desc = f"generate_until GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
-        for local_i, req in enumerate(tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position())):
+        for local_i, req in enumerate(_eval_progress(local_requests, "generate_until")):
             global_request_index = local_i * dp_size + dp_rank
             sample_id = _request_sample_id(req, global_request_index=global_request_index, rank=dp_rank)
             prompt = req.args[0]
@@ -1282,7 +1337,7 @@ class LogKVLM(LM):
                 keep_prompt_len = max_len - max_new_tokens
                 prompt_token_offset = int(prompt_tensor.size(0) - keep_prompt_len)
                 prompt_tensor = prompt_tensor[-keep_prompt_len:]
-                print(f"⚠️ [{_rank_label()}] 警告: 触发生成截断，Prompt 被切至: {keep_prompt_len}")
+                self._warn_truncation("generate_until", keep_prompt_len)
 
             total_max_len = prompt_tensor.size(0) + max_new_tokens
             prompt_len = prompt_tensor.size(0)
@@ -1348,9 +1403,7 @@ class LogKVLM(LM):
         results = []
 
         max_len = self.model.max_seq_length
-        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
-        desc = f"loglikelihood_rolling GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
-        for req in tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position()):
+        for req in _eval_progress(local_requests, "loglikelihood_rolling"):
             (text,) = req.args
             tokens = self.tokenizer.encode(text, bos=False).tolist()
 
@@ -1541,7 +1594,7 @@ def main(
             )
         _valid = set(inspect.signature(main).parameters)
         for _k in _yaml:
-            if _k != "config" and _k not in _valid:
+            if _k != "config" and _k not in _valid and (_is_main() or _eval_verbose()):
                 print(f"[eval] WARNING: unknown YAML key ignored: {_k}")
 
     def _o(name, current):
@@ -1768,6 +1821,7 @@ def main(
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
 
         with (
+            _harness_logging(),
             _trace_hf_cache_resolution(),
             diag_mode(
                 log_kv_diag_mode,
@@ -1984,7 +2038,7 @@ def main(
             if _dist_ready():
                 if eval_done:
                     wait_s = _wait_all_ranks("收尾同步")
-                    print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {wait_s:.1f}s", flush=True)
+                    _eval_print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {wait_s:.1f}s", flush=True)
                 else:
                     print(f"⚠️ [{_rank_label()}] 评测未正常结束，跳过收尾 barrier", flush=True)
         finally:

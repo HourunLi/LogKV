@@ -36,7 +36,7 @@ def _offline_cache(root):
     nodes = [node for node in ast.parse(source.read_text()).body if isinstance(node, ast.FunctionDef)
              and node.name in {"_walk_cache_path", "_trace_hf_cache_resolution"}]
     scope = dict(contextlib=contextlib, os=os, json=json, Path=Path,
-                 __file__=str(source), _global_rank=lambda: 0)
+                 __file__=str(source), _global_rank=lambda: 0, _eval_verbose=lambda: False)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     # Runtime reporting also imports lm_eval; its task implementation is not needed to test the loader.
     lm_eval = ModuleType("lm_eval")
