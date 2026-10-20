@@ -220,6 +220,8 @@ emit("LOG_KV_GAMMA_LEVEL_SLACK", int(value_or("log_kv_gamma_level_slack", 2)))
 emit("LOG_KV_GAMMA_CUE_TOKENS", int(value_or("log_kv_gamma_cue_tokens", 64)))
 # Gamma literals default off; YAML true values first occurrences of random-looking literals.
 emit("LOG_KV_GAMMA_LITERALS", str(bool(value_or("log_kv_gamma_literals", False))).lower())
+# Gamma cue guard default off; YAML true keeps cues from ordinary openings and topic words.
+emit("LOG_KV_GAMMA_CUE_GUARD", str(bool(value_or("log_kv_gamma_cue_guard", False))).lower())
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
 emit("LOG_KV_CLUSTER_LAMBDA_REL", value_or("log_kv_cluster_lambda_rel", 1.0))
 emit("LOG_KV_SEG_ETA", value_or("log_kv_seg_eta", 1.0))
@@ -358,6 +360,7 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
         --log_kv_gamma_level_slack "${LOG_KV_GAMMA_LEVEL_SLACK}"
         --log_kv_gamma_cue_tokens "${LOG_KV_GAMMA_CUE_TOKENS}"
         --log_kv_gamma_literals "${LOG_KV_GAMMA_LITERALS}"
+        --log_kv_gamma_cue_guard "${LOG_KV_GAMMA_CUE_GUARD}"
         --log_kv_cluster_k_max "${LOG_KV_CLUSTER_K_MAX}"
         --log_kv_cluster_lambda_rel "${LOG_KV_CLUSTER_LAMBDA_REL}"
         --log_kv_seg_eta "${LOG_KV_SEG_ETA}"

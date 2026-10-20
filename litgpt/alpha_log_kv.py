@@ -16,6 +16,11 @@ CUE_TAU = math.log(100.)
 CUE_FLOOR = 4.
 CUE_CAP = 30.
 CUE_PRIOR = 2048
+# Gamma cue guard (optional): the opening region must end at a line end, and a
+# cue counted more than CUE_MAX_COUNT times before the decision gives no
+# evidence. A word that points at needles recurs about as often as there are
+# needles; the topic words of an ordinary opening recur dozens of times.
+CUE_MAX_COUNT = 16
 # Gamma literals: a literal's symbols are its ASCII digits and the runs of at
 # most 3 letters between two digits (hex and code fragments). Their adaptive
 # order-0 code length measures how random they are: a random 7-digit string
@@ -107,7 +112,7 @@ class _CueRow:
         self.chunks = []
         self.weights = {}  # stop -> per-cue weight; every layer archives the same blocks
 
-    def add(self, ids, ends, tokens):
+    def add(self, ids, ends, tokens, guard=False):
         start, self.seen = self.seen, self.seen + len(ids)
         if self.cues is not None:
             self.record(ids, start)
@@ -120,8 +125,12 @@ class _CueRow:
             return
         head = np.asarray(self.head_ids, dtype=np.int64)
         kinds = np.asarray(self.head_ends, dtype=np.int64)
-        # The region ends at the last line end in the head, else the last span end.
+        # The region ends at the last line end in the head, else the last span end;
+        # with the guard, a head without a line end has no cues.
         closed = np.flatnonzero(kinds == 2)
+        if not len(closed) and guard:
+            self.region, self.cues = tokens, np.empty(0, dtype=np.int64)
+            return
         if not len(closed):
             closed = np.flatnonzero(kinds)
         self.region = int(closed[-1]) + 1 if len(closed) else tokens
@@ -130,7 +139,7 @@ class _CueRow:
         self.record(ids[take:], tokens)
 
     def record(self, ids, start):
-        if not len(ids):
+        if not len(ids) or not len(self.cues):
             return
         slot = np.minimum(np.searchsorted(self.cues, ids), len(self.cues) - 1)
         hit = self.cues[slot] == ids
@@ -154,12 +163,17 @@ class CueStream:
     (the cache passes the end of the block it archives), so layer-major
     prefill, any prefill block and token-by-token decode select alike. State
     grows with the cue occurrences only.
+
+    With ``guard``, a head without a line end has no cues (an instruction
+    ends its line; an ordinary opening of collapsed text does not), and a cue
+    counted more than CUE_MAX_COUNT times gives no evidence.
     """
 
-    def __init__(self, tokens: int) -> None:
+    def __init__(self, tokens: int, guard: bool = False) -> None:
         if tokens < 1:
             raise ValueError("cue tokens must be >= 1")
         self.tokens = int(tokens)
+        self.guard = bool(guard)
         self._rows: list[_CueRow] = []
 
     def ingest(self, ids, ends, starts) -> None:
@@ -176,7 +190,7 @@ class CueStream:
                 self._rows[b] = _CueRow()
             elif start != self._rows[b].seen:
                 raise ValueError(f"cue stream row {b} expects position {self._rows[b].seen}, got {start}")
-            self._rows[b].add(row_ids, row_ends, self.tokens)
+            self._rows[b].add(row_ids, row_ends, self.tokens, self.guard)
 
     def span_values(self, row, positions, lengths, stop):
         """``max(exp(evidence) - exp(CUE_FLOOR), 0) / length`` per span, as of ``stop``.
@@ -185,12 +199,13 @@ class CueStream:
         region, how many nats rarer than 1% of the first ``stop`` positions (plus
         CUE_PRIOR) each one is. The floor leaves spans with weak evidence at
         their K/V score. Before ``stop`` covers the opening region, every value
-        is 0: the region must not depend on tokens after ``stop``.
+        is 0: the region must not depend on tokens after ``stop``. With the
+        guard, a cue counted more than CUE_MAX_COUNT times weighs 0.
         """
         lengths = np.asarray(lengths, dtype=np.int64)
         values = np.zeros(len(lengths))
         state = self._rows[row] if row < len(self._rows) else None
-        if state is None or state.cues is None or stop < self.tokens or not len(lengths):
+        if state is None or state.cues is None or not len(state.cues) or stop < self.tokens or not len(lengths):
             return values
         pos, slot = state.occurrences()
         if not len(pos):
@@ -200,6 +215,8 @@ class CueStream:
         if weight is None:
             counts = np.bincount(slot[:np.searchsorted(pos, stop)], minlength=n)
             weight = np.maximum(np.log((stop + 1 + CUE_PRIOR) / (counts + 1)) - CUE_TAU, 0.)
+            if self.guard:
+                weight[counts > CUE_MAX_COUNT] = 0.
             if stop <= state.seen:  # Later tokens can no longer change these counts.
                 state.weights[stop] = weight
         positions = np.asarray(positions, dtype=np.int64)
