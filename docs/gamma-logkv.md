@@ -2,8 +2,8 @@
 
 Gamma 建立在 attach + Alpha + Beta 之上（见 [Alpha](alpha-logkv.md)、[Beta](beta-logkv.md)），
 不改变路由。前三个开关只改变条目在层级（梯子）里怎样合并；后两个开关在精确池选择片段时加分：
-重复了流开头区域里稀有 token 的片段（cue，第 4 节），以及含随机字面量首次出现的片段（第 5 节）。
-五个开关：
+重复了流开头区域里稀有 token 的片段（cue，第 4 节，可加保护），以及含随机字面量首次出现的片段（第 5 节）。
+六个开关：
 
 | 参数（省略 `log_kv_` 前缀） | Cache API 默认 | 入口 / `arc_semantic_fast.yaml` | 作用 |
 |---|---|---|---|
@@ -11,6 +11,7 @@ Gamma 建立在 attach + Alpha + Beta 之上（见 [Alpha](alpha-logkv.md)、[Be
 | `gamma_top_merge` | `fold` | `lightest` | 顶层饱和时合并质量和最小的相邻对 |
 | `gamma_level_slack` | `2` | `2` | 余量层数；小于 2 时用同样字节换更宽的 B′ |
 | `gamma_cue_tokens` | `0` | `64` | 开头区域长度；精确池按 cue 证据给片段加分，`0` 关闭 |
+| `gamma_cue_guard` | `false` | `false` | cue 保护：开头区域须以换行结束，出现超过 16 次的 cue 不计证据 |
 | `gamma_literals` | `false` | `false` | 精确池给含随机字面量（数字串、编码）首次出现的片段加分 |
 
 Gamma 之前的实验 YAML 显式写回旧行为（`false` / `fold` / `2` / `0`）；早于 cue 的四个 Gamma
@@ -152,7 +153,36 @@ U(0.3, 1.0) 代替。统计针所在片段在末尾是否仍完整地留在精�
   而开头指令不含针词的 `_paraphrase` 为 0.49；`_preamble` 居中（0.35）。代理中 P=1024 时 cue 价值高于 2
   （K/V 分数的上限）的片段占末尾精确池的比例：qend 99%、preamble 65%、paraphrase 2%：qend 的开头区域
   是第一篇文章的开头，片段重复其中的话题词就得到远超 K/V 分数的价值，K/V 分数本可留住的 uuid 进不了池。
-  数字针（single_2 各变体约 0.2）不受 P 影响，K/V 分数本来就不偏向它们。
+  数字针（single_2 各变体约 0.2）不受 P 影响，K/V 分数本来就不偏向它们。下面的保护针对这一条。
+
+**保护（`gamma_cue_guard`，可选）。** 两条规则，只作用于 cue：
+
+- 开头区域必须截在换行处：前 M 个 token 里没有换行时，这一行没有 cue（指令自成一行；lm-eval 把正文
+  空白压成单个空格，正文开头没有换行）。
+- 在归档块末尾之前出现超过 16 次（`CUE_MAX_COUNT`）的 cue 不计证据：指向针的词重复次数约等于针的根数，
+  普通开头的话题词与常用词重复几十次。qend 的例子里，第一篇文章开头的 less、hard、things、more 等词各出现
+  12–80 次，每个只有 1–2.5 nats，但几个凑在一个片段里就超过 4 nats 的下限。
+
+代理（同上，开头为第一篇文章）中，P=1024 时 cue 价值高于 2 的片段占末尾精确池的比例：
+
+| | 原模板 | qend | preamble | paraphrase |
+|---|---|---|---|---|
+| 不加保护 | 0.07 | 0.99 | 0.65 | 0.02 |
+| 加保护 | 0.04 | 0 | 0 | 0 |
+
+原模板下 1 个 number、1 个 uuid（各 40）、4 个与 8 个 number（各 20）的针在 P=256 时仍全部留住。上限取 8 时
+8 针只留住 3/20；只限制 cue 占精确池的比例（如 1/4）在 P=256 时装不下 4 根针。preamble 的指令在第 64 个
+token 之后，加保护后这一变体不用 cue，表现回到不开 cue 的水平。保护默认关闭；只改变精确池选择，可以只评测：
+[`eval_gamma_cue_guard.yaml`](../exp/qwen1.7b-32k/eval_gamma_cue_guard.yaml)（cue checkpoint）、
+[`eval_gamma_cue_guard_p1024_slack0.yaml`](../exp/qwen1.7b-32k/eval_gamma_cue_guard_p1024_slack0.yaml)
+（cue + P=1024 + `level_slack: 0`）与
+[`eval_gamma_cue_guard_literal_p1024_slack0.yaml`](../exp/qwen1.7b-32k/eval_gamma_cue_guard_literal_p1024_slack0.yaml)
+（同一 checkpoint 再开字面量）。现有 cue checkpoint 训练时 cue 在普通训练文本上照常触发，结论以重训为准。
+
+```bash
+DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+  NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_cue_guard_p1024_slack0.yaml
+```
 
 **配置。** 默认训练配置 [`arc_gamma_cue_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml)
 与 `arc_gamma_k12_b128_2k` 只差 cue。成本最低的第一个实验是只评测、不重训：
@@ -350,7 +380,7 @@ GPU 上的实际收益以训练日志为准：`logKV_host` 的 `route`、`replay
 样本，按实验 YAML 构建同一模型与缓存，逐层报告针在精确池、recent 还是梯子条目（及其 w），
 针所在片段在现有评分（开启 cue 时含 cue 价值）与几种诊断评分下的排名、需要多大的精确池才能
 留住，以及 `--oracle all` 强制保留针时的准确率上限。诊断评分 `cue` 是单独的 cue 价值（开头 64 个
-token），配置未开启 cue 时也会报告；`literal` 同理，是单独的字面量价值。追踪期间关闭分数预取，
+token），配置未开启 cue 时也会报告；`cue_guard` 是加保护后的 cue 价值，`literal` 是单独的字面量价值。追踪期间关闭分数预取，
 选择规则不变（`--oracle` 除外）。
 
 ```bash
@@ -359,7 +389,7 @@ python unused/niah_needle_trace.py --config exp/qwen1.7b-32k/eval_gamma_cue.yaml
 ```
 
 测试：`tests/test_gamma_log_kv.py`（修复前后的梯子形状、上层条目不被改写、同字节余量层），
-`tests/test_gamma_cues.py`（区域截断、去重与阈值、因果与分块不变、针留在精确池、模型接线与回放签名），
+`tests/test_gamma_cues.py`（区域截断、去重与阈值、因果与分块不变、针留在精确池、保护的两条规则、模型接线与回放签名），
 `tests/test_gamma_literals.py`（编码长度、首次出现、与参考实现逐位一致且不依赖分块、随机数针留在精确池、
 cue 与字面量相加、模型接线与回放签名），
 `tests/test_alpha_log_kv.py`（守恒、延迟归档、反向回放与预取，覆盖 Gamma 与 cue 开关），

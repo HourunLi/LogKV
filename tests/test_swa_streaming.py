@@ -74,7 +74,7 @@ def test_swa_auto_budget_and_reset():
                     semantic_replay_updates=False, semantic_merge_passes=1,
                     alpha_exact_tokens=0, alpha_span_max_tokens=64, beta_novelty=False, beta_adaptive_merge=False,
                     gamma_level0_reinsert=False, gamma_top_merge="fold", gamma_level_slack=2, gamma_cue_tokens=0,
-                    gamma_literals=False)
+                    gamma_literals=False, gamma_cue_guard=False)
     for key, value in settings.items():
         setattr(lm, "log_kv_" + key, value)
     lm._set_eval_cache()

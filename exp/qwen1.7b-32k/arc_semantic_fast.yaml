@@ -61,5 +61,8 @@ log_kv_gamma_cue_tokens: 64
 # Gamma 字面量（默认关闭）：精确池选片段时，片段若含随机字面量（数字串、数字与短字母混写的编码）
 # 在流中的首次出现，按其自适应编码长度加分。只在 arc_gamma_*literal* 与 eval_gamma_literal* 中打开。
 log_kv_gamma_literals: false
+# Gamma cue 保护（默认关闭）：开头区域不以换行结束时不用 cue，出现超过 16 次的 cue 词不计证据。
+# 只在 eval_gamma_cue_guard* 中打开。
+log_kv_gamma_cue_guard: false
 log_kv_seg_gap_max: null  # Alpha 延迟归档要求关闭 segment gap/padding
 log_kv_seg_block_level: 0

@@ -1,0 +1,5 @@
+# 只在评测时同时打开 cue 保护与字面量：复评已训练的 cue + P=1024 + level_slack 0 checkpoint
+# （arc_gamma_cue_k12_b128_p1024_slack0_2k，不重训），只改变精确池的片段选择。
+config: arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml
+log_kv_gamma_cue_guard: true
+log_kv_gamma_literals: true
