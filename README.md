@@ -47,6 +47,21 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
   bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
 ```
 
+全程 dense CPT 对照使用 `exp/qwen1.7b-32k/cpt_dense.yaml`：从 Qwen3-1.7B-Base
+初始化，沿用 Gamma cue 的 32K 数据与训练超参，独立保存为 `qwen1.7b-32k-cpt-dense`。
+`log_kv_dense_mode: true` 在训练中使用完整因果 attention，后续评测使用完整 KV；
+保留 Block activation checkpoint 与分块 LM-head loss，不启用压缩缓存或路由重放。
+该 dense 对照的推理 KV 为 O(N)，不属于 O(log N) 压缩路线。
+
+```bash
+BENCHMARKS=none NIAH_BENCHMARKS=none \
+  bash majob.sh exp/qwen1.7b-32k/cpt_dense.yaml
+```
+
+`NIAH_ONLY=1` 只跳过主评测，仍会跑捞针；在 `majob.sh` 中也不会跳过尚未完成的训练。
+只训练需像上面一样将两个 benchmark 环境变量都设为 `none`。之后单独评测捞针可用
+`NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/cpt_dense.yaml`，默认全部 17 个任务。
+
 训练完成后只跑捞针评测（默认全部 17 个 NIAH 任务；`majob.sh` 遇到已完成的 checkpoint 会跳过训练）：
 
 ```bash
