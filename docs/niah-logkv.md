@@ -101,10 +101,10 @@ checkpoint 自身的评测只差所列开关：
 | `eval_niah_heads_p1024.yaml` | 打分头 | 学到的估计器 |
 | `eval_niah_heads_heldout_p1024.yaml` | 打分头（训练时不含 uuid、word 值） | 泛化：niah_single_3 与 words 针 |
 | `eval_gamma_literal_p1024.yaml` | 字面量 | 手写估计器（只认数字串） |
-| `eval_gamma_cue_guard_p1024.yaml` | cue 64 + 保护 | 技巧：开头指令 |
-| `eval_gamma_query_p1024.yaml` | query + 保护 | 技巧：问题 |
-| `eval_gamma_cue_guard_query_p1024.yaml` | cue 64 + query + 保护 | 技巧：两者 |
+| `eval_gamma_query_p1024.yaml` | query + 保护 | 技巧：问题；与"打分头 + query"同 checkpoint 对照 |
 
+cue 与 cue + query 的技巧结果取自带 cue 训练的 checkpoint（`eval_gamma_cue_guard_p1024_slack0.yaml`、
+`eval_gamma_query_p1024_slack0.yaml` 等，见 [Gamma](gamma-logkv.md)），报告时注明 checkpoint 不同。
 上限是 dense CPT 的模型（`cpt_dense.yaml`），不是压缩 checkpoint 的 dense 模式。
 
 **泛化任务。** `eval_tasks/niah_cue` 另有三个不含数字的针：`niah_single_2_words`（RULER 模板）、
