@@ -307,9 +307,30 @@ def test_trainer_options_come_from_the_command_line_then_the_yaml(tmp_path):
     with pytest.raises(SystemExit, match="no output path"):
         tr.resolve_options({}, {})
     heads = RetentionHeads(1, 1, 4, 4)
-    assert tr.resume_step(str(tmp_path / "missing.pth"), 100) == 0
-    heads.save(tmp_path / "h.pth", step=40)
-    assert tr.resume_step(str(tmp_path / "h.pth"), 100) == 40 and tr.resume_step(str(tmp_path / "h.pth"), 30) == 30
+    path = str(tmp_path / "h.pth")
+    assert tr.resume_step(str(tmp_path / "missing.pth"), 100) == (None, 0)
+    heads.save(path, step=40)
+    assert tr.resume_step(path, 100) == (path, 40) and tr.resume_step(path, 30) == (path, 30)
+
+
+def test_heads_save_without_rename_and_resume_from_a_cut_off_save(tmp_path, monkeypatch):
+    import os
+    import train_retention as tr
+    heads = RetentionHeads(1, 1, 4, 4)
+    out = str(tmp_path / "sub" / "h.pth")
+    tr.save_heads(heads, out, step=20)
+    assert tr.resume_step(out, 100) == (out, 20) and not os.path.exists(out + ".tmp")
+
+    def no_rename(src, dst):  # an OBS bucket mount
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(tr.os, "replace", no_rename)
+    tr.save_heads(heads, out, step=40)
+    assert tr.resume_step(out, 100) == (out, 40) and not os.path.exists(out + ".tmp")
+    assert RetentionHeads.load(out).tag() == heads.tag()
+    # killed while copying over the old file: the complete .tmp wins
+    heads.save(out + ".tmp", step=60)
+    Path(out).write_bytes(Path(out + ".tmp").read_bytes()[:100])
+    assert tr.resume_step(out, 100) == (out + ".tmp", 60)
 
 
 def _launcher(tmp_path, yaml_text):

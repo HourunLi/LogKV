@@ -26,10 +26,13 @@ save (``retention_resume``), and a finished one exits at once.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import inspect
 import json
 import os
+import pickle
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -105,12 +108,35 @@ def build_lm(cfg: dict, checkpoint: str | None, device: str):
     return lm
 
 
-def resume_step(path: str, steps: int) -> int:
-    """The step the saved heads at ``path`` reached (0 when there are none)."""
-    if not os.path.isfile(path):
-        return 0
-    meta = torch.load(path, map_location="cpu", weights_only=True).get("meta", {})
-    return min(int(meta.get("step", 0)), steps)
+def save_heads(heads, path: str, **meta) -> None:
+    """Write ``path`` through ``path.tmp``, so a killed job always leaves one complete file.
+
+    A bucket mount (OBS) refuses the rename; the complete .tmp is then copied over
+    ``path`` and removed only after the copy.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    heads.save(path + ".tmp", **meta)
+    try:
+        os.replace(path + ".tmp", path)
+    except OSError:
+        shutil.copyfile(path + ".tmp", path)
+        with contextlib.suppress(OSError):  # a leftover .tmp holds the same step; resume_step reads either
+            os.remove(path + ".tmp")
+
+
+def resume_step(path: str, steps: int) -> tuple[str | None, int]:
+    """The saved heads to resume from and the step they reached: ``path``, or the .tmp a killed save left."""
+    best, step = None, 0
+    for candidate in (path, path + ".tmp"):
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            meta = torch.load(candidate, map_location="cpu", weights_only=True).get("meta", {})
+        except (RuntimeError, EOFError, pickle.UnpicklingError):  # cut off mid-write
+            continue
+        if best is None or int(meta.get("step", 0)) > step:
+            best, step = candidate, int(meta.get("step", 0))
+    return best, min(step, steps)
 
 
 def blocks(cfg: dict, seed: int):
@@ -169,7 +195,7 @@ def main() -> None:
     if not lm.log_kv_alpha_exact_tokens:
         raise SystemExit("retention heads score Alpha's exact spans; this config has alpha_exact_tokens = 0")
     # Resume from the last save; every rank takes rank 0's reading of the shared file.
-    first = resume_step(args.out, args.steps) if args.resume else 0
+    source, first = resume_step(args.out, args.steps) if args.resume else (None, 0)
     if world > 1:
         box = torch.tensor([first], device=device)
         torch.distributed.broadcast(box, 0)
@@ -185,9 +211,9 @@ def main() -> None:
     kit = RetrievalKit.from_tokenizer(lm.tokenizer, kinds)
     model = lm.model
     if first:
-        heads = RetentionHeads.load(args.out)
+        heads = RetentionHeads.load(source)
         if rank == 0:
-            print(f"resuming the heads at {args.out} from step {first}", flush=True)
+            print(f"resuming the heads at {source} from step {first}", flush=True)
     elif args.init:
         heads = RetentionHeads.load(args.init)
     else:
@@ -225,10 +251,8 @@ def main() -> None:
         layers = np.nanmean(np.asarray(recalls), axis=0)
         print(json.dumps(dict(step=step, val=summary, kept_per_layer=[round(x, 3) for x in layers],
                               kept_mean=round(float(np.nanmean(layers)), 4))), flush=True)
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-        heads.save(args.out + ".tmp", config=args.config, checkpoint=args.checkpoint or cfg.get("save_path"),
+        save_heads(heads, args.out, config=args.config, checkpoint=args.checkpoint or cfg.get("save_path"),
                    step=step, steps=args.steps, kinds=list(kinds), facts=list(facts), tag=heads.tag())
-        os.replace(args.out + ".tmp", args.out)  # a killed job never leaves a half-written file
         return layers
 
     with trainer:
