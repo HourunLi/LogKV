@@ -226,19 +226,33 @@ DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu
 （如 mentioned、provided）在正文中出现不超过 16 次时也会给片段加分。代理里没有模型，K/V 分数是随机数；
 准确率要在 GPU 上评测。
 
+**32K 实测（每个任务 500 条）。** cue + P=1024 + `level_slack: 0` 的 checkpoint 只加保护与问题：
+`AVG_NIAH_cue` 由 0.527 升到 0.9996（9 个提示扰动任务都不低于 0.998），`niah_multikey_2` 由 0.138 升到
+0.94，`AVG_NIAH_multi` 由 0.584 升到 0.751。同一 checkpoint 再开字面量，提示扰动任务全部为 1，但
+`niah_multikey_2` 降到 0.878，`niah_multivalue` 由 0.9225 降到 0.9125，其余差异不超过 0.008。P=256 的
+cue checkpoint 开保护、问题与字面量：`AVG_NIAH_cue` 0.9993，`niah_multikey_1` / `_2` 为 0.918 / 0.912。
+`niah_multikey_3` 在三种设置下都约 0.015。
+
+**限制。**
+
+- 问题按单个 token 匹配。Qwen 把 uuid 切成单个十六进制字符与 `-`，在全是 uuid 的干草堆
+  （`niah_multikey_3`）里每个都出现上千次，权重为 0，uuid 形式的 key 给不出证据。
+- 精确池里已有片段的 1.1 倍保留系数乘在整个分数上，含 cue 与字面量价值。同格式针的干草堆里每根针的
+  字面量都到上限，这 10% 成为很大的绝对差，问题证据弱的目标针可能换不进去；开问题时不建议同时开字面量。
+
 这是查询感知的压缩：缓存在 prefill 之前看到了问题（与用 prompt 末尾观察窗口选择 KV 的方法同类），
 结果要与不看问题的设置分开报告。问题在缓存建好之后才出现时（多轮对话、同一文档多次提问）不起作用。
 默认关闭；只改变精确池选择，可以只评测：
 [`eval_gamma_query_p1024_slack0.yaml`](../exp/qwen1.7b-32k/eval_gamma_query_p1024_slack0.yaml)
 （cue + P=1024 + `level_slack: 0` 的 checkpoint，加保护与问题）、
 [`eval_gamma_query_literal_p1024_slack0.yaml`](../exp/qwen1.7b-32k/eval_gamma_query_literal_p1024_slack0.yaml)
-（同一 checkpoint 再开字面量）与
-[`eval_gamma_query_literal.yaml`](../exp/qwen1.7b-32k/eval_gamma_query_literal.yaml)（P=256 的 cue checkpoint，
-保护、问题与字面量）。
+（同一 checkpoint 再开字面量）、
+[`eval_gamma_query.yaml`](../exp/qwen1.7b-32k/eval_gamma_query.yaml)（P=256 的 cue checkpoint，保护与问题）与
+[`eval_gamma_query_literal.yaml`](../exp/qwen1.7b-32k/eval_gamma_query_literal.yaml)（同一 checkpoint 再开字面量）。
 
 ```bash
 DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
-  NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_query_literal_p1024_slack0.yaml
+  NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_query_p1024_slack0.yaml
 ```
 
 **配置。** 默认训练配置 [`arc_gamma_cue_k12_b128_2k.yaml`](../exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml)

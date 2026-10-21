@@ -97,9 +97,9 @@ CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
        "arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_p1024_slack0.yaml",
        "eval_gamma_cue_guard.yaml", "eval_gamma_cue_guard_p1024_slack0.yaml",
        "eval_gamma_cue_guard_literal_p1024_slack0.yaml", "eval_gamma_query_p1024_slack0.yaml",
-       "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml"]
+       "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml"]
 QUERY = ["eval_gamma_query_p1024_slack0.yaml", "eval_gamma_query_literal_p1024_slack0.yaml",
-         "eval_gamma_query_literal.yaml"]
+         "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml"]
 LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml",
            "eval_gamma_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_literal_p1024_slack0.yaml",
            "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml"]
@@ -144,6 +144,7 @@ def test_only_query_cue_evaluations_see_the_question(name):
      {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue", "log_kv_gamma_literals"}),
     ("eval_gamma_query_literal.yaml", "arc_gamma_cue_k12_b128_2k.yaml",
      {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue", "log_kv_gamma_literals"}),
+    ("eval_gamma_query.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
 ])
 def test_cue_guard_evaluations_reuse_their_checkpoint(name, trained, switches):
     evaluated, base = effective(name), effective(trained)

@@ -1,0 +1,5 @@
+# 只在评测时打开查询感知 cue（加 cue 保护，不开字面量）：复评已训练的 cue checkpoint
+# （arc_gamma_cue_k12_b128_2k，P=256，不重训），与 eval_gamma_query_literal.yaml 只差字面量。
+config: arc_gamma_cue_k12_b128_2k.yaml
+log_kv_gamma_cue_guard: true
+log_kv_gamma_query_cue: true
