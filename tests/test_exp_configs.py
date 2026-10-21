@@ -99,16 +99,14 @@ CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
        "arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_p1024_slack0.yaml",
        "eval_gamma_cue_guard.yaml", "eval_gamma_cue_guard_p1024_slack0.yaml",
        "eval_gamma_cue_guard_literal_p1024_slack0.yaml", "eval_gamma_query_p1024_slack0.yaml",
-       "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml",
-       "eval_gamma_cue_guard_p1024.yaml", "eval_gamma_cue_guard_query_p1024.yaml"]
+       "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml"]
 QUERY = ["eval_gamma_query_p1024_slack0.yaml", "eval_gamma_query_literal_p1024_slack0.yaml",
-         "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml", "eval_gamma_query_p1024.yaml",
-         "eval_gamma_cue_guard_query_p1024.yaml"]
+         "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml", "eval_gamma_query_p1024.yaml"]
 LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml",
            "eval_gamma_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_literal_p1024_slack0.yaml",
            "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_literal_p1024.yaml"]
 GUARD = ["eval_gamma_cue_guard.yaml", "eval_gamma_cue_guard_p1024_slack0.yaml",
-         "eval_gamma_cue_guard_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_p1024.yaml", *QUERY]
+         "eval_gamma_cue_guard_literal_p1024_slack0.yaml", *QUERY]
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
@@ -149,13 +147,9 @@ def test_only_query_cue_evaluations_see_the_question(name):
     ("eval_gamma_query_literal.yaml", "arc_gamma_cue_k12_b128_2k.yaml",
      {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue", "log_kv_gamma_literals"}),
     ("eval_gamma_query.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
-    # Tricks on the cue-free P=1024 ladder checkpoint, reported apart from the retention heads.
-    ("eval_gamma_cue_guard_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml",
-     {"log_kv_gamma_cue_tokens", "log_kv_gamma_cue_guard"}),
+    # The question alone on the retention heads' cue-free P=1024 checkpoint (the reference for heads + query).
     ("eval_gamma_query_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml",
      {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
-    ("eval_gamma_cue_guard_query_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml",
-     {"log_kv_gamma_cue_tokens", "log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
 ])
 def test_cue_guard_evaluations_reuse_their_checkpoint(name, trained, switches):
     evaluated, base = effective(name), effective(trained)

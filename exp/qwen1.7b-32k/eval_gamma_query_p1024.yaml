@@ -1,5 +1,6 @@
 # niahLogKV 附加技巧（单列报告，只评测、不重训）：在不带 cue 的 P=1024 梯子 checkpoint
-# （arc_gamma_k12_b128_p1024_2k）上只打开查询感知 cue（问题作为 cue，加 cue 保护），不开开头 cue。
+# （arc_gamma_k12_b128_p1024_2k）上只打开查询感知 cue（问题作为 cue，加 cue 保护），不开开头 cue；
+# 与打分头 + query 在同一 checkpoint 上对照。
 #   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_query_p1024.yaml
 config: arc_gamma_k12_b128_p1024_2k.yaml
 log_kv_gamma_cue_guard: true
