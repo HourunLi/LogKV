@@ -1,19 +1,26 @@
 """Train niahLogKV's learned retention heads on a frozen LogKV checkpoint.
 
-    torchrun --nproc_per_node=8 train_retention.py \\
-        --config exp/qwen1.7b-32k/<checkpoint YAML> --out <retention_heads.pth>
+In the training environment, launch it like majob.sh with retention.sh:
 
-The YAML names the checkpoint (``save_path``, or ``--checkpoint``), its LogKV
-cache (built exactly as eval.py builds it) and its training data
-(``data_dir`` / ``data_mix_yaml``, read as demo.py reads them). Each step
-takes one block of that data, inserts synthetic facts
-(litgpt.synthetic_retrieval), prefills it through the frozen model with the
-heads attached and trains every layer's head on the spans each flush archives
-(litgpt.retention_train). Ranks take different blocks and average the head
-gradients. Every ``--val-every`` steps rank 0 reports, on fixed held-out
-blocks, the fraction of fact tokens each layer kept exact, and saves the heads.
+    bash retention.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml
 
-``--kinds`` limits the value kinds that appear in the facts, e.g. leave out
+(in a development shell: ``torchrun --nproc_per_node=N train_retention.py --config <YAML>``).
+
+The YAML names the checkpoint (``save_path``, or ``retention_checkpoint``), its
+LogKV cache (built exactly as eval.py builds it), its training data
+(``data_dir`` / ``data_mix_yaml``, read as demo.py reads them) and where the
+heads go (``retention_out``, else ``log_kv_retention_heads``, so an eval YAML
+trains the heads it evaluates). The other ``retention_*`` keys set the options
+below; command-line flags override them. Each step takes one block of the
+data, inserts synthetic facts (litgpt.synthetic_retrieval), prefills it
+through the frozen model with the heads attached and trains every layer's head
+on the spans each flush archives (litgpt.retention_train). Ranks take
+different blocks and average the head gradients. Every ``val_every`` steps
+rank 0 reports, on fixed held-out blocks, the fraction of fact tokens each
+layer kept exact, and saves the heads; a restarted job resumes from the last
+save (``retention_resume``), and a finished one exits at once.
+
+``kinds`` limits the value kinds that appear in the facts, e.g. leave out
 ``uuid`` to test on niah_single_3 values the heads never saw.
 """
 from __future__ import annotations
@@ -52,11 +59,39 @@ def checkpoint_dir(resolved: str, requested: str | None) -> str:
     return resolved
 
 
-def build_lm(config: str, checkpoint: str | None, device: str):
+# Options: (default, type); each reads retention_<name> from the YAML unless given on the command line.
+OPTIONS = dict(out=(None, str), init=(None, str), checkpoint=(None, str), steps=(2000, int), lr=(1e-3, float),
+               hidden=(64, int), length=(32768, int), facts=("2,8", str), questions=("1,3", str), kinds=(None, str),
+               val_docs=(16, int), val_every=(200, int), seed=(1234, int), resume=(True, bool))
+
+
+def load_config(config: str) -> dict:
+    ev = importlib.import_module("eval")
+    return ev._coerce_yaml_sci_floats(ev.expand_env_vars(
+        ev._load_yaml_config(os.path.join(os.getcwd(), config), "") or {}))
+
+
+def resolve_options(cfg: dict, cli: dict) -> dict:
+    """Command line, then retention_* in the YAML, then the defaults; out falls back to log_kv_retention_heads."""
+    out = {}
+    for name, (default, kind) in OPTIONS.items():
+        value = cli.get(name)
+        if value is None:
+            value = cfg.get("retention_" + name)
+        if value is None:
+            value = default
+        out[name] = value if value is None or kind is bool else kind(value)
+    out["resume"] = out["resume"] if isinstance(out["resume"], bool) else str(out["resume"]).lower() == "true"
+    if out["out"] is None:
+        out["out"] = cfg.get("log_kv_retention_heads")
+    if not out["out"]:
+        raise SystemExit("no output path: set retention_out (or log_kv_retention_heads) in the YAML, or --out")
+    return out
+
+
+def build_lm(cfg: dict, checkpoint: str | None, device: str):
     """eval.py's LogKVLM for an experiment YAML (the same settings eval.sh passes)."""
     ev = importlib.import_module("eval")
-    cfg = ev._coerce_yaml_sci_floats(ev.expand_env_vars(
-        ev._load_yaml_config(os.path.join(os.getcwd(), config), checkpoint or "") or {}))
     defaults = {k: p.default for k, p in inspect.signature(ev.main).parameters.items()}
     kwargs = {}
     for name in inspect.signature(ev.LogKVLM.__init__).parameters:
@@ -67,7 +102,15 @@ def build_lm(config: str, checkpoint: str | None, device: str):
     path = checkpoint_dir(ev._resolve_checkpoint_dir(checkpoint or cfg["save_path"]), checkpoint)
     lm = ev.LogKVLM(path, device=device, config_overrides=cfg.get("config_overrides"),
                     tokenizer_dir=tokenizer_dir(cfg), **kwargs)
-    return cfg, lm
+    return lm
+
+
+def resume_step(path: str, steps: int) -> int:
+    """The step the saved heads at ``path`` reached (0 when there are none)."""
+    if not os.path.isfile(path):
+        return 0
+    meta = torch.load(path, map_location="cpu", weights_only=True).get("meta", {})
+    return min(int(meta.get("step", 0)), steps)
 
 
 def blocks(cfg: dict, seed: int):
@@ -91,22 +134,25 @@ def _pair(text: str) -> tuple[int, int]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", required=True, help="experiment YAML of the checkpoint, as for eval.sh")
+    p.add_argument("--config", required=True, help="experiment YAML (checkpoint, cache, data, retention_* keys)")
     p.add_argument("--checkpoint", default=None, help="defaults to the YAML save_path (latest step_*)")
-    p.add_argument("--out", required=True, help="where to save the heads (litgpt.retention format)")
-    p.add_argument("--init", default=None, help="heads to continue from (e.g. refit after CPT)")
-    p.add_argument("--steps", type=int, default=2000)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--hidden", type=int, default=64)
-    p.add_argument("--length", type=int, default=32768, help="tokens per training block")
-    p.add_argument("--facts", default="2,8", help="facts per block, low,high")
-    p.add_argument("--questions", default="1,3", help="questions per block, low,high")
+    p.add_argument("--out", default=None, help="where to save the heads (litgpt.retention format)")
+    p.add_argument("--init", default=None, help="heads to start from (e.g. refit after CPT)")
+    p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--hidden", type=int, default=None)
+    p.add_argument("--length", type=int, default=None, help="tokens per training block")
+    p.add_argument("--facts", default=None, help="facts per block, low,high")
+    p.add_argument("--questions", default=None, help="questions per block, low,high")
     p.add_argument("--kinds", default=None, help="comma-separated value kinds (default: all)")
-    p.add_argument("--val-docs", type=int, default=16)
-    p.add_argument("--val-every", type=int, default=200)
-    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--val-docs", type=int, default=None)
+    p.add_argument("--val-every", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--resume", default=None, choices=("true", "false"))
     p.add_argument("--device", default="cuda")
-    args = p.parse_args()
+    cli = vars(p.parse_args())
+    cfg = load_config(cli["config"])
+    args = argparse.Namespace(config=cli["config"], device=cli["device"], **resolve_options(cfg, cli))
 
     from litgpt.retention import RetentionHeads
     from litgpt.retention_train import HeadTrainer, pool_recall
@@ -119,14 +165,30 @@ def main() -> None:
         torch.cuda.set_device(local)
         torch.distributed.init_process_group("nccl")
         device = f"cuda:{local}"
-    cfg, lm = build_lm(args.config, args.checkpoint, device)
+    lm = build_lm(cfg, args.checkpoint, device)
     if not lm.log_kv_alpha_exact_tokens:
         raise SystemExit("retention heads score Alpha's exact spans; this config has alpha_exact_tokens = 0")
-    data = blocks(cfg, args.seed)
+    # Resume from the last save; every rank takes rank 0's reading of the shared file.
+    first = resume_step(args.out, args.steps) if args.resume else 0
+    if world > 1:
+        box = torch.tensor([first], device=device)
+        torch.distributed.broadcast(box, 0)
+        first = int(box.item())
+    if first >= args.steps:
+        if rank == 0:
+            print(f"heads at {args.out} already reached step {first} of {args.steps}; nothing to do", flush=True)
+        if world > 1:
+            torch.distributed.destroy_process_group()
+        return
+    data = blocks(cfg, args.seed + first)
     kinds = tuple(args.kinds.split(",")) if args.kinds else KINDS
     kit = RetrievalKit.from_tokenizer(lm.tokenizer, kinds)
     model = lm.model
-    if args.init:
+    if first:
+        heads = RetentionHeads.load(args.out)
+        if rank == 0:
+            print(f"resuming the heads at {args.out} from step {first}", flush=True)
+    elif args.init:
         heads = RetentionHeads.load(args.init)
     else:
         heads = RetentionHeads(model.config.n_layer, model.config.n_query_groups, model.config.head_size,
@@ -163,15 +225,17 @@ def main() -> None:
         layers = np.nanmean(np.asarray(recalls), axis=0)
         print(json.dumps(dict(step=step, val=summary, kept_per_layer=[round(x, 3) for x in layers],
                               kept_mean=round(float(np.nanmean(layers)), 4))), flush=True)
-        heads.save(args.out, config=args.config, checkpoint=args.checkpoint or cfg.get("save_path"), step=step,
-                   kinds=list(kinds), facts=list(facts), tag=heads.tag())
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        heads.save(args.out + ".tmp", config=args.config, checkpoint=args.checkpoint or cfg.get("save_path"),
+                   step=step, steps=args.steps, kinds=list(kinds), facts=list(facts), tag=heads.tag())
+        os.replace(args.out + ".tmp", args.out)  # a killed job never leaves a half-written file
         return layers
 
     with trainer:
-        if rank == 0:
-            validate(0)  # A fresh head scores below the floor: this is the K/V-only pool.
+        if rank == 0 and not first:
+            validate(0)  # A fresh head scores below the floor (the K/V-only pool); --init: the starting heads.
         start = time.time()
-        for step in range(1, args.steps + 1):
+        for step in range(first + 1, args.steps + 1):
             forward(*document(data, np.random.default_rng([args.seed, rank, step])))
             trainer.step()
             if rank == 0 and step % 10 == 0:
