@@ -92,7 +92,20 @@ NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_refit_p1024_slack0.yam
 ```
 
 报告口径：基准是同一梯子、同一 checkpoint 有无打分头；cue、query（保护 + 问题）在评测 YAML 里另行打开，
-作为附加技巧单列。
+作为附加技巧单列。不带 cue 的 P=1024 checkpoint（`arc_gamma_k12_b128_p1024_2k`）上的只评测 YAML，都与该
+checkpoint 自身的评测只差所列开关：
+
+| YAML | 开关 | 作用 |
+|---|---|---|
+| `arc_gamma_k12_b128_p1024_2k.yaml` | 无 | 基准：只用 K/V 分数 |
+| `eval_niah_heads_p1024.yaml` | 打分头 | 学到的估计器 |
+| `eval_niah_heads_heldout_p1024.yaml` | 打分头（训练时不含 uuid、word 值） | 泛化：niah_single_3 与 words 针 |
+| `eval_gamma_literal_p1024.yaml` | 字面量 | 手写估计器（只认数字串） |
+| `eval_gamma_cue_guard_p1024.yaml` | cue 64 + 保护 | 技巧：开头指令 |
+| `eval_gamma_query_p1024.yaml` | query + 保护 | 技巧：问题 |
+| `eval_gamma_cue_guard_query_p1024.yaml` | cue 64 + query + 保护 | 技巧：两者 |
+
+上限是 dense CPT 的模型（`cpt_dense.yaml`），不是压缩 checkpoint 的 dense 模式。
 
 **泛化任务。** `eval_tasks/niah_cue` 另有三个不含数字的针：`niah_single_2_words`（RULER 模板）、
 `_words_qend`、`_words_paraphrase`，值是一个随机英文词，手写字面量规则对它们不起作用。本分支的

@@ -1,0 +1,5 @@
+# niahLogKV 对照（只评测、不重训）：在不带 cue 的 P=1024 梯子 checkpoint（arc_gamma_k12_b128_p1024_2k）上
+# 打开手写字面量规则（只认数字串）。与 eval_niah_heads_p1024.yaml 同一 checkpoint：手写估计器对学到的打分头。
+#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_literal_p1024.yaml
+config: arc_gamma_k12_b128_p1024_2k.yaml
+log_kv_gamma_literals: true
