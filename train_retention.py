@@ -33,6 +33,25 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
+def tokenizer_dir(cfg: dict) -> str | None:
+    """The tokenizer eval.sh would pass: tokenizer_dir, resume_dir, ckpt_dir, then checkpoints/<arch>."""
+    candidates = [cfg.get("tokenizer_dir"), cfg.get("resume_dir"), cfg.get("ckpt_dir"),
+                  os.path.join("checkpoints", cfg.get("arch_name", "Qwen/Qwen3-0.6B-Base"))]
+    for path in candidates:
+        if path and any(os.path.isfile(os.path.join(path, name)) for name in ("tokenizer.json", "tokenizer.model")):
+            return path
+    return None
+
+
+def checkpoint_dir(resolved: str, requested: str | None) -> str:
+    """The resolved checkpoint, or a clear error when it holds no weights."""
+    if not os.path.exists(os.path.join(resolved, "lit_model.pth")):
+        raise SystemExit(f"no checkpoint at {resolved} (no lit_model.pth there or in a step_* subdirectory; "
+                         f"{'--checkpoint' if requested else 'the YAML save_path'} names it). Train it first "
+                         "(majob.sh), or pass --checkpoint <dir holding lit_model.pth or step_* subdirectories>.")
+    return resolved
+
+
 def build_lm(config: str, checkpoint: str | None, device: str):
     """eval.py's LogKVLM for an experiment YAML (the same settings eval.sh passes)."""
     ev = importlib.import_module("eval")
@@ -45,9 +64,9 @@ def build_lm(config: str, checkpoint: str | None, device: str):
             value = cfg.get(name)
             kwargs[name] = defaults[name] if value is None else value
     kwargs["log_kv_retention_heads"] = None  # the heads come from this script
-    path = ev._resolve_checkpoint_dir(checkpoint or cfg["save_path"])
+    path = checkpoint_dir(ev._resolve_checkpoint_dir(checkpoint or cfg["save_path"]), checkpoint)
     lm = ev.LogKVLM(path, device=device, config_overrides=cfg.get("config_overrides"),
-                    tokenizer_dir=cfg.get("tokenizer_dir"), **kwargs)
+                    tokenizer_dir=tokenizer_dir(cfg), **kwargs)
     return cfg, lm
 
 
@@ -55,7 +74,7 @@ def blocks(cfg: dict, seed: int):
     """Token blocks of the YAML's training data, as demo.py streams them."""
     demo = importlib.import_module("demo")
     torch.set_default_dtype(torch.float32)  # demo.py sets bfloat16 at import
-    tok_dir = cfg.get("tokenizer_dir") or cfg.get("resume_dir") or cfg.get("ckpt_dir")
+    tok_dir = cfg.get("tokenizer_dir") or cfg.get("resume_dir") or cfg.get("ckpt_dir")  # demo.py's LitData key
     dataset = demo.build_train_dataset(
         context_length=int(cfg.get("context_length", 32768)), seed=seed, tok_dir=tok_dir,
         data_dir=cfg.get("data_dir", "data"), dataset_dir=cfg.get("dataset_dir", "data"),
