@@ -267,9 +267,30 @@ class GPT(nn.Module):
                 raise RuntimeError("gamma_literals needs the tokenizer's token texts: pass "
                                    "literal_texts to set_alpha_span_boundary_ids()")
             self.log_kv_literal_stream = LiteralStream(texts, below_cue=query_cue)
-        for block in self.transformer.h:
-            block.attn.kv_cache.cue_stream = self.log_kv_cue_stream
-            block.attn.kv_cache.literal_stream = self.log_kv_literal_stream
+        heads = getattr(self, "log_kv_retention_heads", None)
+        for i, block in enumerate(self.transformer.h):
+            cache = block.attn.kv_cache
+            cache.cue_stream = self.log_kv_cue_stream
+            cache.literal_stream = self.log_kv_literal_stream
+            if cache.retention_head and heads is None:
+                raise RuntimeError("retention_head needs set_retention_heads() before the cache is built")
+            cache.attach_retention_head(heads[i] if cache.retention_head else None)
+
+    def set_retention_heads(self, heads) -> None:
+        """Frozen learned retention heads (litgpt.retention.RetentionHeads), one per layer.
+
+        Kept out of the module tree: not in the LM's state dict, not sharded or
+        trained with it. Caches built afterwards with ``retention_head=True``
+        score their spans with them.
+        """
+        if heads is not None:
+            if len(heads) != self.config.n_layer:
+                raise ValueError(f"{len(heads)} retention heads for {self.config.n_layer} layers")
+            heads = heads.to(device=self.transformer.wte.weight.device, dtype=torch.float32)
+            tag = heads.tag()
+            for head in heads.heads:
+                head.tag = tag
+        object.__setattr__(self, "log_kv_retention_heads", heads)
 
     def set_gamma_queries(self, queries) -> None:
         """Question token ids per batch row for the next request (query-aware cue).
@@ -489,6 +510,7 @@ class GPT(nn.Module):
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
         gamma_query_cue: bool = False,
+        retention_head: bool = False,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -591,6 +613,7 @@ class GPT(nn.Module):
                 gamma_literals=gamma_literals,
                 gamma_cue_guard=gamma_cue_guard,
                 gamma_query_cue=gamma_query_cue,
+                retention_head=retention_head,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -673,6 +696,7 @@ class GPT(nn.Module):
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
         gamma_query_cue: bool = False,
+        retention_head: bool = False,
     ) -> None:
         """Attach a LogStructuredKVCache to every attention layer and switch
         each layer into ``training_log_kv`` mode.
@@ -766,6 +790,7 @@ class GPT(nn.Module):
                 gamma_literals=gamma_literals,
                 gamma_cue_guard=gamma_cue_guard,
                 gamma_query_cue=gamma_query_cue,
+                retention_head=retention_head,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
             )
@@ -1572,6 +1597,7 @@ class CausalSelfAttention(nn.Module):
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
         gamma_query_cue: bool = False,
+        retention_head: bool = False,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
 
@@ -1648,6 +1674,7 @@ class CausalSelfAttention(nn.Module):
             gamma_literals=gamma_literals,
             gamma_cue_guard=gamma_cue_guard,
             gamma_query_cue=gamma_query_cue,
+            retention_head=retention_head,
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rope_n_elem=rope_n_elem,

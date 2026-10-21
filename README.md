@@ -25,6 +25,7 @@ attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启�
 | [Alpha 精确片段算法](docs/alpha-logkv.md) | 分段、打分、替换、预算，以及延迟归档 |
 | [Beta 算法与运行入口](docs/beta-logkv.md) | 新颖度评分、低失真切分、回放约束、训练与评测 |
 | [Gamma 梯子修正与 cue](docs/gamma-logkv.md) | 延迟归档只重排第 0 层、顶层最轻对合并、同字节余量层、精确池的开头提示词与字面量选择、针的去向诊断 |
+| [niahLogKV 学习保留打分](docs/niah-logkv.md) | 不看开头与问题的精确池打分头、合成检索数据、`train_retention.py`、评测与 CPT 配置 |
 | [统一路由实现](docs/semantic-unified-routing.md) | 可选 unified 路由的 Ward/半径公式、增量更新和数值约束 |
 | [位置与注意力](docs/position.md) | pre-RoPE 内容、mid/multi 锚点、质量偏置 |
 | [全程 SWA 对照](docs/swa-niah-comparison.md) | 同权重、同持久缓存字节预算的比较口径 |
@@ -37,7 +38,9 @@ attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启�
 `eval_gamma_cue.yaml` 只在评测时给已训练的 checkpoint 打开 cue。精确池的字面量选择（随机数字串、编码的
 首次出现）默认关闭：`eval_gamma_literal*.yaml` 只在评测时打开，`arc_gamma_cue_literal_k12_b128_2k.yaml` 在 cue 之上训练。
 cue 保护（开头须以换行结束、出现超过 16 次的 cue 词不计）默认关闭，`eval_gamma_cue_guard*.yaml` 只在评测时打开。
-查询感知 cue（生成请求 prompt 末尾的问题也作为 cue，字面量降到 cue 之下一档）默认关闭，`eval_gamma_query*.yaml` 只在评测时打开。cue 在多针与改写提示下的适用边界评测见
+查询感知 cue（生成请求 prompt 末尾的问题也作为 cue，字面量降到 cue 之下一档）默认关闭，`eval_gamma_query*.yaml` 只在评测时打开。
+学习到的保留打分头（niahLogKV：每层一个小打分头按片段 K/V 估计不可压缩度，不看开头与问题）默认关闭，
+`train_retention.py` 训练，`eval_niah_*.yaml` 只评测、`arc_niah_*.yaml` 训练，见 [niahLogKV](docs/niah-logkv.md)。cue 在多针与改写提示下的适用边界评测见
 [Gamma 文档](docs/gamma-logkv.md)（RULER 多针任务与 `eval_tasks/niah_cue`；两个启动脚本的 NIAH 阶段默认跑全部
 17 个捞针任务）。只训练、
 不触发默认的全套后续评测：

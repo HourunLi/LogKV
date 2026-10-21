@@ -90,3 +90,33 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
     values = ("parallel", "true") if anchor_mode == "mid" else ("sequential", "false")
     for name, value in zip(("centroid_backend", "replay_updates"), values):
         assert args[args.index("--log_kv_semantic_" + name) + 1] == value
+
+
+@pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
+@pytest.mark.parametrize("heads", [None, "/tmp/unused/retention_heads.pth"])
+def test_retention_heads_reach_eval_arguments_only_when_set(tmp_path, script, heads):
+    config = tmp_path / "run.yaml"
+    config.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\nlog_kv_cluster_k_max: 8\n"
+                      "log_kv_semantic_anchor_mode: mid\n" + (f"log_kv_retention_heads: {heads}\n" if heads else ""))
+    source = (Path(__file__).resolve().parents[1] / script).read_text()
+    if script == "majob.sh":
+        start = source.index("read -r LOG_KV_B ")
+        read_config = source[start:source.index('\n)"', start) + len('\n)"')]
+        start = source.index('LOG_KV_ARGS="')
+        build_args = source[start:source.index('\nDIAG_ARGS=', start)]
+        print_args = "printf '%s\\n' ${EVAL_LOG_KV_ARGS}"
+    else:
+        start = source.index('CONFIG_EXPORTS=$("${PYTHON_BIN}" ')
+        read_config = source[start:source.index('eval "${CONFIG_EXPORTS}"', start) + len('eval "${CONFIG_EXPORTS}"')]
+        start = source.index('LOG_KV_ARG_LIST=(')
+        build_args = source[start:source.index('\nDIAG_ARGS=', start)]
+        print_args = "printf '%s\\n' \"${LOG_KV_ARG_LIST[@]}\""
+    shell = "\n".join(("set -e", "CONFIG_FILE=$1", read_config, build_args, print_args))
+    env = {**os.environ, "PYTHON_BIN": sys.executable,
+           "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
+    args = subprocess.run(["bash", "-c", shell, "bash", str(config)], capture_output=True, text=True,
+                          check=True, env=env).stdout.splitlines()
+    if heads:
+        assert args.count("--log_kv_retention_heads") == 1 and args[args.index("--log_kv_retention_heads") + 1] == heads
+    else:
+        assert "--log_kv_retention_heads" not in args

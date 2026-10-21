@@ -135,7 +135,7 @@ def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time():
     scope = dict(
         global_step=2, max_steps=4, training_finished=False, step_active=False,
         profile_steps={3}, micro_batch_idx=0, gradient_accumulation_steps=2,
-        loader_iter=iter([torch.ones(1, 5)] * 4), context_length=4, data_epoch=1, num_epochs=1,
+        loader_iter=iter([torch.ones(1, 5)] * 4), context_length=4, data_epoch=1, num_epochs=1, synthetic_kit=None,
         fabric=fabric, model=model, optimizer=optimizer, step_stats=step_stats,
         log_kv_second_order_warmup_steps=0, log_kv_second_order_scale=0., entropy_chunk_size=4,
         get_log_kv_second_order_scale=lambda *args: 0., get_lr=lambda *args: .1,
