@@ -57,7 +57,32 @@ export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
 # ==============================================================================
 # Distributed Training Setup
 # ==============================================================================
-GPUS_PER_NODE=${MA_NUM_GPUS:-${LOCAL_WORLD_SIZE:-8}}
+# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); ModelArts
+# allocation is an upper bound. GPUS_PER_NODE may explicitly select fewer GPUs.
+GPUS_PER_NODE=$("${PYTHON_BIN}" - <<'PY_GPU_COUNT'
+import os
+import sys
+
+import torch
+
+visible = torch.cuda.device_count()
+if visible < 1:
+    raise SystemExit("ERROR: no CUDA GPUs are visible; check CUDA_VISIBLE_DEVICES and the CUDA runtime.")
+try:
+    allocated = int(os.environ.get("MA_NUM_GPUS") or visible)
+    available = min(visible, allocated)
+    selected = int(os.environ.get("GPUS_PER_NODE") or available)
+except ValueError:
+    raise SystemExit("ERROR: GPUS_PER_NODE and MA_NUM_GPUS must be positive integers.")
+if allocated < 1 or not 1 <= selected <= available:
+    raise SystemExit(
+        f"ERROR: GPUS_PER_NODE={selected} must be within 1..{available} "
+        f"(visible={visible}, MA_NUM_GPUS={allocated})."
+    )
+print(f"GPU detection: visible={visible}, MA_NUM_GPUS={allocated}, using={selected}", file=sys.stderr)
+print(selected)
+PY_GPU_COUNT
+) || exit 1
 NUM_NODES=${MA_NUM_HOSTS:-${GROUP_WORLD_SIZE:-1}}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 if [ -n "${MA_VJ_NAME:-}" ]; then
@@ -144,11 +169,10 @@ fi
 echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 
 # ==============================================================================
-# 🧩 logKV 专属：从训练 YAML（跟随 'config:' 继承）提取 logKV 设置，
-# 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
-# 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
+# 从训练 YAML（跟随 'config:' 继承）提取注意力设置，
+# 让评测与训练使用相同的 dense 或 logKV 模式。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_UNIFIED_ROUTE LOG_KV_SEMANTIC_MERGE_PASSES LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_REPLAY_UPDATES LOG_KV_ALPHA_EXACT_TOKENS LOG_KV_ALPHA_SPAN_MAX_TOKENS LOG_KV_BETA_NOVELTY LOG_KV_BETA_ADAPTIVE_MERGE LOG_KV_GAMMA_LEVEL0_REINSERT LOG_KV_GAMMA_TOP_MERGE LOG_KV_GAMMA_LEVEL_SLACK LOG_KV_GAMMA_CUE_TOKENS LOG_KV_GAMMA_LITERALS LOG_KV_GAMMA_CUE_GUARD LOG_KV_GAMMA_QUERY_CUE LOG_KV_RETENTION_HEADS ENABLE_TENSORBOARD TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_DENSE_MODE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_UNIFIED_ROUTE LOG_KV_SEMANTIC_MERGE_PASSES LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_REPLAY_UPDATES LOG_KV_ALPHA_EXACT_TOKENS LOG_KV_ALPHA_SPAN_MAX_TOKENS LOG_KV_BETA_NOVELTY LOG_KV_BETA_ADAPTIVE_MERGE LOG_KV_GAMMA_LEVEL0_REINSERT LOG_KV_GAMMA_TOP_MERGE LOG_KV_GAMMA_LEVEL_SLACK LOG_KV_GAMMA_CUE_TOKENS LOG_KV_GAMMA_LITERALS LOG_KV_GAMMA_CUE_GUARD LOG_KV_GAMMA_QUERY_CUE LOG_KV_RETENTION_HEADS ENABLE_TENSORBOARD TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import math
 import os
 import sys
@@ -214,6 +238,7 @@ print(
     cfg.get("log_kv_recent_size", 1024),
     cfg.get("log_kv_prefill_block", 256),
     cfg.get("log_kv_second_order_scale", 1.0),
+    str(bool(cfg.get("log_kv_dense_mode", False))).lower(),
     str(bool(cfg.get("log_kv_semantic_clusters", False))).lower(),
     cfg.get("log_kv_cluster_k_max", 1),
     cfg.get("log_kv_cluster_lambda_rel", 1.0),
@@ -249,7 +274,7 @@ print(
     str(bool(cfg.get("log_kv_gamma_literals") or False)).lower(),
     # Gamma cue guard default off; YAML true keeps cues from ordinary openings and topic words.
     str(bool(cfg.get("log_kv_gamma_cue_guard") or False)).lower(),
-    # Gamma query-aware cue default off; YAML true also takes cues from each prompt's closing question.
+    # Gamma query-aware cue default off; YAML true also takes cues from each prompt closing question.
     str(bool(cfg.get("log_kv_gamma_query_cue") or False)).lower(),
     # niahLogKV learned retention heads (train_retention.py output); unset = off.
     cfg.get("log_kv_retention_heads") or "__none__",
@@ -391,7 +416,7 @@ for RAW_TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
     fi
 done
 
-LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
+LOG_KV_ARGS="--log_kv_dense_mode ${LOG_KV_DENSE_MODE} --log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
 if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
     LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_cluster_chunk_size ${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE} --log_kv_semantic_capacity_beta ${LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT} --log_kv_semantic_legacy_route ${LOG_KV_SEMANTIC_LEGACY_ROUTE} --log_kv_semantic_unified_route ${LOG_KV_SEMANTIC_UNIFIED_ROUTE} --log_kv_semantic_merge_passes ${LOG_KV_SEMANTIC_MERGE_PASSES} --log_kv_semantic_anchor_mode ${LOG_KV_SEMANTIC_ANCHOR_MODE} --log_kv_semantic_pack_backend ${LOG_KV_SEMANTIC_PACK_BACKEND} --log_kv_semantic_centroid_backend ${LOG_KV_SEMANTIC_CENTROID_BACKEND} --log_kv_semantic_replay_updates ${LOG_KV_SEMANTIC_REPLAY_UPDATES} --log_kv_alpha_exact_tokens ${LOG_KV_ALPHA_EXACT_TOKENS} --log_kv_alpha_span_max_tokens ${LOG_KV_ALPHA_SPAN_MAX_TOKENS} --log_kv_beta_novelty ${LOG_KV_BETA_NOVELTY} --log_kv_beta_adaptive_merge ${LOG_KV_BETA_ADAPTIVE_MERGE} --log_kv_gamma_level0_reinsert ${LOG_KV_GAMMA_LEVEL0_REINSERT} --log_kv_gamma_top_merge ${LOG_KV_GAMMA_TOP_MERGE} --log_kv_gamma_level_slack ${LOG_KV_GAMMA_LEVEL_SLACK} --log_kv_gamma_cue_tokens ${LOG_KV_GAMMA_CUE_TOKENS} --log_kv_gamma_literals ${LOG_KV_GAMMA_LITERALS} --log_kv_gamma_cue_guard ${LOG_KV_GAMMA_CUE_GUARD} --log_kv_gamma_query_cue ${LOG_KV_GAMMA_QUERY_CUE}"
     if [ "${LOG_KV_SEG_GAP_MAX}" != "__none__" ]; then
@@ -416,8 +441,12 @@ else
     echo "⚠️ 未在候选目录中找到 tokenizer.json/tokenizer.model: ${TOKENIZER_CANDIDATES}"
     echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
 fi
-echo "🧩 logKV train config: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, tree_chunk=${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE}, capacity_beta=${LOG_KV_SEMANTIC_CAPACITY_BETA}, hard_cap_mult=${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND}, centroid=${LOG_KV_SEMANTIC_CENTROID_BACKEND}, replay_updates=${LOG_KV_SEMANTIC_REPLAY_UPDATES})"
-echo "🧮 semantic budget: K=${LOG_KV_CLUSTER_K_MAX},B=${LOG_KV_B} -> L_alloc=${TRAIN_L_ALLOC}, persistent_entries=${TRAIN_PERSISTENT}, readout_S=${TRAIN_S}"
+if [ "${LOG_KV_DENSE_MODE}" = "true" ]; then
+    echo "🧩 dense train/eval: 普通因果注意力，评测使用完整 KV"
+else
+    echo "🧩 logKV train config: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, tree_chunk=${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE}, capacity_beta=${LOG_KV_SEMANTIC_CAPACITY_BETA}, hard_cap_mult=${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND}, centroid=${LOG_KV_SEMANTIC_CENTROID_BACKEND}, replay_updates=${LOG_KV_SEMANTIC_REPLAY_UPDATES})"
+    echo "🧮 semantic budget: K=${LOG_KV_CLUSTER_K_MAX},B=${LOG_KV_B} -> L_alloc=${TRAIN_L_ALLOC}, persistent_entries=${TRAIN_PERSISTENT}, readout_S=${TRAIN_S}"
+fi
 if [ -n "${DIAG_ARGS}" ]; then
     echo "🧪 extra eval args: ${DIAG_ARGS}"
 fi

@@ -66,7 +66,32 @@ export LOGKV_ROUTE_OVERLAP=${LOGKV_ROUTE_OVERLAP:-0}
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_MIN_NCHANNELS=4
 
-GPUS_PER_NODE=${MA_NUM_GPUS:-${LOCAL_WORLD_SIZE:-8}}
+# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); ModelArts
+# allocation is an upper bound. GPUS_PER_NODE may explicitly select fewer GPUs.
+GPUS_PER_NODE=$("${PYTHON_BIN}" - <<'PY_GPU_COUNT'
+import os
+import sys
+
+import torch
+
+visible = torch.cuda.device_count()
+if visible < 1:
+    raise SystemExit("ERROR: no CUDA GPUs are visible; check CUDA_VISIBLE_DEVICES and the CUDA runtime.")
+try:
+    allocated = int(os.environ.get("MA_NUM_GPUS") or visible)
+    available = min(visible, allocated)
+    selected = int(os.environ.get("GPUS_PER_NODE") or available)
+except ValueError:
+    raise SystemExit("ERROR: GPUS_PER_NODE and MA_NUM_GPUS must be positive integers.")
+if allocated < 1 or not 1 <= selected <= available:
+    raise SystemExit(
+        f"ERROR: GPUS_PER_NODE={selected} must be within 1..{available} "
+        f"(visible={visible}, MA_NUM_GPUS={allocated})."
+    )
+print(f"GPU detection: visible={visible}, MA_NUM_GPUS={allocated}, using={selected}", file=sys.stderr)
+print(selected)
+PY_GPU_COUNT
+) || exit 1
 NUM_NODES=${MA_NUM_HOSTS:-${GROUP_WORLD_SIZE:-1}}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 if [ -n "${MA_VJ_NAME:-}" ]; then
@@ -199,6 +224,7 @@ emit("LOG_KV_B", value_or("log_kv_B", 512))
 emit("LOG_KV_RECENT", value_or("log_kv_recent_size", 1024))
 emit("LOG_KV_PREFILL", value_or("log_kv_prefill_block", 256))
 emit("LOG_KV_SECOND_ORDER_SCALE", value_or("log_kv_second_order_scale", 1.0))
+emit("LOG_KV_DENSE_MODE", str(bool(cfg.get("log_kv_dense_mode", False))).lower())
 emit("LOG_KV_SEMANTIC", str(bool(cfg.get("log_kv_semantic_clusters", False))).lower())
 emit("LOG_KV_SEMANTIC_LEGACY_ROUTE", str(bool(cfg.get("log_kv_semantic_legacy_route", False))).lower())
 emit("LOG_KV_SEMANTIC_UNIFIED_ROUTE", str(bool(cfg.get("log_kv_semantic_unified_route", False))).lower())
@@ -341,7 +367,7 @@ for TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
     fi
 done
 
-LOG_KV_ARG_LIST=(--log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}")
+LOG_KV_ARG_LIST=(--log_kv_dense_mode "${LOG_KV_DENSE_MODE}" --log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}")
 if [ -n "${LOG_KV_SECOND_ORDER_SCALE}" ]; then
     LOG_KV_ARG_LIST+=(--log_kv_second_order_scale "${LOG_KV_SECOND_ORDER_SCALE}")
 fi
@@ -396,7 +422,11 @@ fi
 
 echo "Checkpoint: ${SAVE_DIR}"
 echo "Output dir: ${EVAL_OUTPUT_DIR}"
-echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, unified_route=${LOG_KV_SEMANTIC_UNIFIED_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND})"
+if [ "${LOG_KV_DENSE_MODE}" = "true" ]; then
+    echo "dense eval: 普通因果注意力，使用完整 KV"
+else
+    echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, unified_route=${LOG_KV_SEMANTIC_UNIFIED_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND})"
+fi
 if [ -n "${DIAG_ARGS}" ]; then
     echo "Extra eval args: ${DIAG_ARGS}"
 fi

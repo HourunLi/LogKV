@@ -50,6 +50,28 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
   bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
 ```
 
+全程 dense CPT 对照使用 `exp/qwen1.7b-32k/cpt_dense.yaml`：从 Qwen3-1.7B-Base
+初始化，沿用 Gamma cue 的 32K 数据与训练超参，独立保存为 `qwen1.7b-32k-cpt-dense`。
+`log_kv_dense_mode: true` 在训练中使用完整因果 attention，后续评测使用完整 KV；
+保留 Block activation checkpoint 与分块 LM-head loss，不启用压缩缓存或路由重放。
+该 dense 对照的推理 KV 为 O(N)，不属于 O(log N) 压缩路线。
+
+```bash
+BENCHMARKS=none NIAH_BENCHMARKS=none \
+  bash majob.sh exp/qwen1.7b-32k/cpt_dense.yaml
+```
+
+`majob.sh` 与 `eval.sh` 自动检测当前进程可见的 CUDA GPU 数量，支持 1、2、4、8 卡，
+遵守 `CUDA_VISIBLE_DEVICES`；ModelArts 的 `MA_NUM_GPUS` 作为分配上限。
+可用 `GPUS_PER_NODE=2` 限制进程数，指定数量不得超过可见卡数或分配上限。
+启动时打印检测结果，YAML 中的 `num_devices: 8` 不会覆盖 torchrun 的实际卡数。
+当前每卡 micro batch 为 1、全局 batch 为 32，单机 1/2/4/8 卡分别累积 32/16/8/4 次；
+多机按全部进程数计算。无法整除时在加载模型前报错，不静默改变全局 batch。
+
+`NIAH_ONLY=1` 只跳过主评测，仍会跑捞针；在 `majob.sh` 中也不会跳过尚未完成的训练。
+只训练需像上面一样将两个 benchmark 环境变量都设为 `none`。之后单独评测捞针可用
+`NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/cpt_dense.yaml`，默认全部 17 个任务。
+
 训练完成后只跑捞针评测（默认全部 17 个 NIAH 任务；`majob.sh` 遇到已完成的 checkpoint 会跳过训练）：
 
 ```bash

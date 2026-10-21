@@ -314,10 +314,13 @@ ORDERED_COLUMNS = [
     "niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery", "AVG_NIAH_multi",
     "niah_single_1_qend", "niah_single_1_preamble", "niah_single_1_paraphrase",
     "niah_single_2_qend", "niah_single_2_preamble", "niah_single_2_paraphrase",
-    "niah_single_3_qend", "niah_single_3_preamble", "niah_single_3_paraphrase", "AVG_NIAH_cue"
+    "niah_single_3_qend", "niah_single_3_preamble", "niah_single_3_paraphrase", "AVG_NIAH_cue",
+    # niahLogKV 泛化：值为随机英文词、不含数字的针（eval_tasks/niah_cue/*_words），取 32K。
+    "niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase", "AVG_NIAH_words"
 ]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
+NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
 
 RAW_TO_TARGET_MAP = {
     "boolq": "BoolQ", "piqa": "PIQA", "social_iqa": "SIQA", "hellaswag": "HellaSwag",
@@ -343,7 +346,7 @@ TARGET_METRIC_MAP = {
     "truthfulqa_gen": "rouge1_max", "truthfulqa_mc1": "acc", "truthfulqa_mc2": "acc",
     "SWDE": "f1", "FDA": "f1", "TriviaQA": "exact_match", "NQ": "exact_match", "DROP": "f1", "SQUAD": "exact_match",
     "niah_single_1": "32768", "niah_single_2": "32768", "niah_single_3": "32768",
-    **{task: "32768" for task in NIAH_MULTI + NIAH_CUE},
+    **{task: "32768" for task in NIAH_MULTI + NIAH_CUE + NIAH_WORDS},
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
@@ -363,9 +366,10 @@ AVG_GROUPS = {
     "AVG_NIAH": ["niah_single_1", "niah_single_2", "niah_single_3"],
     "AVG_NIAH_multi": NIAH_MULTI,
     "AVG_NIAH_cue": NIAH_CUE,
+    "AVG_NIAH_words": NIAH_WORDS,
 }
 # 新增的诊断组不计入 AVG_all，旧结果与新结果的总平均保持可比。
-DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue"}
+DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words"}
 
 # ==============================================================================
 # 3. 解析与计算核心代码
