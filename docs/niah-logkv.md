@@ -42,11 +42,22 @@ niahLogKV 建立在 attach + Alpha + Beta + Gamma 之上（见 [Gamma](gamma-log
 
 ## 3. 训练打分头
 
+训练环境用 `retention.sh` 启动（环境激活、HF/NCCL 变量、GPU 与多机检测同 `majob.sh`）。同一份评测 YAML
+先训练头、再评测；头写到 YAML 的 `log_kv_retention_heads`（或 `retention_out`）：
+
 ```bash
-torchrun --nproc_per_node=8 train_retention.py \
-  --config exp/qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml \
-  --out /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/gamma_k12_b128_p1024.pth
+bash retention.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml
+NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml
 ```
+
+- 启动前检查：YAML 的 `save_path`（或 `retention_checkpoint`）下要有 `lit_model.pth` 或
+  `step_*/lit_model.pth`，否则提示先用 `majob.sh` 训练该 checkpoint；要有输出路径，且开着 Alpha。
+- 选项都是 YAML 键 `retention_*`：`steps`（2000）、`lr`（1e-3）、`hidden`（64）、`length`（32768）、
+  `facts`（`2,8`）、`questions`（`1,3`）、`kinds`（全部）、`val_docs`（16）、`val_every`（200）、
+  `seed`（1234）、`init`、`checkpoint`、`out`、`resume`（true）；`RETENTION_ARGS='--steps 40'` 之类在命令行覆盖。
+- 已训到 `retention_steps` 的头直接跳过；中断后重跑从最近一次保存继续（保存先写临时文件再替换）。
+- tokenizer 与 `eval.sh` 一样依次找 `tokenizer_dir`、`resume_dir`、`ckpt_dir`、`checkpoints/<arch>`。
+- 开发环境也可直接 `torchrun --nproc_per_node=N train_retention.py --config <YAML>`。
 
 - 按 YAML 构建与 `eval.py` 相同的模型与缓存（LM 冻结），按 `demo.py` 的方式读 YAML 的训练数据；每步取一块
   （默认 32768 token），插入合成事实，带着正在训练的头整段 prefill。
@@ -54,9 +65,10 @@ torchrun --nproc_per_node=8 train_retention.py \
   片段（每个 token 每层只计一次），含事实 token 的片段为正样本。损失是带正样本权重（负/正样本数之比，
   上限 200）的二元交叉熵，只更新头（K/V 截断梯度）；各 rank 取不同的块，平均头的梯度。
 - 选择一直使用正在训练的头，深层看到的是推理时会看到的 K/V。
-- 每 `--val-every` 步 rank 0 在固定的留出块上报告每层把事实 token 留在精确（精确池或 recent）的比例
-  `kept_per_layer`，并保存头。第 0 步的数字就是只用 K/V 分数时的比例。
-- `--kinds` 限定值的种类（例如去掉 `uuid`，再看 niah_single_3 是否泛化）；`--init` 从已有的头继续训练。
+- 每 `retention_val_every` 步 rank 0 在固定的留出块上报告每层把事实 token 留在精确（精确池或 recent）的比例
+  `kept_per_layer`，并保存头。第 0 步的数字就是只用 K/V 分数时的比例。留出块与训练块取自同一份语料
+  （不同的打乱种子），插入的事实每块都是新生成的。
+- `retention_kinds` 限定值的种类（例如去掉 `uuid`，再看 niah_single_3 是否泛化）；`retention_init` 从已有的头开始。
 
 ## 4. 评测与 CPT
 
@@ -69,14 +81,12 @@ torchrun --nproc_per_node=8 train_retention.py \
   训练块以 0.5 的概率插入合成事实与问答。对照
   [`arc_niah_synth_k12_b128_p1024_slack0_2k.yaml`](../exp/qwen1.7b-32k/arc_niah_synth_k12_b128_p1024_slack0_2k.yaml)
   数据与结构相同，只是不用头。`demo.py` 把头文件复制到 `save_path/retention_heads.pth`。
-- CPT 之后 K/V 分布变了，在新 checkpoint 上用 `--init` 重训头，再用
-  [`eval_niah_heads_refit_p1024_slack0.yaml`](../exp/qwen1.7b-32k/eval_niah_heads_refit_p1024_slack0.yaml) 评测：
+- CPT 之后 K/V 分布变了，在新 checkpoint 上从 CPT 用的头出发重训 500 步（YAML 里的 `retention_init`、
+  `retention_steps`），再评测：
 
 ```bash
-torchrun --nproc_per_node=8 train_retention.py \
-  --config exp/qwen1.7b-32k/arc_niah_heads_k12_b128_p1024_slack0_2k.yaml --steps 500 \
-  --init /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/gamma_k12_b128_p1024.pth \
-  --out /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/niah_heads_k12_b128_p1024_slack0.pth
+BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_niah_heads_k12_b128_p1024_slack0_2k.yaml
+bash retention.sh exp/qwen1.7b-32k/eval_niah_heads_refit_p1024_slack0.yaml
 NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_refit_p1024_slack0.yaml
 ```
 
@@ -97,7 +107,7 @@ NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_refit_p1024_slack0.yam
 - 头依赖它训练时的 checkpoint 的 K/V；换 checkpoint（包括 CPT 之后）需要重训，文件 tag 用来核对。
 - 打分头的效果尚无 GPU 评测结果。
 
-测试：`tests/test_retention.py`（片段价值公式与设备相加、新头不改变选择、prefill 与逐 token 一致、
+测试：`tests/test_retention.py`（启动脚本的配置读取与 checkpoint 检查、选项解析与续训、片段价值公式与设备相加、新头不改变选择、prefill 与逐 token 一致、
 能识别针的头把针留在精确池、校验与保存/加载、回放签名、合成事实的版式与种类、训练器能分开正负样本、
 `demo.py` 的混入），`tests/test_exp_configs.py`（niah 配置只差所述开关），
 `tests/test_semantic_eval_flags.py`（启动脚本只在设置时传头文件），`tests/test_niah_cue_tasks.py`（words 针）。

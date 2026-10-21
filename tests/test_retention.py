@@ -294,3 +294,51 @@ def test_trainer_finds_the_tokenizer_like_eval_sh_and_names_a_missing_checkpoint
         tr.checkpoint_dir(str(ckpt), None)
     (ckpt / "lit_model.pth").write_text("")
     assert tr.checkpoint_dir(str(ckpt), None) == str(ckpt)
+
+
+def test_trainer_options_come_from_the_command_line_then_the_yaml(tmp_path):
+    import train_retention as tr
+    cfg = {"log_kv_retention_heads": "/h/heads.pth", "retention_steps": 500, "retention_lr": "3e-4",
+           "retention_kinds": "number,word", "retention_resume": "false"}
+    opts = tr.resolve_options(cfg, {"steps": None, "lr": 1e-2})
+    assert opts["out"] == "/h/heads.pth" and opts["steps"] == 500 and opts["lr"] == 1e-2
+    assert opts["kinds"] == "number,word" and opts["resume"] is False and opts["hidden"] == 64
+    assert tr.resolve_options({**cfg, "retention_out": "/o.pth"}, {})["out"] == "/o.pth"
+    with pytest.raises(SystemExit, match="no output path"):
+        tr.resolve_options({}, {})
+    heads = RetentionHeads(1, 1, 4, 4)
+    assert tr.resume_step(str(tmp_path / "missing.pth"), 100) == 0
+    heads.save(tmp_path / "h.pth", step=40)
+    assert tr.resume_step(str(tmp_path / "h.pth"), 100) == 40 and tr.resume_step(str(tmp_path / "h.pth"), 30) == 30
+
+
+def _launcher(tmp_path, yaml_text):
+    import os
+    import subprocess
+    import sys
+    source = (Path(__file__).resolve().parents[1] / "retention.sh").read_text()
+    start = source.index("CONFIG_FILE=$1")
+    stop = source.index("RETENTION_ARGS=${RETENTION_ARGS:-}", start)
+    config = tmp_path / "run.yaml"
+    config.write_text(yaml_text)
+    env = {**os.environ, "PYTHON_BIN": sys.executable}
+    return subprocess.run(["bash", "-c", source[start:stop] + 'echo "OUT=${RETENTION_OUT} SAVE=${SAVE_DIR}"',
+                           "bash", str(config)], capture_output=True, text=True, env=env)
+
+
+def test_retention_launcher_reads_the_yaml_and_checks_the_checkpoint(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    base = f"save_path: {ckpt}\nlog_kv_semantic_clusters: true\nlog_kv_retention_heads: {tmp_path}/heads/h.pth\n"
+    missing = _launcher(tmp_path, base)
+    assert missing.returncode == 1 and "没有 lit_model.pth" in missing.stdout
+    (ckpt / "step_400").mkdir(parents=True)
+    (ckpt / "step_400" / "lit_model.pth").write_text("x")
+    found = _launcher(tmp_path, base)
+    assert found.returncode == 0, found.stdout + found.stderr
+    assert f"OUT={tmp_path}/heads/h.pth SAVE={ckpt}" in found.stdout and (tmp_path / "heads").is_dir()
+    other = _launcher(tmp_path, base + f"retention_out: {tmp_path}/o.pth\n")
+    assert f"OUT={tmp_path}/o.pth" in other.stdout
+    no_alpha = _launcher(tmp_path, base + "log_kv_alpha_exact_tokens: 0\n")
+    assert no_alpha.returncode == 1 and "Alpha" in no_alpha.stdout
+    no_out = _launcher(tmp_path, f"save_path: {ckpt}\nlog_kv_semantic_clusters: true\n")
+    assert no_out.returncode == 1 and "retention_out" in no_out.stdout

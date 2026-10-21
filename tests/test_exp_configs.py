@@ -252,5 +252,7 @@ def test_niah_runs_differ_from_their_controls_only_by_the_named_switches(name, p
 ])
 def test_niah_head_evaluations_reuse_their_checkpoint(name, trained):
     evaluated, base = effective(name), effective(trained)
-    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} <= {"log_kv_retention_heads"}
+    changed = {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)}
+    # Besides the heads, only head-training options (read by retention.sh / train_retention.py).
+    assert {k for k in changed if not k.startswith("retention_")} <= {"log_kv_retention_heads"}
     assert evaluated["save_path"] == base["save_path"]

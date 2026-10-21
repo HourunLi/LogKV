@@ -1,7 +1,10 @@
 # niahLogKV 第一步（只评测、不重训）：在不带 cue 的 P=1024 梯子 checkpoint（arc_gamma_k12_b128_p1024_2k）上
-# 打开学习到的保留打分头。头由 train_retention.py 在同一 checkpoint 上训练：
-#   torchrun --nproc_per_node=8 train_retention.py --config exp/qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml \
-#     --out /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/gamma_k12_b128_p1024.pth
-# 与该 checkpoint 自身的评测只差这一项：不看开头 cue、不看问题。
+# 打开学习到的保留打分头，与该 checkpoint 自身的评测只差这一项：不看开头 cue、不看问题。
+# 同一份 YAML 先训练头、再评测（头写到 log_kv_retention_heads）：
+#   bash retention.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml
+#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml
 config: arc_gamma_k12_b128_p1024_2k.yaml
 log_kv_retention_heads: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/gamma_k12_b128_p1024.pth
+# 打分头训练（retention.sh / train_retention.py 读取；eval.sh、demo.py 不使用）。
+retention_steps: 2000
+retention_val_every: 200
