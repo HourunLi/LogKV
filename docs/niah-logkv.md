@@ -84,13 +84,9 @@ NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_refit_p1024_slack0.yam
 作为附加技巧单列。
 
 **泛化任务。** `eval_tasks/niah_cue` 另有三个不含数字的针：`niah_single_2_words`（RULER 模板）、
-`_words_qend`、`_words_paraphrase`，值是一个随机英文词，手写字面量规则对它们不起作用；不在默认的 NIAH
-任务列表里，需显式给出：
-
-```bash
-NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml none \
-  niah_single_2_words,niah_single_2_words_qend,niah_single_2_words_paraphrase
-```
+`_words_qend`、`_words_paraphrase`，值是一个随机英文词，手写字面量规则对它们不起作用。本分支的
+`eval.sh` 与 `majob.sh` 默认跑它们，NIAH 阶段共 20 个任务；`unused/parse_lmeval_table.py` 汇总为
+`AVG_NIAH_words`（32K，不计入 `AVG_all`）。
 
 ## 5. 限制
 
