@@ -776,6 +776,20 @@ def main(
         loggers=loggers,
     )
     fabric.launch()
+    if any(type(size) is not int or size < 1 for size in (global_batch_size, micro_batch_size)):
+        raise ValueError("global_batch_size and micro_batch_size must be positive integers")
+    distributed_micro_batch = micro_batch_size * fabric.world_size
+    if global_batch_size % distributed_micro_batch:
+        raise ValueError(
+            f"global_batch_size={global_batch_size} must be divisible by "
+            f"micro_batch_size={micro_batch_size} * world_size={fabric.world_size} "
+            f"({distributed_micro_batch}) to preserve the requested batch size"
+        )
+    gradient_accumulation_steps = global_batch_size // distributed_micro_batch
+    fabric.print(
+        f"Training batch: world_size={fabric.world_size}, micro_batch_size={micro_batch_size}, "
+        f"global_batch_size={global_batch_size}, gradient_accumulation_steps={gradient_accumulation_steps}"
+    )
     fabric.print("Tensorboard root:", tensorboard_root)
     # Checkpoint 去向尽早入日志：save_path 为相对路径时跟随作业的 cwd，
     # 训练完“找不到 checkpoint”十有八九是在另一个目录里找。save_ckpt=False
@@ -1128,7 +1142,6 @@ def main(
             f"effective_B={model.transformer.h[0].attn.kv_cache.B}, levels={model.transformer.h[0].attn.kv_cache.L_alloc})"
         )
 
-    gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
     optimizer.zero_grad(set_to_none=True)
     step_active = False
     fabric.print(
