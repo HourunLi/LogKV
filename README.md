@@ -42,7 +42,7 @@ cue 保护（开头须以换行结束、出现超过 16 次的 cue 词不计）�
 学习到的保留打分头（niahLogKV：每层一个小打分头按片段 K/V 估计不可压缩度，不看开头与问题）默认关闭，
 `train_retention.py` 训练，`eval_niah_*.yaml` 只评测、`arc_niah_*.yaml` 训练，见 [niahLogKV](docs/niah-logkv.md)。cue 在多针与改写提示下的适用边界评测见
 [Gamma 文档](docs/gamma-logkv.md)（RULER 多针任务与 `eval_tasks/niah_cue`；两个启动脚本的 NIAH 阶段默认跑全部
-17 个捞针任务）。只训练、
+20 个捞针任务，含 niahLogKV 的 3 个 words 针）。只训练、
 不触发默认的全套后续评测：
 
 ```bash
@@ -70,9 +70,9 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 
 `NIAH_ONLY=1` 只跳过主评测，仍会跑捞针；在 `majob.sh` 中也不会跳过尚未完成的训练。
 只训练需像上面一样将两个 benchmark 环境变量都设为 `none`。之后单独评测捞针可用
-`NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/cpt_dense.yaml`，默认全部 17 个任务。
+`NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/cpt_dense.yaml`，默认全部 20 个任务。
 
-训练完成后只跑捞针评测（默认全部 17 个 NIAH 任务；`majob.sh` 遇到已完成的 checkpoint 会跳过训练）：
+训练完成后只跑捞针评测（默认全部 20 个 NIAH 任务；`majob.sh` 遇到已完成的 checkpoint 会跳过训练）：
 
 ```bash
 NIAH_ONLY=1 bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml

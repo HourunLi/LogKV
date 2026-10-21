@@ -150,11 +150,7 @@ def test_repair_hf_cache_runs_on_node_zero_before_its_barrier():
 
 def test_both_launchers_default_to_every_niah_task():
     root = Path(__file__).resolve().parents[1]
-    tasks = sorted(p.stem for p in (root / "eval_tasks" / "niah_cue").glob("niah_*.yaml"))
-    # The word-valued needles (niahLogKV generalisation) are run on request only.
-    variants = [t for t in tasks if "_words" not in t]
-    assert sorted(set(tasks) - set(variants)) == ["niah_single_2_words", "niah_single_2_words_paraphrase",
-                                                  "niah_single_2_words_qend"]
+    variants = sorted(p.stem for p in (root / "eval_tasks" / "niah_cue").glob("niah_*.yaml"))
     ruler = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2",
              "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
     try:  # lm-eval's own RULER needle tasks, when it is installed here.
@@ -163,7 +159,8 @@ def test_both_launchers_default_to_every_niah_task():
         assert found == sorted(ruler)
     except ImportError:
         pass
-    assert len(variants) == 9
+    # Prompt perturbations (9) and, on niahLogKV, the word-valued needles (3).
+    assert len(variants) == 12 and sum("_words" in v for v in variants) == 3
     defaults = {}
     for script in ("majob.sh", "eval.sh"):
         source = (root / script).read_text()
@@ -174,7 +171,7 @@ def test_both_launchers_default_to_every_niah_task():
         assert "NIAH_BENCHMARKS:-${DEFAULT_NIAH_BENCHMARKS}" in source or \
             "NIAH_BENCHMARKS=${3:-${DEFAULT_NIAH_BENCHMARKS}}" in source, script
     assert defaults["majob.sh"] == defaults["eval.sh"]
-    assert sorted(defaults["eval.sh"]) == sorted(ruler + variants) and len(set(defaults["eval.sh"])) == 17
+    assert sorted(defaults["eval.sh"]) == sorted(ruler + variants) and len(set(defaults["eval.sh"])) == 20
 
 
 def test_task_selection_skips_blank_or_none_stages_and_supports_niah_only():
