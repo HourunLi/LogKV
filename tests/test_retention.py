@@ -279,3 +279,18 @@ def test_demo_inserts_facts_into_the_picked_rows_only():
     mixed = scope["_with_synthetic_facts"](rows, kit, 1.0, [1], "2,3", "1,1")
     assert mixed.shape == rows.shape and mixed.dtype == rows.dtype
     assert all(not torch.equal(mixed[b], rows[b]) for b in range(4))
+
+
+def test_trainer_finds_the_tokenizer_like_eval_sh_and_names_a_missing_checkpoint(tmp_path):
+    import train_retention as tr
+    base, ckpt = tmp_path / "base", tmp_path / "ckpt"
+    base.mkdir()
+    ckpt.mkdir()
+    (base / "tokenizer.json").write_text("{}")
+    assert tr.tokenizer_dir({"ckpt_dir": str(base)}) == str(base)
+    assert tr.tokenizer_dir({"tokenizer_dir": str(ckpt), "ckpt_dir": str(base)}) == str(base)  # first that has one
+    assert tr.tokenizer_dir({"ckpt_dir": str(ckpt)}) is None
+    with pytest.raises(SystemExit, match="no checkpoint at .*YAML save_path"):
+        tr.checkpoint_dir(str(ckpt), None)
+    (ckpt / "lit_model.pth").write_text("")
+    assert tr.checkpoint_dir(str(ckpt), None) == str(ckpt)
