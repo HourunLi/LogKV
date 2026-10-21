@@ -99,14 +99,16 @@ CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
        "arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_p1024_slack0.yaml",
        "eval_gamma_cue_guard.yaml", "eval_gamma_cue_guard_p1024_slack0.yaml",
        "eval_gamma_cue_guard_literal_p1024_slack0.yaml", "eval_gamma_query_p1024_slack0.yaml",
-       "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml"]
+       "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml",
+       "eval_gamma_cue_guard_p1024.yaml", "eval_gamma_cue_guard_query_p1024.yaml"]
 QUERY = ["eval_gamma_query_p1024_slack0.yaml", "eval_gamma_query_literal_p1024_slack0.yaml",
-         "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml"]
+         "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml", "eval_gamma_query_p1024.yaml",
+         "eval_gamma_cue_guard_query_p1024.yaml"]
 LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml",
            "eval_gamma_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_literal_p1024_slack0.yaml",
-           "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml"]
+           "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_literal_p1024.yaml"]
 GUARD = ["eval_gamma_cue_guard.yaml", "eval_gamma_cue_guard_p1024_slack0.yaml",
-         "eval_gamma_cue_guard_literal_p1024_slack0.yaml", *QUERY]
+         "eval_gamma_cue_guard_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_p1024.yaml", *QUERY]
 
 
 @pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
@@ -147,6 +149,13 @@ def test_only_query_cue_evaluations_see_the_question(name):
     ("eval_gamma_query_literal.yaml", "arc_gamma_cue_k12_b128_2k.yaml",
      {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue", "log_kv_gamma_literals"}),
     ("eval_gamma_query.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
+    # Tricks on the cue-free P=1024 ladder checkpoint, reported apart from the retention heads.
+    ("eval_gamma_cue_guard_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml",
+     {"log_kv_gamma_cue_tokens", "log_kv_gamma_cue_guard"}),
+    ("eval_gamma_query_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml",
+     {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
+    ("eval_gamma_cue_guard_query_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml",
+     {"log_kv_gamma_cue_tokens", "log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
 ])
 def test_cue_guard_evaluations_reuse_their_checkpoint(name, trained, switches):
     evaluated, base = effective(name), effective(trained)
@@ -157,7 +166,8 @@ def test_literal_experiments():
     # Eval-only: each trained checkpoint with its own ladder and cue setting, literals on.
     for name, trained in (("eval_gamma_literal.yaml", "arc_gamma_cue_k12_b128_2k.yaml"),
                           ("eval_gamma_literal_nocue.yaml", "arc_gamma_k12_b128_2k.yaml"),
-                          ("eval_gamma_literal_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml")):
+                          ("eval_gamma_literal_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml"),
+                          ("eval_gamma_literal_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml")):
         evaluated, base = effective(name), effective(trained)
         assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {"log_kv_gamma_literals"}
     assert effective("eval_gamma_literal_nocue.yaml")["log_kv_gamma_cue_tokens"] == 0
@@ -210,7 +220,8 @@ def test_combined_cue_experiments_differ_from_their_parents_only_by_the_named_sw
 HEADS = "/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/"
 NIAH_HEADS = {"eval_niah_heads_p1024.yaml": HEADS + "gamma_k12_b128_p1024.pth",
               "arc_niah_heads_k12_b128_p1024_slack0_2k.yaml": HEADS + "gamma_k12_b128_p1024.pth",
-              "eval_niah_heads_refit_p1024_slack0.yaml": HEADS + "niah_heads_k12_b128_p1024_slack0.pth"}
+              "eval_niah_heads_refit_p1024_slack0.yaml": HEADS + "niah_heads_k12_b128_p1024_slack0.pth",
+              "eval_niah_heads_heldout_p1024.yaml": HEADS + "gamma_k12_b128_p1024_heldout.pth"}
 NIAH_SYNTH = ["arc_niah_heads_k12_b128_p1024_slack0_2k.yaml", "arc_niah_synth_k12_b128_p1024_slack0_2k.yaml",
               "eval_niah_heads_refit_p1024_slack0.yaml"]
 
@@ -249,6 +260,7 @@ def test_niah_runs_differ_from_their_controls_only_by_the_named_switches(name, p
 @pytest.mark.parametrize("name, trained", [
     ("eval_niah_heads_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml"),
     ("eval_niah_heads_refit_p1024_slack0.yaml", "arc_niah_heads_k12_b128_p1024_slack0_2k.yaml"),
+    ("eval_niah_heads_heldout_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml"),
 ])
 def test_niah_head_evaluations_reuse_their_checkpoint(name, trained):
     evaluated, base = effective(name), effective(trained)
@@ -256,3 +268,10 @@ def test_niah_head_evaluations_reuse_their_checkpoint(name, trained):
     # Besides the heads, only head-training options (read by retention.sh / train_retention.py).
     assert {k for k in changed if not k.startswith("retention_")} <= {"log_kv_retention_heads"}
     assert evaluated["save_path"] == base["save_path"]
+
+
+def test_niah_heldout_heads_leave_out_the_uuid_and_word_values():
+    from litgpt.synthetic_retrieval import KINDS
+    heldout, heads = effective("eval_niah_heads_heldout_p1024.yaml"), effective("eval_niah_heads_p1024.yaml")
+    assert set(heldout["retention_kinds"].split(",")) == set(KINDS) - {"uuid", "word"}
+    assert heldout["retention_steps"] == heads["retention_steps"] and "retention_kinds" not in heads

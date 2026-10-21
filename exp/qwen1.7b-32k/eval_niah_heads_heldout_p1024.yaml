@@ -1,0 +1,7 @@
+# niahLogKV 泛化检验：与 eval_niah_heads_p1024.yaml 同一 checkpoint、同样的训练步数，但训练打分头时合成事实
+# 不含 uuid 与 word 两种值，看 niah_single_3（uuid）与 words 针是否仍被留在精确池。
+#   bash retention.sh exp/qwen1.7b-32k/eval_niah_heads_heldout_p1024.yaml
+#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_heldout_p1024.yaml
+config: eval_niah_heads_p1024.yaml
+log_kv_retention_heads: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/gamma_k12_b128_p1024_heldout.pth
+retention_kinds: number,decimal,code,name,date

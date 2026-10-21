@@ -1,0 +1,6 @@
+# niahLogKV 附加技巧（单列报告，只评测、不重训）：在不带 cue 的 P=1024 梯子 checkpoint
+# （arc_gamma_k12_b128_p1024_2k）上打开开头 cue（64 token，加 cue 保护）。
+#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_cue_guard_p1024.yaml
+config: arc_gamma_k12_b128_p1024_2k.yaml
+log_kv_gamma_cue_tokens: 64
+log_kv_gamma_cue_guard: true
