@@ -10,6 +10,10 @@ Haystack, needles, depths, answers, generation prefix and scoring are lm-eval's 
 
 Gamma cues read the opening region, so all three are expected to fall back to the
 no-cue score; RULER's own template is the case cues were built for.
+
+The *_words tasks use single_2's essay haystack with a random English word as the
+value (RULER's "words" needles): no digit for a literal rule to find, so they test
+whether a learned retention estimator generalises beyond number-like values.
 """
 from lm_eval.tasks.ruler.common_utils import DEFAULT_SEQ_LENGTHS, aggregate_metrics, get_tokenizer, process_results  # noqa: F401
 from lm_eval.tasks.ruler.niah_utils import TEMPLATE, download_dataset
@@ -26,7 +30,7 @@ PREAMBLE = (
 )
 PARAPHRASE = ("A secret value is hidden within the following text. Make sure to memorize it. "
               "I will quiz you about it afterwards.\n")
-TEMPLATES = dict(qend=QUESTION, preamble=PREAMBLE + TEMPLATE, paraphrase=PARAPHRASE + QUESTION)
+TEMPLATES = dict(ruler=TEMPLATE, qend=QUESTION, preamble=PREAMBLE + TEMPLATE, paraphrase=PARAPHRASE + QUESTION)
 # RULER rewrites these words in single-value templates ("Some" -> "A", "are" -> "is", ...); the added
 # text must not contain them, and must not name the needle's words.
 for _text in (PREAMBLE, PARAPHRASE):
@@ -86,3 +90,16 @@ def niah_single_3_preamble(**kwargs):
 
 def niah_single_3_paraphrase(**kwargs):
     return _samples("paraphrase", "essay", "uuids", **kwargs)
+
+
+# Essays with a random word as the value: RULER's own template, qend and paraphrase.
+def niah_single_2_words(**kwargs):
+    return _samples("ruler", "essay", "words", **kwargs)
+
+
+def niah_single_2_words_qend(**kwargs):
+    return _samples("qend", "essay", "words", **kwargs)
+
+
+def niah_single_2_words_paraphrase(**kwargs):
+    return _samples("paraphrase", "essay", "words", **kwargs)

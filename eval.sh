@@ -224,6 +224,8 @@ emit("LOG_KV_GAMMA_LITERALS", str(bool(value_or("log_kv_gamma_literals", False))
 emit("LOG_KV_GAMMA_CUE_GUARD", str(bool(value_or("log_kv_gamma_cue_guard", False))).lower())
 # Gamma query-aware cue default off; YAML true also takes cues from each prompt's closing question.
 emit("LOG_KV_GAMMA_QUERY_CUE", str(bool(value_or("log_kv_gamma_query_cue", False))).lower())
+# niahLogKV learned retention heads (train_retention.py output); unset = off.
+emit("LOG_KV_RETENTION_HEADS", cfg.get("log_kv_retention_heads") or "")
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
 emit("LOG_KV_CLUSTER_LAMBDA_REL", value_or("log_kv_cluster_lambda_rel", 1.0))
 emit("LOG_KV_SEG_ETA", value_or("log_kv_seg_eta", 1.0))
@@ -377,6 +379,9 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
     fi
     if [ -n "${LOG_KV_SEMANTIC_S_H_PATH}" ]; then
         LOG_KV_ARG_LIST+=(--log_kv_semantic_s_h_path "${LOG_KV_SEMANTIC_S_H_PATH}")
+    fi
+    if [ -n "${LOG_KV_RETENTION_HEADS}" ]; then
+        LOG_KV_ARG_LIST+=(--log_kv_retention_heads "${LOG_KV_RETENTION_HEADS}")
     fi
 fi
 DIAG_ARGS=${DIAG_ARGS:-}

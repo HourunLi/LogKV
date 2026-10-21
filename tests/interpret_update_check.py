@@ -40,12 +40,19 @@ def check_span_scores():
         valid = torch.rand(2, groups, 5, generator=generator) < .6
         valid[1, 0] = False  # A lane without live clusters.
         options = dict(beta_novelty=beta, centroids=centroids, centroid_valid=valid)
-        with patch.object(kv, "_triton_alpha", lambda: None):
-            expected = al.score_spans(k, v, cut, **options)
-        actual = al.score_spans(k, v, cut, **options)
-        # Sums run in another order: rounding only.
-        torch.testing.assert_close(actual, expected.float(), rtol=1e-5, atol=1e-6,
-                                   msg=f"fused span scores differ (groups={groups}, dim={dim}, beta={beta})")
+        # niahLogKV: a learned head's span values join on the device in both paths.
+        from litgpt.retention import RetentionHead
+        head = RetentionHead(groups, dim, dim, hidden=8)
+        torch.nn.init.normal_(head.out.weight, std=3., generator=generator)
+        torch.nn.init.constant_(head.out.bias, 1.)
+        for retention in (None, head):
+            with patch.object(kv, "_triton_alpha", lambda: None):
+                expected = al.score_spans(k, v, cut, retention=retention, **options)
+            actual = al.score_spans(k, v, cut, retention=retention, **options)
+            # Sums run in another order: rounding only.
+            torch.testing.assert_close(actual, expected.float(), rtol=1e-5, atol=1e-6,
+                                       msg=f"fused span scores differ (groups={groups}, dim={dim}, beta={beta}, "
+                                           f"head={retention is not None})")
 
 
 def check_stage_and_clear():

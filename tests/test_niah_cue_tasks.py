@@ -12,6 +12,7 @@ tokenizers = pytest.importorskip("tokenizers")
 
 ROOT = Path(__file__).resolve().parents[1]
 TASKS = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
+WORD_TASKS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
 WORDS = ("Paul wrote about startups and cities. Founders learn by doing hard work every day. "
          "Good ideas often look bad at first. ").split() * 400
 
@@ -60,6 +61,22 @@ def test_variants_change_only_the_prompt_around_the_haystack(ruler):
             assert text.startswith(utils.PARAPHRASE) and "special" not in opening and "magic" not in opening
 
 
+def test_word_variants_hide_a_word_in_the_essays(ruler):
+    utils, metadata = ruler
+    for name in WORD_TASKS:
+        doc = getattr(utils, name)(**dict(metadata))["test"][0]
+        text, (answer,) = doc["input"], doc["outputs"]
+        needle = re.search(r"One of the special magic words for (\S+) is: (\S+)\.", text)
+        assert needle and needle[2] == answer and not any(c.isdigit() for c in answer), name
+        assert text.rstrip().endswith(f"What is the special magic word for {needle[1]} mentioned in the provided text?")
+        if name.endswith("qend"):
+            assert text.replace(needle[0], "", 1).lstrip().startswith("Paul wrote")
+        elif name.endswith("paraphrase"):
+            assert text.startswith(utils.PARAPHRASE)
+        else:
+            assert text.startswith("A special magic word is hidden within the following text.")
+
+
 def test_eval_py_task_manager_finds_and_builds_the_variants(ruler):
     utils, metadata = ruler
     source = ROOT / "eval.py"
@@ -68,7 +85,7 @@ def test_eval_py_task_manager_finds_and_builds_the_variants(ruler):
     scope = dict(inspect=inspect, EVAL_TASKS_DIR=ROOT / "eval_tasks")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     manager = scope["_task_manager"](metadata)
-    assert set(TASKS) | {"niah_single_2"} <= set(manager.all_tasks)
+    assert set(TASKS) | set(WORD_TASKS) | {"niah_single_2"} <= set(manager.all_tasks)
 
     from lm_eval.tasks import get_task_dict
 

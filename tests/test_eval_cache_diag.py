@@ -150,7 +150,11 @@ def test_repair_hf_cache_runs_on_node_zero_before_its_barrier():
 
 def test_both_launchers_default_to_every_niah_task():
     root = Path(__file__).resolve().parents[1]
-    variants = sorted(p.stem for p in (root / "eval_tasks" / "niah_cue").glob("niah_*.yaml"))
+    tasks = sorted(p.stem for p in (root / "eval_tasks" / "niah_cue").glob("niah_*.yaml"))
+    # The word-valued needles (niahLogKV generalisation) are run on request only.
+    variants = [t for t in tasks if "_words" not in t]
+    assert sorted(set(tasks) - set(variants)) == ["niah_single_2_words", "niah_single_2_words_paraphrase",
+                                                  "niah_single_2_words_qend"]
     ruler = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2",
              "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
     try:  # lm-eval's own RULER needle tasks, when it is installed here.

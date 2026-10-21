@@ -900,6 +900,7 @@ class LogKVLM(LM):
         log_kv_gamma_literals: bool = False,
         log_kv_gamma_cue_guard: bool = False,
         log_kv_gamma_query_cue: bool = False,
+        log_kv_retention_heads: str | None = None,
         tokenizer_dir: str | None = None,
         process_group=None,
     ):
@@ -954,6 +955,7 @@ class LogKVLM(LM):
         self.log_kv_gamma_literals = bool(log_kv_gamma_literals)
         self.log_kv_gamma_cue_guard = bool(log_kv_gamma_cue_guard)
         self.log_kv_gamma_query_cue = bool(log_kv_gamma_query_cue)
+        self.log_kv_retention_heads = log_kv_retention_heads or None
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -1004,6 +1006,14 @@ class LogKVLM(LM):
         # Query-aware cue: host table of line-ending tokens, built once; each request's
         # question is cut from the last CUE_QUERY_TOKENS prompt ids only.
         self._query_line_ends = self._query_line_end_table() if self.log_kv_gamma_query_cue else None
+        # niahLogKV: frozen learned retention heads, loaded apart from the LM weights.
+        self._retention_heads = None
+        if self.log_kv_retention_heads:
+            from litgpt.retention import RetentionHeads
+            self._retention_heads = RetentionHeads.load(self.log_kv_retention_heads, device=device)
+            self.model.set_retention_heads(self._retention_heads)
+            if is_master:
+                print(f"🎯 retention heads {self.log_kv_retention_heads} (tag {self._retention_heads.tag()})")
 
         if is_master: print(f"🔄 正在加载权重...")
         checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
@@ -1103,6 +1113,7 @@ class LogKVLM(LM):
             gamma_literals=self.log_kv_gamma_literals,
             gamma_cue_guard=self.log_kv_gamma_cue_guard,
             gamma_query_cue=self.log_kv_gamma_query_cue,
+            retention_head=getattr(self, "_retention_heads", None) is not None,
         )
         if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
@@ -1580,6 +1591,9 @@ def main(
     # Gamma query-aware cue (off by default): the closing question of each generation prompt
     # (its last 64 tokens, after their first line end) is a cue too; literals then rank below cues.
     log_kv_gamma_query_cue: bool = False,
+    # niahLogKV learned retention heads (train_retention.py output); None = off. They score
+    # Alpha's exact spans query-agnostically and hold no KV.
+    log_kv_retention_heads: str | None = None,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1673,6 +1687,7 @@ def main(
     log_kv_gamma_literals = bool(_o("log_kv_gamma_literals", log_kv_gamma_literals))
     log_kv_gamma_cue_guard = bool(_o("log_kv_gamma_cue_guard", log_kv_gamma_cue_guard))
     log_kv_gamma_query_cue = bool(_o("log_kv_gamma_query_cue", log_kv_gamma_query_cue))
+    log_kv_retention_heads = _o("log_kv_retention_heads", log_kv_retention_heads) or None
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
@@ -1681,6 +1696,7 @@ def main(
         log_kv_gamma_cue_tokens = 0
         log_kv_gamma_literals = False
         log_kv_gamma_query_cue = False
+        log_kv_retention_heads = None
     if not (log_kv_gamma_cue_tokens or log_kv_gamma_query_cue):
         log_kv_gamma_cue_guard = False  # the guard only acts on cues
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
@@ -1782,7 +1798,7 @@ def main(
                 f"gamma_level0_reinsert={log_kv_gamma_level0_reinsert}, gamma_top_merge={log_kv_gamma_top_merge}, "
                 f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens}, "
                 f"gamma_literals={log_kv_gamma_literals}, gamma_cue_guard={log_kv_gamma_cue_guard}, "
-                f"gamma_query_cue={log_kv_gamma_query_cue})"
+                f"gamma_query_cue={log_kv_gamma_query_cue}, retention_heads={log_kv_retention_heads})"
             )
         if diag_active:
             print(
@@ -1860,6 +1876,7 @@ def main(
             log_kv_gamma_literals=log_kv_gamma_literals,
             log_kv_gamma_cue_guard=log_kv_gamma_cue_guard,
             log_kv_gamma_query_cue=log_kv_gamma_query_cue,
+            log_kv_retention_heads=log_kv_retention_heads,
             tokenizer_dir=tokenizer_dir,
             process_group=eval_group,
         )
@@ -2017,6 +2034,9 @@ def main(
                     "log_kv_gamma_literals": log_kv_gamma_literals,
                     "log_kv_gamma_cue_guard": log_kv_gamma_cue_guard,
                     "log_kv_gamma_query_cue": log_kv_gamma_query_cue,
+                    "log_kv_retention_heads": log_kv_retention_heads,
+                    "log_kv_retention_tag": (lm_model._retention_heads.tag()
+                                             if getattr(lm_model, "_retention_heads", None) is not None else None),
                     "results": results,
                 }
 

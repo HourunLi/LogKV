@@ -12,7 +12,7 @@ DEFAULTS = dict(log_kv_alpha_exact_tokens=256, log_kv_beta_novelty=True, log_kv_
                 log_kv_second_order_scale=1.0, log_kv_cluster_k_max=1,
                 log_kv_gamma_level0_reinsert=True, log_kv_gamma_top_merge="lightest", log_kv_gamma_level_slack=2,
                 log_kv_gamma_cue_tokens=64, log_kv_gamma_literals=False, log_kv_gamma_cue_guard=False,
-                log_kv_gamma_query_cue=False)
+                log_kv_gamma_query_cue=False, log_kv_retention_heads=None, synthetic_retrieval_prob=0.0)
 LEGACY_GAMMA = dict(log_kv_gamma_level0_reinsert=False, log_kv_gamma_top_merge="fold", log_kv_gamma_level_slack=2)
 
 
@@ -33,6 +33,7 @@ def effective(name):
         out["log_kv_beta_novelty"] = out["log_kv_beta_adaptive_merge"] = False
         out["log_kv_gamma_cue_tokens"] = 0
         out["log_kv_gamma_literals"] = out["log_kv_gamma_query_cue"] = False
+        out["log_kv_retention_heads"] = None
     if not (out["log_kv_gamma_cue_tokens"] or out["log_kv_gamma_query_cue"]):
         out["log_kv_gamma_cue_guard"] = False
     return out
@@ -76,7 +77,8 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
 
 # Eval-only literal runs re-evaluate Gamma checkpoints with the ladder they were trained with.
 GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
-    p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml", "eval_gamma_query*.yaml")
+    p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml", "eval_gamma_query*.yaml",
+                           "arc_niah_*.yaml", "eval_niah_*.yaml")
     for p in EXP.glob(pattern))
 
 
@@ -203,3 +205,52 @@ def test_combined_cue_experiments_differ_from_their_parents_only_by_the_named_sw
     names = {"expid", "save_path", "merged_state_staging_dir", "tensorboard_root"}
     run, base = effective(name), effective(parent)
     assert {k for k in set(run) | set(base) if run.get(k) != base.get(k)} - names == switches
+
+
+HEADS = "/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/"
+NIAH_HEADS = {"eval_niah_heads_p1024.yaml": HEADS + "gamma_k12_b128_p1024.pth",
+              "arc_niah_heads_k12_b128_p1024_slack0_2k.yaml": HEADS + "gamma_k12_b128_p1024.pth",
+              "eval_niah_heads_refit_p1024_slack0.yaml": HEADS + "niah_heads_k12_b128_p1024_slack0.pth"}
+NIAH_SYNTH = ["arc_niah_heads_k12_b128_p1024_slack0_2k.yaml", "arc_niah_synth_k12_b128_p1024_slack0_2k.yaml",
+              "eval_niah_heads_refit_p1024_slack0.yaml"]
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_niah_experiments_use_retention_heads_and_synthetic_facts(name):
+    cfg = effective(name)
+    assert cfg["log_kv_retention_heads"] == NIAH_HEADS.get(name), name
+    assert float(cfg["synthetic_retrieval_prob"]) == (0.5 if name in NIAH_SYNTH else 0.0), name
+
+
+@pytest.mark.parametrize("name", ["arc_niah_heads_k12_b128_p1024_slack0_2k.yaml",
+                                  "arc_niah_synth_k12_b128_p1024_slack0_2k.yaml"])
+def test_niah_runs_look_only_at_the_content(name):
+    # No opening cue, no question, no hand-written literal rule: P=1024 and slack 0 at B=128.
+    cfg = effective(name)
+    assert cfg["log_kv_gamma_cue_tokens"] == 0 and not cfg["log_kv_gamma_query_cue"] and not cfg["log_kv_gamma_literals"]
+    assert cfg["log_kv_alpha_exact_tokens"] == 1024 and cfg["log_kv_gamma_level_slack"] == 0 and int(cfg["log_kv_B"]) == 128
+    assert cfg["expid"] == "qwen1.7b-32k-" + name[len("arc_"):-len(".yaml")]
+
+
+@pytest.mark.parametrize("name, parent, switches", [
+    # The heads run and its control differ only by the heads.
+    ("arc_niah_heads_k12_b128_p1024_slack0_2k.yaml", "arc_niah_synth_k12_b128_p1024_slack0_2k.yaml",
+     {"log_kv_retention_heads"}),
+    # Both differ from the cue-free P=1024 ladder run by slack 0 and the synthetic facts.
+    ("arc_niah_synth_k12_b128_p1024_slack0_2k.yaml", "arc_gamma_k12_b128_p1024_2k.yaml",
+     {"log_kv_gamma_level_slack", "synthetic_retrieval_prob"}),
+])
+def test_niah_runs_differ_from_their_controls_only_by_the_named_switches(name, parent, switches):
+    names = {"expid", "save_path", "merged_state_staging_dir", "tensorboard_root"}
+    run, base = effective(name), effective(parent)
+    assert {k for k in set(run) | set(base) if run.get(k) != base.get(k)} - names == switches
+
+
+@pytest.mark.parametrize("name, trained", [
+    ("eval_niah_heads_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml"),
+    ("eval_niah_heads_refit_p1024_slack0.yaml", "arc_niah_heads_k12_b128_p1024_slack0_2k.yaml"),
+])
+def test_niah_head_evaluations_reuse_their_checkpoint(name, trained):
+    evaluated, base = effective(name), effective(trained)
+    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} <= {"log_kv_retention_heads"}
+    assert evaluated["save_path"] == base["save_path"]

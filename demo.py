@@ -321,6 +321,22 @@ def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     return min_lr + coeff * (max_lr - min_lr)
 
 
+def _with_synthetic_facts(train_data, kit, prob, seed, facts, questions):
+    """Insert synthetic facts and questions into some rows of a training batch (same shape)."""
+    from litgpt.synthetic_retrieval import insert_facts
+
+    rng = np.random.default_rng(seed)
+    pick = rng.random(train_data.size(0)) < prob
+    if not pick.any():
+        return train_data
+    rows = train_data.cpu().numpy().copy()
+    low, high = (int(x) for x in facts.split(","))
+    q_low, q_high = (int(x) for x in questions.split(","))
+    for b in np.flatnonzero(pick):
+        rows[b], _ = insert_facts(rows[b], rng, kit, facts=(low, high), questions=(q_low, q_high))
+    return torch.as_tensor(rows, dtype=train_data.dtype, device=train_data.device)
+
+
 def build_train_dataset(
     *,
     context_length: int,
@@ -568,6 +584,15 @@ def main(
     # Gamma query-aware cue (off by default): only evaluation prompts carry a question;
     # training accepts the switch so that majob.sh can pass one argument list to both.
     log_kv_gamma_query_cue: bool = False,
+    # niahLogKV: frozen learned retention heads (train_retention.py output) score Alpha's exact
+    # spans during CPT; None = off. They are not trained here and are not in the LM checkpoint.
+    log_kv_retention_heads: str | None = None,
+    # niahLogKV synthetic retrieval data: each training block gets facts and questions with
+    # this probability (litgpt.synthetic_retrieval); 0 = off.
+    synthetic_retrieval_prob: float = 0.0,
+    synthetic_facts: str = "2,8",
+    synthetic_questions: str = "1,3",
+    synthetic_kinds: str | None = None,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
     # ── Eval ──
@@ -664,6 +689,13 @@ def main(
     log_kv_gamma_literals = bool(_o("log_kv_gamma_literals", log_kv_gamma_literals))
     log_kv_gamma_cue_guard = bool(_o("log_kv_gamma_cue_guard", log_kv_gamma_cue_guard))
     log_kv_gamma_query_cue = bool(_o("log_kv_gamma_query_cue", log_kv_gamma_query_cue))
+    log_kv_retention_heads = _o("log_kv_retention_heads", log_kv_retention_heads) or None
+    synthetic_retrieval_prob = float(_o("synthetic_retrieval_prob", synthetic_retrieval_prob))
+    synthetic_facts = str(_o("synthetic_facts", synthetic_facts))
+    synthetic_questions = str(_o("synthetic_questions", synthetic_questions))
+    synthetic_kinds = _o("synthetic_kinds", synthetic_kinds) or None
+    if not 0.0 <= synthetic_retrieval_prob <= 1.0:
+        raise ValueError("synthetic_retrieval_prob must be in [0, 1]")
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
@@ -672,6 +704,7 @@ def main(
         log_kv_gamma_cue_tokens = 0
         log_kv_gamma_literals = False
         log_kv_gamma_query_cue = False
+        log_kv_retention_heads = None
     if not (log_kv_gamma_cue_tokens or log_kv_gamma_query_cue):
         log_kv_gamma_cue_guard = False  # the guard only acts on cues
     log_kv_profile_steps = _o("log_kv_profile_steps", log_kv_profile_steps)
@@ -917,6 +950,7 @@ def main(
             log_kv_gamma_literals=log_kv_gamma_literals,
             log_kv_gamma_cue_guard=log_kv_gamma_cue_guard,
             log_kv_gamma_query_cue=log_kv_gamma_query_cue,
+            log_kv_retention_heads=log_kv_retention_heads,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -1040,6 +1074,15 @@ def main(
             boundary_tokenizer.alpha_line_end_ids if log_kv_gamma_cue_tokens else None,
             boundary_tokenizer.gamma_literal_texts if log_kv_gamma_literals else None,
         )
+    retention_heads = None
+    if log_kv_retention_heads:
+        from litgpt.retention import RetentionHeads
+        retention_heads = RetentionHeads.load(log_kv_retention_heads, device=fabric.device)
+        model.set_retention_heads(retention_heads)
+        if fabric.global_rank == 0 and save_path:
+            # The checkpoint is only meaningful with these heads; keep a copy beside it.
+            os.makedirs(save_path, exist_ok=True)
+            shutil.copy2(log_kv_retention_heads, os.path.join(save_path, "retention_heads.pth"))
     model.enable_log_kv_training(
         batch_size=micro_batch_size,
         max_seq_length=context_length,
@@ -1086,6 +1129,7 @@ def main(
         gamma_literals=log_kv_gamma_literals,
         gamma_cue_guard=log_kv_gamma_cue_guard,
         gamma_query_cue=log_kv_gamma_query_cue,
+        retention_head=retention_heads is not None,
     )
     effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
     fabric.print(
@@ -1118,6 +1162,9 @@ def main(
         f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens}, "
         f"gamma_literals={log_kv_gamma_literals}, gamma_cue_guard={log_kv_gamma_cue_guard}, "
         f"gamma_query_cue={log_kv_gamma_query_cue}, "
+        f"retention_heads={log_kv_retention_heads}"
+        f"{'' if retention_heads is None else ' (tag ' + retention_heads.tag() + ')'}, "
+        f"synthetic_retrieval_prob={synthetic_retrieval_prob}, "
         f"effective_B={model.transformer.h[0].attn.kv_cache.B}, levels={model.transformer.h[0].attn.kv_cache.L_alloc})"
     )
 
@@ -1140,6 +1187,12 @@ def main(
         loaded_data_epoch = loaded_data_epoch.item()
     data_epoch = int(loaded_data_epoch)
     loader_iter = iter(dataloader)
+    synthetic_kit = None
+    if synthetic_retrieval_prob > 0:
+        from litgpt.synthetic_retrieval import KINDS, RetrievalKit
+        from litgpt.tokenizer import Tokenizer
+        synthetic_kit = RetrievalKit.from_tokenizer(
+            Tokenizer(tok_dir), tuple(synthetic_kinds.split(",")) if synthetic_kinds else KINDS)
 
     while global_step < max_steps and not training_finished:
         if not step_active:
@@ -1149,6 +1202,10 @@ def main(
         try:
             with logkv_timed("data", cuda=False):
                 train_data = next(loader_iter)
+                if synthetic_kit is not None:
+                    train_data = _with_synthetic_facts(train_data, synthetic_kit, synthetic_retrieval_prob,
+                                                       [data_shuffle_seed, fabric.global_rank, data_epoch,
+                                                        micro_batch_idx], synthetic_facts, synthetic_questions)
                 inputs = train_data[:, 0:context_length].contiguous().long()
                 targets = train_data[:, 1:context_length + 1].contiguous().long()
         except StopIteration:

@@ -733,6 +733,7 @@ class LogStructuredKVCache(nn.Module):
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
         gamma_query_cue: bool = False,
+        retention_head: bool = False,
     ) -> None:
         super().__init__()
 
@@ -785,6 +786,13 @@ class LogStructuredKVCache(nn.Module):
         self.literal_stream = None
         if self.gamma_literals and not alpha_exact_tokens:
             raise ValueError("gamma_literals scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
+        # Learned retention head (niahLogKV): the model attaches this layer's
+        # frozen head (litgpt.retention); its span values join the K/V scores.
+        self.retention_head = bool(retention_head)
+        object.__setattr__(self, "_retention", None)  # not a submodule: no state, no LM checkpoint
+        object.__setattr__(self, "_retention_tag", None)
+        if self.retention_head and not alpha_exact_tokens:
+            raise ValueError("retention_head scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
         self.alpha_count = 0
         if (self.beta_novelty or self.beta_adaptive_merge) and not self.alpha_exact_tokens:
             raise ValueError("BetaLogKV requires the Alpha exact-span cache (alpha_exact_tokens > 0)")
@@ -4123,7 +4131,8 @@ class LogStructuredKVCache(nn.Module):
         keys = torch.cat((self.alpha_k_raw[:, :, :width], self.recent_k_raw[:, :, :take]), dim=2)
         values = torch.cat((self.alpha_v[:, :, :width], self.recent_v[:, :, :take]), dim=2)
         device_scores = score_spans(keys, values, cut, beta_novelty=self.beta_novelty,
-                                    centroids=self.centroid, centroid_valid=self.alive)
+                                    centroids=self.centroid, centroid_valid=self.alive,
+                                    retention=self._retention_for_selection())
         scores = torch.empty(device_scores.shape, dtype=torch.float32, pin_memory=cuda)
         scores.copy_(device_scores, non_blocking=cuda)
         ready = torch.cuda.Event() if cuda else None
@@ -4147,6 +4156,23 @@ class LogStructuredKVCache(nn.Module):
         if ready is not None:
             ready.synchronize()
         return cut, scores.tolist()
+
+    def attach_retention_head(self, head) -> None:
+        """This layer's learned head (or None); kept out of the module tree."""
+        if head is not None and (head.n_groups, head.k_dim, head.v_dim) != (self.n_groups, self.k_dim, self.v_dim):
+            raise ValueError(f"retention head expects {head.n_groups} groups of {head.k_dim}/{head.v_dim} dims, "
+                             f"the cache has {self.n_groups} of {self.k_dim}/{self.v_dim}")
+        object.__setattr__(self, "_retention", head)
+        object.__setattr__(self, "_retention_tag", None if head is None else getattr(head, "tag", None))
+
+    def _retention_for_selection(self):
+        """The attached head when retention_head is on, else None."""
+        if not self.retention_head:
+            return None
+        if self._retention is None:
+            raise RuntimeError("retention_head needs the model's retention heads; call set_retention_heads() "
+                               "before set_log_kv_cache / enable_log_kv_training")
+        return self._retention
 
     def _gamma_cues(self, positions_host):
         """(value stream, per-row end of the archived block) for this flush's selection.
@@ -4200,7 +4226,8 @@ class LogStructuredKVCache(nn.Module):
                     selected = select_spans(keys, values, self._alpha_spans, self._alpha_positions,
                                             positions_host, span_ends, old_width, self.alpha_exact_tokens,
                                             self.alpha_span_max_tokens, beta_novelty=self.beta_novelty,
-                                            centroids=self.centroid, centroid_valid=self.alive, cues=cues)
+                                            centroids=self.centroid, centroid_valid=self.alive, cues=cues,
+                                            retention=self._retention_for_selection())
 
         def gather(rows, width, out=None):
             offsets = np.zeros((self.batch_size, width), dtype=np.int64)
@@ -5252,6 +5279,7 @@ class LogStructuredKVCache(nn.Module):
                          self.beta_novelty, self.beta_adaptive_merge,
                          self.gamma_level0_reinsert, self.gamma_top_merge, self.gamma_level_slack,
                          self.gamma_cue_tokens, self.gamma_literals, self.gamma_cue_guard, self.gamma_query_cue,
+                         self.retention_head, self._retention_tag,
                          tuple(map(tuple, kwargs.get("span_ends") or ())))
             if self._replaying_updates:
                 if not replay or key not in updates.flushes:
@@ -7229,6 +7257,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             cache.beta_novelty, cache.beta_adaptive_merge,
             cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack, cache.gamma_cue_tokens,
             cache.gamma_literals, cache.gamma_cue_guard, cache.gamma_query_cue,
+            cache.retention_head, cache._retention_tag,
         )
         checkpoint_log = checkpoint_route_replay(cache, signature)
         updates = (_SemanticReplayUpdates() if checkpoint_log is None else checkpoint_log[4]) if cache.semantic_replay_updates else None
@@ -7308,7 +7337,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                              cache.beta_novelty, cache.beta_adaptive_merge,
                              cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack,
                              cache.gamma_cue_tokens, cache.gamma_literals, cache.gamma_cue_guard,
-                             cache.gamma_query_cue)
+                             cache.gamma_query_cue, cache.retention_head, cache._retention_tag)
         ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors,
                               *(updates.tensors if updates is not None else ()))
         ctx.has_attention_plans = cache.semantic_clusters
@@ -7341,7 +7370,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                                  cache.beta_novelty, cache.beta_adaptive_merge,
                                  cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack,
                                  cache.gamma_cue_tokens, cache.gamma_literals, cache.gamma_cue_guard,
-                                 cache.gamma_query_cue):
+                                 cache.gamma_query_cue, cache.retention_head, cache._retention_tag):
             raise RuntimeError("semantic update configuration changed between forward and backward")
         updates = (_SemanticReplayUpdates(ctx.update_flushes, saved[ctx.update_tensor_offset:])
                    if ctx.update_flushes is not None else None)

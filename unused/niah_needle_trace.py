@@ -127,12 +127,12 @@ class Tracer:
         al.select_spans = lambda *args, **kwargs: _ACTIVE[0].select(*args, **kwargs)
 
     def select(self, k, v, old_spans, old_positions, new_positions, ends, old_width, budget, max_span,
-               *, beta_novelty=False, centroids=None, centroid_valid=None, cues=None):
+               *, beta_novelty=False, centroids=None, centroid_valid=None, cues=None, retention=None):
         cut = al.cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span)
         if cut is None:
             return al._empty_selection(len(ends))
         scores = al.score_spans(k, v, cut, beta_novelty=beta_novelty, centroids=centroids,
-                                centroid_valid=centroid_valid)
+                                centroid_valid=centroid_valid, retention=retention)
         host = scores.float().cpu().tolist()
         if cues is not None:
             host = al.add_cue_values(cut, host, *cues)

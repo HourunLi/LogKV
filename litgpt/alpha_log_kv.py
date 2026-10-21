@@ -507,18 +507,20 @@ def add_cue_values(cut, host_scores, stream, stops):
 
 
 def select_spans(k, v, old_spans, old_positions, new_positions, ends, old_width, budget, max_span,
-                 *, beta_novelty=False, centroids=None, centroid_valid=None, cues=None):
+                 *, beta_novelty=False, centroids=None, centroid_valid=None, cues=None, retention=None):
     """Indices refer to [padded old pool | current flush], shared across KV groups.
 
     A final unfinished span is mandatory until a boundary or the length cap.
     Scoring makes one batched GPU pass and one small score transfer per flush.
     Beta scores novelty against the old centroids captured before this flush.
-    ``cues`` is an optional ``(stream, stops)`` pair (Gamma cues and/or literals).
+    ``cues`` is an optional ``(stream, stops)`` pair (Gamma cues and/or literals);
+    ``retention`` an optional learned head (litgpt.retention).
     """
     cut = cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span)
     if cut is None:
         return _empty_selection(len(ends))
-    scores = score_spans(k, v, cut, beta_novelty=beta_novelty, centroids=centroids, centroid_valid=centroid_valid)
+    scores = score_spans(k, v, cut, beta_novelty=beta_novelty, centroids=centroids, centroid_valid=centroid_valid,
+                         retention=retention)
     scores = scores.cpu().tolist()
     if cues is not None:
         scores = add_cue_values(cut, scores, *cues)
@@ -567,11 +569,13 @@ def cut_spans(old_spans, old_positions, new_positions, ends, old_width, max_span
     return SpanCut(positions, token_rows, length_rows, old_rows, closed_rows)
 
 
-def score_spans(k, v, cut, *, beta_novelty=False, centroids=None, centroid_valid=None):
+def score_spans(k, v, cut, *, beta_novelty=False, centroids=None, centroid_valid=None, retention=None):
     """Device tensor of span scores in candidate order; nothing is read back.
 
     CUDA (and the Triton interpreter) scores every span in one fused kernel;
     the PyTorch form below is the reference it follows up to rounding.
+    ``retention`` is a layer's learned head (litgpt.retention); its span values
+    are added on the device, so the selection still reads back one score per span.
     """
     from litgpt.log_kv_cache import _fused_on, _triton_alpha, _upload
 
@@ -586,8 +590,14 @@ def score_spans(k, v, cut, *, beta_novelty=False, centroids=None, centroid_valid
         # One upload: token indices, then each span's start, length and row.
         metadata = _upload(np.concatenate((tokens, np.cumsum(lengths) - lengths, lengths,
                                            np.repeat(np.arange(len(sizes)), sizes))), k.device)
-        return fused.span_scores(k, v, metadata[:len(tokens)], metadata[len(tokens):].view(3, -1),
-                                 centroids if beta_novelty else None, centroid_valid if beta_novelty else None)
+        spans = metadata[len(tokens):].view(3, -1)
+        scores = fused.span_scores(k, v, metadata[:len(tokens)], spans,
+                                   centroids if beta_novelty else None, centroid_valid if beta_novelty else None)
+        if retention is not None:
+            from litgpt.retention import span_values
+            token_batch = spans[2].repeat_interleave(spans[1], output_size=len(tokens))
+            scores = scores + span_values(retention, k, v, cut, token_batch, metadata[:len(tokens)], spans[1])
+        return scores
     token_batch = np.repeat(np.arange(len(token_rows)), [len(row) for row in token_rows])
     parts = [token_batch, tokens, lengths]
     if beta_novelty:
@@ -627,6 +637,9 @@ def score_spans(k, v, cut, *, beta_novelty=False, centroids=None, centroid_valid
         novelty = nearest / key_energy.clamp_min(1e-12)
         scores = scores * .5 + novelty / (1 + novelty)
         scores = scores.topk(min(2, k.size(1)), dim=-1).values.mean(-1)
+    if retention is not None:
+        from litgpt.retention import span_values
+        scores = scores + span_values(retention, k, v, cut, index[0], index[1], span_sizes)
     return scores
 
 

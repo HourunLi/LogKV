@@ -1,0 +1,14 @@
+# niahLogKV CPT：精确池 P=1024 + level_slack 0（B=128 预算下 B′=203、4 层），不开 cue/query/字面量，
+# 精确池选择用冻结的学习保留头（eval_niah_heads_p1024.yaml 里训好的那份），训练块以 0.5 的概率插入合成事实与问答。
+# 对照组 arc_niah_synth_k12_b128_p1024_slack0_2k 只差保留头；训练超参与 arc_gamma_* 相同。
+# 训完后在新 checkpoint 上重训保留头（train_retention.py --init 旧头），用 eval_niah_heads_refit_p1024_slack0.yaml 评测。
+config: arc_gamma_k12_b128_p1024_2k.yaml
+
+expid: qwen1.7b-32k-niah_heads_k12_b128_p1024_slack0_2k
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-niah_heads_k12_b128_p1024_slack0_2k
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging-niah_heads_k12_b128_p1024_slack0_2k
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb/tb-32k-niah_heads_k12_b128_p1024_slack0_2k
+
+log_kv_gamma_level_slack: 0
+log_kv_retention_heads: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/gamma_k12_b128_p1024.pth
+synthetic_retrieval_prob: 0.5
