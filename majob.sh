@@ -57,7 +57,32 @@ export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
 # ==============================================================================
 # Distributed Training Setup
 # ==============================================================================
-GPUS_PER_NODE=${MA_NUM_GPUS:-${LOCAL_WORLD_SIZE:-8}}
+# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); ModelArts
+# allocation is an upper bound. GPUS_PER_NODE may explicitly select fewer GPUs.
+GPUS_PER_NODE=$("${PYTHON_BIN}" - <<'PY_GPU_COUNT'
+import os
+import sys
+
+import torch
+
+visible = torch.cuda.device_count()
+if visible < 1:
+    raise SystemExit("ERROR: no CUDA GPUs are visible; check CUDA_VISIBLE_DEVICES and the CUDA runtime.")
+try:
+    allocated = int(os.environ.get("MA_NUM_GPUS") or visible)
+    available = min(visible, allocated)
+    selected = int(os.environ.get("GPUS_PER_NODE") or available)
+except ValueError:
+    raise SystemExit("ERROR: GPUS_PER_NODE and MA_NUM_GPUS must be positive integers.")
+if allocated < 1 or not 1 <= selected <= available:
+    raise SystemExit(
+        f"ERROR: GPUS_PER_NODE={selected} must be within 1..{available} "
+        f"(visible={visible}, MA_NUM_GPUS={allocated})."
+    )
+print(f"GPU detection: visible={visible}, MA_NUM_GPUS={allocated}, using={selected}", file=sys.stderr)
+print(selected)
+PY_GPU_COUNT
+) || exit 1
 NUM_NODES=${MA_NUM_HOSTS:-${GROUP_WORLD_SIZE:-1}}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 if [ -n "${MA_VJ_NAME:-}" ]; then
