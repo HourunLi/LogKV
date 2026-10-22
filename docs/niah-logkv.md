@@ -59,7 +59,8 @@ NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml
   读它），`<out>.state` 是完整训练状态（头、AdamW 的矩估计、正样本权重的累计计数）。中断后用同一条命令重跑，
   从步数最大的那个继续（同步数优先 `.state`；只有 `<out>` 时只恢复头）；学习率取当前配置，可在续训时调整。
   续训的训练块换一个打乱种子（种子 + 已训步数）重新抽取，不重放中断前的顺序；插入的事实只由种子、rank 与步数
-  决定。已训到 `retention_steps` 的头直接跳过，调大 `retention_steps` 即接着训。
+  决定。已训到 `retention_steps` 的头直接跳过，调大 `retention_steps` 即接着训。启动时打印从哪个文件的第几步继续，
+  或从 0 开始的原因；`<out>` 或 `<out>.state` 存在却读不出时停下报错，不会从 0 重训并覆盖它。
 - 每个文件都先写 `.tmp` 再替换；OBS 桶挂载不允许重命名时，把写完的 `.tmp` 复制过去后再删除，续训也读能完整
   读出的 `.tmp`。
 - tokenizer 与 `eval.sh` 一样依次找 `tokenizer_dir`、`resume_dir`、`ckpt_dir`、`checkpoints/<arch>`。
