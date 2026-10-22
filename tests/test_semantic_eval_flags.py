@@ -126,3 +126,46 @@ def test_retention_heads_reach_eval_arguments_only_when_set(tmp_path, script, he
         assert args.count("--log_kv_retention_heads") == 1 and args[args.index("--log_kv_retention_heads") + 1] == heads
     else:
         assert "--log_kv_retention_heads" not in args
+
+
+def _heads_check(config, script):
+    source = (Path(__file__).resolve().parents[1] / script).read_text()
+    start = source.index("# 打分头文件由 retention.sh 写出")
+    check = source[start:source.index("    exit 1\nfi\n", start) + len("    exit 1\nfi\n")]
+    if script == "majob.sh":
+        start = source.index("read -r LOG_KV_B ")
+        read_config = source[start:source.index('\n)"', start) + len('\n)"')]
+    else:
+        start = source.index('CONFIG_EXPORTS=$("${PYTHON_BIN}" ')
+        stop = source.index('eval "${CONFIG_EXPORTS}"', start) + len('eval "${CONFIG_EXPORTS}"')
+        read_config = source[start:stop]
+    shell = '\n'.join(('set -e', 'CONFIG_FILE=$1', read_config, check, 'echo ok'))
+    env = {**os.environ, "PYTHON_BIN": sys.executable,
+           "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
+    return subprocess.run(["bash", "-c", shell, "bash", str(config)], capture_output=True, text=True, env=env)
+
+
+@pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
+def test_launchers_stop_on_missing_heads_and_name_the_yaml_that_trains_them(tmp_path, script):
+    heads = tmp_path / "heads" / "h.pth"
+    cfg = ("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\nlog_kv_cluster_k_max: 8\n"
+           "log_kv_semantic_anchor_mode: mid\n")
+    (tmp_path / "eval_niah_heads_x.yaml").write_text(cfg + f"log_kv_retention_heads: {heads}\n")
+    (tmp_path / "eval_niah_heads_other.yaml").write_text(cfg + f"log_kv_retention_heads: {heads}.other\n")
+    run = tmp_path / "arc_niah_run.yaml"
+    run.write_text(cfg + f"log_kv_retention_heads: {heads}\n")
+    result = _heads_check(run, script)
+    assert result.returncode == 1 and "ok" not in result.stdout
+    assert f"bash retention.sh {tmp_path / 'eval_niah_heads_x.yaml'}" in result.stdout
+    assert "eval_niah_heads_other.yaml" not in result.stdout
+    run.write_text(cfg + f"log_kv_retention_heads: {heads}.nobody\n")
+    result = _heads_check(run, script)
+    assert result.returncode == 1 and "先用 retention.sh 训练它" in result.stdout
+    run.write_text(cfg + f"log_kv_retention_heads: {heads}\n")
+    heads.parent.mkdir()
+    heads.write_bytes(b"")
+    assert _heads_check(run, script).stdout.strip().endswith("ok")
+    # Alpha off: eval.py ignores the heads, so a missing file does not stop the run.
+    heads.unlink()
+    run.write_text(cfg + "log_kv_alpha_exact_tokens: 0\n" + f"log_kv_retention_heads: {heads}\n")
+    assert _heads_check(run, script).stdout.strip().endswith("ok")

@@ -76,7 +76,8 @@ NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml
 - 只评测：[`eval_niah_heads_p1024.yaml`](../exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml) 在不带 cue 的
   P=1024 梯子 checkpoint（`arc_gamma_k12_b128_p1024_2k`）上打开上面训出的头，与该 checkpoint 自身的评测
   只差这一项。`eval.py`、`eval.sh`、`majob.sh` 只在 YAML 设置路径时传 `--log_kv_retention_heads`；结果 JSON
-  记录路径与 tag。
+  记录路径与 tag。文件不存在时 `eval.sh`、`majob.sh` 在加载模型前停下，并给出写出该路径的
+  `eval_niah_*.yaml` 的 `retention.sh` 命令（每个 `eval_niah_*.yaml` 训练、评测的都是它自己路径上的头）。
 - CPT：[`arc_niah_heads_k12_b128_p1024_slack0_2k.yaml`](../exp/qwen1.7b-32k/arc_niah_heads_k12_b128_p1024_slack0_2k.yaml)
   为 P=1024 + `level_slack: 0`（B=128 预算下 B′=203、4 层），不开 cue、query、字面量；精确池选择用冻结的头，
   训练块以 0.5 的概率插入合成事实与问答。对照

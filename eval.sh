@@ -411,6 +411,23 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
     fi
 fi
 DIAG_ARGS=${DIAG_ARGS:-}
+# 打分头文件由 retention.sh 写出（训练与评测共用 eval_niah_*.yaml 里的同一路径）；缺失时在加载模型前停下。
+if [ "${LOG_KV_SEMANTIC}" = "true" ] && [ "${LOG_KV_ALPHA_EXACT_TOKENS}" != "0" ] \
+        && [ -n "${LOG_KV_RETENTION_HEADS}" ] && [ "${LOG_KV_RETENTION_HEADS}" != "__none__" ] \
+        && [ ! -f "${LOG_KV_RETENTION_HEADS}" ]; then
+    echo "❌ 致命错误：打分头文件 ${LOG_KV_RETENTION_HEADS} 不存在（${CONFIG_FILE} 的 log_kv_retention_heads）。"
+    HEADS_TRAINERS=$(grep -lE "^(log_kv_retention_heads|retention_out):[[:space:]]*${LOG_KV_RETENTION_HEADS}[[:space:]]*$" \
+        "$(dirname "${CONFIG_FILE}")"/eval_niah_*.yaml 2>/dev/null || true)
+    if [ -n "${HEADS_TRAINERS}" ]; then
+        echo "   先用写出它的 YAML 训练打分头："
+        for HEADS_TRAINER in ${HEADS_TRAINERS}; do
+            echo "   bash retention.sh ${HEADS_TRAINER}"
+        done
+    else
+        echo "   先用 retention.sh 训练它：YAML 的 log_kv_retention_heads（或 retention_out）指向这个路径。"
+    fi
+    exit 1
+fi
 TOKENIZER_ARGS=""
 if [ -n "${TOKENIZER_SOURCE}" ]; then
     TOKENIZER_ARGS="--tokenizer_dir ${TOKENIZER_SOURCE}"
