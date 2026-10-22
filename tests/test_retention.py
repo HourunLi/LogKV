@@ -393,3 +393,16 @@ def test_training_state_resumes_heads_optimizer_and_positive_weight(tmp_path):
     # A newer heads file without a training state (an older run) still wins on its step.
     heads.save(out, step=20)
     assert tr.resume_step(out, 100) == (out, 20)
+
+
+def test_resume_reports_unreadable_saves_and_never_starts_over_on_them(tmp_path):
+    import train_retention as tr
+    heads, out, notes = RetentionHeads(1, 1, 4, 4), str(tmp_path / "h.pth"), []
+    Path(out + ".tmp").write_bytes(b"cut off")
+    assert tr.resume_step(out, 100, warn=notes.append) == (None, 0)  # only a cut-off write: nothing was saved
+    assert len(notes) == 1 and "h.pth.tmp" in notes[0]
+    Path(out).write_bytes(b"unreadable")
+    with pytest.raises(SystemExit, match="cannot read the saved heads"):
+        tr.resume_step(out, 100)
+    heads.save(out + ".state", step=30)
+    assert tr.resume_step(out, 100) == (out + ".state", 30)

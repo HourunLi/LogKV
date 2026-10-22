@@ -36,7 +36,6 @@ import importlib
 import inspect
 import json
 import os
-import pickle
 import shutil
 import sys
 import time
@@ -137,19 +136,30 @@ def save_training(heads, trainer, path: str, **meta) -> None:
     atomic_save(blob, path)
 
 
-def resume_step(path: str, steps: int) -> tuple[str | None, int]:
+def resume_step(path: str, steps: int, warn=None) -> tuple[str | None, int]:
     """The file to resume from and its step: the training state ``<path>.state`` or the heads ``path``
-    (each also as the .tmp a killed save left); the latest step wins, the training state on a tie."""
-    best, step = None, 0
+    (each also as the .tmp a killed save left); the latest step wins, the training state on a tie.
+
+    A file that exists but does not load is reported through ``warn``. When none loads and ``path`` or
+    ``<path>.state`` is among them, this stops instead of starting over, since the first save would
+    overwrite them.
+    """
+    best, step, unreadable = None, 0, []
     for candidate in (path + ".state", path + ".state.tmp", path, path + ".tmp"):
         if not os.path.isfile(candidate):
             continue
         try:
             meta = torch.load(candidate, map_location="cpu", weights_only=True).get("meta", {})
-        except (RuntimeError, EOFError, pickle.UnpicklingError):  # cut off mid-write
+        except Exception as error:  # cut off mid-write, or not a heads file: torch.load raises many kinds
+            unreadable.append(candidate)
+            if warn is not None:
+                warn(f"cannot read {candidate} ({type(error).__name__}: {error}); not resuming from it")
             continue
         if best is None or int(meta.get("step", 0)) > step:
             best, step = candidate, int(meta.get("step", 0))
+    if best is None and any(not name.endswith(".tmp") for name in unreadable):
+        raise SystemExit(f"cannot read the saved heads {', '.join(unreadable)}: move them away to start over, "
+                         "or pass --resume false")
     return best, min(step, steps)
 
 
@@ -209,11 +219,22 @@ def main() -> None:
     lm = build_lm(cfg, args.checkpoint, device)
     if not lm.log_kv_alpha_exact_tokens:
         raise SystemExit("retention heads score Alpha's exact spans; this config has alpha_exact_tokens = 0")
-    # Resume from the last save; every rank takes rank 0's reading of the shared file.
-    point = [*(resume_step(args.out, args.steps) if args.resume else (None, 0))]
+    # Resume from the last save: rank 0 reads the shared files and every rank takes its answer.
+    point = [None, 0]
+    if rank == 0 and args.resume:
+        try:
+            point = [*resume_step(args.out, args.steps, warn=lambda text: print(text, flush=True))]
+        except SystemExit as stop:
+            point = [None, str(stop)]
     if world > 1:
         torch.distributed.broadcast_object_list(point, 0)
+    if isinstance(point[1], str):
+        raise SystemExit(point[1])
     source, first = point
+    if rank == 0 and not first:
+        reason = ("retention_resume is false" if not args.resume else
+                  f"no save at {args.out} or {args.out}.state" if point[0] is None else f"{point[0]} holds step 0")
+        print(f"starting from step 0: {reason}", flush=True)
     if first >= args.steps:
         if rank == 0:
             print(f"heads at {args.out} already reached step {first} of {args.steps}; nothing to do", flush=True)
