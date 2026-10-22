@@ -54,9 +54,14 @@ NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml
   `step_*/lit_model.pth`，否则提示先用 `majob.sh` 训练该 checkpoint；要有输出路径，且开着 Alpha。
 - 选项都是 YAML 键 `retention_*`：`steps`（2000）、`lr`（1e-3）、`hidden`（64）、`length`（32768）、
   `facts`（`2,8`）、`questions`（`1,3`）、`kinds`（全部）、`val_docs`（16）、`val_every`（200）、
-  `seed`（1234）、`init`、`checkpoint`、`out`、`resume`（true）；`RETENTION_ARGS='--steps 40'` 之类在命令行覆盖。
-- 已训到 `retention_steps` 的头直接跳过；中断后重跑从最近一次保存继续。保存先写 `<out>.tmp` 再替换；OBS 桶挂载
-  不允许重命名时，把写完的 `.tmp` 复制到 `<out>` 后再删除，续训读两者中能完整读出、步数更大的那个。
+  `save_every`（50）、`seed`（1234）、`init`、`checkpoint`、`out`、`resume`（true）；`RETENTION_ARGS='--steps 40'` 之类在命令行覆盖。
+- 断点续训：每 `retention_save_every` 步（以及每次验证和最后一步）rank 0 写两个文件：`<out>` 只有头（评测与 CPT
+  读它），`<out>.state` 是完整训练状态（头、AdamW 的矩估计、正样本权重的累计计数）。中断后用同一条命令重跑，
+  从步数最大的那个继续（同步数优先 `.state`；只有 `<out>` 时只恢复头）；学习率取当前配置，可在续训时调整。
+  续训的训练块换一个打乱种子（种子 + 已训步数）重新抽取，不重放中断前的顺序；插入的事实只由种子、rank 与步数
+  决定。已训到 `retention_steps` 的头直接跳过，调大 `retention_steps` 即接着训。
+- 每个文件都先写 `.tmp` 再替换；OBS 桶挂载不允许重命名时，把写完的 `.tmp` 复制过去后再删除，续训也读能完整
+  读出的 `.tmp`。
 - tokenizer 与 `eval.sh` 一样依次找 `tokenizer_dir`、`resume_dir`、`ckpt_dir`、`checkpoints/<arch>`。
 - 开发环境也可直接 `torchrun --nproc_per_node=N train_retention.py --config <YAML>`。
 
@@ -67,7 +72,7 @@ NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_niah_heads_p1024.yaml
   上限 200）的二元交叉熵，只更新头（K/V 截断梯度）；各 rank 取不同的块，平均头的梯度。
 - 选择一直使用正在训练的头，深层看到的是推理时会看到的 K/V。
 - 每 `retention_val_every` 步 rank 0 在固定的留出块上报告每层把事实 token 留在精确（精确池或 recent）的比例
-  `kept_per_layer`，并保存头。第 0 步的数字就是只用 K/V 分数时的比例。留出块与训练块取自同一份语料
+  `kept_per_layer`。第 0 步的数字就是只用 K/V 分数时的比例。留出块与训练块取自同一份语料
   （不同的打乱种子），插入的事实每块都是新生成的。
 - `retention_kinds` 限定值的种类（例如去掉 `uuid`，再看 niah_single_3 是否泛化）；`retention_init` 从已有的头开始。
 

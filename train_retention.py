@@ -17,8 +17,13 @@ through the frozen model with the heads attached and trains every layer's head
 on the spans each flush archives (litgpt.retention_train). Ranks take
 different blocks and average the head gradients. Every ``val_every`` steps
 rank 0 reports, on fixed held-out blocks, the fraction of fact tokens each
-layer kept exact, and saves the heads; a restarted job resumes from the last
-save (``retention_resume``), and a finished one exits at once.
+layer kept exact.
+
+Every ``save_every`` steps (and at each report and the last step) rank 0
+writes the heads to ``out`` and the full training state (heads, optimizer,
+the positive weight's running counts) to ``<out>.state``. A restarted job
+resumes from the latest of the two (``retention_resume``); a finished one
+exits at once.
 
 ``kinds`` limits the value kinds that appear in the facts, e.g. leave out
 ``uuid`` to test on niah_single_3 values the heads never saw.
@@ -65,7 +70,8 @@ def checkpoint_dir(resolved: str, requested: str | None) -> str:
 # Options: (default, type); each reads retention_<name> from the YAML unless given on the command line.
 OPTIONS = dict(out=(None, str), init=(None, str), checkpoint=(None, str), steps=(2000, int), lr=(1e-3, float),
                hidden=(64, int), length=(32768, int), facts=("2,8", str), questions=("1,3", str), kinds=(None, str),
-               val_docs=(16, int), val_every=(200, int), seed=(1234, int), resume=(True, bool))
+               val_docs=(16, int), val_every=(200, int), save_every=(50, int), seed=(1234, int),
+               resume=(True, bool))
 
 
 def load_config(config: str) -> dict:
@@ -108,14 +114,14 @@ def build_lm(cfg: dict, checkpoint: str | None, device: str):
     return lm
 
 
-def save_heads(heads, path: str, **meta) -> None:
+def atomic_save(blob: dict, path: str) -> None:
     """Write ``path`` through ``path.tmp``, so a killed job always leaves one complete file.
 
     A bucket mount (OBS) refuses the rename; the complete .tmp is then copied over
     ``path`` and removed only after the copy.
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    heads.save(path + ".tmp", **meta)
+    torch.save(blob, path + ".tmp")
     try:
         os.replace(path + ".tmp", path)
     except OSError:
@@ -124,10 +130,18 @@ def save_heads(heads, path: str, **meta) -> None:
             os.remove(path + ".tmp")
 
 
+def save_training(heads, trainer, path: str, **meta) -> None:
+    """The training state at ``<path>.state`` (heads + optimizer + counts), then the heads alone at ``path``."""
+    blob = heads.blob(**meta)
+    atomic_save({**blob, "trainer": trainer.state_dict()}, path + ".state")
+    atomic_save(blob, path)
+
+
 def resume_step(path: str, steps: int) -> tuple[str | None, int]:
-    """The saved heads to resume from and the step they reached: ``path``, or the .tmp a killed save left."""
+    """The file to resume from and its step: the training state ``<path>.state`` or the heads ``path``
+    (each also as the .tmp a killed save left); the latest step wins, the training state on a tie."""
     best, step = None, 0
-    for candidate in (path, path + ".tmp"):
+    for candidate in (path + ".state", path + ".state.tmp", path, path + ".tmp"):
         if not os.path.isfile(candidate):
             continue
         try:
@@ -173,6 +187,7 @@ def main() -> None:
     p.add_argument("--kinds", default=None, help="comma-separated value kinds (default: all)")
     p.add_argument("--val-docs", type=int, default=None)
     p.add_argument("--val-every", type=int, default=None)
+    p.add_argument("--save-every", type=int, default=None, help="steps between saves of the training state")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--resume", default=None, choices=("true", "false"))
     p.add_argument("--device", default="cuda")
@@ -195,11 +210,10 @@ def main() -> None:
     if not lm.log_kv_alpha_exact_tokens:
         raise SystemExit("retention heads score Alpha's exact spans; this config has alpha_exact_tokens = 0")
     # Resume from the last save; every rank takes rank 0's reading of the shared file.
-    source, first = resume_step(args.out, args.steps) if args.resume else (None, 0)
+    point = [*(resume_step(args.out, args.steps) if args.resume else (None, 0))]
     if world > 1:
-        box = torch.tensor([first], device=device)
-        torch.distributed.broadcast(box, 0)
-        first = int(box.item())
+        torch.distributed.broadcast_object_list(point, 0)
+    source, first = point
     if first >= args.steps:
         if rank == 0:
             print(f"heads at {args.out} already reached step {first} of {args.steps}; nothing to do", flush=True)
@@ -212,8 +226,6 @@ def main() -> None:
     model = lm.model
     if first:
         heads = RetentionHeads.load(source)
-        if rank == 0:
-            print(f"resuming the heads at {source} from step {first}", flush=True)
     elif args.init:
         heads = RetentionHeads.load(args.init)
     else:
@@ -222,6 +234,13 @@ def main() -> None:
     model.set_retention_heads(heads)
     lm._retention_heads = heads
     trainer = HeadTrainer(heads, lr=args.lr)
+    if first:
+        state = torch.load(source, map_location="cpu", weights_only=True).get("trainer")
+        if state is not None:
+            trainer.load_state_dict(state)
+        if rank == 0:
+            print(f"resuming from step {first}: {source} "
+                  f"({'heads, optimizer and positive weight' if state is not None else 'heads only'})", flush=True)
     facts, questions = _pair(args.facts), _pair(args.questions)
 
     def document(stream, rng):
@@ -251,13 +270,17 @@ def main() -> None:
         layers = np.nanmean(np.asarray(recalls), axis=0)
         print(json.dumps(dict(step=step, val=summary, kept_per_layer=[round(x, 3) for x in layers],
                               kept_mean=round(float(np.nanmean(layers)), 4))), flush=True)
-        save_heads(heads, args.out, config=args.config, checkpoint=args.checkpoint or cfg.get("save_path"),
-                   step=step, steps=args.steps, kinds=list(kinds), facts=list(facts), tag=heads.tag())
         return layers
+
+    def save(step):
+        save_training(heads, trainer, args.out, config=args.config,
+                      checkpoint=args.checkpoint or cfg.get("save_path"), step=step, steps=args.steps,
+                      kinds=list(kinds), facts=list(facts), tag=heads.tag())
 
     with trainer:
         if rank == 0 and not first:
             validate(0)  # A fresh head scores below the floor (the K/V-only pool); --init: the starting heads.
+            save(0)
         start = time.time()
         for step in range(first + 1, args.steps + 1):
             forward(*document(data, np.random.default_rng([args.seed, rank, step])))
@@ -268,6 +291,8 @@ def main() -> None:
                 trainer.reset_stats()
             if rank == 0 and (step % args.val_every == 0 or step == args.steps):
                 validate(step)
+            if rank == 0 and (step % args.save_every == 0 or step % args.val_every == 0 or step == args.steps):
+                save(step)
     if world > 1:
         torch.distributed.barrier()
         torch.distributed.destroy_process_group()
