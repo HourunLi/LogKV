@@ -318,13 +318,13 @@ def test_heads_save_without_rename_and_resume_from_a_cut_off_save(tmp_path, monk
     import train_retention as tr
     heads = RetentionHeads(1, 1, 4, 4)
     out = str(tmp_path / "sub" / "h.pth")
-    tr.save_heads(heads, out, step=20)
+    tr.atomic_save(heads.blob(step=20), out)
     assert tr.resume_step(out, 100) == (out, 20) and not os.path.exists(out + ".tmp")
 
     def no_rename(src, dst):  # an OBS bucket mount
         raise PermissionError(1, "Operation not permitted")
     monkeypatch.setattr(tr.os, "replace", no_rename)
-    tr.save_heads(heads, out, step=40)
+    tr.atomic_save(heads.blob(step=40), out)
     assert tr.resume_step(out, 100) == (out, 40) and not os.path.exists(out + ".tmp")
     assert RetentionHeads.load(out).tag() == heads.tag()
     # killed while copying over the old file: the complete .tmp wins
@@ -363,3 +363,33 @@ def test_retention_launcher_reads_the_yaml_and_checks_the_checkpoint(tmp_path):
     assert no_alpha.returncode == 1 and "Alpha" in no_alpha.stdout
     no_out = _launcher(tmp_path, f"save_path: {ckpt}\nlog_kv_semantic_clusters: true\n")
     assert no_out.returncode == 1 and "retention_out" in no_out.stdout
+
+
+def test_training_state_resumes_heads_optimizer_and_positive_weight(tmp_path):
+    import train_retention as tr
+    torch.manual_seed(0)
+    heads = RetentionHeads(2, 1, 4, 4, hidden=8)
+    trainer = HeadTrainer(heads, lr=1e-2)
+    for p in heads.parameters():
+        p.grad = torch.randn_like(p)
+    trainer.step()
+    trainer.counts += (90., 3.)
+    out = str(tmp_path / "h.pth")
+    tr.save_training(heads, trainer, out, step=10)
+    assert tr.resume_step(out, 100) == (out + ".state", 10)  # a tie goes to the training state
+    assert RetentionHeads.load(out).tag() == RetentionHeads.load(out + ".state").tag() == heads.tag()
+
+    resumed = RetentionHeads.load(out + ".state")
+    again = HeadTrainer(resumed, lr=3e-3)
+    again.load_state_dict(torch.load(out + ".state", map_location="cpu", weights_only=True)["trainer"])
+    assert np.array_equal(again.counts, trainer.counts)
+    assert again.optimizer.param_groups[0]["lr"] == 3e-3  # the configured rate, not the saved one
+    before, after = trainer.optimizer.state_dict()["state"], again.optimizer.state_dict()["state"]
+    assert before.keys() == after.keys()
+    for key in before:
+        assert torch.equal(before[key]["exp_avg"], after[key]["exp_avg"])
+        assert torch.equal(before[key]["exp_avg_sq"], after[key]["exp_avg_sq"])
+        assert float(before[key]["step"]) == float(after[key]["step"]) == 1.
+    # A newer heads file without a training state (an older run) still wins on its step.
+    heads.save(out, step=20)
+    assert tr.resume_step(out, 100) == (out, 20)

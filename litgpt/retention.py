@@ -81,9 +81,13 @@ class RetentionHeads(nn.Module):
             digest.update(tensor.detach().float().cpu().numpy().tobytes())
         return digest.hexdigest()[:12]
 
-    def save(self, path, **meta) -> None:
+    def blob(self, **meta) -> dict:
+        """What ``save`` writes: shape, CPU weights and metadata (``load`` ignores any other keys)."""
         state = {name: tensor.detach().cpu() for name, tensor in self.state_dict().items()}
-        torch.save({"shape": self.shape, "state": state, "meta": meta}, path)
+        return {"shape": self.shape, "state": state, "meta": meta}
+
+    def save(self, path, **meta) -> None:
+        torch.save(self.blob(**meta), path)
 
     @classmethod
     def load(cls, path, device=None) -> "RetentionHeads":

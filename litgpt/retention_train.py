@@ -98,6 +98,18 @@ class HeadTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
 
+    def state_dict(self) -> dict:
+        """Optimizer state and the running counts behind the positive weight (for resuming)."""
+        return {"optimizer": self.optimizer.state_dict(), "counts": [float(c) for c in self.counts]}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restores the moments and counts; the learning rate stays the one this trainer was built with."""
+        lrs = [group["lr"] for group in self.optimizer.param_groups]
+        self.optimizer.load_state_dict(state["optimizer"])
+        for group, lr in zip(self.optimizer.param_groups, lrs):
+            group["lr"] = lr
+        self.counts = np.asarray(state["counts"], dtype=np.float64)
+
     def summary(self) -> dict:
         s = self.stats
         negatives = max(s["spans"] - s["positives"], 1)
