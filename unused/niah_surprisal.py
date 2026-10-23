@@ -25,6 +25,9 @@ Launch it in the training environment with diag.sh (majob.sh's environment, one 
 
     bash diag.sh unused/niah_surprisal.py --config exp/qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml \\
         --tasks niah_single_2,niah_single_2_words,niah_single_2_words_qend --samples 32 --out surprisal.jsonl
+
+``--save-surprisal <file>.npz`` also keeps every prompt's ids and token surprisal (with the needle's
+positions and the cache settings) for the CPU replay of exact-pool policies, unused/pool_policy_sim.py.
 """
 from __future__ import annotations
 
@@ -178,6 +181,53 @@ def summarize(task, records, budgets=BUDGETS):
               f"fraction that fits {fits}")
 
 
+class SurprisalStore:
+    """Token ids and surprisal of every prompt or block, saved with the cache settings a replay needs.
+
+    ``add`` takes one sequence and its fields (scalars or strings); ``save`` writes one .npz with the
+    concatenated ``ids`` / ``surprisal``, ``offsets`` (sequence i is ``offsets[i]:offsets[i + 1]``), one
+    array per field, and ``meta`` (JSON: recent window, flush granularity, span cap, exact pool,
+    span-boundary token ids, config). ``load`` reads it back as (meta, list of per-sequence dicts).
+    """
+
+    def __init__(self, path, **meta) -> None:
+        self.path, self.meta, self.rows = path, meta, []
+
+    def add(self, ids, surprisal, **fields) -> None:
+        self.rows.append((np.asarray(ids, dtype=np.int32), np.asarray(surprisal, dtype=np.float32), fields))
+
+    def save(self) -> None:
+        if self.path is None or not self.rows:
+            return
+        Path(self.path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+        lengths = [len(ids) for ids, _, _ in self.rows]
+        fields = {name: np.asarray([f[name] for _, _, f in self.rows]) for name in self.rows[0][2]}
+        np.savez_compressed(self.path, ids=np.concatenate([r[0] for r in self.rows]),
+                            surprisal=np.concatenate([r[1] for r in self.rows]),
+                            offsets=np.concatenate(([0], np.cumsum(lengths))), meta=json.dumps(self.meta), **fields)
+
+    @staticmethod
+    def load(path):
+        data = np.load(path, allow_pickle=False)
+        meta, offsets = json.loads(str(data["meta"])), data["offsets"]
+        names = [k for k in data.files if k not in ("ids", "surprisal", "offsets", "meta")]
+        rows = []
+        for i in range(len(offsets) - 1):
+            a, b = int(offsets[i]), int(offsets[i + 1])
+            row = {name: data[name][i].item() for name in names}
+            row.update(ids=data["ids"][a:b].astype(np.int64), surprisal=data["surprisal"][a:b].astype(np.float64))
+            rows.append(row)
+        return meta, rows
+
+
+def cache_settings(lm, config: str) -> dict:
+    """The LogKV settings an offline replay of the exact pool needs (``SurprisalStore`` meta)."""
+    return dict(config=config, dense=bool(lm.log_kv_dense_mode), recent=int(lm.log_kv_recent_size),
+                flush=int(lm.log_kv_semantic_flush_granularity), max_span=int(lm.log_kv_alpha_span_max_tokens),
+                pool=int(lm.log_kv_alpha_exact_tokens or 0),
+                boundary_ids=sorted(int(i) for i in lm.tokenizer.alpha_span_boundary_ids))
+
+
 def niah_samples(task, hf_tokenizer, length, count):
     """lm-eval's samples for ``task`` (RULER generator; the niah_cue templates for the variants)."""
     sys.path.insert(0, str(ROOT / "eval_tasks" / "niah_cue"))
@@ -216,6 +266,8 @@ def main():
     p.add_argument("--samples", type=int, default=32, help="samples per task")
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", default="niah_surprisal.jsonl")
+    p.add_argument("--save-surprisal", default=None,
+                   help=".npz of every prompt's ids and token surprisal, for unused/pool_policy_sim.py")
     args = p.parse_args()
 
     import train_retention as tr
@@ -232,6 +284,7 @@ def main():
     max_span, recent = int(lm.log_kv_alpha_span_max_tokens), int(lm.log_kv_recent_size)
     print(f"spans capped at {max_span} tokens; recent window {recent}; "
           f"{'dense' if lm.log_kv_dense_mode else 'LogKV'} cache from {args.config}", flush=True)
+    store = SurprisalStore(args.save_surprisal, **cache_settings(lm, args.config))
     Path(args.out).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as out:
         for task in args.tasks.split(","):
@@ -245,6 +298,9 @@ def main():
                 record = analyse(np.asarray(ids), surprisal, boundary, max_span, recent, needle, value,
                                  lambda t: lm.tokenizer.decode(torch.as_tensor(t)))
                 record.update(task=task, index=sample["index"], depth=round(depth, 4), value=text)
+                store.add(ids, surprisal, task=task, index=int(sample["index"]), depth=float(depth),
+                          needle_start=int(needle[0]), needle_stop=int(needle[-1]) + 1,
+                          value_start=int(value[0]), value_stop=int(value[-1]) + 1)
                 out.write(json.dumps(record) + "\n")
                 out.flush()
                 records.append(record)
@@ -254,6 +310,7 @@ def main():
                       f"seconds={time.time() - start:.1f}",
                       flush=True)
             summarize(task, records)
+            store.save()  # after every task, so an interrupted run keeps what it computed
 
 
 if __name__ == "__main__":

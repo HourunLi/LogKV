@@ -150,10 +150,33 @@ bash diag.sh unused/reuse_label_stats.py --config exp/qwen1.7b-32k/arc_gamma_k12
   报告正 token 占比、含正 token 的片段数与 token 数、能否装进精确池、首次与复用处的惊异度、LogKV 缓存自己的
   选择留住正 token 的比例（对比所有已归档 token），以及正 n-gram 的种类（数字、大写词、代码符号、小写词），并打印例子。
   标签不涉及任何句式或任务。
+- 两个脚本加 `--save-surprisal <文件>.npz` 时另存每段序列的 token id 与惊异度（NIAH 还存针与值的位置），并记下
+  recent 窗口、flush 粒度、片段上限、精确池与片段边界 token，供下面的离线重放使用。
+
+**精确池策略的离线重放**（`unused/pool_policy_sim.py`，只用 CPU、不加载模型）读上面的 .npz，按缓存的节奏重放：
+token 逐个进入，攒满 recent + flush 后最早的 flush 个离开 recent 窗口，完全离开的候选片段与池中片段一起按价值整段
+贪心装满 P（池中片段乘 1.1），没装下的即并入梯子、不再回来。片段价值
+
+  v(T) = (I + β·M(T)) · g(T − last(T))
+
+- I：准入时的信息量，片段的惊异度分数（mean、top4、topq 即最高四分之一的均值、max），或恒为 1（只看新近的基准）。
+- g：遗忘，none、幂律 (1 + age/τ)^(−α) 或指数 exp(−age/τ)。
+- last(T)：片段末尾；打开复用时取 T 之前它的"有信息的 n-gram"（片段内惊异度不低于 `--reuse-bits` 的 n-gram）
+  最近一次再出现的位置（刷新）。M(T)：复用加分时这些再出现的惊异度之和。
+- 全部因果：T 时的价值只用 T 之前的 token。默认网格为 3 种分数 × 6 种遗忘 × 3 种复用（无、刷新、加分）再加新近基准，
+  共 55 种策略。
+
+报告每种策略：NIAH 提示结束时针的值仍为精确的比例（按任务，以及针在前三分之一的样本）；自然块上远距离复用的
+命中率（`reuse_label_stats.py` 的标签：b 读入时 a 处的那份是否仍为精确），单块与 `--concat` 块拼接成的长流；
+池中 token 所在片段在保留期间被复用过的比例。
+
+```bash
+python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --concat 4 --out <输出>.json
+```
 
 测试：`tests/test_retention.py`（启动脚本的配置读取与 checkpoint 检查、选项解析与续训、片段价值公式与设备相加、新头不改变选择、prefill 与逐 token 一致、
 能识别针的头把针留在精确池、校验与保存/加载、回放签名、合成事实的版式与种类、训练器能分开正负样本、
 `demo.py` 的混入），`tests/test_exp_configs.py`（niah 配置只差所述开关），
 `tests/test_semantic_eval_flags.py`（启动脚本只在设置时传头文件），`tests/test_niah_cue_tasks.py`（words 针），
 `tests/test_surprisal_diag.py`（惊异度与逐位 log-softmax 一致、recent 窗口内缓存与不缓存一致、片段切分、针的名次、
-复用对与阈值、`diag.sh`）。
+复用对与阈值、`diag.sh`、惊异度存档的读写、离线重放的准入、遗忘与复用刷新、远距离复用命中）。
