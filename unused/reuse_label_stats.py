@@ -27,6 +27,9 @@ and prints examples for one (n, threshold) pair.
 
     bash diag.sh unused/reuse_label_stats.py --config exp/qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml \\
         --blocks 16 --out reuse_labels.json
+
+``--save-surprisal <file>.npz`` also keeps every block's ids and token surprisal (with the cache
+settings) for the CPU replay of exact-pool policies, unused/pool_policy_sim.py.
 """
 from __future__ import annotations
 
@@ -42,7 +45,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "unused"))
-from niah_surprisal import cut, token_surprisal  # noqa: E402
+from niah_surprisal import SurprisalStore, cache_settings, cut, token_surprisal  # noqa: E402
 
 CODE_CHARS = set("_(){}[]=<>/\\;:$#@|*&^%~`")
 CAPITALISED = re.compile(r"(?:^|\s)[A-Z][a-z]")
@@ -186,6 +189,8 @@ def main():
     p.add_argument("--examples", type=int, default=40)
     p.add_argument("--device", default="cuda")
     p.add_argument("--out", default="reuse_labels.json")
+    p.add_argument("--save-surprisal", default=None,
+                   help=".npz of every block's ids and token surprisal, for unused/pool_policy_sim.py")
     args = p.parse_args()
 
     import torch
@@ -206,6 +211,7 @@ def main():
 
     print(f"gap {gap} tokens; spans capped at {max_span}; exact pool {pool}; "
           f"{'dense' if lm.log_kv_dense_mode else 'LogKV'} cache from {args.config}", flush=True)
+    store = SurprisalStore(args.save_surprisal, **cache_settings(lm, args.config), seed=args.seed)
     rows = {(n, t): [] for n in ngrams for t in thresholds}
     examples = []
     data = tr.blocks(cfg, args.seed)
@@ -214,6 +220,7 @@ def main():
         ids = np.asarray(next(data)[:args.length], dtype=np.int64)
         surprisal = token_surprisal(lm.model, ids, prepare=lm._set_eval_cache)
         kept = exact_masks(lm.model, len(ids)) if not lm.log_kv_dense_mode else None
+        store.add(ids, surprisal, block=index)
         lm._reset_eval_cache()
         for n in ngrams:
             for threshold in thresholds:
@@ -227,6 +234,7 @@ def main():
                                              context=decode(ids[max(0, a - 12):a + n + 4])))
         print(f"block {index}: median token surprisal {np.nanmedian(surprisal):.2f} bits, "
               f"seconds={time.time() - start:.1f}", flush=True)
+    store.save()
     grid = {key: aggregate(value) for key, value in rows.items()}
     report(grid, pool)
     print(f"\nexamples (n={example_n}, >= {example_t:g} bits):")

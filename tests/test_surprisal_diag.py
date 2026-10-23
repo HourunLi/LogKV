@@ -117,3 +117,67 @@ def test_diag_launcher_is_majobs_environment_then_the_script(tmp_path):
     assert ok.returncode == 0 and "args ['--x', '1']" in ok.stdout
     missing = subprocess.run(["bash", "-c", tail, "bash"], capture_output=True, text=True, env=env)
     assert missing.returncode == 1 and "未提供要运行的脚本" in missing.stdout
+
+
+import pool_policy_sim as ps  # noqa: E402
+
+
+def test_surprisal_store_round_trips_sequences_fields_and_settings(tmp_path):
+    path = tmp_path / "s.npz"
+    store = ns.SurprisalStore(str(path), recent=16, flush=8, max_span=4, pool=8, boundary_ids=[3])
+    store.add([1, 2, 3], [np.nan, 1., 2.], task="niah_single_2", index=0, depth=.5)
+    store.add([4, 5], [np.nan, 3.], task="niah_single_3", index=1, depth=.25)
+    store.save()
+    meta, rows = ns.SurprisalStore.load(str(path))
+    assert meta["flush"] == 8 and meta["boundary_ids"] == [3]
+    assert rows[1]["ids"].tolist() == [4, 5] and rows[1]["surprisal"][1] == 3. and math.isnan(rows[0]["surprisal"][0])
+    assert rows[0]["task"] == "niah_single_2" and rows[1]["depth"] == .25 and rows[1]["index"] == 1
+
+
+def _stream(n=400, needle=40, reuse_at=None, **kwargs):
+    """Spans of 4 tokens (boundary id 3); a surprising needle span at ``needle``; a repeat of its
+    rare bigram at ``reuse_at``; everything else 1 bit."""
+    ids = np.full(n, 1, dtype=np.int64)
+    ids[3::4] = 3
+    s = np.full(n, 1.)
+    s[0] = np.nan
+    ids[needle:needle + 2] = [20, 21]
+    s[needle:needle + 2] = 9.
+    if reuse_at is not None:
+        ids[reuse_at:reuse_at + 2] = [20, 21]
+    boundary = np.zeros(32, dtype=bool)
+    boundary[3] = True
+    return ps.Stream(ids, s, boundary, 4, reuse_n=2, reuse_bits=6., label_n=2, label_bits=6., recent=16,
+                     value_start=needle, value_stop=needle + 2, task="t", depth=needle / n, **kwargs)
+
+
+def test_surprisal_admission_keeps_the_needle_and_recency_forgets_it():
+    stream = _stream()
+    kept = ps.replay(stream, ps.Policy(score="mean"), pool=8, recent=16, flush=8)
+    assert ps.needle_kept(stream, kept) and sum(stream.stops[s] - stream.starts[s] for s in kept["kept"]) <= 8
+    recency = ps.replay(stream, ps.Policy(score="recency", decay="exp", tau=16.), pool=8, recent=16, flush=8)
+    assert not ps.needle_kept(stream, recency)
+
+
+def test_forgetting_drops_an_old_needle_and_reuse_keeps_it():
+    def run(reuse_at=None, **policy):
+        stream = _stream(reuse_at=reuse_at)
+        return ps.needle_kept(stream, ps.replay(stream, ps.Policy(**policy), pool=4, recent=16, flush=8))
+    # A one-span pool. The needle span averages 5 bits, every other span 1 bit; with tau = 150 the
+    # needle falls below a fresh span about 270 tokens after it was written.
+    assert run(score="mean")                                                       # no forgetting
+    assert not run(score="mean", decay="exp", tau=150.)                            # forgotten by the end
+    assert run(reuse_at=290, score="mean", decay="exp", tau=150., reuse="refresh")  # its bigram recurs in time
+    assert not run(reuse_at=290, score="mean", decay="exp", tau=150.)              # the same, reuse ignored
+
+
+def test_far_reuse_hits_count_the_copy_exact_when_it_is_read():
+    stream = _stream(reuse_at=380)
+    assert stream.events_a.tolist() == [40] and stream.events_b.tolist() == [380]  # n-gram starts
+    assert ps.replay(stream, ps.Policy(score="mean"), pool=8, recent=16, flush=8)["hits"] == 1
+    assert ps.replay(stream, ps.Policy(score="recency", decay="exp", tau=16.), 8, 16, 8)["hits"] == 0
+
+
+def test_default_grid_names_are_unique():
+    names = [p.name for p in ps.default_policies()]
+    assert len(names) == len(set(names)) == 55
