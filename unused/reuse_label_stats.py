@@ -34,6 +34,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -209,6 +210,7 @@ def main():
     examples = []
     data = tr.blocks(cfg, args.seed)
     for index in range(args.blocks):
+        start = time.time()
         ids = np.asarray(next(data)[:args.length], dtype=np.int64)
         surprisal = token_surprisal(lm.model, ids, prepare=lm._set_eval_cache)
         kept = exact_masks(lm.model, len(ids)) if not lm.log_kv_dense_mode else None
@@ -223,7 +225,8 @@ def main():
                         examples.append(dict(block=index, position=a, gap=b - a, s_first=round(s_first, 2),
                                              s_next=round(s_next, 2), text=decode(ids[a:a + n]),
                                              context=decode(ids[max(0, a - 12):a + n + 4])))
-        print(f"block {index}: median token surprisal {np.nanmedian(surprisal):.2f} bits", flush=True)
+        print(f"block {index}: median token surprisal {np.nanmedian(surprisal):.2f} bits, "
+              f"seconds={time.time() - start:.1f}", flush=True)
     grid = {key: aggregate(value) for key, value in rows.items()}
     report(grid, pool)
     print(f"\nexamples (n={example_n}, >= {example_t:g} bits):")
