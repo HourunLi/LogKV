@@ -31,6 +31,9 @@ Everything is causal: a value at T uses only tokens before T. Reported per polic
     reused   the share of pool tokens (by span) whose span saw a re-occurrence while kept
 
     python unused/pool_policy_sim.py --niah niah.npz --natural natural.npz --concat 4 --out sim.json
+
+The table (all policies, then the ten best by mean NIAH and by the longest streams' hit rate) is also
+written to ``<out stem>.summary.txt``; ``--report <out>.json`` rebuilds it from a finished run.
 """
 from __future__ import annotations
 
@@ -46,7 +49,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "unused"))
-from niah_surprisal import SurprisalStore, cut  # noqa: E402
+from niah_surprisal import SurprisalStore, cut, write_summary  # noqa: E402
 from reuse_label_stats import reuse_pairs  # noqa: E402
 
 SCORES = ("mean", "top4", "topq", "max")
@@ -254,6 +257,27 @@ def evaluate(policies, niah, natural, pool, recent, flush):
     return rows
 
 
+def summary(saved: dict) -> str:
+    """All policies in grid order, then the ten best by mean NIAH and by the longest natural hit rate."""
+    rows = saved["rows"]
+    lines = [f"pool {saved['pool']}, recent {saved['recent']}, flush {saved['flush']}; "
+             f"reuse {saved['reuse_n']}-grams >= {saved['reuse_bits']:g} bits; "
+             f"far-reuse label {saved['label_n']}-grams >= {saved['label_bits']:g} bits"
+             + (f"; {saved['streams']}" if saved.get("streams") else ""), "", "all policies:"]
+    lines += [format_row(row) for row in rows]
+
+    def niah_mean(row):
+        return float(np.mean(list(row["niah"].values()))) if row["niah"] else float("nan")
+
+    lines += ["", "best 10 by mean NIAH:"] + [format_row(r) for r in sorted(rows, key=niah_mean, reverse=True)[:10]]
+    natural = [k for k in (rows[0] if rows else {}) if k.startswith("natural_")]
+    if natural:
+        key = natural[-1]
+        best = sorted(rows, key=lambda r: r[key], reverse=True)[:10]
+        lines += ["", f"best 10 by {key}:"] + [format_row(r) for r in best]
+    return "\n".join(lines)
+
+
 def format_row(row) -> str:
     niah = " ".join(f"{task.replace('niah_single_', 's')}={v:.2f}" for task, v in row["niah"].items())
     natural = " ".join(f"{k[len('natural_'):]}={row[k]:.3f}" for k in row if k.startswith("natural_"))
@@ -274,7 +298,12 @@ def main():
     p.add_argument("--label-bits", type=float, default=6., help="far-reuse label first-occurrence threshold")
     p.add_argument("--policies", default=None, help="JSON list of Policy fields (default: the built-in grid)")
     p.add_argument("--out", default="pool_policy_sim.json")
+    p.add_argument("--report", default=None, help="a finished run's .json: write its summary, replay nothing")
     args = p.parse_args()
+    if args.report:
+        with open(args.report) as f:
+            write_summary(args.report, summary(json.load(f)))
+        return
     if not args.niah and not args.natural:
         raise SystemExit("give --niah and/or --natural (.npz from --save-surprisal)")
 
@@ -306,11 +335,15 @@ def main():
           + ", ".join(f"{len(v)} natural streams ({k})" for k, v in natural.items()) + f"; {len(policies)} policies",
           flush=True)
     rows = evaluate(policies, niah, natural, pool, recent, flush)
+    saved = dict(pool=pool, recent=recent, flush=flush, reuse_n=args.reuse_n, reuse_bits=args.reuse_bits,
+                 label_n=args.label_n, label_bits=args.label_bits, rows=rows,
+                 streams=f"{len(niah)} NIAH prompts, " + ", ".join(f"{len(v)} natural streams ({k})"
+                                                                    for k, v in natural.items()))
     Path(args.out).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump(dict(pool=pool, recent=recent, flush=flush, reuse_n=args.reuse_n, reuse_bits=args.reuse_bits,
-                       label_n=args.label_n, label_bits=args.label_bits, rows=rows), f, indent=1)
+        json.dump(saved, f, indent=1)
     print(f"saved {args.out}")
+    write_summary(args.out, summary(saved))
 
 
 if __name__ == "__main__":

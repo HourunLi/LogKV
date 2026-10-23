@@ -26,6 +26,9 @@ Launch it in the training environment with diag.sh (majob.sh's environment, one 
     bash diag.sh unused/niah_surprisal.py --config exp/qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml \\
         --tasks niah_single_2,niah_single_2_words,niah_single_2_words_qend --samples 32 --out surprisal.jsonl
 
+Every run writes its per-task summary to ``<out stem>.summary.txt`` beside ``--out``;
+``--report <out>.jsonl`` rebuilds that summary from a finished run without the model.
+
 ``--save-surprisal <file>.npz`` also keeps every prompt's ids and token surprisal (with the needle's
 positions and the cache settings) for the CPU replay of exact-pool policies, unused/pool_policy_sim.py.
 """
@@ -164,21 +167,45 @@ def analyse(ids, surprisal, boundary, max_span, recent, needle, value, decode, c
     return record
 
 
-def summarize(task, records, budgets=BUDGETS):
+def summarize(task, records, budgets=BUDGETS) -> str:
     """One block of lines per task: how many needles each score would keep at each pool budget."""
     ranked = [r for r in records if "ranks" in r]
-    print(f"{task}: samples={len(records)} needle in the recent window={len(records) - len(ranked)}")
-    if not ranked:
-        return
-    value = np.concatenate([r["value_surprisal"] for r in records])
-    print(f"  value-token surprisal: median {np.median(value):.2f} bits; "
-          f"document median {np.median([r['document_surprisal_median'] for r in records]):.2f} bits")
-    for name in SCORES:
-        needed = [r["ranks"][name]["tokens_needed"] for r in ranked]
-        fits = " ".join(f"P{b}:{np.mean([t <= b for t in needed]):.2f}" for b in budgets)
-        pct = np.median([r["ranks"][name]["percentile"] for r in ranked])
-        print(f"  {name:8s} tokens_needed median={int(np.median(needed)):6d}  percentile median={pct:.4f}  "
-              f"fraction that fits {fits}")
+    lines = [f"{task}: samples={len(records)} needle in the recent window={len(records) - len(ranked)}"]
+    if ranked:
+        value = np.concatenate([r["value_surprisal"] for r in records])
+        lines.append(f"  value-token surprisal: median {np.median(value):.2f} bits; "
+                     f"document median {np.median([r['document_surprisal_median'] for r in records]):.2f} bits")
+        for name in SCORES:
+            needed = [r["ranks"][name]["tokens_needed"] for r in ranked]
+            fits = " ".join(f"P{b}:{np.mean([t <= b for t in needed]):.2f}" for b in budgets)
+            pct = np.median([r["ranks"][name]["percentile"] for r in ranked])
+            lines.append(f"  {name:8s} tokens_needed median={int(np.median(needed)):6d}  percentile median={pct:.4f}  "
+                         f"fraction that fits {fits}")
+    return "\n".join(lines)
+
+
+def summary_path(out) -> Path:
+    """Where a run's readable summary goes: beside its output, ``<stem>.summary.txt``."""
+    out = Path(out).expanduser()
+    return out.with_name(out.stem + ".summary.txt")
+
+
+def write_summary(out, text: str) -> None:
+    path = summary_path(out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n")
+    print(text, flush=True)
+    print(f"summary written to {path}", flush=True)
+
+
+def report(jsonl) -> str:
+    """The per-task summary of a finished run, from its .jsonl (no model)."""
+    by_task: dict[str, list] = {}
+    for line in open(jsonl):
+        if line.strip():
+            record = json.loads(line)
+            by_task.setdefault(record["task"], []).append(record)
+    return "\n".join(summarize(task, records) for task, records in by_task.items())
 
 
 class SurprisalStore:
@@ -257,7 +284,7 @@ def prompt_ids(sample, tokenizer, hf_tokenizer):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", required=True, help="experiment YAML, as for eval.sh")
+    p.add_argument("--config", default=None, help="experiment YAML, as for eval.sh")
     p.add_argument("--checkpoint", default=None, help="defaults to the YAML save_path (latest step_*)")
     p.add_argument("--hf-tokenizer", default=None,
                    help="HF tokenizer dir (default: the one eval.sh would use, else the checkpoint's own)")
@@ -268,7 +295,13 @@ def main():
     p.add_argument("--out", default="niah_surprisal.jsonl")
     p.add_argument("--save-surprisal", default=None,
                    help=".npz of every prompt's ids and token surprisal, for unused/pool_policy_sim.py")
+    p.add_argument("--report", default=None, help="a finished run's .jsonl: write its summary, load no model")
     args = p.parse_args()
+    if args.report:
+        write_summary(args.report, report(args.report))
+        return
+    if not args.config:
+        p.error("--config is required (or --report <run>.jsonl)")
 
     import train_retention as tr
     cfg = tr.load_config(args.config)
@@ -286,6 +319,7 @@ def main():
           f"{'dense' if lm.log_kv_dense_mode else 'LogKV'} cache from {args.config}", flush=True)
     store = SurprisalStore(args.save_surprisal, **cache_settings(lm, args.config))
     Path(args.out).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    summaries = []
     with open(args.out, "w") as out:
         for task in args.tasks.split(","):
             records = []
@@ -309,7 +343,8 @@ def main():
                       f"rank(max)={ranks.get('rank', 'recent')} tokens_needed={ranks.get('tokens_needed', '-')} "
                       f"seconds={time.time() - start:.1f}",
                       flush=True)
-            summarize(task, records)
+            summaries.append(summarize(task, records))
+            write_summary(args.out, "\n".join(summaries))
             store.save()  # after every task, so an interrupted run keeps what it computed
 
 
