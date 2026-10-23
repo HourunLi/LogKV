@@ -30,6 +30,7 @@ Cache API 为兼容旧路径保留保守默认值，不能把直接构造 cache 
 | `gamma_cue_guard` | `false` | `false` |
 | `gamma_query_cue` | `false` | `false` |
 | `retention_head`（niahLogKV；入口为头文件路径 `log_kv_retention_heads`） | `false` | 关闭（`null`） |
+| `gamma_surprisal`（niahLogKV；评测入口 `log_kv_gamma_surprisal`，`mean` \| `top4`） | `None` | 关闭（`null`） |
 | `gamma_literals` | `false` | `false` |
 
 当前 `recent_size`、`train_block`、`prefill_block` 均为 `2048`，上下文长度 `32768`；

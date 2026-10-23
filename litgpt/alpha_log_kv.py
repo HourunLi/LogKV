@@ -38,6 +38,13 @@ LITERAL_FLOOR = 12.
 # random 7-digit number (at the cap) still ranks above K/V scores.
 LITERAL_TIER_CAP = 6.
 _LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
+# Surprisal admission (optional, niahLogKV): a span's value is SURPRISAL_SCALE times its
+# surprisal score in bits per token, the mean or the mean of the four largest of its tokens'
+# -log2 p under the model itself. The scale puts every span's surprisal far above its K/V
+# score, so the exact pool ranks spans by how unpredictable they were and K/V scores only
+# break ties.
+SURPRISAL_SCALE = 1e4
+SURPRISAL_SCORES = ("mean", "top4")
 
 
 @dataclass
@@ -496,10 +503,58 @@ class SummedValues:
         return sum(stream.span_values(row, positions, lengths, stop) for stream in self.streams)
 
 
+class SurprisalStream:
+    """Each row's token surprisal in bits, fed by GPT.forward; span values for the exact pool.
+
+    ``add(row, start, bits)`` appends the surprisal of positions ``start, start + 1, ...``;
+    a row restarts at position 0. The model computes it from its own next-token logits one
+    prefill chunk at a time (no longer than the recent window), so every token's surprisal
+    is known before the token can leave the window. One float per token is kept on the host.
+    """
+
+    def __init__(self, score: str) -> None:
+        if score not in SURPRISAL_SCORES:
+            raise ValueError(f"surprisal score must be one of {SURPRISAL_SCORES}, got {score!r}")
+        self.score = score
+        self._rows: list[np.ndarray] = []
+
+    def add(self, row: int, start: int, bits) -> None:
+        while len(self._rows) <= row:
+            self._rows.append(np.zeros(0))
+        if start == 0:
+            self._rows[row] = np.zeros(0)
+        if start != len(self._rows[row]):
+            raise ValueError(f"surprisal row {row} expects position {len(self._rows[row])}, got {start}")
+        self._rows[row] = np.concatenate((self._rows[row], np.nan_to_num(np.asarray(bits, dtype=np.float64))))
+
+    def span_values(self, row, positions, lengths, stop):
+        """``SURPRISAL_SCALE * score`` per span (``stop`` is unused: surprisal never changes)."""
+        lengths = np.asarray(lengths, dtype=np.int64)
+        if not len(lengths):
+            return np.zeros(0)
+        known = self._rows[row] if row < len(self._rows) else np.zeros(0)
+        positions = np.asarray(positions, dtype=np.int64)
+        if len(positions) and positions.max() >= len(known):
+            raise RuntimeError(f"surprisal of position {int(positions.max())} is not known yet (row {row} has "
+                               f"{len(known)}): GPT.forward feeds it one chunk ahead of the cache")
+        bits = known[positions]
+        starts = np.cumsum(lengths) - lengths
+        if self.score == "mean":
+            score = np.add.reduceat(bits, starts) / np.maximum(lengths, 1)
+        else:  # the mean of each span's four largest
+            span = np.repeat(np.arange(len(lengths)), lengths)
+            order = np.lexsort((-bits, span))
+            rank = np.arange(len(bits)) - starts[span[order]]
+            top = rank < 4
+            score = (np.bincount(span[order][top], weights=bits[order][top], minlength=len(lengths))
+                     / np.minimum(lengths, 4).clip(min=1))
+        return SURPRISAL_SCALE * score
+
+
 def add_cue_values(cut, host_scores, stream, stops):
     """Host scores plus each span's Gamma value; ``stops[b]`` ends row b's archived block.
 
-    ``stream`` is a CueStream, a LiteralStream or their SummedValues.
+    ``stream`` is a CueStream, a LiteralStream, a SurprisalStream or their SummedValues.
     """
     values = [stream.span_values(b, positions[tokens], lengths, stops[b])
               for b, (positions, tokens, lengths) in enumerate(zip(cut.positions, cut.token_rows, cut.length_rows))]

@@ -784,6 +784,10 @@ class LogStructuredKVCache(nn.Module):
         # the shared LiteralStream like the CueStream.
         self.gamma_literals = bool(gamma_literals)
         self.literal_stream = None
+        # niahLogKV surprisal admission ("mean" | "top4" | None): GPT.set_log_kv_cache sets it
+        # with the model's SurprisalStream after building the cache (eval-only; not in training).
+        self.gamma_surprisal = None
+        self.surprisal_stream = None
         if self.gamma_literals and not alpha_exact_tokens:
             raise ValueError("gamma_literals scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
         # Learned retention head (niahLogKV): the model attaches this layer's
@@ -4198,6 +4202,10 @@ class LogStructuredKVCache(nn.Module):
             if self.literal_stream.below_cue != self.gamma_query_cue:
                 raise RuntimeError("the model's LiteralStream tier does not match gamma_query_cue")
             streams.append(self.literal_stream)
+        if self.gamma_surprisal:
+            if self.surprisal_stream is None or self.surprisal_stream.score != self.gamma_surprisal:
+                raise RuntimeError("gamma_surprisal needs the model's SurprisalStream; set_log_kv_cache attaches it")
+            streams.append(self.surprisal_stream)
         stream = streams[0] if len(streams) == 1 else SummedValues(streams)
         return stream, [flushed[-1] + 1 if len(flushed) else 0 for flushed in positions_host]
 
@@ -4208,7 +4216,8 @@ class LogStructuredKVCache(nn.Module):
             raise ValueError("AlphaLogKV requires natural span boundaries")
         old_width = self.alpha_count
         cues = (self._gamma_cues(positions_host)
-                if self.gamma_cue_tokens or self.gamma_query_cue or self.gamma_literals else None)
+                if self.gamma_cue_tokens or self.gamma_query_cue or self.gamma_literals or self.gamma_surprisal
+                else None)
         side = self._route_decision_stream(k, v)
         with torch.cuda.stream(side) if side is not None else contextlib.nullcontext():
             # Snapshots: the pool is rewritten below from these sources.
