@@ -34,6 +34,7 @@ import json
 import math
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -236,6 +237,7 @@ def main():
         for task in args.tasks.split(","):
             records = []
             for sample in niah_samples(task, hf_tokenizer, args.length, args.samples):
+                start = time.time()
                 prompt, ids, offsets = prompt_ids(sample, lm.tokenizer, hf_tokenizer)
                 needle, value, text, depth = locate(prompt, offsets)
                 surprisal = token_surprisal(lm.model, ids, prepare=lm._set_eval_cache)
@@ -248,7 +250,8 @@ def main():
                 records.append(record)
                 ranks = record.get("ranks", {}).get("max", {})
                 print(f"{task} sample {sample['index']}: depth={depth:.2f} value={text} "
-                      f"rank(max)={ranks.get('rank', 'recent')} tokens_needed={ranks.get('tokens_needed', '-')}",
+                      f"rank(max)={ranks.get('rank', 'recent')} tokens_needed={ranks.get('tokens_needed', '-')} "
+                      f"seconds={time.time() - start:.1f}",
                       flush=True)
             summarize(task, records)
 
