@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import subprocess
@@ -181,3 +182,21 @@ def test_far_reuse_hits_count_the_copy_exact_when_it_is_read():
 def test_default_grid_names_are_unique():
     names = [p.name for p in ps.default_policies()]
     assert len(names) == len(set(names)) == 55
+
+
+def test_finished_runs_rebuild_their_summaries_from_the_saved_files(tmp_path):
+    record = dict(task="niah_single_2", value_surprisal=[9.], document_surprisal_median=2.,
+                  ranks={name: dict(rank=1, tokens_needed=20, percentile=1., score=9.) for name in ns.SCORES})
+    (tmp_path / "s.jsonl").write_text((json.dumps(record) + "\n") * 2)
+    text = ns.report(tmp_path / "s.jsonl")
+    assert text.startswith("niah_single_2: samples=2") and "P1024:1.00" in text
+    ns.write_summary(tmp_path / "s.jsonl", text)
+    assert (tmp_path / "s.summary.txt").read_text().strip() == text
+    row = dict(n=3, threshold=6., blocks=1, pairs_per_block=1., token_share=.01, spans_per_block=2., span_tokens_median=40.,
+               fits_pool=1., s_first=7., s_next=3., kinds={"capitalised": 1.})
+    (tmp_path / "r.json").write_text(json.dumps(dict(config="c.yaml", gap=2048, pool=1024, grid=[row], examples=[])))
+    assert "    6    1.000       2.0       40      1.00    7.00   3.00" in rl.report_file(tmp_path / "r.json")
+    saved = dict(pool=8, recent=16, flush=8, reuse_n=2, reuse_bits=6., label_n=3, label_bits=6.,
+                 rows=[dict(policy="mean|none|none", niah={"niah_single_2": 1.}, niah_early=1., natural_32k=.5, reused=.2)])
+    text = ps.summary(saved)
+    assert "best 10 by mean NIAH:" in text and "best 10 by natural_32k:" in text and text.count("mean|none|none") == 3

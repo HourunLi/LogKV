@@ -28,6 +28,9 @@ and prints examples for one (n, threshold) pair.
     bash diag.sh unused/reuse_label_stats.py --config exp/qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml \\
         --blocks 16 --out reuse_labels.json
 
+The table and examples are also written to ``<out stem>.summary.txt``; ``--report <out>.json``
+rebuilds them from a finished run without the model.
+
 ``--save-surprisal <file>.npz`` also keeps every block's ids and token surprisal (with the cache
 settings) for the CPU replay of exact-pool policies, unused/pool_policy_sim.py.
 """
@@ -45,7 +48,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "unused"))
-from niah_surprisal import SurprisalStore, cache_settings, cut, token_surprisal  # noqa: E402
+from niah_surprisal import SurprisalStore, cache_settings, cut, token_surprisal, write_summary  # noqa: E402
 
 CODE_CHARS = set("_(){}[]=<>/\\;:$#@|*&^%~`")
 CAPITALISED = re.compile(r"(?:^|\s)[A-Z][a-z]")
@@ -161,23 +164,41 @@ def aggregate(rows):
     return out
 
 
-def report(grid, pool):
-    print(f"{'n':>2} {'bits':>5} {'tokens%':>8} {'spans/blk':>9} {'span tok':>8} {'fits P' + str(pool):>9} "
-          f"{'s_first':>7} {'s_next':>6} {'kept K/V':>8} {'kept all':>8}  kinds")
+def report(grid, pool, examples=(), example=None, header="") -> str:
+    """The table over (n, threshold) and the examples, as text."""
+    lines = [header] if header else []
+    lines.append(f"{'n':>2} {'bits':>5} {'tokens%':>8} {'spans/blk':>9} {'span tok':>8} {'fits P' + str(pool):>9} "
+                 f"{'s_first':>7} {'s_next':>6} {'kept K/V':>8} {'kept all':>8}  kinds")
     for (n, threshold), row in sorted(grid.items()):
         if not row:
             continue
         kept = (f"{row['kept_positive']:8.3f} {row['kept_archived']:8.3f}" if "kept_positive" in row
                 else f"{'-':>8} {'-':>8}")
         kinds = ", ".join(f"{k} {v:.2f}" for k, v in row["kinds"].items())
-        print(f"{n:>2} {threshold:>5g} {100 * row['token_share']:8.3f} {row['spans_per_block']:9.1f} "
-              f"{row['span_tokens_median']:8.0f} {row['fits_pool']:9.2f} {row['s_first']:7.2f} {row['s_next']:6.2f} "
-              f"{kept}  {kinds}")
+        lines.append(f"{n:>2} {threshold:>5g} {100 * row['token_share']:8.3f} {row['spans_per_block']:9.1f} "
+                     f"{row['span_tokens_median']:8.0f} {row['fits_pool']:9.2f} {row['s_first']:7.2f} "
+                     f"{row['s_next']:6.2f} {kept}  {kinds}")
+    if examples:
+        lines.append("\nexamples" + (f" (n={example[0]}, >= {example[1]:g} bits):" if example else ":"))
+        for e in examples:
+            lines.append(f"  gap={e['gap']:6d} s_first={e['s_first']:5.2f} s_next={e['s_next']:5.2f} "
+                         f"{e['text']!r:30s} ... {e['context']!r}")
+    return "\n".join(lines)
+
+
+def report_file(path) -> str:
+    """The text report of a finished run, from its .json (no model)."""
+    with open(path) as f:
+        saved = json.load(f)
+    grid = {(row["n"], row["threshold"]): {k: v for k, v in row.items() if k not in ("n", "threshold")}
+            for row in saved["grid"]}
+    header = f"{saved.get('config', '')}: gap {saved.get('gap')}, pool {saved.get('pool')}"
+    return report(grid, saved.get("pool", 0), saved.get("examples", []), saved.get("example"), header)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", required=True, help="experiment YAML (checkpoint, cache, training data)")
+    p.add_argument("--config", default=None, help="experiment YAML (checkpoint, cache, training data)")
     p.add_argument("--checkpoint", default=None, help="defaults to the YAML save_path (latest step_*)")
     p.add_argument("--blocks", type=int, default=16)
     p.add_argument("--length", type=int, default=32768)
@@ -191,7 +212,13 @@ def main():
     p.add_argument("--out", default="reuse_labels.json")
     p.add_argument("--save-surprisal", default=None,
                    help=".npz of every block's ids and token surprisal, for unused/pool_policy_sim.py")
+    p.add_argument("--report", default=None, help="a finished run's .json: write its summary, load no model")
     args = p.parse_args()
+    if args.report:
+        write_summary(args.report, report_file(args.report))
+        return
+    if not args.config:
+        p.error("--config is required (or --report <run>.json)")
 
     import torch
     import train_retention as tr
@@ -236,17 +263,13 @@ def main():
               f"seconds={time.time() - start:.1f}", flush=True)
     store.save()
     grid = {key: aggregate(value) for key, value in rows.items()}
-    report(grid, pool)
-    print(f"\nexamples (n={example_n}, >= {example_t:g} bits):")
-    for e in examples:
-        print(f"  gap={e['gap']:6d} s_first={e['s_first']:5.2f} s_next={e['s_next']:5.2f} "
-              f"{e['text']!r:30s} ... {e['context']!r}")
     Path(args.out).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump(dict(config=args.config, gap=gap, pool=pool, max_span=max_span,
+        json.dump(dict(config=args.config, gap=gap, pool=pool, max_span=max_span, example=[example_n, example_t],
                        grid=[dict(n=n, threshold=t, **row) for (n, t), row in sorted(grid.items())],
                        examples=examples), f, indent=1, ensure_ascii=False)
     print(f"saved {args.out}")
+    write_summary(args.out, report_file(args.out))
 
 
 if __name__ == "__main__":
