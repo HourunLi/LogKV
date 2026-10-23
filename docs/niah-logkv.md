@@ -121,14 +121,39 @@ cue 与 cue + query 的技巧结果取自带 cue 训练的 checkpoint（`eval_ga
 
 ## 5. 限制
 
-- 监督来自合成事实：头学的是"像可被查询的具体细节"的片段，句式与值的种类有限；要用未见过的句式（RULER）、
-  未训练的值种类（`--kinds` 留出）和 words 针检验泛化。
+- 监督来自合成事实：只有 14 个固定句式、3 种键形式，事实整句标为正样本，头可以靠句式与值的格式认出事实；
+  合成验证块与训练块同分布，`kept_mean` 衡量不了泛化。RULER 的针（连字符键、"is: 值"）与部分模板、键形式相近，
+  在 RULER 上的结果也不能作为泛化证据。
 - 不看问题时，精确池容量决定上限：全是同格式针的干草堆（`niah_multikey_2/3`）里几百根针同样需要保留，
   P=1024 装不下，也分不出被问的是哪一根。
 - 头依赖它训练时的 checkpoint 的 K/V；换 checkpoint（包括 CPT 之后）需要重训，文件 tag 用来核对。
-- 打分头的效果尚无 GPU 评测结果。
+
+## 6. 诊断：惊异度与自然复用
+
+两个只读诊断脚本，不训练、不改变任何运行，用 `diag.sh`（`majob.sh` 的环境，单进程单卡）启动：
+
+```bash
+bash diag.sh unused/niah_surprisal.py --config exp/qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml \
+    --tasks niah_single_2,niah_single_2_words,niah_single_2_words_qend --samples 32 --out <输出>.jsonl
+bash diag.sh unused/reuse_label_stats.py --config exp/qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml \
+    --blocks 16 --out <输出>.json
+```
+
+- token 的惊异度 s[t] = −log2 p(ids[t] | ids[:t])（比特），是模型对它的编码长度。两个脚本都按 YAML 构建与 `eval.py`
+  相同的模型与缓存，整段 prefill 后从最终隐状态分块算出（不保留整段 logits）。
+- `niah_surprisal.py`：lm-eval 自己的 NIAH 样本（RULER 模板与 `eval_tasks/niah_cue` 的变体），按 Alpha 的切法
+  切片段，以 max、top4、mean（惊异度）与 uni_max（文档内一元编码长度，不用 LM）为片段分数，报告针所在片段在
+  离开 recent 窗口的片段中的名次、装下它需要的精确池 token 数（`tokens_needed`，最终池的离线估计，不含 1.1 倍）、
+  在 P=256/1024/2048 下装得下的比例，以及分数比针高的片段。
+- `reuse_label_stats.py`：YAML 的训练数据（按 `demo.py` 读）。同一 n-gram 的相邻两次出现 a < b 相距不小于 gap
+  （默认 recent 窗口），且该 n-gram 首次出现时的平均惊异度不低于阈值，则 a 处的 n 个 token 为正。按 (n, 阈值)
+  报告正 token 占比、含正 token 的片段数与 token 数、能否装进精确池、首次与复用处的惊异度、LogKV 缓存自己的
+  选择留住正 token 的比例（对比所有已归档 token），以及正 n-gram 的种类（数字、大写词、代码符号、小写词），并打印例子。
+  标签不涉及任何句式或任务。
 
 测试：`tests/test_retention.py`（启动脚本的配置读取与 checkpoint 检查、选项解析与续训、片段价值公式与设备相加、新头不改变选择、prefill 与逐 token 一致、
 能识别针的头把针留在精确池、校验与保存/加载、回放签名、合成事实的版式与种类、训练器能分开正负样本、
 `demo.py` 的混入），`tests/test_exp_configs.py`（niah 配置只差所述开关），
-`tests/test_semantic_eval_flags.py`（启动脚本只在设置时传头文件），`tests/test_niah_cue_tasks.py`（words 针）。
+`tests/test_semantic_eval_flags.py`（启动脚本只在设置时传头文件），`tests/test_niah_cue_tasks.py`（words 针），
+`tests/test_surprisal_diag.py`（惊异度与逐位 log-softmax 一致、recent 窗口内缓存与不缓存一致、片段切分、针的名次、
+复用对与阈值、`diag.sh`）。
