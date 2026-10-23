@@ -78,7 +78,7 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
 # Eval-only literal runs re-evaluate Gamma checkpoints with the ladder they were trained with.
 GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
     p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml", "eval_gamma_query*.yaml",
-                           "arc_niah_*.yaml", "eval_niah_*.yaml")
+                           "arc_niah_*.yaml", "eval_niah_*.yaml", "eval_gamma_surprisal*.yaml")
     for p in EXP.glob(pattern))
 
 
@@ -269,3 +269,15 @@ def test_niah_heldout_heads_leave_out_the_uuid_and_word_values():
     heldout, heads = effective("eval_niah_heads_heldout_p1024.yaml"), effective("eval_niah_heads_p1024.yaml")
     assert set(heldout["retention_kinds"].split(",")) == set(KINDS) - {"uuid", "word"}
     assert heldout["retention_steps"] == heads["retention_steps"] and "retention_kinds" not in heads
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_surprisal_evaluations_rank_by_surprisal(name):
+    expected = {"eval_gamma_surprisal_p1024.yaml": "top4", "eval_gamma_surprisal_mean_p1024.yaml": "mean"}
+    assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
+
+
+@pytest.mark.parametrize("name", ["eval_gamma_surprisal_p1024.yaml", "eval_gamma_surprisal_mean_p1024.yaml"])
+def test_surprisal_evaluations_reuse_the_cue_free_p1024_checkpoint(name):
+    evaluated, base = effective(name), effective("arc_gamma_k12_b128_p1024_2k.yaml")
+    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {"log_kv_gamma_surprisal"}

@@ -25,7 +25,7 @@ attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启�
 | [Alpha 精确片段算法](docs/alpha-logkv.md) | 分段、打分、替换、预算，以及延迟归档 |
 | [Beta 算法与运行入口](docs/beta-logkv.md) | 新颖度评分、低失真切分、回放约束、训练与评测 |
 | [Gamma 梯子修正与 cue](docs/gamma-logkv.md) | 延迟归档只重排第 0 层、顶层最轻对合并、同字节余量层、精确池的开头提示词与字面量选择、针的去向诊断 |
-| [niahLogKV 学习保留打分](docs/niah-logkv.md) | 不看开头与问题的精确池打分头、合成检索数据、`train_retention.py`、评测与 CPT 配置 |
+| [niahLogKV 学习保留打分](docs/niah-logkv.md) | 不看开头与问题的精确池打分头、合成检索数据、`train_retention.py`、惊异度准入与诊断、评测与 CPT 配置 |
 | [统一路由实现](docs/semantic-unified-routing.md) | 可选 unified 路由的 Ward/半径公式、增量更新和数值约束 |
 | [位置与注意力](docs/position.md) | pre-RoPE 内容、mid/multi 锚点、质量偏置 |
 | [全程 SWA 对照](docs/swa-niah-comparison.md) | 同权重、同持久缓存字节预算的比较口径 |

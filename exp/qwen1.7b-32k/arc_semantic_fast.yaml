@@ -70,6 +70,8 @@ log_kv_gamma_query_cue: false
 # niahLogKV 学习到的保留打分头（默认关闭）：train_retention.py 训出的文件路径；不看问题、不看开头，
 # 按片段 K/V 给精确池选择加分，不增加 KV。只在 *niah* 配置中设置。
 log_kv_retention_heads: null
+# niahLogKV 惊异度准入（默认关闭）：mean | top4，按 token 在模型下的惊异度给精确池片段打分；只在 eval_gamma_surprisal* 中打开。
+log_kv_gamma_surprisal: null
 # niahLogKV 合成检索数据（默认关闭）：训练块以此概率插入事实与问答（litgpt/synthetic_retrieval.py）。
 synthetic_retrieval_prob: 0.0
 log_kv_seg_gap_max: null  # Alpha 延迟归档要求关闭 segment gap/padding

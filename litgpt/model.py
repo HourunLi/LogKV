@@ -140,6 +140,9 @@ class GPT(nn.Module):
         """
         if targets is not None and (targets.shape != idx.shape or lm_head_start is not None or input_pos is not None):
             raise ValueError("training targets must match idx and require unsliced, uncached model output")
+        if (input_pos is not None and getattr(self, "log_kv_surprisal_stream", None) is not None
+                and not getattr(self, "_surprisal_inner", False)):
+            return self._surprisal_forward(idx, input_pos, lm_head_chunk_size, lm_head_start)
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -275,6 +278,65 @@ class GPT(nn.Module):
             if cache.retention_head and heads is None:
                 raise RuntimeError("retention_head needs set_retention_heads() before the cache is built")
             cache.attach_retention_head(heads[i] if cache.retention_head else None)
+
+    def _attach_surprisal_stream(self, score, alpha_exact_tokens, recent_size, flush_granularity) -> None:
+        """niahLogKV surprisal admission: one SurprisalStream per model, shared by every layer's cache.
+
+        GPT.forward then runs cached input in chunks no longer than the recent window and the
+        flush granularity, so a token's surprisal (from the logits before it) reaches the stream
+        before any layer can archive the token.
+        """
+        from litgpt.alpha_log_kv import SurprisalStream
+
+        if score and not alpha_exact_tokens:
+            raise ValueError("gamma_surprisal scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
+        self.log_kv_surprisal_stream = SurprisalStream(score) if score else None
+        self.log_kv_surprisal_chunk = max(1, min(int(recent_size), int(flush_granularity)))
+        self._surprisal_last = None
+        for block in self.transformer.h:
+            block.attn.kv_cache.gamma_surprisal = score or None
+            block.attn.kv_cache.surprisal_stream = self.log_kv_surprisal_stream
+
+    def _surprisal_forward(self, idx, input_pos, lm_head_chunk_size, lm_head_start):
+        """Cached forward in chunks that feeds every token's surprisal (bits) to the SurprisalStream.
+
+        A token's surprisal comes from the logits at the position before it: within a chunk from
+        the chunk's own logits, for its first token from the previous call's last logits. Returns
+        the logits the caller asked for (``lm_head_start``) as one forward would.
+        """
+        T, chunk = idx.size(1), self.log_kv_surprisal_chunk
+        rows = input_pos if input_pos.dim() == 2 else input_pos.unsqueeze(0).expand(idx.size(0), -1)
+        starts = rows[:, 0].tolist()
+        keep_from = 0 if lm_head_start is None else lm_head_start
+        kept = []
+        self._surprisal_inner = True
+        try:
+            for a in range(0, T, chunk):
+                b = min(a + chunk, T)
+                x = idx[:, a:b]
+                logits = self.forward(x, input_pos=input_pos[..., a:b], lm_head_start=0)
+                bits = torch.full(x.shape, float("nan"), device=x.device)
+                last = self._surprisal_last
+                if last is not None and a == 0:
+                    first = last.log_softmax(-1).gather(-1, x[:, :1])[:, 0]
+                    bits[:, 0] = torch.where(rows[:, 0] > 0, -first, float("nan"))
+                elif a > 0:
+                    bits[:, 0] = -prev.log_softmax(-1).gather(-1, x[:, :1])[:, 0]
+                for s in range(0, b - a - 1, 512):  # log-softmax in fp32, 512 positions at a time
+                    e = min(s + 512, b - a - 1)
+                    bits[:, s + 1:e + 1] = -logits[:, s:e].float().log_softmax(-1).gather(
+                        -1, x[:, s + 1:e + 1, None])[..., 0]
+                bits = (bits / math.log(2)).cpu().numpy()
+                for row in range(x.size(0)):
+                    self.log_kv_surprisal_stream.add(row, starts[row] + a, bits[row])
+                prev = logits[:, -1].float()
+                if b > keep_from:
+                    kept.append(logits[:, max(keep_from - a, 0):])
+            self._surprisal_last = prev
+        finally:
+            self._surprisal_inner = False
+        out = torch.cat(kept, dim=1)
+        return list(out.split(lm_head_chunk_size, dim=1)) if lm_head_chunk_size > 0 else out
 
     def set_retention_heads(self, heads) -> None:
         """Frozen learned retention heads (litgpt.retention.RetentionHeads), one per layer.
@@ -422,7 +484,7 @@ class GPT(nn.Module):
         dtype: torch.dtype | None = None,
     ) -> None:
         self._alpha_enabled = False
-        self.log_kv_cue_stream = self.log_kv_literal_stream = None
+        self.log_kv_cue_stream = self.log_kv_literal_stream = self.log_kv_surprisal_stream = None
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
 
@@ -450,7 +512,7 @@ class GPT(nn.Module):
 
     def clear_kv_cache(self) -> None:
         self._alpha_enabled = False
-        self.log_kv_cue_stream = self.log_kv_literal_stream = None
+        self.log_kv_cue_stream = self.log_kv_literal_stream = self.log_kv_surprisal_stream = None
         self.mask_cache = None
         for block in self.transformer.h:
             block.attn.kv_cache = None
@@ -511,6 +573,7 @@ class GPT(nn.Module):
         gamma_cue_guard: bool = False,
         gamma_query_cue: bool = False,
         retention_head: bool = False,
+        gamma_surprisal: str | None = None,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -621,6 +684,7 @@ class GPT(nn.Module):
             block.attn.log_kv_prefill_block = prefill_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
         self._attach_gamma_streams(gamma_cue_tokens, gamma_literals, gamma_cue_guard, gamma_query_cue)
+        self._attach_surprisal_stream(gamma_surprisal, alpha_exact_tokens, recent_size, semantic_flush_granularity)
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
         # holding stale O(N^2) bool tensors in GPU memory. With every block on
@@ -803,7 +867,7 @@ class GPT(nn.Module):
     def disable_log_kv_training(self) -> None:
         """Turn off logKV training mode and drop the caches."""
         self._alpha_enabled = False
-        self.log_kv_cue_stream = self.log_kv_literal_stream = None
+        self.log_kv_cue_stream = self.log_kv_literal_stream = self.log_kv_surprisal_stream = None
         for block in self.transformer.h:
             block.attn.training_log_kv = False
             block.attn.kv_cache = None
