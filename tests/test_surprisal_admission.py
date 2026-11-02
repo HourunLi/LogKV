@@ -41,6 +41,9 @@ def test_span_values_grow_exponentially_with_the_mean_or_top4_surprisal():
         [value(2.), value(5.)])
     with pytest.raises(RuntimeError, match="not known yet"):
         stream.span_values(0, np.array([5]), [1], 6)
+    stream = SurprisalStream("mix")
+    stream.add(0, 0, [1., 1., 1., 1., 1., 9.])
+    assert stream.span_values(0, np.arange(6), [6], 6).tolist() == pytest.approx([value((14 / 6 + 3) / 2)])
 
 
 def test_the_model_feeds_each_tokens_surprisal_in_chunks_and_returns_the_asked_logits():
