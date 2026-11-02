@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from litgpt.alpha_log_kv import SURPRISAL_SCALE, SurprisalStream
+from litgpt.alpha_log_kv import SURPRISAL_BASE, SURPRISAL_SCALE, SurprisalStream
 from litgpt.config import Config
 from litgpt.model import GPT
 
@@ -27,16 +27,18 @@ def _model():
     return model
 
 
-def test_span_values_are_the_scaled_mean_or_top4_surprisal():
+def test_span_values_grow_exponentially_with_the_mean_or_top4_surprisal():
+    def value(bits):
+        return SURPRISAL_SCALE * SURPRISAL_BASE ** bits
     stream = SurprisalStream("top4")
     stream.add(0, 0, [np.nan, 1., 2., 3., 4., 5., 9.])
     assert stream.span_values(0, np.arange(7), [2, 5], 7).tolist() == pytest.approx(
-        [SURPRISAL_SCALE * 0.5, SURPRISAL_SCALE * (3 + 4 + 5 + 9) / 4])
+        [value(0.5), value((3 + 4 + 5 + 9) / 4)])
     stream = SurprisalStream("mean")
     stream.add(0, 0, [np.nan, 1., 2., 3.])
     stream.add(0, 4, [5.])
     assert stream.span_values(0, np.array([1, 2, 3, 4]), [3, 1], 5).tolist() == pytest.approx(
-        [SURPRISAL_SCALE * 2., SURPRISAL_SCALE * 5.])
+        [value(2.), value(5.)])
     with pytest.raises(RuntimeError, match="not known yet"):
         stream.span_values(0, np.array([5]), [1], 6)
 
@@ -83,3 +85,16 @@ def test_a_surprising_span_takes_the_exact_pool():
     assert all(set(range(20, 24)) <= pool for layers in pools.values() for pool in layers)
     with pytest.raises(ValueError, match="requires alpha_exact_tokens"):
         model.set_log_kv_cache(recent_size=16, gamma_surprisal="mean", **{**KWARGS, "alpha_exact_tokens": 0})
+
+
+def test_a_short_surprising_span_evicts_a_long_dull_one():
+    from litgpt.alpha_log_kv import SpanCut, choose_spans
+    # The pool holds one 64-token span of 3 bits; a 20-token span of 6 bits arrives.
+    cut = SpanCut([np.arange(84)], [np.arange(84)], [np.array([64, 20])], [np.array([True, False])],
+                  [np.array([True, True])])
+    stream = SurprisalStream("mean")
+    stream.add(0, 0, np.r_[np.full(64, 3.), np.full(20, 6.)])
+    exponential = stream.span_values(0, np.arange(84), [64, 20], 84).tolist()
+    assert choose_spans(cut, exponential, 64).keep[0] == list(range(64, 84))
+    linear = [3. * SURPRISAL_SCALE, 6. * SURPRISAL_SCALE]  # 20 x 6 < 64 x 3 x 1.1: the swap would fail
+    assert choose_spans(cut, linear, 64).keep[0] == list(range(64))

@@ -180,9 +180,11 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 ## 7. 惊异度准入（只评测）
 
 `log_kv_gamma_surprisal: mean | top4` 让精确池按片段 token 的惊异度排序：token t 的惊异度是模型自己对它的编码长度
-−log2 p(ids[t] | ids[:t])（比特），片段分数取其均值（`mean`）或最大 4 个的均值（`top4`），价值为
-`SURPRISAL_SCALE`（1e4）× 分数，加到 K/V 分数上进入原有的整段贪心（含旧片段 1.1 倍）。这一尺度让惊异度主导排序，
-K/V 分数只区分惊异度相同的片段。不看开头、不看问题、不训练，不增加 KV。
+−log2 p(ids[t] | ids[:t])（比特），片段分数取其均值（`mean`）或最大 4 个的均值（`top4`），价值密度为
+`SURPRISAL_SCALE`（1e4）× `SURPRISAL_BASE`（16）^ min(分数, 32)，加到 K/V 分数上进入原有的整段贪心（含旧片段 1.1 倍）。
+1e4 让惊异度主导排序，K/V 分数只区分惊异度相同的片段；指数让整段换入跟随惊异度的顺序：换入要求"密度 × 长度"
+超过被换出片段之和，线性价值下 20 token 的针换不掉一个惊异度一半、64 token 的片段，每比特 16 倍时惊异度高 1.5 比特
+的片段即可抵过 64 倍长度。不看开头、不看问题、不训练，不增加 KV。
 
 - 惊异度来自模型自己的 logits：开启时 `GPT.forward` 把带缓存的输入按不超过 recent 窗口与 flush 粒度的块（默认 2048）
   逐块前向，每块之后把该块各 token 的惊异度交给 `SurprisalStream`（块首 token 用上一块或上一步的末位 logits）。
@@ -194,7 +196,8 @@ K/V 分数只区分惊异度相同的片段。不看开头、不看问题、不�
   [`eval_gamma_surprisal_mean_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_mean_p1024.yaml)（`mean`），
   都在不带 cue 的 P=1024 checkpoint（`arc_gamma_k12_b128_p1024_2k`）上，与它自身的评测只差这一项。
 
-测试：`tests/test_surprisal_admission.py`（片段价值、分块前向的惊异度与返回的 logits、逐 token 解码一致、惊异片段进入精确池），
+测试：`tests/test_surprisal_admission.py`（片段价值、分块前向的惊异度与返回的 logits、逐 token 解码一致、惊异片段进入精确池、
+短而惊异的片段换掉长而平淡的片段），
 `tests/test_retention.py`（启动脚本的配置读取与 checkpoint 检查、选项解析与续训、片段价值公式与设备相加、新头不改变选择、prefill 与逐 token 一致、
 能识别针的头把针留在精确池、校验与保存/加载、回放签名、合成事实的版式与种类、训练器能分开正负样本、
 `demo.py` 的混入），`tests/test_exp_configs.py`（niah 配置只差所述开关），
