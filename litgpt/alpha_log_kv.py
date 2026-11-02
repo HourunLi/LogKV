@@ -38,8 +38,8 @@ LITERAL_FLOOR = 12.
 # random 7-digit number (at the cap) still ranks above K/V scores.
 LITERAL_TIER_CAP = 6.
 _LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
-# Surprisal admission (optional, niahLogKV): a span's score is the mean, or the mean of the
-# four largest, of its tokens' -log2 p under the model itself (bits). Its value density is
+# Surprisal admission (optional, niahLogKV): a span's score is the mean, the mean of the four
+# largest, or the average of the two ("mix"), of its tokens' -log2 p under the model itself (bits). Its value density is
 # SURPRISAL_SCALE * SURPRISAL_BASE ** min(score, SURPRISAL_CAP). The scale keeps every span far
 # above its K/V score, so K/V scores only break ties. The base makes the whole-span swaps of
 # choose_spans follow the surprisal order: a span replaces pool spans only if density x length
@@ -48,7 +48,7 @@ _LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
 SURPRISAL_SCALE = 1e4
 SURPRISAL_BASE = 16.
 SURPRISAL_CAP = 32.
-SURPRISAL_SCORES = ("mean", "top4")
+SURPRISAL_SCORES = ("mean", "top4", "mix")
 
 
 @dataclass
@@ -544,15 +544,18 @@ class SurprisalStream:
                                f"{len(known)}): GPT.forward feeds it one chunk ahead of the cache")
         bits = known[positions]
         starts = np.cumsum(lengths) - lengths
+        mean = np.add.reduceat(bits, starts) / np.maximum(lengths, 1)
         if self.score == "mean":
-            score = np.add.reduceat(bits, starts) / np.maximum(lengths, 1)
-        else:  # the mean of each span's four largest
+            score = mean
+        else:  # the mean of each span's four largest; "mix" averages it with the mean
             span = np.repeat(np.arange(len(lengths)), lengths)
             order = np.lexsort((-bits, span))
             rank = np.arange(len(bits)) - starts[span[order]]
             top = rank < 4
             score = (np.bincount(span[order][top], weights=bits[order][top], minlength=len(lengths))
                      / np.minimum(lengths, 4).clip(min=1))
+            if self.score == "mix":
+                score = (score + mean) / 2
         return SURPRISAL_SCALE * SURPRISAL_BASE ** np.minimum(score, SURPRISAL_CAP)
 
 
