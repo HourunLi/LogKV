@@ -168,8 +168,9 @@ token 逐个进入，攒满 recent + flush 后最早的 flush 个离开 recent �
 - g：遗忘，none、幂律 (1 + age/τ)^(−α) 或指数 exp(−age/τ)。
 - last(T)：片段末尾；打开复用时取 T 之前它的"有信息的 n-gram"（片段内惊异度不低于 `--reuse-bits` 的 n-gram）
   最近一次再出现的位置（刷新）。M(T)：复用加分时这些再出现的惊异度之和。
-- 全部因果：T 时的价值只用 T 之前的 token。默认网格为 3 种分数 × 6 种遗忘 × 3 种复用（无、刷新、加分）再加新近基准，
-  共 55 种策略。
+- 全部因果：T 时的价值只用 T 之前的 token。默认网格为 3 种分数 × 6 种遗忘 × 3 种复用（无、刷新、加分）再加新近基准
+  与 mix、multi、sum 三种分数，共 58 种策略。
+- `--info-spans` 按上面的信息片段规则另切片段（词首表由 tokenizer 构建，默认按 .npz 里记下的配置找，或用 `--tokenizer` 指定）。
 
 报告每种策略：NIAH 提示结束时针的值仍为精确的比例（按任务，以及针在前三分之一的样本）；自然块上远距离复用的
 命中率（`reuse_label_stats.py` 的标签：b 读入时 a 处的那份是否仍为精确），单块与 `--concat` 块拼接成的长流；
@@ -196,10 +197,13 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 - `sum` 按片段的总编码长度 −log2 p(片段)（token 惊异度之和）打分，价值为片段的逆概率 `SURPRISAL_SCALE` × 2^min(总比特, 512)。
   它与分词方式无关：数字逐位切分，每位最多 log2 10 ≈ 3.3 比特，按平均或峰值算会输给单个罕见词，按总量算一个 7 位
   随机数约 23 比特。整句求和会偏向长的普通句子，所以 `sum` 应与信息片段同用。
-- 信息片段（`log_kv_gamma_surprisal_spans: true`）：除句末与片段上限外，惊异度换了"档位"的地方也切开片段——
-  一个 token 比本行已见 token 的平均惊异度高出 1 个标准差时开始一串，惊异度回到平均以下时结束，这一串自成片段。
-  人名、数值、编码因此能单独进入精确池，不必连带整句；它们的 K/V 已含上下文。`GPT.forward` 每块之后把切点补进各层
-  缓存里仍在 recent 窗口的片段边界（块首 token 开始的一串，切点落在上一块末 token 上，它仍在窗口内）。
+- 信息片段（`log_kv_gamma_surprisal_spans: true`）：除句末与片段上限外，信息量高的一串词也自成片段。词是一个以空白或
+  CJK 字符开头的 token 加上其后直到下一个词首的 token（由 tokenizer 各 token 单独解码的文本判定，`word_start_table`），
+  词的编码长度是其 token 惊异度之和 −log2 p(词 | 上文)，与分词方式无关（7 位随机数约 25 比特，不会因逐位切分而显得平淡）。
+  一个词的编码长度比本行已见词的均值高出 1 个标准差时开始一串，回到均值以下时结束；只在词与词之间切，所以一个词、
+  一个值不会被切开。人名、数值、编码因此能单独进入精确池，不必连带整句；它们的 K/V 已含上下文。词要到下一个词开始
+  才算完，所以切点总落在仍在 recent 窗口的 token 上；`GPT.forward` 每块之后把切点补进各层缓存的片段边界。
+  需要 token 文本（`set_alpha_span_boundary_ids(..., literal_texts=...)`，`eval.py` 开启时自动传入）。
 - 只用于评测：训练（`enable_log_kv_training`）与 CPT 不支持。`eval.py` 与 `eval.sh` 在 YAML 设置时传
   `--log_kv_gamma_surprisal`；关 Alpha 时一并关闭。结果 JSON 记录该开关。
 - 配置：[`eval_gamma_surprisal_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_p1024.yaml)（`top4`）与
@@ -212,7 +216,7 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
   都在不带 cue 的 P=1024 checkpoint（`arc_gamma_k12_b128_p1024_2k`）上，与它自身的评测只差这一项。
 
 测试：`tests/test_surprisal_admission.py`（片段价值、分块前向的惊异度与返回的 logits、逐 token 解码一致、惊异片段进入精确池、
-短而惊异的片段换掉长而平淡的片段），
+短而惊异的片段换掉长而平淡的片段、信息片段按词切且不切开多 token 的数值），
 `tests/test_retention.py`（启动脚本的配置读取与 checkpoint 检查、选项解析与续训、片段价值公式与设备相加、新头不改变选择、prefill 与逐 token 一致、
 能识别针的头把针留在精确池、校验与保存/加载、回放签名、合成事实的版式与种类、训练器能分开正负样本、
 `demo.py` 的混入），`tests/test_exp_configs.py`（niah 配置只差所述开关），

@@ -1019,7 +1019,8 @@ class LogKVLM(LM):
             self.model.set_alpha_span_boundary_ids(
                 self.tokenizer.alpha_span_boundary_ids,
                 self.tokenizer.alpha_line_end_ids if self.log_kv_gamma_cue_tokens else None,
-                self.tokenizer.gamma_literal_texts if self.log_kv_gamma_literals else None,
+                self.tokenizer.gamma_literal_texts if self.log_kv_gamma_literals or self.log_kv_gamma_surprisal_spans
+                else None,
             )
         # Query-aware cue: host table of line-ending tokens, built once; each request's
         # question is cut from the last CUE_QUERY_TOKENS prompt ids only.

@@ -105,11 +105,12 @@ class Stream:
     """One token sequence prepared for replay: spans, admission scores, n-gram re-occurrence index."""
 
     def __init__(self, ids, s, boundary, max_span, reuse_n=2, reuse_bits=6., label_n=3, label_bits=6.,
-                 recent=2048, info_chunk=0, **fields):
+                 recent=2048, info_chunk=0, word_starts=None, **fields):
         self.ids, self.s = np.asarray(ids, dtype=np.int64), np.asarray(s, dtype=np.float64)
         self.fields = fields
-        # info_chunk > 0: information spans as the cache cuts them (surprisal fed in chunks of that size).
-        extra = information_ends(self.s, info_chunk) if info_chunk else None
+        # info_chunk > 0: information spans as the cache cuts them (surprisal fed in chunks of that size;
+        # word_starts flags the tokens that begin a word).
+        extra = information_ends(self.s, info_chunk, word_starts) if info_chunk else None
         self.starts, self.stops = cut(self.ids, boundary, max_span, extra)
         self.base = span_base(self.s, self.starts, self.stops)
         n = reuse_n
@@ -302,6 +303,19 @@ def format_row(row) -> str:
     return f"{row['policy']:42s} {niah} early={row['niah_early']:.2f} | hit {natural} | reused={row['reused']:.2f}"
 
 
+def word_table(tokenizer_dir, config):
+    """Which token ids begin a word, from the tokenizer (``tokenizer_dir``, else the one of the saved config:
+    the YAML's tokenizer_dir / resume_dir / ckpt_dir, then its checkpoint directory)."""
+    from litgpt.alpha_log_kv import word_start_table
+    from litgpt.tokenizer import Tokenizer
+    if tokenizer_dir is None:
+        import importlib
+        import train_retention as tr
+        cfg = tr.load_config(config)
+        tokenizer_dir = tr.tokenizer_dir(cfg) or importlib.import_module("eval")._resolve_checkpoint_dir(cfg["save_path"])
+    return word_start_table(Tokenizer(tokenizer_dir).gamma_literal_texts)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--niah", default=None, help="unused/niah_surprisal.py --save-surprisal output")
@@ -315,6 +329,8 @@ def main():
     p.add_argument("--label-n", type=int, default=3, help="far-reuse label n-gram (natural hit rate)")
     p.add_argument("--label-bits", type=float, default=6., help="far-reuse label first-occurrence threshold")
     p.add_argument("--policies", default=None, help="JSON list of Policy fields (default: the built-in grid)")
+    p.add_argument("--tokenizer", default=None,
+                   help="tokenizer dir for --info-spans word boundaries (default: the one of the saved config)")
     p.add_argument("--info-spans", action="store_true",
                    help="cut information spans as log_kv_gamma_surprisal_spans does (chunks of min(recent, flush))")
     p.add_argument("--out", default="pool_policy_sim.json")
@@ -332,12 +348,14 @@ def main():
     pool, recent, flush = args.pool or meta["pool"], args.recent or meta["recent"], args.flush or meta["flush"]
     boundary = np.zeros(max(max(meta["boundary_ids"]) + 1, 1), dtype=bool)
     boundary[meta["boundary_ids"]] = True
+    words = word_table(args.tokenizer, meta["config"]) if args.info_spans else None
 
     def prepare(row, **fields):
         ids = row["ids"]
         table = boundary if boundary.size > ids.max() else np.pad(boundary, (0, int(ids.max()) + 1 - boundary.size))
         return Stream(ids, row["surprisal"], table, meta["max_span"], args.reuse_n, args.reuse_bits, args.label_n,
-                      args.label_bits, recent, min(recent, flush) if args.info_spans else 0, **fields)
+                      args.label_bits, recent, min(recent, flush) if args.info_spans else 0,
+                      words[ids] if words is not None else None, **fields)
 
     niah = []
     if "niah" in loaded:

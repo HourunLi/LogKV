@@ -123,20 +123,30 @@ def test_a_short_surprising_span_evicts_a_long_dull_one():
     assert choose_spans(cut, linear, 64).keep[0] == list(range(64))
 
 
-def test_information_runs_cut_a_span_around_informative_tokens():
-    from litgpt.alpha_log_kv import information_ends
-    bits = np.r_[np.full(20, 1.), [9., 9., 4.], np.full(20, 1.)]  # a run starts at 9 bits, lasts above the mean
-    assert np.flatnonzero(information_ends(bits, 64)).tolist() == [19, 22]
+def test_information_runs_cut_whole_words_by_their_code_length():
+    from litgpt.alpha_log_kv import information_ends, word_start_table
+    assert word_start_table([" the", "ing", "\n", "中", "", "-"]).tolist() == [True, False, True, True, True, False]
+    # 30 one-token words of 2 bits, then a 7-token number of 3.5-bit digits (one word of 24.5 bits: none of
+    # its tokens stands out alone), then a word "obnoxious-sale" of 12 + 0.2 + 10 bits, then 30 more words.
+    bits = np.r_[np.full(30, 2.), np.full(7, 3.5), [12., 0.2, 10.], np.full(30, 2.)]
+    starts = np.r_[np.ones(30), [1] + [0] * 6, [1, 0, 0], np.ones(30)].astype(bool)
+    ends = np.flatnonzero(information_ends(bits, 64, starts)).tolist()
+    assert ends == [29, 39]  # one run of both words, cut only between words
 
 
 def test_information_spans_mark_the_caches_span_ends():
-    from litgpt.alpha_log_kv import information_ends
+    from litgpt.alpha_log_kv import information_ends, word_start_table
     model = _model()
+    texts = [" w" if i % 3 == 0 else "x" for i in range(41)]  # every third id begins a word
+    with pytest.raises(RuntimeError, match="token texts"):
+        model.set_log_kv_cache(recent_size=64, gamma_surprisal="mean", gamma_surprisal_spans=True, **KWARGS)
+    model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7], literal_texts=texts)
     ids = torch.randint(0, 41, (40,))
     model.set_log_kv_cache(recent_size=64, gamma_surprisal="mean", gamma_surprisal_spans=True, **KWARGS)
     with torch.no_grad():
         model(ids[None], input_pos=torch.arange(40))
-    expected = np.flatnonzero(information_ends(model.log_kv_surprisal_stream._rows[0], 8))
+    words = word_start_table(texts)[ids.numpy()]
+    expected = np.flatnonzero(information_ends(model.log_kv_surprisal_stream._rows[0], 8, words))
     assert len(expected)
     for block in model.transformer.h:
         assert all(block.attn.kv_cache._recent_span_ends[0][p] for p in expected)

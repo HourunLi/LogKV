@@ -345,6 +345,7 @@ def main():
     hf_tokenizer = AutoTokenizer.from_pretrained(hf_dir)
     boundary = np.zeros(max(lm.tokenizer.vocab_size, lm.config.padded_vocab_size), dtype=bool)
     boundary[list(lm.tokenizer.alpha_span_boundary_ids)] = True
+    word_starts = al.word_start_table(lm.tokenizer.gamma_literal_texts) if args.info_spans else None
     max_span, recent = int(lm.log_kv_alpha_span_max_tokens), int(lm.log_kv_recent_size)
     print(f"spans capped at {max_span} tokens; recent window {recent}; "
           f"{'dense' if lm.log_kv_dense_mode else 'LogKV'} cache from {args.config}", flush=True)
@@ -362,8 +363,8 @@ def main():
                 needle, value, text = main["needle"], main["value"], main["text"]
                 surprisal = token_surprisal(lm.model, ids, prepare=lm._set_eval_cache)
                 lm._reset_eval_cache()
-                extra = (al.information_ends(surprisal, min(recent, int(lm.log_kv_semantic_flush_granularity)))
-                         if args.info_spans else None)
+                extra = (al.information_ends(surprisal, min(recent, int(lm.log_kv_semantic_flush_granularity)),
+                                             word_starts[np.asarray(ids)]) if args.info_spans else None)
                 record = analyse(np.asarray(ids), surprisal, boundary, max_span, recent, needles,
                                  lambda t: lm.tokenizer.decode(torch.as_tensor(t)), extra_ends=extra)
                 record.update(task=task, index=sample["index"], depth=round(depth, 4), value=text)
