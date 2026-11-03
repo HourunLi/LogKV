@@ -77,6 +77,20 @@ def _rank_label() -> str:
     return f"GlobalRank {_global_rank()}/{_world_size()} (local {_local_rank()})"
 
 
+def _code_version() -> dict:
+    """The git commit this eval ran from and whether tracked files differed from it (None outside git)."""
+    import subprocess
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        commit = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                timeout=10, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", root, "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return {"git_commit": None, "git_dirty": None}
+    return {"git_commit": commit, "git_dirty": bool(dirty)}
+
+
 def _eval_verbose() -> bool:
     return os.environ.get("LOGKV_EVAL_VERBOSE", "0") == "1"
 
@@ -2009,6 +2023,7 @@ def main(
             if output_path is not None:
                 json_output = {
                     "timestamp": ts,
+                    **_code_version(),
                     "benchmark": benchmark,
                     "checkpoint_dir": checkpoint_dir,
                     "log_kv_dense_mode": log_kv_dense_mode,
@@ -2190,6 +2205,7 @@ def output_from_cache(
     if output_path is not None:
         json_output = {
             "timestamp": ts,
+            **_code_version(),
             "benchmark": benchmark,
             "checkpoint_dir": checkpoint_dir,
             "log_kv_dense_mode": log_kv_dense_mode,
