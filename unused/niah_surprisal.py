@@ -104,10 +104,12 @@ def unigram_code_length(ids, vocab: int) -> np.ndarray:
     return out
 
 
-def cut(ids, boundary, max_span: int) -> tuple[np.ndarray, np.ndarray]:
-    """Alpha's candidate spans [start, stop) over the whole prompt: natural boundaries and the span cap."""
+def cut(ids, boundary, max_span: int, extra_ends=None) -> tuple[np.ndarray, np.ndarray]:
+    """Alpha's candidate spans [start, stop) over the whole prompt: natural boundaries (plus
+    ``extra_ends``, e.g. information spans) and the span cap."""
     ids = np.asarray(ids, dtype=np.int64)
-    _, starts, stops, _ = al._new_runs(np.arange(len(ids)), boundary[ids], 0, 0, max_span)
+    ends = boundary[ids] if extra_ends is None else boundary[ids] | np.asarray(extra_ends, dtype=bool)
+    _, starts, stops, _ = al._new_runs(np.arange(len(ids)), ends, 0, 0, max_span)
     return starts, stops
 
 

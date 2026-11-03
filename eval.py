@@ -902,6 +902,7 @@ class LogKVLM(LM):
         log_kv_gamma_query_cue: bool = False,
         log_kv_retention_heads: str | None = None,
         log_kv_gamma_surprisal: str | None = None,
+        log_kv_gamma_surprisal_spans: bool = False,
         tokenizer_dir: str | None = None,
         process_group=None,
     ):
@@ -958,6 +959,7 @@ class LogKVLM(LM):
         self.log_kv_gamma_query_cue = bool(log_kv_gamma_query_cue)
         self.log_kv_retention_heads = log_kv_retention_heads or None
         self.log_kv_gamma_surprisal = log_kv_gamma_surprisal or None
+        self.log_kv_gamma_surprisal_spans = bool(log_kv_gamma_surprisal_spans) and self.log_kv_gamma_surprisal is not None
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -1117,6 +1119,7 @@ class LogKVLM(LM):
             gamma_query_cue=self.log_kv_gamma_query_cue,
             retention_head=getattr(self, "_retention_heads", None) is not None,
             gamma_surprisal=self.log_kv_gamma_surprisal,
+            gamma_surprisal_spans=self.log_kv_gamma_surprisal_spans,
         )
         if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
@@ -1600,6 +1603,9 @@ def main(
     # niahLogKV surprisal admission ("mean" | "top4"; None = off): the exact pool ranks spans by
     # their tokens' surprisal under the model itself (prefill runs in recent-window chunks).
     log_kv_gamma_surprisal: str | None = None,
+    # With surprisal admission: a run of informative tokens (a name, a number) is a span of its own,
+    # so the exact pool can keep it without its sentence.
+    log_kv_gamma_surprisal_spans: bool = False,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1695,6 +1701,7 @@ def main(
     log_kv_gamma_query_cue = bool(_o("log_kv_gamma_query_cue", log_kv_gamma_query_cue))
     log_kv_retention_heads = _o("log_kv_retention_heads", log_kv_retention_heads) or None
     log_kv_gamma_surprisal = _o("log_kv_gamma_surprisal", log_kv_gamma_surprisal) or None
+    log_kv_gamma_surprisal_spans = bool(_o("log_kv_gamma_surprisal_spans", log_kv_gamma_surprisal_spans))
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
@@ -1705,6 +1712,8 @@ def main(
         log_kv_gamma_query_cue = False
         log_kv_retention_heads = None
         log_kv_gamma_surprisal = None
+    if not log_kv_gamma_surprisal:
+        log_kv_gamma_surprisal_spans = False
     if not (log_kv_gamma_cue_tokens or log_kv_gamma_query_cue):
         log_kv_gamma_cue_guard = False  # the guard only acts on cues
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
@@ -1807,7 +1816,7 @@ def main(
                 f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens}, "
                 f"gamma_literals={log_kv_gamma_literals}, gamma_cue_guard={log_kv_gamma_cue_guard}, "
                 f"gamma_query_cue={log_kv_gamma_query_cue}, retention_heads={log_kv_retention_heads}, "
-                f"gamma_surprisal={log_kv_gamma_surprisal})"
+                f"gamma_surprisal={log_kv_gamma_surprisal}, gamma_surprisal_spans={log_kv_gamma_surprisal_spans})"
             )
         if diag_active:
             print(
@@ -1887,6 +1896,7 @@ def main(
             log_kv_gamma_query_cue=log_kv_gamma_query_cue,
             log_kv_retention_heads=log_kv_retention_heads,
             log_kv_gamma_surprisal=log_kv_gamma_surprisal,
+            log_kv_gamma_surprisal_spans=log_kv_gamma_surprisal_spans,
             tokenizer_dir=tokenizer_dir,
             process_group=eval_group,
         )
@@ -2046,6 +2056,7 @@ def main(
                     "log_kv_gamma_query_cue": log_kv_gamma_query_cue,
                     "log_kv_retention_heads": log_kv_retention_heads,
                     "log_kv_gamma_surprisal": log_kv_gamma_surprisal,
+                    "log_kv_gamma_surprisal_spans": log_kv_gamma_surprisal_spans,
                     "log_kv_retention_tag": (lm_model._retention_heads.tag()
                                              if getattr(lm_model, "_retention_heads", None) is not None else None),
                     "results": results,

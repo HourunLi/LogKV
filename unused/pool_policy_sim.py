@@ -49,15 +49,16 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "unused"))
+from litgpt.alpha_log_kv import RunningStats, information_ends  # noqa: E402
 from niah_surprisal import SurprisalStore, cut, write_summary  # noqa: E402
 from reuse_label_stats import reuse_pairs  # noqa: E402
 
-SCORES = ("mean", "top4", "topq", "max")
+SCORES = ("mean", "top4", "topq", "max", "mix")
 
 
 @dataclass(frozen=True)
 class Policy:
-    score: str = "mean"          # mean | top4 | topq | max | recency
+    score: str = "mean"          # mean | top4 | topq | max | mix | multi | recency
     decay: str = "none"          # none | power | exp
     tau: float = 16384.
     alpha: float = 1.
@@ -80,7 +81,7 @@ def default_policies() -> list[Policy]:
               dict(decay="exp", tau=16384.)]
     reuses = [dict(reuse="none"), dict(reuse="refresh"), dict(reuse="boost", beta=.5)]
     out = [Policy(score=s, **d, **r) for s, d, r in itertools.product(("mean", "top4", "topq"), decays, reuses)]
-    return out + [Policy(score="recency", decay="exp", tau=4096.)]
+    return out + [Policy(score="recency", decay="exp", tau=4096.), Policy(score="mix"), Policy(score="multi")]
 
 
 def span_base(s, starts, stops) -> dict[str, np.ndarray]:
@@ -93,6 +94,7 @@ def span_base(s, starts, stops) -> dict[str, np.ndarray]:
             out["mean"][i], out["max"][i] = part.mean(), part[-1]
             out["top4"][i] = part[-4:].mean()
             out["topq"][i] = part[-max(1, len(part) // 4):].mean()
+    out["mix"] = (out["mean"] + out["top4"]) / 2
     out["recency"] = np.ones(len(starts))
     return out
 
@@ -101,10 +103,12 @@ class Stream:
     """One token sequence prepared for replay: spans, admission scores, n-gram re-occurrence index."""
 
     def __init__(self, ids, s, boundary, max_span, reuse_n=2, reuse_bits=6., label_n=3, label_bits=6.,
-                 recent=2048, **fields):
+                 recent=2048, info_chunk=0, **fields):
         self.ids, self.s = np.asarray(ids, dtype=np.int64), np.asarray(s, dtype=np.float64)
         self.fields = fields
-        self.starts, self.stops = cut(self.ids, boundary, max_span)
+        # info_chunk > 0: information spans as the cache cuts them (surprisal fed in chunks of that size).
+        extra = information_ends(self.s, info_chunk) if info_chunk else None
+        self.starts, self.stops = cut(self.ids, boundary, max_span, extra)
         self.base = span_base(self.s, self.starts, self.stops)
         n = reuse_n
         self.span_keys: list[np.ndarray] = [np.empty(0, dtype=np.int64)] * len(self.starts)
@@ -157,8 +161,8 @@ def concat(rows):
     return dict(ids=np.concatenate([r["ids"] for r in rows]), surprisal=np.concatenate([r["surprisal"] for r in rows]))
 
 
-def value(policy: Policy, stream: Stream, spans: np.ndarray, time: int) -> np.ndarray:
-    base = stream.base[policy.score][spans].copy()
+def value(policy: Policy, stream: Stream, spans: np.ndarray, time: int, base=None) -> np.ndarray:
+    base = stream.base[policy.score][spans].copy() if base is None else base
     last = stream.stops[spans].astype(np.float64)
     if policy.reuse != "none":
         for j, span in enumerate(spans):
@@ -183,6 +187,8 @@ def replay(stream: Stream, policy: Policy, pool: int, recent: int, flush: int) -
     snapshots = []  # (time, kept spans) after every flush
     archived, next_span, reused_tokens, kept_tokens = 0, 0, 0, 0
     time = recent + flush
+    stats = RunningStats(2)  # "multi": each dimension against the spans archived so far
+    features = np.stack((stream.base["mean"], stream.base["top4"]), 1)
     while time <= n:
         archived += flush
         first = next_span
@@ -190,7 +196,11 @@ def replay(stream: Stream, policy: Policy, pool: int, recent: int, flush: int) -
             next_span += 1
         candidates = np.arange(first, next_span)
         spans = np.concatenate((kept, candidates))
-        v = value(policy, stream, spans, time)
+        base = None
+        if policy.score == "multi":
+            stats.update(features[candidates])
+            base = stats.z(features[spans]).max(1)
+        v = value(policy, stream, spans, time, base)
         v[:len(kept)] *= policy.hysteresis
         chosen, used = [], 0
         for j in np.argsort(-v, kind="stable"):
@@ -260,7 +270,8 @@ def evaluate(policies, niah, natural, pool, recent, flush):
 def summary(saved: dict) -> str:
     """All policies in grid order, then the ten best by mean NIAH and by the longest natural hit rate."""
     rows = saved["rows"]
-    lines = [f"pool {saved['pool']}, recent {saved['recent']}, flush {saved['flush']}; "
+    lines = [f"pool {saved['pool']}, recent {saved['recent']}, flush {saved['flush']}"
+             f"{', information spans' if saved.get('info_spans') else ''}; "
              f"reuse {saved['reuse_n']}-grams >= {saved['reuse_bits']:g} bits; "
              f"far-reuse label {saved['label_n']}-grams >= {saved['label_bits']:g} bits"
              + (f"; {saved['streams']}" if saved.get("streams") else ""), "", "all policies:"]
@@ -297,6 +308,8 @@ def main():
     p.add_argument("--label-n", type=int, default=3, help="far-reuse label n-gram (natural hit rate)")
     p.add_argument("--label-bits", type=float, default=6., help="far-reuse label first-occurrence threshold")
     p.add_argument("--policies", default=None, help="JSON list of Policy fields (default: the built-in grid)")
+    p.add_argument("--info-spans", action="store_true",
+                   help="cut information spans as log_kv_gamma_surprisal_spans does (chunks of min(recent, flush))")
     p.add_argument("--out", default="pool_policy_sim.json")
     p.add_argument("--report", default=None, help="a finished run's .json: write its summary, replay nothing")
     args = p.parse_args()
@@ -317,7 +330,7 @@ def main():
         ids = row["ids"]
         table = boundary if boundary.size > ids.max() else np.pad(boundary, (0, int(ids.max()) + 1 - boundary.size))
         return Stream(ids, row["surprisal"], table, meta["max_span"], args.reuse_n, args.reuse_bits, args.label_n,
-                      args.label_bits, recent, **fields)
+                      args.label_bits, recent, min(recent, flush) if args.info_spans else 0, **fields)
 
     niah = []
     if "niah" in loaded:
@@ -335,7 +348,8 @@ def main():
           + ", ".join(f"{len(v)} natural streams ({k})" for k, v in natural.items()) + f"; {len(policies)} policies",
           flush=True)
     rows = evaluate(policies, niah, natural, pool, recent, flush)
-    saved = dict(pool=pool, recent=recent, flush=flush, reuse_n=args.reuse_n, reuse_bits=args.reuse_bits,
+    saved = dict(pool=pool, recent=recent, flush=flush, info_spans=args.info_spans, reuse_n=args.reuse_n,
+                 reuse_bits=args.reuse_bits,
                  label_n=args.label_n, label_bits=args.label_bits, rows=rows,
                  streams=f"{len(niah)} NIAH prompts, " + ", ".join(f"{len(v)} natural streams ({k})"
                                                                     for k, v in natural.items()))

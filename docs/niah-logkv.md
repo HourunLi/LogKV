@@ -8,7 +8,8 @@ niahLogKV 建立在 attach + Alpha + Beta + Gamma 之上（见 [Gamma](gamma-log
 | 参数 | 默认 | 作用 |
 |---|---|---|
 | `log_kv_retention_heads` | `null`（关闭） | `train_retention.py` 训出的打分头文件；评测与 CPT 都读它 |
-| `log_kv_gamma_surprisal` | `null`（关闭） | 精确池按 token 惊异度给片段打分（`mean`、`top4` 或 `mix`，见第 7 节；只评测） |
+| `log_kv_gamma_surprisal` | `null`（关闭） | 精确池按 token 惊异度给片段打分（`mean`、`top4`、`mix` 或 `multi`，见第 7 节；只评测） |
+| `log_kv_gamma_surprisal_spans` | `false` | 与上者同用：惊异度持续偏高的一串 token 自成片段（信息片段，见第 7 节） |
 | `synthetic_retrieval_prob` | `0.0` | CPT 时训练块插入合成事实与问答的概率（只在 `demo.py`） |
 | `synthetic_facts` / `synthetic_questions` / `synthetic_kinds` | `2,8` / `1,3` / 全部 | 每块事实数、问题数与值的种类 |
 
@@ -179,8 +180,9 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 
 ## 7. 惊异度准入（只评测）
 
-`log_kv_gamma_surprisal: mean | top4 | mix` 让精确池按片段 token 的惊异度排序：token t 的惊异度是模型自己对它的编码长度
-−log2 p(ids[t] | ids[:t])（比特），片段分数取其均值（`mean`）、最大 4 个的均值（`top4`）或两者的平均（`mix`），价值密度为
+`log_kv_gamma_surprisal: mean | top4 | mix | multi` 让精确池按片段 token 的惊异度排序：token t 的惊异度是模型自己对它的编码长度
+−log2 p(ids[t] | ids[:t])（比特），片段分数取其均值（`mean`）、最大 4 个的均值（`top4`）、两者的平均（`mix`），或多维度（`multi`：两者各自相对本条
+序列已归档片段的均值与标准差换算成 z 分数，标准差下限 0.25 比特，片段按更突出的一维计分），价值密度为
 `SURPRISAL_SCALE`（1e4）× `SURPRISAL_BASE`（16）^ min(分数, 32)，加到 K/V 分数上进入原有的整段贪心（含旧片段 1.1 倍）。
 1e4 让惊异度主导排序，K/V 分数只区分惊异度相同的片段；指数让整段换入跟随惊异度的顺序：换入要求"密度 × 长度"
 超过被换出片段之和，线性价值下 20 token 的针换不掉一个惊异度一半、64 token 的片段，每比特 16 倍时惊异度高 1.5 比特
@@ -190,11 +192,17 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
   逐块前向，每块之后把该块各 token 的惊异度交给 `SurprisalStream`（块首 token 用上一块或上一步的末位 logits）。
   flush 只归档更早块里的 token，所以被归档的 token 的惊异度总已在流里。逐 token 解码同样逐步喂入。
 - 代价：每块对所有位置算一次 lm_head（Qwen3-1.7B 上约为预填充计算的两成），主机上每个 token 存一个浮点数。
+- 信息片段（`log_kv_gamma_surprisal_spans: true`）：除句末与片段上限外，惊异度换了"档位"的地方也切开片段——
+  一个 token 比本行已见 token 的平均惊异度高出 1 个标准差时开始一串，惊异度回到平均以下时结束，这一串自成片段。
+  人名、数值、编码因此能单独进入精确池，不必连带整句；它们的 K/V 已含上下文。`GPT.forward` 每块之后把切点补进各层
+  缓存里仍在 recent 窗口的片段边界（块首 token 开始的一串，切点落在上一块末 token 上，它仍在窗口内）。
 - 只用于评测：训练（`enable_log_kv_training`）与 CPT 不支持。`eval.py` 与 `eval.sh` 在 YAML 设置时传
   `--log_kv_gamma_surprisal`；关 Alpha 时一并关闭。结果 JSON 记录该开关。
 - 配置：[`eval_gamma_surprisal_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_p1024.yaml)（`top4`）与
   [`eval_gamma_surprisal_mean_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_mean_p1024.yaml)（`mean`）与
-  [`eval_gamma_surprisal_mix_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_mix_p1024.yaml)（`mix`），
+  [`eval_gamma_surprisal_mix_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_mix_p1024.yaml)（`mix`）、
+  [`eval_gamma_surprisal_multi_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_multi_p1024.yaml)（`multi`）与
+  [`eval_gamma_surprisal_spans_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_spans_p1024.yaml)（`mean` + 信息片段），
   都在不带 cue 的 P=1024 checkpoint（`arc_gamma_k12_b128_p1024_2k`）上，与它自身的评测只差这一项。
 
 测试：`tests/test_surprisal_admission.py`（片段价值、分块前向的惊异度与返回的 logits、逐 token 解码一致、惊异片段进入精确池、
