@@ -164,13 +164,18 @@ token 逐个进入，攒满 recent + flush 后最早的 flush 个离开 recent �
 
   v(T) = (I + β·M(T)) · g(T − last(T))
 
-- I：准入时的信息量，片段的惊异度分数（mean、top4、topq 即最高四分之一的均值、max），或恒为 1（只看新近的基准）。
+- I：准入时的信息量，片段的惊异度分数（mean、top4、topq 即最高四分之一的均值、max、mix、sum），词分数（`word_max`：
+  片段中编码长度最大的词的编码长度，词与编码长度同第 7 节信息片段；`word_top2`：最大两个的均值），多维 z 分数
+  （`multi`：mean 与 top4；`multi_word`：mean 与 word_max），或恒为 1（只看新近的基准）。
 - g：遗忘，none、幂律 (1 + age/τ)^(−α) 或指数 exp(−age/τ)。
 - last(T)：片段末尾；打开复用时取 T 之前它的"有信息的 n-gram"（片段内惊异度不低于 `--reuse-bits` 的 n-gram）
   最近一次再出现的位置（刷新）。M(T)：复用加分时这些再出现的惊异度之和。
 - 全部因果：T 时的价值只用 T 之前的 token。默认网格为 3 种分数 × 6 种遗忘 × 3 种复用（无、刷新、加分）再加新近基准
-  与 mix、multi、sum 三种分数，共 58 种策略。
-- `--info-spans` 按上面的信息片段规则另切片段（词首表由 tokenizer 构建，默认按 .npz 里记下的配置找，或用 `--tokenizer` 指定）。
+  与 mix、multi、sum、word_max、word_top2、multi_word 六种分数，共 61 种策略。
+- `--info-spans` 按第 7 节的信息片段规则另切片段。词分数与 `--info-spans` 要用 tokenizer 判断词首（默认按 .npz 里记下的
+  配置找，或用 `--tokenizer` 指定）。
+- `--explain K` 另写 `<输出名>.explain.txt`：每种策略、每个任务前 K 个丢针的样本，列出针所在片段与最终池中分数最高的
+  片段（文本、长度、各分数、在已归档片段中的名次）。汇总首行记下代码的 commit。
 
 报告每种策略：NIAH 提示结束时针的值仍为精确的比例（按任务，以及针在前三分之一的样本）；自然块上远距离复用的
 命中率（`reuse_label_stats.py` 的标签：b 读入时 a 处的那份是否仍为精确），单块与 `--concat` 块拼接成的长流；
