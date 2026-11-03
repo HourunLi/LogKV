@@ -53,12 +53,12 @@ from litgpt.alpha_log_kv import RunningStats, information_ends  # noqa: E402
 from niah_surprisal import SurprisalStore, cut, write_summary  # noqa: E402
 from reuse_label_stats import reuse_pairs  # noqa: E402
 
-SCORES = ("mean", "top4", "topq", "max", "mix")
+SCORES = ("mean", "top4", "topq", "max", "mix", "sum")
 
 
 @dataclass(frozen=True)
 class Policy:
-    score: str = "mean"          # mean | top4 | topq | max | mix | multi | recency
+    score: str = "mean"          # mean | top4 | topq | max | mix | sum | multi | recency
     decay: str = "none"          # none | power | exp
     tau: float = 16384.
     alpha: float = 1.
@@ -81,7 +81,8 @@ def default_policies() -> list[Policy]:
               dict(decay="exp", tau=16384.)]
     reuses = [dict(reuse="none"), dict(reuse="refresh"), dict(reuse="boost", beta=.5)]
     out = [Policy(score=s, **d, **r) for s, d, r in itertools.product(("mean", "top4", "topq"), decays, reuses)]
-    return out + [Policy(score="recency", decay="exp", tau=4096.), Policy(score="mix"), Policy(score="multi")]
+    return out + [Policy(score="recency", decay="exp", tau=4096.), Policy(score="mix"), Policy(score="multi"),
+                  Policy(score="sum")]
 
 
 def span_base(s, starts, stops) -> dict[str, np.ndarray]:
@@ -94,6 +95,7 @@ def span_base(s, starts, stops) -> dict[str, np.ndarray]:
             out["mean"][i], out["max"][i] = part.mean(), part[-1]
             out["top4"][i] = part[-4:].mean()
             out["topq"][i] = part[-max(1, len(part) // 4):].mean()
+            out["sum"][i] = part.sum()  # -log2 p(span), as log_kv_gamma_surprisal: sum ranks spans
     out["mix"] = (out["mean"] + out["top4"]) / 2
     out["recency"] = np.ones(len(starts))
     return out
@@ -231,11 +233,16 @@ def replay(stream: Stream, policy: Policy, pool: int, recent: int, flush: int) -
                 reused_tokens=reused_tokens, kept_tokens=kept_tokens)
 
 
-def needle_kept(stream: Stream, result: dict) -> bool:
-    """Every token of the needle value is exact when the prompt ends."""
-    lo, hi = stream.fields["value_start"], stream.fields["value_stop"]
-    spans = np.unique(stream.span_of(np.arange(lo, hi)))
-    return all(stream.stops[s] > result["archived"] or s in result["kept"] for s in spans)
+def needle_kept(stream: Stream, result: dict) -> float:
+    """The share of asked needle values whose every token is exact when the prompt ends (multi-needle
+    prompts saved with ``asked_values``; else the one saved value)."""
+    asked = json.loads(stream.fields["asked_values"]) if "asked_values" in stream.fields else [
+        [stream.fields["value_start"], stream.fields["value_stop"]]]
+    kept = 0
+    for lo, hi in asked:
+        spans = np.unique(stream.span_of(np.arange(lo, hi)))
+        kept += all(stream.stops[s] > result["archived"] or s in result["kept"] for s in spans)
+    return kept / len(asked)
 
 
 def evaluate(policies, niah, natural, pool, recent, flush):

@@ -8,7 +8,7 @@ niahLogKV 建立在 attach + Alpha + Beta + Gamma 之上（见 [Gamma](gamma-log
 | 参数 | 默认 | 作用 |
 |---|---|---|
 | `log_kv_retention_heads` | `null`（关闭） | `train_retention.py` 训出的打分头文件；评测与 CPT 都读它 |
-| `log_kv_gamma_surprisal` | `null`（关闭） | 精确池按 token 惊异度给片段打分（`mean`、`top4`、`mix` 或 `multi`，见第 7 节；只评测） |
+| `log_kv_gamma_surprisal` | `null`（关闭） | 精确池按 token 惊异度给片段打分（`mean`、`top4`、`mix`、`multi` 或 `sum`，见第 7 节；只评测） |
 | `log_kv_gamma_surprisal_spans` | `false` | 与上者同用：惊异度持续偏高的一串 token 自成片段（信息片段，见第 7 节） |
 | `synthetic_retrieval_prob` | `0.0` | CPT 时训练块插入合成事实与问答的概率（只在 `demo.py`） |
 | `synthetic_facts` / `synthetic_questions` / `synthetic_kinds` | `2,8` / `1,3` / 全部 | 每块事实数、问题数与值的种类 |
@@ -181,7 +181,7 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 
 ## 7. 惊异度准入（只评测）
 
-`log_kv_gamma_surprisal: mean | top4 | mix | multi` 让精确池按片段 token 的惊异度排序：token t 的惊异度是模型自己对它的编码长度
+`log_kv_gamma_surprisal: mean | top4 | mix | multi | sum` 让精确池按片段 token 的惊异度排序：token t 的惊异度是模型自己对它的编码长度
 −log2 p(ids[t] | ids[:t])（比特），片段分数取其均值（`mean`）、最大 4 个的均值（`top4`）、两者的平均（`mix`），或多维度（`multi`：两者各自相对本条
 序列已归档片段的均值与标准差换算成 z 分数，标准差下限 0.25 比特，片段按更突出的一维计分），价值密度为
 `SURPRISAL_SCALE`（1e4）× `SURPRISAL_BASE`（16）^ min(分数, 32)，加到 K/V 分数上进入原有的整段贪心（含旧片段 1.1 倍）。
@@ -193,6 +193,9 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
   逐块前向，每块之后把该块各 token 的惊异度交给 `SurprisalStream`（块首 token 用上一块或上一步的末位 logits）。
   flush 只归档更早块里的 token，所以被归档的 token 的惊异度总已在流里。逐 token 解码同样逐步喂入。
 - 代价：每块对所有位置算一次 lm_head（Qwen3-1.7B 上约为预填充计算的两成），主机上每个 token 存一个浮点数。
+- `sum` 按片段的总编码长度 −log2 p(片段)（token 惊异度之和）打分，价值为片段的逆概率 `SURPRISAL_SCALE` × 2^min(总比特, 512)。
+  它与分词方式无关：数字逐位切分，每位最多 log2 10 ≈ 3.3 比特，按平均或峰值算会输给单个罕见词，按总量算一个 7 位
+  随机数约 23 比特。整句求和会偏向长的普通句子，所以 `sum` 应与信息片段同用。
 - 信息片段（`log_kv_gamma_surprisal_spans: true`）：除句末与片段上限外，惊异度换了"档位"的地方也切开片段——
   一个 token 比本行已见 token 的平均惊异度高出 1 个标准差时开始一串，惊异度回到平均以下时结束，这一串自成片段。
   人名、数值、编码因此能单独进入精确池，不必连带整句；它们的 K/V 已含上下文。`GPT.forward` 每块之后把切点补进各层
@@ -204,6 +207,7 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
   [`eval_gamma_surprisal_mix_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_mix_p1024.yaml)（`mix`）、
   [`eval_gamma_surprisal_multi_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_multi_p1024.yaml)（`multi`）与
   [`eval_gamma_surprisal_spans_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_spans_p1024.yaml)（`mean` + 信息片段），
+  [`eval_gamma_surprisal_sum_spans_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_sum_spans_p1024.yaml)（`sum` + 信息片段），
   以及技巧单列的 `eval_gamma_surprisal_{mean,mix}_query_p1024.yaml`（再加查询感知 cue 与 cue 保护，两者的价值相加），
   都在不带 cue 的 P=1024 checkpoint（`arc_gamma_k12_b128_p1024_2k`）上，与它自身的评测只差这一项。
 

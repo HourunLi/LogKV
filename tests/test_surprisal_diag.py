@@ -188,7 +188,7 @@ def test_far_reuse_hits_count_the_copy_exact_when_it_is_read():
 
 def test_default_grid_names_are_unique():
     names = [p.name for p in ps.default_policies()]
-    assert len(names) == len(set(names)) == 57
+    assert len(names) == len(set(names)) == 58
 
 
 def test_finished_runs_rebuild_their_summaries_from_the_saved_files(tmp_path):
