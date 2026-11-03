@@ -143,7 +143,8 @@ bash diag.sh unused/reuse_label_stats.py --config exp/qwen1.7b-32k/arc_gamma_k12
 
 - token 的惊异度 s[t] = −log2 p(ids[t] | ids[:t])（比特），是模型对它的编码长度。两个脚本都按 YAML 构建与 `eval.py`
   相同的模型与缓存，整段 prefill 后从最终隐状态分块算出（不保留整段 logits）。
-- `niah_surprisal.py`：lm-eval 自己的 NIAH 样本（RULER 模板与 `eval_tasks/niah_cue` 的变体），按 Alpha 的切法
+- `niah_surprisal.py`：lm-eval 自己的 NIAH 样本（RULER 模板与 `eval_tasks/niah_cue` 的变体，以及多针的
+  `niah_multikey_1`、`niah_multivalue`、`niah_multiquery`；多针时按出现顺序逐根报告；`--info-spans` 先切信息片段），按 Alpha 的切法
   切片段，以 max、top4、mean（惊异度）与 uni_max（文档内一元编码长度，不用 LM）为片段分数，报告针所在片段在
   离开 recent 窗口的片段中的名次、装下它需要的精确池 token 数（`tokens_needed`，最终池的离线估计，不含 1.1 倍）、
   在 P=256/1024/2048 下装得下的比例，以及分数比针高的片段。

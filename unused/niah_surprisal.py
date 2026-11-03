@@ -53,9 +53,15 @@ import litgpt.alpha_log_kv as al  # noqa: E402
 NEEDLE_RE = re.compile(r"One of the special magic (?:numbers|uuids|words) for (\S+) is: (\S+)\.")
 SCORES = ("max", "top4", "mean", "uni_max")
 BUDGETS = (256, 1024, 2048)
-# Task name -> (haystack, value type); a suffix _qend / _preamble / _paraphrase picks the niah_cue template.
-BASES = {"niah_single_1": ("repeat", "numbers"), "niah_single_2": ("essay", "numbers"),
-         "niah_single_3": ("essay", "uuids"), "niah_single_2_words": ("essay", "words")}
+# Task name -> RULER generator settings; a suffix _qend / _preamble / _paraphrase picks the niah_cue template.
+# The multi-needle tasks are lm-eval's (niah_utils): four keys, four values for one key, or four queried keys.
+BASES = {"niah_single_1": dict(type_haystack="repeat", type_needle_v="numbers"),
+         "niah_single_2": dict(type_haystack="essay", type_needle_v="numbers"),
+         "niah_single_3": dict(type_haystack="essay", type_needle_v="uuids"),
+         "niah_single_2_words": dict(type_haystack="essay", type_needle_v="words"),
+         "niah_multikey_1": dict(type_haystack="essay", type_needle_v="numbers", num_needle_k=4),
+         "niah_multivalue": dict(type_haystack="essay", type_needle_v="numbers", num_needle_v=4),
+         "niah_multiquery": dict(type_haystack="essay", type_needle_v="numbers", num_needle_q=4)}
 VARIANTS = ("qend", "preamble", "paraphrase")
 
 
@@ -136,36 +142,47 @@ def needle_rank(scores, starts, stops, target: int, archived) -> dict:
                 score=round(float(scores[target]), 3))
 
 
-def locate(prompt, offsets):
-    """Token indices of the needle sentence and of its value, from character offsets."""
-    match = NEEDLE_RE.search(prompt)
-    if match is None:
+def locate(prompt, offsets, asked=()):
+    """Every needle in prompt order: its sentence's and its value's token indices, the value, and whether
+    the question asks for it (``asked``: the sample's answers); plus the first needle's relative depth."""
+    needles = []
+    for match in NEEDLE_RE.finditer(prompt):
+        s, e = match.span()
+        vs, ve = match.span(2)
+        needles.append(dict(needle=[i for i, (a, b) in enumerate(offsets) if a < e and b > s],
+                            value=[i for i, (a, b) in enumerate(offsets) if a < ve and b > vs],
+                            text=match.group(2), asked=match.group(2) in asked))
+    if not needles:
         raise RuntimeError("needle sentence not found in prompt")
-    s, e = match.span()
-    vs, ve = match.span(2)
-    needle = [i for i, (a, b) in enumerate(offsets) if a < e and b > s]
-    value = [i for i, (a, b) in enumerate(offsets) if a < ve and b > vs]
-    return needle, value, match.group(2), s / max(len(prompt), 1)
+    return needles, NEEDLE_RE.search(prompt).start() / max(len(prompt), 1)
 
 
-def analyse(ids, surprisal, boundary, max_span, recent, needle, value, decode, competitors=5) -> dict:
-    """The needle's rank under every score, its token surprisal, and the spans that outrank it most."""
-    starts, stops = cut(ids, boundary, max_span)
+def analyse(ids, surprisal, boundary, max_span, recent, needles, decode, competitors=5, extra_ends=None) -> dict:
+    """Each needle's rank under every score and its token surprisal; the top-level fields describe the first
+    asked needle (else the first), with the spans that outrank it most. ``extra_ends``: more span ends."""
+    starts, stops = cut(ids, boundary, max_span, extra_ends)
     scores = span_scores(surprisal, starts, stops)
     scores["uni_max"] = span_scores(unigram_code_length(ids, len(boundary)), starts, stops)["max"]
-    target = int(np.searchsorted(stops, value[0], side="right"))  # the span holding the first value token
     archived = stops <= len(ids) - recent
-    record = dict(tokens=len(ids), spans=len(starts), needle_span=[int(starts[target]), int(stops[target])],
-                  in_recent=bool(not archived[target]),
-                  value_surprisal=[round(float(surprisal[i]), 2) for i in value],
-                  needle_surprisal_mean=round(float(np.nanmean(surprisal[needle])), 3),
-                  document_surprisal_median=round(float(np.nanmedian(surprisal)), 3))
-    if record["in_recent"]:
-        return record
-    record["ranks"] = {name: needle_rank(scores[name], starts, stops, target, archived) for name in SCORES}
-    order = [i for i in np.argsort(-scores["max"]) if archived[i] and i != target][:competitors]
-    record["top_competitors"] = [dict(score=round(float(scores["max"][i]), 2), position=int(starts[i]),
-                                      text=decode(ids[starts[i]:stops[i]])[:120]) for i in order]
+    per = []
+    for order, n in enumerate(needles):
+        target = int(np.searchsorted(stops, n["value"][0], side="right"))  # the span holding the first value token
+        entry = dict(order=order, value=n["text"], asked=n["asked"], target=target,
+                     needle_span=[int(starts[target]), int(stops[target])], in_recent=bool(not archived[target]),
+                     value_surprisal=[round(float(surprisal[i]), 2) for i in n["value"]],
+                     needle_surprisal_mean=round(float(np.nanmean(surprisal[n["needle"]])), 3))
+        if not entry["in_recent"]:
+            entry["ranks"] = {name: needle_rank(scores[name], starts, stops, target, archived) for name in SCORES}
+        per.append(entry)
+    main = next((e for e in per if e["asked"]), per[0])
+    record = dict(tokens=len(ids), spans=len(starts), document_surprisal_median=round(float(np.nanmedian(surprisal)), 3),
+                  **{k: v for k, v in main.items() if k not in ("order", "target", "value", "asked")})
+    if len(per) > 1:
+        record["needles"] = [{k: v for k, v in e.items() if k != "target"} for e in per]
+    if not main["in_recent"]:
+        order = [i for i in np.argsort(-scores["max"]) if archived[i] and i != main["target"]][:competitors]
+        record["top_competitors"] = [dict(score=round(float(scores["max"][i]), 2), position=int(starts[i]),
+                                          text=decode(ids[starts[i]:stops[i]])[:120]) for i in order]
     return record
 
 
@@ -183,6 +200,15 @@ def summarize(task, records, budgets=BUDGETS) -> str:
             pct = np.median([r["ranks"][name]["percentile"] for r in ranked])
             lines.append(f"  {name:8s} tokens_needed median={int(np.median(needed)):6d}  percentile median={pct:.4f}  "
                          f"fraction that fits {fits}")
+    many = [r["needles"] for r in records if "needles" in r]
+    for k in range(max((len(n) for n in many), default=0)):  # multi-needle tasks: by order in the prompt
+        at = [n[k] for n in many if len(n) > k]
+        ranked = [e for e in at if "ranks" in e]
+        fits = " ".join(f"{name} {np.mean([e['ranks'][name]['tokens_needed'] <= 1024 for e in ranked]):.2f}"
+                        for name in ("mean", "top4", "max")) if ranked else "-"
+        lines.append(f"  needle {k + 1}: n={len(at)} sentence {np.median([e['needle_surprisal_mean'] for e in at]):.2f} "
+                     f"bits, value {np.median(np.concatenate([e['value_surprisal'] for e in at])):.2f} bits; "
+                     f"fits P1024 {fits}")
     return "\n".join(lines)
 
 
@@ -266,10 +292,10 @@ def niah_samples(task, hf_tokenizer, length, count):
     base = task[:-len(variant) - 1] if variant != "ruler" else task
     if base not in BASES:
         raise SystemExit(f"unknown task {task}: use {', '.join(BASES)} with an optional _qend/_preamble/_paraphrase")
-    haystack, value_type = BASES[base]
-    return generate_samples(get_haystack(type_haystack=haystack), max_seq_length=length,
-                            template=TEMPLATES[variant], type_haystack=haystack, type_needle_k="words",
-                            type_needle_v=value_type, num_samples=count, TOKENIZER=hf_tokenizer)
+    settings = BASES[base]
+    return generate_samples(get_haystack(type_haystack=settings["type_haystack"]), max_seq_length=length,
+                            template=TEMPLATES[variant], type_needle_k="words", num_samples=count,
+                            TOKENIZER=hf_tokenizer, **settings)
 
 
 def prompt_ids(sample, tokenizer, hf_tokenizer):
@@ -297,6 +323,8 @@ def main():
     p.add_argument("--out", default="niah_surprisal.jsonl")
     p.add_argument("--save-surprisal", default=None,
                    help=".npz of every prompt's ids and token surprisal, for unused/pool_policy_sim.py")
+    p.add_argument("--info-spans", action="store_true",
+                   help="also cut information spans (log_kv_gamma_surprisal_spans) before ranking")
     p.add_argument("--report", default=None, help="a finished run's .jsonl: write its summary, load no model")
     args = p.parse_args()
     if args.report:
@@ -328,11 +356,15 @@ def main():
             for sample in niah_samples(task, hf_tokenizer, args.length, args.samples):
                 start = time.time()
                 prompt, ids, offsets = prompt_ids(sample, lm.tokenizer, hf_tokenizer)
-                needle, value, text, depth = locate(prompt, offsets)
+                needles, depth = locate(prompt, offsets, sample["outputs"])
+                main = next((n for n in needles if n["asked"]), needles[0])
+                needle, value, text = main["needle"], main["value"], main["text"]
                 surprisal = token_surprisal(lm.model, ids, prepare=lm._set_eval_cache)
                 lm._reset_eval_cache()
-                record = analyse(np.asarray(ids), surprisal, boundary, max_span, recent, needle, value,
-                                 lambda t: lm.tokenizer.decode(torch.as_tensor(t)))
+                extra = (al.information_ends(surprisal, min(recent, int(lm.log_kv_semantic_flush_granularity)))
+                         if args.info_spans else None)
+                record = analyse(np.asarray(ids), surprisal, boundary, max_span, recent, needles,
+                                 lambda t: lm.tokenizer.decode(torch.as_tensor(t)), extra_ends=extra)
                 record.update(task=task, index=sample["index"], depth=round(depth, 4), value=text)
                 store.add(ids, surprisal, task=task, index=int(sample["index"]), depth=float(depth),
                           needle_start=int(needle[0]), needle_stop=int(needle[-1]) + 1,

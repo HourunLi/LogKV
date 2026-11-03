@@ -70,13 +70,20 @@ def test_the_needle_span_ranks_by_its_surprisal_and_the_recent_window_keeps_it()
     s[0] = np.nan
     s[[10, 31]] = 9.  # the needle value at 10; a competitor at 31
     s[31] = 12.
-    record = ns.analyse(ids, s, boundary, max_span=8, recent=9, needle=[9, 10, 11], value=[10],
+    needle = dict(needle=[9, 10, 11], value=[10], text="x", asked=True)
+    record = ns.analyse(ids, s, boundary, max_span=8, recent=9, needles=[needle],
                         decode=lambda t: " ".join(map(str, t)))
-    assert record["needle_span"] == [9, 12] and not record["in_recent"]
+    assert record["needle_span"] == [9, 12] and not record["in_recent"] and "needles" not in record
     assert record["ranks"]["max"] == dict(rank=2, tokens_needed=6, percentile=pytest.approx(0.94, abs=0.01),
                                           score=9.)
     assert record["top_competitors"][0]["position"] == 30
-    assert ns.analyse(ids, s, boundary, 8, 30, [9, 10, 11], [40], str)["in_recent"]
+    assert ns.analyse(ids, s, boundary, 8, 30, [dict(needle, value=[40])], str)["in_recent"]
+    # Several needles: each is ranked; the top-level fields follow the asked one.
+    other = dict(needle=[30, 31, 32], value=[31], text="y", asked=False)
+    record = ns.analyse(ids, s, boundary, 8, 9, [other, needle], str)
+    assert [n["order"] for n in record["needles"]] == [0, 1] and record["needle_span"] == [9, 12]
+    assert record["needles"][0]["ranks"]["max"]["rank"] == 1
+    assert "needle 2: n=1" in ns.summarize("t", [record])
 
 
 def test_reuse_pairs_need_the_gap_and_a_surprising_first_occurrence():
