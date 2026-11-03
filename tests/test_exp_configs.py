@@ -277,9 +277,10 @@ def test_only_surprisal_evaluations_rank_by_surprisal(name):
     expected = {"eval_gamma_surprisal_p1024.yaml": "top4", "eval_gamma_surprisal_mean_p1024.yaml": "mean",
                 "eval_gamma_surprisal_mix_p1024.yaml": "mix", "eval_gamma_surprisal_multi_p1024.yaml": "multi",
                 "eval_gamma_surprisal_spans_p1024.yaml": "mean", "eval_gamma_surprisal_mean_query_p1024.yaml": "mean",
-                "eval_gamma_surprisal_mix_query_p1024.yaml": "mix"}
+                "eval_gamma_surprisal_mix_query_p1024.yaml": "mix", "eval_gamma_surprisal_sum_spans_p1024.yaml": "sum"}
     assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
-    assert bool(effective(name).get("log_kv_gamma_surprisal_spans")) is (name == "eval_gamma_surprisal_spans_p1024.yaml")
+    assert bool(effective(name).get("log_kv_gamma_surprisal_spans")) is (
+        name in ("eval_gamma_surprisal_spans_p1024.yaml", "eval_gamma_surprisal_sum_spans_p1024.yaml"))
 
 
 @pytest.mark.parametrize("name", ["eval_gamma_surprisal_p1024.yaml", "eval_gamma_surprisal_mean_p1024.yaml",

@@ -51,7 +51,7 @@ sys.path.insert(0, str(ROOT))
 import litgpt.alpha_log_kv as al  # noqa: E402
 
 NEEDLE_RE = re.compile(r"One of the special magic (?:numbers|uuids|words) for (\S+) is: (\S+)\.")
-SCORES = ("max", "top4", "mean", "uni_max")
+SCORES = ("max", "top4", "mean", "sum", "uni_max")
 BUDGETS = (256, 1024, 2048)
 # Task name -> RULER generator settings; a suffix _qend / _preamble / _paraphrase picks the niah_cue template.
 # The multi-needle tasks are lm-eval's (niah_utils): four keys, four values for one key, or four queried keys.
@@ -121,7 +121,7 @@ def cut(ids, boundary, max_span: int, extra_ends=None) -> tuple[np.ndarray, np.n
 
 def span_scores(values, starts, stops) -> dict[str, np.ndarray]:
     """Per-span scores from per-token surprisal; nan tokens (the first one) are ignored."""
-    out = {name: np.full(len(starts), -np.inf) for name in ("max", "top4", "mean")}
+    out = {name: np.full(len(starts), -np.inf) for name in ("max", "top4", "mean", "sum")}
     for i, (a, b) in enumerate(zip(starts, stops)):
         part = values[a:b]
         part = part[np.isfinite(part)]
@@ -129,6 +129,7 @@ def span_scores(values, starts, stops) -> dict[str, np.ndarray]:
             out["max"][i] = part.max()
             out["top4"][i] = np.sort(part)[-4:].mean()
             out["mean"][i] = part.mean()
+            out["sum"][i] = part.sum()  # the span's code length, -log2 p(span)
     return out
 
 
@@ -205,7 +206,7 @@ def summarize(task, records, budgets=BUDGETS) -> str:
         at = [n[k] for n in many if len(n) > k]
         ranked = [e for e in at if "ranks" in e]
         fits = " ".join(f"{name} {np.mean([e['ranks'][name]['tokens_needed'] <= 1024 for e in ranked]):.2f}"
-                        for name in ("mean", "top4", "max")) if ranked else "-"
+                        for name in ("mean", "top4", "max", "sum")) if ranked else "-"
         lines.append(f"  needle {k + 1}: n={len(at)} sentence {np.median([e['needle_surprisal_mean'] for e in at]):.2f} "
                      f"bits, value {np.median(np.concatenate([e['value_surprisal'] for e in at])):.2f} bits; "
                      f"fits P1024 {fits}")
@@ -366,9 +367,10 @@ def main():
                 record = analyse(np.asarray(ids), surprisal, boundary, max_span, recent, needles,
                                  lambda t: lm.tokenizer.decode(torch.as_tensor(t)), extra_ends=extra)
                 record.update(task=task, index=sample["index"], depth=round(depth, 4), value=text)
+                asked = [[n["value"][0], n["value"][-1] + 1] for n in needles if n["asked"]] or [[value[0], value[-1] + 1]]
                 store.add(ids, surprisal, task=task, index=int(sample["index"]), depth=float(depth),
                           needle_start=int(needle[0]), needle_stop=int(needle[-1]) + 1,
-                          value_start=int(value[0]), value_stop=int(value[-1]) + 1)
+                          value_start=int(value[0]), value_stop=int(value[-1]) + 1, asked_values=json.dumps(asked))
                 out.write(json.dumps(record) + "\n")
                 out.flush()
                 records.append(record)

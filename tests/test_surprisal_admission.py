@@ -44,6 +44,11 @@ def test_span_values_grow_exponentially_with_the_mean_or_top4_surprisal():
     stream = SurprisalStream("mix")
     stream.add(0, 0, [1., 1., 1., 1., 1., 9.])
     assert stream.span_values(0, np.arange(6), [6], 6).tolist() == pytest.approx([value((14 / 6 + 3) / 2)])
+    # "sum": the inverse probability of the span; seven 3.3-bit digits outweigh one 12-bit word.
+    stream = SurprisalStream("sum")
+    stream.add(0, 0, [3.3] * 7 + [12.])
+    number, word = stream.span_values(0, np.arange(8), [7, 1], 8)
+    assert number == pytest.approx(SURPRISAL_SCALE * 2 ** 23.1) and number > word
 
 
 def test_multi_scores_a_span_by_the_dimension_it_stands_out_in():

@@ -51,7 +51,13 @@ _LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
 SURPRISAL_SCALE = 1e4
 SURPRISAL_BASE = 16.
 SURPRISAL_CAP = 32.
-SURPRISAL_SCORES = ("mean", "top4", "mix", "multi")
+# "sum" scores a span by its total code length, the sum of its tokens' surprisal = -log2 p(span),
+# which does not depend on how the tokenizer splits the text (a 7-digit number cut into 7 digits of
+# at most log2 10 bits each still totals about 23 bits), and values it at its inverse probability,
+# SURPRISAL_SCALE * 2 ** min(total, SURPRISAL_SUM_CAP). It is meant for information spans: on whole
+# sentences a long ordinary span would total more than a short informative one.
+SURPRISAL_SUM_CAP = 512.
+SURPRISAL_SCORES = ("mean", "top4", "mix", "multi", "sum")
 SURPRISAL_MIN_SPREAD = 0.25
 # Information spans (optional, with surprisal admission): besides sentence ends and the span cap,
 # a span also ends where token surprisal changes regime, so a run of informative tokens (a name,
@@ -647,6 +653,8 @@ class SurprisalStream:
                 self._stats[row].update(features[new])
                 self._counted[row] = int(positions.max()) + 1
             score = self._stats[row].z(features).max(1)
+        elif self.score == "sum":
+            return SURPRISAL_SCALE * 2. ** np.minimum(mean * lengths, SURPRISAL_SUM_CAP)
         else:
             score = {"mean": mean, "top4": top4, "mix": (mean + top4) / 2}[self.score]
         return SURPRISAL_SCALE * SURPRISAL_BASE ** np.minimum(score, SURPRISAL_CAP)
