@@ -60,10 +60,13 @@ SURPRISAL_SUM_CAP = 512.
 SURPRISAL_SCORES = ("mean", "top4", "mix", "multi", "sum")
 SURPRISAL_MIN_SPREAD = 0.25
 # Information spans (optional, with surprisal admission): besides sentence ends and the span cap,
-# a span also ends where token surprisal changes regime, so a run of informative tokens (a name,
-# a number, a code) is a span of its own and the exact pool can keep it without its sentence; the
-# run's K/V already carry its context. A run starts at a token INFO_START spreads above the row's
-# running mean surprisal and lasts while tokens stay above INFO_CONTINUE spreads (the mean).
+# a span also ends around a run of informative words (a name, a number, a code), so the exact pool
+# can keep the run without its sentence; the run's K/V already carry its context. A word is a token
+# that begins one (its text starts with whitespace or a CJK character) and the tokens up to the next;
+# its code length is the sum of its tokens' surprisal, -log2 p(word | context), whatever the split
+# (a 7-digit number of 3.5-bit digits totals about 25 bits). A run starts at a word INFO_START spreads
+# above the row's running mean word code length and lasts while words stay above INFO_CONTINUE
+# spreads (the mean). Cuts fall only between words, so no word, and no value, is split.
 INFO_START = 1.
 INFO_CONTINUE = 0.
 
@@ -558,42 +561,71 @@ class RunningStats:
         return (np.asarray(x, dtype=np.float64) - self.mean) / np.maximum(spread, SURPRISAL_MIN_SPREAD)
 
 
+_CJK_START = re.compile(r"[\u2e80-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]")
+
+
+def word_start_table(texts) -> np.ndarray:
+    """Per token id (``texts``: each token decoded alone): does the token begin a word? It does when its
+    text starts with whitespace, or with a CJK character or mark (such text has no spaces between words,
+    so each of those tokens is a word of its own); an empty text (a special token) also does."""
+    return np.array([not text or text[0].isspace() or _CJK_START.match(text[0]) is not None for text in texts],
+                    dtype=bool)
+
+
 class InformationRuns:
-    """Span ends around runs of informative tokens, fed one chunk at a time (one per row)."""
+    """Span ends around runs of informative words, fed one chunk at a time (one per row).
+
+    A word is judged when the next one begins, since only then is its code length complete; the cuts it
+    yields fall on tokens that are still in the recent window.
+    """
 
     def __init__(self) -> None:
         self.stats, self.in_run = RunningStats(1), False
+        self.word, self.word_bits = None, 0.  # the open word: its first position and bits so far
 
-    def feed(self, start: int, bits) -> list[int]:
-        """Positions that end a span among ``start - 1, start, ...``, given the surprisal of the tokens
-        from ``start`` on. Each chunk is judged against the tokens before it (the first against itself)."""
-        bits = np.asarray(bits, dtype=np.float64)[:, None]
-        if self.stats.count < 2:
-            self.stats.update(bits)
-            bits_seen = True
-        else:
-            bits_seen = False
-        z = self.stats.z(bits)[:, 0]
+    def feed(self, start: int, bits, word_starts) -> list[int]:
+        """Positions that end a span (the last token before a run, the last token of a run), given the
+        surprisal of the tokens from ``start`` on and whether each begins a word. The words a chunk
+        closes are judged against the words before them (the first such batch against itself)."""
+        closed = []
+        for i, (value, begins) in enumerate(zip(np.asarray(bits, dtype=np.float64).tolist(),
+                                                np.asarray(word_starts, dtype=bool).tolist())):
+            position = start + i
+            if self.word is None:
+                self.word = position
+            elif begins:
+                closed.append((self.word, self.word_bits))
+                self.word, self.word_bits = position, 0.
+            self.word_bits += value
+        if not closed:
+            return []
+        totals = np.asarray([total for _, total in closed])[:, None]
+        bootstrap = self.stats.count < 2
+        if bootstrap:
+            self.stats.update(totals)
+        z = self.stats.z(totals)[:, 0]
+        if not bootstrap:
+            self.stats.update(totals)
         ends = []
-        for i, value in enumerate(z.tolist()):
+        for (first, _), value in zip(closed, z.tolist()):
             if not self.in_run and value >= INFO_START:
-                if start + i:
-                    ends.append(start + i - 1)
+                if first:
+                    ends.append(first - 1)
                 self.in_run = True
             elif self.in_run and value < INFO_CONTINUE:
-                ends.append(start + i - 1)
+                ends.append(first - 1)
                 self.in_run = False
-        if not bits_seen:
-            self.stats.update(bits)
         return ends
 
 
-def information_ends(bits, chunk: int) -> np.ndarray:
-    """Span ends (bool per token) that InformationRuns gives for ``bits`` fed ``chunk`` tokens at a time."""
+def information_ends(bits, chunk: int, word_starts) -> np.ndarray:
+    """Span ends (bool per token) that InformationRuns gives for ``bits`` fed ``chunk`` tokens at a time;
+    ``word_starts`` flags the tokens that begin a word."""
     bits = np.nan_to_num(np.asarray(bits, dtype=np.float64))
+    word_starts = np.asarray(word_starts, dtype=bool)
     runs, out = InformationRuns(), np.zeros(len(bits), dtype=bool)
     for start in range(0, len(bits), chunk):
-        out[runs.feed(start, bits[start:start + chunk])] = True
+        out[runs.feed(start, bits[start:start + chunk], word_starts[start:start + chunk])] = True
     return out
 
 
@@ -628,10 +660,10 @@ class SurprisalStream:
             raise ValueError(f"surprisal row {row} expects position {len(self._rows[row])}, got {start}")
         self._rows[row] = np.concatenate((self._rows[row], np.nan_to_num(np.asarray(bits, dtype=np.float64))))
 
-    def information_ends(self, row: int, start: int) -> list[int]:
-        """Span ends around informative runs among the tokens added last (from ``start``; may include
-        ``start - 1``)."""
-        return self._runs[row].feed(start, self._rows[row][start:])
+    def information_ends(self, row: int, start: int, word_starts) -> list[int]:
+        """Span ends around runs of informative words, given the tokens added last (from ``start``) and
+        whether each begins a word; the ends may fall on earlier tokens still in the recent window."""
+        return self._runs[row].feed(start, self._rows[row][start:], word_starts)
 
     def span_values(self, row, positions, lengths, stop):
         """``SURPRISAL_SCALE * SURPRISAL_BASE ** min(score, SURPRISAL_CAP)`` per span (``stop`` is unused:

@@ -295,6 +295,14 @@ class GPT(nn.Module):
             raise ValueError("gamma_surprisal_spans cuts spans by surprisal; it requires gamma_surprisal")
         self.log_kv_surprisal_stream = SurprisalStream(score) if score else None
         self.log_kv_surprisal_spans = bool(spans)
+        if spans:
+            from litgpt.alpha_log_kv import word_start_table
+            texts = getattr(self, "alpha_literal_texts", None)
+            if texts is None:
+                raise RuntimeError("gamma_surprisal_spans needs the tokenizer's token texts to find words: pass "
+                                   "literal_texts to set_alpha_span_boundary_ids()")
+            if getattr(self, "_word_start_texts", None) is not texts:
+                self.log_kv_word_starts, self._word_start_texts = word_start_table(texts), texts
         self.log_kv_surprisal_chunk = max(1, min(int(recent_size), int(flush_granularity)))
         self._surprisal_last = None
         for block in self.transformer.h:
@@ -331,10 +339,13 @@ class GPT(nn.Module):
                     bits[:, s + 1:e + 1] = -logits[:, s:e].float().log_softmax(-1).gather(
                         -1, x[:, s + 1:e + 1, None])[..., 0]
                 bits = (bits / math.log(2)).cpu().numpy()
+                ids_host = x.cpu().numpy() if self.log_kv_surprisal_spans else None
                 for row in range(x.size(0)):
                     self.log_kv_surprisal_stream.add(row, starts[row] + a, bits[row])
                     if self.log_kv_surprisal_spans:
-                        self._mark_span_ends(row, self.log_kv_surprisal_stream.information_ends(row, starts[row] + a))
+                        words = self.log_kv_word_starts[ids_host[row]]
+                        self._mark_span_ends(row, self.log_kv_surprisal_stream.information_ends(
+                            row, starts[row] + a, words))
                 prev = logits[:, -1].float()
                 if b > keep_from:
                     kept.append(logits[:, max(keep_from - a, 0):])
