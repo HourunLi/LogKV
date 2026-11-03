@@ -46,6 +46,21 @@ def test_span_values_grow_exponentially_with_the_mean_or_top4_surprisal():
     assert stream.span_values(0, np.arange(6), [6], 6).tolist() == pytest.approx([value((14 / 6 + 3) / 2)])
 
 
+def test_multi_scores_a_span_by_the_dimension_it_stands_out_in():
+    from litgpt.alpha_log_kv import SURPRISAL_MIN_SPREAD
+    # 20 dull 4-token spans, a uniformly surprising one (mean) and a long one with one peak (top4).
+    dull = [1., 2., 1., 2.] * 20
+    bits = np.r_[dull, [6.] * 4, [1.] * 15 + [12.]]
+    lengths = [4] * 20 + [4, 16]
+    stream = SurprisalStream("multi")
+    stream.add(0, 0, bits)
+    values = stream.span_values(0, np.arange(len(bits)), lengths, len(bits))
+    assert values[20] > values[0] * 100 and values[21] > values[0] * 100
+    # A later call for the same flush (another layer) sees the same statistics.
+    assert stream.span_values(0, np.arange(len(bits)), lengths, len(bits)).tolist() == pytest.approx(values.tolist())
+    assert stream._stats[0].count == 22 and SURPRISAL_MIN_SPREAD > 0
+
+
 def test_the_model_feeds_each_tokens_surprisal_in_chunks_and_returns_the_asked_logits():
     model = _model()
     ids = torch.randint(0, 41, (40,))
@@ -101,3 +116,24 @@ def test_a_short_surprising_span_evicts_a_long_dull_one():
     assert choose_spans(cut, exponential, 64).keep[0] == list(range(64, 84))
     linear = [3. * SURPRISAL_SCALE, 6. * SURPRISAL_SCALE]  # 20 x 6 < 64 x 3 x 1.1: the swap would fail
     assert choose_spans(cut, linear, 64).keep[0] == list(range(64))
+
+
+def test_information_runs_cut_a_span_around_informative_tokens():
+    from litgpt.alpha_log_kv import information_ends
+    bits = np.r_[np.full(20, 1.), [9., 9., 4.], np.full(20, 1.)]  # a run starts at 9 bits, lasts above the mean
+    assert np.flatnonzero(information_ends(bits, 64)).tolist() == [19, 22]
+
+
+def test_information_spans_mark_the_caches_span_ends():
+    from litgpt.alpha_log_kv import information_ends
+    model = _model()
+    ids = torch.randint(0, 41, (40,))
+    model.set_log_kv_cache(recent_size=64, gamma_surprisal="mean", gamma_surprisal_spans=True, **KWARGS)
+    with torch.no_grad():
+        model(ids[None], input_pos=torch.arange(40))
+    expected = np.flatnonzero(information_ends(model.log_kv_surprisal_stream._rows[0], 8))
+    assert len(expected)
+    for block in model.transformer.h:
+        assert all(block.attn.kv_cache._recent_span_ends[0][p] for p in expected)
+    with pytest.raises(ValueError, match="requires gamma_surprisal"):
+        model.set_log_kv_cache(recent_size=64, gamma_surprisal_spans=True, **KWARGS)

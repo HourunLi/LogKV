@@ -279,7 +279,8 @@ class GPT(nn.Module):
                 raise RuntimeError("retention_head needs set_retention_heads() before the cache is built")
             cache.attach_retention_head(heads[i] if cache.retention_head else None)
 
-    def _attach_surprisal_stream(self, score, alpha_exact_tokens, recent_size, flush_granularity) -> None:
+    def _attach_surprisal_stream(self, score, alpha_exact_tokens, recent_size, flush_granularity,
+                                 spans=False) -> None:
         """niahLogKV surprisal admission: one SurprisalStream per model, shared by every layer's cache.
 
         GPT.forward then runs cached input in chunks no longer than the recent window and the
@@ -290,7 +291,10 @@ class GPT(nn.Module):
 
         if score and not alpha_exact_tokens:
             raise ValueError("gamma_surprisal scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
+        if spans and not score:
+            raise ValueError("gamma_surprisal_spans cuts spans by surprisal; it requires gamma_surprisal")
         self.log_kv_surprisal_stream = SurprisalStream(score) if score else None
+        self.log_kv_surprisal_spans = bool(spans)
         self.log_kv_surprisal_chunk = max(1, min(int(recent_size), int(flush_granularity)))
         self._surprisal_last = None
         for block in self.transformer.h:
@@ -329,6 +333,8 @@ class GPT(nn.Module):
                 bits = (bits / math.log(2)).cpu().numpy()
                 for row in range(x.size(0)):
                     self.log_kv_surprisal_stream.add(row, starts[row] + a, bits[row])
+                    if self.log_kv_surprisal_spans:
+                        self._mark_span_ends(row, self.log_kv_surprisal_stream.information_ends(row, starts[row] + a))
                 prev = logits[:, -1].float()
                 if b > keep_from:
                     kept.append(logits[:, max(keep_from - a, 0):])
@@ -337,6 +343,17 @@ class GPT(nn.Module):
             self._surprisal_inner = False
         out = torch.cat(kept, dim=1)
         return list(out.split(lm_head_chunk_size, dim=1)) if lm_head_chunk_size > 0 else out
+
+    def _mark_span_ends(self, row: int, positions) -> None:
+        """Add span ends at ``positions`` (tokens still in the recent window) in every layer's cache."""
+        for block in self.transformer.h:
+            cache = block.attn.kv_cache
+            if not positions or not cache.recent_count:
+                continue
+            first, ends = cache._recent_pos_host[row][0], cache._recent_span_ends[row]
+            for position in positions:
+                if 0 <= position - first < cache.recent_count:
+                    ends[position - first] = True
 
     def set_retention_heads(self, heads) -> None:
         """Frozen learned retention heads (litgpt.retention.RetentionHeads), one per layer.
@@ -574,6 +591,7 @@ class GPT(nn.Module):
         gamma_query_cue: bool = False,
         retention_head: bool = False,
         gamma_surprisal: str | None = None,
+        gamma_surprisal_spans: bool = False,
     ) -> None:
         """Initialize log-structured KV caches for all attention layers.
 
@@ -684,7 +702,8 @@ class GPT(nn.Module):
             block.attn.log_kv_prefill_block = prefill_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
         self._attach_gamma_streams(gamma_cue_tokens, gamma_literals, gamma_cue_guard, gamma_query_cue)
-        self._attach_surprisal_stream(gamma_surprisal, alpha_exact_tokens, recent_size, semantic_flush_granularity)
+        self._attach_surprisal_stream(gamma_surprisal, alpha_exact_tokens, recent_size, semantic_flush_granularity,
+                                      gamma_surprisal_spans)
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
         # holding stale O(N^2) bool tensors in GPU memory. With every block on

@@ -39,7 +39,10 @@ LITERAL_FLOOR = 12.
 LITERAL_TIER_CAP = 6.
 _LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
 # Surprisal admission (optional, niahLogKV): a span's score is the mean, the mean of the four
-# largest, or the average of the two ("mix"), of its tokens' -log2 p under the model itself (bits). Its value density is
+# largest, or the average of the two ("mix"), of its tokens' -log2 p under the model itself (bits).
+# "multi" keeps the two apart: each is measured against the running mean and spread of that
+# dimension over every span the row has archived so far (a z-score, spread floored at
+# SURPRISAL_MIN_SPREAD bits), and a span counts by the dimension in which it stands out most. Its value density is
 # SURPRISAL_SCALE * SURPRISAL_BASE ** min(score, SURPRISAL_CAP). The scale keeps every span far
 # above its K/V score, so K/V scores only break ties. The base makes the whole-span swaps of
 # choose_spans follow the surprisal order: a span replaces pool spans only if density x length
@@ -48,7 +51,15 @@ _LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
 SURPRISAL_SCALE = 1e4
 SURPRISAL_BASE = 16.
 SURPRISAL_CAP = 32.
-SURPRISAL_SCORES = ("mean", "top4", "mix")
+SURPRISAL_SCORES = ("mean", "top4", "mix", "multi")
+SURPRISAL_MIN_SPREAD = 0.25
+# Information spans (optional, with surprisal admission): besides sentence ends and the span cap,
+# a span also ends where token surprisal changes regime, so a run of informative tokens (a name,
+# a number, a code) is a span of its own and the exact pool can keep it without its sentence; the
+# run's K/V already carry its context. A run starts at a token INFO_START spreads above the row's
+# running mean surprisal and lasts while tokens stay above INFO_CONTINUE spreads (the mean).
+INFO_START = 1.
+INFO_CONTINUE = 0.
 
 
 @dataclass
@@ -507,6 +518,79 @@ class SummedValues:
         return sum(stream.span_values(row, positions, lengths, stop) for stream in self.streams)
 
 
+def surprisal_mean_top4(bits, lengths):
+    """Per span: the mean and the mean of the four largest of its tokens' surprisal (``bits`` holds the
+    spans one after another)."""
+    starts = np.cumsum(lengths) - lengths
+    mean = np.add.reduceat(bits, starts) / np.maximum(lengths, 1)
+    span = np.repeat(np.arange(len(lengths)), lengths)
+    order = np.lexsort((-bits, span))
+    top = np.arange(len(bits)) - starts[span[order]] < 4
+    top4 = (np.bincount(span[order][top], weights=bits[order][top], minlength=len(lengths))
+            / np.minimum(lengths, 4).clip(min=1))
+    return mean, top4
+
+
+class RunningStats:
+    """Mean and spread of feature vectors seen so far (batched Welford); z-scores against them."""
+
+    def __init__(self, dims: int) -> None:
+        self.count, self.mean, self.m2 = 0, np.zeros(dims), np.zeros(dims)
+
+    def update(self, x) -> None:
+        x = np.asarray(x, dtype=np.float64)
+        if not len(x):
+            return
+        n, mean = len(x), x.mean(0)
+        delta, total = mean - self.mean, self.count + n
+        self.m2 += ((x - mean) ** 2).sum(0) + delta ** 2 * self.count * n / total
+        self.mean += delta * n / total
+        self.count = total
+
+    def z(self, x) -> np.ndarray:
+        spread = np.sqrt(self.m2 / (self.count - 1)) if self.count > 1 else np.ones_like(self.mean)
+        return (np.asarray(x, dtype=np.float64) - self.mean) / np.maximum(spread, SURPRISAL_MIN_SPREAD)
+
+
+class InformationRuns:
+    """Span ends around runs of informative tokens, fed one chunk at a time (one per row)."""
+
+    def __init__(self) -> None:
+        self.stats, self.in_run = RunningStats(1), False
+
+    def feed(self, start: int, bits) -> list[int]:
+        """Positions that end a span among ``start - 1, start, ...``, given the surprisal of the tokens
+        from ``start`` on. Each chunk is judged against the tokens before it (the first against itself)."""
+        bits = np.asarray(bits, dtype=np.float64)[:, None]
+        if self.stats.count < 2:
+            self.stats.update(bits)
+            bits_seen = True
+        else:
+            bits_seen = False
+        z = self.stats.z(bits)[:, 0]
+        ends = []
+        for i, value in enumerate(z.tolist()):
+            if not self.in_run and value >= INFO_START:
+                if start + i:
+                    ends.append(start + i - 1)
+                self.in_run = True
+            elif self.in_run and value < INFO_CONTINUE:
+                ends.append(start + i - 1)
+                self.in_run = False
+        if not bits_seen:
+            self.stats.update(bits)
+        return ends
+
+
+def information_ends(bits, chunk: int) -> np.ndarray:
+    """Span ends (bool per token) that InformationRuns gives for ``bits`` fed ``chunk`` tokens at a time."""
+    bits = np.nan_to_num(np.asarray(bits, dtype=np.float64))
+    runs, out = InformationRuns(), np.zeros(len(bits), dtype=bool)
+    for start in range(0, len(bits), chunk):
+        out[runs.feed(start, bits[start:start + chunk])] = True
+    return out
+
+
 class SurprisalStream:
     """Each row's token surprisal in bits, fed by GPT.forward; span values for the exact pool.
 
@@ -521,15 +605,27 @@ class SurprisalStream:
             raise ValueError(f"surprisal score must be one of {SURPRISAL_SCORES}, got {score!r}")
         self.score = score
         self._rows: list[np.ndarray] = []
+        self._stats: list[RunningStats] = []  # "multi": spans archived so far, per row
+        self._counted: list[int] = []  # "multi": spans starting before this are in the statistics
+        self._runs: list[InformationRuns] = []  # information spans, per row
 
     def add(self, row: int, start: int, bits) -> None:
         while len(self._rows) <= row:
             self._rows.append(np.zeros(0))
+            self._stats.append(RunningStats(2))
+            self._counted.append(0)
+            self._runs.append(InformationRuns())
         if start == 0:
             self._rows[row] = np.zeros(0)
+            self._stats[row], self._counted[row], self._runs[row] = RunningStats(2), 0, InformationRuns()
         if start != len(self._rows[row]):
             raise ValueError(f"surprisal row {row} expects position {len(self._rows[row])}, got {start}")
         self._rows[row] = np.concatenate((self._rows[row], np.nan_to_num(np.asarray(bits, dtype=np.float64))))
+
+    def information_ends(self, row: int, start: int) -> list[int]:
+        """Span ends around informative runs among the tokens added last (from ``start``; may include
+        ``start - 1``)."""
+        return self._runs[row].feed(start, self._rows[row][start:])
 
     def span_values(self, row, positions, lengths, stop):
         """``SURPRISAL_SCALE * SURPRISAL_BASE ** min(score, SURPRISAL_CAP)`` per span (``stop`` is unused:
@@ -542,20 +638,17 @@ class SurprisalStream:
         if len(positions) and positions.max() >= len(known):
             raise RuntimeError(f"surprisal of position {int(positions.max())} is not known yet (row {row} has "
                                f"{len(known)}): GPT.forward feeds it one chunk ahead of the cache")
-        bits = known[positions]
-        starts = np.cumsum(lengths) - lengths
-        mean = np.add.reduceat(bits, starts) / np.maximum(lengths, 1)
-        if self.score == "mean":
-            score = mean
-        else:  # the mean of each span's four largest; "mix" averages it with the mean
-            span = np.repeat(np.arange(len(lengths)), lengths)
-            order = np.lexsort((-bits, span))
-            rank = np.arange(len(bits)) - starts[span[order]]
-            top = rank < 4
-            score = (np.bincount(span[order][top], weights=bits[order][top], minlength=len(lengths))
-                     / np.minimum(lengths, 4).clip(min=1))
-            if self.score == "mix":
-                score = (score + mean) / 2
+        mean, top4 = surprisal_mean_top4(known[positions], lengths)
+        if self.score == "multi":
+            # Every layer scores the same flush; the first call adds its new spans to the statistics.
+            features = np.stack((mean, top4), 1)
+            new = positions[np.cumsum(lengths) - lengths] >= self._counted[row]
+            if new.any():
+                self._stats[row].update(features[new])
+                self._counted[row] = int(positions.max()) + 1
+            score = self._stats[row].z(features).max(1)
+        else:
+            score = {"mean": mean, "top4": top4, "mix": (mean + top4) / 2}[self.score]
         return SURPRISAL_SCALE * SURPRISAL_BASE ** np.minimum(score, SURPRISAL_CAP)
 
 
