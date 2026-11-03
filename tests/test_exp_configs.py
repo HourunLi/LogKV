@@ -101,7 +101,8 @@ CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
        "eval_gamma_cue_guard_literal_p1024_slack0.yaml", "eval_gamma_query_p1024_slack0.yaml",
        "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml"]
 QUERY = ["eval_gamma_query_p1024_slack0.yaml", "eval_gamma_query_literal_p1024_slack0.yaml",
-         "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml", "eval_gamma_query_p1024.yaml"]
+         "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml", "eval_gamma_query_p1024.yaml",
+         "eval_gamma_surprisal_mean_query_p1024.yaml", "eval_gamma_surprisal_mix_query_p1024.yaml"]
 LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml",
            "eval_gamma_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_literal_p1024_slack0.yaml",
            "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_literal_p1024.yaml"]
@@ -275,7 +276,8 @@ def test_niah_heldout_heads_leave_out_the_uuid_and_word_values():
 def test_only_surprisal_evaluations_rank_by_surprisal(name):
     expected = {"eval_gamma_surprisal_p1024.yaml": "top4", "eval_gamma_surprisal_mean_p1024.yaml": "mean",
                 "eval_gamma_surprisal_mix_p1024.yaml": "mix", "eval_gamma_surprisal_multi_p1024.yaml": "multi",
-                "eval_gamma_surprisal_spans_p1024.yaml": "mean"}
+                "eval_gamma_surprisal_spans_p1024.yaml": "mean", "eval_gamma_surprisal_mean_query_p1024.yaml": "mean",
+                "eval_gamma_surprisal_mix_query_p1024.yaml": "mix"}
     assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
     assert bool(effective(name).get("log_kv_gamma_surprisal_spans")) is (name == "eval_gamma_surprisal_spans_p1024.yaml")
 
@@ -285,6 +287,10 @@ def test_only_surprisal_evaluations_rank_by_surprisal(name):
 def test_surprisal_evaluations_reuse_the_cue_free_p1024_checkpoint(name):
     evaluated, base = effective(name), effective("arc_gamma_k12_b128_p1024_2k.yaml")
     assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {"log_kv_gamma_surprisal"}
+    for score in ("mean", "mix"):  # the query trick on top: surprisal + the guarded question cue
+        tricked = effective(f"eval_gamma_surprisal_{score}_query_p1024.yaml")
+        assert {k for k in set(tricked) | set(base) if tricked.get(k) != base.get(k)} == {
+            "log_kv_gamma_surprisal", "log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}
     spans = effective("eval_gamma_surprisal_spans_p1024.yaml")
     assert {k for k in set(spans) | set(base) if spans.get(k) != base.get(k)} == {
         "log_kv_gamma_surprisal", "log_kv_gamma_surprisal_spans"}
