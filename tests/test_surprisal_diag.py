@@ -188,7 +188,25 @@ def test_far_reuse_hits_count_the_copy_exact_when_it_is_read():
 
 def test_default_grid_names_are_unique():
     names = [p.name for p in ps.default_policies()]
-    assert len(names) == len(set(names)) == 58
+    assert len(names) == len(set(names)) == 61
+
+
+def test_word_scores_total_each_words_tokens_within_its_span():
+    # Two 8-token spans (boundary id 3 ends each): "a 7-digit number" (word start, then 7 digits of 3.3 bits)
+    # and four 2-token words of 6 + 1 bits.
+    ids = np.array([5, 6, 6, 6, 6, 6, 6, 3, 7, 8, 7, 8, 7, 8, 7, 3])
+    s = np.r_[np.nan, [3.3] * 6, 1., [6., 1.] * 4]
+    words = np.isin(ids, [5, 7])
+    words[0] = True
+    boundary = np.zeros(16, dtype=bool)
+    boundary[3] = True
+    stream = ps.Stream(ids, s, boundary, 8, word_starts=words, value_start=0, value_stop=7, task="t", depth=0.)
+    assert stream.base["word_max"].tolist() == pytest.approx([20.8, 7.])  # the number beats any one token
+    assert stream.base["top4"][0] < stream.base["top4"][1]
+    result = ps.replay(stream, ps.Policy(score="word_max"), pool=8, recent=4, flush=4)
+    assert ps.needle_kept(stream, result) == 1.
+    lines = ps.explain(ps.Policy(score="top4"), stream, dict(kept={1}, archived=16), lambda ids: str(list(ids)))
+    assert "needle:" in lines[1] and "rank 2/2" in lines[2]
 
 
 def test_finished_runs_rebuild_their_summaries_from_the_saved_files(tmp_path):
