@@ -57,11 +57,15 @@ SURPRISAL_CAP = 32.
 # how the tokenizer splits it: a 7-digit number cut into digits of at most log2 10 bits each totals
 # about 23 bits, a UUID over 100, while an ordinary word takes a few. "word_max" is the code length
 # of the span's longest word, "word_top2" the mean of its two longest (a name and its value),
-# "multi_word" the "multi" z-score of the mean and word_max. The span keeps its sentence, so the
-# value stays with the words that ask for it. A word score is valued at the word's inverse probability,
-# SURPRISAL_SCALE * 2 ** min(bits, SURPRISAL_WORD_CAP) ("multi_word" like "multi").
+# "word_first" word_max with every word credited the code length it had at its first mention in the
+# row (the same token ids): once a rare name has been read the model can copy it, yet a sentence that
+# names it again with a new value is as much about it as the first (a key with several values, a
+# record per row of a table); the lookup is causal. "multi_word" is the "multi" z-score of the mean
+# and word_max. The span keeps its sentence, so the value stays with the words that ask for it. A
+# word score is valued at the word's inverse probability, SURPRISAL_SCALE * 2 ** min(bits,
+# SURPRISAL_WORD_CAP) ("multi_word" like "multi").
 SURPRISAL_WORD_CAP = 256.
-WORD_SCORES = ("word_max", "word_top2", "multi_word")
+WORD_SCORES = ("word_max", "word_top2", "word_first", "multi_word")
 SURPRISAL_SCORES = ("mean", "top4", "mix", "multi") + WORD_SCORES
 SURPRISAL_MIN_SPREAD = 0.25
 
@@ -522,16 +526,23 @@ class SummedValues:
         return sum(stream.span_values(row, positions, lengths, stop) for stream in self.streams)
 
 
-def word_max_top2(bits, word_starts, lengths):
-    """Per span: the code length of its longest word and the mean of its two longest (``bits`` and
-    ``word_starts`` hold the spans one after another; a word also begins at every span start)."""
+def span_words(bits, word_starts, lengths):
+    """The words of spans laid one after another (a word also begins at every span start): each word's
+    first index, code length (the sum of its tokens' ``bits``) and span."""
     lengths = np.asarray(lengths, dtype=np.int64)
     starts = np.cumsum(lengths) - lengths
     begin = np.asarray(word_starts, dtype=bool).copy()
     begin[starts[lengths > 0]] = True
     first = np.flatnonzero(begin)
     totals = np.add.reduceat(bits, first) if len(first) else np.zeros(0)
-    span = np.searchsorted(starts, first, side="right") - 1
+    return first, totals, np.searchsorted(starts, first, side="right") - 1
+
+
+def word_max_top2(bits, word_starts, lengths, totals=None):
+    """Per span: the code length of its longest word and the mean of its two longest (``bits`` and
+    ``word_starts`` hold the spans one after another; ``totals`` replaces the words' code lengths)."""
+    first, own, span = span_words(bits, word_starts, lengths)
+    totals = own if totals is None else np.asarray(totals, dtype=np.float64)
     order = np.lexsort((-totals, span))
     rank = np.arange(len(order)) - np.searchsorted(span[order], span[order])
     top = rank < 2
@@ -604,19 +615,29 @@ class SurprisalStream:
         self.words = score in WORD_SCORES
         self._rows: list[np.ndarray] = []
         self._word_rows: list[np.ndarray] = []  # word scores: does the token begin a word
+        self._id_rows: list[np.ndarray] = []  # word_first: token ids
+        self._mention_rows: list[np.ndarray] = []  # word_first: the credited bits of the word starting here
+        self._first_mention: list[dict] = []  # word_first: token ids of a word -> its first code length
         self._stats: list[RunningStats] = []  # multi scores: spans archived so far, per row
         self._counted: list[int] = []  # multi scores: spans starting before this are in the statistics
 
-    def add(self, row: int, start: int, bits, word_starts=None) -> None:
+    def add(self, row: int, start: int, bits, word_starts=None, ids=None) -> None:
         if self.words and word_starts is None:
             raise ValueError(f"surprisal score {self.score!r} needs each token's word start")
+        if self.score == "word_first" and ids is None:
+            raise ValueError("surprisal score 'word_first' needs the token ids")
         while len(self._rows) <= row:
             self._rows.append(np.zeros(0))
             self._word_rows.append(np.zeros(0, dtype=bool))
+            self._id_rows.append(np.zeros(0, dtype=np.int64))
+            self._mention_rows.append(np.zeros(0))
+            self._first_mention.append({})
             self._stats.append(RunningStats(2))
             self._counted.append(0)
         if start == 0:
             self._rows[row], self._word_rows[row] = np.zeros(0), np.zeros(0, dtype=bool)
+            self._id_rows[row], self._mention_rows[row], self._first_mention[row] = (
+                np.zeros(0, dtype=np.int64), np.zeros(0), {})
             self._stats[row], self._counted[row] = RunningStats(2), 0
         if start != len(self._rows[row]):
             raise ValueError(f"surprisal row {row} expects position {len(self._rows[row])}, got {start}")
@@ -627,6 +648,24 @@ class SurprisalStream:
             if len(words) != len(bits):
                 raise ValueError(f"{len(bits)} surprisal values but {len(words)} word starts")
             self._word_rows[row] = np.concatenate((self._word_rows[row], words))
+        if self.score == "word_first":
+            ids = np.asarray(ids, dtype=np.int64)
+            if len(ids) != len(bits):
+                raise ValueError(f"{len(bits)} surprisal values but {len(ids)} token ids")
+            self._id_rows[row] = np.concatenate((self._id_rows[row], ids))
+            self._mention_rows[row] = np.concatenate((self._mention_rows[row], np.full(len(bits), np.nan)))
+
+    def _first_mentions(self, row, positions, first, totals):
+        """Each word's credited code length: that of the first mention of the same token ids. Words are
+        registered in the order they are scored (the cache scores each span when it leaves the recent
+        window, oldest first), and a word's credit is kept by position, so every layer reads the same."""
+        ids, mention, seen = self._id_rows[row], self._mention_rows[row], self._first_mention[row]
+        starts = positions[first]
+        out = mention[starts]
+        for k in np.flatnonzero(np.isnan(out)).tolist():
+            stop = first[k + 1] if k + 1 < len(first) else len(positions)
+            out[k] = mention[starts[k]] = seen.setdefault(ids[positions[first[k]:stop]].tobytes(), totals[k])
+        return out
 
     def span_values(self, row, positions, lengths, stop):
         """``SURPRISAL_SCALE * SURPRISAL_BASE ** min(score, SURPRISAL_CAP)`` per span, for word_max and
@@ -642,9 +681,14 @@ class SurprisalStream:
                                f"{len(known)}): GPT.forward feeds it one chunk ahead of the cache")
         mean, top4 = surprisal_mean_top4(known[positions], lengths)
         if self.words:
-            word_max, top2 = word_max_top2(known[positions], self._word_rows[row][positions], lengths)
+            bits, words = known[positions], self._word_rows[row][positions]
+            credited = None
+            if self.score == "word_first":
+                first, totals, _ = span_words(bits, words, lengths)
+                credited = self._first_mentions(row, positions, first, totals)
+            word_max, top2 = word_max_top2(bits, words, lengths, credited)
             if self.score != "multi_word":
-                return SURPRISAL_SCALE * 2. ** np.minimum(word_max if self.score == "word_max" else top2,
+                return SURPRISAL_SCALE * 2. ** np.minimum(top2 if self.score == "word_top2" else word_max,
                                                           SURPRISAL_WORD_CAP)
         if self.score in ("multi", "multi_word"):
             # Every layer scores the same flush; the first call adds its new spans to the statistics.

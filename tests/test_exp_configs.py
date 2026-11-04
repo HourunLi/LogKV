@@ -277,14 +277,14 @@ def test_only_surprisal_evaluations_rank_by_surprisal(name):
     expected = {"eval_gamma_surprisal_p1024.yaml": "top4", "eval_gamma_surprisal_mean_p1024.yaml": "mean",
                 "eval_gamma_surprisal_mix_p1024.yaml": "mix", "eval_gamma_surprisal_multi_p1024.yaml": "multi",
                 "eval_gamma_surprisal_mean_query_p1024.yaml": "mean", "eval_gamma_surprisal_mix_query_p1024.yaml": "mix",
-                **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "multi_word")}}
+                **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "word_first", "multi_word")}}
     assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
 
 
 @pytest.mark.parametrize("name", ["eval_gamma_surprisal_p1024.yaml", "eval_gamma_surprisal_mean_p1024.yaml",
                                   "eval_gamma_surprisal_mix_p1024.yaml", "eval_gamma_surprisal_multi_p1024.yaml",
                                   "eval_gamma_surprisal_word_max_p1024.yaml", "eval_gamma_surprisal_word_top2_p1024.yaml",
-                                  "eval_gamma_surprisal_multi_word_p1024.yaml"])
+                                  "eval_gamma_surprisal_word_first_p1024.yaml", "eval_gamma_surprisal_multi_word_p1024.yaml"])
 def test_surprisal_evaluations_reuse_the_cue_free_p1024_checkpoint(name):
     evaluated, base = effective(name), effective("arc_gamma_k12_b128_p1024_2k.yaml")
     assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {"log_kv_gamma_surprisal"}
