@@ -8,7 +8,7 @@ niahLogKV 建立在 attach + Alpha + Beta + Gamma 之上（见 [Gamma](gamma-log
 | 参数 | 默认 | 作用 |
 |---|---|---|
 | `log_kv_retention_heads` | `null`（关闭） | `train_retention.py` 训出的打分头文件；评测与 CPT 都读它 |
-| `log_kv_gamma_surprisal` | `null`（关闭） | 精确池按 token 惊异度给片段打分（`mean`、`top4`、`mix`、`multi` 或词分数 `word_max`、`word_top2`、`multi_word`，见第 7 节；只评测） |
+| `log_kv_gamma_surprisal` | `null`（关闭） | 精确池按 token 惊异度给片段打分（`mean`、`top4`、`mix`、`multi` 或词分数 `word_max`、`word_top2`、`word_first`、`multi_word`，见第 7 节；只评测） |
 | `synthetic_retrieval_prob` | `0.0` | CPT 时训练块插入合成事实与问答的概率（只在 `demo.py`） |
 | `synthetic_facts` / `synthetic_questions` / `synthetic_kinds` | `2,8` / `1,3` / 全部 | 每块事实数、问题数与值的种类 |
 
@@ -187,7 +187,7 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 
 ## 7. 惊异度准入（只评测）
 
-`log_kv_gamma_surprisal: mean | top4 | mix | multi | word_max | word_top2 | multi_word` 让精确池按片段 token 的惊异度排序：token t 的惊异度是模型自己对它的编码长度
+`log_kv_gamma_surprisal: mean | top4 | mix | multi | word_max | word_top2 | word_first | multi_word` 让精确池按片段 token 的惊异度排序：token t 的惊异度是模型自己对它的编码长度
 −log2 p(ids[t] | ids[:t])（比特），片段分数取其均值（`mean`）、最大 4 个的均值（`top4`）、两者的平均（`mix`），或多维度（`multi`：两者各自相对本条
 序列已归档片段的均值与标准差换算成 z 分数，标准差下限 0.25 比特，片段按更突出的一维计分），价值密度为
 `SURPRISAL_SCALE`（1e4）× `SURPRISAL_BASE`（16）^ min(分数, 32)，加到 K/V 分数上进入原有的整段贪心（含旧片段 1.1 倍）。
@@ -198,15 +198,21 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 - 惊异度来自模型自己的 logits：开启时 `GPT.forward` 把带缓存的输入按不超过 recent 窗口与 flush 粒度的块（默认 2048）
   逐块前向，每块之后把该块各 token 的惊异度交给 `SurprisalStream`（块首 token 用上一块或上一步的末位 logits）。
   flush 只归档更早块里的 token，所以被归档的 token 的惊异度总已在流里。逐 token 解码同样逐步喂入。
-- 代价：每块对所有位置算一次 lm_head（Qwen3-1.7B 上约为预填充计算的两成），主机上每个 token 存一个浮点数（词分数再加一个标志）。
-- 词分数（`word_max`、`word_top2`、`multi_word`）按片段里信息量最大的词计分。词是一个以空白或 CJK 字符开头（或位于片段首）
+- 代价：每块对所有位置算一次 lm_head（Qwen3-1.7B 上约为预填充计算的两成），主机上每个 token 存一个浮点数（词分数再加一个标志，
+  `word_first` 再加 token id 与一张"词 → 首次编码长度"的表）；KV 不变。
+- 词分数（`word_max`、`word_top2`、`word_first`、`multi_word`）按片段里信息量最大的词计分。词是一个以空白或 CJK 字符开头（或位于片段首）
   的 token 加上其后直到下一个词首的 token（由 tokenizer 各 token 单独解码的文本判定，`word_start_table`）；词的编码长度是其
   token 惊异度之和 −log2 p(词 | 上文)，与分词方式无关：数字逐位切分，每位最多 log2 10 ≈ 3.3 比特，按 token 平均或峰值
   会输给单个罕见词，按词算一个 7 位随机数约 23 比特、一个 UUID 上百比特，而普通词只有几比特。`word_max` 取片段中最长的词，
-  `word_top2` 取最长两个词的均值（例如键与值），价值为 `SURPRISAL_SCALE` × 2^min(比特, 256)，即该词的逆概率；`multi_word`
+  `word_top2` 取最长两个词的均值（例如键与值），`word_first` 同 `word_max`，但每个词按它在本序列首次出现（相同 token id）
+  时的编码长度计：罕见的名字读过一次后模型就能照抄，但再次提到它并带来新值的句子（一个键的多个值、表格的一行行记录）
+  与第一次同样关乎它；查找是因果的，按片段离开 recent 窗口的先后登记，各层读到相同的值。价值为 `SURPRISAL_SCALE` × 2^min(比特, 256)，即该词的逆概率；`multi_word`
   与 `multi` 相同，只是两维为 mean 与 word_max。片段仍按句切，值与问它的词留在同一片段。模型从 token 文本建词首表
   （`set_alpha_span_boundary_ids(..., literal_texts=...)`，`eval.py` 开启词分数时自动传入），每块前向后连同惊异度交给流。
-  离线重放（P=1024，单针 160 条）：三种词分数在 s2、s3、三个 words 针上都是 1.00；`mean` 的 s3（UUID）为 0.41，`mix` 的 s2 为 0.97。
+  离线重放（P=1024）：单针 160 条上 `word_max`、`word_top2`、`word_first` 在 s2、s3、三个 words 针上都是 1.00（`mean` 的 s3
+  即 UUID 为 0.41，`mix` 的 s2 为 0.97）；多针 96 条上 multikey_1 / multivalue / multiquery 为 `mean` 0.56 / 0.45 / 0.54，
+  `word_max` 0.97 / 0.51 / 0.97，`word_first` 0.97 / 1.00 / 0.97。`word_max` 丢的是同一键的第 2–4 个值：键已可照抄，句子只剩
+  22–26 比特的数值，排在 URL、链接等更长的字面量之后。
   把值单独切成片段的做法（信息片段）已试过并删去：脱离句子后，数值的平均每 token 惊异度低于孤立的罕见词，
   总量又低于连成串的普通实词，单针 s2 降到 0.16。
 - 只用于评测：训练（`enable_log_kv_training`）与 CPT 不支持。`eval.py` 与 `eval.sh` 在 YAML 设置时传
@@ -216,7 +222,8 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
   [`eval_gamma_surprisal_mix_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_mix_p1024.yaml)（`mix`）、
   [`eval_gamma_surprisal_multi_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_multi_p1024.yaml)（`multi`）、
   [`eval_gamma_surprisal_word_max_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_word_max_p1024.yaml)（`word_max`）、
-  [`eval_gamma_surprisal_word_top2_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_word_top2_p1024.yaml)（`word_top2`）与
+  [`eval_gamma_surprisal_word_top2_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_word_top2_p1024.yaml)（`word_top2`）、
+  [`eval_gamma_surprisal_word_first_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_word_first_p1024.yaml)（`word_first`）与
   [`eval_gamma_surprisal_multi_word_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_multi_word_p1024.yaml)（`multi_word`），
   以及技巧单列的 `eval_gamma_surprisal_{mean,mix}_query_p1024.yaml`（再加查询感知 cue 与 cue 保护，两者的价值相加），
   都在不带 cue 的 P=1024 checkpoint（`arc_gamma_k12_b128_p1024_2k`）上，与它自身的评测只差这一项。

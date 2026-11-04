@@ -336,10 +336,12 @@ class GPT(nn.Module):
                     bits[:, s + 1:e + 1] = -logits[:, s:e].float().log_softmax(-1).gather(
                         -1, x[:, s + 1:e + 1, None])[..., 0]
                 bits = (bits / math.log(2)).cpu().numpy()
-                words = self.log_kv_word_starts[x.cpu().numpy()] if self.log_kv_surprisal_stream.words else None
+                ids = x.cpu().numpy() if self.log_kv_surprisal_stream.words else None
+                words = None if ids is None else self.log_kv_word_starts[ids]
                 for row in range(x.size(0)):
                     self.log_kv_surprisal_stream.add(row, starts[row] + a, bits[row],
-                                                     None if words is None else words[row])
+                                                     None if words is None else words[row],
+                                                     None if ids is None else ids[row])
                 prev = logits[:, -1].float()
                 if b > keep_from:
                     kept.append(logits[:, max(keep_from - a, 0):])

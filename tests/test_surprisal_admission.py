@@ -55,6 +55,17 @@ def test_span_values_grow_exponentially_with_the_mean_or_top4_surprisal():
             [SURPRISAL_SCALE * 2 ** e for e in expected])
     with pytest.raises(ValueError, match="word start"):
         SurprisalStream("word_max").add(0, 0, [1.])
+    # word_first: a word read again (the same ids) keeps the code length of its first mention; spans
+    # are scored oldest first, as the cache archives them, and a second layer reads the same credit.
+    stream = SurprisalStream("word_first")
+    stream.add(0, 0, [20., 3., 1., 2., 24.], [1, 1, 1, 1, 1], [9, 5, 9, 6, 7])
+    first = stream.span_values(0, np.arange(2), [2], 2)
+    assert first.tolist() == pytest.approx([SURPRISAL_SCALE * 2 ** 20])
+    for _ in range(2):
+        assert stream.span_values(0, np.arange(2, 5), [2, 1], 5).tolist() == pytest.approx(
+            [SURPRISAL_SCALE * 2 ** 20, SURPRISAL_SCALE * 2 ** 24])
+    with pytest.raises(ValueError, match="token ids"):
+        SurprisalStream("word_first").add(0, 0, [1.], [1])
 
 
 def test_multi_scores_a_span_by_the_dimension_it_stands_out_in():
@@ -140,8 +151,9 @@ def test_word_scores_find_words_from_the_token_texts():
         model.set_log_kv_cache(recent_size=64, gamma_surprisal="word_max", **KWARGS)
     model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7], literal_texts=texts)
     ids = torch.randint(0, 41, (40,))
-    model.set_log_kv_cache(recent_size=64, gamma_surprisal="multi_word", **KWARGS)
+    model.set_log_kv_cache(recent_size=64, gamma_surprisal="word_first", **KWARGS)
     with torch.no_grad():
         model(ids[None], input_pos=torch.arange(40))
     stream = model.log_kv_surprisal_stream
     assert stream._word_rows[0].tolist() == word_start_table(texts)[ids.numpy()].tolist()
+    assert stream._id_rows[0].tolist() == ids.tolist()
