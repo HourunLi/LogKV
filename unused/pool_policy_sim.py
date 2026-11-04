@@ -55,7 +55,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "unused"))
-from litgpt.alpha_log_kv import RunningStats, information_ends  # noqa: E402
+from litgpt.alpha_log_kv import RunningStats  # noqa: E402
 from niah_surprisal import SurprisalStore, cut, write_summary  # noqa: E402
 from reuse_label_stats import reuse_pairs  # noqa: E402
 
@@ -130,13 +130,11 @@ class Stream:
     """One token sequence prepared for replay: spans, admission scores, n-gram re-occurrence index."""
 
     def __init__(self, ids, s, boundary, max_span, reuse_n=2, reuse_bits=6., label_n=3, label_bits=6.,
-                 recent=2048, info_chunk=0, word_starts=None, **fields):
+                 recent=2048, word_starts=None, **fields):
         self.ids, self.s = np.asarray(ids, dtype=np.int64), np.asarray(s, dtype=np.float64)
         self.fields = fields
-        # info_chunk > 0: information spans as the cache cuts them (surprisal fed in chunks of that size;
-        # word_starts flags the tokens that begin a word).
-        extra = information_ends(self.s, info_chunk, word_starts) if info_chunk else None
-        self.starts, self.stops = cut(self.ids, boundary, max_span, extra)
+        # word_starts flags the tokens that begin a word (the word scores need it).
+        self.starts, self.stops = cut(self.ids, boundary, max_span)
         self.base = span_base(self.s, self.starts, self.stops, word_starts)
         n = reuse_n
         self.span_keys: list[np.ndarray] = [np.empty(0, dtype=np.int64)] * len(self.starts)
@@ -344,7 +342,7 @@ def summary(saved: dict) -> str:
     """All policies in grid order, then the ten best by mean NIAH and by the longest natural hit rate."""
     rows = saved["rows"]
     lines = [f"code {saved.get('code', '?')}; pool {saved['pool']}, recent {saved['recent']}, flush {saved['flush']}"
-             f"{', information spans' if saved.get('info_spans') else ''}; "
+             "; "
              f"reuse {saved['reuse_n']}-grams >= {saved['reuse_bits']:g} bits; "
              f"far-reuse label {saved['label_n']}-grams >= {saved['label_bits']:g} bits"
              + (f"; {saved['streams']}" if saved.get("streams") else ""), "", "all policies:"]
@@ -407,8 +405,6 @@ def main():
                    help="tokenizer dir for word boundaries and --explain text (default: the one of the saved config)")
     p.add_argument("--explain", type=int, default=0,
                    help="per policy, explain up to this many lost needles per task (<out stem>.explain.txt)")
-    p.add_argument("--info-spans", action="store_true",
-                   help="cut information spans as log_kv_gamma_surprisal_spans does (chunks of min(recent, flush))")
     p.add_argument("--out", default="pool_policy_sim.json")
     p.add_argument("--report", default=None, help="a finished run's .json: write its summary, replay nothing")
     args = p.parse_args()
@@ -426,7 +422,7 @@ def main():
     boundary[meta["boundary_ids"]] = True
     policies = default_policies() if args.policies is None else [Policy(**d) for d in json.loads(args.policies)]
     words = decode = None
-    if args.info_spans or args.explain or any(p.score in WORD_SCORES for p in policies):
+    if args.explain or any(p.score in WORD_SCORES for p in policies):
         from litgpt.alpha_log_kv import word_start_table
         import torch
         tokenizer = load_tokenizer(args.tokenizer, meta["config"])
@@ -438,8 +434,7 @@ def main():
         ids = row["ids"]
         table = boundary if boundary.size > ids.max() else np.pad(boundary, (0, int(ids.max()) + 1 - boundary.size))
         return Stream(ids, row["surprisal"], table, meta["max_span"], args.reuse_n, args.reuse_bits, args.label_n,
-                      args.label_bits, recent, min(recent, flush) if args.info_spans else 0,
-                      words[ids] if words is not None else None, **fields)
+                      args.label_bits, recent, words[ids] if words is not None else None, **fields)
 
     niah = []
     if "niah" in loaded:
@@ -456,7 +451,7 @@ def main():
           + ", ".join(f"{len(v)} natural streams ({k})" for k, v in natural.items()) + f"; {len(policies)} policies",
           flush=True)
     rows, explained = evaluate(policies, niah, natural, pool, recent, flush, args.explain, decode)
-    saved = dict(code=code_version(), pool=pool, recent=recent, flush=flush, info_spans=args.info_spans, reuse_n=args.reuse_n,
+    saved = dict(code=code_version(), pool=pool, recent=recent, flush=flush, reuse_n=args.reuse_n,
                  reuse_bits=args.reuse_bits,
                  label_n=args.label_n, label_bits=args.label_bits, rows=rows,
                  streams=f"{len(niah)} NIAH prompts, " + ", ".join(f"{len(v)} natural streams ({k})"

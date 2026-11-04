@@ -1,0 +1,5 @@
+# niahLogKV 惊异度准入（只评测、不重训）：与 eval_gamma_surprisal_p1024.yaml 相同，只是片段分数取句中编码长度最大的词的编码长度（word_max，词内 token 惊异度之和，与分词方式无关），
+# 价值为该词的逆概率；片段仍按句切，值与问它的词留在一起。
+#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_surprisal_word_max_p1024.yaml
+config: arc_gamma_k12_b128_p1024_2k.yaml
+log_kv_gamma_surprisal: word_max

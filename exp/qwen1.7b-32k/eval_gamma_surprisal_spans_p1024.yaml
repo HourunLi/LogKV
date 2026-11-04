@@ -1,6 +1,0 @@
-# niahLogKV 惊异度准入 + 信息片段（只评测、不重训）：在不带 cue 的 P=1024 checkpoint（arc_gamma_k12_b128_p1024_2k）上，
-# 惊异度持续偏高的一串 token（人名、数值、编码）自成片段，精确池按片段平均惊异度（mean）挑选，可以只存它们而不存整句。
-#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_surprisal_spans_p1024.yaml
-config: arc_gamma_k12_b128_p1024_2k.yaml
-log_kv_gamma_surprisal: mean
-log_kv_gamma_surprisal_spans: true

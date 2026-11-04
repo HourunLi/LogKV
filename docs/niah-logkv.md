@@ -8,8 +8,7 @@ niahLogKV 建立在 attach + Alpha + Beta + Gamma 之上（见 [Gamma](gamma-log
 | 参数 | 默认 | 作用 |
 |---|---|---|
 | `log_kv_retention_heads` | `null`（关闭） | `train_retention.py` 训出的打分头文件；评测与 CPT 都读它 |
-| `log_kv_gamma_surprisal` | `null`（关闭） | 精确池按 token 惊异度给片段打分（`mean`、`top4`、`mix`、`multi` 或 `sum`，见第 7 节；只评测） |
-| `log_kv_gamma_surprisal_spans` | `false` | 与上者同用：惊异度持续偏高的一串 token 自成片段（信息片段，见第 7 节） |
+| `log_kv_gamma_surprisal` | `null`（关闭） | 精确池按 token 惊异度给片段打分（`mean`、`top4`、`mix`、`multi` 或词分数 `word_max`、`word_top2`、`multi_word`，见第 7 节；只评测） |
 | `synthetic_retrieval_prob` | `0.0` | CPT 时训练块插入合成事实与问答的概率（只在 `demo.py`） |
 | `synthetic_facts` / `synthetic_questions` / `synthetic_kinds` | `2,8` / `1,3` / 全部 | 每块事实数、问题数与值的种类 |
 
@@ -144,7 +143,7 @@ bash diag.sh unused/reuse_label_stats.py --config exp/qwen1.7b-32k/arc_gamma_k12
 - token 的惊异度 s[t] = −log2 p(ids[t] | ids[:t])（比特），是模型对它的编码长度。两个脚本都按 YAML 构建与 `eval.py`
   相同的模型与缓存，整段 prefill 后从最终隐状态分块算出（不保留整段 logits）。
 - `niah_surprisal.py`：lm-eval 自己的 NIAH 样本（RULER 模板与 `eval_tasks/niah_cue` 的变体，以及多针的
-  `niah_multikey_1`、`niah_multivalue`、`niah_multiquery`；多针时按出现顺序逐根报告；`--info-spans` 先切信息片段），按 Alpha 的切法
+  `niah_multikey_1`、`niah_multivalue`、`niah_multiquery`；多针时按出现顺序逐根报告），按 Alpha 的切法
   切片段，以 max、top4、mean（惊异度）与 uni_max（文档内一元编码长度，不用 LM）为片段分数，报告针所在片段在
   离开 recent 窗口的片段中的名次、装下它需要的精确池 token 数（`tokens_needed`，最终池的离线估计，不含 1.1 倍）、
   在 P=256/1024/2048 下装得下的比例，以及分数比针高的片段。
@@ -165,14 +164,14 @@ token 逐个进入，攒满 recent + flush 后最早的 flush 个离开 recent �
   v(T) = (I + β·M(T)) · g(T − last(T))
 
 - I：准入时的信息量，片段的惊异度分数（mean、top4、topq 即最高四分之一的均值、max、mix、sum），词分数（`word_max`：
-  片段中编码长度最大的词的编码长度，词与编码长度同第 7 节信息片段；`word_top2`：最大两个的均值），多维 z 分数
+  片段中编码长度最大的词的编码长度，词与编码长度见第 7 节；`word_top2`：最大两个的均值），多维 z 分数
   （`multi`：mean 与 top4；`multi_word`：mean 与 word_max），或恒为 1（只看新近的基准）。
 - g：遗忘，none、幂律 (1 + age/τ)^(−α) 或指数 exp(−age/τ)。
 - last(T)：片段末尾；打开复用时取 T 之前它的"有信息的 n-gram"（片段内惊异度不低于 `--reuse-bits` 的 n-gram）
   最近一次再出现的位置（刷新）。M(T)：复用加分时这些再出现的惊异度之和。
 - 全部因果：T 时的价值只用 T 之前的 token。默认网格为 3 种分数 × 6 种遗忘 × 3 种复用（无、刷新、加分）再加新近基准
   与 mix、multi、sum、word_max、word_top2、multi_word 六种分数，共 61 种策略。
-- `--info-spans` 按第 7 节的信息片段规则另切片段。词分数与 `--info-spans` 要用 tokenizer 判断词首（默认按 .npz 里记下的
+- 词分数要用 tokenizer 判断词首（默认按 .npz 里记下的
   配置找，或用 `--tokenizer` 指定）。
 - `--explain K` 另写 `<输出名>.explain.txt`：每种策略、每个任务前 K 个丢针的样本，列出针所在片段与最终池中分数最高的
   片段（文本、长度、各分数、在已归档片段中的名次）。汇总首行记下代码的 commit。
@@ -187,7 +186,7 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 
 ## 7. 惊异度准入（只评测）
 
-`log_kv_gamma_surprisal: mean | top4 | mix | multi | sum` 让精确池按片段 token 的惊异度排序：token t 的惊异度是模型自己对它的编码长度
+`log_kv_gamma_surprisal: mean | top4 | mix | multi | word_max | word_top2 | multi_word` 让精确池按片段 token 的惊异度排序：token t 的惊异度是模型自己对它的编码长度
 −log2 p(ids[t] | ids[:t])（比特），片段分数取其均值（`mean`）、最大 4 个的均值（`top4`）、两者的平均（`mix`），或多维度（`multi`：两者各自相对本条
 序列已归档片段的均值与标准差换算成 z 分数，标准差下限 0.25 比特，片段按更突出的一维计分），价值密度为
 `SURPRISAL_SCALE`（1e4）× `SURPRISAL_BASE`（16）^ min(分数, 32)，加到 K/V 分数上进入原有的整段贪心（含旧片段 1.1 倍）。
@@ -198,30 +197,31 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 - 惊异度来自模型自己的 logits：开启时 `GPT.forward` 把带缓存的输入按不超过 recent 窗口与 flush 粒度的块（默认 2048）
   逐块前向，每块之后把该块各 token 的惊异度交给 `SurprisalStream`（块首 token 用上一块或上一步的末位 logits）。
   flush 只归档更早块里的 token，所以被归档的 token 的惊异度总已在流里。逐 token 解码同样逐步喂入。
-- 代价：每块对所有位置算一次 lm_head（Qwen3-1.7B 上约为预填充计算的两成），主机上每个 token 存一个浮点数。
-- `sum` 按片段的总编码长度 −log2 p(片段)（token 惊异度之和）打分，价值为片段的逆概率 `SURPRISAL_SCALE` × 2^min(总比特, 512)。
-  它与分词方式无关：数字逐位切分，每位最多 log2 10 ≈ 3.3 比特，按平均或峰值算会输给单个罕见词，按总量算一个 7 位
-  随机数约 23 比特。整句求和会偏向长的普通句子，所以 `sum` 应与信息片段同用。
-- 信息片段（`log_kv_gamma_surprisal_spans: true`）：除句末与片段上限外，信息量高的一串词也自成片段。词是一个以空白或
-  CJK 字符开头的 token 加上其后直到下一个词首的 token（由 tokenizer 各 token 单独解码的文本判定，`word_start_table`），
-  词的编码长度是其 token 惊异度之和 −log2 p(词 | 上文)，与分词方式无关（7 位随机数约 25 比特，不会因逐位切分而显得平淡）。
-  一个词的编码长度比本行已见词的均值高出 1 个标准差时开始一串，回到均值以下时结束；只在词与词之间切，所以一个词、
-  一个值不会被切开。人名、数值、编码因此能单独进入精确池，不必连带整句；它们的 K/V 已含上下文。词要到下一个词开始
-  才算完，所以切点总落在仍在 recent 窗口的 token 上；`GPT.forward` 每块之后把切点补进各层缓存的片段边界。
-  需要 token 文本（`set_alpha_span_boundary_ids(..., literal_texts=...)`，`eval.py` 开启时自动传入）。
+- 代价：每块对所有位置算一次 lm_head（Qwen3-1.7B 上约为预填充计算的两成），主机上每个 token 存一个浮点数（词分数再加一个标志）。
+- 词分数（`word_max`、`word_top2`、`multi_word`）按片段里信息量最大的词计分。词是一个以空白或 CJK 字符开头（或位于片段首）
+  的 token 加上其后直到下一个词首的 token（由 tokenizer 各 token 单独解码的文本判定，`word_start_table`）；词的编码长度是其
+  token 惊异度之和 −log2 p(词 | 上文)，与分词方式无关：数字逐位切分，每位最多 log2 10 ≈ 3.3 比特，按 token 平均或峰值
+  会输给单个罕见词，按词算一个 7 位随机数约 23 比特、一个 UUID 上百比特，而普通词只有几比特。`word_max` 取片段中最长的词，
+  `word_top2` 取最长两个词的均值（例如键与值），价值为 `SURPRISAL_SCALE` × 2^min(比特, 256)，即该词的逆概率；`multi_word`
+  与 `multi` 相同，只是两维为 mean 与 word_max。片段仍按句切，值与问它的词留在同一片段。模型从 token 文本建词首表
+  （`set_alpha_span_boundary_ids(..., literal_texts=...)`，`eval.py` 开启词分数时自动传入），每块前向后连同惊异度交给流。
+  离线重放（P=1024，单针 160 条）：三种词分数在 s2、s3、三个 words 针上都是 1.00；`mean` 的 s3（UUID）为 0.41，`mix` 的 s2 为 0.97。
+  把值单独切成片段的做法（信息片段）已试过并删去：脱离句子后，数值的平均每 token 惊异度低于孤立的罕见词，
+  总量又低于连成串的普通实词，单针 s2 降到 0.16。
 - 只用于评测：训练（`enable_log_kv_training`）与 CPT 不支持。`eval.py` 与 `eval.sh` 在 YAML 设置时传
   `--log_kv_gamma_surprisal`；关 Alpha 时一并关闭。结果 JSON 记录该开关。
 - 配置：[`eval_gamma_surprisal_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_p1024.yaml)（`top4`）与
   [`eval_gamma_surprisal_mean_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_mean_p1024.yaml)（`mean`）与
   [`eval_gamma_surprisal_mix_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_mix_p1024.yaml)（`mix`）、
-  [`eval_gamma_surprisal_multi_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_multi_p1024.yaml)（`multi`）与
-  [`eval_gamma_surprisal_spans_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_spans_p1024.yaml)（`mean` + 信息片段），
-  [`eval_gamma_surprisal_sum_spans_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_sum_spans_p1024.yaml)（`sum` + 信息片段），
+  [`eval_gamma_surprisal_multi_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_multi_p1024.yaml)（`multi`）、
+  [`eval_gamma_surprisal_word_max_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_word_max_p1024.yaml)（`word_max`）、
+  [`eval_gamma_surprisal_word_top2_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_word_top2_p1024.yaml)（`word_top2`）与
+  [`eval_gamma_surprisal_multi_word_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_multi_word_p1024.yaml)（`multi_word`），
   以及技巧单列的 `eval_gamma_surprisal_{mean,mix}_query_p1024.yaml`（再加查询感知 cue 与 cue 保护，两者的价值相加），
   都在不带 cue 的 P=1024 checkpoint（`arc_gamma_k12_b128_p1024_2k`）上，与它自身的评测只差这一项。
 
 测试：`tests/test_surprisal_admission.py`（片段价值、分块前向的惊异度与返回的 logits、逐 token 解码一致、惊异片段进入精确池、
-短而惊异的片段换掉长而平淡的片段、信息片段按词切且不切开多 token 的数值），
+短而惊异的片段换掉长而平淡的片段、词分数按词总计编码长度、词首表来自 token 文本），
 `tests/test_retention.py`（启动脚本的配置读取与 checkpoint 检查、选项解析与续训、片段价值公式与设备相加、新头不改变选择、prefill 与逐 token 一致、
 能识别针的头把针留在精确池、校验与保存/加载、回放签名、合成事实的版式与种类、训练器能分开正负样本、
 `demo.py` 的混入），`tests/test_exp_configs.py`（niah 配置只差所述开关），
