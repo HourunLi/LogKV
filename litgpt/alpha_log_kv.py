@@ -51,24 +51,19 @@ _LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
 SURPRISAL_SCALE = 1e4
 SURPRISAL_BASE = 16.
 SURPRISAL_CAP = 32.
-# "sum" scores a span by its total code length, the sum of its tokens' surprisal = -log2 p(span),
-# which does not depend on how the tokenizer splits the text (a 7-digit number cut into 7 digits of
-# at most log2 10 bits each still totals about 23 bits), and values it at its inverse probability,
-# SURPRISAL_SCALE * 2 ** min(total, SURPRISAL_SUM_CAP). It is meant for information spans: on whole
-# sentences a long ordinary span would total more than a short informative one.
-SURPRISAL_SUM_CAP = 512.
-SURPRISAL_SCORES = ("mean", "top4", "mix", "multi", "sum")
+# Word scores count a span by its most informative words. A word is a token that begins one (its text
+# starts with whitespace or a CJK character, or it starts the span) and the tokens up to the next; its
+# code length is the sum of its tokens' surprisal, -log2 p(word | context), which does not depend on
+# how the tokenizer splits it: a 7-digit number cut into digits of at most log2 10 bits each totals
+# about 23 bits, a UUID over 100, while an ordinary word takes a few. "word_max" is the code length
+# of the span's longest word, "word_top2" the mean of its two longest (a name and its value),
+# "multi_word" the "multi" z-score of the mean and word_max. The span keeps its sentence, so the
+# value stays with the words that ask for it. A word score is valued at the word's inverse probability,
+# SURPRISAL_SCALE * 2 ** min(bits, SURPRISAL_WORD_CAP) ("multi_word" like "multi").
+SURPRISAL_WORD_CAP = 256.
+WORD_SCORES = ("word_max", "word_top2", "multi_word")
+SURPRISAL_SCORES = ("mean", "top4", "mix", "multi") + WORD_SCORES
 SURPRISAL_MIN_SPREAD = 0.25
-# Information spans (optional, with surprisal admission): besides sentence ends and the span cap,
-# a span also ends around a run of informative words (a name, a number, a code), so the exact pool
-# can keep the run without its sentence; the run's K/V already carry its context. A word is a token
-# that begins one (its text starts with whitespace or a CJK character) and the tokens up to the next;
-# its code length is the sum of its tokens' surprisal, -log2 p(word | context), whatever the split
-# (a 7-digit number of 3.5-bit digits totals about 25 bits). A run starts at a word INFO_START spreads
-# above the row's running mean word code length and lasts while words stay above INFO_CONTINUE
-# spreads (the mean). Cuts fall only between words, so no word, and no value, is split.
-INFO_START = 1.
-INFO_CONTINUE = 0.
 
 
 @dataclass
@@ -527,6 +522,26 @@ class SummedValues:
         return sum(stream.span_values(row, positions, lengths, stop) for stream in self.streams)
 
 
+def word_max_top2(bits, word_starts, lengths):
+    """Per span: the code length of its longest word and the mean of its two longest (``bits`` and
+    ``word_starts`` hold the spans one after another; a word also begins at every span start)."""
+    lengths = np.asarray(lengths, dtype=np.int64)
+    starts = np.cumsum(lengths) - lengths
+    begin = np.asarray(word_starts, dtype=bool).copy()
+    begin[starts[lengths > 0]] = True
+    first = np.flatnonzero(begin)
+    totals = np.add.reduceat(bits, first) if len(first) else np.zeros(0)
+    span = np.searchsorted(starts, first, side="right") - 1
+    order = np.lexsort((-totals, span))
+    rank = np.arange(len(order)) - np.searchsorted(span[order], span[order])
+    top = rank < 2
+    word_max = np.zeros(len(lengths))
+    word_max[span[order][rank == 0]] = totals[order][rank == 0]
+    top2 = (np.bincount(span[order][top], weights=totals[order][top], minlength=len(lengths))
+            / np.minimum(np.bincount(span, minlength=len(lengths)), 2).clip(min=1))
+    return word_max, top2
+
+
 def surprisal_mean_top4(bits, lengths):
     """Per span: the mean and the mean of the four largest of its tokens' surprisal (``bits`` holds the
     spans one after another)."""
@@ -572,101 +587,50 @@ def word_start_table(texts) -> np.ndarray:
                     dtype=bool)
 
 
-class InformationRuns:
-    """Span ends around runs of informative words, fed one chunk at a time (one per row).
-
-    A word is judged when the next one begins, since only then is its code length complete; the cuts it
-    yields fall on tokens that are still in the recent window.
-    """
-
-    def __init__(self) -> None:
-        self.stats, self.in_run = RunningStats(1), False
-        self.word, self.word_bits = None, 0.  # the open word: its first position and bits so far
-
-    def feed(self, start: int, bits, word_starts) -> list[int]:
-        """Positions that end a span (the last token before a run, the last token of a run), given the
-        surprisal of the tokens from ``start`` on and whether each begins a word. The words a chunk
-        closes are judged against the words before them (the first such batch against itself)."""
-        closed = []
-        for i, (value, begins) in enumerate(zip(np.asarray(bits, dtype=np.float64).tolist(),
-                                                np.asarray(word_starts, dtype=bool).tolist())):
-            position = start + i
-            if self.word is None:
-                self.word = position
-            elif begins:
-                closed.append((self.word, self.word_bits))
-                self.word, self.word_bits = position, 0.
-            self.word_bits += value
-        if not closed:
-            return []
-        totals = np.asarray([total for _, total in closed])[:, None]
-        bootstrap = self.stats.count < 2
-        if bootstrap:
-            self.stats.update(totals)
-        z = self.stats.z(totals)[:, 0]
-        if not bootstrap:
-            self.stats.update(totals)
-        ends = []
-        for (first, _), value in zip(closed, z.tolist()):
-            if not self.in_run and value >= INFO_START:
-                if first:
-                    ends.append(first - 1)
-                self.in_run = True
-            elif self.in_run and value < INFO_CONTINUE:
-                ends.append(first - 1)
-                self.in_run = False
-        return ends
-
-
-def information_ends(bits, chunk: int, word_starts) -> np.ndarray:
-    """Span ends (bool per token) that InformationRuns gives for ``bits`` fed ``chunk`` tokens at a time;
-    ``word_starts`` flags the tokens that begin a word."""
-    bits = np.nan_to_num(np.asarray(bits, dtype=np.float64))
-    word_starts = np.asarray(word_starts, dtype=bool)
-    runs, out = InformationRuns(), np.zeros(len(bits), dtype=bool)
-    for start in range(0, len(bits), chunk):
-        out[runs.feed(start, bits[start:start + chunk], word_starts[start:start + chunk])] = True
-    return out
-
-
 class SurprisalStream:
     """Each row's token surprisal in bits, fed by GPT.forward; span values for the exact pool.
 
-    ``add(row, start, bits)`` appends the surprisal of positions ``start, start + 1, ...``;
-    a row restarts at position 0. The model computes it from its own next-token logits one
-    prefill chunk at a time (no longer than the recent window), so every token's surprisal
-    is known before the token can leave the window. One float per token is kept on the host.
+    ``add(row, start, bits, word_starts)`` appends the surprisal of positions ``start, start + 1, ...``
+    (and, for the word scores, whether each begins a word); a row restarts at position 0. The model
+    computes it from its own next-token logits one prefill chunk at a time (no longer than the recent
+    window), so every token's surprisal is known before the token can leave the window. A float (and a
+    flag) per token is kept on the host.
     """
 
     def __init__(self, score: str) -> None:
         if score not in SURPRISAL_SCORES:
             raise ValueError(f"surprisal score must be one of {SURPRISAL_SCORES}, got {score!r}")
         self.score = score
+        self.words = score in WORD_SCORES
         self._rows: list[np.ndarray] = []
-        self._stats: list[RunningStats] = []  # "multi": spans archived so far, per row
-        self._counted: list[int] = []  # "multi": spans starting before this are in the statistics
-        self._runs: list[InformationRuns] = []  # information spans, per row
+        self._word_rows: list[np.ndarray] = []  # word scores: does the token begin a word
+        self._stats: list[RunningStats] = []  # multi scores: spans archived so far, per row
+        self._counted: list[int] = []  # multi scores: spans starting before this are in the statistics
 
-    def add(self, row: int, start: int, bits) -> None:
+    def add(self, row: int, start: int, bits, word_starts=None) -> None:
+        if self.words and word_starts is None:
+            raise ValueError(f"surprisal score {self.score!r} needs each token's word start")
         while len(self._rows) <= row:
             self._rows.append(np.zeros(0))
+            self._word_rows.append(np.zeros(0, dtype=bool))
             self._stats.append(RunningStats(2))
             self._counted.append(0)
-            self._runs.append(InformationRuns())
         if start == 0:
-            self._rows[row] = np.zeros(0)
-            self._stats[row], self._counted[row], self._runs[row] = RunningStats(2), 0, InformationRuns()
+            self._rows[row], self._word_rows[row] = np.zeros(0), np.zeros(0, dtype=bool)
+            self._stats[row], self._counted[row] = RunningStats(2), 0
         if start != len(self._rows[row]):
             raise ValueError(f"surprisal row {row} expects position {len(self._rows[row])}, got {start}")
-        self._rows[row] = np.concatenate((self._rows[row], np.nan_to_num(np.asarray(bits, dtype=np.float64))))
-
-    def information_ends(self, row: int, start: int, word_starts) -> list[int]:
-        """Span ends around runs of informative words, given the tokens added last (from ``start``) and
-        whether each begins a word; the ends may fall on earlier tokens still in the recent window."""
-        return self._runs[row].feed(start, self._rows[row][start:], word_starts)
+        bits = np.nan_to_num(np.asarray(bits, dtype=np.float64))
+        self._rows[row] = np.concatenate((self._rows[row], bits))
+        if self.words:
+            words = np.asarray(word_starts, dtype=bool)
+            if len(words) != len(bits):
+                raise ValueError(f"{len(bits)} surprisal values but {len(words)} word starts")
+            self._word_rows[row] = np.concatenate((self._word_rows[row], words))
 
     def span_values(self, row, positions, lengths, stop):
-        """``SURPRISAL_SCALE * SURPRISAL_BASE ** min(score, SURPRISAL_CAP)`` per span (``stop`` is unused:
+        """``SURPRISAL_SCALE * SURPRISAL_BASE ** min(score, SURPRISAL_CAP)`` per span, for word_max and
+        word_top2 ``SURPRISAL_SCALE * 2 ** min(bits, SURPRISAL_WORD_CAP)`` (``stop`` is unused:
         surprisal never changes)."""
         lengths = np.asarray(lengths, dtype=np.int64)
         if not len(lengths):
@@ -677,16 +641,19 @@ class SurprisalStream:
             raise RuntimeError(f"surprisal of position {int(positions.max())} is not known yet (row {row} has "
                                f"{len(known)}): GPT.forward feeds it one chunk ahead of the cache")
         mean, top4 = surprisal_mean_top4(known[positions], lengths)
-        if self.score == "multi":
+        if self.words:
+            word_max, top2 = word_max_top2(known[positions], self._word_rows[row][positions], lengths)
+            if self.score != "multi_word":
+                return SURPRISAL_SCALE * 2. ** np.minimum(word_max if self.score == "word_max" else top2,
+                                                          SURPRISAL_WORD_CAP)
+        if self.score in ("multi", "multi_word"):
             # Every layer scores the same flush; the first call adds its new spans to the statistics.
-            features = np.stack((mean, top4), 1)
+            features = np.stack((mean, top4 if self.score == "multi" else word_max), 1)
             new = positions[np.cumsum(lengths) - lengths] >= self._counted[row]
             if new.any():
                 self._stats[row].update(features[new])
                 self._counted[row] = int(positions.max()) + 1
             score = self._stats[row].z(features).max(1)
-        elif self.score == "sum":
-            return SURPRISAL_SCALE * 2. ** np.minimum(mean * lengths, SURPRISAL_SUM_CAP)
         else:
             score = {"mean": mean, "top4": top4, "mix": (mean + top4) / 2}[self.score]
         return SURPRISAL_SCALE * SURPRISAL_BASE ** np.minimum(score, SURPRISAL_CAP)

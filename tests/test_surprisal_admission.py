@@ -44,11 +44,17 @@ def test_span_values_grow_exponentially_with_the_mean_or_top4_surprisal():
     stream = SurprisalStream("mix")
     stream.add(0, 0, [1., 1., 1., 1., 1., 9.])
     assert stream.span_values(0, np.arange(6), [6], 6).tolist() == pytest.approx([value((14 / 6 + 3) / 2)])
-    # "sum": the inverse probability of the span; seven 3.3-bit digits outweigh one 12-bit word.
-    stream = SurprisalStream("sum")
-    stream.add(0, 0, [3.3] * 7 + [12.])
-    number, word = stream.span_values(0, np.arange(8), [7, 1], 8)
-    assert number == pytest.approx(SURPRISAL_SCALE * 2 ** 23.1) and number > word
+    # Word scores: a word's code length is the sum of its tokens' bits. Span 0 is " is 1234567" (a word of
+    # 2 bits, then a number of seven 3.3-bit digits); span 1 is four one-token words of 12, 9, 2 and 1 bits.
+    bits, words = [2.] + [0.] + [3.3] * 7 + [12., 9., 2., 1.], [1, 1] + [0] * 7 + [1, 1, 1, 1]
+    lengths = [9, 4]
+    for score, expected in (("word_max", [23.1, 12.]), ("word_top2", [(23.1 + 2) / 2, 10.5])):
+        stream = SurprisalStream(score)
+        stream.add(0, 0, bits, words)
+        assert stream.span_values(0, np.arange(13), lengths, 13).tolist() == pytest.approx(
+            [SURPRISAL_SCALE * 2 ** e for e in expected])
+    with pytest.raises(ValueError, match="word start"):
+        SurprisalStream("word_max").add(0, 0, [1.])
 
 
 def test_multi_scores_a_span_by_the_dimension_it_stands_out_in():
@@ -95,9 +101,11 @@ def test_a_surprising_span_takes_the_exact_pool():
     bits = np.full(64, 1.)
     bits[20:24] = 12.  # one surprising span, long out of the recent window by the end
     pools = {}
-    for score in ("mean", "top4"):
+    model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7], literal_texts=[" w"] * 41)  # one-token words
+    for score in ("mean", "top4", "word_max"):
         model.set_log_kv_cache(recent_size=16, gamma_surprisal=score, **KWARGS)
-        model.log_kv_surprisal_stream.add(0, 0, bits)  # given values: run the cache without the model's feed
+        # Given values: run the cache without the model's feed.
+        model.log_kv_surprisal_stream.add(0, 0, bits, np.ones(64, dtype=bool))
         model._surprisal_inner = True
         try:
             with torch.no_grad():
@@ -123,32 +131,17 @@ def test_a_short_surprising_span_evicts_a_long_dull_one():
     assert choose_spans(cut, linear, 64).keep[0] == list(range(64))
 
 
-def test_information_runs_cut_whole_words_by_their_code_length():
-    from litgpt.alpha_log_kv import information_ends, word_start_table
+def test_word_scores_find_words_from_the_token_texts():
+    from litgpt.alpha_log_kv import word_start_table
     assert word_start_table([" the", "ing", "\n", "中", "", "-"]).tolist() == [True, False, True, True, True, False]
-    # 30 one-token words of 2 bits, then a 7-token number of 3.5-bit digits (one word of 24.5 bits: none of
-    # its tokens stands out alone), then a word "obnoxious-sale" of 12 + 0.2 + 10 bits, then 30 more words.
-    bits = np.r_[np.full(30, 2.), np.full(7, 3.5), [12., 0.2, 10.], np.full(30, 2.)]
-    starts = np.r_[np.ones(30), [1] + [0] * 6, [1, 0, 0], np.ones(30)].astype(bool)
-    ends = np.flatnonzero(information_ends(bits, 64, starts)).tolist()
-    assert ends == [29, 39]  # one run of both words, cut only between words
-
-
-def test_information_spans_mark_the_caches_span_ends():
-    from litgpt.alpha_log_kv import information_ends, word_start_table
     model = _model()
     texts = [" w" if i % 3 == 0 else "x" for i in range(41)]  # every third id begins a word
     with pytest.raises(RuntimeError, match="token texts"):
-        model.set_log_kv_cache(recent_size=64, gamma_surprisal="mean", gamma_surprisal_spans=True, **KWARGS)
+        model.set_log_kv_cache(recent_size=64, gamma_surprisal="word_max", **KWARGS)
     model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7], literal_texts=texts)
     ids = torch.randint(0, 41, (40,))
-    model.set_log_kv_cache(recent_size=64, gamma_surprisal="mean", gamma_surprisal_spans=True, **KWARGS)
+    model.set_log_kv_cache(recent_size=64, gamma_surprisal="multi_word", **KWARGS)
     with torch.no_grad():
         model(ids[None], input_pos=torch.arange(40))
-    words = word_start_table(texts)[ids.numpy()]
-    expected = np.flatnonzero(information_ends(model.log_kv_surprisal_stream._rows[0], 8, words))
-    assert len(expected)
-    for block in model.transformer.h:
-        assert all(block.attn.kv_cache._recent_span_ends[0][p] for p in expected)
-    with pytest.raises(ValueError, match="requires gamma_surprisal"):
-        model.set_log_kv_cache(recent_size=64, gamma_surprisal_spans=True, **KWARGS)
+    stream = model.log_kv_surprisal_stream
+    assert stream._word_rows[0].tolist() == word_start_table(texts)[ids.numpy()].tolist()

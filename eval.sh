@@ -253,7 +253,6 @@ emit("LOG_KV_GAMMA_QUERY_CUE", str(bool(value_or("log_kv_gamma_query_cue", False
 # niahLogKV learned retention heads (train_retention.py output); unset = off.
 emit("LOG_KV_RETENTION_HEADS", cfg.get("log_kv_retention_heads") or "")
 emit("LOG_KV_GAMMA_SURPRISAL", cfg.get("log_kv_gamma_surprisal") or "")
-emit("LOG_KV_GAMMA_SURPRISAL_SPANS", str(bool(cfg.get("log_kv_gamma_surprisal_spans", False))).lower())
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
 emit("LOG_KV_CLUSTER_LAMBDA_REL", value_or("log_kv_cluster_lambda_rel", 1.0))
 emit("LOG_KV_SEG_ETA", value_or("log_kv_seg_eta", 1.0))
@@ -413,9 +412,6 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
     fi
     if [ -n "${LOG_KV_GAMMA_SURPRISAL}" ]; then
         LOG_KV_ARG_LIST+=(--log_kv_gamma_surprisal "${LOG_KV_GAMMA_SURPRISAL}")
-    fi
-    if [ "${LOG_KV_GAMMA_SURPRISAL_SPANS}" = "true" ]; then
-        LOG_KV_ARG_LIST+=(--log_kv_gamma_surprisal_spans true)
     fi
 fi
 DIAG_ARGS=${DIAG_ARGS:-}

@@ -1,6 +1,0 @@
-# niahLogKV 惊异度准入 + 信息片段（只评测、不重训）：惊异度持续偏高的一串 token 自成片段，片段按整串的编码长度
-# −log2 p(片段)（token 惊异度之和，与分词方式无关）打分；在不带 cue 的 P=1024 checkpoint（arc_gamma_k12_b128_p1024_2k）上。
-#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_surprisal_sum_spans_p1024.yaml
-config: arc_gamma_k12_b128_p1024_2k.yaml
-log_kv_gamma_surprisal: sum
-log_kv_gamma_surprisal_spans: true

@@ -110,11 +110,10 @@ def unigram_code_length(ids, vocab: int) -> np.ndarray:
     return out
 
 
-def cut(ids, boundary, max_span: int, extra_ends=None) -> tuple[np.ndarray, np.ndarray]:
-    """Alpha's candidate spans [start, stop) over the whole prompt: natural boundaries (plus
-    ``extra_ends``, e.g. information spans) and the span cap."""
+def cut(ids, boundary, max_span: int) -> tuple[np.ndarray, np.ndarray]:
+    """Alpha's candidate spans [start, stop) over the whole prompt: natural boundaries and the span cap."""
     ids = np.asarray(ids, dtype=np.int64)
-    ends = boundary[ids] if extra_ends is None else boundary[ids] | np.asarray(extra_ends, dtype=bool)
+    ends = boundary[ids]
     _, starts, stops, _ = al._new_runs(np.arange(len(ids)), ends, 0, 0, max_span)
     return starts, stops
 
@@ -158,10 +157,10 @@ def locate(prompt, offsets, asked=()):
     return needles, NEEDLE_RE.search(prompt).start() / max(len(prompt), 1)
 
 
-def analyse(ids, surprisal, boundary, max_span, recent, needles, decode, competitors=5, extra_ends=None) -> dict:
+def analyse(ids, surprisal, boundary, max_span, recent, needles, decode, competitors=5) -> dict:
     """Each needle's rank under every score and its token surprisal; the top-level fields describe the first
-    asked needle (else the first), with the spans that outrank it most. ``extra_ends``: more span ends."""
-    starts, stops = cut(ids, boundary, max_span, extra_ends)
+    asked needle (else the first), with the spans that outrank it most."""
+    starts, stops = cut(ids, boundary, max_span)
     scores = span_scores(surprisal, starts, stops)
     scores["uni_max"] = span_scores(unigram_code_length(ids, len(boundary)), starts, stops)["max"]
     archived = stops <= len(ids) - recent
@@ -324,8 +323,6 @@ def main():
     p.add_argument("--out", default="niah_surprisal.jsonl")
     p.add_argument("--save-surprisal", default=None,
                    help=".npz of every prompt's ids and token surprisal, for unused/pool_policy_sim.py")
-    p.add_argument("--info-spans", action="store_true",
-                   help="also cut information spans (log_kv_gamma_surprisal_spans) before ranking")
     p.add_argument("--report", default=None, help="a finished run's .jsonl: write its summary, load no model")
     args = p.parse_args()
     if args.report:
@@ -345,7 +342,6 @@ def main():
     hf_tokenizer = AutoTokenizer.from_pretrained(hf_dir)
     boundary = np.zeros(max(lm.tokenizer.vocab_size, lm.config.padded_vocab_size), dtype=bool)
     boundary[list(lm.tokenizer.alpha_span_boundary_ids)] = True
-    word_starts = al.word_start_table(lm.tokenizer.gamma_literal_texts) if args.info_spans else None
     max_span, recent = int(lm.log_kv_alpha_span_max_tokens), int(lm.log_kv_recent_size)
     print(f"spans capped at {max_span} tokens; recent window {recent}; "
           f"{'dense' if lm.log_kv_dense_mode else 'LogKV'} cache from {args.config}", flush=True)
@@ -363,10 +359,8 @@ def main():
                 needle, value, text = main["needle"], main["value"], main["text"]
                 surprisal = token_surprisal(lm.model, ids, prepare=lm._set_eval_cache)
                 lm._reset_eval_cache()
-                extra = (al.information_ends(surprisal, min(recent, int(lm.log_kv_semantic_flush_granularity)),
-                                             word_starts[np.asarray(ids)]) if args.info_spans else None)
                 record = analyse(np.asarray(ids), surprisal, boundary, max_span, recent, needles,
-                                 lambda t: lm.tokenizer.decode(torch.as_tensor(t)), extra_ends=extra)
+                                 lambda t: lm.tokenizer.decode(torch.as_tensor(t)))
                 record.update(task=task, index=sample["index"], depth=round(depth, 4), value=text)
                 asked = [[n["value"][0], n["value"][-1] + 1] for n in needles if n["asked"]] or [[value[0], value[-1] + 1]]
                 store.add(ids, surprisal, task=task, index=int(sample["index"]), depth=float(depth),
