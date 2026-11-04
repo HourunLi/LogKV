@@ -164,13 +164,14 @@ token 逐个进入，攒满 recent + flush 后最早的 flush 个离开 recent �
   v(T) = (I + β·M(T)) · g(T − last(T))
 
 - I：准入时的信息量，片段的惊异度分数（mean、top4、topq 即最高四分之一的均值、max、mix、sum），词分数（`word_max`：
-  片段中编码长度最大的词的编码长度，词与编码长度见第 7 节；`word_top2`：最大两个的均值），多维 z 分数
+  片段中编码长度最大的词的编码长度，词与编码长度见第 7 节；`word_top2`：最大两个的均值；`word_first`：同 word_max，但每个词按它在本序列首次出现时的
+  编码长度计，再次提到罕见实体的句子保留其分量），多维 z 分数
   （`multi`：mean 与 top4；`multi_word`：mean 与 word_max），或恒为 1（只看新近的基准）。
 - g：遗忘，none、幂律 (1 + age/τ)^(−α) 或指数 exp(−age/τ)。
 - last(T)：片段末尾；打开复用时取 T 之前它的"有信息的 n-gram"（片段内惊异度不低于 `--reuse-bits` 的 n-gram）
   最近一次再出现的位置（刷新）。M(T)：复用加分时这些再出现的惊异度之和。
 - 全部因果：T 时的价值只用 T 之前的 token。默认网格为 3 种分数 × 6 种遗忘 × 3 种复用（无、刷新、加分）再加新近基准
-  与 mix、multi、sum、word_max、word_top2、multi_word 六种分数，共 61 种策略。
+  与 mix、multi、sum、word_max、word_top2、word_first、multi_word 七种分数，共 62 种策略。
 - 词分数要用 tokenizer 判断词首（默认按 .npz 里记下的
   配置找，或用 `--tokenizer` 指定）。
 - `--explain K` 另写 `<输出名>.explain.txt`：每种策略、每个任务前 K 个丢针的样本，列出针所在片段与最终池中分数最高的

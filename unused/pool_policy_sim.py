@@ -17,7 +17,9 @@ A policy gives each span the value
     I        admission information: the span's surprisal score (mean | top4 | topq | max | mix | sum),
              a word score (word_max: the code length of the span's most informative word, a word being
              a token that begins one and the tokens up to the next, its code length the sum of their
-             surprisal; word_top2: the mean of its two highest), a multi-dimensional z score (multi:
+             surprisal; word_top2: the mean of its two highest; word_first: word_max with every word
+             credited the code length it had at its first mention in the stream, so a sentence that
+             names a rare entity again keeps its weight), a multi-dimensional z score (multi:
              mean and top4; multi_word: mean and word_max), or 1 for the recency baseline
     g        forgetting: none, power (1 + age / tau) ** -alpha, or exp(-age / tau)
     last(T)  the span's end, or with reuse on, the latest re-occurrence up to T of one of its
@@ -59,9 +61,9 @@ from litgpt.alpha_log_kv import RunningStats  # noqa: E402
 from niah_surprisal import SurprisalStore, cut, write_summary  # noqa: E402
 from reuse_label_stats import reuse_pairs  # noqa: E402
 
-SCORES = ("mean", "top4", "topq", "max", "mix", "sum", "word_max", "word_top2")
+SCORES = ("mean", "top4", "topq", "max", "mix", "sum", "word_max", "word_top2", "word_first")
 MULTI = {"multi": ("mean", "top4"), "multi_word": ("mean", "word_max")}  # z per dimension, max over them
-WORD_SCORES = ("word_max", "word_top2", "multi_word")
+WORD_SCORES = ("word_max", "word_top2", "word_first", "multi_word")
 
 
 @dataclass(frozen=True)
@@ -90,7 +92,7 @@ def default_policies() -> list[Policy]:
     reuses = [dict(reuse="none"), dict(reuse="refresh"), dict(reuse="boost", beta=.5)]
     out = [Policy(score=s, **d, **r) for s, d, r in itertools.product(("mean", "top4", "topq"), decays, reuses)]
     return out + [Policy(score="recency", decay="exp", tau=4096.)] + [
-        Policy(score=s) for s in ("mix", "multi", "sum", "word_max", "word_top2", "multi_word")]
+        Policy(score=s) for s in ("mix", "multi", "sum", "word_max", "word_top2", "word_first", "multi_word")]
 
 
 def word_code_lengths(s, starts, word_starts):
@@ -102,17 +104,28 @@ def word_code_lengths(s, starts, word_starts):
     return first, np.add.reduceat(np.nan_to_num(np.asarray(s, dtype=np.float64)), first)
 
 
-def span_base(s, starts, stops, word_starts=None) -> dict[str, np.ndarray]:
+def first_mention_bits(ids, first, bits) -> np.ndarray:
+    """Each word's code length at the first mention of the same word (the same token ids) so far."""
+    ids = np.asarray(ids, dtype=np.int64)
+    seen, out = {}, np.empty(len(first))
+    for k, (a, b) in enumerate(zip(first.tolist(), np.r_[first[1:], len(ids)].tolist())):
+        out[k] = seen.setdefault(ids[a:b].tobytes(), bits[k])
+    return out
+
+
+def span_base(s, starts, stops, word_starts=None, ids=None) -> dict[str, np.ndarray]:
     """Admission scores per span from token surprisal (nan tokens ignored, empty spans score 0); the
-    word scores need ``word_starts`` (else they stay 0)."""
+    word scores need ``word_starts`` (and word_first the token ``ids``), else they stay 0."""
     out = {name: np.zeros(len(starts)) for name in SCORES}
     if word_starts is not None and len(starts):
         first, bits = word_code_lengths(s, starts, word_starts)
+        mention = first_mention_bits(ids, first, bits) if ids is not None else np.zeros(len(first))
         bounds = np.searchsorted(first, np.r_[starts, len(s)])
         for i in range(len(starts)):
             words = np.sort(bits[bounds[i]:bounds[i + 1]])
             if len(words):
                 out["word_max"][i], out["word_top2"][i] = words[-1], words[-2:].mean()
+                out["word_first"][i] = mention[bounds[i]:bounds[i + 1]].max()
     for i, (a, b) in enumerate(zip(starts, stops)):
         part = s[a:b]
         part = np.sort(part[np.isfinite(part)])
@@ -135,7 +148,7 @@ class Stream:
         self.fields = fields
         # word_starts flags the tokens that begin a word (the word scores need it).
         self.starts, self.stops = cut(self.ids, boundary, max_span)
-        self.base = span_base(self.s, self.starts, self.stops, word_starts)
+        self.base = span_base(self.s, self.starts, self.stops, word_starts, self.ids)
         n = reuse_n
         self.span_keys: list[np.ndarray] = [np.empty(0, dtype=np.int64)] * len(self.starts)
         self.occurrences: dict[int, np.ndarray] = {}

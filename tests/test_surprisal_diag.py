@@ -188,7 +188,7 @@ def test_far_reuse_hits_count_the_copy_exact_when_it_is_read():
 
 def test_default_grid_names_are_unique():
     names = [p.name for p in ps.default_policies()]
-    assert len(names) == len(set(names)) == 61
+    assert len(names) == len(set(names)) == 62
 
 
 def test_word_scores_total_each_words_tokens_within_its_span():
@@ -203,6 +203,9 @@ def test_word_scores_total_each_words_tokens_within_its_span():
     stream = ps.Stream(ids, s, boundary, 8, word_starts=words, value_start=0, value_stop=7, task="t", depth=0.)
     assert stream.base["word_max"].tolist() == pytest.approx([20.8, 7.])  # the number beats any one token
     assert stream.base["top4"][0] < stream.base["top4"][1]
+    # word_first: a repeated word keeps the code length of its first mention.
+    first, bits = ps.word_code_lengths([5., 1., 9., 2.], [0], [1, 1, 1, 1])
+    assert ps.first_mention_bits([7, 8, 7, 8], first, bits).tolist() == [5., 1., 5., 1.]
     result = ps.replay(stream, ps.Policy(score="word_max"), pool=8, recent=4, flush=4)
     assert ps.needle_kept(stream, result) == 1.
     lines = ps.explain(ps.Policy(score="top4"), stream, dict(kept={1}, archived=16), lambda ids: str(list(ids)))
