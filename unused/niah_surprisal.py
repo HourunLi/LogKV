@@ -31,6 +31,10 @@ Every run writes its per-task summary to ``<out stem>.summary.txt`` beside ``--o
 
 ``--save-surprisal <file>.npz`` also keeps every prompt's ids and token surprisal (with the needle's
 positions and the cache settings) for the CPU replay of exact-pool policies, unused/pool_policy_sim.py.
+
+With a LogKV cache, every record also says, per asked value, the share of layers whose real cache
+holds all of its tokens exact (exact pool or recent window) right after the prefill ("exact_layers";
+the summary's "real cache" line). With a surprisal-admission YAML the surprisal is the cache's own.
 """
 from __future__ import annotations
 
@@ -70,7 +74,9 @@ def token_surprisal(model, ids, prepare=None, chunk: int = 1024) -> np.ndarray:
 
     ``prepare`` (e.g. eval's cache setup) runs first and the prefill then uses the cache; without it
     the model runs uncached. Only the last position's logits leave the forward; the final hidden
-    states are captured and projected ``chunk`` positions at a time.
+    states are captured and projected ``chunk`` positions at a time. With surprisal admission on
+    (the model then prefills in chunks and keeps every token's surprisal), the values are the ones
+    the cache itself used.
     """
     device = next(model.parameters()).device
     x = torch.as_tensor(np.asarray(ids, dtype=np.int64), device=device)[None]
@@ -85,6 +91,11 @@ def token_surprisal(model, ids, prepare=None, chunk: int = 1024) -> np.ndarray:
                 model(x, lm_head_start=x.size(1) - 1)
     finally:
         hook.remove()
+    stream = getattr(model, "log_kv_surprisal_stream", None)
+    if prepare is not None and stream is not None:
+        out = np.array(stream._rows[0][:x.size(1)], dtype=np.float64)
+        out[0] = np.nan
+        return out
     h, targets = captured["h"][0], x[0, 1:]
     softcap = model.config.final_logit_softcapping
     out = np.full(x.size(1), np.nan)
@@ -96,6 +107,23 @@ def token_surprisal(model, ids, prepare=None, chunk: int = 1024) -> np.ndarray:
                 logits = torch.tanh(logits / softcap) * softcap
             logp = logits.log_softmax(-1).gather(-1, targets[start:stop, None])[:, 0]
             out[start + 1:stop + 1] = (-logp / math.log(2)).cpu().numpy()
+    return out
+
+
+def exact_layers(model, asked) -> list[float]:
+    """Per asked value [lo, hi): the share of layers whose cache holds every one of its tokens exact
+    (Alpha's exact pool or the recent window) right after the prefill, read from the real cache."""
+    caches = [block.attn.kv_cache for block in model.transformer.h]
+    out = []
+    for lo, hi in asked:
+        held = 0
+        for cache in caches:
+            exact = set(getattr(cache, "_alpha_positions", [[]])[0])
+            if getattr(cache, "recent_count", 0):
+                first = int(cache._recent_pos_host[0][0])
+                exact.update(range(first, first + int(cache.recent_count)))
+            held += all(t in exact for t in range(lo, hi))
+        out.append(held / len(caches))
     return out
 
 
@@ -190,6 +218,10 @@ def summarize(task, records, budgets=BUDGETS) -> str:
     """One block of lines per task: how many needles each score would keep at each pool budget."""
     ranked = [r for r in records if "ranks" in r]
     lines = [f"{task}: samples={len(records)} needle in the recent window={len(records) - len(ranked)}"]
+    real = [share for r in records for share in r.get("exact_layers", [])]
+    if real:  # the real cache after the prefill, every asked value
+        lines.append(f"  real cache: asked values exact in every layer {np.mean([s == 1 for s in real]):.2f}, "
+                     f"in no layer {np.mean([s == 0 for s in real]):.2f}, mean share of layers {np.mean(real):.2f}")
     if ranked:
         value = np.concatenate([r["value_surprisal"] for r in records])
         lines.append(f"  value-token surprisal: median {np.median(value):.2f} bits; "
@@ -357,12 +389,13 @@ def main():
                 needles, depth = locate(prompt, offsets, sample["outputs"])
                 main = next((n for n in needles if n["asked"]), needles[0])
                 needle, value, text = main["needle"], main["value"], main["text"]
+                asked = [[n["value"][0], n["value"][-1] + 1] for n in needles if n["asked"]] or [[value[0], value[-1] + 1]]
                 surprisal = token_surprisal(lm.model, ids, prepare=lm._set_eval_cache)
+                held = exact_layers(lm.model, asked) if not lm.log_kv_dense_mode else []
                 lm._reset_eval_cache()
                 record = analyse(np.asarray(ids), surprisal, boundary, max_span, recent, needles,
                                  lambda t: lm.tokenizer.decode(torch.as_tensor(t)))
-                record.update(task=task, index=sample["index"], depth=round(depth, 4), value=text)
-                asked = [[n["value"][0], n["value"][-1] + 1] for n in needles if n["asked"]] or [[value[0], value[-1] + 1]]
+                record.update(task=task, index=sample["index"], depth=round(depth, 4), value=text, exact_layers=held)
                 store.add(ids, surprisal, task=task, index=int(sample["index"]), depth=float(depth),
                           needle_start=int(needle[0]), needle_stop=int(needle[-1]) + 1,
                           value_start=int(value[0]), value_stop=int(value[-1]) + 1, asked_values=json.dumps(asked))
@@ -371,6 +404,7 @@ def main():
                 records.append(record)
                 ranks = record.get("ranks", {}).get("max", {})
                 print(f"{task} sample {sample['index']}: depth={depth:.2f} value={text} "
+                      f"exact_layers={[round(h, 2) for h in held]} "
                       f"rank(max)={ranks.get('rank', 'recent')} tokens_needed={ranks.get('tokens_needed', '-')} "
                       f"seconds={time.time() - start:.1f}",
                       flush=True)

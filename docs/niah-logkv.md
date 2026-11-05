@@ -154,6 +154,8 @@ bash diag.sh unused/reuse_label_stats.py --config exp/qwen1.7b-32k/arc_gamma_k12
   标签不涉及任何句式或任务。
 - 每个脚本都把可读的汇总写到输出文件旁的 `<输出名>.summary.txt`（不依赖终端输出）；`--report <输出文件>` 不加载模型、
   不重放，直接从已有的输出文件重建这份汇总。
+- `niah_surprisal.py` 在 LogKV 缓存上还从真实缓存读出：prefill 结束时，被问的每个值在多少比例的层里全部精确（精确池或
+  recent 窗口），记为 `exact_layers`，汇总里是 "real cache" 一行；YAML 开了惊异度准入时，惊异度直接取缓存自己用的值。
 - 两个脚本加 `--save-surprisal <文件>.npz` 时另存每段序列的 token id 与惊异度（NIAH 还存针与值的位置），并记下
   recent 窗口、flush 粒度、片段上限、精确池与片段边界 token，供下面的离线重放使用。
 
