@@ -125,6 +125,8 @@ def test_a_surprising_span_takes_the_exact_pool():
             model._surprisal_inner = False
         pools[score] = [set(block.attn.kv_cache._alpha_positions[0]) for block in model.transformer.h]
     assert all(set(range(20, 24)) <= pool for layers in pools.values() for pool in layers)
+    from niah_surprisal import exact_layers
+    assert exact_layers(model, [[20, 24], [60, 64], [4, 8]]) == [1., 1., 0.]  # pool, recent window, gone
     with pytest.raises(ValueError, match="requires alpha_exact_tokens"):
         model.set_log_kv_cache(recent_size=16, gamma_surprisal="mean", **{**KWARGS, "alpha_exact_tokens": 0})
 
