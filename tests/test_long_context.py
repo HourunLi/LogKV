@@ -217,3 +217,34 @@ def test_the_fetch_script_caches_the_ppl_documents_the_tasks_read(tmp_path, monk
         (copy / f.name).write_bytes(f.read_bytes())
     key = utils.cache_key(str(tmp_path / "heldout.parquet"), str(copy), 1, False)
     assert (tmp_path / "cache" / f"{key}.json").is_file()
+
+
+def test_the_fetch_script_skips_certificate_checks_and_waits_out_rate_limits(monkeypatch):
+    import importlib.util
+    import io
+
+    import requests
+
+    calls, waits = [], []
+
+    def record(self, method, url, **kwargs):
+        calls.append(kwargs)
+        response = requests.Response()
+        response.status_code, response.raw = (429 if len(calls) < 3 else 200), io.BytesIO()
+        response.headers["Retry-After"] = "7"
+        return response
+
+    # Restored after the test: Session.request (with the script's wrapper), the variables it sets, time.sleep.
+    monkeypatch.setattr(requests.Session, "request", record)
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items() if not k.startswith("HF_HUB_")})
+    monkeypatch.setattr("time.sleep", waits.append)
+    path = ROOT / "unused" / "fetch_long_eval_data.py"
+    spec = importlib.util.spec_from_file_location("fetch_long_eval_data_ssl", path)
+    fetch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetch)
+    fetch.patch_requests(verify_ssl=False)
+    # huggingface_hub's sessions go through Session.request too.
+    assert requests.get("https://hf-mirror.com/x", timeout=5).status_code == 200
+    assert waits == [7, 7] and all(c["verify"] is False and c["timeout"] == 5 for c in calls)
+    assert os.environ["HF_HUB_ENABLE_HF_TRANSFER"] == "0" and os.environ["HF_HUB_DISABLE_XET"] == "1"
+    assert os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] == "300"
