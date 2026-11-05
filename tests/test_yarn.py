@@ -205,3 +205,42 @@ def sync_block_weights(block_litgpt, block_hf):
         block_hf.post_attention_layernorm.weight.copy_(block_litgpt.norm_2.weight)
 
     print("Block synchronization complete.")
+
+
+@pytest.mark.parametrize(
+    ("scaling", "extra"),
+    [
+        # Qwen's long-context rope_scaling: no mscale, so the YaRN temperature 0.1 * ln(factor) + 1.
+        ({"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768},
+         dict(factor=4.0, beta_fast=32, beta_slow=1, original_max_seq_len=32768)),
+        ({"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 32768},
+         dict(factor=2.0, beta_fast=32, beta_slow=1, original_max_seq_len=32768)),
+        # DeepSeek's: mscale and mscale_all_dim.
+        ({"rope_type": "yarn", "factor": 8.0, "original_max_position_embeddings": 4096, "mscale": 1.0,
+          "mscale_all_dim": 0.8},
+         dict(factor=8.0, beta_fast=32, beta_slow=1, original_max_seq_len=4096, mscale=1.0, mscale_all_dim=0.8)),
+    ],
+)
+def test_yarn_rope_cache_matches_transformers(scaling, extra):
+    """The cos/sin tables themselves, against transformers' YaRN (the block test above feeds LitGPT's
+    tables to both models, so it cannot see a wrong table)."""
+    from transformers import PretrainedConfig
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    from litgpt.model import build_rope_cache
+
+    config = PretrainedConfig()
+    config.rope_theta, config.hidden_size, config.num_attention_heads, config.head_dim = 1e6, 2048, 16, 128
+    config.max_position_embeddings, config.partial_rotary_factor = 131072, 1.0
+    config.rope_scaling = scaling
+    inv_freq, attention = ROPE_INIT_FUNCTIONS["yarn"](config, "cpu")
+    positions = torch.tensor([0, 1, 100, 40000, 131071])
+    angles = positions[:, None].double() * inv_freq.double()[None]
+    cos, sin = build_rope_cache(131072, 128, base=1000000, extra_config=extra)
+    expected_cos = (torch.cos(angles).repeat(1, 2) * attention).float()
+    expected_sin = (torch.sin(angles).repeat(1, 2) * attention).float()
+    # float32 angles at position 131071 carry ~1e-2 absolute error in the fastest dimensions.
+    assert torch.allclose(cos[positions[:3]], expected_cos[:3], atol=1e-4)
+    assert torch.allclose(sin[positions[:3]], expected_sin[:3], atol=1e-4)
+    slow = slice(32, 64)  # the interpolated, slow dimensions stay exact far out
+    assert torch.allclose(cos[positions[3:]][:, slow], expected_cos[3:][:, slow], atol=1e-3)

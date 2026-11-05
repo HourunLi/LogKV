@@ -248,3 +248,31 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 `tests/test_semantic_eval_flags.py`（启动脚本只在设置时传头文件），`tests/test_niah_cue_tasks.py`（words 针），
 `tests/test_surprisal_diag.py`（惊异度与逐位 log-softmax 一致、recent 窗口内缓存与不缓存一致、片段切分、针的名次、
 复用对与阈值、`diag.sh`、惊异度存档的读写、离线重放的准入、遗忘与复用刷新、远距离复用命中）。
+
+## 8. 长文本评测（64K / 128K，只评测）
+
+模型与 CPT 都只到 32K。更长的评测不重训，用 YaRN 把 RoPE 拉长（factor = 目标长度 / 32768，原长 32768，beta_fast 32，
+beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一套，比较的是压缩而不是外推。
+
+- YaRN：litgpt 原实现插值方向相反（对高频维插值、保留低频维），且默认不乘注意力温度；已按 transformers 的
+  `_compute_yarn_parameters` 修正：低于 beta_fast 转数的高频维保持原频率，高于 beta_slow 的低频维插值，温度为
+  `attention_factor`，否则 mscale / mscale_all_dim，否则 0.1·ln(factor)+1。LogKV 缓存的位置编码全部来自模型的 cos/sin 表，
+  所以 YaRN 同样作用于精确池与梯子的期望 RoPE。
+- 稠密 KV 缓存不再分配 max_seq_length × max_seq_length 的掩码（128K 时约 17 GB）：从位置 0 开始的预填充直接是因果注意力
+  （SDPA 的 is_causal），只读已写入的那部分缓存；其余调用（解码、续接的分块）按需建 T × (最大位置+1) 的掩码。
+- `eval.sh` 从 YAML 读：`eval_max_seq_lengths`（RULER / NIAH 的长度，默认 1K–32K）、`niah_benchmark`（NIAH 任务列表，命令行第
+  三个参数优先）、`benchmark`、`limit`（每个任务的样本数）、`config_overrides`（`block_size`、`rope_adjustments`，以 JSON
+  传给 `eval.py`）。`majob.sh` 只读 `eval_max_seq_lengths`。
+- 任务：RULER 在 65536 / 131072（合成任务，草堆仍是 Paul Graham 文章，不需新数据）；BABILong qa1–qa5
+  （`eval_tasks/babilong_long`，任务名带长度：`babilong_qa1_64k` 等，组 `babilong_{32k,64k,128k}`；提示、示例与打分同 lm-eval
+  的 `babilong_qaN`；数据 `RMT-team/babilong-1k-samples`，环境变量 `BABILONG_DATASET` 可指向本地副本）；LongBench v2
+  （lm-eval 的 `longbench2`，数据 `recursal/longbench-v2`，四选一按似然打分，每题四次预填充；长于 block_size 的上下文
+  从开头截断，保留问题）。
+- 配置：`eval_long{64k,128k}_{dense,baseline,word_first}.yaml`，分别是 dense CPT、同 checkpoint 的 K/V 准入基线与 `word_first`，
+  与各自的基础配置只差上面几项；RULER 8 个任务与 BABILong 各 100 条。
+- 汇总表（`unused/parse_lmeval_table.py`）：`<任务>@64k`、`AVG_NIAH@64k`、`AVG_NIAH_multi@64k`（128k 同）、`babilong_qaN_<长度>`、
+  `AVG_babilong_<长度>`、`LongBench2`，都不计入 `AVG_all`。
+
+测试：`tests/test_yarn.py`（YaRN 的 cos/sin 与 transformers 一致），`tests/test_long_context.py`（YaRN 进入 LogKV 缓存且 recent
+窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数、BABILong 按长度加载、稠密缓存无方阵掩码且与不缓存一致），
+`tests/test_exp_configs.py`（长文本配置只差长度相关的几项）。
