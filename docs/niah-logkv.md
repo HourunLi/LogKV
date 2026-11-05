@@ -263,16 +263,27 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
 - `eval.sh` 从 YAML 读：`eval_max_seq_lengths`（RULER / NIAH 的长度，默认 1K–32K）、`niah_benchmark`（NIAH 任务列表，命令行第
   三个参数优先）、`benchmark`、`limit`（每个任务的样本数）、`config_overrides`（`block_size`、`rope_adjustments`，以 JSON
   传给 `eval.py`）。`majob.sh` 只读 `eval_max_seq_lengths`。
-- 任务：RULER 在 65536 / 131072（合成任务，草堆仍是 Paul Graham 文章，不需新数据）；BABILong qa1–qa5
+- 任务：完整 RULER 13 个任务（8 个捞针，加变量追踪 vt、常见词与高频词提取 cwe / fwe、SQuAD 与 HotpotQA 问答）在
+  65536 / 131072：捞针、vt、cwe、fwe 是合成任务，草堆仍是 Paul Graham 文章；两个问答任务运行时从 `rajpurkar.github.io`
+  与 `curtis.ml.cmu.edu` 取 SQuAD / HotpotQA 的 dev 集。长文档困惑度（`eval_tasks/long_ppl`，`long_ppl_{32k,64k,128k}`）：
+  取不短于 131072 token 的文档（按文件与行的顺序，所以各长度是同一批文档），截到 L，给定前 L−4096 个 token，计末尾
+  4096 个 token 的困惑度（`ppl`）与每字节比特（`bits_per_byte`）；它衡量的是大部分上下文已在身后（LogKV 中已压缩）
+  时的预测，不受任务难度的地板影响。数据由 YAML 的 `long_ppl_data` 或环境变量 `LONG_PPL_DATA` 给出（parquet / jsonl
+  文件或目录，正文列 text / content / code），`LONG_PPL_DOCS` 限制文档数（默认 100），`LONG_PPL_CONCAT=1` 把同一文件的
+  相邻行拼成一篇（行是长文的片段时），选出的文档缓存在 `LONG_PPL_CACHE`（默认 `~/.cache/logkv_long_ppl`）。训练读取
+  `data_dir` 下的全部 parquet，所以只有不在其中的文件才是严格留出的。BABILong qa1–qa5
   （`eval_tasks/babilong_long`，任务名带长度：`babilong_qa1_64k` 等，组 `babilong_{32k,64k,128k}`；提示、示例与打分同 lm-eval
   的 `babilong_qaN`；数据 `RMT-team/babilong-1k-samples`，环境变量 `BABILONG_DATASET` 可指向本地副本）；LongBench v2
   （lm-eval 的 `longbench2`，数据 `recursal/longbench-v2`，四选一按似然打分，每题四次预填充；长于 block_size 的上下文
   从开头截断，保留问题）。
 - 配置：`eval_long{64k,128k}_{dense,baseline,word_first}.yaml`，分别是 dense CPT、同 checkpoint 的 K/V 准入基线与 `word_first`，
-  与各自的基础配置只差上面几项；RULER 8 个任务与 BABILong 各 100 条。
-- 汇总表（`unused/parse_lmeval_table.py`）：`<任务>@64k`、`AVG_NIAH@64k`、`AVG_NIAH_multi@64k`（128k 同）、`babilong_qaN_<长度>`、
-  `AVG_babilong_<长度>`、`LongBench2`，都不计入 `AVG_all`。
+  与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER，主阶段跑 BABILong 与困惑度（64K 配置为 32K 与 64K，128K 配置为
+  128K），每个任务 100 条。`babilong_dataset` 与 `long_ppl_data` 两个键（或同名环境变量）给出本地数据。
+- 汇总表（`unused/parse_lmeval_table.py`）：RULER 13 个任务的 `<任务>@64k`、`AVG_NIAH@64k`、`AVG_NIAH_multi@64k`、
+  `AVG_RULER@64k`（128k 同）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`，
+  都不计入 `AVG_all`。
 
 测试：`tests/test_yarn.py`（YaRN 的 cos/sin 与 transformers 一致），`tests/test_long_context.py`（YaRN 进入 LogKV 缓存且 recent
-窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数、BABILong 按长度加载、稠密缓存无方阵掩码且与不缓存一致），
+窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数/数据路径、BABILong 按长度加载、困惑度任务取同一批长文档的末尾、稠密缓存无方阵掩码且
+与不缓存一致），
 `tests/test_exp_configs.py`（长文本配置只差长度相关的几项）。

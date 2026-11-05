@@ -3,6 +3,7 @@ and the per-length BABILong tasks."""
 import ast
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -52,6 +53,7 @@ def _eval_settings(config):
                        'printf "%s\\n" "${LOG_KV_ARG_LIST[@]}"', 'echo "NIAH=${NIAH_BENCHMARKS}"', 'echo "META=${META}"'))
     env = {**os.environ, "PYTHON_BIN": sys.executable,
            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
+    shell += '\necho "LONG_PPL=${CONFIG_LONG_PPL_DATA}"'
     out = subprocess.run(["bash", "-c", shell, "bash", str(config)], capture_output=True, text=True, check=True,
                          env=env).stdout.splitlines()
     niah_list = next(line[5:] for line in out if line.startswith("NIAH="))
@@ -69,10 +71,10 @@ def test_the_launcher_reads_lengths_tasks_and_overrides_from_the_yaml(tmp_path):
     long.write_text("save_path: /tmp/unused-checkpoint\neval_max_seq_lengths: [65536]\n"
                     "niah_benchmark: [niah_single_2, niah_multikey_1]\n"
                     "config_overrides:\n  block_size: 135168\n  rope_adjustments: {factor: 4.0, beta_fast: 32}\n"
-                    "limit: 100\n")
+                    "limit: 100\nlong_ppl_data: /data/prolong-heldout\n")
     args, niah, meta = _eval_settings(long)
     assert meta["max_seq_lengths"] == [65536] and niah == "niah_single_2,niah_multikey_1"
-    assert args[args.index("--limit") + 1] == "100"
+    assert args[args.index("--limit") + 1] == "100" and "LONG_PPL=/data/prolong-heldout" in args
     overrides = json.loads(args[args.index("--config_overrides") + 1])
     assert overrides == {"block_size": 135168, "rope_adjustments": {"factor": 4.0, "beta_fast": 32}}
 
@@ -127,3 +129,60 @@ def test_the_dense_kv_cache_needs_no_square_mask_and_matches_the_uncached_model(
         model(ids[:, :16], input_pos=torch.arange(16))
         rows = model(ids[:, 16:18], input_pos=torch.arange(16, 18).expand(2, -1)).float()
     assert torch.allclose(rows, full[:, 16:18], atol=1e-5)
+
+
+@pytest.fixture
+def word_tokenizer(tmp_path):
+    """A whitespace word-level tokenizer saved where AutoTokenizer can load it."""
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    vocab = {"[UNK]": 0, **{f"w{i}": i + 1 for i in range(50)}}
+    model = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab, unk_token="[UNK]"))
+    model.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    model.decoder = tokenizers.decoders.WordPiece(prefix="##")  # joins words with spaces
+    path = tmp_path / "tok"
+    transformers.PreTrainedTokenizerFast(tokenizer_object=model, unk_token="[UNK]").save_pretrained(path)
+    return str(path)
+
+
+def test_long_ppl_scores_the_tail_of_the_same_long_documents(tmp_path, monkeypatch, word_tokenizer):
+    pytest.importorskip("lm_eval")
+    import importlib.util
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    spec = importlib.util.spec_from_file_location("long_ppl_utils", ROOT / "eval_tasks" / "long_ppl" / "long_ppl_utils.py")
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+    monkeypatch.setattr(utils, "LONGEST", 64)
+    monkeypatch.setattr(utils, "TAIL", 8)
+    words = [f"w{i % 50}" for i in range(200)]
+    # A short row, then two long ones; rows of "text" as in ProLong's parquet shards.
+    pq.write_table(pa.table({"text": [" ".join(words[:10]), " ".join(words[:100]), " ".join(words[50:200])]}),
+                   tmp_path / "shard-0.parquet")
+    monkeypatch.setenv("LONG_PPL_DATA", str(tmp_path))
+    monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache"))
+    rows = utils.build(32, {"pretrained": word_tokenizer})["test"]
+    assert len(rows) == 2 and rows[0]["context"].split() == words[:24] and rows[0]["continuation"].split() == words[24:32]
+    assert rows[1]["context"].split()[0] == "w0" and rows[0]["tail_tokens"] == 8  # the second row starts at w50
+    longer = utils.build(48, {"pretrained": word_tokenizer})["test"]
+    assert longer[0]["continuation"].split() == words[40:48]  # the same document, more context before the tail
+    assert list((tmp_path / "cache").iterdir())  # the selection is cached
+    scores = [utils.process_results(row, [(-8. * math.log(4.), False)]) for row in rows]
+    assert utils.perplexity([s["ppl"] for s in scores]) == pytest.approx(4.)
+    monkeypatch.setenv("LONG_PPL_DATA", str(tmp_path / "missing"))
+    monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache2"))
+    with pytest.raises(FileNotFoundError):
+        utils.build(32, {"pretrained": word_tokenizer})
+
+
+def test_long_ppl_tasks_are_found_by_eval_py():
+    pytest.importorskip("lm_eval")
+    source = ROOT / "eval.py"
+    tree = ast.parse(source.read_text())
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_task_manager"]
+    scope = dict(inspect=inspect, EVAL_TASKS_DIR=ROOT / "eval_tasks")
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+    manager = scope["_task_manager"]({"pretrained": "unused"})
+    assert {"long_ppl_32k", "long_ppl_64k", "long_ppl_128k"} <= set(manager.all_tasks)

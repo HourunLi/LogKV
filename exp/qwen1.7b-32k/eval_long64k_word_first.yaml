@@ -1,13 +1,17 @@
 # 长文本评测（只评测、不重训）：LogKV P=1024 + 惊异度准入 word_first，评测长度 64k。
 # 模型只训到 32K，RoPE 用 YaRN 拉长 2 倍（与 Qwen 的 rope_scaling 相同：factor、原长 32768，
-# 注意力温度 0.1·ln(factor)+1）；block_size 留出生成的余量。RULER 8 个任务与 BABILong qa1-5 在 64k，
-# 每个任务 100 条。要加 LongBench v2：bash eval.sh <本文件> babilong_64k,longbench2
+# 注意力温度 0.1·ln(factor)+1）；block_size 留出生成的余量。
+# NIAH 阶段：完整 RULER（13 个任务）在 64k；主阶段：BABILong qa1-5 与长文档困惑度（long_ppl_32k、long_ppl_64k，
+# 文档的最后 4096 个 token），每个任务 100 条。困惑度的数据由 long_ppl_data 或环境变量 LONG_PPL_DATA 给出
+# （留出的 ProLong parquet 文件或目录）。要加 LongBench v2：bash eval.sh <本文件> babilong_64k,long_ppl_32k,long_ppl_64k,longbench2
 #   bash eval.sh exp/qwen1.7b-32k/eval_long64k_word_first.yaml
 config: eval_gamma_surprisal_word_first_p1024.yaml
 eval_max_seq_lengths: [65536]
-niah_benchmark: [niah_single_1, niah_single_2, niah_single_3, niah_multikey_1, niah_multikey_2, niah_multikey_3, niah_multivalue, niah_multiquery]
-benchmark: babilong_64k
+niah_benchmark: [niah_single_1, niah_single_2, niah_single_3, niah_multikey_1, niah_multikey_2, niah_multikey_3,
+  niah_multivalue, niah_multiquery, ruler_vt, ruler_cwe, ruler_fwe, ruler_qa_squad, ruler_qa_hotpot]
+benchmark: babilong_64k,long_ppl_32k,long_ppl_64k
 limit: 100
+long_ppl_data: ${LONG_PPL_DATA:-}
 config_overrides:
   block_size: 66560
   rope_adjustments: {factor: 2.0, beta_fast: 32, beta_slow: 1, original_max_seq_len: 32768}

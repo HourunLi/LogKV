@@ -275,6 +275,9 @@ emit("CONFIG_NIAH_BENCHMARKS", ",".join(niah) if isinstance(niah, (list, tuple))
 overrides = cfg.get("config_overrides")
 emit("CONFIG_OVERRIDES", json.dumps(overrides) if overrides else "")
 emit("EVAL_LIMIT", cfg.get("limit") or "")  # samples per task (lm-eval's --limit), every stage
+# Data of the repository's long-context tasks (eval_tasks/long_ppl, eval_tasks/babilong_long).
+emit("CONFIG_LONG_PPL_DATA", cfg.get("long_ppl_data") or "")
+emit("CONFIG_BABILONG_DATASET", cfg.get("babilong_dataset") or "")
 EOF
 )
 CONFIG_STATUS=$?
@@ -283,6 +286,11 @@ if [ ${CONFIG_STATUS} -ne 0 ]; then
     exit ${CONFIG_STATUS}
 fi
 eval "${CONFIG_EXPORTS}"
+# An environment variable wins over the YAML; eval.py's tasks read these.
+LONG_PPL_DATA=${LONG_PPL_DATA:-${CONFIG_LONG_PPL_DATA}}
+BABILONG_DATASET=${BABILONG_DATASET:-${CONFIG_BABILONG_DATASET}}
+if [ -n "${LONG_PPL_DATA}" ]; then export LONG_PPL_DATA; fi
+if [ -n "${BABILONG_DATASET}" ]; then export BABILONG_DATASET; fi
 
 checkpoint_exists() {
     [ -f "$1" ] || { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
@@ -578,7 +586,8 @@ echo "NIAH benchmarks: ${NIAH_BENCHMARKS}"
 # RULER / NIAH context lengths: the YAML's eval_max_seq_lengths (default 1K-32K).
 META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENGTHS}"'}'
 MAIN_METADATA_ARGS=()
-if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* ]]; then
+# Tasks that build their samples with the tokenizer (RULER, long_ppl) need the metadata.
+if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* ]]; then
     MAIN_METADATA_ARGS=(--metadata "${META}")
 fi
 

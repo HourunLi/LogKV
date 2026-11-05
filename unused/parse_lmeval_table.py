@@ -421,17 +421,21 @@ ORDERED_COLUMNS = [
     # niahLogKV 泛化：值为随机英文词、不含数字的针（eval_tasks/niah_cue/*_words），取 32K。
     "niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase", "AVG_NIAH_words",
 ]
-# 长文本（eval_max_seq_lengths 设到 64K/128K 时）：RULER 单针与多针在该长度的得分记为 <任务>@64k 等；
-# BABILong qa1-qa5（eval_tasks/babilong_long，任务名带长度）；LongBench v2 总分。都不计入 AVG_all。
+# 长文本（eval_max_seq_lengths 设到 64K/128K 时）：RULER 13 个任务在该长度的得分记为 <任务>@64k 等，
+# AVG_RULER@64k 为 13 个的平均（RULER 的标准报告）；BABILong qa1-qa5（eval_tasks/babilong_long，任务名带长度）；
+# 长文档困惑度（eval_tasks/long_ppl，越低越好）；LongBench v2 总分。都不计入 AVG_all。
 LONG_LENGTHS = {"65536": "64k", "131072": "128k"}
 LONG_NIAH = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2",
              "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
+LONG_RULER = LONG_NIAH + ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
 BABILONG_LENGTHS = ("32k", "64k", "128k")
+PPL_LENGTHS = ("32k", "64k", "128k")
 for _length in LONG_LENGTHS.values():
-    ORDERED_COLUMNS += [f"{t}@{_length}" for t in LONG_NIAH] + [f"AVG_NIAH@{_length}", f"AVG_NIAH_multi@{_length}"]
+    ORDERED_COLUMNS += [f"{t}@{_length}" for t in LONG_RULER] + [
+        f"AVG_NIAH@{_length}", f"AVG_NIAH_multi@{_length}", f"AVG_RULER@{_length}"]
 for _length in BABILONG_LENGTHS:
     ORDERED_COLUMNS += [f"babilong_qa{i}_{_length}" for i in range(1, 6)] + [f"AVG_babilong_{_length}"]
-ORDERED_COLUMNS += ["LongBench2"]
+ORDERED_COLUMNS += [f"long_ppl_{n}" for n in PPL_LENGTHS] + ["LongBench2"]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
@@ -463,6 +467,7 @@ TARGET_METRIC_MAP = {
     "niah_single_1": "32768", "niah_single_2": "32768", "niah_single_3": "32768",
     **{task: "32768" for task in NIAH_MULTI + NIAH_CUE + NIAH_WORDS},
     **{f"babilong_qa{i}_{n}": "acc" for i in range(1, 6) for n in BABILONG_LENGTHS},
+    **{f"long_ppl_{n}": "ppl" for n in PPL_LENGTHS},
     "LongBench2": "acc",
 }
 for col in ORDERED_COLUMNS:
@@ -486,12 +491,14 @@ AVG_GROUPS = {
     "AVG_NIAH_words": NIAH_WORDS,
     **{f"AVG_NIAH@{n}": [f"niah_single_{k}@{n}" for k in (1, 2, 3)] for n in LONG_LENGTHS.values()},
     **{f"AVG_NIAH_multi@{n}": [f"{t}@{n}" for t in NIAH_MULTI] for n in LONG_LENGTHS.values()},
+    **{f"AVG_RULER@{n}": [f"{t}@{n}" for t in LONG_RULER] for n in LONG_LENGTHS.values()},
     **{f"AVG_babilong_{n}": [f"babilong_qa{i}_{n}" for i in range(1, 6)] for n in BABILONG_LENGTHS},
 }
 # 新增的诊断组不计入 AVG_all，旧结果与新结果的总平均保持可比。
 DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words",
                      *(f"AVG_NIAH@{n}" for n in LONG_LENGTHS.values()),
                      *(f"AVG_NIAH_multi@{n}" for n in LONG_LENGTHS.values()),
+                     *(f"AVG_RULER@{n}" for n in LONG_LENGTHS.values()),
                      *(f"AVG_babilong_{n}" for n in BABILONG_LENGTHS)}
 
 # ==============================================================================
@@ -517,7 +524,7 @@ def parse_single_model(model_name, markdown_text):
 
         target_task = RAW_TO_TARGET_MAP.get(raw_task, raw_task)
         expected_metric = TARGET_METRIC_MAP.get(target_task)
-        if target_task in LONG_NIAH and metric in LONG_LENGTHS:  # RULER at 64K / 128K
+        if target_task in LONG_RULER and metric in LONG_LENGTHS:  # RULER at 64K / 128K
             try:
                 row_data[f"{target_task}@{LONG_LENGTHS[metric]}"] = float(value)
             except ValueError:
