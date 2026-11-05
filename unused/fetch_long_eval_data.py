@@ -109,7 +109,7 @@ def cache_ppl(data: str, tokenizer: str, lines: list[str]) -> None:
     docs = utils._documents({"pretrained": tokenizer})
     want = int(os.environ.get("LONG_PPL_DOCS", "100"))
     lines.append(f"long_ppl: {len(docs)} documents of >= {utils.LONGEST} tokens from {data} (want {want}); "
-                 f"cache {os.environ.get('LONG_PPL_CACHE', '~/.cache/logkv_long_ppl')}")
+                 f"cache {utils.cache_dir()}")
     if len(docs) < want:
         lines.append("  fewer than wanted: point --ppl-data at more shards, or if the rows are pieces of longer "
                      "texts, rerun with LONG_PPL_CONCAT=1 (and run eval.sh with it too)")

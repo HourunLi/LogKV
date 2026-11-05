@@ -9,7 +9,8 @@ the same kind of tail.
 Data: LONG_PPL_DATA, a .parquet / .jsonl file or a directory of them (text in a "text", "content" or
 "code" column), e.g. held-out ProLong shards. LONG_PPL_DOCS caps the documents (default 100);
 LONG_PPL_CONCAT=1 joins consecutive rows of a file into one document when the rows are pieces of
-longer texts. The selection is cached under LONG_PPL_CACHE (default ~/.cache/logkv_long_ppl).
+longer texts. The selection is cached under LONG_PPL_CACHE (default $HF_HOME/logkv_long_ppl, shared by
+every node when HF_HOME is, else ~/.cache/logkv_long_ppl).
 """
 from __future__ import annotations
 
@@ -80,6 +81,11 @@ def select_documents(source: str, tokenizer, count: int, concat: bool = False) -
     return found
 
 
+def cache_dir() -> Path:
+    default = os.path.join(os.environ["HF_HOME"], "logkv_long_ppl") if os.environ.get("HF_HOME") else "~/.cache/logkv_long_ppl"
+    return Path(os.environ.get("LONG_PPL_CACHE") or default).expanduser()
+
+
 def cache_key(source: str, tokenizer_name: str, count: int, concat: bool) -> str:
     """The documents depend on the data, the tokenizer's files (not the path it was named by: eval.sh names
     the checkpoint, a warm-up may name the base model), the count and the concat flag."""
@@ -113,7 +119,7 @@ def _documents(kwargs) -> list[list[int]]:
     concat = os.environ.get("LONG_PPL_CONCAT", "0") == "1"
     name, tokenizer = _tokenizer(kwargs)
     key = cache_key(source, name, count, concat)
-    cache = Path(os.environ.get("LONG_PPL_CACHE", "~/.cache/logkv_long_ppl")).expanduser() / f"{key}.json"
+    cache = cache_dir() / f"{key}.json"
     if cache.is_file():
         return json.loads(cache.read_text())
     docs = select_documents(source, tokenizer, count, concat)
