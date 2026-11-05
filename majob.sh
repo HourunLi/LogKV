@@ -648,9 +648,29 @@ done
 echo "🧭 [Node ${NODE_RANK}] 主评测: ${BENCHMARKS}"
 echo "🧭 [Node ${NODE_RANK}] NIAH 评测: ${NIAH_BENCHMARKS}"
 
-# NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度
-# max_seq_lengths 可根据模型实际最大上下文调整
-META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
+# NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度（YAML 的 eval_max_seq_lengths，默认 1K-32K）。
+# 长于训练长度的评测（YaRN、block_size 覆盖）用 eval.sh，它还读 config_overrides 与 niah_benchmark。
+EVAL_MAX_SEQ_LENGTHS=$(python - "${CONFIG_FILE}" <<'EOF'
+import json
+import os
+import sys
+
+import yaml
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if "config" in cfg:
+        base = load(os.path.join(os.path.dirname(path), cfg.pop("config")))
+        cfg = {**base, **cfg}
+    return cfg
+
+
+print(json.dumps([int(x) for x in load(sys.argv[1]).get("eval_max_seq_lengths") or [1024, 2048, 4096, 8192, 16384, 32768]]))
+EOF
+)
+META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENGTHS}"'}'
 
 # 评测结果：rank0 写入 JSON（带时间戳），与 litgpt evaluate 惯例一致放在 checkpoint 下 evaluate/
 EVAL_OUTPUT_DIR="${SAVE_DIR}/evaluate"

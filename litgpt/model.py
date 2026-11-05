@@ -166,18 +166,22 @@ class GPT(nn.Module):
             if local_cache_masks:
                 mask = None
             else:
-                if self.mask_cache is None:
+                if any(block.attn.kv_cache is None for block in self.transformer.h):
                     raise TypeError("You need to call `gpt.set_kv_cache()`")
-                mask = batched_index_select(self.mask_cache, 2, input_pos)
-                if mask.dim() > 4:
-                    # the mask cache has a batch dim of 1 in addition to the one
-                    # we get if input_pos has a batch dimension
-                    mask = mask.view(*(mask.shape[0:1] + mask.shape[2:]))
-                if input_pos_maxp1 is not None:
-                    # Shorten final dimension so it just covers all `input_pos` entries
-                    if input_pos_maxp1 > self.max_seq_length:
-                        raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
-                    mask = mask[..., :input_pos_maxp1]
+                # Dense KV cache, without a (max_seq_length x max_seq_length) mask (17 GB at 128K):
+                # attention reads the first input_pos_maxp1 cache entries; a prefill from position 0
+                # is plain causal attention (SDPA's is_causal), any other call gets its own
+                # T x input_pos_maxp1 mask (one row per query at decode).
+                if input_pos_maxp1 is None:
+                    input_pos_maxp1 = int(input_pos.max()) + 1
+                if input_pos_maxp1 > self.max_seq_length:
+                    raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
+                if input_pos.dim() == 1 and input_pos_maxp1 == T and int(input_pos[0]) == 0:
+                    mask = None
+                else:
+                    keys = torch.arange(input_pos_maxp1, device=input_pos.device)
+                    mask = keys <= input_pos[..., :, None]
+                    mask = mask.unsqueeze(1) if input_pos.dim() == 2 else mask[None, None]
         else:
             # unsqueeze to have a batch dimension
             cos = self.cos[:T].unsqueeze(0)
@@ -436,7 +440,7 @@ class GPT(nn.Module):
             # YaRN-style RoPE
             elif has_yarn:
                 # Required: factor, beta_fast, beta_slow, original_max_seq_len
-                # Optional: mscale, mscale_all_dim
+                # Optional: mscale, mscale_all_dim, attention_factor, truncate
                 yarn_required_params = ["factor", "beta_fast", "beta_slow", "original_max_seq_len"]
                 params_present = [param in self.config.rope_adjustments for param in yarn_required_params]
 
@@ -452,7 +456,7 @@ class GPT(nn.Module):
                 extra_config = {name: self.config.rope_adjustments[name] for name in yarn_required_params}
 
                 # Add optional YaRN parameters
-                for param in ["mscale", "mscale_all_dim"]:
+                for param in ["mscale", "mscale_all_dim", "attention_factor", "truncate"]:
                     if param in self.config.rope_adjustments:
                         extra_config[param] = self.config.rope_adjustments[param]
 
@@ -514,13 +518,8 @@ class GPT(nn.Module):
             )
             block.attn._log_kv_pending = None
 
-        if all(isinstance(block.attn.kv_cache, KVCache) and block.attn.kv_cache.is_sliding_window
-               for block in self.transformer.h):
-            self.mask_cache = None
-        elif self.mask_cache is None or self.mask_cache.size(3) != max_seq_length:
-            # passing `attn_mask` to SDPA disables the flash implementation. since we only need the mask
-            # for the kv-cache support (only during inference), we only create it in that situation
-            self.mask_cache = build_mask_cache(max_seq_length, device)
+        # GPT.forward builds each call's mask (or none, for a prefill from position 0) itself.
+        self.mask_cache = None
 
     def clear_kv_cache(self) -> None:
         self._alpha_enabled = False
@@ -2099,16 +2098,17 @@ def build_rope_cache(
             beta_slow = extra_config["beta_slow"]
             original_max_seq_len = extra_config["original_max_seq_len"]
 
-            # Calculate attention scaling factor based on mscale and mscale_all_dim
+            # Attention scaling as transformers' _compute_yarn_parameters: an explicit attention_factor,
+            # else mscale / mscale_all_dim when both are given, else 0.1 * ln(factor) + 1 (the YaRN
+            # paper's temperature, which Qwen's rope_scaling relies on).
             mscale = extra_config.get("mscale")
             mscale_all_dim = extra_config.get("mscale_all_dim")
-            if mscale and mscale_all_dim:
+            if extra_config.get("attention_factor") is not None:
+                attention_scaling = float(extra_config["attention_factor"])
+            elif mscale and mscale_all_dim:
                 attention_scaling = yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor, mscale_all_dim)
-            elif mscale_all_dim:
-                attention_scaling = yarn_get_mscale(factor, mscale_all_dim)
-            elif mscale:
-                attention_scaling = yarn_get_mscale(factor, mscale)
-            # else: attention_scaling remains 1.0
+            else:
+                attention_scaling = yarn_get_mscale(factor, 1.0)
 
             # Create two frequency sets: extrapolation (unscaled) and interpolation (scaled)
             pos_freqs = base ** (torch.arange(0, n_elem, 2, device=device).float() / n_elem)
@@ -2129,7 +2129,7 @@ def build_rope_cache(
                 high_dim = math.ceil(high_dim)
 
             low_dim = max(low_dim, 0)
-            high_dim = min(high_dim, n_elem // 2 - 1)
+            high_dim = min(high_dim, n_elem - 1)
 
             # Create linear ramp factor for blending
             dim_range = torch.arange(n_elem // 2, device=device, dtype=torch.float32)
@@ -2139,9 +2139,11 @@ def build_rope_cache(
             linear_func = (dim_range - low_dim) / (high_dim - low_dim)
             ramp_func = torch.clamp(linear_func, 0.0, 1.0)
 
-            # Blend extrapolation and interpolation frequencies
-            # ramp_func = 0 -> use interpolation (scaled), ramp_func = 1 -> use extrapolation (unscaled)
-            theta_extrapolation_factor = ramp_func
+            # Blend extrapolation and interpolation frequencies: the high-frequency dimensions below
+            # low_dim (more than beta_fast rotations over the original context) keep their frequency,
+            # those above high_dim (under beta_slow rotations) are interpolated, as in YaRN and in
+            # transformers (ramp_func = 0 -> extrapolation, unscaled; 1 -> interpolation, scaled).
+            theta_extrapolation_factor = 1.0 - ramp_func
             theta = (
                 theta_interpolation * (1 - theta_extrapolation_factor)
                 + theta_extrapolation * theta_extrapolation_factor

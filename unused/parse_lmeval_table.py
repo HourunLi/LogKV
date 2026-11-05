@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import io
+import re
 
 # 把你的各个模型的原始输出放在这里。这里以 Model_A 为例（填入你提供的原数据）
 model_outputs = {
@@ -418,8 +419,19 @@ ORDERED_COLUMNS = [
     "niah_single_2_qend", "niah_single_2_preamble", "niah_single_2_paraphrase",
     "niah_single_3_qend", "niah_single_3_preamble", "niah_single_3_paraphrase", "AVG_NIAH_cue",
     # niahLogKV 泛化：值为随机英文词、不含数字的针（eval_tasks/niah_cue/*_words），取 32K。
-    "niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase", "AVG_NIAH_words"
+    "niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase", "AVG_NIAH_words",
 ]
+# 长文本（eval_max_seq_lengths 设到 64K/128K 时）：RULER 单针与多针在该长度的得分记为 <任务>@64k 等；
+# BABILong qa1-qa5（eval_tasks/babilong_long，任务名带长度）；LongBench v2 总分。都不计入 AVG_all。
+LONG_LENGTHS = {"65536": "64k", "131072": "128k"}
+LONG_NIAH = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2",
+             "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
+BABILONG_LENGTHS = ("32k", "64k", "128k")
+for _length in LONG_LENGTHS.values():
+    ORDERED_COLUMNS += [f"{t}@{_length}" for t in LONG_NIAH] + [f"AVG_NIAH@{_length}", f"AVG_NIAH_multi@{_length}"]
+for _length in BABILONG_LENGTHS:
+    ORDERED_COLUMNS += [f"babilong_qa{i}_{_length}" for i in range(1, 6)] + [f"AVG_babilong_{_length}"]
+ORDERED_COLUMNS += ["LongBench2"]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
@@ -438,7 +450,8 @@ RAW_TO_TARGET_MAP = {
     "longbench_lcc_e": "lcc_e", "longbench_multi_news_e": "multi_news_e", "longbench_multifieldqa_en_e": "MFQA_en_e",
     "longbench_passage_count_e": "passage_count_e", "longbench_passage_retrieval_en_e": "passage_retrieval_en_e",
     "longbench_qasper_e": "qasper_e", "longbench_repobench-p_e": "repobench-p_e", "longbench_samsum_e": "samsum_e",
-    "longbench_trec_e": "trec_e", "longbench_triviaqa_e": "triviaqa_e"
+    "longbench_trec_e": "trec_e", "longbench_triviaqa_e": "triviaqa_e",
+    "longbench2": "LongBench2",
 }
 
 TARGET_METRIC_MAP = {
@@ -449,6 +462,8 @@ TARGET_METRIC_MAP = {
     "SWDE": "f1", "FDA": "f1", "TriviaQA": "exact_match", "NQ": "exact_match", "DROP": "f1", "SQUAD": "exact_match",
     "niah_single_1": "32768", "niah_single_2": "32768", "niah_single_3": "32768",
     **{task: "32768" for task in NIAH_MULTI + NIAH_CUE + NIAH_WORDS},
+    **{f"babilong_qa{i}_{n}": "acc" for i in range(1, 6) for n in BABILONG_LENGTHS},
+    "LongBench2": "acc",
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
@@ -469,9 +484,15 @@ AVG_GROUPS = {
     "AVG_NIAH_multi": NIAH_MULTI,
     "AVG_NIAH_cue": NIAH_CUE,
     "AVG_NIAH_words": NIAH_WORDS,
+    **{f"AVG_NIAH@{n}": [f"niah_single_{k}@{n}" for k in (1, 2, 3)] for n in LONG_LENGTHS.values()},
+    **{f"AVG_NIAH_multi@{n}": [f"{t}@{n}" for t in NIAH_MULTI] for n in LONG_LENGTHS.values()},
+    **{f"AVG_babilong_{n}": [f"babilong_qa{i}_{n}" for i in range(1, 6)] for n in BABILONG_LENGTHS},
 }
 # 新增的诊断组不计入 AVG_all，旧结果与新结果的总平均保持可比。
-DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words"}
+DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words",
+                     *(f"AVG_NIAH@{n}" for n in LONG_LENGTHS.values()),
+                     *(f"AVG_NIAH_multi@{n}" for n in LONG_LENGTHS.values()),
+                     *(f"AVG_babilong_{n}" for n in BABILONG_LENGTHS)}
 
 # ==============================================================================
 # 3. 解析与计算核心代码
@@ -483,20 +504,26 @@ def parse_single_model(model_name, markdown_text):
     df = pd.read_csv(io.StringIO('\n'.join(lines)), sep='|')
     df = df.iloc[:, 1:-1]
     df.columns = df.columns.str.strip()
-    for col in df.columns:
-        if df[col].dtype == 'object': df[col] = df[col].str.strip()
+    for col in df.columns:  # text columns (object, or pandas 3's string dtype)
+        if not pd.api.types.is_numeric_dtype(df[col]): df[col] = df[col].astype(str).str.strip()
     
     df['Tasks'] = df['Tasks'].replace('', np.nan).ffill()
     row_data = {"Model": model_name}
     
     for _, row in df.iterrows():
-        raw_task = row['Tasks']
+        raw_task = re.sub(r"^-\s*", "", str(row['Tasks']))  # a group's subtasks are listed as " - name"
         metric = row['Metric']
         value = row['Value']
-        
+
         target_task = RAW_TO_TARGET_MAP.get(raw_task, raw_task)
         expected_metric = TARGET_METRIC_MAP.get(target_task)
-        
+        if target_task in LONG_NIAH and metric in LONG_LENGTHS:  # RULER at 64K / 128K
+            try:
+                row_data[f"{target_task}@{LONG_LENGTHS[metric]}"] = float(value)
+            except ValueError:
+                pass
+            continue
+
         if expected_metric and metric == expected_metric:
             try:
                 row_data[target_task] = float(value)

@@ -138,6 +138,7 @@ fi
 echo "Reading eval settings from ${CONFIG_FILE}"
 
 CONFIG_EXPORTS=$("${PYTHON_BIN}" - "${CONFIG_FILE}" <<'EOF'
+import json
 import os
 import re
 import shlex
@@ -265,6 +266,15 @@ emit("LOG_KV_SEMANTIC_FLUSH_GRANULARITY", value_or("log_kv_semantic_flush_granul
 emit("MAX_STEPS", max_steps)
 emit("NUM_EPOCHS", num_epochs)
 emit("TOKENIZER_CANDIDATES", ":".join(candidates))
+# Long-context evaluation: the RULER / NIAH context lengths, the NIAH task list, and model config
+# overrides (e.g. block_size and YaRN rope_adjustments) handed to eval.py as JSON.
+lengths = cfg.get("eval_max_seq_lengths") or [1024, 2048, 4096, 8192, 16384, 32768]
+emit("EVAL_MAX_SEQ_LENGTHS", json.dumps([int(x) for x in lengths]))
+niah = cfg.get("niah_benchmark")
+emit("CONFIG_NIAH_BENCHMARKS", ",".join(niah) if isinstance(niah, (list, tuple)) else (niah or ""))
+overrides = cfg.get("config_overrides")
+emit("CONFIG_OVERRIDES", json.dumps(overrides) if overrides else "")
+emit("EVAL_LIMIT", cfg.get("limit") or "")  # samples per task (lm-eval's --limit), every stage
 EOF
 )
 CONFIG_STATUS=$?
@@ -414,6 +424,12 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
         LOG_KV_ARG_LIST+=(--log_kv_gamma_surprisal "${LOG_KV_GAMMA_SURPRISAL}")
     fi
 fi
+if [ -n "${CONFIG_OVERRIDES}" ]; then
+    LOG_KV_ARG_LIST+=(--config_overrides "${CONFIG_OVERRIDES}")
+fi
+if [ -n "${EVAL_LIMIT}" ]; then
+    LOG_KV_ARG_LIST+=(--limit "${EVAL_LIMIT}")
+fi
 DIAG_ARGS=${DIAG_ARGS:-}
 # 打分头文件由 retention.sh 写出（训练与评测共用 eval_niah_*.yaml 里的同一路径）；缺失时在加载模型前停下。
 if [ "${LOG_KV_SEMANTIC}" = "true" ] && [ "${LOG_KV_ALPHA_EXACT_TOKENS}" != "0" ] \
@@ -534,7 +550,7 @@ DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_qend,niah_sing
 DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_3_qend,niah_single_3_preamble,niah_single_3_paraphrase"
 # niahLogKV: word-valued needles (no digit), the generalisation check for learned retention heads.
 DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_words,niah_single_2_words_qend,niah_single_2_words_paraphrase"
-NIAH_BENCHMARKS=${3:-${DEFAULT_NIAH_BENCHMARKS}}
+NIAH_BENCHMARKS=${3:-${CONFIG_NIAH_BENCHMARKS:-${DEFAULT_NIAH_BENCHMARKS}}}
 
 # Task lists lose whitespace and stray commas; none / skip / off / false / 0 or nothing left skips that
 # stage instead of handing eval.py an empty --benchmark. NIAH_ONLY=1 skips the main stage.
@@ -559,7 +575,8 @@ for TASK_LIST in "${BENCHMARKS}" "${NIAH_BENCHMARKS}"; do
 done
 echo "Main benchmarks: ${BENCHMARKS}"
 echo "NIAH benchmarks: ${NIAH_BENCHMARKS}"
-META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
+# RULER / NIAH context lengths: the YAML's eval_max_seq_lengths (default 1K-32K).
+META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENGTHS}"'}'
 MAIN_METADATA_ARGS=()
 if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* ]]; then
     MAIN_METADATA_ARGS=(--metadata "${META}")

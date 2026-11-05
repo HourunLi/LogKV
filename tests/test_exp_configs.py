@@ -78,7 +78,8 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
 # Eval-only literal runs re-evaluate Gamma checkpoints with the ladder they were trained with.
 GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
     p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml", "eval_gamma_query*.yaml",
-                           "arc_niah_*.yaml", "eval_niah_*.yaml", "eval_gamma_surprisal*.yaml")
+                           "arc_niah_*.yaml", "eval_niah_*.yaml", "eval_gamma_surprisal*.yaml",
+                           "eval_long*_baseline.yaml", "eval_long*_word_first.yaml")
     for p in EXP.glob(pattern))
 
 
@@ -279,7 +280,8 @@ def test_only_surprisal_evaluations_rank_by_surprisal(name):
                 "eval_gamma_surprisal_mix_p1024.yaml": "mix", "eval_gamma_surprisal_multi_p1024.yaml": "multi",
                 "eval_gamma_surprisal_mean_query_p1024.yaml": "mean", "eval_gamma_surprisal_mix_query_p1024.yaml": "mix",
                 "eval_gamma_surprisal_word_first_query_p1024.yaml": "word_first",
-                **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "word_first", "multi_word")}}
+                **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "word_first", "multi_word")},
+                **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k")}}
     assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
 
 
@@ -294,3 +296,19 @@ def test_surprisal_evaluations_reuse_the_cue_free_p1024_checkpoint(name):
         tricked = effective(f"eval_gamma_surprisal_{score}_query_p1024.yaml")
         assert {k for k in set(tricked) | set(base) if tricked.get(k) != base.get(k)} == {
             "log_kv_gamma_surprisal", "log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}
+
+
+LONG = {"dense": "cpt_dense.yaml", "baseline": "arc_gamma_k12_b128_p1024_2k.yaml",
+        "word_first": "eval_gamma_surprisal_word_first_p1024.yaml"}
+
+
+@pytest.mark.parametrize("length,tokens,factor", [("64k", 65536, 2.0), ("128k", 131072, 4.0)])
+@pytest.mark.parametrize("name", sorted(LONG))
+def test_long_context_evaluations_change_only_the_length_settings(length, tokens, factor, name):
+    evaluated, base = effective(f"eval_long{length}_{name}.yaml"), effective(LONG[name])
+    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
+        "eval_max_seq_lengths", "niah_benchmark", "benchmark", "limit", "config_overrides"}
+    assert evaluated["eval_max_seq_lengths"] == [tokens] and evaluated["benchmark"] == f"babilong_{length}"
+    overrides = evaluated["config_overrides"]
+    assert overrides["block_size"] > tokens and overrides["rope_adjustments"] == dict(
+        factor=factor, beta_fast=32, beta_slow=1, original_max_seq_len=32768)
