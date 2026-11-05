@@ -186,3 +186,34 @@ def test_long_ppl_tasks_are_found_by_eval_py():
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     manager = scope["_task_manager"]({"pretrained": "unused"})
     assert {"long_ppl_32k", "long_ppl_64k", "long_ppl_128k"} <= set(manager.all_tasks)
+
+
+def test_the_fetch_script_caches_the_ppl_documents_the_tasks_read(tmp_path, monkeypatch, word_tokenizer):
+    pytest.importorskip("lm_eval")
+    import importlib.util
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    def load(name, path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    fetch = load("fetch_long_eval_data", ROOT / "unused" / "fetch_long_eval_data.py")
+    utils = load("long_ppl_utils_check", ROOT / "eval_tasks" / "long_ppl" / "long_ppl_utils.py")
+    assert "academic_single" in fetch.longbench2_subsets() and len(fetch.longbench2_subsets()) == 20
+    words = " ".join(f"w{i % 50}" for i in range(140000))
+    pq.write_table(pa.table({"text": [words]}), tmp_path / "heldout.parquet")
+    monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("LONG_PPL_DOCS", "1")
+    lines = []
+    fetch.cache_ppl(str(tmp_path / "heldout.parquet"), word_tokenizer, lines)
+    assert "1 documents of >= 131072 tokens" in lines[0]
+    # The tasks find the same cache whatever path names the same tokenizer files.
+    copy = tmp_path / "tok-copy"
+    copy.mkdir()
+    for f in Path(word_tokenizer).iterdir():
+        (copy / f.name).write_bytes(f.read_bytes())
+    key = utils.cache_key(str(tmp_path / "heldout.parquet"), str(copy), 1, False)
+    assert (tmp_path / "cache" / f"{key}.json").is_file()
