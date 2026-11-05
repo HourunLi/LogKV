@@ -235,7 +235,7 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
   [`eval_gamma_surprisal_word_top2_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_word_top2_p1024.yaml)（`word_top2`）、
   [`eval_gamma_surprisal_word_first_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_word_first_p1024.yaml)（`word_first`）与
   [`eval_gamma_surprisal_multi_word_p1024.yaml`](../exp/qwen1.7b-32k/eval_gamma_surprisal_multi_word_p1024.yaml)（`multi_word`），
-  以及技巧单列的 `eval_gamma_surprisal_{mean,mix}_query_p1024.yaml`（再加查询感知 cue 与 cue 保护，两者的价值相加），
+  以及技巧单列的 `eval_gamma_surprisal_{mean,mix,word_first}_query_p1024.yaml`（再加查询感知 cue 与 cue 保护，两者的价值相加），
   都在不带 cue 的 P=1024 checkpoint（`arc_gamma_k12_b128_p1024_2k`）上，与它自身的评测只差这一项。
 
 测试：`tests/test_surprisal_admission.py`（片段价值、分块前向的惊异度与返回的 logits、逐 token 解码一致、惊异片段进入精确池、
