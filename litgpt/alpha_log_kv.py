@@ -62,8 +62,10 @@ SURPRISAL_CAP = 32.
 # names it again with a new value is as much about it as the first (a key with several values, a
 # record per row of a table); the lookup is causal. "multi_word" is the "multi" z-score of the mean
 # and word_max. The span keeps its sentence, so the value stays with the words that ask for it. A
-# word score is valued at the word's inverse probability, SURPRISAL_SCALE * 2 ** min(bits,
-# SURPRISAL_WORD_CAP) ("multi_word" like "multi").
+# word score values the whole span at the word's inverse probability, SURPRISAL_SCALE * 2 ** min(bits,
+# SURPRISAL_WORD_CAP), so its density is that over the span's length ("multi_word" is valued like
+# "multi"). Valued per token instead, a 64-token span would count 64 times its word, and a 22-token
+# needle could not evict it unless its word were some 1.7 bits longer.
 SURPRISAL_WORD_CAP = 256.
 WORD_SCORES = ("word_max", "word_top2", "word_first", "multi_word")
 SURPRISAL_SCORES = ("mean", "top4", "mix", "multi") + WORD_SCORES
@@ -668,9 +670,9 @@ class SurprisalStream:
         return out
 
     def span_values(self, row, positions, lengths, stop):
-        """``SURPRISAL_SCALE * SURPRISAL_BASE ** min(score, SURPRISAL_CAP)`` per span, for word_max and
-        word_top2 ``SURPRISAL_SCALE * 2 ** min(bits, SURPRISAL_WORD_CAP)`` (``stop`` is unused:
-        surprisal never changes)."""
+        """Value density per span: ``SURPRISAL_SCALE * SURPRISAL_BASE ** min(score, SURPRISAL_CAP)``, for
+        the word scores but multi_word ``SURPRISAL_SCALE * 2 ** min(bits, SURPRISAL_WORD_CAP) / length``
+        (``stop`` is unused: surprisal never changes)."""
         lengths = np.asarray(lengths, dtype=np.int64)
         if not len(lengths):
             return np.zeros(0)
@@ -689,7 +691,7 @@ class SurprisalStream:
             word_max, top2 = word_max_top2(bits, words, lengths, credited)
             if self.score != "multi_word":
                 return SURPRISAL_SCALE * 2. ** np.minimum(top2 if self.score == "word_top2" else word_max,
-                                                          SURPRISAL_WORD_CAP)
+                                                          SURPRISAL_WORD_CAP) / np.maximum(lengths, 1)
         if self.score in ("multi", "multi_word"):
             # Every layer scores the same flush; the first call adds its new spans to the statistics.
             features = np.stack((mean, top4 if self.score == "multi" else word_max), 1)

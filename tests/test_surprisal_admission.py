@@ -52,7 +52,7 @@ def test_span_values_grow_exponentially_with_the_mean_or_top4_surprisal():
         stream = SurprisalStream(score)
         stream.add(0, 0, bits, words)
         assert stream.span_values(0, np.arange(13), lengths, 13).tolist() == pytest.approx(
-            [SURPRISAL_SCALE * 2 ** e for e in expected])
+            [SURPRISAL_SCALE * 2 ** e / n for e, n in zip(expected, lengths)])  # the span's value, per token
     with pytest.raises(ValueError, match="word start"):
         SurprisalStream("word_max").add(0, 0, [1.])
     # word_first: a word read again (the same ids) keeps the code length of its first mention; spans
@@ -60,10 +60,10 @@ def test_span_values_grow_exponentially_with_the_mean_or_top4_surprisal():
     stream = SurprisalStream("word_first")
     stream.add(0, 0, [20., 3., 1., 2., 24.], [1, 1, 1, 1, 1], [9, 5, 9, 6, 7])
     first = stream.span_values(0, np.arange(2), [2], 2)
-    assert first.tolist() == pytest.approx([SURPRISAL_SCALE * 2 ** 20])
+    assert first.tolist() == pytest.approx([SURPRISAL_SCALE * 2 ** 20 / 2])
     for _ in range(2):
         assert stream.span_values(0, np.arange(2, 5), [2, 1], 5).tolist() == pytest.approx(
-            [SURPRISAL_SCALE * 2 ** 20, SURPRISAL_SCALE * 2 ** 24])
+            [SURPRISAL_SCALE * 2 ** 20 / 2, SURPRISAL_SCALE * 2 ** 24])
     with pytest.raises(ValueError, match="token ids"):
         SurprisalStream("word_first").add(0, 0, [1.], [1])
 
@@ -140,6 +140,14 @@ def test_a_short_surprising_span_evicts_a_long_dull_one():
     assert choose_spans(cut, exponential, 64).keep[0] == list(range(64, 84))
     linear = [3. * SURPRISAL_SCALE, 6. * SURPRISAL_SCALE]  # 20 x 6 < 64 x 3 x 1.1: the swap would fail
     assert choose_spans(cut, linear, 64).keep[0] == list(range(64))
+    # Word scores value the whole span at its word: a 22-token span with a 26-bit word evicts a 64-token
+    # one whose longest word has 25 bits (valued per token, 22 x 2^26 < 1.1 x 64 x 2^25 would block it).
+    cut = SpanCut([np.arange(86)], [np.arange(86)], [np.array([64, 22])], [np.array([True, False])],
+                  [np.array([True, True])])
+    stream = SurprisalStream("word_max")
+    stream.add(0, 0, np.r_[25., np.zeros(63), 26., np.zeros(21)], np.ones(86, dtype=bool))
+    assert choose_spans(cut, stream.span_values(0, np.arange(86), [64, 22], 86).tolist(), 64).keep[0] == list(
+        range(64, 86))
 
 
 def test_word_scores_find_words_from_the_token_texts():

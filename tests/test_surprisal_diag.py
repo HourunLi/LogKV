@@ -171,12 +171,12 @@ def test_forgetting_drops_an_old_needle_and_reuse_keeps_it():
     def run(reuse_at=None, **policy):
         stream = _stream(reuse_at=reuse_at)
         return ps.needle_kept(stream, ps.replay(stream, ps.Policy(**policy), pool=4, recent=16, flush=8))
-    # A one-span pool. The needle span averages 5 bits, every other span 1 bit; with tau = 150 the
-    # needle falls below a fresh span about 270 tokens after it was written.
+    # A one-span pool. The needle span averages 5 bits, every other span 1 bit, so it is worth 16^4 times
+    # a fresh span; with tau = 25 it falls below one about 300 tokens after it was written.
     assert run(score="mean")                                                       # no forgetting
-    assert not run(score="mean", decay="exp", tau=150.)                            # forgotten by the end
-    assert run(reuse_at=290, score="mean", decay="exp", tau=150., reuse="refresh")  # its bigram recurs in time
-    assert not run(reuse_at=290, score="mean", decay="exp", tau=150.)              # the same, reuse ignored
+    assert not run(score="mean", decay="exp", tau=25.)                             # forgotten by the end
+    assert run(reuse_at=290, score="mean", decay="exp", tau=25., reuse="refresh")   # its bigram recurs in time
+    assert not run(reuse_at=290, score="mean", decay="exp", tau=25.)               # the same, reuse ignored
 
 
 def test_far_reuse_hits_count_the_copy_exact_when_it_is_read():

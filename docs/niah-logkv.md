@@ -158,10 +158,13 @@ bash diag.sh unused/reuse_label_stats.py --config exp/qwen1.7b-32k/arc_gamma_k12
   recent 窗口、flush 粒度、片段上限、精确池与片段边界 token，供下面的离线重放使用。
 
 **精确池策略的离线重放**（`unused/pool_policy_sim.py`，只用 CPU、不加载模型）读上面的 .npz，按缓存的节奏重放：
-token 逐个进入，攒满 recent + flush 后最早的 flush 个离开 recent 窗口，完全离开的候选片段与池中片段一起按价值整段
-贪心装满 P（池中片段乘 1.1），没装下的即并入梯子、不再回来。片段价值
+token 逐个进入，攒满 recent + flush 后最早的 flush 个离开 recent 窗口，完全离开的候选片段与池中片段一起交给缓存自己的
+`choose_spans`（按价值密度整段换入，池中片段乘 1.1）装满 P，没装下的即并入梯子、不再回来。价值密度
 
-  v(T) = (I + β·M(T)) · g(T − last(T))
+  v(T) = D(I + β·M(T)) · g(T − last(T))
+
+D 与缓存相同：token 分数与 z 分数为 16^分数，sum 为 2^比特，词分数为整段价值 2^比特 再除以片段长度（`per_span: false`
+时不除，即此前缓存按每 token 计的做法）。
 
 - I：准入时的信息量，片段的惊异度分数（mean、top4、topq 即最高四分之一的均值、max、mix、sum），词分数（`word_max`：
   片段中编码长度最大的词的编码长度，词与编码长度见第 7 节；`word_top2`：最大两个的均值；`word_first`：同 word_max，但每个词按它在本序列首次出现时的
@@ -206,7 +209,8 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
   会输给单个罕见词，按词算一个 7 位随机数约 23 比特、一个 UUID 上百比特，而普通词只有几比特。`word_max` 取片段中最长的词，
   `word_top2` 取最长两个词的均值（例如键与值），`word_first` 同 `word_max`，但每个词按它在本序列首次出现（相同 token id）
   时的编码长度计：罕见的名字读过一次后模型就能照抄，但再次提到它并带来新值的句子（一个键的多个值、表格的一行行记录）
-  与第一次同样关乎它；查找是因果的，按片段离开 recent 窗口的先后登记，各层读到相同的值。价值为 `SURPRISAL_SCALE` × 2^min(比特, 256)，即该词的逆概率；`multi_word`
+  与第一次同样关乎它；查找是因果的，按片段离开 recent 窗口的先后登记，各层读到相同的值。整段价值为 `SURPRISAL_SCALE` × 2^min(比特, 256)，即该词的逆概率，价值密度再除以片段长度（按每 token 计时，64 token 的片段
+  算作 64 倍，22 token 的针要长约 1.7 比特才换得掉它）；`multi_word`
   与 `multi` 相同，只是两维为 mean 与 word_max。片段仍按句切，值与问它的词留在同一片段。模型从 token 文本建词首表
   （`set_alpha_span_boundary_ids(..., literal_texts=...)`，`eval.py` 开启词分数时自动传入），每块前向后连同惊异度交给流。
   离线重放（P=1024）：单针 160 条上 `word_max`、`word_top2`、`word_first` 在 s2、s3、三个 words 针上都是 1.00（`mean` 的 s3
