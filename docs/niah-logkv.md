@@ -270,7 +270,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   4096 个 token 的困惑度（`ppl`）与每字节比特（`bits_per_byte`）；它衡量的是大部分上下文已在身后（LogKV 中已压缩）
   时的预测，不受任务难度的地板影响。数据由 YAML 的 `long_ppl_data` 或环境变量 `LONG_PPL_DATA` 给出（parquet / jsonl
   文件或目录，正文列 text / content / code），`LONG_PPL_DOCS` 限制文档数（默认 100），`LONG_PPL_CONCAT=1` 把同一文件的
-  相邻行拼成一篇（行是长文的片段时），选出的文档缓存在 `LONG_PPL_CACHE`（默认 `~/.cache/logkv_long_ppl`）。训练读取
+  相邻行拼成一篇（行是长文的片段时），选出的文档缓存在 `LONG_PPL_CACHE`（默认 `$HF_HOME/logkv_long_ppl`，各节点共用）。训练读取
   `data_dir` 下的全部 parquet，所以只有不在其中的文件才是严格留出的。BABILong qa1–qa5
   （`eval_tasks/babilong_long`，任务名带长度：`babilong_qa1_64k` 等，组 `babilong_{32k,64k,128k}`；提示、示例与打分同 lm-eval
   的 `babilong_qaN`；数据 `RMT-team/babilong-1k-samples`，环境变量 `BABILONG_DATASET` 可指向本地副本）；LongBench v2
