@@ -80,6 +80,21 @@ def select_documents(source: str, tokenizer, count: int, concat: bool = False) -
     return found
 
 
+def cache_key(source: str, tokenizer_name: str, count: int, concat: bool) -> str:
+    """The documents depend on the data, the tokenizer's files (not the path it was named by: eval.sh names
+    the checkpoint, a warm-up may name the base model), the count and the concat flag."""
+    digest = hashlib.sha256()
+    folder = Path(tokenizer_name).expanduser()
+    files = [folder / n for n in ("tokenizer.json", "tokenizer.model", "vocab.json", "merges.txt")]
+    files = [f for f in files if f.is_file()]
+    for f in files:
+        digest.update(f.read_bytes())
+    if not files:
+        digest.update(tokenizer_name.encode())
+    digest.update(json.dumps([os.path.abspath(os.path.expanduser(source)), count, concat, LONGEST]).encode())
+    return digest.hexdigest()[:16]
+
+
 def _tokenizer(kwargs):
     from transformers import AutoTokenizer
 
@@ -97,7 +112,7 @@ def _documents(kwargs) -> list[list[int]]:
     count = int(os.environ.get("LONG_PPL_DOCS", "100"))
     concat = os.environ.get("LONG_PPL_CONCAT", "0") == "1"
     name, tokenizer = _tokenizer(kwargs)
-    key = hashlib.sha256(json.dumps([os.path.abspath(source), name, count, concat, LONGEST]).encode()).hexdigest()[:16]
+    key = cache_key(source, name, count, concat)
     cache = Path(os.environ.get("LONG_PPL_CACHE", "~/.cache/logkv_long_ppl")).expanduser() / f"{key}.json"
     if cache.is_file():
         return json.loads(cache.read_text())

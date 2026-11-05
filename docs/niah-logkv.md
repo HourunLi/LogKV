@@ -276,6 +276,11 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   的 `babilong_qaN`；数据 `RMT-team/babilong-1k-samples`，环境变量 `BABILONG_DATASET` 可指向本地副本）；LongBench v2
   （lm-eval 的 `longbench2`，数据 `recursal/longbench-v2`，四选一按似然打分，每题四次预填充；长于 block_size 的上下文
   从开头截断，保留问题）。
+- 数据：`eval.sh` 离线运行（`HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`），新数据要先在联网时放进它读的缓存：
+  `bash diag.sh unused/fetch_long_eval_data.py [--longbench2] [--ppl-data <留出数据> --tokenizer <tokenizer 目录>]`
+  用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k）、
+  RULER 问答的 SQuAD 与 HotpotQA（`litgpt/ruler_patch.py` 先读的本地文件）与可选的 LongBench v2，再以离线方式重新加载
+  一遍；给了 `--ppl-data` 时还选出困惑度的文档并写入它的缓存（缓存键按 tokenizer 文件内容，与用哪个路径指向它无关）。
 - 配置：`eval_long{64k,128k}_{dense,baseline,word_first}.yaml`，分别是 dense CPT、同 checkpoint 的 K/V 准入基线与 `word_first`，
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER，主阶段跑 BABILong 与困惑度（64K 配置为 32K 与 64K，128K 配置为
   128K），每个任务 100 条。`babilong_dataset` 与 `long_ppl_data` 两个键（或同名环境变量）给出本地数据。
@@ -284,6 +289,6 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   都不计入 `AVG_all`。
 
 测试：`tests/test_yarn.py`（YaRN 的 cos/sin 与 transformers 一致），`tests/test_long_context.py`（YaRN 进入 LogKV 缓存且 recent
-窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数/数据路径、BABILong 按长度加载、困惑度任务取同一批长文档的末尾、稠密缓存无方阵掩码且
+窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数/数据路径、BABILong 按长度加载、困惑度任务取同一批长文档的末尾、下载脚本预建困惑度缓存、稠密缓存无方阵掩码且
 与不缓存一致），
 `tests/test_exp_configs.py`（长文本配置只差长度相关的几项）。
