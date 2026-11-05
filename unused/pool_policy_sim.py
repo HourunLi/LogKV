@@ -7,8 +7,12 @@ P and the span-boundary tokens.
 
 The replay follows the cache's rhythm: tokens enter one at a time; once R + F are waiting, the oldest
 F leave the recent window, every candidate span (Alpha's cut) that has fully left it competes with
-the spans already in the pool, and a whole-span greedy by value fills P tokens (pool spans get the
-hysteresis factor, 1.1 in the cache). A span that is not kept is gone (it is averaged into the ladder).
+the spans already in the pool, and the cache's own selection (alpha_log_kv.choose_spans: whole-span
+swaps by value density, pool spans x1.1) fills P tokens. A span that is not kept is gone (it is
+averaged into the ladder). Scores become densities as in the cache: SURPRISAL_BASE ** score per token
+for the token scores and z scores, 2 ** bits for sum, and for the word scores the word's inverse
+probability 2 ** bits for the whole span (density 2 ** bits / length; per_span=False gives it per
+token instead, as the cache did before).
 
 A policy gives each span the value
 
@@ -57,7 +61,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "unused"))
-from litgpt.alpha_log_kv import RunningStats  # noqa: E402
+from litgpt.alpha_log_kv import (SURPRISAL_BASE, SURPRISAL_CAP, SURPRISAL_WORD_CAP, RunningStats,  # noqa: E402
+                                 SpanCut, choose_spans)
 from niah_surprisal import SurprisalStore, cut, write_summary  # noqa: E402
 from reuse_label_stats import reuse_pairs  # noqa: E402
 
@@ -75,13 +80,15 @@ class Policy:
     reuse: str = "none"          # none | refresh | boost
     beta: float = 0.5
     hysteresis: float = 1.1
+    per_span: bool = True        # word scores: the word's value is the whole span's (density / length)
 
     @property
     def name(self) -> str:
         decay = {"none": "none", "power": f"pow(tau={self.tau:g},a={self.alpha:g})",
                  "exp": f"exp(tau={self.tau:g})"}[self.decay]
         reuse = f"boost(b={self.beta:g})" if self.reuse == "boost" else self.reuse
-        return f"{self.score}|{decay}|{reuse}" + (f"|h={self.hysteresis:g}" if self.hysteresis != 1.1 else "")
+        return (f"{self.score}|{decay}|{reuse}" + (f"|h={self.hysteresis:g}" if self.hysteresis != 1.1 else "")
+                + ("" if self.per_span or self.score not in WORD_SCORES else "|per_token"))
 
 
 def default_policies() -> list[Policy]:
@@ -200,6 +207,18 @@ def concat(rows):
     return dict(ids=np.concatenate([r["ids"] for r in rows]), surprisal=np.concatenate([r["surprisal"] for r in rows]))
 
 
+def density(policy: Policy, score, lengths) -> np.ndarray:
+    """The cache's value density for a score (before forgetting)."""
+    if policy.score == "recency":
+        return np.ones(len(score))
+    if policy.score == "sum":
+        return 2. ** np.minimum(score, 512.)
+    if policy.score in ("word_max", "word_top2", "word_first"):
+        value = 2. ** np.minimum(score, SURPRISAL_WORD_CAP)
+        return value / np.maximum(lengths, 1) if policy.per_span else value
+    return SURPRISAL_BASE ** np.minimum(score, SURPRISAL_CAP)
+
+
 def value(policy: Policy, stream: Stream, spans: np.ndarray, time: int, base=None) -> np.ndarray:
     base = stream.base[policy.score][spans].copy() if base is None else base
     last = stream.stops[spans].astype(np.float64)
@@ -211,6 +230,7 @@ def value(policy: Policy, stream: Stream, spans: np.ndarray, time: int, base=Non
             if policy.reuse == "boost":
                 base[j] += policy.beta * mass
     age = np.maximum(time - last, 0.)
+    base = density(policy, base, (stream.stops - stream.starts)[spans])
     if policy.decay == "power":
         return base * (1. + age / policy.tau) ** -policy.alpha
     if policy.decay == "exp":
@@ -241,12 +261,8 @@ def replay(stream: Stream, policy: Policy, pool: int, recent: int, flush: int) -
             stats.update(features[candidates])
             base = stats.z(features[spans]).max(1)
         v = value(policy, stream, spans, time, base)
-        v[:len(kept)] *= policy.hysteresis
-        chosen, used = [], 0
-        for j in np.argsort(-v, kind="stable"):
-            if used + lengths[spans[j]] <= pool:
-                chosen.append(spans[j])
-                used += lengths[spans[j]]
+        v[:len(kept)] *= policy.hysteresis / 1.1  # choose_spans applies the cache's 1.1
+        chosen = select(spans, lengths[spans], len(kept), v, pool)
         dropped = np.setdiff1d(kept, chosen)
         for span in dropped:  # a span leaving the pool: was it re-occurred while kept?
             reused_tokens += lengths[span] * (stream.reuse(int(span), time)[0] is not None)
@@ -269,6 +285,17 @@ def replay(stream: Stream, policy: Policy, pool: int, recent: int, flush: int) -
             hits += 1
     return dict(kept=set(kept.tolist()), archived=archived, hits=hits, events=len(stream.events_a),
                 reused_tokens=reused_tokens, kept_tokens=kept_tokens)
+
+
+def select(spans, lengths, n_old, densities, pool) -> np.ndarray:
+    """The spans the cache's choose_spans keeps of [pool | candidates] (all closed)."""
+    total = int(lengths.sum())
+    old = np.arange(len(spans)) < n_old
+    cut = SpanCut([np.arange(total)], [np.arange(total)], [np.asarray(lengths, dtype=np.int64)], [old],
+                  [np.ones(len(spans), dtype=bool)])
+    kept = np.zeros(total, dtype=bool)
+    kept[choose_spans(cut, np.asarray(densities, dtype=np.float64).tolist(), pool).keep[0]] = True
+    return spans[kept[np.cumsum(lengths) - lengths]]
 
 
 def needle_spans(stream: Stream) -> list[np.ndarray]:
