@@ -178,7 +178,7 @@ D 与缓存相同：token 分数与 z 分数为 16^分数，sum 为 2^比特，�
 - 全部因果：T 时的价值只用 T 之前的 token。默认网格为 3 种分数 × 6 种遗忘 × 3 种复用（无、刷新、加分）再加新近基准
   与 mix、multi、sum、word_max、word_top2、word_first、multi_word 七种分数，共 62 种策略。
 - 词分数要用 tokenizer 判断词首（默认按 .npz 里记下的
-  配置找，或用 `--tokenizer` 指定）。
+  配置找，或用 `--tokenizer` 指定）；`--space-words` 改回只在空白处分词的旧规则以作对照。
 - `--explain K` 另写 `<输出名>.explain.txt`：每种策略、每个任务前 K 个丢针的样本，列出针所在片段与最终池中分数最高的
   片段（文本、长度、各分数、在已归档片段中的名次）。汇总首行记下代码的 commit。
 
@@ -203,10 +203,13 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 - 惊异度来自模型自己的 logits：开启时 `GPT.forward` 把带缓存的输入按不超过 recent 窗口与 flush 粒度的块（默认 2048）
   逐块前向，每块之后把该块各 token 的惊异度交给 `SurprisalStream`（块首 token 用上一块或上一步的末位 logits）。
   flush 只归档更早块里的 token，所以被归档的 token 的惊异度总已在流里。逐 token 解码同样逐步喂入。
-- 代价：每块对所有位置算一次 lm_head（Qwen3-1.7B 上约为预填充计算的两成），主机上每个 token 存一个浮点数（词分数再加一个标志，
-  `word_first` 再加 token id 与一张"词 → 首次编码长度"的表）；KV 不变。
-- 词分数（`word_max`、`word_top2`、`word_first`、`multi_word`）按片段里信息量最大的词计分。词是一个以空白或 CJK 字符开头（或位于片段首）
-  的 token 加上其后直到下一个词首的 token（由 tokenizer 各 token 单独解码的文本判定，`word_start_table`）；词的编码长度是其
+- 代价：每块对所有位置算一次 lm_head（Qwen3-1.7B 上约为预填充计算的两成），主机上每个 token 存一个浮点数（词分数再加 token id，
+  `word_first` 再加一张"词 → 首次编码长度"的表）；KV 不变。
+- 词分数（`word_max`、`word_top2`、`word_first`、`multi_word`）按片段里信息量最大的词计分。词按词法切分（`word_starts`，由
+  tokenizer 各 token 单独解码的文本得到每个 token 首末字符的类别）：字母与数字连成一个词，词内可含连字符、撇号、下划线
+  （"mid-century"、"don't"、UUID），数字之间的 "." "," 也算词内（"3.14"）；空白、其余标点、每个 CJK 字符以及片段首都开始
+  新词。所以 URL、路径、标记是若干个词，不会因为不含空格就成了一个越长分越高的"词"（只按空白切分时，一条链接所在的
+  64 token 句子以 85–240 比特排在所有针之前，十几个这样的句子就占满 P=1024）。词的编码长度是其
   token 惊异度之和 −log2 p(词 | 上文)，与分词方式无关：数字逐位切分，每位最多 log2 10 ≈ 3.3 比特，按 token 平均或峰值
   会输给单个罕见词，按词算一个 7 位随机数约 23 比特、一个 UUID 上百比特，而普通词只有几比特。`word_max` 取片段中最长的词，
   `word_top2` 取最长两个词的均值（例如键与值），`word_first` 同 `word_max`，但每个词按它在本序列首次出现（相同 token id）
@@ -215,10 +218,11 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
   算作 64 倍，22 token 的针要长约 1.7 比特才换得掉它）；`multi_word`
   与 `multi` 相同，只是两维为 mean 与 word_max。片段仍按句切，值与问它的词留在同一片段。模型从 token 文本建词首表
   （`set_alpha_span_boundary_ids(..., literal_texts=...)`，`eval.py` 开启词分数时自动传入），每块前向后连同惊异度交给流。
-  离线重放（P=1024）：单针 160 条上 `word_max`、`word_top2`、`word_first` 在 s2、s3、三个 words 针上都是 1.00（`mean` 的 s3
-  即 UUID 为 0.41，`mix` 的 s2 为 0.97）；多针 96 条上 multikey_1 / multivalue / multiquery 为 `mean` 0.56 / 0.45 / 0.54，
-  `word_max` 0.97 / 0.51 / 0.97，`word_first` 0.97 / 1.00 / 0.97。`word_max` 丢的是同一键的第 2–4 个值：键已可照抄，句子只剩
-  22–26 比特的数值，排在 URL、链接等更长的字面量之后。
+  GPU（P=1024，空白分词）：`word_first` 单针 1 / 1 / 0.968，multikey_1 / multivalue / multiquery 0.866 / 0.871 / 0.801，words
+  0.957（dense CPT 0.966 / 0.883 / 0.885，words 0.885）；`word_max` 的 multivalue 只有 0.40：键已可照抄，第 2–4 个值的句子只剩
+  22–26 比特的数值。真实缓存中被问的值是否精确（`niah_surprisal.py` 的 real cache）与 GPU 准确率一致，用真实运行存下的惊异度
+  重放也一致；用 K/V 准入缓存上算的惊异度重放则高估（0.97），因为精确留下第一条记录后，同格式的后续记录变得可预测——
+  多针的离线判断要用对应准入真实运行的 .npz。挤掉这些针的是带链接的句子，这促成了上面的词法分词。
   把值单独切成片段的做法（信息片段）已试过并删去：脱离句子后，数值的平均每 token 惊异度低于孤立的罕见词，
   总量又低于连成串的普通实词，单针 s2 降到 0.16。
 - 只用于评测：训练（`enable_log_kv_training`）与 CPT 不支持。`eval.py` 与 `eval.sh` 在 YAML 设置时传

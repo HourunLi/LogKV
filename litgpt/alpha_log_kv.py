@@ -3,6 +3,7 @@ Gamma's optional cue evidence adds a lexical relevance proxy, and its optional
 literal evidence a lexical incompressibility proxy."""
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 
 import numpy as np
@@ -51,8 +52,11 @@ _LITERAL_RUNS = re.compile(r"[0-9]|[A-Za-z]+")
 SURPRISAL_SCALE = 1e4
 SURPRISAL_BASE = 16.
 SURPRISAL_CAP = 32.
-# Word scores count a span by its most informative words. A word is a token that begins one (its text
-# starts with whitespace or a CJK character, or it starts the span) and the tokens up to the next; its
+# Word scores count a span by its most informative words. Words are lexical (word_starts): a run of
+# letters and digits, which may contain a hyphen, an apostrophe or an underscore ("mid-century",
+# "don't", "No_Great_Hackers", a UUID) and a "." or "," between digits ("3.14", "1,250"); whitespace,
+# other punctuation and every CJK character begin a new one, and so does a span start. A URL, a path or
+# markup is therefore several words, not one whose code length grows with its length. A word's
 # code length is the sum of its tokens' surprisal, -log2 p(word | context), which does not depend on
 # how the tokenizer splits it: a 7-digit number cut into digits of at most log2 10 bits each totals
 # about 23 bits, a UUID over 100, while an ordinary word takes a few. "word_max" is the code length
@@ -590,54 +594,100 @@ class RunningStats:
 
 
 _CJK_START = re.compile(r"[\u2e80-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]")
+# Character classes for word_starts: whitespace, CJK, digit, other word character (letters, "_", the
+# replacement character of a partial UTF-8 token, combining marks), joiner ("-", "'"), digit separator
+# (".", ","), other punctuation and symbols, nothing (an empty text).
+SPACE, CJK, DIGIT, LETTER, JOINER, DIGIT_SEP, PUNCT, EMPTY = range(8)
 
 
-def word_start_table(texts) -> np.ndarray:
-    """Per token id (``texts``: each token decoded alone): does the token begin a word? It does when its
-    text starts with whitespace, or with a CJK character or mark (such text has no spaces between words,
-    so each of those tokens is a word of its own); an empty text (a special token) also does."""
-    return np.array([not text or text[0].isspace() or _CJK_START.match(text[0]) is not None for text in texts],
-                    dtype=bool)
+def _char_class(ch: str) -> int:
+    if ch.isspace():
+        return SPACE
+    if _CJK_START.match(ch):
+        return CJK
+    if ch.isdigit():
+        return DIGIT
+    if ch.isalnum() or ch in "_\ufffd" or unicodedata.category(ch).startswith("M"):
+        return LETTER
+    if ch in "-'\u2019":
+        return JOINER
+    if ch in ".,":
+        return DIGIT_SEP
+    return PUNCT
+
+
+def word_classes(texts) -> np.ndarray:
+    """Per token id (``texts``: each token decoded alone): the class of its first character, its last,
+    and the one before its last (EMPTY when the text is shorter)."""
+    out = np.full((len(texts), 3), EMPTY, dtype=np.int8)
+    for i, text in enumerate(texts):
+        if text:
+            out[i] = _char_class(text[0]), _char_class(text[-1]), _char_class(text[-2]) if len(text) > 1 else EMPTY
+    return out
+
+
+def word_starts(ids, classes, positions=None) -> np.ndarray:
+    """Does the token at each of ``positions`` (default: all) of the id sequence ``ids`` begin a word?
+    It continues one when a word character follows a word character or a joiner, a joiner follows a
+    word character, or a "." or "," stands between two digits (and the digit after it then continues
+    too); anything else begins one. The token after a position must be known to join a separator."""
+    ids = np.asarray(ids, dtype=np.int64)
+    n = len(ids)
+    pos = np.arange(n) if positions is None else np.asarray(positions, dtype=np.int64)
+    first = classes[ids[pos], 0]
+    has_prev, has_next = pos >= 1, pos + 1 < n
+    prev = ids[np.maximum(pos - 1, 0)]
+    last = np.where(has_prev, classes[prev, 1], EMPTY)
+    before_last = np.where(has_prev, classes[prev, 2], EMPTY)
+    before_last = np.where(before_last == EMPTY, np.where(pos >= 2, classes[ids[np.maximum(pos - 2, 0)], 1], EMPTY),
+                           before_last)
+    following = np.where(has_next, classes[ids[np.minimum(pos + 1, n - 1)], 0], EMPTY)
+    word = (first == DIGIT) | (first == LETTER)
+    join = ((word & np.isin(last, (DIGIT, LETTER, JOINER)))
+            | ((first == JOINER) & np.isin(last, (DIGIT, LETTER)))
+            | ((first == DIGIT_SEP) & (last == DIGIT) & (following == DIGIT))
+            | ((first == DIGIT) & (last == DIGIT_SEP) & (before_last == DIGIT)))
+    return ~join
 
 
 class SurprisalStream:
     """Each row's token surprisal in bits, fed by GPT.forward; span values for the exact pool.
 
-    ``add(row, start, bits, word_starts)`` appends the surprisal of positions ``start, start + 1, ...``
-    (and, for the word scores, whether each begins a word); a row restarts at position 0. The model
-    computes it from its own next-token logits one prefill chunk at a time (no longer than the recent
-    window), so every token's surprisal is known before the token can leave the window. A float (and a
-    flag) per token is kept on the host.
+    ``add(row, start, bits, ids)`` appends the surprisal of positions ``start, start + 1, ...`` (and,
+    for the word scores, their token ids: words are found from them and ``word_classes``, built from the
+    token texts, when a span is scored, since a separator joins a word only if a digit follows it); a
+    row restarts at position 0. The model computes the surprisal from its own next-token logits one
+    prefill chunk at a time (no longer than the recent window), so every token's is known before the
+    token can leave the window. A float (and an id) per token is kept on the host.
     """
 
-    def __init__(self, score: str) -> None:
+    def __init__(self, score: str, word_classes=None) -> None:
         if score not in SURPRISAL_SCORES:
             raise ValueError(f"surprisal score must be one of {SURPRISAL_SCORES}, got {score!r}")
         self.score = score
         self.words = score in WORD_SCORES
+        if self.words and word_classes is None:
+            raise ValueError(f"surprisal score {score!r} needs word_classes() of the token texts")
+        self.word_classes = word_classes
         self._rows: list[np.ndarray] = []
-        self._word_rows: list[np.ndarray] = []  # word scores: does the token begin a word
-        self._id_rows: list[np.ndarray] = []  # word_first: token ids
+        self._id_rows: list[np.ndarray] = []  # word scores: token ids
         self._mention_rows: list[np.ndarray] = []  # word_first: the credited bits of the word starting here
         self._first_mention: list[dict] = []  # word_first: token ids of a word -> its first code length
         self._stats: list[RunningStats] = []  # multi scores: spans archived so far, per row
         self._counted: list[int] = []  # multi scores: spans starting before this are in the statistics
 
-    def add(self, row: int, start: int, bits, word_starts=None, ids=None) -> None:
-        if self.words and word_starts is None:
-            raise ValueError(f"surprisal score {self.score!r} needs each token's word start")
-        if self.score == "word_first" and ids is None:
-            raise ValueError("surprisal score 'word_first' needs the token ids")
+    def add(self, row: int, start: int, bits, ids=None) -> None:
+        if self.words and ids is None:
+            raise ValueError(f"surprisal score {self.score!r} needs the token ids")
         while len(self._rows) <= row:
             self._rows.append(np.zeros(0))
-            self._word_rows.append(np.zeros(0, dtype=bool))
             self._id_rows.append(np.zeros(0, dtype=np.int64))
             self._mention_rows.append(np.zeros(0))
             self._first_mention.append({})
             self._stats.append(RunningStats(2))
             self._counted.append(0)
         if start == 0:
-            self._rows[row], self._word_rows[row] = np.zeros(0), np.zeros(0, dtype=bool)
+            self._rows[row] = np.zeros(0)
             self._id_rows[row], self._mention_rows[row], self._first_mention[row] = (
                 np.zeros(0, dtype=np.int64), np.zeros(0), {})
             self._stats[row], self._counted[row] = RunningStats(2), 0
@@ -646,11 +696,6 @@ class SurprisalStream:
         bits = np.nan_to_num(np.asarray(bits, dtype=np.float64))
         self._rows[row] = np.concatenate((self._rows[row], bits))
         if self.words:
-            words = np.asarray(word_starts, dtype=bool)
-            if len(words) != len(bits):
-                raise ValueError(f"{len(bits)} surprisal values but {len(words)} word starts")
-            self._word_rows[row] = np.concatenate((self._word_rows[row], words))
-        if self.score == "word_first":
             ids = np.asarray(ids, dtype=np.int64)
             if len(ids) != len(bits):
                 raise ValueError(f"{len(bits)} surprisal values but {len(ids)} token ids")
@@ -683,7 +728,7 @@ class SurprisalStream:
                                f"{len(known)}): GPT.forward feeds it one chunk ahead of the cache")
         mean, top4 = surprisal_mean_top4(known[positions], lengths)
         if self.words:
-            bits, words = known[positions], self._word_rows[row][positions]
+            bits, words = known[positions], word_starts(self._id_rows[row], self.word_classes, positions)
             credited = None
             if self.score == "word_first":
                 first, totals, _ = span_words(bits, words, lengths)

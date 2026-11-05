@@ -287,19 +287,20 @@ class GPT(nn.Module):
         before any layer can archive the token. The word scores also need each token's text (to find
         where words begin): ``literal_texts`` of set_alpha_span_boundary_ids().
         """
-        from litgpt.alpha_log_kv import SurprisalStream
+        from litgpt.alpha_log_kv import WORD_SCORES, SurprisalStream, word_classes
 
         if score and not alpha_exact_tokens:
             raise ValueError("gamma_surprisal scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
-        self.log_kv_surprisal_stream = SurprisalStream(score) if score else None
-        if self.log_kv_surprisal_stream is not None and self.log_kv_surprisal_stream.words:
-            from litgpt.alpha_log_kv import word_start_table
+        classes = None
+        if score in WORD_SCORES:
             texts = getattr(self, "alpha_literal_texts", None)
             if texts is None:
                 raise RuntimeError(f"gamma_surprisal={score!r} needs the tokenizer's token texts to find words: "
                                    "pass literal_texts to set_alpha_span_boundary_ids()")
-            if getattr(self, "_word_start_texts", None) is not texts:
-                self.log_kv_word_starts, self._word_start_texts = word_start_table(texts), texts
+            if getattr(self, "_word_class_texts", None) is not texts:
+                self.log_kv_word_classes, self._word_class_texts = word_classes(texts), texts
+            classes = self.log_kv_word_classes
+        self.log_kv_surprisal_stream = SurprisalStream(score, classes) if score else None
         self.log_kv_surprisal_chunk = max(1, min(int(recent_size), int(flush_granularity)))
         self._surprisal_last = None
         for block in self.transformer.h:
@@ -337,10 +338,8 @@ class GPT(nn.Module):
                         -1, x[:, s + 1:e + 1, None])[..., 0]
                 bits = (bits / math.log(2)).cpu().numpy()
                 ids = x.cpu().numpy() if self.log_kv_surprisal_stream.words else None
-                words = None if ids is None else self.log_kv_word_starts[ids]
                 for row in range(x.size(0)):
                     self.log_kv_surprisal_stream.add(row, starts[row] + a, bits[row],
-                                                     None if words is None else words[row],
                                                      None if ids is None else ids[row])
                 prev = logits[:, -1].float()
                 if b > keep_from:
