@@ -61,8 +61,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "unused"))
-from litgpt.alpha_log_kv import (SURPRISAL_BASE, SURPRISAL_CAP, SURPRISAL_WORD_CAP, RunningStats,  # noqa: E402
-                                 SpanCut, choose_spans)
+from litgpt.alpha_log_kv import (CJK, EMPTY, SPACE, SURPRISAL_BASE, SURPRISAL_CAP,  # noqa: E402
+                                 SURPRISAL_WORD_CAP, RunningStats, SpanCut, choose_spans, word_classes,
+                                 word_starts)
 from niah_surprisal import SurprisalStore, cut, write_summary  # noqa: E402
 from reuse_label_stats import reuse_pairs  # noqa: E402
 
@@ -382,7 +383,7 @@ def summary(saved: dict) -> str:
     """All policies in grid order, then the ten best by mean NIAH and by the longest natural hit rate."""
     rows = saved["rows"]
     lines = [f"code {saved.get('code', '?')}; pool {saved['pool']}, recent {saved['recent']}, flush {saved['flush']}"
-             "; "
+             f"{'; words end at whitespace only' if saved.get('space_words') else ''}; "
              f"reuse {saved['reuse_n']}-grams >= {saved['reuse_bits']:g} bits; "
              f"far-reuse label {saved['label_n']}-grams >= {saved['label_bits']:g} bits"
              + (f"; {saved['streams']}" if saved.get("streams") else ""), "", "all policies:"]
@@ -443,6 +444,8 @@ def main():
     p.add_argument("--policies", default=None, help="JSON list of Policy fields (default: the built-in grid)")
     p.add_argument("--tokenizer", default=None,
                    help="tokenizer dir for word boundaries and --explain text (default: the one of the saved config)")
+    p.add_argument("--space-words", action="store_true",
+                   help="words end only at whitespace (and CJK), the rule before lexical words")
     p.add_argument("--explain", type=int, default=0,
                    help="per policy, explain up to this many lost needles per task (<out stem>.explain.txt)")
     p.add_argument("--out", default="pool_policy_sim.json")
@@ -461,20 +464,28 @@ def main():
     boundary = np.zeros(max(max(meta["boundary_ids"]) + 1, 1), dtype=bool)
     boundary[meta["boundary_ids"]] = True
     policies = default_policies() if args.policies is None else [Policy(**d) for d in json.loads(args.policies)]
-    words = decode = None
+    classes = decode = None
     if args.explain or any(p.score in WORD_SCORES for p in policies):
-        from litgpt.alpha_log_kv import word_start_table
         import torch
         tokenizer = load_tokenizer(args.tokenizer, meta["config"])
-        words = word_start_table(tokenizer.gamma_literal_texts)
+        classes = word_classes(tokenizer.gamma_literal_texts)
         def decode(ids):
             return tokenizer.decode(torch.as_tensor(np.asarray(ids)))
+
+    def words_of(ids):
+        if classes is None:
+            return None
+        if args.space_words:
+            starts = np.isin(classes[ids, 0], (SPACE, CJK, EMPTY))
+            starts[:1] = True
+            return starts
+        return word_starts(ids, classes)
 
     def prepare(row, **fields):
         ids = row["ids"]
         table = boundary if boundary.size > ids.max() else np.pad(boundary, (0, int(ids.max()) + 1 - boundary.size))
         return Stream(ids, row["surprisal"], table, meta["max_span"], args.reuse_n, args.reuse_bits, args.label_n,
-                      args.label_bits, recent, words[ids] if words is not None else None, **fields)
+                      args.label_bits, recent, words_of(ids), **fields)
 
     niah = []
     if "niah" in loaded:
@@ -491,7 +502,8 @@ def main():
           + ", ".join(f"{len(v)} natural streams ({k})" for k, v in natural.items()) + f"; {len(policies)} policies",
           flush=True)
     rows, explained = evaluate(policies, niah, natural, pool, recent, flush, args.explain, decode)
-    saved = dict(code=code_version(), pool=pool, recent=recent, flush=flush, reuse_n=args.reuse_n,
+    saved = dict(code=code_version(), pool=pool, recent=recent, flush=flush, space_words=args.space_words,
+                 reuse_n=args.reuse_n,
                  reuse_bits=args.reuse_bits,
                  label_n=args.label_n, label_bits=args.label_bits, rows=rows,
                  streams=f"{len(niah)} NIAH prompts, " + ", ".join(f"{len(v)} natural streams ({k})"
