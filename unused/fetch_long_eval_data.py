@@ -131,6 +131,8 @@ def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> tuple[
             if label == "LongBench v2":
                 root, files = snapshot()
                 lines.append(f"LongBench v2 snapshot {root}: {len(files)} data files, e.g. {files[:4]}")
+                if not repair_parquet(root, files, lines):
+                    raise ValueError("some LongBench v2 files are still not parquet after a fresh download (above)")
             for path, name, split in group:
                 rows = len(datasets.load_dataset(path, name=name, split=split))
                 lines.append(f"{path} {name} {split}: {rows} rows")
@@ -139,6 +141,44 @@ def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> tuple[
             ok = False
             lines.append(f"{label}: FAILED {type(error).__name__}: {str(error)[:1500]}")
     return loads, ok
+
+
+def is_parquet(path: Path) -> bool:
+    """A parquet file starts and ends with the magic bytes PAR1."""
+    if not path.is_file() or path.stat().st_size < 12:
+        return False
+    with open(path, "rb") as f:
+        head = f.read(4)
+        f.seek(-4, os.SEEK_END)
+        return head == b"PAR1" and f.read(4) == b"PAR1"
+
+
+def describe(path: Path) -> str:
+    """Size and first bytes of a file that should be parquet (a Git LFS pointer, an error page, a cut file)."""
+    if not path.exists():
+        return "missing"
+    with open(path, "rb") as f:
+        head = f.read(120)
+    return f"{path.stat().st_size} bytes, starts {head!r}"
+
+
+def repair_parquet(root: str, files: list[str], lines: list[str]) -> bool:
+    """Download again, fresh, every snapshot parquet file that is not a whole parquet file."""
+    from huggingface_hub import hf_hub_download
+
+    from litgpt.longbench2_patch import REPO
+
+    bad = [f for f in files if f.endswith(".parquet") and not is_parquet(Path(root) / f)]
+    ok = True
+    for f in bad:
+        before = describe(Path(root) / f)
+        fresh = Path(hf_hub_download(REPO, f, repo_type="dataset", force_download=True))
+        good = is_parquet(fresh)
+        ok = ok and good
+        lines.append(f"LongBench v2 {f}: was {before}; downloaded again: " + ("ok" if good else describe(fresh)))
+    if not bad:
+        lines.append("LongBench v2 files: all whole parquet")
+    return ok
 
 
 def check_offline(loads, lines: list[str]) -> bool:
@@ -166,13 +206,50 @@ def cache_ppl(data: str, tokenizer: str, lines: list[str]) -> None:
     utils = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(utils)
     os.environ["LONG_PPL_DATA"] = data
-    docs = utils._documents({"pretrained": tokenizer})
     want = int(os.environ.get("LONG_PPL_DOCS", "100"))
+    try:
+        docs = utils._documents({"pretrained": tokenizer})
+    except ValueError:
+        ppl_data_stats(data, tokenizer, utils, lines)
+        raise
     lines.append(f"long_ppl: {len(docs)} documents of >= {utils.LONGEST} tokens from {data} (want {want}); "
                  f"cache {utils.cache_dir()}")
     if len(docs) < want:
+        ppl_data_stats(data, tokenizer, utils, lines)
         lines.append("  fewer than wanted: point --ppl-data at more shards, or if the rows are pieces of longer "
                      "texts, rerun with LONG_PPL_CONCAT=1 (and run eval.sh with it too)")
+
+
+def ppl_data_stats(data: str, tokenizer: str, utils, lines: list[str], files: int = 2, show: int = 5) -> None:
+    """How long the rows are: characters over every row of the first files, tokens of the first and the
+    longest rows (rows of one length throughout are packed sequences, not documents)."""
+    import heapq
+
+    import numpy as np
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=True)
+    paths = utils._files(data)[:files]
+    lengths, first, longest = [], [], []
+    for path in paths:
+        for i, text in enumerate(utils._texts(path)):
+            lengths.append(len(text))
+            if len(first) < show:
+                first.append(text)
+            heapq.heappush(longest, (len(text), len(lengths), text))
+            if len(longest) > show:
+                heapq.heappop(longest)
+    if not lengths:
+        lines.append(f"  long_ppl data: no text rows in {[str(p) for p in paths]}")
+        return
+    chars = np.asarray(lengths)
+
+    def tokens(texts):
+        return [len(tok(t, add_special_tokens=False)["input_ids"]) for t in texts]
+    lines.append(f"  long_ppl data: {len(chars)} rows in {len(paths)} file(s); characters p50 {int(np.median(chars))}, "
+                 f"p90 {int(np.percentile(chars, 90))}, max {int(chars.max())}")
+    lines.append(f"  tokens of the first {len(first)} rows: {tokens(first)}")
+    lines.append(f"  tokens of the {len(longest)} longest rows: {sorted(tokens([t for _, _, t in longest]), reverse=True)}")
 
 
 def main():
