@@ -210,6 +210,9 @@ def test_the_fetch_script_caches_the_ppl_documents_the_tasks_read(tmp_path, monk
     lines = []
     fetch.cache_ppl(str(tmp_path / "heldout.parquet"), word_tokenizer, lines)
     assert "1 documents of >= 131072 tokens" in lines[0]
+    stats = []
+    fetch.ppl_data_stats(str(tmp_path / "heldout.parquet"), word_tokenizer, utils, stats)
+    assert "1 rows in 1 file(s)" in stats[0] and stats[1].endswith("[140000]")
     # The tasks find the same cache whatever path names the same tokenizer files.
     copy = tmp_path / "tok-copy"
     copy.mkdir()
@@ -279,3 +282,19 @@ def test_the_fetch_script_skips_certificate_checks_and_waits_out_rate_limits(mon
     assert waits == [7, 7] and all(c["verify"] is False and c["timeout"] == 5 for c in calls)
     assert os.environ["HF_HUB_ENABLE_HF_TRANSFER"] == "0" and os.environ["HF_HUB_DISABLE_XET"] == "1"
     assert os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] == "300"
+
+
+def test_the_fetch_script_spots_files_that_are_not_parquet(tmp_path):
+    import importlib.util
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    spec = importlib.util.spec_from_file_location("fetch_long_eval_data_pq", ROOT / "unused" / "fetch_long_eval_data.py")
+    fetch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetch)
+    good, pointer = tmp_path / "good.parquet", tmp_path / "pointer.parquet"
+    pq.write_table(pa.table({"x": [1]}), good)
+    pointer.write_text("version https://git-lfs.github.com/spec/v1\\noid sha256:abc\\nsize 123\\n")
+    assert fetch.is_parquet(good) and not fetch.is_parquet(pointer) and not fetch.is_parquet(tmp_path / "missing")
+    assert "git-lfs" in fetch.describe(pointer) and fetch.describe(tmp_path / "missing") == "missing"
