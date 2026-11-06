@@ -9,7 +9,10 @@ switches off for itself only, then:
                   litgpt/ruler_patch.py looks first
     LongBench v2  recursal/longbench-v2, every subset lm-eval's longbench2 tasks load (--longbench2)
     long_ppl      --ppl-data: finds the documents of at least 131072 tokens (with --tokenizer) and caches
-                  the selection the long_ppl tasks use, so eval ranks do not tokenize it again
+                  the selection the long_ppl tasks use, so eval ranks do not tokenize it again;
+                  --ppl-hub <dataset repo> (e.g. emozilla/pg19-test, PG19's 100 test books) downloads
+                  the repository first and uses its folder as --ppl-data (export the printed path as
+                  LONG_PPL_DATA for eval.sh)
 
 and finally loads every dataset again in an offline subprocess, as eval.py will. A summary goes to
 <--out>.summary.txt beside --out (default fetch_long_eval_data.json in the current directory).
@@ -162,23 +165,37 @@ def describe(path: Path) -> str:
     return f"{path.stat().st_size} bytes, starts {head!r}"
 
 
-def repair_parquet(root: str, files: list[str], lines: list[str]) -> bool:
+def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | None = None) -> bool:
     """Download again, fresh, every snapshot parquet file that is not a whole parquet file."""
     from huggingface_hub import hf_hub_download
 
     from litgpt.longbench2_patch import REPO
 
+    repo = repo or REPO
     bad = [f for f in files if f.endswith(".parquet") and not is_parquet(Path(root) / f)]
     ok = True
     for f in bad:
         before = describe(Path(root) / f)
-        fresh = Path(hf_hub_download(REPO, f, repo_type="dataset", force_download=True))
+        fresh = Path(hf_hub_download(repo, f, repo_type="dataset", force_download=True))
         good = is_parquet(fresh)
         ok = ok and good
-        lines.append(f"LongBench v2 {f}: was {before}; downloaded again: " + ("ok" if good else describe(fresh)))
+        lines.append(f"{repo} {f}: was {before}; downloaded again: " + ("ok" if good else describe(fresh)))
     if not bad:
-        lines.append("LongBench v2 files: all whole parquet")
+        lines.append(f"{repo} files: all whole parquet")
     return ok
+
+
+def fetch_ppl_hub(repo: str, lines: list[str]) -> str:
+    """Download a dataset repository for long_ppl and return its snapshot folder (the --ppl-data)."""
+    from huggingface_hub import snapshot_download
+
+    root = snapshot_download(repo, repo_type="dataset")
+    files = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*") if p.suffix in (".parquet", ".jsonl"))
+    lines.append(f"long_ppl data {repo}: {root} ({len(files)} files, e.g. {files[:3]})")
+    if not repair_parquet(root, files, lines, repo):
+        raise ValueError(f"some {repo} files are still not parquet after a fresh download (above)")
+    lines.append(f"  for eval.sh: export LONG_PPL_DATA={root}")
+    return root
 
 
 def check_offline(loads, lines: list[str]) -> bool:
@@ -258,6 +275,8 @@ def main():
     p.add_argument("--no-babilong", action="store_true")
     p.add_argument("--no-ruler-qa", action="store_true")
     p.add_argument("--ppl-data", default=None, help="held-out ProLong parquet / jsonl file or directory")
+    p.add_argument("--ppl-hub", default=None,
+                   help="dataset repository to download and use as --ppl-data (e.g. emozilla/pg19-test)")
     p.add_argument("--tokenizer", default=None, help="tokenizer dir for --ppl-data (e.g. the Qwen3-1.7B-Base dir)")
     p.add_argument("--out", default="fetch_long_eval_data.json")
     p.add_argument("--verify-ssl", action="store_true", help="keep HTTPS certificate checks (off by default)")
@@ -267,8 +286,8 @@ def main():
              f"RULER_CACHE_DIR={ruler_cache_dir()}",
              f"HTTPS certificate checks: {'on' if args.verify_ssl else 'off (--verify-ssl turns them on)'}"]
     ok = True
-    if args.ppl_data and not args.tokenizer:
-        raise SystemExit("--ppl-data needs --tokenizer (the dir with tokenizer.json)")
+    if (args.ppl_data or args.ppl_hub) and not args.tokenizer:
+        raise SystemExit("--ppl-data / --ppl-hub need --tokenizer (the dir with tokenizer.json)")
     if not args.no_ruler_qa:
         try:
             fetch_ruler_qa(lines)
@@ -279,6 +298,12 @@ def main():
     ok = ok and fetched
     if loads:
         ok = check_offline(loads, lines) and ok
+    if args.ppl_hub:
+        try:
+            args.ppl_data = fetch_ppl_hub(args.ppl_hub, lines)
+        except Exception as error:  # noqa: BLE001
+            ok = False
+            lines.append(f"long_ppl data {args.ppl_hub}: FAILED {type(error).__name__}: {str(error)[:1500]}")
     if args.ppl_data:
         try:
             cache_ppl(args.ppl_data, args.tokenizer, lines)
