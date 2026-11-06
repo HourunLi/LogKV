@@ -298,7 +298,7 @@ def test_surprisal_evaluations_reuse_the_cue_free_p1024_checkpoint(name):
             "log_kv_gamma_surprisal", "log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}
 
 
-LONG = {"dense": "cpt_dense.yaml", "baseline": "arc_gamma_k12_b128_p1024_2k.yaml",
+LONG = {"dense": "dense_niah_base.yaml", "baseline": "arc_gamma_k12_b128_p1024_2k.yaml",
         "word_first": "eval_gamma_surprisal_word_first_p1024.yaml"}
 
 
@@ -306,8 +306,10 @@ LONG = {"dense": "cpt_dense.yaml", "baseline": "arc_gamma_k12_b128_p1024_2k.yaml
 @pytest.mark.parametrize("name", sorted(LONG))
 def test_long_context_evaluations_change_only_the_length_settings(length, tokens, factor, name):
     evaluated, base = effective(f"eval_long{length}_{name}.yaml"), effective(LONG[name])
+    # The base model's dense run keeps its results apart from its 32K ones.
     assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
-        "eval_max_seq_lengths", "niah_benchmark", "benchmark", "limit", "config_overrides", "long_ppl_data"}
+        "eval_max_seq_lengths", "niah_benchmark", "benchmark", "limit", "config_overrides", "long_ppl_data",
+        *(("output_path",) if name == "dense" else ())}
     assert evaluated["eval_max_seq_lengths"] == [tokens]
     assert evaluated["benchmark"].split(",")[:2] == [f"babilong_{length}", "long_ppl_32k" if length == "64k" else
                                                      "long_ppl_128k"]

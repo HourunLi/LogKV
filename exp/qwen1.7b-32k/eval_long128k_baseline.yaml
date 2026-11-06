@@ -3,7 +3,7 @@
 # 注意力温度 0.1·ln(factor)+1）；block_size 留出生成的余量。
 # NIAH 阶段：完整 RULER（13 个任务）在 128k；主阶段：BABILong qa1-5 与长文档困惑度（long_ppl_128k，
 # 文档的最后 4096 个 token），每个任务 100 条。困惑度的数据由 long_ppl_data 或环境变量 LONG_PPL_DATA 给出
-# （留出的 ProLong parquet 文件或目录）。要加 LongBench v2：bash eval.sh <本文件> babilong_128k,long_ppl_128k,longbench2
+# （PG19 测试集：fetch_long_eval_data.py --ppl-hub emozilla/pg19-test 打印的路径）。要加 LongBench v2：bash eval.sh <本文件> babilong_128k,long_ppl_128k,longbench2
 #   bash eval.sh exp/qwen1.7b-32k/eval_long128k_baseline.yaml
 config: arc_gamma_k12_b128_p1024_2k.yaml
 eval_max_seq_lengths: [131072]
