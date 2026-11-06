@@ -1,11 +1,12 @@
-# 长文本评测（只评测、不重训）：dense CPT（全 KV，上限），评测长度 64k。
+# 长文本评测（只评测、不重训）：原始 Qwen3-1.7B-Base，dense（全 KV，未经 CPT；作为不压缩的参照），评测长度 64k。
 # 模型只训到 32K，RoPE 用 YaRN 拉长 2 倍（与 Qwen 的 rope_scaling 相同：factor、原长 32768，
 # 注意力温度 0.1·ln(factor)+1）；block_size 留出生成的余量。
 # NIAH 阶段：完整 RULER（13 个任务）在 64k；主阶段：BABILong qa1-5 与长文档困惑度（long_ppl_32k、long_ppl_64k，
 # 文档的最后 4096 个 token），每个任务 100 条。困惑度的数据由 long_ppl_data 或环境变量 LONG_PPL_DATA 给出
-# （留出的 ProLong parquet 文件或目录）。要加 LongBench v2：bash eval.sh <本文件> babilong_64k,long_ppl_32k,long_ppl_64k,longbench2
+# （PG19 测试集：fetch_long_eval_data.py --ppl-hub emozilla/pg19-test 打印的路径）。要加 LongBench v2：bash eval.sh <本文件> babilong_64k,long_ppl_32k,long_ppl_64k,longbench2
 #   bash eval.sh exp/qwen1.7b-32k/eval_long64k_dense.yaml
-config: cpt_dense.yaml
+config: dense_niah_base.yaml
+output_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-new/dense_niah_base_eval/long64k
 eval_max_seq_lengths: [65536]
 niah_benchmark: [niah_single_1, niah_single_2, niah_single_3, niah_multikey_1, niah_multikey_2, niah_multikey_3,
   niah_multivalue, niah_multiquery, ruler_vt, ruler_cwe, ruler_fwe, ruler_qa_squad, ruler_qa_hotpot]
