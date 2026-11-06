@@ -427,6 +427,8 @@ from litgpt.kv_compression import cache_compression_snapshot, summarize_compress
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
 from litgpt.ruler_patch import apply_patch
 apply_patch()
+from litgpt.longbench2_patch import apply_patch as apply_longbench2_patch  # noqa: E402
+apply_longbench2_patch()
 
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 

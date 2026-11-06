@@ -217,3 +217,34 @@ def test_the_fetch_script_caches_the_ppl_documents_the_tasks_read(tmp_path, monk
         (copy / f.name).write_bytes(f.read_bytes())
     key = utils.cache_key(str(tmp_path / "heldout.parquet"), str(copy), 1, False)
     assert (tmp_path / "cache" / f"{key}.json").is_file()
+
+
+def test_longbench2_subsets_come_from_the_snapshot_files_when_the_card_has_no_configs(tmp_path, monkeypatch):
+    import datasets
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from litgpt import longbench2_patch as patch
+
+    files = ["academic_single/train-00000.parquet", "data/academic_multi-00000-of-00001.parquet",
+             "legal_single.jsonl", "README.md"]
+    assert patch.subset_files(files, "academic_single") == ["academic_single/train-00000.parquet"]
+    assert patch.subset_files(files, "academic_multi") == ["data/academic_multi-00000-of-00001.parquet"]
+    assert patch.subset_files(files, "legal_single") == ["legal_single.jsonl"] and not patch.subset_files(files, "legal")
+    (tmp_path / "academic_single").mkdir()
+    pq.write_table(pa.table({"question": ["q1", "q2"], "answer": [0, 1]}), tmp_path / "academic_single" / "train-0.parquet")
+    pq.write_table(pa.table({"question": ["other"], "answer": [2]}), tmp_path / "multinews.parquet")
+    monkeypatch.setattr(patch, "snapshot", lambda: (str(tmp_path), ["academic_single/train-0.parquet", "multinews.parquet"]))
+    original = datasets.load_dataset
+
+    def no_configs(path=None, name=None, *args, **kwargs):
+        if path == patch.REPO:
+            raise ValueError(f"BuilderConfig '{name}' not found. Available: ['default']")
+        return original(path, name, *args, **kwargs)
+    monkeypatch.setattr(datasets, "load_dataset", no_configs)
+    patch.apply_patch()
+    loaded = datasets.load_dataset(path=patch.REPO, name="academic_single")  # as lm-eval's task calls it
+    assert loaded["train"]["question"] == ["q1", "q2"]
+    assert datasets.load_dataset(patch.REPO, name="multinews", split="train")["question"] == ["other"]
+    with pytest.raises(ValueError, match="no file"):
+        datasets.load_dataset(patch.REPO, name="table_qa")

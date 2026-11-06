@@ -32,6 +32,7 @@ import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 BABILONG = "RMT-team/babilong-1k-samples"
 BABILONG_LENGTHS = ("32k", "64k", "128k")
 QA_SPLITS = tuple(f"qa{i}" for i in range(1, 6))
@@ -73,21 +74,41 @@ def fetch_ruler_qa(lines: list[str]) -> None:
         lines.append(f"RULER QA {name}: {path} ({path.stat().st_size / 1e6:.1f} MB)")
 
 
-def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> list[tuple[str, str, str]]:
+def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> tuple[list[tuple[str, str, str]], bool]:
+    """Each dataset group in turn; a group that fails is reported and the others still run."""
     import datasets
 
-    loads = [(BABILONG, n, s) for n in BABILONG_LENGTHS for s in QA_SPLITS] if babilong else []
+    from litgpt.longbench2_patch import apply_patch, snapshot
+
+    apply_patch()  # as eval.py: LongBench v2 subsets from the snapshot's files when the card has no configs
+    groups = []
+    if babilong:
+        groups.append(("BABILong", [(BABILONG, n, s) for n in BABILONG_LENGTHS for s in QA_SPLITS]))
     if longbench2:
-        loads += [(LONGBENCH2, name, "train") for name in longbench2_subsets()]
-    for path, name, split in loads:
-        rows = len(datasets.load_dataset(path, name=name, split=split))
-        lines.append(f"{path} {name} {split}: {rows} rows")
-    return loads
+        groups.append(("LongBench v2", [(LONGBENCH2, name, "train") for name in longbench2_subsets()]))
+    loads, ok = [], True
+    for label, group in groups:
+        try:
+            if label == "LongBench v2":
+                root, files = snapshot()
+                lines.append(f"LongBench v2 snapshot {root}: {len(files)} data files, e.g. {files[:4]}")
+            for path, name, split in group:
+                rows = len(datasets.load_dataset(path, name=name, split=split))
+                lines.append(f"{path} {name} {split}: {rows} rows")
+            loads += group
+        except Exception as error:  # noqa: BLE001 - report and go on with the next group
+            ok = False
+            lines.append(f"{label}: FAILED {type(error).__name__}: {str(error)[:1500]}")
+    return loads, ok
 
 
 def check_offline(loads, lines: list[str]) -> bool:
-    """Load every dataset again with the offline switches eval.sh sets, in a fresh process."""
+    """Load every dataset again with the offline switches eval.sh sets (and its LongBench v2 patch), in a
+    fresh process."""
     script = ("import datasets, json, sys\n"
+              f"sys.path.insert(0, {str(ROOT)!r})\n"
+              "from litgpt.longbench2_patch import apply_patch\n"
+              "apply_patch()\n"
               "for path, name, split in json.loads(sys.argv[1]):\n"
               "    datasets.load_dataset(path, name=name, split=split)\n"
               "print('ok')\n")
@@ -127,15 +148,24 @@ def main():
     lines = [f"HF_HOME={os.environ.get('HF_HOME')}", f"HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE')}",
              f"RULER_CACHE_DIR={ruler_cache_dir()}"]
     ok = True
+    if args.ppl_data and not args.tokenizer:
+        raise SystemExit("--ppl-data needs --tokenizer (the dir with tokenizer.json)")
     if not args.no_ruler_qa:
-        fetch_ruler_qa(lines)
-    loads = fetch_datasets(not args.no_babilong, args.longbench2, lines)
+        try:
+            fetch_ruler_qa(lines)
+        except Exception as error:  # noqa: BLE001
+            ok = False
+            lines.append(f"RULER QA: FAILED {type(error).__name__}: {error}")
+    loads, fetched = fetch_datasets(not args.no_babilong, args.longbench2, lines)
+    ok = ok and fetched
     if loads:
-        ok = check_offline(loads, lines)
+        ok = check_offline(loads, lines) and ok
     if args.ppl_data:
-        if not args.tokenizer:
-            raise SystemExit("--ppl-data needs --tokenizer (the dir with tokenizer.json)")
-        cache_ppl(args.ppl_data, args.tokenizer, lines)
+        try:
+            cache_ppl(args.ppl_data, args.tokenizer, lines)
+        except Exception as error:  # noqa: BLE001
+            ok = False
+            lines.append(f"long_ppl: FAILED {type(error).__name__}: {error}")
     text = "\n".join(lines)
     out = Path(args.out).expanduser()
     out.with_name(out.stem + ".summary.txt").write_text(text + "\n")

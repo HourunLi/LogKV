@@ -1,0 +1,71 @@
+"""LongBench v2 by subset when recursal/longbench-v2 exposes no per-subset configs.
+
+lm-eval's longbench2 tasks load ``datasets.load_dataset("recursal/longbench-v2", "<subset>")``; when the
+dataset card defines no configs, datasets only offers "default" (all 20 files) and every task fails with
+"BuilderConfig '<subset>' not found". This patch keeps the normal call and, when it fails, reads the
+subset's files from the repository snapshot instead (downloaded online, or from the hub cache when
+HF_HUB_OFFLINE=1): a file belongs to the subset when its stem or its folder is the subset's name, or its
+stem starts with the name and "-" or ".". Applied by eval.py; unused/fetch_long_eval_data.py uses it to
+fetch and check the same files.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+REPO = "recursal/longbench-v2"
+BUILDERS = {".parquet": "parquet", ".jsonl": "json", ".json": "json", ".csv": "csv", ".arrow": "arrow"}
+
+
+def subset_files(files, name: str) -> list[str]:
+    """The data files (paths relative to the snapshot) of subset ``name``."""
+    chosen = []
+    for f in files:
+        path = Path(f)
+        if path.suffix not in BUILDERS:
+            continue
+        stem = path.name[:-len(path.suffix)]
+        if stem == name or path.parent.name == name or stem.startswith((name + "-", name + ".")):
+            chosen.append(f)
+    return sorted(chosen)
+
+
+def snapshot() -> tuple[str, list[str]]:
+    """The repository snapshot's folder and data files (offline: the hub cache only)."""
+    from huggingface_hub import snapshot_download
+
+    root = snapshot_download(REPO, repo_type="dataset", local_files_only=os.environ.get("HF_HUB_OFFLINE") == "1")
+    files = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*") if p.is_file() and p.suffix in BUILDERS)
+    return root, files
+
+
+def load_subset(load, name: str, split=None):
+    root, files = snapshot()
+    chosen = subset_files(files, name)
+    if not chosen:
+        raise ValueError(f"no file of {REPO} matches subset {name!r}; its data files: {files}")
+    builder = BUILDERS[Path(chosen[0]).suffix]
+    data = load(builder, data_files={"train": [os.path.join(root, f) for f in chosen]})
+    return data[split] if split else data
+
+
+def apply_patch() -> None:
+    import datasets
+
+    original = datasets.load_dataset
+    if getattr(original, "_longbench2_patched", False):
+        return
+
+    def load_dataset(path=None, name=None, *args, **kwargs):
+        if path != REPO or not name:
+            return original(path, name, *args, **kwargs)
+        try:
+            return original(path, name, *args, **kwargs)
+        except Exception as error:  # no such config (online), or no cache for it (offline)
+            try:
+                return load_subset(original, name, kwargs.get("split"))
+            except Exception as fallback:
+                raise fallback from error
+
+    load_dataset._longbench2_patched = True
+    datasets.load_dataset = load_dataset

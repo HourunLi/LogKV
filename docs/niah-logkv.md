@@ -275,7 +275,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   （`eval_tasks/babilong_long`，任务名带长度：`babilong_qa1_64k` 等，组 `babilong_{32k,64k,128k}`；提示、示例与打分同 lm-eval
   的 `babilong_qaN`；数据 `RMT-team/babilong-1k-samples`，环境变量 `BABILONG_DATASET` 可指向本地副本）；LongBench v2
   （lm-eval 的 `longbench2`，数据 `recursal/longbench-v2`，四选一按似然打分，每题四次预填充；长于 block_size 的上下文
-  从开头截断，保留问题）。
+  从开头截断，保留问题。数据集卡片没有按子集的配置时，`litgpt/longbench2_patch.py` 改从仓库快照里按文件名读出该子集）。
 - 数据：`eval.sh` 离线运行（`HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`），新数据要先在联网时放进它读的缓存：
   `bash diag.sh unused/fetch_long_eval_data.py [--longbench2] [--ppl-data <留出数据> --tokenizer <tokenizer 目录>]`
   用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k）、
