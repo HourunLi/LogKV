@@ -14,6 +14,11 @@ switches off for itself only, then:
 and finally loads every dataset again in an offline subprocess, as eval.py will. A summary goes to
 <--out>.summary.txt beside --out (default fetch_long_eval_data.json in the current directory).
 
+The platform's proxy re-signs HTTPS with a self-signed CA, so certificate checks are off unless --verify-ssl
+is given (as litgpt/ruler_patch.py does for RULER); downloads then stay on requests, without hf_transfer or
+hf_xet, which check certificates themselves. hf-mirror answers 429 when the Hub quota it shares across its users
+runs out; every request waits and retries then.
+
     bash diag.sh unused/fetch_long_eval_data.py --longbench2 \\
         --ppl-data <held-out ProLong parquet file or directory> --tokenizer <Qwen3-1.7B-Base dir>
 """
@@ -24,6 +29,9 @@ import os
 # Before any Hugging Face import: these are read when the libraries load.
 os.environ["HF_HUB_OFFLINE"] = "0"
 os.environ["HF_DATASETS_OFFLINE"] = "0"
+# The mirror can pause mid-file for longer than the Hub's 10 s default read timeout.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 
 import argparse  # noqa: E402
 import json  # noqa: E402
@@ -41,6 +49,37 @@ RULER_QA = {
     "https://rajpurkar.github.io/SQuAD-explorer/dataset/dev-v2.0.json": "dev-v2.0.json",
     "http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json": "hotpot_dev_distractor_v1.json",
 }
+
+
+def patch_requests(verify_ssl: bool, retries: int = 10) -> None:
+    """Every requests call (RULER QA, and the Hub API calls and files of datasets) retries a 429 after its
+    Retry-After (60 s without one, at most 300 s), and skips certificate checks unless verify_ssl. Call before
+    any Hugging Face import: without the checks, hf_transfer and hf_xet are switched off when the Hub loads."""
+    import time
+
+    import requests
+    import urllib3
+
+    if not verify_ssl:
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    request = requests.Session.request
+
+    def patched_request(self, *args, **kwargs):
+        if not verify_ssl:
+            kwargs["verify"] = False
+        for attempt in range(retries + 1):
+            response = request(self, *args, **kwargs)
+            if response.status_code != 429 or attempt == retries:
+                return response
+            wait = response.headers.get("Retry-After", "")
+            wait = min(int(wait), 300) if wait.isdigit() else 60
+            print(f"429 rate limit on {response.url}; retry {attempt + 1}/{retries} in {wait} s", file=sys.stderr)
+            response.close()
+            time.sleep(wait)
+
+    requests.Session.request = patched_request
 
 
 def longbench2_subsets() -> list[str]:
@@ -144,9 +183,12 @@ def main():
     p.add_argument("--ppl-data", default=None, help="held-out ProLong parquet / jsonl file or directory")
     p.add_argument("--tokenizer", default=None, help="tokenizer dir for --ppl-data (e.g. the Qwen3-1.7B-Base dir)")
     p.add_argument("--out", default="fetch_long_eval_data.json")
+    p.add_argument("--verify-ssl", action="store_true", help="keep HTTPS certificate checks (off by default)")
     args = p.parse_args()
+    patch_requests(args.verify_ssl)
     lines = [f"HF_HOME={os.environ.get('HF_HOME')}", f"HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE')}",
-             f"RULER_CACHE_DIR={ruler_cache_dir()}"]
+             f"RULER_CACHE_DIR={ruler_cache_dir()}",
+             f"HTTPS certificate checks: {'on' if args.verify_ssl else 'off (--verify-ssl turns them on)'}"]
     ok = True
     if args.ppl_data and not args.tokenizer:
         raise SystemExit("--ppl-data needs --tokenizer (the dir with tokenizer.json)")
