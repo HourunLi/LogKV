@@ -248,3 +248,34 @@ def test_longbench2_subsets_come_from_the_snapshot_files_when_the_card_has_no_co
     assert datasets.load_dataset(patch.REPO, name="multinews", split="train")["question"] == ["other"]
     with pytest.raises(ValueError, match="no file"):
         datasets.load_dataset(patch.REPO, name="table_qa")
+
+
+def test_the_fetch_script_skips_certificate_checks_and_waits_out_rate_limits(monkeypatch):
+    import importlib.util
+    import io
+
+    import requests
+
+    calls, waits = [], []
+
+    def record(self, method, url, **kwargs):
+        calls.append(kwargs)
+        response = requests.Response()
+        response.status_code, response.raw = (429 if len(calls) < 3 else 200), io.BytesIO()
+        response.headers["Retry-After"] = "7"
+        return response
+
+    # Restored after the test: Session.request (with the script's wrapper), the variables it sets, time.sleep.
+    monkeypatch.setattr(requests.Session, "request", record)
+    monkeypatch.setattr(os, "environ", {k: v for k, v in os.environ.items() if not k.startswith("HF_HUB_")})
+    monkeypatch.setattr("time.sleep", waits.append)
+    path = ROOT / "unused" / "fetch_long_eval_data.py"
+    spec = importlib.util.spec_from_file_location("fetch_long_eval_data_ssl", path)
+    fetch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetch)
+    fetch.patch_requests(verify_ssl=False)
+    # huggingface_hub's sessions go through Session.request too.
+    assert requests.get("https://hf-mirror.com/x", timeout=5).status_code == 200
+    assert waits == [7, 7] and all(c["verify"] is False and c["timeout"] == 5 for c in calls)
+    assert os.environ["HF_HUB_ENABLE_HF_TRANSFER"] == "0" and os.environ["HF_HUB_DISABLE_XET"] == "1"
+    assert os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] == "300"

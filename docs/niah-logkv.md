@@ -281,6 +281,9 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k）、
   RULER 问答的 SQuAD 与 HotpotQA（`litgpt/ruler_patch.py` 先读的本地文件）与可选的 LongBench v2，再以离线方式重新加载
   一遍；给了 `--ppl-data` 时还选出困惑度的文档并写入它的缓存（缓存键按 tokenizer 文件内容，与用哪个路径指向它无关）。
+  平台代理用自签证书重签 HTTPS，脚本默认不校验证书（同 `litgpt/ruler_patch.py`），下载只走 requests、不用 hf_transfer / hf_xet，
+  `--verify-ssl` 恢复校验；Hub 下载的读超时默认放宽到 300 秒（`HF_HUB_DOWNLOAD_TIMEOUT` 可覆盖）。hf-mirror 的共享 Hub 限额
+  用完时返回 429，每个请求按 `Retry-After`（没有时 60 秒）等待后重试，最多 10 次。
 - 配置：`eval_long{64k,128k}_{dense,baseline,word_first}.yaml`，分别是 dense CPT、同 checkpoint 的 K/V 准入基线与 `word_first`，
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER，主阶段跑 BABILong 与困惑度（64K 配置为 32K 与 64K，128K 配置为
   128K），每个任务 100 条。`babilong_dataset` 与 `long_ppl_data` 两个键（或同名环境变量）给出本地数据。
