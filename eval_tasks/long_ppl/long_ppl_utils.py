@@ -14,10 +14,12 @@ every node when HF_HOME is, else ~/.cache/logkv_long_ppl).
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 
 import datasets
@@ -121,7 +123,10 @@ def _documents(kwargs) -> list[list[int]]:
     key = cache_key(source, name, count, concat)
     cache = cache_dir() / f"{key}.json"
     if cache.is_file():
-        return json.loads(cache.read_text())
+        try:
+            return json.loads(cache.read_text())
+        except ValueError:  # another rank is still copying it (see below): build it here too
+            pass
     docs = select_documents(source, tokenizer, count, concat)
     if not docs:
         raise ValueError(f"no document of {LONGEST} tokens or more in {source!r}; if its rows are pieces of longer "
@@ -129,7 +134,12 @@ def _documents(kwargs) -> list[list[int]]:
     cache.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(docs))
-    os.replace(tmp, cache)  # several ranks may build it at once
+    try:
+        os.replace(tmp, cache)  # several ranks may build it at once
+    except OSError:  # a bucket mount (OBS) refuses the rename: copy the complete file over, then drop it
+        shutil.copyfile(tmp, cache)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
     return docs
 
 

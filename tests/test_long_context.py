@@ -169,6 +169,19 @@ def test_long_ppl_scores_the_tail_of_the_same_long_documents(tmp_path, monkeypat
     longer = utils.build(48, {"pretrained": word_tokenizer})["test"]
     assert longer[0]["continuation"].split() == words[40:48]  # the same document, more context before the tail
     assert list((tmp_path / "cache").iterdir())  # the selection is cached
+    # A bucket mount refuses the rename: the cache is copied into place instead.
+    monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "bucket"))
+
+    def refuse(src, dst):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(utils.os, "replace", refuse)
+    assert utils.build(32, {"pretrained": word_tokenizer})["test"]["continuation"] == rows["continuation"]
+    assert [f.suffix for f in (tmp_path / "bucket").iterdir()] == [".json"]
+    monkeypatch.undo()
+    monkeypatch.setattr(utils, "LONGEST", 64)
+    monkeypatch.setattr(utils, "TAIL", 8)
+    monkeypatch.setenv("LONG_PPL_DATA", str(tmp_path))
+    monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache"))
     scores = [utils.process_results(row, [(-8. * math.log(4.), False)]) for row in rows]
     assert utils.perplexity([s["ppl"] for s in scores]) == pytest.approx(4.)
     monkeypatch.setenv("LONG_PPL_DATA", str(tmp_path / "missing"))
