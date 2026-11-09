@@ -115,3 +115,72 @@ def test_a_single_length_yaml_runs_as_before(tmp_path):
     assert done.returncode == 0, done.stderr
     (out, args, *_rest, log_kv_args), = passes
     assert args == "" and '--config_overrides {"block_size": 66560}' in log_kv_args
+
+
+def _majob_long_eval(tmp_path, context_length, env=None, main=None, niah=None):
+    """majob.sh's post-training long-context block, with torchrun printing its arguments."""
+    source = (ROOT / "majob.sh").read_text()
+    lines = source.splitlines()
+    default = {name: subprocess.run(["bash", "-c", "\n".join(l for l in lines if l.startswith(name + "=")) + f'\necho "${name}"'],
+                                    capture_output=True, text=True).stdout.strip()
+               for name in ("DEFAULT_BENCHMARKS", "DEFAULT_NIAH_BENCHMARKS")}
+    main = default["DEFAULT_BENCHMARKS"].rstrip(",") + ",niah_turns_32k,long_ppl_books_32k" if main is None else main
+    niah = default["DEFAULT_NIAH_BENCHMARKS"] if niah is None else niah
+    block = source[source.index("# 长文本评测（训练后接着跑"):source.index("# 清理 barrier 目录（rank 0 负责）")]
+    config = tmp_path / "train.yaml"
+    config.write_text(f"save_path: /ckpt\ncontext_length: {context_length}\n")
+    stub = f'''fakepython() {{ if [ "$1" = "-m" ]; then printf 'CALL'; printf ' <%s>' "$@"; printf '\\n'; else "{sys.executable}" "$@"; fi; }}
+python() {{ "{sys.executable}" "$@"; }}
+PYTHON_BIN=fakepython
+CONFIG_FILE={config}
+SAVE_DIR=/ckpt
+EVAL_OUTPUT_DIR=/ckpt/evaluate
+NODE_RANK=0; NUM_NODES=1; GPUS_PER_NODE=8; MASTER_ADDR=localhost; EVAL_MASTER_PORT=6001; NIAH_MASTER_PORT=6002
+EVAL_LOG_KV_ARGS="--log_kv_B 128"
+BENCHMARKS="{main}"
+NIAH_BENCHMARKS="{niah}"
+EVAL_MAX_SEQ_LENGTHS='[1024, 2048, 4096, 8192, 16384, 32768]'
+'''
+    environment = {k: v for k, v in os.environ.items()
+                   if k not in ("EVAL_LENGTHS", "EVAL_SUITES", "YARN_MODE", "NIAH_ONLY", "LONG_PPL_DATA", "LONG_PPL_BOOKS")}
+    done = subprocess.run(["bash", "-c", stub + block + 'echo "OPTIONAL=${EVAL_OPTIONAL_TASKS:-}|BOOKS=${LONG_PPL_BOOKS:-}"'],
+                          capture_output=True, text=True, cwd=ROOT, env={**environment, **(env or {})})
+    calls = []
+    for line in done.stdout.splitlines():
+        if line.startswith("CALL"):
+            args = line[len("CALL <"):-1].split("> <")
+            call = {k: args[args.index(k) + 1] for k in ("--benchmark", "--output_path", "--config_overrides",
+                                                         "--limit", "--metadata")}
+            call["--master_port"] = next(a.split("=", 1)[1] for a in args if a.startswith("--master_port="))
+            calls.append(call)
+    return done, calls
+
+
+def test_majob_runs_the_long_passes_after_training(tmp_path):
+    done, calls = _majob_long_eval(tmp_path, 32768, env=dict(LONG_PPL_BOOKS="/books"))
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert [c["--output_path"] for c in calls] == ["/ckpt/evaluate/long32k"] * 2 + [
+        f"/ckpt/evaluate/long{n}" for n in ("64k", "64k", "128k", "128k", "256k", "256k")]
+    # 32K: only what the main line did not measure (its main stage ran the turns and the book curve, its NIAH
+    # stage the eight needles at 32768).
+    assert calls[0]["--benchmark"] == "babilong_32k,long_ppl_32k,longbench2_32k"
+    assert calls[1]["--benchmark"] == "ruler_vt,ruler_cwe,ruler_fwe,ruler_qa_squad,ruler_qa_hotpot"
+    assert calls[2]["--benchmark"] == "babilong_64k,long_ppl_64k,long_ppl_books_64k,niah_turns_64k,longbench2_64k"
+    assert len(calls[7]["--benchmark"].split(",")) == 12 and "ruler_qa_squad" not in calls[7]["--benchmark"]
+    overrides = [json.loads(c["--config_overrides"]) for c in calls[::2]]
+    assert [o["block_size"] for o in overrides] == [33792, 66560, 132096, 263168]
+    assert [o.get("rope_adjustments", {}).get("factor") for o in overrides] == [None, 2., 4., 8.]
+    assert all(c["--limit"] == "100" for c in calls)
+    assert [json.loads(c["--metadata"])["max_seq_lengths"] for c in calls[1::2]] == [[32768], [65536], [131072], [262144]]
+    assert [c["--master_port"] for c in calls[:2]] == ["6001", "6002"]
+    assert "BOOKS=/books" in done.stdout
+
+    done, calls = _majob_long_eval(tmp_path, 4096)
+    assert done.returncode == 0 and not calls and "训练长度 4096 不到 32K" in done.stdout
+    done, calls = _majob_long_eval(tmp_path, 32768, env=dict(EVAL_LENGTHS="none"))
+    assert done.returncode == 0 and not calls and "跳过长文本评测" in done.stdout
+    done, calls = _majob_long_eval(tmp_path, 32768, env=dict(NIAH_ONLY="1", EVAL_LENGTHS="64k"), main="none")
+    assert [c["--benchmark"].split(",")[0] for c in calls] == ["niah_single_1"]
+    done, calls = _majob_long_eval(tmp_path, 32768, env=dict(EVAL_LENGTHS="128k", YARN_MODE="fixed",
+                                                             EVAL_SUITES="turns"))
+    assert [c["--output_path"] for c in calls] == ["/ckpt/evaluate/yarn4/long128k"]

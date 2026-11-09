@@ -695,6 +695,7 @@ if [ ${#LONG_EVAL_PASSES[@]} -eq 0 ]; then
     run_stages
 else
     for PASS in "${LONG_EVAL_PASSES[@]}"; do
+        [ -n "${PASS}" ] || continue
         IFS='|' read -r EVAL_OUTPUT_DIR PASS_OVERRIDES EVAL_MAX_SEQ_LENGTHS BENCHMARKS NIAH_BENCHMARKS PASS_OPTIONAL <<< "${PASS}"
         export EVAL_OPTIONAL_TASKS=${PASS_OPTIONAL}
         PASS_ARGS=(--config_overrides "${PASS_OVERRIDES}")

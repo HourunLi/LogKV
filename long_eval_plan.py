@@ -19,7 +19,10 @@ ruler_qa_squad, whose 1204 SQuAD paragraphs cannot fill it), babilong, ppl (long
 ruler only. With the default suites the data-bound ones (ppl, books) are optional: eval.py leaves them out, with
 the reason, when their data is not given; named suites must run.
 
-    python long_eval_plan.py <lengths> <suites or ""> <yarn_mode> <niah_only 0/1> <base overrides json or ""> <output dir>
+    python long_eval_plan.py <lengths> <suites or ""> <yarn_mode> <niah_only 0/1> <base overrides json or ""> <output dir> [skip]
+
+skip lists what an earlier stage of the same job already measured (majob.sh's main line): a main task by name,
+a RULER task at a length as task@length (e.g. niah_single_1@32768); a pass left with nothing to run is dropped.
 
 prints one line per pass, fields separated by "|": output dir, config overrides (json), RULER lengths (json),
 main tasks, NIAH tasks (comma lists, or none), optional tasks.
@@ -66,7 +69,7 @@ def overrides_for(length: int, factor: float, base: dict) -> dict:
 
 
 def plan(lengths: str, suites: str = "", yarn_mode: str = "per_length", niah_only: bool = False,
-         base_overrides: dict | None = None, output_dir: str = "") -> list[dict]:
+         base_overrides: dict | None = None, output_dir: str = "", skip=()) -> list[dict]:
     names = parse_list(lengths, tuple(LENGTHS), "EVAL_LENGTHS")
     chosen = parse_list(suites, SUITES, "EVAL_SUITES") if suites else list(SUITES)
     if yarn_mode not in ("per_length", "fixed"):
@@ -78,9 +81,12 @@ def plan(lengths: str, suites: str = "", yarn_mode: str = "per_length", niah_onl
     for name in names:
         length = LENGTHS[name]
         factor = (length if yarn_mode == "per_length" else longest) / ORIGINAL
-        main = [t for s in chosen if s != "ruler" for t in tasks(s, name)]
-        niah = [t for t in RULER if length <= SQUAD_MAX or t != "ruler_qa_squad"] if "ruler" in chosen else []
-        optional = [t for s in chosen if s in DATA_SUITES and not suites for t in tasks(s, name)]
+        main = [t for s in chosen if s != "ruler" for t in tasks(s, name) if t not in skip]
+        niah = [t for t in RULER if (length <= SQUAD_MAX or t != "ruler_qa_squad") and f"{t}@{length}" not in skip] \
+            if "ruler" in chosen else []
+        if not main and not niah:
+            continue
+        optional = [t for s in chosen if s in DATA_SUITES and not suites for t in tasks(s, name) if t in main]
         folder = f"long{name}" if yarn_mode == "per_length" else f"yarn{factor:g}/long{name}"
         passes.append(dict(length=length, name=name, factor=factor, ruler_lengths=[length], main=main, niah=niah,
                            optional=optional, config_overrides=overrides_for(length, factor, base_overrides or {}),
@@ -89,9 +95,10 @@ def plan(lengths: str, suites: str = "", yarn_mode: str = "per_length", niah_onl
 
 
 def main(argv: list[str]) -> None:
-    lengths, suites, yarn_mode, niah_only, base, output_dir = argv
+    lengths, suites, yarn_mode, niah_only, base, output_dir, *rest = argv
+    skip = {t for t in (rest[0] if rest else "").split(",") if t}
     for p in plan(lengths, suites, yarn_mode or "per_length", niah_only == "1",
-                  json.loads(base) if base else {}, output_dir):
+                  json.loads(base) if base else {}, output_dir, skip):
         print("|".join([p["output_dir"], json.dumps(p["config_overrides"]), json.dumps(p["ruler_lengths"]),
                          ",".join(p["main"]) or "none", ",".join(p["niah"]) or "none", ",".join(p["optional"])]))
 

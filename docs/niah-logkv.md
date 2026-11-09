@@ -334,6 +334,12 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   每档换一次窗口与 YaRN，要重新加载模型（约一分钟）。注意 `long_ppl_32k` 在这里是 32K 档（不用 YaRN）测的，在
   `eval_long64k_*.yaml` 里是 64K 配置（YaRN 2）测的；32K 档的 8 个捞针任务写进 32K 主线的同名列，其余 5 个 RULER 任务、
   `AVG_RULER@32k` 与 `LongBench2@32k` 是新加的列。按长度拆开的 `eval_long{64k,128k,256k}_*.yaml` 保留，用于复现已有结果。
+- 训练后自动跑：`majob.sh` 在主评测与 NIAH 阶段之后，用训练 YAML 的缓存设置对刚训好的 checkpoint 跑同样的逐档评测
+  （长度默认 YAML 的 `eval_lengths`，否则 32K–256K 全部；`EVAL_LENGTHS=none` 关闭，`EVAL_SUITES`、`YARN_MODE`、`NIAH_ONLY` 同上），
+  每个任务 `LONG_EVAL_LIMIT`（默认 100）条，结果写到 `evaluate/long<L>`。主线已经测过的不再重测（主评测的任务、NIAH 阶段在各自
+  长度上的捞针，`long_eval_plan.py` 的 skip），所以 32K 档只补 BABILong、`long_ppl_32k`、LongBench v2 与其余 5 个 RULER 任务，
+  主线 500 条的 32K 捞针不会被 100 条的结果覆盖。训练长度（`context_length`）不到 32K 的 checkpoint 跳过：长文本的 YaRN 以 32K
+  为原长。数据取环境变量 `LONG_PPL_DATA`、`LONG_PPL_BOOKS`、`BABILONG_DATASET`，或 YAML 的同名小写键。
 - 配置：`eval_long{64k,128k,256k}_{dense,baseline,word_first}.yaml`，分别是原始 Qwen3-1.7B-Base 的 dense（未经 CPT，继承
   `dense_niah_base.yaml`，结果写到其 `long64k` / `long128k` / `long256k` 子目录）、同 checkpoint 的 K/V 准入基线与 `word_first`，
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER（256K 为上面的 12 个），主阶段跑 BABILong 与困惑度（64K 配置为 32K
