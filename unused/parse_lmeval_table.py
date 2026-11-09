@@ -1,7 +1,15 @@
+"""Export eval.py JSON or console tables to CSV/XLSX; --help lists input formats."""
+import argparse
+import csv
+import json
+from pathlib import Path
+import sys
+
 import pandas as pd
-import numpy as np
-import io
-import re
+
+# Direct script invocation should not import litgpt (and therefore Torch/CUDA).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from eval_results import RESULT_COLUMNS, markdown_rows, result_rows
 
 # 把你的各个模型的原始输出放在这里。这里以 Model_A 为例（填入你提供的原数据）
 model_outputs = {
@@ -506,56 +514,158 @@ DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words",
 # ==============================================================================
 # 3. 解析与计算核心代码
 # ==============================================================================
-def parse_single_model(model_name, markdown_text):
-    lines = [line for line in markdown_text.strip().split('\n') if not line.strip().startswith('|---')]
-    if not lines: return {"Model": model_name}
-    
-    df = pd.read_csv(io.StringIO('\n'.join(lines)), sep='|')
-    df = df.iloc[:, 1:-1]
-    df.columns = df.columns.str.strip()
-    for col in df.columns:  # text columns (object, or pandas 3's string dtype)
-        if not pd.api.types.is_numeric_dtype(df[col]): df[col] = df[col].astype(str).str.strip()
-    
-    df['Tasks'] = df['Tasks'].replace('', np.nan).ffill()
-    row_data = {"Model": model_name}
-    
-    for _, row in df.iterrows():
-        raw_task = re.sub(r"^-\s*", "", str(row['Tasks']))  # a group's subtasks are listed as " - name"
-        metric = row['Metric']
-        value = row['Value']
+# lm-eval versions may emit both `score` and a task-specific metric, or only the latter.
+LB_METRICS = {
+    "gov_report": "rouge_score", "hotpotqa": "qa_f1_score", "lcc": "code_sim_score",
+    "qasper": "qa_f1_score", "multifieldqa_zh": "qa_f1_zh_score", "multifieldqa_en": "qa_f1_score",
+    "musique": "qa_f1_score", "narrativeqa": "qa_f1_score", "passage_count": "count_score",
+    "passage_retrieval_en": "retrieval_score", "passage_retrieval_zh": "retrieval_zh_score",
+    "repobench-p": "code_sim_score", "samsum": "rouge_score", "triviaqa": "qa_f1_score",
+    "trec": "classification_score", "lsht": "classification_score", "multi_news": "rouge_score",
+    "qmsum": "rouge_score", "dureader": "rouge_zh_score", "2wikimqa": "qa_f1_score", "vcsum": "rouge_zh_score",
+}
+AVG_GROUPS["AVG_LBe_wo"] = [t for t in AVG_GROUPS["AVG_LBe"] if t not in
+                           {"lcc_e", "repobench-p_e", "passage_count_e", "passage_retrieval_en_e"}]
+META_COLUMNS = ["Model", "Source", "Checkpoint", "ContextLimit"]
 
-        target_task = RAW_TO_TARGET_MAP.get(raw_task, raw_task)
-        expected_metric = TARGET_METRIC_MAP.get(target_task)
-        if target_task in LONG_RULER and metric in LONG_LENGTHS:  # RULER at 64K / 128K / 256K
-            try:
-                row_data[f"{target_task}@{LONG_LENGTHS[metric]}"] = float(value)
-            except ValueError:
-                pass
+
+def length_label(length):
+    length = int(length)
+    return f"{length // 1024}k" if length % 1024 == 0 else str(length)
+
+
+def wide_row(model_name, records):
+    row, priorities = {"Model": model_name}, {}
+    for record in records:
+        # The detailed export retains every filter; the historical comparison uses `none`.
+        if record["filter"] != "none":
             continue
+        task, metric, value = record["dataset"], record["metric"], record["value"]
+        target = RAW_TO_TARGET_MAP.get(task, task)
+        if task.startswith(("niah_", "ruler_")) and metric.isdigit():
+            row[f"{task}@{length_label(metric)}"] = value
+        expected = TARGET_METRIC_MAP.get(target)
+        priority = 2 if metric == expected else 0
+        if task.startswith("longbench_"):
+            name = task.removeprefix("longbench_").removesuffix("_e")
+            if metric == LB_METRICS.get(name):
+                priority = max(priority, 1)
+        if priority and priority > priorities.get(target, 0):
+            row[target], priorities[target] = value, priority
+    return row
 
-        if expected_metric and metric == expected_metric:
-            try:
-                row_data[target_task] = float(value)
-            except ValueError:
-                pass # 忽略非数字
-    return row_data
 
-# 1. 组合数据为 DataFrame
-final_df = pd.DataFrame([parse_single_model(m, text) for m, text in model_outputs.items()])
-final_df = final_df.reindex(columns=['Model'] + ORDERED_COLUMNS) # 对齐格式
+def parse_single_model(model_name, markdown_text):
+    return wide_row(model_name, markdown_rows(markdown_text))
 
-# 2. ================= 自动计算各组平均值 =================
-for avg_col, sub_tasks in AVG_GROUPS.items():
-    # 选出有实际成绩的列，利用 pd.to_numeric 把可能混入的字符转为 NaN 并求均值
-    valid_cols = [t for t in sub_tasks if t in final_df.columns]
-    final_df[avg_col] = final_df[valid_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
 
-# 计算全局汇总平均 AVG_all (综合所有分组子任务的基础列)
-all_base_tasks = list(set([task for group, group_tasks in AVG_GROUPS.items() if group not in DIAGNOSTIC_GROUPS
-                           for task in group_tasks]))
-valid_base_tasks = [t for t in all_base_tasks if t in final_df.columns]
-final_df['AVG_all'] = final_df[valid_base_tasks].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
+def build_table(rows, compact=False):
+    frame = pd.DataFrame(rows)
+    extra = sorted(set(frame.columns) - set(META_COLUMNS + ORDERED_COLUMNS))
+    frame = frame.reindex(columns=META_COLUMNS + ORDERED_COLUMNS + extra)
+    for name, tasks in AVG_GROUPS.items():
+        values = frame.reindex(columns=tasks).apply(pd.to_numeric, errors="coerce")
+        counts = values.count(axis=1)
+        mean = values.mean(axis=1).round(4)
+        # A missing RULER/BABILong task must not silently become a complete benchmark score.
+        if name in DIAGNOSTIC_GROUPS:
+            mean = mean.where(counts == len(tasks))
+        frame[name] = mean
+        frame[f"{name}_n"] = counts
+    base_tasks = sorted({t for group, tasks in AVG_GROUPS.items() if group not in DIAGNOSTIC_GROUPS for t in tasks})
+    values = frame.reindex(columns=base_tasks).apply(pd.to_numeric, errors="coerce")
+    frame["AVG_all"] = values.mean(axis=1).round(4)
+    frame["AVG_all_n"] = values.count(axis=1)
+    if compact:
+        frame = frame.dropna(axis=1, how="all")
+        frame = frame.drop(columns=[c for c in frame if c.endswith("_n") and (frame[c] == 0).all()])
+    return frame.fillna("")
 
-# 3. 清理空白，输出剪贴板友好格式
-final_df = final_df.fillna("")
-print(final_df.to_csv(sep=',', index=False))
+
+def read_input(path):
+    text = path.read_text(encoding="utf-8-sig")
+    if path.suffix.lower() == ".json":
+        payload = json.loads(text)
+        records = result_rows(payload)
+        meta = {"Checkpoint": payload.get("checkpoint_dir"),
+                "ContextLimit": payload.get("model_max_seq_length") or
+                (payload.get("config_overrides") or {}).get("block_size")}
+        # Raw harness cache files do not necessarily contain model configuration.
+        return records, {k: v for k, v in meta.items() if v is not None}
+    return list(markdown_rows(text)), {}
+
+
+def collect_inputs(specs):
+    grouped, metadata, sources, seen, details = {}, {}, {}, {}, []
+    for label, path in specs:
+        records, meta = read_input(path)
+        if not records:
+            raise ValueError(f"{path}: no numeric evaluation results found")
+        grouped.setdefault(label, [])
+        metadata.setdefault(label, {})
+        sources.setdefault(label, [])
+        seen.setdefault(label, {})
+        for key, value in meta.items():
+            if key in metadata[label] and metadata[label][key] != value:
+                raise ValueError(f"{label}: conflicting {key}; use separate labels for different runs")
+            metadata[label][key] = value
+        for record in records:
+            identity = (record["dataset"], record["metric"], record["filter"])
+            if identity in seen[label]:
+                raise ValueError(f"{label}: duplicate result {identity} in {path}; use separate labels for reruns")
+            seen[label][identity] = path
+            grouped[label].append(record)
+            details.append({"Model": label, "Source": str(path), **meta, **record})
+        sources[label].append(str(path))
+    rows = [{**wide_row(label, records), **metadata[label], "Source": " ; ".join(sources[label])}
+            for label, records in grouped.items()]
+    return rows, details
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("files", nargs="*", type=Path, help="JSON/log files; one row per file")
+    parser.add_argument("--input", action="append", default=[], metavar="LABEL=PATH",
+                        help="repeat a label to join complementary main/NIAH outputs; duplicates are rejected")
+    parser.add_argument("-o", "--output", type=Path, help=".csv or .xlsx; default: CSV on stdout")
+    parser.add_argument("--long-output", type=Path, help="CSV with every task, metric, filter, length and stderr")
+    parser.add_argument("--compact", action="store_true", help="omit empty columns")
+    args = parser.parse_args(argv)
+    specs = [(str(path), path) for path in args.files]
+    for item in args.input:
+        label, sep, filename = item.partition("=")
+        if not sep or not label or not filename:
+            parser.error("--input expects LABEL=PATH")
+        specs.append((label, Path(filename)))
+    try:
+        if specs:
+            rows, details = collect_inputs(specs)
+        else:
+            rows = [parse_single_model(m, text) for m, text in model_outputs.items()]
+            details = [{"Model": m, "Source": "embedded model_outputs", **record}
+                       for m, text in model_outputs.items() for record in markdown_rows(text)]
+        frame = build_table(rows, args.compact)
+        if args.output:
+            if args.output.suffix.lower() not in {".csv", ".xlsx"}:
+                parser.error("--output must end in .csv or .xlsx")
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            if args.output.suffix.lower() == ".xlsx":
+                with pd.ExcelWriter(args.output) as writer:
+                    frame.to_excel(writer, sheet_name="summary", index=False)
+                    pd.DataFrame(details).to_excel(writer, sheet_name="metrics", index=False)
+            else:
+                frame.to_csv(args.output, index=False, encoding="utf-8-sig")
+        else:
+            print(frame.to_csv(index=False), end="")
+        if args.long_output:
+            args.long_output.parent.mkdir(parents=True, exist_ok=True)
+            with args.long_output.open("w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=META_COLUMNS + RESULT_COLUMNS)
+                writer.writeheader()
+                writer.writerows(details)
+    except (OSError, ValueError, ImportError) as error:
+        parser.error(str(error))
+
+
+if __name__ == "__main__":
+    main()

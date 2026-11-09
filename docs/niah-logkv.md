@@ -309,3 +309,101 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
 窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数/数据路径、BABILong 按长度加载、困惑度任务取同一批长文档的末尾、下载脚本预建困惑度缓存、稠密缓存无方阵掩码且
 与不缓存一致），
 `tests/test_exp_configs.py`（长文本配置只差长度相关的几项）。
+
+### 8.1 已有结果直接汇总，不用重新评测
+
+`unused/parse_lmeval_table.py` 支持 `eval.py` 保存的完整 JSON、原始 harness JSON（包括
+`eval_results_cache.json`），以及含一张或多张 lm-eval 表格的控制台日志。不再需要把输出粘进 Python
+源码。保留无参数运行时的内嵌历史数据；导入模块不会自动打印表格。只需 pandas，导出 XLSX 另需
+openpyxl 或其他 pandas Excel writer，不需要加载模型、Torch 或 CUDA。
+
+每个位置参数文件单独一行；建议给 64K、128K 与不同方法分别命名。以下路径须换成实际结果文件：
+
+```bash
+python unused/parse_lmeval_table.py \
+  --input word_first64=/path/to/64k_main.json \
+  --input word_first64=/path/to/64k_niah.json \
+  --input word_first128=/path/to/128k_main.json \
+  --input word_first128=/path/to/128k_niah.json \
+  --compact --output summary.xlsx --long-output metrics.csv
+```
+
+同名 `--input` 合并互补的主阶段与 NIAH 阶段结果；同一 task/metric/filter 重复会报错（即使分数相同），
+应为重跑结果使用不同标签，不能混用缓存文件与对应完整 JSON。已知 checkpoint 或上下文上限不同也会
+报错。旧 JSON 没有上下文设置时不会猜测，需自行确保同一标签对应同一评测配置。
+`--output summary.csv` 输出宽表，XLSX 包含 `summary` 宽表与 `metrics` 全指标明细。
+`--compact` 去掉空列；不传 `--output` 时向 stdout 输出 CSV。位置参数可用 shell 通配符，适合逐文件检查：
+
+```bash
+python unused/parse_lmeval_table.py /path/to/evaluate/eval_results_*.json \
+  --compact --output runs.csv --long-output metrics.csv
+```
+
+宽表保留原有列名，并按数字长度指标动态增加 `<任务>@64k`、`@128k`、`@256k` 等列，包含 cue/words
+变体；原先无长度后缀的 NIAH 列仍表示 32K。LongBench 优先选 `score`，没有它时选对应的 F1、ROUGE、
+代码相似度等指标。宽表选用 `none` filter，其他 filter 与未配置宽表列的指标都保留在明细中。
+长文本和诊断组只有任务齐全才计算平均，`<平均列>_n` 表示实际任务数；64K/128K RULER 要求 13 个，
+256K 按本仓库协议要求 12 个。历史普通任务平均仍按已有分数计算，并附任务数。PPL 越低越好，
+不混入 `AVG_all`；BABILong 的 `AVG_babilong_*` 是 qa1–qa5 的宏平均，harness 按样本数加权的组分保留在明细。
+
+后续 `eval.py` 自动生成的同名 CSV 也改为每个 task/metric/filter 一行，列为
+`dataset,metric,filter,context_length,value,stderr,result_type`，不再只尝试提取 ACC。
+`context_length` 来自 RULER 的指标名或 BABILong/PPL 的任务后缀，是任务标称长度；不能当作实际输入 token 数。
+完整 JSON 新增 `config_overrides` 与 `model_max_seq_length`；宽表的 `ContextLimit` 是模型上限，
+64K 配置通常为 66560、128K 为 132096（包括生成余量），不是每条样本都达到的长度。
+速度 XLSX 的 prompt 分桶也区分 32–64K、64–128K、128–256K 与 256K 以上。
+
+小检查（无需 GPU）：
+
+```bash
+python -m unittest discover -s tests -p test_eval_results_table.py -v
+```
+
+### 8.2 LongBench 的长度含义与运行方式
+
+以下外部版本核对于 2026-11-09：
+
+| 任务 | 长度控制 | 当前长文本 YAML 默认运行 |
+|---|---|---|
+| RULER / NIAH | `eval_max_seq_lengths` 控制合成长度，结果指标为 65536 / 131072 等 | 是 |
+| BABILong | `babilong_64k` / `babilong_128k` 选择对应数据子集 | 是 |
+| 长文档 PPL | `long_ppl_64k` / `long_ppl_128k` 截取指定 token 长度 | 是 |
+| LongBench v1 / `_e` | 原始文档长度各异，没有官方固定 64K/128K 任务；`_e` 均衡的是 0–4k、4–8k、8k+ 区间 | 否 |
+| LongBench v2 | 原始样本长度各异；在不同上下文上限下运行，不等于固定长度子集 | 否，需显式指定，且环境中要有任务定义 |
+
+[`LongBench` 官方说明](https://github.com/THUDM/LongBench/blob/main/LongBench/README.md)的 length
+字段按英文词/中文字符统计，不等同于当前模型的 token 数。只增加 `block_size` 不会把短文补成长文；
+`eval_max_seq_lengths` 只传给 RULER/NIAH，不会给 LongBench 自动建立 64K/128K 数据集。
+[`LongBench v2`](https://github.com/THUDM/LongBench) 有更长的真实任务，但仍应按本模型 tokenizer 的实际长度
+分桶，并记录截断情况；本脚本不根据总分反推不存在的长度分桶分数。
+
+只补跑现有 LongBench v1 任务、跳过 NIAH，可使用同一长文本 YAML（任务列表按需替换）：
+
+```bash
+bash eval.sh exp/qwen1.7b-32k/eval_long64k_word_first.yaml \
+  longbench_qasper,longbench_hotpotqa,longbench_gov_report none
+bash eval.sh exp/qwen1.7b-32k/eval_long128k_word_first.yaml \
+  longbench_qasper,longbench_hotpotqa,longbench_gov_report none
+```
+
+这两次表示不同模型上下文上限下的同一数据集评测，不能把结果标为“64K/128K 等长样本”。
+当前 `generate_until` 对超限 prompt 保留尾部，而 LongBench 官方实现从中间截断；报告需注明这一差异。
+
+LongBench v2 还存在依赖版本边界：仓库 `pyproject.toml` 固定的官方 lm-eval 0.4.9 没有
+`lm_eval/tasks/longbench2`；环境若另装了包含这些定义的版本才可用。`litgpt/longbench2_patch.py`
+只修复数据加载，不注册缺失任务。先核对当前环境：
+
+```bash
+python -c 'from lm_eval.tasks import TaskManager; print("longbench2" in TaskManager().all_groups)'
+```
+
+只有输出 `True` 时，再准备数据并补跑（加载的是 `recursal/longbench-v2`，与官方原始评测方式不同，
+本仓库按四选一似然评分）：
+
+```bash
+bash diag.sh unused/fetch_long_eval_data.py --longbench2
+bash eval.sh exp/qwen1.7b-32k/eval_long64k_word_first.yaml longbench2 none
+bash eval.sh exp/qwen1.7b-32k/eval_long128k_word_first.yaml longbench2 none
+```
+
+不为运行一个任务直接更改全仓库 lm-eval 的版本约束；升级还需验证原有任务、datasets 和离线加载的兼容性。
