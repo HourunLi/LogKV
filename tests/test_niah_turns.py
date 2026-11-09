@@ -165,6 +165,7 @@ def test_multiquery_samples_become_a_context_and_one_question_per_key(turns_util
 
 
 def test_the_tasks_ask_eval_py_for_turns(turns_utils, monkeypatch):
+    import functools
     import inspect
 
     import lm_eval.tasks.ruler.common_utils as common
@@ -181,12 +182,14 @@ def test_the_tasks_ask_eval_py_for_turns(turns_utils, monkeypatch):
     # niah_turns_utils binds these names when lm-eval loads it for the task.
     monkeypatch.setattr(prepare, "generate_samples", small)
     monkeypatch.setattr(prepare, "get_haystack", lambda type_haystack: None)
-    monkeypatch.setattr(common, "get_tokenizer", lambda **kwargs: WordCounter())
+    # lm-eval's get_tokenizer is cached by its arguments, so they must be hashable.
+    monkeypatch.setattr(common, "get_tokenizer", functools.cache(lambda tokenizer=None, pretrained=None: WordCounter()))
     source = ROOT / "eval.py"
     nodes = [n for n in ast.parse(source.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_task_manager"]
     scope = dict(inspect=inspect, EVAL_TASKS_DIR=ROOT / "eval_tasks")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
-    manager = scope["_task_manager"]({"pretrained": "unused"})
+    # The main stage's metadata, as eval.sh / majob.sh pass it: max_seq_lengths is a list.
+    manager = scope["_task_manager"]({"pretrained": "unused", "max_seq_lengths": [262144]})
     assert {f"niah_turns_{n}" for n in ("32k", "64k", "128k", "256k")} <= set(manager.all_tasks)
     task = get_task_dict(["niah_turns_256k"], manager)["niah_turns_256k"]
     assert calls[-1]["max_seq_length"] == 262144 and calls[-1]["num_needle_q"] == 4

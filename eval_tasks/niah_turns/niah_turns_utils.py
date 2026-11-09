@@ -35,11 +35,14 @@ def turns_of(sample):
 
 
 def build(length, kwargs, num_samples=100):
+    # lm-eval caches get_tokenizer by its arguments: pass the tokenizer's only, not the rest of the metadata
+    # (max_seq_lengths is a list, which cannot be a cache key).
+    tokenizer = get_tokenizer(**{k: kwargs[k] for k in ("tokenizer", "pretrained") if kwargs.get(k)})
     # Room for four questions and answers instead of one question and its answer.
     samples = generate_samples(get_haystack(type_haystack="essay"), max_seq_length=length, template=TEMPLATE,
                                type_haystack="essay", type_needle_k="words", type_needle_v="numbers",
                                num_needle_q=TURNS, num_samples=num_samples, tokens_to_generate=384,
-                               TOKENIZER=get_tokenizer(**kwargs))
+                               TOKENIZER=tokenizer)
     return download_dataset([[turns_of(sample) for sample in samples]])
 
 
