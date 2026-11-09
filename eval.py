@@ -325,15 +325,43 @@ class SafeJSONEncoder(json.JSONEncoder):
 
 
 def extract_results_to_csv(results: dict, benchmark: str, output_path: Path) -> None:
-    """Export all numeric task/group metrics, including per-length RULER scores."""
-    from eval_results import RESULT_COLUMNS, result_rows
+    """
+    从 results 中提取各数据集的 acc 或 acc_norm 数值，输出为 CSV 文件。
+    - HellaSwag 数据集：提取 acc_norm,none
+    - 其他数据集：提取 acc,none
+    """
+    csv_rows = []
+    tasks = benchmark.split(",") if benchmark != "debug" else ["piqa"]
 
+    results_data = results.get("results", {})
+
+    for task in tasks:
+        task = task.strip()
+        task_results = results_data.get(task, {})
+
+        # HellaSwag 使用 acc_norm，其他使用 acc
+        if task.lower() in ["hellaswag", "arc-c", "openbookqa"]:
+            metric_key = "acc_norm,none"
+            metric_name = "acc_norm"
+        else:
+            metric_key = "acc,none"
+            metric_name = "acc"
+
+        value = task_results.get(metric_key, None)
+
+        csv_rows.append({
+            "dataset": task,
+            # "metric": metric_name,
+            "value": value,
+        })
+
+    # 写入 CSV
     csv_file = output_path.with_suffix(".csv")
     try:
-        with open(csv_file, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=RESULT_COLUMNS)
+        with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["dataset", "value"])
             writer.writeheader()
-            writer.writerows(result_rows(results))
+            writer.writerows(csv_rows)
         print(f"📊 CSV 结果已保存到: {csv_file}")
     except Exception as e:
         print(f"❌ 保存 CSV 失败: {e}")
@@ -1995,8 +2023,6 @@ def main(
                     **_code_version(),
                     "benchmark": benchmark,
                     "checkpoint_dir": checkpoint_dir,
-                    "config_overrides": config_overrides,
-                    "model_max_seq_length": lm_model.max_length,
                     "log_kv_dense_mode": log_kv_dense_mode,
                     "swa_window_size": lm_model.swa_window_size,
                     "cache_budget": lm_model.cache_budget,
@@ -2088,9 +2114,8 @@ def main(
                             gen_df.to_excel(writer, sheet_name="generate_until", index=False)
                             # 按 prompt 长度分桶统计
                             gen_df["prompt_bucket"] = pd.cut(gen_df["prompt_len"],
-                                bins=[0, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144, float("inf")],
-                                labels=["0-1K", "1K-4K", "4K-8K", "8K-16K", "16K-32K",
-                                        "32K-64K", "64K-128K", "128K-256K", "256K+"])
+                                bins=[0, 1024, 4096, 8192, 16384, 32768, 999999],
+                                labels=["0-1K", "1K-4K", "4K-8K", "8K-16K", "16K-32K", "32K+"])
                             summary = gen_df.groupby("prompt_bucket", observed=False).agg(
                                 count=("prompt_len", "count"),
                                 avg_prompt_len=("prompt_len", "mean"),
