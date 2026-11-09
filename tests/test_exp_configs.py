@@ -313,6 +313,7 @@ def test_long_context_evaluations_change_only_the_length_settings(length, tokens
     assert evaluated["eval_max_seq_lengths"] == [tokens]
     assert evaluated["benchmark"].split(",")[:2] == [f"babilong_{length}", "long_ppl_32k" if length == "64k" else
                                                      f"long_ppl_{length}"]
+    assert evaluated["benchmark"].split(",")[-1] == f"longbench2_{length}"  # LongBench v2 under its length
     # All of RULER; at 256K but SQuAD, whose 1204 dev paragraphs (about 220K tokens) cannot fill the context.
     assert "ruler_qa_hotpot" in evaluated["niah_benchmark"] and len(evaluated["niah_benchmark"]) == (
         12 if length == "256k" else 13)

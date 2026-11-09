@@ -1,7 +1,18 @@
+"""把 lm-eval 的结果表汇总成一行一个模型的 CSV（表头顺序固定，可直接贴进表格）。
+
+两种用法：
+  python unused/parse_lmeval_table.py <名字>=<eval 日志> [<名字>=<日志> ...]
+      直接读 eval.sh 的日志，自动挑出其中的结果表（eval.py 每个阶段打印一张；行首的时间戳、rank 等前缀会去掉）。
+      同一个名字可以重复，例如一个模型的 32K、128K、256K 三份日志，合成一行；只给路径时以文件名为名字。
+  python unused/parse_lmeval_table.py
+      读下面 model_outputs 里粘贴的表（也可以整段粘日志）。
+"""
 import pandas as pd
 import numpy as np
 import io
 import re
+import sys
+from pathlib import Path
 
 # 把你的各个模型的原始输出放在这里。这里以 Model_A 为例（填入你提供的原数据）
 model_outputs = {
@@ -432,12 +443,15 @@ LONG_RULER = LONG_NIAH + ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad"
 RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] for n in LONG_LENGTHS.values()}
 BABILONG_LENGTHS = ("32k", "64k", "128k", "256k")
 PPL_LENGTHS = ("32k", "64k", "128k", "256k")
+# LongBench v2 的上下文预算来自 block_size：按长度命名的组（eval_tasks/longbench2_long）才能分列。
+LONGBENCH2_LENGTHS = ("64k", "128k", "256k")
 for _length in LONG_LENGTHS.values():
     ORDERED_COLUMNS += [f"{t}@{_length}" for t in RULER_AT[_length]] + [
         f"AVG_NIAH@{_length}", f"AVG_NIAH_multi@{_length}", f"AVG_RULER@{_length}"]
 for _length in BABILONG_LENGTHS:
     ORDERED_COLUMNS += [f"babilong_qa{i}_{_length}" for i in range(1, 6)] + [f"AVG_babilong_{_length}"]
-ORDERED_COLUMNS += [f"long_ppl_{n}" for n in PPL_LENGTHS] + ["LongBench2"]
+ORDERED_COLUMNS += [f"long_ppl_{n}" for n in PPL_LENGTHS] + ["LongBench2"] + [
+    f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
@@ -458,6 +472,7 @@ RAW_TO_TARGET_MAP = {
     "longbench_qasper_e": "qasper_e", "longbench_repobench-p_e": "repobench-p_e", "longbench_samsum_e": "samsum_e",
     "longbench_trec_e": "trec_e", "longbench_triviaqa_e": "triviaqa_e",
     "longbench2": "LongBench2",
+    **{f"longbench2_{n}": f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS},
 }
 
 TARGET_METRIC_MAP = {
@@ -471,6 +486,7 @@ TARGET_METRIC_MAP = {
     **{f"babilong_qa{i}_{n}": "acc" for i in range(1, 6) for n in BABILONG_LENGTHS},
     **{f"long_ppl_{n}": "ppl" for n in PPL_LENGTHS},
     "LongBench2": "acc",
+    **{f"LongBench2@{n}": "acc" for n in LONGBENCH2_LENGTHS},
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
@@ -506,19 +522,40 @@ DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words",
 # ==============================================================================
 # 3. 解析与计算核心代码
 # ==============================================================================
+TABLE_HEADER = "|Tasks|Version|Filter|n-shot|Metric| |Value| |Stderr|"
+TABLE_ROW = re.compile(r"\|(?:[^|]*\|){9}\s*$")  # lm-eval 结果表的一行：九列，十个竖线
+
+
+def table_lines(text):
+    """``text`` 里所有 lm-eval 结果表的数据行：粘贴的表，或整份 eval 日志（每个阶段一张表，行首可能有前缀）。
+    去掉表头（Tasks / Groups）与分隔行，保留 lm-eval 的九列。"""
+    rows = []
+    for line in text.splitlines():
+        match = TABLE_ROW.search(line.rstrip())
+        if not match:
+            continue
+        row = match.group(0).strip()
+        first = row.split("|")[1].strip()
+        if first in ("Tasks", "Groups") or set(row) <= set("|-: "):
+            continue
+        rows.append(row)
+    return rows
+
+
 def parse_single_model(model_name, markdown_text):
-    lines = [line for line in markdown_text.strip().split('\n') if not line.strip().startswith('|---')]
-    if not lines: return {"Model": model_name}
-    
-    df = pd.read_csv(io.StringIO('\n'.join(lines)), sep='|')
+    rows = table_lines(markdown_text)
+    if not rows: return {"Model": model_name}
+
+    # 全按字符串读：只有 RULER 行的表，Metric 列（65536 等）也要和 LONG_LENGTHS 的键比较。
+    df = pd.read_csv(io.StringIO('\n'.join([TABLE_HEADER] + rows)), sep='|', dtype=str, keep_default_na=False)
     df = df.iloc[:, 1:-1]
     df.columns = df.columns.str.strip()
-    for col in df.columns:  # text columns (object, or pandas 3's string dtype)
-        if not pd.api.types.is_numeric_dtype(df[col]): df[col] = df[col].astype(str).str.strip()
-    
+    for col in df.columns:
+        df[col] = df[col].astype(str).str.strip()
+
     df['Tasks'] = df['Tasks'].replace('', np.nan).ffill()
     row_data = {"Model": model_name}
-    
+
     for _, row in df.iterrows():
         raw_task = re.sub(r"^-\s*", "", str(row['Tasks']))  # a group's subtasks are listed as " - name"
         metric = row['Metric']
@@ -540,22 +577,41 @@ def parse_single_model(model_name, markdown_text):
                 pass # 忽略非数字
     return row_data
 
-# 1. 组合数据为 DataFrame
-final_df = pd.DataFrame([parse_single_model(m, text) for m, text in model_outputs.items()])
-final_df = final_df.reindex(columns=['Model'] + ORDERED_COLUMNS) # 对齐格式
 
-# 2. ================= 自动计算各组平均值 =================
-for avg_col, sub_tasks in AVG_GROUPS.items():
-    # 选出有实际成绩的列，利用 pd.to_numeric 把可能混入的字符转为 NaN 并求均值
-    valid_cols = [t for t in sub_tasks if t in final_df.columns]
-    final_df[avg_col] = final_df[valid_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
+def build_table(outputs):
+    """``{模型名: 结果表或日志文本}`` -> 一行一个模型、列为 ORDERED_COLUMNS 的表，含各组平均与 AVG_all。"""
+    # 1. 组合数据为 DataFrame
+    final_df = pd.DataFrame([parse_single_model(m, text) for m, text in outputs.items()])
+    final_df = final_df.reindex(columns=['Model'] + ORDERED_COLUMNS) # 对齐格式
 
-# 计算全局汇总平均 AVG_all (综合所有分组子任务的基础列)
-all_base_tasks = list(set([task for group, group_tasks in AVG_GROUPS.items() if group not in DIAGNOSTIC_GROUPS
-                           for task in group_tasks]))
-valid_base_tasks = [t for t in all_base_tasks if t in final_df.columns]
-final_df['AVG_all'] = final_df[valid_base_tasks].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
+    # 2. ================= 自动计算各组平均值 =================
+    for avg_col, sub_tasks in AVG_GROUPS.items():
+        # 选出有实际成绩的列，利用 pd.to_numeric 把可能混入的字符转为 NaN 并求均值
+        valid_cols = [t for t in sub_tasks if t in final_df.columns]
+        final_df[avg_col] = final_df[valid_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
 
-# 3. 清理空白，输出剪贴板友好格式
-final_df = final_df.fillna("")
-print(final_df.to_csv(sep=',', index=False))
+    # 计算全局汇总平均 AVG_all (综合所有分组子任务的基础列)
+    all_base_tasks = list(set([task for group, group_tasks in AVG_GROUPS.items() if group not in DIAGNOSTIC_GROUPS
+                               for task in group_tasks]))
+    valid_base_tasks = [t for t in all_base_tasks if t in final_df.columns]
+    final_df['AVG_all'] = final_df[valid_base_tasks].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
+    return final_df
+
+
+def load_outputs(args):
+    """命令行的 ``名字=日志``（或只给路径，以文件名为名字）；同一个名字重复时，各日志合成一行。"""
+    outputs = {}
+    for arg in args:
+        name, sep, path = arg.partition("=")
+        if not sep:
+            name, path = Path(arg).stem, arg
+        text = Path(path).expanduser().read_text(encoding="utf-8", errors="replace")
+        outputs[name] = outputs.get(name, "") + "\n" + text
+    return outputs
+
+
+if __name__ == "__main__":
+    final_df = build_table(load_outputs(sys.argv[1:]) or model_outputs)
+    # 3. 清理空白，输出剪贴板友好格式
+    final_df = final_df.fillna("")
+    print(final_df.to_csv(sep=',', index=False))

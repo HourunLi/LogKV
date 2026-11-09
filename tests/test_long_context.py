@@ -221,6 +221,39 @@ def test_long_ppl_scores_the_tail_of_the_same_long_documents(tmp_path, monkeypat
         utils.build(32, {"pretrained": word_tokenizer})
 
 
+def test_per_length_longbench2_groups_are_lm_evals_longbench2(monkeypatch):
+    """The same 20 subtasks under a name that carries the length; eval.py refuses a window that does not match."""
+    pytest.importorskip("lm_eval")
+    import datasets
+    from lm_eval.evaluator_utils import get_subtask_list
+    from lm_eval.tasks import get_task_dict
+
+    def fake(path=None, name=None, **kwargs):
+        return datasets.DatasetDict({"train": datasets.Dataset.from_dict(
+            {"context": ["c"], "question": ["q"], "choices": [["a", "b", "c", "d"]], "answer": [0]})})
+    monkeypatch.setattr(datasets, "load_dataset", fake)
+    source = ROOT / "eval.py"
+    tree = ast.parse(source.read_text())
+    nodes = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in {"_task_manager", "_check_task_lengths"})
+             or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_LENGTH_NAMED_TASK")]
+    scope = dict(inspect=inspect, re=__import__("re"), EVAL_TASKS_DIR=ROOT / "eval_tasks")
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+    manager = scope["_task_manager"]({"pretrained": "unused"})
+    theirs = sorted(get_subtask_list(get_task_dict(["longbench2"], manager))["longbench2"])
+    assert len(theirs) == 20
+    for n in ("64k", "128k", "256k"):
+        assert sorted(get_subtask_list(get_task_dict([f"longbench2_{n}"], manager))[f"longbench2_{n}"]) == theirs
+    check = scope["_check_task_lengths"]
+    check(["babilong_256k", "long_ppl_256k", "longbench2_256k"], 263168)
+    check(["long_ppl_32k", "babilong_64k", "longbench2_64k", "piqa"], 66560)
+    with pytest.raises(ValueError, match="longbench2_256k needs a model window of 262144"):
+        check(["longbench2_256k"], 132096)
+    with pytest.raises(ValueError, match="at most 69632"):  # the budget is the window: not larger either
+        check(["longbench2_64k"], 263168)
+    with pytest.raises(ValueError, match="babilong_qa2_256k"):  # longer inputs would be cut without a word
+        check(["babilong_qa2_256k"], 132096)
+
+
 def test_long_ppl_tasks_are_found_by_eval_py():
     pytest.importorskip("lm_eval")
     source = ROOT / "eval.py"
