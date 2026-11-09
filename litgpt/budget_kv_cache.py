@@ -10,7 +10,8 @@ Keys are stored after RoPE at their original positions, so evicting an entry mov
                (summed over every query since they arrived, averaged over a KV group's query heads).
     snapkv     SnapKV, per chunk: the chunk's last ``window`` queries score every entry (softmax
                attention averaged over those queries and the group's heads, then average-pooled along
-               the sequence with ``kernel``); the ``recent`` newest entries stay, the rest by score.
+               the sequence with ``kernel``); the ``recent`` newest entries stay (default ``window``, at
+               most half the budget), the rest by score.
                The scores are recomputed for every chunk, decode steps included (window 1 there).
 
 Persistent memory of one entry in one layer, per KV head: K and V (``head_size`` each), an int64 position
@@ -68,7 +69,8 @@ class BudgetKVCache(nn.Module):
         self.sinks = int(sinks) if policy == "streaming" else 0
         if not 0 <= self.sinks < self.capacity:
             raise ValueError(f"sinks must be in [0, capacity), got {sinks} for capacity {capacity}")
-        default = {"streaming": self.capacity - self.sinks, "h2o": self.capacity // 2, "snapkv": window}[policy]
+        default = {"streaming": self.capacity - self.sinks, "h2o": self.capacity // 2,
+                   "snapkv": min(window, self.capacity // 2)}[policy]
         self.recent = int(default if recent is None or policy == "streaming" else recent)
         if not 0 <= self.recent <= self.capacity:
             raise ValueError(f"recent must be in [0, capacity], got {self.recent} for capacity {capacity}")
