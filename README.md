@@ -29,7 +29,6 @@ attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启�
 | [统一路由实现](docs/semantic-unified-routing.md) | 可选 unified 路由的 Ward/半径公式、增量更新和数值约束 |
 | [位置与注意力](docs/position.md) | pre-RoPE 内容、mid/multi 锚点、质量偏置 |
 | [全程 SWA 对照](docs/swa-niah-comparison.md) | 同权重、同持久缓存字节预算的比较口径 |
-| [同内存基线](docs/same-memory-baselines.md) | 64K / 128K 下 SWA、StreamingLLM、H2O、SnapKV 与 LogKV 同持久缓存字节、流式预填充的比较 |
 
 ## 运行入口
 

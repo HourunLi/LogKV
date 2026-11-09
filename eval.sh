@@ -226,14 +226,9 @@ emit("LOG_KV_RECENT", value_or("log_kv_recent_size", 1024))
 emit("LOG_KV_PREFILL", value_or("log_kv_prefill_block", 256))
 emit("LOG_KV_SECOND_ORDER_SCALE", value_or("log_kv_second_order_scale", 1.0))
 emit("LOG_KV_DENSE_MODE", str(bool(cfg.get("log_kv_dense_mode", False))).lower())
-# Same-memory comparisons: full SWA (0 = window matched to the LogKV cache's bytes) or an eviction baseline
-# (streaming | h2o | snapkv; budget 0 = matched the same way, its options as a dict).
+# Full SWA at the same memory (0 = window matched to the LogKV cache's allocated bytes).
 swa = cfg.get("swa_window_size")
 emit("SWA_WINDOW_SIZE", "" if swa is None else int(swa))
-emit("KV_BASELINE", cfg.get("kv_baseline") or "")
-emit("KV_BASELINE_BUDGET", int(cfg.get("kv_baseline_budget") or 0))
-options = cfg.get("kv_baseline_options")
-emit("KV_BASELINE_OPTIONS", json.dumps(options) if options else "")
 emit("LOG_KV_SEMANTIC", str(bool(cfg.get("log_kv_semantic_clusters", False))).lower())
 emit("LOG_KV_SEMANTIC_LEGACY_ROUTE", str(bool(cfg.get("log_kv_semantic_legacy_route", False))).lower())
 emit("LOG_KV_SEMANTIC_UNIFIED_ROUTE", str(bool(cfg.get("log_kv_semantic_unified_route", False))).lower())
@@ -443,12 +438,6 @@ fi
 if [ -n "${SWA_WINDOW_SIZE}" ]; then
     LOG_KV_ARG_LIST+=(--swa_window_size "${SWA_WINDOW_SIZE}")
 fi
-if [ -n "${KV_BASELINE}" ]; then
-    LOG_KV_ARG_LIST+=(--kv_baseline "${KV_BASELINE}" --kv_baseline_budget "${KV_BASELINE_BUDGET}")
-    if [ -n "${KV_BASELINE_OPTIONS}" ]; then
-        LOG_KV_ARG_LIST+=(--kv_baseline_options "${KV_BASELINE_OPTIONS}")
-    fi
-fi
 if [ -n "${CONFIG_OVERRIDES}" ]; then
     LOG_KV_ARG_LIST+=(--config_overrides "${CONFIG_OVERRIDES}")
 fi
@@ -486,8 +475,6 @@ echo "Checkpoint: ${SAVE_DIR}"
 echo "Output dir: ${EVAL_OUTPUT_DIR}"
 if [ "${LOG_KV_DENSE_MODE}" = "true" ]; then
     echo "dense eval: 普通因果注意力，使用完整 KV"
-elif [ -n "${KV_BASELINE}" ]; then
-    echo "eviction baseline eval: ${KV_BASELINE}, entries per KV head ${KV_BASELINE_BUDGET} (0 = LogKV bytes: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, K=${LOG_KV_CLUSTER_K_MAX}), options ${KV_BASELINE_OPTIONS:-default}"
 elif [ -n "${SWA_WINDOW_SIZE}" ]; then
     echo "SWA eval: window ${SWA_WINDOW_SIZE} (0 = LogKV bytes: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, K=${LOG_KV_CLUSTER_K_MAX})"
 else

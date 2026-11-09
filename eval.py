@@ -423,7 +423,6 @@ def _task_manager(metadata):
         return None  # simple_evaluate builds its own, with lm-eval's tasks only.
     return TaskManager(include_path=str(EVAL_TASKS_DIR), metadata=dict(metadata or {}))
 from litgpt.generate.base import generate as litgpt_generate
-from litgpt.budget_kv_cache import POLICIES as KV_BASELINES, capacity_for as kv_baseline_capacity
 from litgpt.kv_compression import cache_compression_snapshot, summarize_compression
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
 from litgpt.ruler_patch import apply_patch
@@ -886,9 +885,6 @@ class LogKVLM(LM):
         log_kv_second_order_scale: float = 1.0,
         log_kv_dense_mode: bool = False,
         swa_window_size: int | None = None,
-        kv_baseline: str | None = None,
-        kv_baseline_budget: int = 0,
-        kv_baseline_options: dict | None = None,
         log_kv_importance_pooling: bool = False,
         log_kv_importance_pooling_lambda: float = 1.0,
         log_kv_importance_pooling_temperature: float = 1.0,
@@ -940,16 +936,6 @@ class LogKVLM(LM):
         if swa_window_size is not None and (swa_window_size < 0 or log_kv_dense_mode):
             raise ValueError("swa_window_size must be >= 0 and cannot be combined with dense mode")
         self.swa_window_size = swa_window_size
-        # Eviction baselines (litgpt/budget_kv_cache.py): the LogKV settings above give the reference cache
-        # whose persistent bytes a budget of 0 matches.
-        self.kv_baseline = kv_baseline or None
-        if self.kv_baseline is not None:
-            if self.kv_baseline not in KV_BASELINES:
-                raise ValueError(f"kv_baseline must be one of {KV_BASELINES}, got {kv_baseline!r}")
-            if log_kv_dense_mode or swa_window_size is not None or int(kv_baseline_budget) < 0:
-                raise ValueError("kv_baseline needs a budget >= 0 and cannot be combined with dense mode or SWA")
-        self.kv_baseline_budget = int(kv_baseline_budget)
-        self.kv_baseline_options = dict(kv_baseline_options or {})
         self.cache_budget = {}
         self._truncation_counts = {}
         if swa_window_size:
@@ -1028,7 +1014,6 @@ class LogKVLM(LM):
         )
 
         mode_name = "全程 SWA" if swa_window_size is not None else (
-            f"驱逐基线 {self.kv_baseline}" if self.kv_baseline else
             "dense 标准 KV 注意力" if self.log_kv_dense_mode else "logKV 压缩注意力"
         )
         if is_master: print(f"🔧 正在初始化 Transformer ({mode_name})...")
@@ -1153,9 +1138,7 @@ class LogKVLM(LM):
             retention_head=getattr(self, "_retention_heads", None) is not None,
             gamma_surprisal=self.log_kv_gamma_surprisal,
         )
-        if self.kv_baseline:
-            self._set_baseline_cache(dtype, max_seq_length)
-        elif self.swa_window_size == 0:
+        if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
             # spare ladder/recent capacity. RoPE tables are common model state.
             reference_bytes = self._cache_storage_bytes()
@@ -1176,22 +1159,6 @@ class LogKVLM(LM):
             self.model.set_kv_cache(batch_size=1, max_seq_length=max_seq_length, device=self._device, dtype=dtype)
         self._eval_cache_ready = True
         self._report_cache_budget()
-
-    def _set_baseline_cache(self, dtype, max_seq_length: int) -> None:
-        """Replace the reference LogKV cache just built by the eviction baseline: a budget of 0 takes the
-        most entries whose persistent buffers fit the LogKV cache's allocated bytes."""
-        reference_bytes = self._cache_storage_bytes()
-        capacity = self.kv_baseline_budget or kv_baseline_capacity(
-            reference_bytes, self.kv_baseline, self.config.n_layer, self.config.n_query_groups,
-            self.config.head_size, torch.empty((), dtype=dtype).element_size())
-        capacity = min(capacity, max_seq_length)
-        self.model.set_budget_kv_cache(1, capacity, self.kv_baseline, device=self._device, dtype=dtype,
-                                       **self.kv_baseline_options)
-        first = self.model.transformer.h[0].attn.kv_cache
-        self.cache_budget.update(reference_logkv_bytes=reference_bytes, kv_baseline=self.kv_baseline,
-                                 kv_baseline_capacity=capacity, kv_baseline_sinks=first.sinks,
-                                 kv_baseline_recent=first.recent, kv_baseline_window=first.window,
-                                 kv_baseline_kernel=first.kernel, kv_baseline_chunk=first.chunk)
 
     def _cache_storage_bytes(self) -> int:
         seen = {}
@@ -1223,9 +1190,7 @@ class LogKVLM(LM):
             print(f"🧮 persistent cache budget (excluding shared RoPE / transient workspace): {self.cache_budget}")
 
     def _reset_eval_cache(self) -> None:
-        if self.kv_baseline:
-            self.model.reset_budget_kv_cache()
-        elif self.log_kv_dense_mode or self.swa_window_size is not None:
+        if self.log_kv_dense_mode or self.swa_window_size is not None:
             self.model.reset_kv_cache()
         else:
             self.model.reset_log_kv_cache()
@@ -1577,12 +1542,6 @@ def main(
     log_kv_dense_mode: bool = False,
     # None = LogKV; 0 = SWA matched to LogKV's allocated cache bytes; >0 = explicit window.
     swa_window_size: int | None = None,
-    # Eviction baseline instead of LogKV (litgpt/budget_kv_cache.py): streaming | h2o | snapkv. Budget 0 =
-    # as many entries per KV head as fit the persistent bytes of the LogKV cache the log_kv_* settings
-    # describe; >0 = that many entries. Options: sinks, recent, window, kernel, chunk.
-    kv_baseline: str | None = None,
-    kv_baseline_budget: int = 0,
-    kv_baseline_options: dict[str, int] | None = None,
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
     # prefill 分块大小：块内 query 共享块首冻结的 slot 状态。2 = 严格 2-token
@@ -1728,9 +1687,6 @@ def main(
     metadata = _o("metadata", metadata)
     log_kv_dense_mode = bool(_o("log_kv_dense_mode", log_kv_dense_mode))
     swa_window_size = _o("swa_window_size", swa_window_size)
-    kv_baseline = _o("kv_baseline", kv_baseline) or None
-    kv_baseline_budget = int(_o("kv_baseline_budget", kv_baseline_budget) or 0)
-    kv_baseline_options = _o("kv_baseline_options", kv_baseline_options)
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_prefill_block = _o("log_kv_prefill_block", log_kv_prefill_block)
@@ -1829,7 +1785,7 @@ def main(
     device = f"cuda:{local_rank}"
 
     diag_active = log_kv_diag_mode not in (None, "off")
-    if log_kv_dense_mode or swa_window_size is not None or kv_baseline:
+    if log_kv_dense_mode or swa_window_size is not None:
         if diag_active:
             raise ValueError(
                 "dense/SWA mode is incompatible with log_kv_diag_mode: "
@@ -1841,9 +1797,6 @@ def main(
         print(f"🚀 启动魔改版评估管线 | 任务: {benchmark}")
         if swa_window_size is not None:
             print(f"🧩 SWA during prefill and decode | window: {swa_window_size} (0 = match LogKV bytes)")
-        elif kv_baseline:
-            print(f"🧩 eviction baseline {kv_baseline} during prefill and decode | entries per KV head: "
-                  f"{kv_baseline_budget or 'match LogKV bytes'} | options: {kv_baseline_options or {}}")
         elif log_kv_dense_mode:
             print(
                 "🧩 dense 标准 KV 注意力 | 使用 GPT.set_kv_cache() 原生 causal attention；"
@@ -1919,9 +1872,6 @@ def main(
             log_kv_second_order_scale=log_kv_second_order_scale,
             log_kv_dense_mode=log_kv_dense_mode,
             swa_window_size=swa_window_size,
-            kv_baseline=kv_baseline,
-            kv_baseline_budget=kv_baseline_budget,
-            kv_baseline_options=kv_baseline_options,
             log_kv_importance_pooling=log_kv_importance_pooling,
             log_kv_importance_pooling_lambda=log_kv_importance_pooling_lambda,
             log_kv_importance_pooling_temperature=log_kv_importance_pooling_temperature,
@@ -2075,7 +2025,6 @@ def main(
                     "checkpoint_dir": checkpoint_dir,
                     "log_kv_dense_mode": log_kv_dense_mode,
                     "swa_window_size": lm_model.swa_window_size,
-                    "kv_baseline": lm_model.kv_baseline,
                     "cache_budget": lm_model.cache_budget,
                     "kv_compression": compression_report,
                     "log_kv_B": log_kv_B,

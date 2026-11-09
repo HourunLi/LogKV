@@ -21,7 +21,7 @@ bash unused/compare_swa_niah.sh '<已完成checkpoint目录>'
 在 GPU 环境、仓库根目录执行。默认8卡、32K single1/2/3；`GPUS_PER_NODE=1` 可改为单卡，
 附加 `--limit 4` 仅用于检查流程。两组输出分开保存在 `swa_compare_<时间>` 下，
 可由 `SWA_COMPARE_OUTPUT_DIR` 指定目录。该脚本不训练、不安装依赖。
-`eval.sh` 透传 YAML 的 `swa_window_size`；64K / 128K 的 SWA 与驱逐基线配置见 [同内存基线](same-memory-baselines.md)。
+`eval.sh` 透传 YAML 的 `swa_window_size`（0 为按 LogKV 持久缓存字节换算窗口）。
 
 ## 预算口径
 

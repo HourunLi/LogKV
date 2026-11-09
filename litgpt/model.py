@@ -15,7 +15,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing_extensions import Self
 
-from litgpt.budget_kv_cache import BudgetKVCache
 from litgpt.config import Config
 from litgpt.chunked_loss import chunked_linear_cross_entropy
 from litgpt.log_kv_cache import (
@@ -160,7 +159,7 @@ class GPT(nn.Module):
                 cos = cos.unsqueeze(0)
                 sin = sin.unsqueeze(0)
             local_cache_masks = all(
-                isinstance(block.attn.kv_cache, (LogStructuredKVCache, BudgetKVCache))
+                isinstance(block.attn.kv_cache, LogStructuredKVCache)
                 or (isinstance(block.attn.kv_cache, KVCache) and block.attn.kv_cache.is_sliding_window)
                 for block in self.transformer.h
             )
@@ -529,22 +528,6 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             block.attn.kv_cache = None
             block.attn._log_kv_pending = None
-
-    def set_budget_kv_cache(self, batch_size: int, capacity: int, policy: str, *,
-                            device: torch.device | None = None, dtype: torch.dtype | None = None,
-                            **options) -> None:
-        """Give every layer a fixed-budget eviction cache (litgpt/budget_kv_cache.py): at most ``capacity``
-        entries per KV head for the whole request."""
-        self.clear_kv_cache()
-        for block in self.transformer.h:
-            block.attn.kv_cache = BudgetKVCache(batch_size, self.config.n_query_groups, self.config.head_size,
-                                                capacity, policy=policy, device=device, dtype=dtype, **options)
-
-    def reset_budget_kv_cache(self) -> None:
-        for block in self.transformer.h:
-            if not isinstance(block.attn.kv_cache, BudgetKVCache):
-                raise TypeError("reset_budget_kv_cache() requires set_budget_kv_cache() to have been called first")
-            block.attn.kv_cache.reset_parameters()
 
     def reset_kv_cache(self) -> None:
         """Reset every layer's standard KV cache state in place — no reallocation."""
@@ -1152,8 +1135,6 @@ class CausalSelfAttention(nn.Module):
 
         # Apply kv-cache during inference.
         if input_pos is not None:
-            if isinstance(self.kv_cache, BudgetKVCache):  # an eviction baseline attends chunk by chunk
-                return self.proj(self.kv_cache.attend(self, q, k, v, input_pos))
             if not isinstance(self.kv_cache, (KVCache, LogStructuredKVCache)):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
 
