@@ -429,6 +429,8 @@ from litgpt.ruler_patch import apply_patch
 apply_patch()
 from litgpt.longbench2_patch import apply_patch as apply_longbench2_patch  # noqa: E402
 apply_longbench2_patch()
+from litgpt.hf_cache_patch import apply_patch as apply_hf_cache_patch  # noqa: E402
+apply_hf_cache_patch()  # offline loads skip <hash>.incomplete folders
 
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
 
