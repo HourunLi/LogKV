@@ -299,6 +299,10 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   再问下一个（SCBench 的多轮模式）。`generation_kwargs.turn_separator` 让 `generate_until` 走这条路径：prompt 用它把上下文
   与各轮问题隔开，结果也用它把各轮答案连起来。`acc` 是四轮平均，`turn1`…`turn4` 是各轮；与同长度的 `niah_multiquery`
   （问题在缓存时已知）对比，差距是缓存不知道问题时丢掉的部分。上下文太长时从开头截断。
+- 32K 主线：`niah_turns_32k` 与 `long_ppl_books_32k` 在两个启动脚本（`eval.sh`、`majob.sh`）主阶段默认清单的末尾，作为可选任务
+  （`EVAL_OPTIONAL_TASKS`）：模型窗口不到 32K（4K 训练的 checkpoint，`block_size` 为训练长度）或没设 `LONG_PPL_BOOKS` 时，
+  `eval.py` 打印原因后跳过（`_skip_optional_tasks`）；按名字指定的任务不可选，放不进窗口就报错。主阶段清单里有用 tokenizer
+  生成样本的任务（`niah_*`、`ruler*`、`long_ppl*`）时，两个脚本都传 metadata。与 32K 的 `niah_multiquery` 对比，且不受 YaRN 外推影响。
 - 数据：`eval.sh` 离线运行（`HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`），新数据要先在联网时放进它读的缓存：
   `bash diag.sh unused/fetch_long_eval_data.py [--longbench2] [--ppl-data <留出数据> --tokenizer <tokenizer 目录>]`
   用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k，与 `RMT-team/babilong` 的 256k）、

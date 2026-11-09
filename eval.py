@@ -436,6 +436,29 @@ def _check_task_lengths(tasks, max_seq_length):
                              + f", but max_seq_length is {max_seq_length}: set config_overrides.block_size")
 
 
+def _skip_optional_tasks(tasks, max_seq_length):
+    """The launchers' default lists mark tasks that some checkpoints or setups cannot serve (EVAL_OPTIONAL_TASKS,
+    e.g. the 32K turns and book curve): such a task is left out, with the reason, when the model's window is
+    shorter than its length (a 4K run) or its data is not given; a task asked for by name must fit or fails
+    (_check_task_lengths)."""
+    optional = {t for t in os.environ.get("EVAL_OPTIONAL_TASKS", "").split(",") if t}
+    kept = []
+    for task in tasks:
+        reason = None
+        if task in optional:
+            try:
+                _check_task_lengths([task], max_seq_length)
+            except ValueError as error:
+                reason = str(error)
+            if reason is None and task.startswith("long_ppl_books") and not os.environ.get("LONG_PPL_BOOKS"):
+                reason = "LONG_PPL_BOOKS is not set (unused/fetch_long_eval_data.py --ppl-books-hub emozilla/pg19)"
+        if reason is None:
+            kept.append(task)
+        elif _is_main():
+            print(f"⚠️ [eval] 默认清单跳过 {task}: {reason}", flush=True)
+    return kept
+
+
 def _task_manager(metadata):
     """lm-eval's task index plus ``eval_tasks/``, carrying ``metadata`` as ``simple_evaluate`` would."""
     from lm_eval.tasks import TaskManager
@@ -1989,6 +2012,7 @@ def main(
         if world_size > 1:
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
         if benchmark != "debug":
+            benchmark = ",".join(_skip_optional_tasks(benchmark.split(","), lm_model.max_length))
             _check_task_lengths(benchmark.split(","), lm_model.max_length)
 
         with (
