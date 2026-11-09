@@ -415,6 +415,26 @@ from lm_eval.api.model import LM
 EVAL_TASKS_DIR = Path(__file__).resolve().parent / "eval_tasks"
 
 
+# Tasks named for a context length (eval_tasks/babilong_long, long_ppl, longbench2_long).
+_LENGTH_NAMED_TASK = re.compile(r"^(babilong(?:_qa\d+)?|long_ppl|longbench2)_(\d+)k$")
+
+
+def _check_task_lengths(tasks, max_seq_length):
+    """A task named for a context length must fit the model's window: longer inputs are cut from the start
+    without a word, and the result would still carry the name. LongBench v2's per-length groups take their
+    budget from the window itself, so for them the window must not be larger either (block_size = length plus
+    a generation margin of at most 4096)."""
+    for task in tasks:
+        match = _LENGTH_NAMED_TASK.match(task.strip())
+        if not match:
+            continue
+        length = int(match.group(2)) * 1024
+        if max_seq_length < length or (match.group(1) == "longbench2" and max_seq_length > length + 4096):
+            raise ValueError(f"task {task} needs a model window of {length} tokens"
+                             + (f" (at most {length + 4096})" if match.group(1) == "longbench2" else "")
+                             + f", but max_seq_length is {max_seq_length}: set config_overrides.block_size")
+
+
 def _task_manager(metadata):
     """lm-eval's task index plus ``eval_tasks/``, carrying ``metadata`` as ``simple_evaluate`` would."""
     from lm_eval.tasks import TaskManager
@@ -1913,6 +1933,8 @@ def main(
         )
         if world_size > 1:
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
+        if benchmark != "debug":
+            _check_task_lengths(benchmark.split(","), lm_model.max_length)
 
         with (
             _harness_logging(),

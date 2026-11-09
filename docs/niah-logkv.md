@@ -280,7 +280,12 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   的 `babilong_qaN`；数据 `RMT-team/babilong-1k-samples`，环境变量 `BABILONG_DATASET` 可指向本地副本；它只到 128k，256k 的任务
   在 `dataset_kwargs` 里指定 `RMT-team/babilong`（每个长度 100 条，是另一批样本），`BABILONG_DATASET` 不替换它）；LongBench v2
   （lm-eval 的 `longbench2`，数据 `recursal/longbench-v2`，四选一按似然打分，每题四次预填充；长于 block_size 的上下文
-  从开头截断，保留问题。数据集卡片没有按子集的配置时，`litgpt/longbench2_patch.py` 改从仓库快照里按文件名读出该子集）。
+  从开头截断，保留问题。数据集卡片没有按子集的配置时，`litgpt/longbench2_patch.py` 改从仓库快照里按文件名读出该子集）；
+  它的上下文预算就是 block_size，所以长文本配置跑按长度命名的组 `longbench2_{64k,128k,256k}`（`eval_tasks/longbench2_long`，
+  与 `longbench2` 同样的 20 个子任务、提示和打分），各长度的结果才能分开。`eval.py` 在评测前检查：名字带长度的任务
+  （`babilong_*_<L>`、`long_ppl_<L>`、`longbench2_<L>`）要求 max_seq_length 不小于 L，`longbench2_<L>` 还要求不超过 L+4096，
+  否则报错（长于窗口的输入会被悄悄截短，结果却仍带着这个长度的名字）。LongBench v1（`longbench_*`）平均约 6.7K 词，
+  绝大多数样本不到 32K token，没有按长度的版本。
 - 数据：`eval.sh` 离线运行（`HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`），新数据要先在联网时放进它读的缓存：
   `bash diag.sh unused/fetch_long_eval_data.py [--longbench2] [--ppl-data <留出数据> --tokenizer <tokenizer 目录>]`
   用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k，与 `RMT-team/babilong` 的 256k）、
@@ -290,7 +295,9 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   `--ppl-hub <数据集仓库>` 先下载该仓库再以它为 `--ppl-data`。下载机与评测节点经桶同步时，评测前要把 BABILong 的数据集缓存、
   该仓库的 `$HF_HOME/hub/datasets--<owner>--<name>/`（`snapshots/` 是指向 `blobs/` 的软链接，两者都要）和
   `$HF_HOME/logkv_long_ppl`（选出的文档；命中时不再读数据）同步（预热）到评测节点。桶里的 ProLong 是按文档存的短文（中位数约 1000 字符，
-  最长约 4.8 万 token），没有 128K 的文档，困惑度改用 PG19 测试集的整本书（`emozilla/pg19-test`）。
+  最长约 4.8 万 token），没有 128K 的文档，困惑度改用 PG19 测试集的整本书（`emozilla/pg19-test`）。按 Qwen 的分词
+  （约 4.06 字节/token）这 100 本书里只有 18 本不短于 131072 token、4 本不短于 262144，所以 `long_ppl_{32k,64k,128k}`
+  实际是 18 篇文档的平均，`long_ppl_256k` 只有 4 篇；PG19 训练集（2.86 万本）里不短于 256K 的书有一千多本。
   平台代理用自签证书重签 HTTPS，脚本默认不校验证书（同 `litgpt/ruler_patch.py`），下载只走 requests、不用 hf_transfer / hf_xet，
   `--verify-ssl` 恢复校验；Hub 下载的读超时默认放宽到 300 秒（`HF_HUB_DOWNLOAD_TIMEOUT` 可覆盖）。hf-mirror 的共享 Hub 限额
   用完时返回 429，每个请求按 `Retry-After`（没有时 60 秒）等待后重试，最多 10 次。
@@ -302,8 +309,10 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER（256K 为上面的 12 个），主阶段跑 BABILong 与困惑度（64K 配置为 32K
   与 64K，128K、256K 配置为各自的长度），每个任务 100 条。256K 的 dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset` 与 `long_ppl_data` 两个键（或同名环境变量）给出本地数据。
 - 汇总表（`unused/parse_lmeval_table.py`）：RULER 13 个任务的 `<任务>@64k`、`AVG_NIAH@64k`、`AVG_NIAH_multi@64k`、
-  `AVG_RULER@64k`（128k、256k 同；256k 没有 `ruler_qa_squad`，为 12 个的平均）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`，
-  都不计入 `AVG_all`。
+  `AVG_RULER@64k`（128k、256k 同；256k 没有 `ruler_qa_squad`，为 12 个的平均）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`
+  与 `LongBench2@<长度>`，都不计入 `AVG_all`。可直接读日志：`python unused/parse_lmeval_table.py <名字>=<eval 日志> ...`，
+  挑出日志里 eval.py 打印的结果表（行首前缀会去掉），同一名字的多份日志（如 32K、128K、256K 各一份）合成一行；
+  不给参数时照旧读文件里粘贴的 `model_outputs`。
 
 测试：`tests/test_yarn.py`（YaRN 的 cos/sin 与 transformers 一致），`tests/test_long_context.py`（YaRN 进入 LogKV 缓存且 recent
 窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数/数据路径、BABILong 按长度加载、困惑度任务取同一批长文档的末尾、下载脚本预建困惑度缓存、稠密缓存无方阵掩码且
