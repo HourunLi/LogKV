@@ -181,7 +181,9 @@ def test_task_selection_skips_blank_or_none_stages_and_supports_niah_only():
 
     def select(script, env=(), args=()):
         source = (root / script).read_text()
-        block = source[source.index('DEFAULT_BENCHMARKS="boolq'):source.index("\nMETA=")]
+        # eval.sh runs its stages in run_stages (once, or once per length); majob.sh inline.
+        end = source.index("\nMETA=") if "\nMETA=" in source else source.index("\n# The main stage, then the NIAH stage")
+        block = source[source.index('DEFAULT_BENCHMARKS="boolq'):end]
         result = subprocess.run(["bash", "-c", block + '\necho "MAIN=$BENCHMARKS"; echo "NIAH=$NIAH_BENCHMARKS"',
                                  script, *args], capture_output=True, text=True,
                                 env={"PATH": os.environ["PATH"], "NODE_RANK": "0", **dict(env)})
@@ -211,8 +213,8 @@ def test_task_selection_skips_blank_or_none_stages_and_supports_niah_only():
 
 def test_eval_launch_uses_selected_python_for_both_jobs():
     source = (Path(__file__).resolve().parents[1] / "eval.sh").read_text()
-    start = source.index('if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then')
-    # The trailing barrier cleanup is inert with NODE_RANK=1.
+    # The stages (run_stages), run once for a single-length YAML; the trailing barrier cleanup is inert with NODE_RANK=1.
+    start = source.index("# The main stage, then the NIAH stage")
     shell = '''
 PYTHON_BIN=selected_python
 BENCHMARKS=social_iqa

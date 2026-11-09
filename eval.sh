@@ -7,6 +7,9 @@
 #   bash eval.sh <training_yaml_or_eval_yaml> [benchmark_csv|none] [niah_csv|none]
 #   (niah_csv defaults to every NIAH task: DEFAULT_NIAH_BENCHMARKS below)
 #   NIAH only: bash eval.sh <yaml> none   or   NIAH_ONLY=1 bash eval.sh <yaml>
+#   Several lengths (a YAML with eval_lengths, e.g. exp/qwen1.7b-32k/eval_long_word_first.yaml; long_eval_plan.py):
+#     [EVAL_LENGTHS=32k,128k] [EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2] [YARN_MODE=fixed] [NIAH_ONLY=1] \
+#         bash eval.sh <yaml>
 #
 # Examples:
 #   bash eval.sh exp/qwen1.7b-32k/arc.yaml
@@ -281,6 +284,8 @@ emit("EVAL_LIMIT", cfg.get("limit") or "")  # samples per task (lm-eval's --limi
 # Data of the repository's long-context tasks (eval_tasks/long_ppl, eval_tasks/babilong_long).
 emit("CONFIG_LONG_PPL_DATA", cfg.get("long_ppl_data") or "")
 emit("CONFIG_LONG_PPL_BOOKS", cfg.get("long_ppl_books") or "")  # long_ppl_books_<L>: books of >= 256K tokens
+# Several lengths in one job (long_eval_plan.py): a list such as [32k, 64k, 128k, 256k].
+emit("CONFIG_EVAL_LENGTHS", ",".join(str(x) for x in (cfg.get("eval_lengths") or [])))
 emit("CONFIG_BABILONG_DATASET", cfg.get("babilong_dataset") or "")
 EOF
 )
@@ -297,6 +302,24 @@ BABILONG_DATASET=${BABILONG_DATASET:-${CONFIG_BABILONG_DATASET}}
 if [ -n "${LONG_PPL_DATA}" ]; then export LONG_PPL_DATA; fi
 if [ -n "${LONG_PPL_BOOKS}" ]; then export LONG_PPL_BOOKS; fi
 if [ -n "${BABILONG_DATASET}" ]; then export BABILONG_DATASET; fi
+
+# Several lengths in one job (eval_lengths in the YAML, or EVAL_LENGTHS=32k,128k): one pass per length with its
+# own window and YaRN factor (YARN_MODE=per_length, the default, or fixed), tasks chosen by EVAL_SUITES and
+# NIAH_ONLY=1; see long_eval_plan.py. Each pass writes to <output_path>/long<L> (fixed: yarn<F>/long<L>).
+EVAL_LENGTHS=${EVAL_LENGTHS:-${CONFIG_EVAL_LENGTHS}}
+LONG_EVAL_PASSES=()
+if [ -n "${EVAL_LENGTHS}" ]; then
+    if [ -n "${2:-}" ] || [ -n "${3:-}" ]; then
+        echo "ERROR: ${CONFIG_FILE} evaluates several lengths (EVAL_LENGTHS=${EVAL_LENGTHS}): choose tasks with EVAL_SUITES or NIAH_ONLY=1, not task-list arguments."
+        exit 1
+    fi
+    LONG_EVAL_PLAN=$("${PYTHON_BIN}" long_eval_plan.py "${EVAL_LENGTHS}" "${EVAL_SUITES:-}" "${YARN_MODE:-per_length}" \
+        "${NIAH_ONLY:-0}" "${CONFIG_OVERRIDES}" "${EVAL_OUTPUT_DIR}") || exit 1
+    mapfile -t LONG_EVAL_PASSES <<< "${LONG_EVAL_PLAN}"
+    CONFIG_OVERRIDES=""  # each pass brings its own, the YAML's merged in
+    echo "Long-context passes (YARN_MODE=${YARN_MODE:-per_length}, EVAL_SUITES=${EVAL_SUITES:-all}):"
+    printf '  %s\n' "${LONG_EVAL_PASSES[@]}"
+fi
 
 checkpoint_exists() {
     [ -f "$1" ] || { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
@@ -602,64 +625,82 @@ for TASK_LIST in "${BENCHMARKS}" "${NIAH_BENCHMARKS}"; do
             exit 1 ;;
     esac
 done
-echo "Main benchmarks: ${BENCHMARKS}"
-echo "NIAH benchmarks: ${NIAH_BENCHMARKS}"
-# RULER / NIAH context lengths: the YAML's eval_max_seq_lengths (default 1K-32K).
-META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENGTHS}"'}'
-MAIN_METADATA_ARGS=()
-# Tasks that build their samples with the tokenizer (RULER, long_ppl) need the metadata.
-if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* ]]; then
-    MAIN_METADATA_ARGS=(--metadata "${META}")
-fi
-
-if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
-    "${PYTHON_BIN}" -m torch.distributed.run \
-        --nnodes=${NUM_NODES} \
-        --nproc_per_node=${GPUS_PER_NODE} \
-        --node_rank=${NODE_RANK} \
-        --master_addr=${MASTER_ADDR} \
-        --master_port=${MAIN_EVAL_MASTER_PORT} \
-        eval.py \
-        --checkpoint_dir "${SAVE_DIR}" \
-        --benchmark "${BENCHMARKS}" \
-        --output_path "${EVAL_OUTPUT_DIR}" \
-        "${MAIN_METADATA_ARGS[@]}" \
-        "${LOG_KV_ARG_LIST[@]}" \
-        ${DIAG_ARGS} \
-        ${TOKENIZER_ARGS}
-
-    EVAL_STATUS=$?
-    if [ ${EVAL_STATUS} -ne 0 ]; then
-        echo "ERROR: main eval failed with exit code ${EVAL_STATUS}"
-        exit ${EVAL_STATUS}
+# The main stage, then the NIAH stage, with the current task lists, lengths, output dir and PASS_ARGS.
+run_stages() {
+    echo "Main benchmarks: ${BENCHMARKS}"
+    echo "NIAH benchmarks: ${NIAH_BENCHMARKS}"
+    # RULER / NIAH context lengths: the YAML's eval_max_seq_lengths (default 1K-32K).
+    META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENGTHS}"'}'
+    MAIN_METADATA_ARGS=()
+    # Tasks that build their samples with the tokenizer (RULER, long_ppl) need the metadata.
+    if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* ]]; then
+        MAIN_METADATA_ARGS=(--metadata "${META}")
     fi
-else
-    echo "Skipping main benchmark eval."
-fi
 
-if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
-    "${PYTHON_BIN}" -m torch.distributed.run \
-        --nnodes=${NUM_NODES} \
-        --nproc_per_node=${GPUS_PER_NODE} \
-        --node_rank=${NODE_RANK} \
-        --master_addr=${MASTER_ADDR} \
-        --master_port=${NIAH_EVAL_MASTER_PORT} \
-        eval.py \
-        --checkpoint_dir "${SAVE_DIR}" \
-        --benchmark "${NIAH_BENCHMARKS}" \
-        --metadata "${META}" \
-        --output_path "${EVAL_OUTPUT_DIR}" \
-        "${LOG_KV_ARG_LIST[@]}" \
-        ${DIAG_ARGS} \
-        ${TOKENIZER_ARGS}
+    if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
+        "${PYTHON_BIN}" -m torch.distributed.run \
+            --nnodes=${NUM_NODES} \
+            --nproc_per_node=${GPUS_PER_NODE} \
+            --node_rank=${NODE_RANK} \
+            --master_addr=${MASTER_ADDR} \
+            --master_port=${MAIN_EVAL_MASTER_PORT} \
+            eval.py \
+            --checkpoint_dir "${SAVE_DIR}" \
+            --benchmark "${BENCHMARKS}" \
+            --output_path "${EVAL_OUTPUT_DIR}" \
+            "${MAIN_METADATA_ARGS[@]}" \
+            "${LOG_KV_ARG_LIST[@]}" \
+            "${PASS_ARGS[@]}" \
+            ${DIAG_ARGS} \
+            ${TOKENIZER_ARGS}
 
-    EVAL_STATUS=$?
-    if [ ${EVAL_STATUS} -ne 0 ]; then
-        echo "ERROR: NIAH eval failed with exit code ${EVAL_STATUS}"
-        exit ${EVAL_STATUS}
+        EVAL_STATUS=$?
+        if [ ${EVAL_STATUS} -ne 0 ]; then
+            echo "ERROR: main eval failed with exit code ${EVAL_STATUS}"
+            exit ${EVAL_STATUS}
+        fi
+    else
+        echo "Skipping main benchmark eval."
     fi
+
+    if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
+        "${PYTHON_BIN}" -m torch.distributed.run \
+            --nnodes=${NUM_NODES} \
+            --nproc_per_node=${GPUS_PER_NODE} \
+            --node_rank=${NODE_RANK} \
+            --master_addr=${MASTER_ADDR} \
+            --master_port=${NIAH_EVAL_MASTER_PORT} \
+            eval.py \
+            --checkpoint_dir "${SAVE_DIR}" \
+            --benchmark "${NIAH_BENCHMARKS}" \
+            --metadata "${META}" \
+            --output_path "${EVAL_OUTPUT_DIR}" \
+            "${LOG_KV_ARG_LIST[@]}" \
+            "${PASS_ARGS[@]}" \
+            ${DIAG_ARGS} \
+            ${TOKENIZER_ARGS}
+
+        EVAL_STATUS=$?
+        if [ ${EVAL_STATUS} -ne 0 ]; then
+            echo "ERROR: NIAH eval failed with exit code ${EVAL_STATUS}"
+            exit ${EVAL_STATUS}
+        fi
+    else
+        echo "Skipping NIAH eval."
+    fi
+}
+
+if [ ${#LONG_EVAL_PASSES[@]} -eq 0 ]; then
+    PASS_ARGS=()
+    run_stages
 else
-    echo "Skipping NIAH eval."
+    for PASS in "${LONG_EVAL_PASSES[@]}"; do
+        IFS='|' read -r EVAL_OUTPUT_DIR PASS_OVERRIDES EVAL_MAX_SEQ_LENGTHS BENCHMARKS NIAH_BENCHMARKS PASS_OPTIONAL <<< "${PASS}"
+        export EVAL_OPTIONAL_TASKS=${PASS_OPTIONAL}
+        PASS_ARGS=(--config_overrides "${PASS_OVERRIDES}")
+        echo "===== Long-context pass: ${EVAL_OUTPUT_DIR} | ${PASS_OVERRIDES} ====="
+        run_stages
+    done
 fi
 
 if [ ${NODE_RANK} -eq 0 ] && [ -d "${BARRIER_DIR}" ]; then

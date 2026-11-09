@@ -205,3 +205,10 @@ long_ppl_books_256k@32k
 long_ppl_books_256k@64k
 long_ppl_books_256k@128k
 long_ppl_books_256k@256k
+ruler_vt@32k
+ruler_cwe@32k
+ruler_fwe@32k
+ruler_qa_squad@32k
+ruler_qa_hotpot@32k
+AVG_RULER@32k
+LongBench2@32k

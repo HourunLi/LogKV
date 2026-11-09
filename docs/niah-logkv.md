@@ -323,6 +323,17 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   下载进行中（桶不允许重命名，收尾时先复制再删除，要一段时间）或被中断时，`<配置>/<版本>/` 下有还没写 `dataset_info.json`
   的 `<hash>.incomplete` 目录，`datasets` 离线查找会读到它并报 `FileNotFoundError`；`litgpt/hf_cache_patch.py`（`eval.py` 与下载脚本的离线复查都会应用）让离线查找跳过它，
   该配置只剩这种目录时报“not completely downloaded”并列出目录，此时等下载结束或联网重跑下载脚本；下载脚本的汇总也会列出残留目录。
+- 一份配置测多个长度：`eval_long_{dense,baseline,word_first}.yaml`（`eval_lengths: [32k, 64k, 128k, 256k]`）。`eval.sh` 用
+  `long_eval_plan.py` 按长度逐档评测：每档窗口为长度 + 1024，NIAH 阶段跑该长度的 RULER，主阶段跑该长度的 `babilong_<L>`、
+  `long_ppl_<L>`、`long_ppl_books_<L>`、`niah_turns_<L>` 与 `longbench2_<L>`，结果写到 `<output_path>/long<L>`。YaRN 默认按长度取倍数
+  （`YARN_MODE=per_length`：32K 不用，64K 2、128K 4、256K 8），32K 档与 32K 主线一致、各长度比较的是压缩而不是外推；
+  `YARN_MODE=fixed` 是附加实验：每档都用所测最长一档的倍数（按该长度部署的模型，静态 YaRN），写到 `<output_path>/yarn<F>/long<L>`。
+  YaRN 的频率与温度只取决于倍数、与窗口无关，所以两种模式只差倍数，LongBench v2 的预算仍是各档自己的长度。外部变量控制范围：
+  `EVAL_LENGTHS=32k,128k`（默认 YAML 的 `eval_lengths`）、`EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2`（默认全部；
+  默认时缺数据的 `ppl`、`books` 作为可选任务跳过，点名的必须能跑）、`NIAH_ONLY=1`（只跑 RULER）；这种配置不接受任务清单参数。
+  每档换一次窗口与 YaRN，要重新加载模型（约一分钟）。注意 `long_ppl_32k` 在这里是 32K 档（不用 YaRN）测的，在
+  `eval_long64k_*.yaml` 里是 64K 配置（YaRN 2）测的；32K 档的 8 个捞针任务写进 32K 主线的同名列，其余 5 个 RULER 任务、
+  `AVG_RULER@32k` 与 `LongBench2@32k` 是新加的列。按长度拆开的 `eval_long{64k,128k,256k}_*.yaml` 保留，用于复现已有结果。
 - 配置：`eval_long{64k,128k,256k}_{dense,baseline,word_first}.yaml`，分别是原始 Qwen3-1.7B-Base 的 dense（未经 CPT，继承
   `dense_niah_base.yaml`，结果写到其 `long64k` / `long128k` / `long256k` 子目录）、同 checkpoint 的 K/V 准入基线与 `word_first`，
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER（256K 为上面的 12 个），主阶段跑 BABILong 与困惑度（64K 配置为 32K
@@ -339,5 +350,6 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
 测试：`tests/test_yarn.py`（YaRN 的 cos/sin 与 transformers 一致），`tests/test_long_context.py`（YaRN 进入 LogKV 缓存且 recent
 窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数/数据路径、BABILong 按长度加载、困惑度任务取同一批长文档的末尾、下载脚本预建困惑度缓存、稠密缓存无方阵掩码且
 与不缓存一致、书的曲线逐点取同一批书且 `--limit` 按书计、下载脚本逐个文件下载到书够为止），
-`tests/test_niah_turns.py`（缓存精确时逐轮答案与不用缓存逐 token 重算一致、压缩缓存上不给 query cue、样本切成上下文与四个问题、
+`tests/test_long_eval_plan.py`（每档的窗口、YaRN 倍数、任务、输出目录与可选任务，两种 YaRN 模式，`eval.sh` 逐档传参、单长度配置
+照旧），`tests/test_niah_turns.py`（缓存精确时逐轮答案与不用缓存逐 token 重算一致、压缩缓存上不给 query cue、样本切成上下文与四个问题、
 任务把 `turn_separator` 交给 eval.py），`tests/test_exp_configs.py`（长文本配置只差长度相关的几项）。
