@@ -184,9 +184,13 @@ def test_long_ppl_scores_the_tail_of_the_same_long_documents(tmp_path, monkeypat
     monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache"))
     scores = [utils.process_results(row, [(-8. * math.log(4.), False)]) for row in rows]
     assert utils.perplexity([s["ppl"] for s in scores]) == pytest.approx(4.)
-    monkeypatch.setenv("LONG_PPL_DATA", str(tmp_path / "missing"))
+    monkeypatch.setenv("LONG_PPL_DATA", str(tmp_path / "missing" / "snapshot"))
     monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache2"))
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(FileNotFoundError, match="nearest existing folder is .*shard-0.parquet"):
+        utils.build(32, {"pretrained": word_tokenizer})  # the error shows what this node does see
+    (tmp_path / "link").symlink_to(tmp_path / "gone")
+    monkeypatch.setenv("LONG_PPL_DATA", str(tmp_path / "link"))
+    with pytest.raises(FileNotFoundError, match="a symlink to .*gone"):
         utils.build(32, {"pretrained": word_tokenizer})
 
 
@@ -311,3 +315,31 @@ def test_the_fetch_script_spots_files_that_are_not_parquet(tmp_path):
     pointer.write_text("version https://git-lfs.github.com/spec/v1\\noid sha256:abc\\nsize 123\\n")
     assert fetch.is_parquet(good) and not fetch.is_parquet(pointer) and not fetch.is_parquet(tmp_path / "missing")
     assert "git-lfs" in fetch.describe(pointer) and fetch.describe(tmp_path / "missing") == "missing"
+
+
+def test_the_fetch_script_puts_a_ppl_hub_repository_in_a_folder_of_real_files(tmp_path, monkeypatch):
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    import importlib.util
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    spec = importlib.util.spec_from_file_location("fetch_long_eval_data_hub", ROOT / "unused" / "fetch_long_eval_data.py")
+    fetch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetch)
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    pq.write_table(pa.table({"text": ["a book"]}), blobs / "abc123")
+
+    def download(repo, repo_type=None, local_dir=None):  # as older huggingface_hub: large files link to the cache
+        (Path(local_dir) / "data").mkdir(parents=True, exist_ok=True)
+        (Path(local_dir) / "data" / "test-0.parquet").symlink_to(blobs / "abc123")
+        return local_dir
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "home"))
+    lines = []
+    root = fetch.fetch_ppl_hub("emozilla/pg19-test", lines)
+    assert root == str(tmp_path / "home" / "long_ppl_data" / "emozilla--pg19-test")
+    data = Path(root) / "data" / "test-0.parquet"
+    assert not data.is_symlink() and fetch.is_parquet(data)  # the folder holds the file itself
+    assert "1 symlinks replaced by copies" in lines[0] and lines[-1] == f"  for eval.sh: export LONG_PPL_DATA={root}"

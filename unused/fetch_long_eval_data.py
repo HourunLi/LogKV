@@ -11,8 +11,9 @@ switches off for itself only, then:
     long_ppl      --ppl-data: finds the documents of at least 131072 tokens (with --tokenizer) and caches
                   the selection the long_ppl tasks use, so eval ranks do not tokenize it again;
                   --ppl-hub <dataset repo> (e.g. emozilla/pg19-test, PG19's 100 test books) downloads
-                  the repository first and uses its folder as --ppl-data (export the printed path as
-                  LONG_PPL_DATA for eval.sh)
+                  the repository first into $HF_HOME/long_ppl_data/<owner>--<name> (real files, not
+                  the hub cache's symlinks into blobs/) and uses that folder as --ppl-data (export the
+                  printed path as LONG_PPL_DATA for eval.sh)
 
 and finally loads every dataset again in an offline subprocess, as eval.py will. A summary goes to
 <--out>.summary.txt beside --out (default fetch_long_eval_data.json in the current directory).
@@ -165,8 +166,10 @@ def describe(path: Path) -> str:
     return f"{path.stat().st_size} bytes, starts {head!r}"
 
 
-def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | None = None) -> bool:
-    """Download again, fresh, every snapshot parquet file that is not a whole parquet file."""
+def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | None = None,
+                   local_dir: str | None = None) -> bool:
+    """Download again, fresh, every snapshot parquet file that is not a whole parquet file (into local_dir
+    when the files live there rather than in the hub cache)."""
     from huggingface_hub import hf_hub_download
 
     from litgpt.longbench2_patch import REPO
@@ -176,7 +179,9 @@ def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | No
     ok = True
     for f in bad:
         before = describe(Path(root) / f)
-        fresh = Path(hf_hub_download(repo, f, repo_type="dataset", force_download=True))
+        fresh = Path(hf_hub_download(repo, f, repo_type="dataset", force_download=True, local_dir=local_dir))
+        if local_dir:
+            materialize(local_dir)
         good = is_parquet(fresh)
         ok = ok and good
         lines.append(f"{repo} {f}: was {before}; downloaded again: " + ("ok" if good else describe(fresh)))
@@ -185,14 +190,42 @@ def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | No
     return ok
 
 
+def ppl_hub_dir(repo: str) -> Path:
+    """Where --ppl-hub puts a repository: a folder of its own under HF_HOME, apart from the hub cache."""
+    home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    return Path(home) / "long_ppl_data" / repo.replace("/", "--")
+
+
+def materialize(folder) -> int:
+    """Replace every symlink under folder by a copy of its target, so the folder holds its files itself."""
+    import shutil
+
+    count = 0
+    for path in sorted(Path(folder).rglob("*")):
+        if path.is_symlink():
+            target = path.resolve()
+            path.unlink()
+            shutil.copyfile(target, path)
+            count += 1
+    return count
+
+
 def fetch_ppl_hub(repo: str, lines: list[str]) -> str:
-    """Download a dataset repository for long_ppl and return its snapshot folder (the --ppl-data)."""
+    """Download a dataset repository for long_ppl into ppl_hub_dir(repo) and return that folder (the
+    --ppl-data). The hub cache keeps a snapshot as symlinks into blobs/, which a bucket sync or warm-up of
+    the snapshot folder alone does not carry; this folder holds real files."""
     from huggingface_hub import snapshot_download
 
-    root = snapshot_download(repo, repo_type="dataset")
-    files = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*") if p.suffix in (".parquet", ".jsonl"))
-    lines.append(f"long_ppl data {repo}: {root} ({len(files)} files, e.g. {files[:3]})")
-    if not repair_parquet(root, files, lines, repo):
+    root = ppl_hub_dir(repo)
+    root.mkdir(parents=True, exist_ok=True)
+    snapshot_download(repo, repo_type="dataset", local_dir=str(root))
+    copied = materialize(root)  # older huggingface_hub links large files of a local_dir to the cache
+    root = str(root)
+    files = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*")
+                   if p.suffix in (".parquet", ".jsonl") and ".cache" not in p.relative_to(root).parts)
+    lines.append(f"long_ppl data {repo}: {root} ({len(files)} files, e.g. {files[:3]}"
+                 + (f"; {copied} symlinks replaced by copies" if copied else "") + ")")
+    if not repair_parquet(root, files, lines, repo, local_dir=root):
         raise ValueError(f"some {repo} files are still not parquet after a fresh download (above)")
     lines.append(f"  for eval.sh: export LONG_PPL_DATA={root}")
     return root

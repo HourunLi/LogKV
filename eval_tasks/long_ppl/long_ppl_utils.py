@@ -29,12 +29,28 @@ TAIL = 4096
 COLUMNS = ("text", "content", "code")
 
 
+def _missing(path: Path) -> str:
+    """What this node sees of a LONG_PPL_DATA that is not there: a dangling link, or its nearest folder."""
+    if path.is_symlink():
+        return f"a symlink to {os.readlink(path)!r}, which is missing"
+    parent = path.parent
+    while not parent.is_dir() and parent != parent.parent:
+        parent = parent.parent
+    try:
+        names = sorted(p.name for p in parent.iterdir())
+    except OSError as error:
+        names = [f"<unreadable: {error}>"]
+    return (f"the nearest existing folder is {str(parent)!r}, holding {names[:10]}"
+            + (f" and {len(names) - 10} more" if len(names) > 10 else "")
+            + "; a bucket path written from another machine may need syncing (warming up) to this one")
+
+
 def _files(source: str) -> list[Path]:
     path = Path(source).expanduser()
     if path.is_file():
         return [path]
     if not path.is_dir():
-        raise FileNotFoundError(f"LONG_PPL_DATA={source!r} is neither a file nor a directory")
+        raise FileNotFoundError(f"LONG_PPL_DATA={source!r} is neither a file nor a directory: {_missing(path)}")
     return sorted([*path.rglob("*.parquet"), *path.rglob("*.jsonl")])
 
 
