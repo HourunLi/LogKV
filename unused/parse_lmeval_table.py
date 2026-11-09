@@ -441,6 +441,11 @@ ORDERED_COLUMNS += [f"long_ppl_{n}" for n in PPL_LENGTHS] + ["LongBench2"]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
+# 追加新列，不改变旧列名、顺序和平均值口径。无后缀的 NIAH 列仍取 32K。
+for _length in LONG_LENGTHS.values():
+    ORDERED_COLUMNS += [f"{t}@{_length}" for t in NIAH_CUE + NIAH_WORDS]
+ORDERED_COLUMNS += [f"babilong_{n}" for n in BABILONG_LENGTHS]
+ORDERED_COLUMNS += [f"long_ppl_{n}_bits_per_byte" for n in PPL_LENGTHS]
 
 RAW_TO_TARGET_MAP = {
     "boolq": "BoolQ", "piqa": "PIQA", "social_iqa": "SIQA", "hellaswag": "HellaSwag",
@@ -469,12 +474,24 @@ TARGET_METRIC_MAP = {
     "niah_single_1": "32768", "niah_single_2": "32768", "niah_single_3": "32768",
     **{task: "32768" for task in NIAH_MULTI + NIAH_CUE + NIAH_WORDS},
     **{f"babilong_qa{i}_{n}": "acc" for i in range(1, 6) for n in BABILONG_LENGTHS},
+    **{f"babilong_{n}": "acc" for n in BABILONG_LENGTHS},
     **{f"long_ppl_{n}": "ppl" for n in PPL_LENGTHS},
     "LongBench2": "acc",
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
         TARGET_METRIC_MAP[col] = "score"
+
+# 保留旧版优先读取 score 的行为；有些 lm-eval 版本只输出任务专用指标。
+LONGBENCH_METRICS = {
+    "gov_report": "rouge_score", "hotpotqa": "qa_f1_score", "lcc": "code_sim_score",
+    "qasper": "qa_f1_score", "multifieldqa_zh": "qa_f1_zh_score", "multifieldqa_en": "qa_f1_score",
+    "musique": "qa_f1_score", "narrativeqa": "qa_f1_score", "passage_count": "count_score",
+    "passage_retrieval_en": "retrieval_score", "repobench-p": "code_sim_score",
+    "samsum": "rouge_score", "triviaqa": "qa_f1_score", "trec": "classification_score",
+    "lsht": "classification_score", "multi_news": "rouge_score", "qmsum": "rouge_score",
+    "dureader": "rouge_zh_score", "2wikimqa": "qa_f1_score", "vcsum": "rouge_zh_score",
+}
 
 # ==============================================================================
 # 2. 定义各模块的平均值计算范围
@@ -510,7 +527,8 @@ def parse_single_model(model_name, markdown_text):
     lines = [line for line in markdown_text.strip().split('\n') if not line.strip().startswith('|---')]
     if not lines: return {"Model": model_name}
     
-    df = pd.read_csv(io.StringIO('\n'.join(lines)), sep='|')
+    # 单独粘贴 NIAH/RULER 表时 Metric 全是数字；必须保留为字符串才能匹配长度键。
+    df = pd.read_csv(io.StringIO('\n'.join(lines)), sep='|', dtype=str, keep_default_na=False)
     df = df.iloc[:, 1:-1]
     df.columns = df.columns.str.strip()
     for col in df.columns:  # text columns (object, or pandas 3's string dtype)
@@ -518,6 +536,7 @@ def parse_single_model(model_name, markdown_text):
     
     df['Tasks'] = df['Tasks'].replace('', np.nan).ffill()
     row_data = {"Model": model_name}
+    fallback_values = {}
     
     for _, row in df.iterrows():
         raw_task = re.sub(r"^-\s*", "", str(row['Tasks']))  # a group's subtasks are listed as " - name"
@@ -526,18 +545,36 @@ def parse_single_model(model_name, markdown_text):
 
         target_task = RAW_TO_TARGET_MAP.get(raw_task, raw_task)
         expected_metric = TARGET_METRIC_MAP.get(target_task)
-        if target_task in LONG_RULER and metric in LONG_LENGTHS:  # RULER at 64K / 128K / 256K
+        if target_task in LONG_RULER + NIAH_CUE + NIAH_WORDS and metric in LONG_LENGTHS:
+            target_column = f"{target_task}@{LONG_LENGTHS[metric]}"
             try:
-                row_data[f"{target_task}@{LONG_LENGTHS[metric]}"] = float(value)
+                if target_column in ORDERED_COLUMNS:
+                    row_data[target_column] = float(value)
             except ValueError:
                 pass
             continue
+
+        if raw_task.startswith("longbench_"):
+            name = raw_task.removeprefix("longbench_").removesuffix("_e")
+            if metric == LONGBENCH_METRICS.get(name):
+                try:
+                    fallback_values[target_task] = float(value)
+                except ValueError:
+                    pass
+
+        if raw_task in {f"long_ppl_{n}" for n in PPL_LENGTHS} and metric == "bits_per_byte":
+            try:
+                row_data[f"{raw_task}_bits_per_byte"] = float(value)
+            except ValueError:
+                pass
 
         if expected_metric and metric == expected_metric:
             try:
                 row_data[target_task] = float(value)
             except ValueError:
                 pass # 忽略非数字
+    for task, value in fallback_values.items():
+        row_data.setdefault(task, value)
     return row_data
 
 # 1. 组合数据为 DataFrame
