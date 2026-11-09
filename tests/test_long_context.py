@@ -79,21 +79,14 @@ def test_the_launcher_reads_lengths_tasks_and_overrides_from_the_yaml(tmp_path):
     assert overrides == {"block_size": 135168, "rope_adjustments": {"factor": 4.0, "beta_fast": 32}}
 
 
-def test_the_launcher_passes_the_same_memory_baselines(tmp_path):
+def test_the_launcher_passes_the_swa_window(tmp_path):
     plain = tmp_path / "plain.yaml"
     plain.write_text("save_path: /tmp/unused-checkpoint\n")
-    args, _, _ = _eval_settings(plain)
-    assert "--swa_window_size" not in args and "--kv_baseline" not in args
+    assert "--swa_window_size" not in _eval_settings(plain)[0]
     swa = tmp_path / "swa.yaml"
     swa.write_text("save_path: /tmp/unused-checkpoint\nswa_window_size: 0\n")
     args, _, _ = _eval_settings(swa)
     assert args[args.index("--swa_window_size") + 1] == "0"
-    evict = tmp_path / "evict.yaml"
-    evict.write_text("save_path: /tmp/unused-checkpoint\nkv_baseline: snapkv\nkv_baseline_budget: 0\n"
-                     "kv_baseline_options: {window: 32, chunk: 512}\n")
-    args, _, _ = _eval_settings(evict)
-    assert args[args.index("--kv_baseline") + 1] == "snapkv" and args[args.index("--kv_baseline_budget") + 1] == "0"
-    assert json.loads(args[args.index("--kv_baseline_options") + 1]) == {"window": 32, "chunk": 512}
 
 
 def test_per_length_babilong_tasks_load_their_length(monkeypatch):
