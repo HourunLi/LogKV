@@ -3,13 +3,13 @@
 Offline (HF_DATASETS_OFFLINE=1), ``datasets`` finds a cached config by globbing
 ``<cache>/<namespace>___<name>/<config>/<version>/*`` and reading the ``dataset_info.json`` of every match
 (``datasets.packaged_modules.cache.cache._find_hash_in_cache``). That glob also matches ``<hash>.incomplete``,
-the folder a builder fills before moving it to ``<hash>``. A download that was killed, or whose move stopped
-part way (the OBS bucket refuses renames, so shutil.move copies the folder and then deletes it), leaves that
-folder behind without the file, and every offline load of the config then fails with
+the folder a builder fills before moving it to ``<hash>``; the file is written only at the end. While a
+download is still running (the OBS bucket refuses renames, so the final move copies the folder and then deletes
+it, which takes a while), or after one was killed, every offline load of the config fails with
 ``FileNotFoundError: .../<hash>.incomplete/dataset_info.json``, whether ``<hash>`` is complete or missing.
 Online loads never take such a folder for a finished cache; with this patch the offline lookup skips it as
-well. When nothing else is cached for the config, the error names the leftover folders: the config was never
-completely downloaded. Applied by eval.py; unused/fetch_long_eval_data.py checks its downloads with it.
+well. When nothing else is cached for the config, the error names the unfinished folders. Applied by eval.py;
+unused/fetch_long_eval_data.py checks its downloads with it.
 """
 from __future__ import annotations
 
@@ -68,9 +68,10 @@ def apply_patch() -> None:
                 raise
             raise ValueError(
                 f"{error}\n{name}" + (f" config '{config_id}'" if config_id else "")
-                + " was never completely downloaded: the cache holds only the unfinished folder(s) "
-                + ", ".join(left) + ", left by an interrupted download. Download it again online "
-                "(the long-context evals: bash diag.sh unused/fetch_long_eval_data.py); the folders may be deleted."
+                + " is not completely downloaded: the cache holds only the unfinished folder(s) "
+                + ", ".join(left) + " of a download still running or one that was interrupted. Wait for the running "
+                "one, or download it again online (the long-context evals: bash diag.sh "
+                "unused/fetch_long_eval_data.py); a folder no download is writing may be deleted."
             ) from error
 
     cache._find_hash_in_cache = find_finished

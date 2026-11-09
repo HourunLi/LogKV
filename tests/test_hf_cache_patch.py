@@ -72,12 +72,12 @@ def test_a_leftover_beside_a_finished_copy_no_longer_breaks_the_offline_load(tmp
     assert _load(tmp_path, "patched") == dict(rows=["qa1-a", "qa1-b"])
 
 
-def test_a_config_with_only_a_leftover_says_it_was_never_downloaded(tmp_path):
+def test_a_config_with_only_a_leftover_says_it_is_not_downloaded_yet(tmp_path):
     _write_config(tmp_path / "RMT-team___babilong-1k-samples" / "64k" / "0.0.0" / HASH)
     folder = _leftover(tmp_path, with_arrow=False)
     result = _load(tmp_path, "patched")
     assert result["error"] == "ValueError"
-    assert "never completely downloaded" in result["message"] and str(folder) in result["message"]
+    assert "not completely downloaded" in result["message"] and str(folder) in result["message"]
     assert "for config '128k'" in result["message"]  # datasets' own message is kept
 
 
