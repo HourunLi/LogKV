@@ -281,7 +281,7 @@ def test_only_surprisal_evaluations_rank_by_surprisal(name):
                 "eval_gamma_surprisal_mean_query_p1024.yaml": "mean", "eval_gamma_surprisal_mix_query_p1024.yaml": "mix",
                 "eval_gamma_surprisal_word_first_query_p1024.yaml": "word_first",
                 **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "word_first", "multi_word")},
-                **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k", "256k")}}
+                **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k", "256k", "")}}
     assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
 
 
@@ -323,3 +323,16 @@ def test_long_context_evaluations_change_only_the_length_settings(length, tokens
     overrides = evaluated["config_overrides"]
     assert overrides["block_size"] > tokens and overrides["rope_adjustments"] == dict(
         factor=factor, beta_fast=32, beta_slow=1, original_max_seq_len=32768)
+
+
+@pytest.mark.parametrize("name", sorted(LONG))
+def test_one_yaml_per_method_covers_every_length(name):
+    """eval_long_<method>.yaml: the same model and cache settings as the per-length YAMLs, the lengths listed
+    (eval.sh computes each pass's window, YaRN and tasks: long_eval_plan.py)."""
+    evaluated, base = effective(f"eval_long_{name}.yaml"), effective(LONG[name])
+    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
+        "eval_lengths", "limit", "long_ppl_data", "long_ppl_books"}
+    assert evaluated["eval_lengths"] == ["32k", "64k", "128k", "256k"] and evaluated["limit"] == 100
+    assert "config_overrides" not in evaluated
+    if name == "dense":  # passes write to its long<L> folders, where the per-length dense runs wrote
+        assert evaluated["output_path"] + "/long64k" == effective("eval_long64k_dense.yaml")["output_path"]

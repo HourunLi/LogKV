@@ -452,6 +452,9 @@ def _skip_optional_tasks(tasks, max_seq_length):
                 reason = str(error)
             if reason is None and task.startswith("long_ppl_books") and not os.environ.get("LONG_PPL_BOOKS"):
                 reason = "LONG_PPL_BOOKS is not set (unused/fetch_long_eval_data.py --ppl-books-hub emozilla/pg19)"
+            elif reason is None and task.startswith("long_ppl_") and not task.startswith("long_ppl_books") \
+                    and not os.environ.get("LONG_PPL_DATA"):
+                reason = "LONG_PPL_DATA is not set (unused/fetch_long_eval_data.py --ppl-hub emozilla/pg19-test)"
         if reason is None:
             kept.append(task)
         elif _is_main():

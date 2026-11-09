@@ -440,7 +440,7 @@ RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] f
 BABILONG_LENGTHS = ("32k", "64k", "128k", "256k")
 PPL_LENGTHS = ("32k", "64k", "128k", "256k")
 # LongBench v2 的上下文预算来自 block_size：按长度命名的组（eval_tasks/longbench2_long）才能分列。
-LONGBENCH2_LENGTHS = ("64k", "128k", "256k")
+LONGBENCH2_LENGTHS = ("64k", "128k", "256k", "32k")  # 32k came last (eval_long_*.yaml's 32K pass)
 
 
 
@@ -459,7 +459,7 @@ def _long_columns(ruler_lengths, babilong_lengths, ppl_lengths):
 # 64K / 128K 的长文本列（以及 LongBench2）：
 ORDERED_COLUMNS += _long_columns(("64k", "128k"), ("32k", "64k", "128k"), ("32k", "64k", "128k")) + ["LongBench2"]
 # 后加：256K（RULER 12 个任务、BABILong、困惑度），按长度命名的 LongBench v2。
-ORDERED_COLUMNS += _long_columns(("256k",), ("256k",), ("256k",)) + [f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS]
+ORDERED_COLUMNS += _long_columns(("256k",), ("256k",), ("256k",)) + [f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS[:3]]
 # 后加：同一份缓存上逐轮问（eval_tasks/niah_turns：niah_turns_<长度> 为四轮平均，@turnN 为第 N 轮），
 # 书的困惑度曲线（eval_tasks/long_ppl：long_ppl_books_<配置长度>@<截断长度>，同一批书，越低越好）。
 TURN_LENGTHS = ("32k", "64k", "128k", "256k")
@@ -467,6 +467,10 @@ TURN_TASKS = [f"niah_turns_{n}" for n in TURN_LENGTHS]
 BOOK_POINTS = {n: [f"{2 ** k}k" for k in range(3, 9) if 2 ** k <= int(n[:-1])] for n in ("32k", "64k", "128k", "256k")}
 ORDERED_COLUMNS += [c for t in TURN_TASKS for c in [t] + [f"{t}@turn{i}" for i in range(1, 5)]]
 ORDERED_COLUMNS += [f"long_ppl_books_{n}@{q}" for n, points in BOOK_POINTS.items() for q in points]
+# 后加：多长度评测（eval_long_*.yaml）的 32K 档。8 个捞针任务的 32K 写进上面 32K 主线的同名列（同为 32K、不用 YaRN），
+# 这里是其余 5 个 RULER 任务、13 个的平均与 LongBench v2。
+RULER_32K_EXTRA = ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
+ORDERED_COLUMNS += [f"{t}@32k" for t in RULER_32K_EXTRA] + ["AVG_RULER@32k", "LongBench2@32k"]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
@@ -529,13 +533,14 @@ AVG_GROUPS = {
     **{f"AVG_NIAH_multi@{n}": [f"{t}@{n}" for t in NIAH_MULTI] for n in LONG_LENGTHS.values()},
     **{f"AVG_RULER@{n}": [f"{t}@{n}" for t in RULER_AT[n]] for n in LONG_LENGTHS.values()},
     **{f"AVG_babilong_{n}": [f"babilong_qa{i}_{n}" for i in range(1, 6)] for n in BABILONG_LENGTHS},
+    "AVG_RULER@32k": LONG_NIAH + [f"{t}@32k" for t in RULER_32K_EXTRA],
 }
 # 新增的诊断组不计入 AVG_all，旧结果与新结果的总平均保持可比。
 DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words",
                      *(f"AVG_NIAH@{n}" for n in LONG_LENGTHS.values()),
                      *(f"AVG_NIAH_multi@{n}" for n in LONG_LENGTHS.values()),
                      *(f"AVG_RULER@{n}" for n in LONG_LENGTHS.values()),
-                     *(f"AVG_babilong_{n}" for n in BABILONG_LENGTHS)}
+                     *(f"AVG_babilong_{n}" for n in BABILONG_LENGTHS), "AVG_RULER@32k"}
 
 # ==============================================================================
 # 3. 解析与计算核心代码
@@ -584,6 +589,12 @@ def parse_single_model(model_name, markdown_text):
         if target_task in TURN_TASKS and re.fullmatch(r"turn\d", metric):  # niah_turns: one column per turn
             try:
                 row_data[f"{target_task}@{metric}"] = float(value)
+            except ValueError:
+                pass
+            continue
+        if target_task in RULER_32K_EXTRA and metric == "32768":  # the other RULER tasks at 32K
+            try:
+                row_data[f"{target_task}@32k"] = float(value)
             except ValueError:
                 pass
             continue
