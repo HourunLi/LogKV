@@ -310,9 +310,9 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   与 64K，128K、256K 配置为各自的长度），每个任务 100 条。256K 的 dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset` 与 `long_ppl_data` 两个键（或同名环境变量）给出本地数据。
 - 汇总表（`unused/parse_lmeval_table.py`）：RULER 13 个任务的 `<任务>@64k`、`AVG_NIAH@64k`、`AVG_NIAH_multi@64k`、
   `AVG_RULER@64k`（128k、256k 同；256k 没有 `ruler_qa_squad`，为 12 个的平均）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`
-  与 `LongBench2@<长度>`，都不计入 `AVG_all`。可直接读日志：`python unused/parse_lmeval_table.py <名字>=<eval 日志> ...`，
-  挑出日志里 eval.py 打印的结果表（行首前缀会去掉），同一名字的多份日志（如 32K、128K、256K 各一份）合成一行；
-  不给参数时照旧读文件里粘贴的 `model_outputs`。
+  与 `LongBench2@<长度>`，都不计入 `AVG_all`。把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
+  日志里 eval.py 打印的结果表会被挑出来（行首前缀会去掉），同一模型的几份日志（如 32K、128K、256K 各一份）接着贴进
+  同一个字符串，合成一行。
 
 测试：`tests/test_yarn.py`（YaRN 的 cos/sin 与 transformers 一致），`tests/test_long_context.py`（YaRN 进入 LogKV 缓存且 recent
 窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数/数据路径、BABILong 按长度加载、困惑度任务取同一批长文档的末尾、下载脚本预建困惑度缓存、稠密缓存无方阵掩码且
