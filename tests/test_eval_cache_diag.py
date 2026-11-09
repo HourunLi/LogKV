@@ -10,6 +10,8 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 def test_cache_failure_is_visible_and_original_behavior_is_preserved():
     source = Path(__file__).resolve().parents[1] / "eval.py"
@@ -262,3 +264,55 @@ if __name__ == "__main__":
     test_eval_launch_uses_selected_python_for_both_jobs()
     test_eval_barrier_is_one_folder_per_job()
     print("HF cache diagnostic check passed")
+
+
+def test_the_default_lists_end_with_the_optional_32k_tasks():
+    """Both launchers run the 32K turns and book curve by default, marked optional; a list given by name is not."""
+    root = Path(__file__).resolve().parents[1]
+    blocks = {}
+    for script, given in (("eval.sh", 'BENCHMARKS=${2:-}'), ("majob.sh", None)):
+        source = (root / script).read_text().splitlines()
+        start = next(i for i, line in enumerate(source) if line.startswith('DEFAULT_BENCHMARKS="boolq'))
+        end = next(i for i, line in enumerate(source) if i > start and line.startswith("BENCHMARKS=${BENCHMARKS:-")) \
+            if script == "majob.sh" else next(i for i, line in enumerate(source)
+                                              if i > start and line == "fi" and "EVAL_OPTIONAL_TASKS" in source[i - 1])
+        blocks[script] = "\n".join(source[start:end + 1])
+
+    def run(script, benchmarks):
+        env = {"PATH": os.environ["PATH"], **({"BENCHMARKS": benchmarks} if script == "majob.sh" and benchmarks else {})}
+        args = ["x", benchmarks] if script == "eval.sh" and benchmarks else []
+        out = subprocess.run(["bash", "-c", blocks[script] + '\necho "$DEFAULT_BENCHMARKS|$EVAL_OPTIONAL_TASKS"', "_", *args],
+                             capture_output=True, text=True, check=True, env=env).stdout.strip()
+        return out.split("|")
+    defaults = {script: run(script, "") for script in blocks}
+    assert defaults["eval.sh"] == defaults["majob.sh"]
+    names, optional = defaults["eval.sh"]
+    assert names.split(",")[-2:] == ["niah_turns_32k", "long_ppl_books_32k"] and optional == "niah_turns_32k,long_ppl_books_32k"
+    for script in blocks:
+        assert run(script, "piqa,niah_turns_32k")[1] == ""  # asked for by name: must run
+
+
+def test_optional_tasks_are_left_out_when_the_window_or_data_cannot_serve_them(monkeypatch, capsys):
+    import ast
+    import re
+
+    source = Path(__file__).resolve().parents[1] / "eval.py"
+    nodes = [n for n in ast.parse(source.read_text()).body
+             if (isinstance(n, ast.FunctionDef) and n.name in {"_check_task_lengths", "_skip_optional_tasks"})
+             or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_LENGTH_NAMED_TASK")]
+    scope = dict(re=re, os=os, _is_main=lambda: True)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+    skip = scope["_skip_optional_tasks"]
+    tasks = ["piqa", "niah_turns_32k", "long_ppl_books_32k"]
+    monkeypatch.setenv("EVAL_OPTIONAL_TASKS", "niah_turns_32k,long_ppl_books_32k")
+    monkeypatch.setenv("LONG_PPL_BOOKS", "/data/pg19-train")
+    assert skip(tasks, 32768) == tasks
+    assert skip(tasks, 4096) == ["piqa"]  # a 4K run: neither fits
+    assert "niah_turns_32k needs a model window of 32768" in capsys.readouterr().out
+    monkeypatch.delenv("LONG_PPL_BOOKS")
+    assert skip(tasks, 32768) == ["piqa", "niah_turns_32k"]
+    assert "LONG_PPL_BOOKS is not set" in capsys.readouterr().out
+    monkeypatch.setenv("EVAL_OPTIONAL_TASKS", "")
+    assert skip(tasks, 4096) == tasks  # asked for by name: kept, and _check_task_lengths refuses it
+    with pytest.raises(ValueError, match="niah_turns_32k"):
+        scope["_check_task_lengths"](skip(tasks, 4096), 4096)

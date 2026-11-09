@@ -554,13 +554,20 @@ DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_qasper,longbench_qmsum,longb
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
+# At the native 32K: several questions on one cache (eval_tasks/niah_turns) and the book perplexity curve
+# (eval_tasks/long_ppl, data LONG_PPL_BOOKS). Optional in the default list: eval.py leaves them out, with a
+# warning, for a checkpoint whose window is shorter (a 4K run) or when LONG_PPL_BOOKS is not set.
+DEFAULT_OPTIONAL_BENCHMARKS="niah_turns_32k,long_ppl_books_32k"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},${DEFAULT_OPTIONAL_BENCHMARKS}"
 
 BENCHMARKS=${2:-}
 if [ -z "${BENCHMARKS}" ]; then
     BENCHMARKS=${CONFIG_BENCHMARKS:-}
 fi
+export EVAL_OPTIONAL_TASKS=  # tasks asked for by name must run
 if [ -z "${BENCHMARKS}" ]; then
     BENCHMARKS=${DEFAULT_BENCHMARKS}
+    export EVAL_OPTIONAL_TASKS=${DEFAULT_OPTIONAL_BENCHMARKS}
 fi
 
 # Every needle-in-a-haystack eval: RULER single needles, lm-eval's multi-needle tasks and the

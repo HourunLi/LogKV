@@ -612,6 +612,14 @@ DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_qasper,longbench_qmsum,longb
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
+# 原生 32K 下的逐轮问（eval_tasks/niah_turns）与书的困惑度曲线（eval_tasks/long_ppl，数据 LONG_PPL_BOOKS）。
+# 默认清单里是可选的：窗口不到 32K（4K 训练）或没设 LONG_PPL_BOOKS 时，eval.py 打印原因后跳过。
+DEFAULT_OPTIONAL_BENCHMARKS="niah_turns_32k,long_ppl_books_32k"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},${DEFAULT_OPTIONAL_BENCHMARKS}"
+export EVAL_OPTIONAL_TASKS=  # 按名字指定的任务必须跑
+if [ -z "${BENCHMARKS:-}" ]; then
+    export EVAL_OPTIONAL_TASKS=${DEFAULT_OPTIONAL_BENCHMARKS}
+fi
 BENCHMARKS=${BENCHMARKS:-${DEFAULT_BENCHMARKS}}
 # 全部捞针评测：RULER 单针（single_1/2/3）、lm-eval 自带的多针，以及 eval_tasks/niah_cue 里改写提示的
 # cue 适用边界变体。NIAH_BENCHMARKS=none 跳过；只跑一部分时写逗号分隔的任务名。
@@ -674,6 +682,11 @@ META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENG
 
 # 评测结果：rank0 写入 JSON（带时间戳），与 litgpt evaluate 惯例一致放在 checkpoint 下 evaluate/
 EVAL_OUTPUT_DIR="${SAVE_DIR}/evaluate"
+# 用 tokenizer 生成样本的任务（RULER、niah_turns、long_ppl）也在主评测里时，主评测同样要 metadata（同 eval.sh）。
+MAIN_METADATA_ARGS=()
+if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* ]]; then
+    MAIN_METADATA_ARGS=(--metadata "${META}")
+fi
 
 if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
     "${PYTHON_BIN}" -m torch.distributed.run \
@@ -686,6 +699,7 @@ if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
         --checkpoint_dir ${SAVE_DIR} \
         --benchmark "${BENCHMARKS}" \
         --output_path "${EVAL_OUTPUT_DIR}" \
+        "${MAIN_METADATA_ARGS[@]}" \
         ${EVAL_LOG_KV_ARGS} \
         ${DIAG_ARGS} \
         ${TOKENIZER_ARGS}
