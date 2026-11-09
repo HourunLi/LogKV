@@ -460,6 +460,13 @@ def _long_columns(ruler_lengths, babilong_lengths, ppl_lengths):
 ORDERED_COLUMNS += _long_columns(("64k", "128k"), ("32k", "64k", "128k"), ("32k", "64k", "128k")) + ["LongBench2"]
 # 后加：256K（RULER 12 个任务、BABILong、困惑度），按长度命名的 LongBench v2。
 ORDERED_COLUMNS += _long_columns(("256k",), ("256k",), ("256k",)) + [f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS]
+# 后加：同一份缓存上逐轮问（eval_tasks/niah_turns：niah_turns_<长度> 为四轮平均，@turnN 为第 N 轮），
+# 书的困惑度曲线（eval_tasks/long_ppl：long_ppl_books_<配置长度>@<截断长度>，同一批书，越低越好）。
+TURN_LENGTHS = ("32k", "64k", "128k", "256k")
+TURN_TASKS = [f"niah_turns_{n}" for n in TURN_LENGTHS]
+BOOK_POINTS = {n: [f"{2 ** k}k" for k in range(3, 9) if 2 ** k <= int(n[:-1])] for n in ("32k", "64k", "128k", "256k")}
+ORDERED_COLUMNS += [c for t in TURN_TASKS for c in [t] + [f"{t}@turn{i}" for i in range(1, 5)]]
+ORDERED_COLUMNS += [f"long_ppl_books_{n}@{q}" for n, points in BOOK_POINTS.items() for q in points]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
@@ -481,6 +488,7 @@ RAW_TO_TARGET_MAP = {
     "longbench_trec_e": "trec_e", "longbench_triviaqa_e": "triviaqa_e",
     "longbench2": "LongBench2",
     **{f"longbench2_{n}": f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS},
+    **{f"long_ppl_books_{n}_{q}": f"long_ppl_books_{n}@{q}" for n, points in BOOK_POINTS.items() for q in points},
 }
 
 TARGET_METRIC_MAP = {
@@ -495,6 +503,8 @@ TARGET_METRIC_MAP = {
     **{f"long_ppl_{n}": "ppl" for n in PPL_LENGTHS},
     "LongBench2": "acc",
     **{f"LongBench2@{n}": "acc" for n in LONGBENCH2_LENGTHS},
+    **{t: "acc" for t in TURN_TASKS},
+    **{f"long_ppl_books_{n}@{q}": "ppl" for n, points in BOOK_POINTS.items() for q in points},
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
@@ -571,6 +581,12 @@ def parse_single_model(model_name, markdown_text):
 
         target_task = RAW_TO_TARGET_MAP.get(raw_task, raw_task)
         expected_metric = TARGET_METRIC_MAP.get(target_task)
+        if target_task in TURN_TASKS and re.fullmatch(r"turn\d", metric):  # niah_turns: one column per turn
+            try:
+                row_data[f"{target_task}@{metric}"] = float(value)
+            except ValueError:
+                pass
+            continue
         if target_task in LONG_RULER and metric in LONG_LENGTHS:  # RULER at 64K / 128K / 256K
             try:
                 row_data[f"{target_task}@{LONG_LENGTHS[metric]}"] = float(value)

@@ -280,6 +280,7 @@ emit("CONFIG_OVERRIDES", json.dumps(overrides) if overrides else "")
 emit("EVAL_LIMIT", cfg.get("limit") or "")  # samples per task (lm-eval's --limit), every stage
 # Data of the repository's long-context tasks (eval_tasks/long_ppl, eval_tasks/babilong_long).
 emit("CONFIG_LONG_PPL_DATA", cfg.get("long_ppl_data") or "")
+emit("CONFIG_LONG_PPL_BOOKS", cfg.get("long_ppl_books") or "")  # long_ppl_books_<L>: books of >= 256K tokens
 emit("CONFIG_BABILONG_DATASET", cfg.get("babilong_dataset") or "")
 EOF
 )
@@ -291,8 +292,10 @@ fi
 eval "${CONFIG_EXPORTS}"
 # An environment variable wins over the YAML; eval.py's tasks read these.
 LONG_PPL_DATA=${LONG_PPL_DATA:-${CONFIG_LONG_PPL_DATA}}
+LONG_PPL_BOOKS=${LONG_PPL_BOOKS:-${CONFIG_LONG_PPL_BOOKS}}
 BABILONG_DATASET=${BABILONG_DATASET:-${CONFIG_BABILONG_DATASET}}
 if [ -n "${LONG_PPL_DATA}" ]; then export LONG_PPL_DATA; fi
+if [ -n "${LONG_PPL_BOOKS}" ]; then export LONG_PPL_BOOKS; fi
 if [ -n "${BABILONG_DATASET}" ]; then export BABILONG_DATASET; fi
 
 checkpoint_exists() {

@@ -286,11 +286,26 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   （`babilong_*_<L>`、`long_ppl_<L>`、`longbench2_<L>`）要求 max_seq_length 不小于 L，`longbench2_<L>` 还要求不超过 L+4096，
   否则报错（长于窗口的输入会被悄悄截短，结果却仍带着这个长度的名字）。LongBench v1（`longbench_*`）平均约 6.7K 词，
   绝大多数样本不到 32K token，没有按长度的版本。
+- 书的困惑度曲线（组 `long_ppl_books_{32k,64k,128k,256k}`）：另一个数据源 `LONG_PPL_BOOKS`（YAML 的 `long_ppl_books`），取前
+  `LONG_PPL_DOCS`（100）本不短于 262144 token 的书，所有组共用这一批（`_documents(..., LONGEST_256K, env="LONG_PPL_BOOKS")`，
+  缓存与 `long_ppl_*` 分开）。组 `long_ppl_books_<L>` 的每个任务 `long_ppl_books_<L>_<p>`（p = 8k, 16k, … , L）把每本书截到 p，
+  计末尾 4096 个 token 的困惑度：某一点是该位置在前面全部内容都在上下文时的损失，各点连起来就是随位置的损失曲线
+  （大部分上下文已在身后、LogKV 中已压缩时预测如何变化），每点一次该长度的前向，256K 组每本书共约 50 万 token。组名带配置的
+  长度（YaRN 倍数不同），各配置的曲线各占一组列；一点一个任务，lm-eval 的 `--limit` 才是按书数计。原来的 `long_ppl_*`
+  （`LONG_PPL_DATA`，PG19 测试集）保留不动，已有结果仍可比。
+- 同一份缓存上逐轮问（`niah_turns_{32k,64k,128k,256k}`，`eval_tasks/niah_turns`）：样本是 lm-eval 为 `niah_multiquery` 生成的
+  （同样的文章草堆、四个键各一个数值、同样的字符串匹配），但在问题之前切开：`eval.py` 的 `LogKVLM._generate_turns`
+  先在不知道任何问题时缓存上下文（不给 query cue），再在同一份缓存上逐轮追加一个键的问题，贪心生成到行尾，答案留在缓存里
+  再问下一个（SCBench 的多轮模式）。`generation_kwargs.turn_separator` 让 `generate_until` 走这条路径：prompt 用它把上下文
+  与各轮问题隔开，结果也用它把各轮答案连起来。`acc` 是四轮平均，`turn1`…`turn4` 是各轮；与同长度的 `niah_multiquery`
+  （问题在缓存时已知）对比，差距是缓存不知道问题时丢掉的部分。上下文太长时从开头截断。
 - 数据：`eval.sh` 离线运行（`HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`），新数据要先在联网时放进它读的缓存：
   `bash diag.sh unused/fetch_long_eval_data.py [--longbench2] [--ppl-data <留出数据> --tokenizer <tokenizer 目录>]`
   用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k，与 `RMT-team/babilong` 的 256k）、
   RULER 问答的 SQuAD 与 HotpotQA（`litgpt/ruler_patch.py` 先读的本地文件）与可选的 LongBench v2，再以离线方式重新加载
-  一遍；给了 `--ppl-data` 时还选出困惑度的两批文档（不短于 131072 与 262144 token）并写入缓存（缓存键按 tokenizer 文件内容，
+  一遍；`--ppl-books-hub emozilla/pg19`（或本地的 `--ppl-books-data`）按文件名顺序逐个下载训练集文件，直到找到 100 本不短于
+  262144 token 的书（PG19 训练集 2.86 万本里约 4–6%），写入 `long_ppl_books` 的缓存并打印 `LONG_PPL_BOOKS` 的目录；该目录里
+  若还有以前下载的其他文件也会被读到，汇总会提醒；给了 `--ppl-data` 时还选出困惑度的两批文档（不短于 131072 与 262144 token）并写入缓存（缓存键按 tokenizer 文件内容，
 与用哪个路径指向它无关），汇总给出 256K 那批选到几篇（一篇没有时只是 `long_ppl_256k` 跑不了，不算下载失败），
   `--ppl-hub <数据集仓库>` 先下载该仓库再以它为 `--ppl-data`。下载机与评测节点经桶同步时，评测前要把 BABILong 的数据集缓存、
   该仓库的 `$HF_HOME/hub/datasets--<owner>--<name>/`（`snapshots/` 是指向 `blobs/` 的软链接，两者都要）和
@@ -307,15 +322,18 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
 - 配置：`eval_long{64k,128k,256k}_{dense,baseline,word_first}.yaml`，分别是原始 Qwen3-1.7B-Base 的 dense（未经 CPT，继承
   `dense_niah_base.yaml`，结果写到其 `long64k` / `long128k` / `long256k` 子目录）、同 checkpoint 的 K/V 准入基线与 `word_first`，
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER（256K 为上面的 12 个），主阶段跑 BABILong 与困惑度（64K 配置为 32K
-  与 64K，128K、256K 配置为各自的长度），每个任务 100 条。256K 的 dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset` 与 `long_ppl_data` 两个键（或同名环境变量）给出本地数据。
+  与 64K，128K、256K 配置为各自的长度），再跑 `long_ppl_books_<L>`、`niah_turns_<L>` 与 `longbench2_<L>`，每个任务 100 条。256K 的
+  dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset`、`long_ppl_data` 与 `long_ppl_books` 三个键（或同名环境变量）给出本地数据。
 - 汇总表（`unused/parse_lmeval_table.py`）：RULER 13 个任务的 `<任务>@64k`、`AVG_NIAH@64k`、`AVG_NIAH_multi@64k`、
   `AVG_RULER@64k`（128k、256k 同；256k 没有 `ruler_qa_squad`，为 12 个的平均）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`
   与 `LongBench2@<长度>`，都不计入 `AVG_all`。把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
   日志里 eval.py 打印的结果表会被挑出来（行首前缀会去掉），同一模型的几份日志（如 32K、128K、256K 各一份）接着贴进
   同一个字符串，合成一行。表头只往后加：已有列的位置不变（已填的表格按位置对齐），64K/128K 的 144 列（到 `LongBench2`）
-  之后才是 256K 的列与 `LongBench2@<长度>`；`tests/parse_lmeval_table_columns.txt` 记着表头，测试检查它仍是输出的前缀。
+  之后才是 256K 的列与 `LongBench2@<长度>`，再后是 `niah_turns_<长度>`（四轮平均）与 `niah_turns_<长度>@turnN`、
+  `long_ppl_books_<配置长度>@<截断长度>`；`tests/parse_lmeval_table_columns.txt` 记着表头，测试检查它仍是输出的前缀。
 
 测试：`tests/test_yarn.py`（YaRN 的 cos/sin 与 transformers 一致），`tests/test_long_context.py`（YaRN 进入 LogKV 缓存且 recent
 窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数/数据路径、BABILong 按长度加载、困惑度任务取同一批长文档的末尾、下载脚本预建困惑度缓存、稠密缓存无方阵掩码且
-与不缓存一致），
-`tests/test_exp_configs.py`（长文本配置只差长度相关的几项）。
+与不缓存一致、书的曲线逐点取同一批书且 `--limit` 按书计、下载脚本逐个文件下载到书够为止），
+`tests/test_niah_turns.py`（缓存精确时逐轮答案与不用缓存逐 token 重算一致、压缩缓存上不给 query cue、样本切成上下文与四个问题、
+任务把 `turn_separator` 交给 eval.py），`tests/test_exp_configs.py`（长文本配置只差长度相关的几项）。

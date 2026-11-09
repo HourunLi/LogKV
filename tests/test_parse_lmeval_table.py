@@ -86,3 +86,15 @@ def test_the_header_only_grows_at_the_end(parse):
     assert header[:len(frozen)] == frozen
     # The 64K / 128K layout (144 columns, up to LongBench2) comes before everything 256K added.
     assert frozen[143] == "LongBench2" and frozen[144] == "niah_single_1@256k"
+
+
+def test_turn_and_book_curve_columns(parse):
+    turns = {"niah_turns_256k": {"acc": 0.625, "turn1": 0.9, "turn2": 0.6, "turn3": 0.5, "turn4": 0.5}}
+    books = {"long_ppl_books_256k": {}, **{f"long_ppl_books_256k_{q}": {"ppl": 10. - i, "bits_per_byte": 0.9}
+                                           for i, q in enumerate(("8k", "16k", "32k", "64k", "128k", "256k"))}}
+    log = _log(_table(turns), _table({k: v for k, v in books.items() if v},
+                                     [("long_ppl_books_256k", [k for k in books if k != "long_ppl_books_256k"])]))
+    row = parse.build_table({"wf": log}).set_index("Model").loc["wf"]
+    assert row["niah_turns_256k"] == 0.625 and row["niah_turns_256k@turn1"] == 0.9 and row["niah_turns_256k@turn4"] == 0.5
+    assert [row[f"long_ppl_books_256k@{q}"] for q in ("8k", "256k")] == [10., 5.]  # ppl, not bits_per_byte
+    assert row["long_ppl_books_128k@8k"] != row["long_ppl_books_128k@8k"]  # another configuration's curve: empty
