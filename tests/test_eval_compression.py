@@ -57,7 +57,7 @@ def make_lm(wrapper_class, backend, block_size=32):
     lm = wrapper_class()
     lm.model = GPT(config).eval()
     lm._device, lm.tokenizer = "cpu", Tokenizer()
-    lm.log_kv_dense_mode, lm.swa_window_size = backend == "dense", None
+    lm.log_kv_dense_mode, lm.swa_window_size, lm.kv_baseline = backend == "dense", None, None
     if lm.log_kv_dense_mode:
         lm.model.set_kv_cache(batch_size=1)
     else:
