@@ -1,18 +1,14 @@
 """把 lm-eval 的结果表汇总成一行一个模型的 CSV（表头顺序固定，可直接贴进表格）。
 
-两种用法：
-  python unused/parse_lmeval_table.py <名字>=<eval 日志> [<名字>=<日志> ...]
-      直接读 eval.sh 的日志，自动挑出其中的结果表（eval.py 每个阶段打印一张；行首的时间戳、rank 等前缀会去掉）。
-      同一个名字可以重复，例如一个模型的 32K、128K、256K 三份日志，合成一行；只给路径时以文件名为名字。
+用法：把各模型的输出粘进下面的 model_outputs（键是模型名），然后不带参数运行
   python unused/parse_lmeval_table.py
-      读下面 model_outputs 里粘贴的表（也可以整段粘日志）。
+值可以只是结果表，也可以是整段 eval 日志：其中 eval.py 打印的结果表（每个阶段一张）会被挑出来，行首的时间戳、
+rank 等前缀会去掉，其余行忽略。同一个模型的几份日志（例如 32K、128K、256K 各一份）接着贴进同一个字符串，合成一行。
 """
 import pandas as pd
 import numpy as np
 import io
 import re
-import sys
-from pathlib import Path
 
 # 把你的各个模型的原始输出放在这里。这里以 Model_A 为例（填入你提供的原数据）
 model_outputs = {
@@ -598,20 +594,8 @@ def build_table(outputs):
     return final_df
 
 
-def load_outputs(args):
-    """命令行的 ``名字=日志``（或只给路径，以文件名为名字）；同一个名字重复时，各日志合成一行。"""
-    outputs = {}
-    for arg in args:
-        name, sep, path = arg.partition("=")
-        if not sep:
-            name, path = Path(arg).stem, arg
-        text = Path(path).expanduser().read_text(encoding="utf-8", errors="replace")
-        outputs[name] = outputs.get(name, "") + "\n" + text
-    return outputs
-
-
 if __name__ == "__main__":
-    final_df = build_table(load_outputs(sys.argv[1:]) or model_outputs)
+    final_df = build_table(model_outputs)
     # 3. 清理空白，输出剪贴板友好格式
     final_df = final_df.fillna("")
     print(final_df.to_csv(sep=',', index=False))

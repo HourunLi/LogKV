@@ -1,5 +1,6 @@
-"""unused/parse_lmeval_table.py reads eval logs: the result tables eval.py prints, with whatever surrounds them,
-one row per model across its logs, with the long-context columns at 64K / 128K / 256K."""
+"""unused/parse_lmeval_table.py reads what is pasted into its model_outputs: result tables, or whole eval logs
+(the tables eval.py prints, with whatever surrounds them), one row per model across the logs pasted under its
+name, with the long-context columns at 64K / 128K / 256K."""
 import importlib.util
 from pathlib import Path
 
@@ -43,20 +44,18 @@ def _log(*tables, prefix="[rank0]: 2026-11-09 10:00:00 | INFO | "):
     return "\n".join(prefix + line for line in lines)
 
 
-def test_one_row_from_a_models_logs_at_three_lengths(parse, tmp_path):
+def test_one_row_from_a_models_logs_at_three_lengths(parse):
     niah = {t: {"4096": -1.0, "262144": 0.5 + i / 100} for i, t in enumerate(RULER_256K)}  # NIAH stage: lengths only
     babilong = {"babilong_256k": {"acc": 0.3}, **{f"babilong_qa{i}_256k": {"acc": i / 10} for i in range(1, 6)}}
     main = {**babilong, "long_ppl_256k": {"ppl": 9.5, "bits_per_byte": 0.8},
             "longbench2_256k": {"acc": 0.27}, "longbench2_academic_single": {"acc": 0.2}}
     groups = [("babilong_256k", [f"babilong_qa{i}_256k" for i in range(1, 6)]),
               ("longbench2_256k", ["longbench2_academic_single"])]
-    (tmp_path / "wf_256k.log").write_text(_log(_table(niah), _table(main, groups)))
-    (tmp_path / "wf_128k.log").write_text(_log(_table({"niah_single_1": {"131072": 0.9}, "ruler_qa_squad": {"131072": 0.4},
-                                                       "longbench2_128k": {"acc": 0.3}}), prefix=""))
-    outputs = parse.load_outputs([f"wf={tmp_path / 'wf_256k.log'}", f"wf={tmp_path / 'wf_128k.log'}",
-                                  str(tmp_path / "wf_256k.log")])
-    assert list(outputs) == ["wf", "wf_256k"]  # a bare path is named by its file
-    table = parse.build_table(outputs).set_index("Model")
+    log_256k = _log(_table(niah), _table(main, groups))
+    log_128k = _log(_table({"niah_single_1": {"131072": 0.9}, "ruler_qa_squad": {"131072": 0.4},
+                            "longbench2_128k": {"acc": 0.3}}), prefix="")
+    # As pasted into model_outputs: one model's two logs one after the other, and a second model.
+    table = parse.build_table({"wf": log_256k + "\n" + log_128k, "wf_256k": log_256k}).set_index("Model")
     row = table.loc["wf"]
     assert list(table.columns[:1]) == ["Common Sense Reasoning (ACC)"] and "Model" not in table.columns
     assert row["niah_single_1@256k"] == 0.5 and row["ruler_qa_hotpot@256k"] == 0.61
