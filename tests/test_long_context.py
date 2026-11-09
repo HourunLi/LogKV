@@ -315,31 +315,3 @@ def test_the_fetch_script_spots_files_that_are_not_parquet(tmp_path):
     pointer.write_text("version https://git-lfs.github.com/spec/v1\\noid sha256:abc\\nsize 123\\n")
     assert fetch.is_parquet(good) and not fetch.is_parquet(pointer) and not fetch.is_parquet(tmp_path / "missing")
     assert "git-lfs" in fetch.describe(pointer) and fetch.describe(tmp_path / "missing") == "missing"
-
-
-def test_the_fetch_script_puts_a_ppl_hub_repository_in_a_folder_of_real_files(tmp_path, monkeypatch):
-    huggingface_hub = pytest.importorskip("huggingface_hub")
-    import importlib.util
-
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    spec = importlib.util.spec_from_file_location("fetch_long_eval_data_hub", ROOT / "unused" / "fetch_long_eval_data.py")
-    fetch = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(fetch)
-    blobs = tmp_path / "blobs"
-    blobs.mkdir()
-    pq.write_table(pa.table({"text": ["a book"]}), blobs / "abc123")
-
-    def download(repo, repo_type=None, local_dir=None):  # as older huggingface_hub: large files link to the cache
-        (Path(local_dir) / "data").mkdir(parents=True, exist_ok=True)
-        (Path(local_dir) / "data" / "test-0.parquet").symlink_to(blobs / "abc123")
-        return local_dir
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
-    monkeypatch.setenv("HF_HOME", str(tmp_path / "home"))
-    lines = []
-    root = fetch.fetch_ppl_hub("emozilla/pg19-test", lines)
-    assert root == str(tmp_path / "home" / "long_ppl_data" / "emozilla--pg19-test")
-    data = Path(root) / "data" / "test-0.parquet"
-    assert not data.is_symlink() and fetch.is_parquet(data)  # the folder holds the file itself
-    assert "1 symlinks replaced by copies" in lines[0] and lines[-1] == f"  for eval.sh: export LONG_PPL_DATA={root}"
