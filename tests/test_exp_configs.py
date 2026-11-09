@@ -281,7 +281,7 @@ def test_only_surprisal_evaluations_rank_by_surprisal(name):
                 "eval_gamma_surprisal_mean_query_p1024.yaml": "mean", "eval_gamma_surprisal_mix_query_p1024.yaml": "mix",
                 "eval_gamma_surprisal_word_first_query_p1024.yaml": "word_first",
                 **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "word_first", "multi_word")},
-                **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k")}}
+                **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k", "256k")}}
     assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
 
 
@@ -302,7 +302,7 @@ LONG = {"dense": "dense_niah_base.yaml", "baseline": "arc_gamma_k12_b128_p1024_2
         "word_first": "eval_gamma_surprisal_word_first_p1024.yaml"}
 
 
-@pytest.mark.parametrize("length,tokens,factor", [("64k", 65536, 2.0), ("128k", 131072, 4.0)])
+@pytest.mark.parametrize("length,tokens,factor", [("64k", 65536, 2.0), ("128k", 131072, 4.0), ("256k", 262144, 8.0)])
 @pytest.mark.parametrize("name", sorted(LONG))
 def test_long_context_evaluations_change_only_the_length_settings(length, tokens, factor, name):
     evaluated, base = effective(f"eval_long{length}_{name}.yaml"), effective(LONG[name])
@@ -312,8 +312,11 @@ def test_long_context_evaluations_change_only_the_length_settings(length, tokens
         *(("output_path",) if name == "dense" else ())}
     assert evaluated["eval_max_seq_lengths"] == [tokens]
     assert evaluated["benchmark"].split(",")[:2] == [f"babilong_{length}", "long_ppl_32k" if length == "64k" else
-                                                     "long_ppl_128k"]
-    assert len(evaluated["niah_benchmark"]) == 13 and "ruler_qa_hotpot" in evaluated["niah_benchmark"]  # all of RULER
+                                                     f"long_ppl_{length}"]
+    # All of RULER; at 256K but SQuAD, whose 1204 dev paragraphs (about 220K tokens) cannot fill the context.
+    assert "ruler_qa_hotpot" in evaluated["niah_benchmark"] and len(evaluated["niah_benchmark"]) == (
+        12 if length == "256k" else 13)
+    assert ("ruler_qa_squad" in evaluated["niah_benchmark"]) == (length != "256k")
     overrides = evaluated["config_overrides"]
     assert overrides["block_size"] > tokens and overrides["rope_adjustments"] == dict(
         factor=factor, beta_fast=32, beta_slow=1, original_max_seq_len=32768)

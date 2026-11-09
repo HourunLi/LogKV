@@ -1,0 +1,19 @@
+# 长文本评测（只评测、不重训）：LogKV P=1024 + 惊异度准入 word_first，评测长度 256k。
+# 模型只训到 32K，RoPE 用 YaRN 拉长 8 倍（与 Qwen 的 rope_scaling 相同：factor、原长 32768，
+# 注意力温度 0.1·ln(factor)+1；Qwen 官方只验证到 factor 4）；block_size 留出生成的余量。
+# NIAH 阶段：RULER 的 12 个任务在 256k（不含 ruler_qa_squad：SQuAD dev 去重后 1204 段、约 22 万 token，lm-eval
+# 会悄悄生成更短的样本）；主阶段：BABILong qa1-5（RMT-team/babilong，每个长度 100 条）与长文档困惑度
+# （long_ppl_256k：不短于 262144 token 的另一批文档的最后 4096 个 token），每个任务 100 条。困惑度的数据由
+# long_ppl_data 或环境变量 LONG_PPL_DATA 给出；PG19 测试集里够 256k 的书可能不多，fetch_long_eval_data.py 会报告选到几篇。
+# 要加 LongBench v2：bash eval.sh <本文件> babilong_256k,long_ppl_256k,longbench2
+#   bash eval.sh exp/qwen1.7b-32k/eval_long256k_word_first.yaml
+config: eval_gamma_surprisal_word_first_p1024.yaml
+eval_max_seq_lengths: [262144]
+niah_benchmark: [niah_single_1, niah_single_2, niah_single_3, niah_multikey_1, niah_multikey_2, niah_multikey_3,
+  niah_multivalue, niah_multiquery, ruler_vt, ruler_cwe, ruler_fwe, ruler_qa_hotpot]
+benchmark: babilong_256k,long_ppl_256k
+limit: 100
+long_ppl_data: ${LONG_PPL_DATA:-}
+config_overrides:
+  block_size: 263168
+  rope_adjustments: {factor: 8.0, beta_fast: 32, beta_slow: 1, original_max_seq_len: 32768}
