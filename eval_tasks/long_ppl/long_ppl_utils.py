@@ -7,6 +7,14 @@ are taken, in file order, so the three differ only in how much context precedes 
 256K takes its own documents, of at least 262144 tokens (LONGEST_256K), so that the shorter lengths keep
 the documents (and caches) they had; its numbers compare methods at 256K, not lengths.
 
+The group long_ppl_books_<L> reads another source, LONG_PPL_BOOKS (books of at least 262144 tokens, e.g.
+PG19's train set, whose test set holds only 4 such books): its tasks long_ppl_books_<L>_8k, _16k, ... _<L> take
+the same first LONG_PPL_DOCS books and score the last TAIL tokens of each book cut to 8K, 16K, ... up to L. A
+point is the loss at that position with everything before it in context, so the curve shows how prediction
+changes as more of the context lies far behind (in LogKV, compressed); each point costs one forward of its
+length. The group's length names the configuration (its YaRN factor), so each configuration's curve keeps
+its own columns, and one task per point keeps lm-eval's --limit counting books.
+
 Data: LONG_PPL_DATA, a .parquet / .jsonl file or a directory of them (text in a "text", "content" or
 "code" column), e.g. held-out ProLong shards. LONG_PPL_DOCS caps the documents (default 100);
 LONG_PPL_CONCAT=1 joins consecutive rows of a file into one document when the rows are pieces of
@@ -134,11 +142,11 @@ def _tokenizer(kwargs):
     return name, AutoTokenizer.from_pretrained(name, trust_remote_code=True)
 
 
-def _documents(kwargs, longest: int | None = None) -> list[list[int]]:
-    source = os.environ.get("LONG_PPL_DATA")
+def _documents(kwargs, longest: int | None = None, env: str = "LONG_PPL_DATA") -> list[list[int]]:
+    source = os.environ.get(env)
     if not source:
-        raise ValueError("long_ppl needs LONG_PPL_DATA (a .parquet / .jsonl file or a directory, e.g. held-out "
-                         "ProLong shards; eval.sh exports the YAML's long_ppl_data)")
+        raise ValueError(f"long_ppl needs {env} (a .parquet / .jsonl file or a directory, e.g. held-out "
+                         f"ProLong shards; eval.sh exports the YAML's {env.lower()})")
     count = int(os.environ.get("LONG_PPL_DOCS", "100"))
     concat = os.environ.get("LONG_PPL_CONCAT", "0") == "1"
     name, tokenizer = _tokenizer(kwargs)
@@ -166,10 +174,10 @@ def _documents(kwargs, longest: int | None = None) -> list[list[int]]:
     return docs
 
 
-def build(length: int, kwargs, longest: int | None = None) -> dict:
+def build(length: int, kwargs, longest: int | None = None, env: str = "LONG_PPL_DATA") -> dict:
     _, tokenizer = _tokenizer(kwargs)
     rows = []
-    for ids in _documents(kwargs, longest):
+    for ids in _documents(kwargs, longest, env):
         context, tail = ids[:length - TAIL], ids[length - TAIL:length]
         continuation = tokenizer.decode(tail)
         # eval.py encodes the continuation on its own: count the tokens it scores.
@@ -193,6 +201,20 @@ def long_ppl_128k(**kwargs):
 
 def long_ppl_256k(**kwargs):
     return build(262144, kwargs, longest=LONGEST_256K)
+
+
+def book_points(length: int) -> list[int]:
+    """8K, 16K, ... up to ``length``: the points of long_ppl_books_<length>'s curve."""
+    points, n = [], 8192
+    while n <= length:
+        points.append(n)
+        n *= 2
+    return points
+
+
+def long_ppl_books(**kwargs):
+    """long_ppl_books_<L>_<point>: the books cut to ``point`` (dataset_kwargs), their last TAIL tokens scored."""
+    return build(int(kwargs["point"]), kwargs, longest=LONGEST_256K, env="LONG_PPL_BOOKS")
 
 
 def process_results(doc, results):

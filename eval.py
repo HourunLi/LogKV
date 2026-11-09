@@ -415,8 +415,9 @@ from lm_eval.api.model import LM
 EVAL_TASKS_DIR = Path(__file__).resolve().parent / "eval_tasks"
 
 
-# Tasks named for a context length (eval_tasks/babilong_long, long_ppl, longbench2_long).
-_LENGTH_NAMED_TASK = re.compile(r"^(babilong(?:_qa\d+)?|long_ppl|longbench2)_(\d+)k$")
+# Tasks named for a context length (eval_tasks/babilong_long, long_ppl, longbench2_long, niah_turns); a
+# long_ppl_books_<L>_<point> task is named for its configuration's length L.
+_LENGTH_NAMED_TASK = re.compile(r"^(babilong(?:_qa\d+)?|long_ppl(?:_books)?|longbench2|niah_turns)_(\d+)k(?:_\d+k)?$")
 
 
 def _check_task_lengths(tasks, max_seq_length):
@@ -1386,6 +1387,57 @@ class LogKVLM(LM):
         tail = prompt_tensor[-CUE_QUERY_TOKENS:].tolist()
         self.model.set_gamma_queries([query_region(tail, self._query_line_ends)])
 
+    def _generate_turns(self, prompt, separator, max_new_tokens, sample_id):
+        """Questions asked one after another on one cache (SCBench's multi-turn mode).
+
+        ``prompt`` is the shared context, then each question, joined by ``separator``. The context is
+        prefilled before any question is known (no query cue: a compressed cache must serve whatever is
+        asked later); each question and each greedy answer are appended to the same cache, and an answer
+        ends at a line end (or the end of text) or after ``max_new_tokens``. A context too long for the
+        window loses its start. Returns the answers joined by ``separator``.
+        """
+        context, *questions = prompt.split(separator)
+        stops = set(self.tokenizer.alpha_line_end_ids)
+        asked = [self.tokenizer.encode(q, device=self._device, bos=False) for q in questions]
+        pending = self.tokenizer.encode(context, device=self._device)
+        room = self.model.max_seq_length - sum(q.numel() for q in asked) - len(asked) * max_new_tokens
+        if pending.numel() > room:
+            pending = pending[-max(room, 1):]
+            self._warn_truncation("generate_until", pending.numel())
+        context_len, pos, answers = int(pending.numel()), 0, []
+        with torch.no_grad():
+            self._set_eval_cache()
+            if (getattr(self, "_query_line_ends", None) is not None
+                    and getattr(self.model, "log_kv_cue_stream", None) is not None):
+                self.model.set_gamma_queries([None])
+            try:
+                t0 = time.perf_counter()
+                for question in asked:
+                    # The previous answer's last token has not been forwarded yet: it leads this chunk.
+                    pending = torch.cat([pending, question])
+                    answer = []
+                    for _ in range(max_new_tokens):
+                        T = pending.numel()
+                        logits = self.model(pending[None], input_pos=torch.arange(pos, pos + T, device=self._device),
+                                            input_pos_maxp1=pos + T, lm_head_start=T - 1)
+                        pos += T
+                        token = int(logits[0, -1].argmax())
+                        answer.append(token)
+                        pending = torch.tensor([token], device=self._device, dtype=torch.long)
+                        if token in stops:
+                            break
+                    answers.append(self.tokenizer.decode(torch.tensor(answer, dtype=torch.long)))
+                t1 = time.perf_counter()
+                self.compression_metrics.append({
+                    "request_type": "generate_turns", "rank": _global_rank(), "sample_id": sample_id,
+                    "prompt_len": context_len, "turns": len(asked), **cache_compression_snapshot(self.model, pos),
+                })
+            finally:
+                self._reset_eval_cache()
+        self.gen_metrics.append({"prompt_len": context_len, "turns": len(asked), "processed_tokens": pos,
+                                 "total_time_s": round(t1 - t0, 4)})
+        return separator.join(answers)
+
     def generate_until(self, requests):
         dp_rank = _global_rank()
         dp_size = _world_size()
@@ -1409,6 +1461,9 @@ class LogKVLM(LM):
                 # litgpt.generate.sample 仅在 temperature<=0 且 top_p<=0 时走 argmax；仅设 temperature=0 而 top_p=1 仍会多项式采样
                 temperature = 0.0
                 top_p = 0.0
+            if gen_args.get("turn_separator"):  # several questions on one cache (eval_tasks/niah_turns)
+                results.append(self._generate_turns(prompt, gen_args["turn_separator"], max_new_tokens, sample_id))
+                continue
 
             prompt_tensor = self.tokenizer.encode(prompt, device=self._device)
             original_prompt_tokens = int(prompt_tensor.size(0))

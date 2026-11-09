@@ -15,6 +15,11 @@ switches off for itself only, then:
                   --ppl-hub <dataset repo> (e.g. emozilla/pg19-test, PG19's 100 test books) downloads
                   the repository first and uses its folder as --ppl-data (export the printed path as
                   LONG_PPL_DATA for eval.sh)
+    long_ppl_books --ppl-books-hub <dataset repo> (e.g. emozilla/pg19): downloads its train parquet files
+                  one at a time, in name order, until LONG_PPL_DOCS (100) books of at least 262144 tokens are
+                  found (4-6% of PG19's 28,602 train books are that long), and caches the selection the
+                  long_ppl_books_<L> tasks read (export the printed folder as LONG_PPL_BOOKS);
+                  --ppl-books-data <file or folder> selects from local data instead
 
 and finally loads every dataset again in an offline subprocess, as eval.py will (skipping the
 <hash>.incomplete folders an interrupted download leaves, litgpt/hf_cache_patch.py; the summary names any
@@ -259,6 +264,61 @@ def cache_ppl(data: str, tokenizer: str, lines: list[str]) -> None:
                      "texts, rerun with LONG_PPL_CONCAT=1 (and run eval.sh with it too)")
 
 
+def _long_ppl_utils():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("long_ppl_utils", ROOT / "eval_tasks" / "long_ppl" / "long_ppl_utils.py")
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+    return utils
+
+
+def fetch_ppl_books(repo: str, tokenizer: str, lines: list[str], pattern: str | None = None) -> str:
+    """Download a dataset repository's train files one at a time, in name order, until enough long books are
+    in them; returns the snapshot folder that holds them (the LONG_PPL_BOOKS of eval.sh)."""
+    from fnmatch import fnmatch
+
+    from huggingface_hub import HfApi, hf_hub_download
+    from transformers import AutoTokenizer
+
+    utils = _long_ppl_utils()
+    want = int(os.environ.get("LONG_PPL_DOCS", "100"))
+    files = sorted(f for f in HfApi().list_repo_files(repo, repo_type="dataset")
+                   if f.endswith((".parquet", ".jsonl")) and (fnmatch(f, pattern) if pattern else "train" in f))
+    if not files:
+        raise ValueError(f"no {'file matching ' + pattern if pattern else 'train parquet / jsonl file'} in {repo}")
+    tok = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=True)
+    found, root = 0, None
+    for name in files:
+        path = Path(hf_hub_download(repo, name, repo_type="dataset"))
+        if name.endswith(".parquet") and not is_parquet(path):
+            path = Path(hf_hub_download(repo, name, repo_type="dataset", force_download=True))
+        root = str(path)[:-len(name)].rstrip("/")
+        found += len(utils.select_documents(str(path), tok, want - found, longest=utils.LONGEST_256K))
+        lines.append(f"long_ppl_books {repo} {name}: {found} books of >= {utils.LONGEST_256K} tokens so far")
+        if found >= want:
+            break
+    # The tasks read every parquet / jsonl file under the folder, in name order: other files there change the books.
+    read = set(files[:files.index(name) + 1])
+    others = sorted(str(f.relative_to(root)) for f in Path(root).rglob("*")
+                    if f.suffix in (".parquet", ".jsonl") and str(f.relative_to(root)) not in read)
+    if others:
+        lines.append(f"  WARNING: the folder also holds {others[:5]} ({len(others)} files) from earlier downloads; "
+                     "the tasks would read them too")
+    lines.append(f"  for eval.sh: export LONG_PPL_BOOKS={root}")
+    return root
+
+
+def cache_ppl_books(data: str, tokenizer: str, lines: list[str]) -> None:
+    """Select the long_ppl_books documents now (every long_ppl_books_<L>_<point> task reads this cache)."""
+    utils = _long_ppl_utils()
+    os.environ["LONG_PPL_BOOKS"] = data
+    want = int(os.environ.get("LONG_PPL_DOCS", "100"))
+    docs = utils._documents({"pretrained": tokenizer}, utils.LONGEST_256K, env="LONG_PPL_BOOKS")
+    lines.append(f"long_ppl_books: {len(docs)} books of >= {utils.LONGEST_256K} tokens from {data} (want {want}); "
+                 f"cache {utils.cache_dir()}" + ("" if len(docs) >= want else "; fewer than wanted: give more data"))
+
+
 def ppl_data_stats(data: str, tokenizer: str, utils, lines: list[str], files: int = 2, show: int = 5) -> None:
     """How long the rows are: characters over every row of the first files, tokens of the first and the
     longest rows (rows of one length throughout are packed sequences, not documents)."""
@@ -299,7 +359,13 @@ def main():
     p.add_argument("--ppl-data", default=None, help="held-out ProLong parquet / jsonl file or directory")
     p.add_argument("--ppl-hub", default=None,
                    help="dataset repository to download and use as --ppl-data (e.g. emozilla/pg19-test)")
-    p.add_argument("--tokenizer", default=None, help="tokenizer dir for --ppl-data (e.g. the Qwen3-1.7B-Base dir)")
+    p.add_argument("--ppl-books-hub", default=None,
+                   help="dataset repository whose train files hold long books (e.g. emozilla/pg19), for long_ppl_books")
+    p.add_argument("--ppl-books-files", default=None,
+                   help="glob of the --ppl-books-hub files to read (default: names containing 'train')")
+    p.add_argument("--ppl-books-data", default=None, help="local file or folder of long books, for long_ppl_books")
+    p.add_argument("--tokenizer", default=None, help="tokenizer dir for --ppl-data / --ppl-books-* (e.g. the "
+                   "Qwen3-1.7B-Base dir)")
     p.add_argument("--out", default="fetch_long_eval_data.json")
     p.add_argument("--verify-ssl", action="store_true", help="keep HTTPS certificate checks (off by default)")
     args = p.parse_args()
@@ -308,8 +374,8 @@ def main():
              f"RULER_CACHE_DIR={ruler_cache_dir()}",
              f"HTTPS certificate checks: {'on' if args.verify_ssl else 'off (--verify-ssl turns them on)'}"]
     ok = True
-    if (args.ppl_data or args.ppl_hub) and not args.tokenizer:
-        raise SystemExit("--ppl-data / --ppl-hub need --tokenizer (the dir with tokenizer.json)")
+    if (args.ppl_data or args.ppl_hub or args.ppl_books_hub or args.ppl_books_data) and not args.tokenizer:
+        raise SystemExit("--ppl-data / --ppl-hub / --ppl-books-* need --tokenizer (the dir with tokenizer.json)")
     if not args.no_ruler_qa:
         try:
             fetch_ruler_qa(lines)
@@ -332,6 +398,18 @@ def main():
         except Exception as error:  # noqa: BLE001
             ok = False
             lines.append(f"long_ppl: FAILED {type(error).__name__}: {error}")
+    if args.ppl_books_hub:
+        try:
+            args.ppl_books_data = fetch_ppl_books(args.ppl_books_hub, args.tokenizer, lines, args.ppl_books_files)
+        except Exception as error:  # noqa: BLE001
+            ok = False
+            lines.append(f"long_ppl_books {args.ppl_books_hub}: FAILED {type(error).__name__}: {str(error)[:1500]}")
+    if args.ppl_books_data:
+        try:
+            cache_ppl_books(args.ppl_books_data, args.tokenizer, lines)
+        except Exception as error:  # noqa: BLE001
+            ok = False
+            lines.append(f"long_ppl_books: FAILED {type(error).__name__}: {error}")
     text = "\n".join(lines)
     out = Path(args.out).expanduser()
     out.with_name(out.stem + ".summary.txt").write_text(text + "\n")

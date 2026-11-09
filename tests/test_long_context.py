@@ -377,3 +377,113 @@ def test_the_fetch_script_spots_files_that_are_not_parquet(tmp_path):
     pointer.write_text("version https://git-lfs.github.com/spec/v1\\noid sha256:abc\\nsize 123\\n")
     assert fetch.is_parquet(good) and not fetch.is_parquet(pointer) and not fetch.is_parquet(tmp_path / "missing")
     assert "git-lfs" in fetch.describe(pointer) and fetch.describe(tmp_path / "missing") == "missing"
+
+
+def _book_tasks_manager():
+    source = ROOT / "eval.py"
+    tree = ast.parse(source.read_text())
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_task_manager"]
+    scope = dict(inspect=inspect, EVAL_TASKS_DIR=ROOT / "eval_tasks")
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+    return scope
+
+
+def test_the_book_curve_scores_the_same_books_at_every_point(tmp_path, monkeypatch, word_tokenizer):
+    """long_ppl_books_32k: one task per point (8k, 16k, 32k), each scoring the last 4096 tokens of the same books
+    cut to the point; --limit counts books."""
+    pytest.importorskip("lm_eval")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from lm_eval import evaluator
+    from lm_eval.api.model import LM
+
+    book = lambda shift, n: " ".join(f"w{(i + shift) % 50}" for i in range(n))
+    # Three books long enough (262144 tokens), one too short: the short one is skipped.
+    pq.write_table(pa.table({"text": [book(0, 262200), book(7, 1000), book(3, 262144), book(11, 262150)]}),
+                   tmp_path / "train-0.parquet")
+    monkeypatch.setenv("LONG_PPL_BOOKS", str(tmp_path))
+    monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache"))
+    monkeypatch.delenv("LONG_PPL_DATA", raising=False)
+    requests_seen = []
+
+    class FourWayLM(LM):  # every token costs log 4
+        def loglikelihood(self, requests):
+            requests_seen.extend(r.args for r in requests)
+            return [(-len(cont.split()) * math.log(4.), False) for _, cont in (r.args for r in requests)]
+
+        def loglikelihood_rolling(self, requests):
+            raise NotImplementedError
+
+        def generate_until(self, requests):
+            raise NotImplementedError
+
+    manager = _book_tasks_manager()["_task_manager"]({"pretrained": word_tokenizer})
+    assert {"long_ppl_books_32k", "long_ppl_books_256k"} <= set(manager.all_groups)
+    results = evaluator.simple_evaluate(model=FourWayLM(), tasks=["long_ppl_books_32k"], task_manager=manager,
+                                        limit=2, metadata={"pretrained": word_tokenizer})
+    for point in (8, 16, 32):
+        name = f"long_ppl_books_32k_{point}k"
+        assert results["results"][name]["ppl,none"] == pytest.approx(4.)
+        assert results["n-samples"][name]["effective"] == 2  # the first two long books
+    by_length = {}
+    for context, continuation in requests_seen:
+        by_length.setdefault(len(context.split()) + len(continuation.split()), []).append(context.split()[:3])
+    assert sorted(by_length) == [8192, 16384, 32768]
+    assert all(starts == [["w0", "w1", "w2"], ["w3", "w4", "w5"]] for starts in by_length.values())
+    assert all(len(continuation.split()) == 4096 for _, continuation in requests_seen)
+    scope = _book_tasks_manager()
+    nodes = [n for n in ast.parse((ROOT / "eval.py").read_text()).body
+             if (isinstance(n, ast.FunctionDef) and n.name == "_check_task_lengths")
+             or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_LENGTH_NAMED_TASK")]
+    scope["re"] = __import__("re")
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "eval.py", "exec"), scope)
+    scope["_check_task_lengths"](["long_ppl_books_256k", "niah_turns_256k"], 263168)
+    with pytest.raises(ValueError, match="long_ppl_books_256k_8k"):  # named for its configuration's length
+        scope["_check_task_lengths"](["long_ppl_books_256k_8k"], 132096)
+    with pytest.raises(ValueError, match="niah_turns_256k"):
+        scope["_check_task_lengths"](["niah_turns_256k"], 132096)
+
+
+def test_the_fetch_script_downloads_book_files_until_enough_are_long(tmp_path, monkeypatch, word_tokenizer):
+    pytest.importorskip("lm_eval")
+    import importlib.util
+
+    import huggingface_hub
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    spec = importlib.util.spec_from_file_location("fetch_books", ROOT / "unused" / "fetch_long_eval_data.py")
+    fetch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetch)
+    snapshot = tmp_path / "snapshot"
+    (snapshot / "data").mkdir(parents=True)
+    long_book, short_book = " ".join(f"w{i % 50}" for i in range(262144)), "w1 w2 w3"
+    names = ["data/test-0.parquet", "data/train-0.parquet", "data/train-1.parquet", "data/train-2.parquet"]
+    for name, books in zip(names, ([long_book], [short_book, long_book], [long_book, long_book], [long_book])):
+        pq.write_table(pa.table({"text": books}), tmp_path / name.replace("/", "_"))
+    downloaded = []
+
+    def download(repo, name, repo_type=None, force_download=False):
+        target = snapshot / name
+        target.write_bytes((tmp_path / name.replace("/", "_")).read_bytes())
+        downloaded.append(name)
+        return str(target)
+    monkeypatch.setattr(huggingface_hub.HfApi, "list_repo_files", lambda self, repo, repo_type=None: list(names))
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    monkeypatch.setenv("LONG_PPL_DOCS", "3")
+    monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache"))
+    lines = []
+    root = fetch.fetch_ppl_books("someone/books", word_tokenizer, lines)
+    assert root == str(snapshot) and downloaded == ["data/train-0.parquet", "data/train-1.parquet"]  # 1 + 2 books
+    assert lines[-2].endswith("3 books of >= 262144 tokens so far") and lines[-1].endswith(f"LONG_PPL_BOOKS={root}")
+    fetch.cache_ppl_books(root, word_tokenizer, lines)
+    assert lines[-1].startswith(f"long_ppl_books: 3 books of >= 262144 tokens from {root}")
+    utils = fetch._long_ppl_utils()
+    key = utils.cache_key(root, word_tokenizer, 3, False, utils.LONGEST_256K)
+    assert (tmp_path / "cache" / f"{key}.json").is_file()  # what long_ppl_books_<L>_<point> read
+    # A file of an earlier download in the same folder would be read too: said so.
+    download("someone/books", "data/test-0.parquet")
+    downloaded.clear()
+    lines = []
+    fetch.fetch_ppl_books("someone/books", word_tokenizer, lines)
+    assert any("WARNING" in line and "data/test-0.parquet" in line for line in lines)
