@@ -515,7 +515,10 @@ if [ "${REPAIR_HF_CACHE:-0}" = "1" ] && [ "${NODE_RANK}" = "0" ]; then
     fi
 fi
 
-BARRIER_DIR="${SAVE_DIR}/.eval_only_barrier_d"
+# One barrier folder per job (MA_VJ_NAME names the ModelArts job, MASTER_ADDR elsewhere): evals of the same
+# checkpoint may run at once, and node 0 of one must not count or remove another's node files, nor a
+# failed run's leftovers.
+BARRIER_DIR="${SAVE_DIR}/.eval_only_barrier_d/${MA_VJ_NAME:-${MASTER_ADDR}}"
 mkdir -p "${BARRIER_DIR}"
 touch "${BARRIER_DIR}/node_${NODE_RANK}"
 

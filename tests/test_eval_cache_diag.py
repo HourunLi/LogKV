@@ -227,6 +227,31 @@ torchrun() { echo WRONG_INTERPRETER; return 99; }
     assert "WRONG_INTERPRETER" not in result.stdout
 
 
+def test_eval_barrier_is_one_folder_per_job(tmp_path=None):
+    import tempfile
+    source = (Path(__file__).resolve().parents[1] / "eval.sh").read_text()
+    snippet = source[source.index("BARRIER_DIR="):source.index('echo "All nodes are ready. Starting eval.py"')]
+    shell = 'sleep() { :; }\nSAVE_DIR=$1\nNODE_RANK=0\nNUM_NODES=2\nMASTER_ADDR=host-a\n' + snippet + 'echo "DIR=${BARRIER_DIR}"\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        shared = Path(tmp, ".eval_only_barrier_d")
+        (shared / "job-a").mkdir(parents=True)
+        for name in ("node_0", "node_1", "job-a/node_0", "job-a/node_1"):  # a failed run's, another job's
+            (shared / name).touch()
+        (shared / "job-b").mkdir()
+        (shared / "job-b" / "node_1").touch()  # this job's other node has arrived
+        env = {**os.environ, "MA_VJ_NAME": "job-b"}
+        done = subprocess.run(["bash", "-c", shell, "_", tmp], env=env, capture_output=True, text=True, timeout=30)
+        assert done.returncode == 0 and f"DIR={shared}/job-b" in done.stdout, done.stdout + done.stderr
+        # Alone, a job waits for its own nodes: the leftovers and the other job's files do not count.
+        try:
+            subprocess.run(["bash", "-c", shell, "_", tmp], env={**os.environ, "MA_VJ_NAME": "job-c"},
+                           capture_output=True, text=True, timeout=3)
+            raise AssertionError("job-c passed its barrier on files that are not its own")
+        except subprocess.TimeoutExpired:
+            pass
+        assert sorted(p.name for p in (shared / "job-a").iterdir()) == ["node_0", "node_1"]
+
+
 if __name__ == "__main__":
     test_cache_failure_is_visible_and_original_behavior_is_preserved()
     test_path_walk_names_the_component_that_blocks_traversal()
@@ -235,4 +260,5 @@ if __name__ == "__main__":
     test_both_launchers_default_to_every_niah_task()
     test_task_selection_skips_blank_or_none_stages_and_supports_niah_only()
     test_eval_launch_uses_selected_python_for_both_jobs()
+    test_eval_barrier_is_one_folder_per_job()
     print("HF cache diagnostic check passed")
