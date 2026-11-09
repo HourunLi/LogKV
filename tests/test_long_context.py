@@ -90,6 +90,7 @@ def test_the_launcher_passes_the_swa_window(tmp_path):
 
 
 def test_per_length_babilong_tasks_load_their_length(monkeypatch):
+    """Up to 128k from the 1000-sample set (or BABILONG_DATASET); 256k from RMT-team/babilong, whatever it says."""
     pytest.importorskip("lm_eval")
     import datasets
 
@@ -106,8 +107,9 @@ def test_per_length_babilong_tasks_load_their_length(monkeypatch):
     scope = dict(inspect=inspect, EVAL_TASKS_DIR=ROOT / "eval_tasks")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     manager = scope["_task_manager"]({"pretrained": "unused"})
-    names = {f"babilong_qa{i}_{n}" for i in range(1, 6) for n in ("32k", "64k", "128k")}
-    assert names <= set(manager.all_tasks) and {"babilong_64k", "babilong_128k"} <= set(manager.all_groups)
+    names = {f"babilong_qa{i}_{n}" for i in range(1, 6) for n in ("32k", "64k", "128k", "256k")}
+    assert names <= set(manager.all_tasks) and {"babilong_64k", "babilong_128k", "babilong_256k"} <= set(
+        manager.all_groups)
 
     from lm_eval.tasks import get_task_dict
     task = get_task_dict(["babilong_qa2_128k"], manager)["babilong_qa2_128k"]
@@ -115,6 +117,11 @@ def test_per_length_babilong_tasks_load_their_length(monkeypatch):
     assert calls[-1] == ("RMT-team/babilong-1k-samples", "128k", "qa2")
     assert task.doc_to_text(doc) == "Mary went to the kitchen.\nWhere is Mary?" and task.config.num_fewshot == 2
     assert task.process_results(doc, [" The most recent location of Mary is kitchen."]) == {"acc": 1.0}
+    monkeypatch.setenv("BABILONG_DATASET", "/data/babilong-1k-copy")
+    for name, call in (("babilong_qa3_256k", ("RMT-team/babilong", "256k", "qa3")),
+                       ("babilong_qa3_128k", ("/data/babilong-1k-copy", "128k", "qa3"))):
+        list(get_task_dict([name], manager)[name].test_docs())
+        assert calls[-1] == call
 
 
 def test_the_dense_kv_cache_needs_no_square_mask_and_matches_the_uncached_model():
@@ -192,6 +199,16 @@ def test_long_ppl_scores_the_tail_of_the_same_long_documents(tmp_path, monkeypat
     monkeypatch.setattr(utils, "TAIL", 8)
     monkeypatch.setenv("LONG_PPL_DATA", str(tmp_path))
     monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache"))
+    # 256K takes its own, longer documents (here: at least 120 tokens, only the second row), cached apart.
+    monkeypatch.setattr(utils, "LONGEST_256K", 120)
+    own = utils.build(96, {"pretrained": word_tokenizer}, longest=utils.LONGEST_256K)["test"]
+    assert len(own) == 1 and own[0]["context"].split() == words[50:138] and own[0]["continuation"].split() == words[138:146]
+    assert utils.build(32, {"pretrained": word_tokenizer})["test"]["continuation"] == rows["continuation"]
+    assert len(list((tmp_path / "cache").iterdir())) == 2
+    source = str(tmp_path)
+    key = utils.cache_key(source, word_tokenizer, 100, False)
+    assert key == utils.cache_key(source, word_tokenizer, 100, False, utils.LONGEST) != utils.cache_key(
+        source, word_tokenizer, 100, False, utils.LONGEST_256K)
     scores = [utils.process_results(row, [(-8. * math.log(4.), False)]) for row in rows]
     assert utils.perplexity([s["ppl"] for s in scores]) == pytest.approx(4.)
     monkeypatch.setenv("LONG_PPL_DATA", str(tmp_path / "missing" / "snapshot"))
@@ -212,7 +229,7 @@ def test_long_ppl_tasks_are_found_by_eval_py():
     scope = dict(inspect=inspect, EVAL_TASKS_DIR=ROOT / "eval_tasks")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     manager = scope["_task_manager"]({"pretrained": "unused"})
-    assert {"long_ppl_32k", "long_ppl_64k", "long_ppl_128k"} <= set(manager.all_tasks)
+    assert {"long_ppl_32k", "long_ppl_64k", "long_ppl_128k", "long_ppl_256k"} <= set(manager.all_tasks)
 
 
 def test_the_fetch_script_caches_the_ppl_documents_the_tasks_read(tmp_path, monkeypatch, word_tokenizer):
@@ -237,6 +254,8 @@ def test_the_fetch_script_caches_the_ppl_documents_the_tasks_read(tmp_path, monk
     lines = []
     fetch.cache_ppl(str(tmp_path / "heldout.parquet"), word_tokenizer, lines)
     assert "1 documents of >= 131072 tokens" in lines[0]
+    # Too short for 256K: reported, and the 128K selection is still cached.
+    assert lines[1].startswith("long_ppl_256k: 0 documents of >= 262144 tokens") and "cannot run" in lines[1]
     stats = []
     fetch.ppl_data_stats(str(tmp_path / "heldout.parquet"), word_tokenizer, utils, stats)
     assert "1 rows in 1 file(s)" in stats[0] and stats[1].endswith("[140000]")

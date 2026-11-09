@@ -1,10 +1,11 @@
-"""Long-document perplexity at a fixed context length (64K, 128K, and 32K for reference).
+"""Long-document perplexity at a fixed context length (64K, 128K, 256K, and 32K for reference).
 
 Each document is cut to L tokens; the last TAIL tokens are scored given the L - TAIL before them, so the
 number says how well the model predicts text once most of its context is far behind it (in LogKV,
-compressed). The same documents serve every length: only documents of at least the longest length
-(131072 tokens) are taken, in file order, so 32K / 64K / 128K differ only in how much context precedes
-the same kind of tail.
+compressed). 32K / 64K / 128K share their documents: only documents of at least LONGEST (131072) tokens
+are taken, in file order, so the three differ only in how much context precedes the same kind of tail.
+256K takes its own documents, of at least 262144 tokens (LONGEST_256K), so that the shorter lengths keep
+the documents (and caches) they had; its numbers compare methods at 256K, not lengths.
 
 Data: LONG_PPL_DATA, a .parquet / .jsonl file or a directory of them (text in a "text", "content" or
 "code" column), e.g. held-out ProLong shards. LONG_PPL_DOCS caps the documents (default 100);
@@ -25,6 +26,7 @@ from pathlib import Path
 import datasets
 
 LONGEST = 131072
+LONGEST_256K = 262144
 TAIL = 4096
 COLUMNS = ("text", "content", "code")
 
@@ -78,22 +80,24 @@ def _texts(path: Path):
                     yield str(value)
 
 
-def select_documents(source: str, tokenizer, count: int, concat: bool = False) -> list[list[int]]:
-    """The first ``count`` documents of at least LONGEST tokens (token ids, cut to LONGEST)."""
+def select_documents(source: str, tokenizer, count: int, concat: bool = False,
+                     longest: int | None = None) -> list[list[int]]:
+    """The first ``count`` documents of at least ``longest`` (default LONGEST) tokens, cut to it."""
+    longest = longest or LONGEST
     found: list[list[int]] = []
     for path in _files(source):
         pending: list[int] = []
         for text in _texts(path):
-            if not concat and len(text) < LONGEST:  # fewer characters than tokens: too short
+            if not concat and len(text) < longest:  # fewer characters than tokens: too short
                 continue
             ids = tokenizer(text, add_special_tokens=False)["input_ids"]
             if concat:
                 pending += ids
-                if len(pending) < LONGEST:
+                if len(pending) < longest:
                     continue
                 ids, pending = pending, []
-            if len(ids) >= LONGEST:
-                found.append(ids[:LONGEST])
+            if len(ids) >= longest:
+                found.append(ids[:longest])
                 if len(found) >= count:
                     return found
     return found
@@ -104,9 +108,10 @@ def cache_dir() -> Path:
     return Path(os.environ.get("LONG_PPL_CACHE") or default).expanduser()
 
 
-def cache_key(source: str, tokenizer_name: str, count: int, concat: bool) -> str:
+def cache_key(source: str, tokenizer_name: str, count: int, concat: bool, longest: int | None = None) -> str:
     """The documents depend on the data, the tokenizer's files (not the path it was named by: eval.sh names
-    the checkpoint, a warm-up may name the base model), the count and the concat flag."""
+    the checkpoint, a warm-up may name the base model), the count, the concat flag and the minimum length
+    (LONGEST by default, which keeps the keys of the caches written before 256K)."""
     digest = hashlib.sha256()
     folder = Path(tokenizer_name).expanduser()
     files = [folder / n for n in ("tokenizer.json", "tokenizer.model", "vocab.json", "merges.txt")]
@@ -115,7 +120,8 @@ def cache_key(source: str, tokenizer_name: str, count: int, concat: bool) -> str
         digest.update(f.read_bytes())
     if not files:
         digest.update(tokenizer_name.encode())
-    digest.update(json.dumps([os.path.abspath(os.path.expanduser(source)), count, concat, LONGEST]).encode())
+    digest.update(json.dumps([os.path.abspath(os.path.expanduser(source)), count, concat,
+                              longest or LONGEST]).encode())
     return digest.hexdigest()[:16]
 
 
@@ -128,7 +134,7 @@ def _tokenizer(kwargs):
     return name, AutoTokenizer.from_pretrained(name, trust_remote_code=True)
 
 
-def _documents(kwargs) -> list[list[int]]:
+def _documents(kwargs, longest: int | None = None) -> list[list[int]]:
     source = os.environ.get("LONG_PPL_DATA")
     if not source:
         raise ValueError("long_ppl needs LONG_PPL_DATA (a .parquet / .jsonl file or a directory, e.g. held-out "
@@ -136,16 +142,17 @@ def _documents(kwargs) -> list[list[int]]:
     count = int(os.environ.get("LONG_PPL_DOCS", "100"))
     concat = os.environ.get("LONG_PPL_CONCAT", "0") == "1"
     name, tokenizer = _tokenizer(kwargs)
-    key = cache_key(source, name, count, concat)
+    longest = longest or LONGEST
+    key = cache_key(source, name, count, concat, longest)
     cache = cache_dir() / f"{key}.json"
     if cache.is_file():
         try:
             return json.loads(cache.read_text())
         except ValueError:  # another rank is still copying it (see below): build it here too
             pass
-    docs = select_documents(source, tokenizer, count, concat)
+    docs = select_documents(source, tokenizer, count, concat, longest)
     if not docs:
-        raise ValueError(f"no document of {LONGEST} tokens or more in {source!r}; if its rows are pieces of longer "
+        raise ValueError(f"no document of {longest} tokens or more in {source!r}; if its rows are pieces of longer "
                          "texts, set LONG_PPL_CONCAT=1")
     cache.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache.with_suffix(f".{os.getpid()}.tmp")
@@ -159,10 +166,10 @@ def _documents(kwargs) -> list[list[int]]:
     return docs
 
 
-def build(length: int, kwargs) -> dict:
+def build(length: int, kwargs, longest: int | None = None) -> dict:
     _, tokenizer = _tokenizer(kwargs)
     rows = []
-    for ids in _documents(kwargs):
+    for ids in _documents(kwargs, longest):
         context, tail = ids[:length - TAIL], ids[length - TAIL:length]
         continuation = tokenizer.decode(tail)
         # eval.py encodes the continuation on its own: count the tokens it scores.
@@ -182,6 +189,10 @@ def long_ppl_64k(**kwargs):
 
 def long_ppl_128k(**kwargs):
     return build(131072, kwargs)
+
+
+def long_ppl_256k(**kwargs):
+    return build(262144, kwargs, longest=LONGEST_256K)
 
 
 def process_results(doc, results):

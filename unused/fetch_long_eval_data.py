@@ -4,12 +4,14 @@ eval.sh runs offline (HF_HUB_OFFLINE=1, HF_DATASETS_OFFLINE=1) with HF_HOME, HF_
 RULER_CACHE_DIR from its environment header; diag.sh sets the same paths. This script turns the offline
 switches off for itself only, then:
 
-    BABILong      RMT-team/babilong-1k-samples, configs 32k / 64k / 128k, splits qa1 ... qa5
+    BABILong      RMT-team/babilong-1k-samples, configs 32k / 64k / 128k, and RMT-team/babilong (100
+                  samples per length), config 256k; splits qa1 ... qa5
     RULER QA      SQuAD v2 dev and HotpotQA dev (distractor) JSON, into RULER_CACHE_DIR, where
                   litgpt/ruler_patch.py looks first
     LongBench v2  recursal/longbench-v2, every subset lm-eval's longbench2 tasks load (--longbench2)
-    long_ppl      --ppl-data: finds the documents of at least 131072 tokens (with --tokenizer) and caches
-                  the selection the long_ppl tasks use, so eval ranks do not tokenize it again;
+    long_ppl      --ppl-data: finds the documents of at least 131072 tokens (32K-128K) and of at least
+                  262144 (256K) with --tokenizer and caches both selections the long_ppl tasks use, so
+                  eval ranks do not tokenize them again (no 256K document only stops long_ppl_256k);
                   --ppl-hub <dataset repo> (e.g. emozilla/pg19-test, PG19's 100 test books) downloads
                   the repository first and uses its folder as --ppl-data (export the printed path as
                   LONG_PPL_DATA for eval.sh)
@@ -48,6 +50,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 BABILONG = "RMT-team/babilong-1k-samples"
 BABILONG_LENGTHS = ("32k", "64k", "128k")
+BABILONG_LONG = "RMT-team/babilong"  # the 1000-sample set stops at 128k
+BABILONG_LONG_LENGTHS = ("256k",)
 QA_SPLITS = tuple(f"qa{i}" for i in range(1, 6))
 LONGBENCH2 = "recursal/longbench-v2"
 RULER_QA = {
@@ -129,6 +133,7 @@ def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> tuple[
     groups = []
     if babilong:
         groups.append(("BABILong", [(BABILONG, n, s) for n in BABILONG_LENGTHS for s in QA_SPLITS]))
+        groups.append(("BABILong 256k", [(BABILONG_LONG, n, s) for n in BABILONG_LONG_LENGTHS for s in QA_SPLITS]))
     if longbench2:
         groups.append(("LongBench v2", [(LONGBENCH2, name, "train") for name in longbench2_subsets()]))
     loads, ok = [], True
@@ -226,7 +231,8 @@ def check_offline(loads, lines: list[str]) -> bool:
 
 
 def cache_ppl(data: str, tokenizer: str, lines: list[str]) -> None:
-    """Select the long_ppl documents now (the tasks read the same cache)."""
+    """Select the long_ppl documents now (the tasks read the same caches): those of at least LONGEST tokens
+    (32K-128K) and those of at least LONGEST_256K (256K). Data without the latter is reported, not an error."""
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("long_ppl_utils", ROOT / "eval_tasks" / "long_ppl" / "long_ppl_utils.py")
@@ -241,7 +247,13 @@ def cache_ppl(data: str, tokenizer: str, lines: list[str]) -> None:
         raise
     lines.append(f"long_ppl: {len(docs)} documents of >= {utils.LONGEST} tokens from {data} (want {want}); "
                  f"cache {utils.cache_dir()}")
-    if len(docs) < want:
+    try:
+        found = len(utils._documents({"pretrained": tokenizer}, utils.LONGEST_256K))
+    except ValueError:
+        found = 0
+    lines.append(f"long_ppl_256k: {found} documents of >= {utils.LONGEST_256K} tokens from {data} (want {want})"
+                 + ("" if found else "; long_ppl_256k cannot run on this data"))
+    if min(len(docs), found) < want:
         ppl_data_stats(data, tokenizer, utils, lines)
         lines.append("  fewer than wanted: point --ppl-data at more shards, or if the rows are pieces of longer "
                      "texts, rerun with LONG_PPL_CONCAT=1 (and run eval.sh with it too)")

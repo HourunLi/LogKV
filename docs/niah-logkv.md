@@ -249,10 +249,11 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 `tests/test_surprisal_diag.py`（惊异度与逐位 log-softmax 一致、recent 窗口内缓存与不缓存一致、片段切分、针的名次、
 复用对与阈值、`diag.sh`、惊异度存档的读写、离线重放的准入、遗忘与复用刷新、远距离复用命中）。
 
-## 8. 长文本评测（64K / 128K，只评测）
+## 8. 长文本评测（64K / 128K / 256K，只评测）
 
 模型与 CPT 都只到 32K。更长的评测不重训，用 YaRN 把 RoPE 拉长（factor = 目标长度 / 32768，原长 32768，beta_fast 32，
-beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一套，比较的是压缩而不是外推。
+beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一套，比较的是压缩而不是外推。256K 的 factor 为 8，
+超出 Qwen 官方验证的 4，先看 dense 在 256K 是否仍然有效，再解读 LogKV 与它的差距。
 
 - YaRN：litgpt 原实现插值方向相反（对高频维插值、保留低频维），且默认不乘注意力温度；已按 transformers 的
   `_compute_yarn_parameters` 修正：低于 beta_fast 转数的高频维保持原频率，高于 beta_slow 的低频维插值，温度为
@@ -265,22 +266,27 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   传给 `eval.py`）。`majob.sh` 只读 `eval_max_seq_lengths`。
 - 任务：完整 RULER 13 个任务（8 个捞针，加变量追踪 vt、常见词与高频词提取 cwe / fwe、SQuAD 与 HotpotQA 问答）在
   65536 / 131072：捞针、vt、cwe、fwe 是合成任务，草堆仍是 Paul Graham 文章；两个问答任务运行时从 `rajpurkar.github.io`
-  与 `curtis.ml.cmu.edu` 取 SQuAD / HotpotQA 的 dev 集。长文档困惑度（`eval_tasks/long_ppl`，`long_ppl_{32k,64k,128k}`）：
+  与 `curtis.ml.cmu.edu` 取 SQuAD / HotpotQA 的 dev 集。262144 时去掉 `ruler_qa_squad`，只跑 12 个：lm-eval 的 RULER 把
+  草堆（文章词数、问答文档数）截在语料的长度上，不报错，只是样本变短；SQuAD v2 dev 去重后 1204 段（15.2 万词、约 22 万 token）
+  填不满 256K，HotpotQA 的文档池够大，217 篇文章的草堆估计约 60–70 万 token，也够。长文档困惑度（`eval_tasks/long_ppl`，`long_ppl_{32k,64k,128k}`）：
   取不短于 131072 token 的文档（按文件与行的顺序，所以各长度是同一批文档），截到 L，给定前 L−4096 个 token，计末尾
-  4096 个 token 的困惑度（`ppl`）与每字节比特（`bits_per_byte`）；它衡量的是大部分上下文已在身后（LogKV 中已压缩）
+  4096 个 token 的困惑度（`ppl`）与每字节比特（`bits_per_byte`）；`long_ppl_256k` 另取不短于 262144 token 的一批文档
+  （`LONGEST_256K`，缓存键不同；短长度的文档与缓存不变），所以它比较的是 256K 下的各方法，而不是与 128K 的长度曲线；它衡量的是大部分上下文已在身后（LogKV 中已压缩）
   时的预测，不受任务难度的地板影响。数据由 YAML 的 `long_ppl_data` 或环境变量 `LONG_PPL_DATA` 给出（parquet / jsonl
   文件或目录，正文列 text / content / code），`LONG_PPL_DOCS` 限制文档数（默认 100），`LONG_PPL_CONCAT=1` 把同一文件的
   相邻行拼成一篇（行是长文的片段时），选出的文档缓存在 `LONG_PPL_CACHE`（默认 `$HF_HOME/logkv_long_ppl`，各节点共用）。训练读取
   `data_dir` 下的全部 parquet，所以只有不在其中的文件才是严格留出的。BABILong qa1–qa5
-  （`eval_tasks/babilong_long`，任务名带长度：`babilong_qa1_64k` 等，组 `babilong_{32k,64k,128k}`；提示、示例与打分同 lm-eval
-  的 `babilong_qaN`；数据 `RMT-team/babilong-1k-samples`，环境变量 `BABILONG_DATASET` 可指向本地副本）；LongBench v2
+  （`eval_tasks/babilong_long`，任务名带长度：`babilong_qa1_64k` 等，组 `babilong_{32k,64k,128k,256k}`；提示、示例与打分同 lm-eval
+  的 `babilong_qaN`；数据 `RMT-team/babilong-1k-samples`，环境变量 `BABILONG_DATASET` 可指向本地副本；它只到 128k，256k 的任务
+  在 `dataset_kwargs` 里指定 `RMT-team/babilong`（每个长度 100 条，是另一批样本），`BABILONG_DATASET` 不替换它）；LongBench v2
   （lm-eval 的 `longbench2`，数据 `recursal/longbench-v2`，四选一按似然打分，每题四次预填充；长于 block_size 的上下文
   从开头截断，保留问题。数据集卡片没有按子集的配置时，`litgpt/longbench2_patch.py` 改从仓库快照里按文件名读出该子集）。
 - 数据：`eval.sh` 离线运行（`HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`），新数据要先在联网时放进它读的缓存：
   `bash diag.sh unused/fetch_long_eval_data.py [--longbench2] [--ppl-data <留出数据> --tokenizer <tokenizer 目录>]`
-  用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k）、
+  用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k，与 `RMT-team/babilong` 的 256k）、
   RULER 问答的 SQuAD 与 HotpotQA（`litgpt/ruler_patch.py` 先读的本地文件）与可选的 LongBench v2，再以离线方式重新加载
-  一遍；给了 `--ppl-data` 时还选出困惑度的文档并写入它的缓存（缓存键按 tokenizer 文件内容，与用哪个路径指向它无关），
+  一遍；给了 `--ppl-data` 时还选出困惑度的两批文档（不短于 131072 与 262144 token）并写入缓存（缓存键按 tokenizer 文件内容，
+与用哪个路径指向它无关），汇总给出 256K 那批选到几篇（一篇没有时只是 `long_ppl_256k` 跑不了，不算下载失败），
   `--ppl-hub <数据集仓库>` 先下载该仓库再以它为 `--ppl-data`。下载机与评测节点经桶同步时，评测前要把 BABILong 的数据集缓存、
   该仓库的 `$HF_HOME/hub/datasets--<owner>--<name>/`（`snapshots/` 是指向 `blobs/` 的软链接，两者都要）和
   `$HF_HOME/logkv_long_ppl`（选出的文档；命中时不再读数据）同步（预热）到评测节点。桶里的 ProLong 是按文档存的短文（中位数约 1000 字符，
@@ -291,12 +297,12 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   下载进行中（桶不允许重命名，收尾时先复制再删除，要一段时间）或被中断时，`<配置>/<版本>/` 下有还没写 `dataset_info.json`
   的 `<hash>.incomplete` 目录，`datasets` 离线查找会读到它并报 `FileNotFoundError`；`litgpt/hf_cache_patch.py`（`eval.py` 与下载脚本的离线复查都会应用）让离线查找跳过它，
   该配置只剩这种目录时报“not completely downloaded”并列出目录，此时等下载结束或联网重跑下载脚本；下载脚本的汇总也会列出残留目录。
-- 配置：`eval_long{64k,128k}_{dense,baseline,word_first}.yaml`，分别是原始 Qwen3-1.7B-Base 的 dense（未经 CPT，继承
-  `dense_niah_base.yaml`，结果写到其 `long64k` / `long128k` 子目录）、同 checkpoint 的 K/V 准入基线与 `word_first`，
-  与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER，主阶段跑 BABILong 与困惑度（64K 配置为 32K 与 64K，128K 配置为
-  128K），每个任务 100 条。`babilong_dataset` 与 `long_ppl_data` 两个键（或同名环境变量）给出本地数据。
+- 配置：`eval_long{64k,128k,256k}_{dense,baseline,word_first}.yaml`，分别是原始 Qwen3-1.7B-Base 的 dense（未经 CPT，继承
+  `dense_niah_base.yaml`，结果写到其 `long64k` / `long128k` / `long256k` 子目录）、同 checkpoint 的 K/V 准入基线与 `word_first`，
+  与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER（256K 为上面的 12 个），主阶段跑 BABILong 与困惑度（64K 配置为 32K
+  与 64K，128K、256K 配置为各自的长度），每个任务 100 条。256K 的 dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset` 与 `long_ppl_data` 两个键（或同名环境变量）给出本地数据。
 - 汇总表（`unused/parse_lmeval_table.py`）：RULER 13 个任务的 `<任务>@64k`、`AVG_NIAH@64k`、`AVG_NIAH_multi@64k`、
-  `AVG_RULER@64k`（128k 同）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`，
+  `AVG_RULER@64k`（128k、256k 同；256k 没有 `ruler_qa_squad`，为 12 个的平均）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`，
   都不计入 `AVG_all`。
 
 测试：`tests/test_yarn.py`（YaRN 的 cos/sin 与 transformers 一致），`tests/test_long_context.py`（YaRN 进入 LogKV 缓存且 recent
