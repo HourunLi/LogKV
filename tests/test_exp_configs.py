@@ -79,7 +79,8 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
 GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
     p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml", "eval_gamma_query*.yaml",
                            "arc_niah_*.yaml", "eval_niah_*.yaml", "eval_gamma_surprisal*.yaml",
-                           "eval_long*_baseline.yaml", "eval_long*_word_first.yaml")
+                           "eval_long*_baseline.yaml", "eval_long*_word_first.yaml",
+                           *(f"eval_long*_{m}.yaml" for m in ("swa", "streamingllm", "h2o", "snapkv")))
     for p in EXP.glob(pattern))
 
 
@@ -317,3 +318,21 @@ def test_long_context_evaluations_change_only_the_length_settings(length, tokens
     overrides = evaluated["config_overrides"]
     assert overrides["block_size"] > tokens and overrides["rope_adjustments"] == dict(
         factor=factor, beta_fast=32, beta_slow=1, original_max_seq_len=32768)
+
+
+SAME_MEMORY = {"swa": {"swa_window_size": 0}, "streamingllm": {"kv_baseline": "streaming", "kv_baseline_budget": 0},
+               "h2o": {"kv_baseline": "h2o", "kv_baseline_budget": 0},
+               "snapkv": {"kv_baseline": "snapkv", "kv_baseline_budget": 0}}
+
+
+@pytest.mark.parametrize("length", ["64k", "128k"])
+@pytest.mark.parametrize("name", sorted(SAME_MEMORY))
+def test_same_memory_baselines_run_the_base_model_at_the_logkv_budget(length, name):
+    # The LogKV evaluation's settings stay (they give the byte budget); the weights are the dense run's.
+    evaluated, logkv = effective(f"eval_long{length}_{name}.yaml"), effective(f"eval_long{length}_baseline.yaml")
+    dense = effective(f"eval_long{length}_dense.yaml")
+    changed = {k for k in set(evaluated) | set(logkv) if evaluated.get(k) != logkv.get(k)}
+    assert changed == {"save_path", "tokenizer_dir", "output_path", *SAME_MEMORY[name]}
+    assert all(evaluated[k] == v for k, v in SAME_MEMORY[name].items())
+    assert evaluated["save_path"] == dense["checkpoint_dir"] and evaluated["tokenizer_dir"] == dense["tokenizer_dir"]
+    assert evaluated["output_path"] == dense["output_path"] + "_" + name

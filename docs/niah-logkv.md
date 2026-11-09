@@ -295,6 +295,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   `dense_niah_base.yaml`，结果写到其 `long64k` / `long128k` 子目录）、同 checkpoint 的 K/V 准入基线与 `word_first`，
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER，主阶段跑 BABILong 与困惑度（64K 配置为 32K 与 64K，128K 配置为
   128K），每个任务 100 条。`babilong_dataset` 与 `long_ppl_data` 两个键（或同名环境变量）给出本地数据。
+  同内存的外部基线 `eval_long{64k,128k}_{swa,streamingllm,h2o,snapkv}.yaml` 见 [同内存基线](same-memory-baselines.md)。
 - 汇总表（`unused/parse_lmeval_table.py`）：RULER 13 个任务的 `<任务>@64k`、`AVG_NIAH@64k`、`AVG_NIAH_multi@64k`、
   `AVG_RULER@64k`（128k 同）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`，
   都不计入 `AVG_all`。

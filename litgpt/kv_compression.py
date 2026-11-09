@@ -2,7 +2,7 @@
 
 An entry is one stored K/V pair in one batch item, layer and KV group. Counts
 include recent/deferred tokens, Alpha exact spans (including unfinished spans), and live
-hierarchical entries. They exclude padding, multi-anchor attention expansion,
+hierarchical entries; the entries an eviction baseline (litgpt/budget_kv_cache.py) keeps count as exact. They exclude padding, multi-anchor attention expansion,
 preallocated capacity and packing workspaces; these are not GPU-memory metrics.
 """
 
@@ -55,6 +55,10 @@ def cache_compression_snapshot(model, processed_tokens: int) -> dict:
             recent = (cache.recent_count + pending_len) * batch_groups
             exact = sum(len(row) for row in cache._alpha_positions) * cache.n_groups if cache.alpha_exact_tokens else 0
             hierarchical = int((cache.level_w > 0).sum().item())
+        elif hasattr(cache, "policy"):  # an eviction baseline: the uncompressed tokens it keeps
+            batch_groups = cache.k.size(0) * cache.k.size(1)
+            recent = hierarchical = 0
+            exact = cache.count * batch_groups
         else:
             batch_size, n_groups = cache.k.shape[:2]
             batch_groups = batch_size * n_groups
