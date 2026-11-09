@@ -14,8 +14,10 @@ switches off for itself only, then:
                   the repository first and uses its folder as --ppl-data (export the printed path as
                   LONG_PPL_DATA for eval.sh)
 
-and finally loads every dataset again in an offline subprocess, as eval.py will. A summary goes to
-<--out>.summary.txt beside --out (default fetch_long_eval_data.json in the current directory).
+and finally loads every dataset again in an offline subprocess, as eval.py will (skipping the
+<hash>.incomplete folders an interrupted download leaves, litgpt/hf_cache_patch.py; the summary names any
+that remain). A summary goes to <--out>.summary.txt beside --out (default fetch_long_eval_data.json in the
+current directory).
 
 The platform's proxy re-signs HTTPS with a self-signed CA, so certificate checks are off unless --verify-ssl
 is given (as litgpt/ruler_patch.py does for RULER); downloads then stay on requests, without hf_transfer or
@@ -120,6 +122,7 @@ def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> tuple[
     """Each dataset group in turn; a group that fails is reported and the others still run."""
     import datasets
 
+    from litgpt.hf_cache_patch import leftovers
     from litgpt.longbench2_patch import apply_patch, snapshot
 
     apply_patch()  # as eval.py: LongBench v2 subsets from the snapshot's files when the card has no configs
@@ -140,6 +143,11 @@ def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> tuple[
                 rows = len(datasets.load_dataset(path, name=name, split=split))
                 lines.append(f"{path} {name} {split}: {rows} rows")
             loads += group
+            for path in sorted({path for path, _, _ in group}):
+                left = leftovers(path)
+                if left:
+                    lines.append(f"{path}: unfinished folders of earlier downloads, skipped offline and safe to "
+                                 f"delete: {left}")
         except Exception as error:  # noqa: BLE001 - report and go on with the next group
             ok = False
             lines.append(f"{label}: FAILED {type(error).__name__}: {str(error)[:1500]}")
@@ -199,11 +207,13 @@ def fetch_ppl_hub(repo: str, lines: list[str]) -> str:
 
 
 def check_offline(loads, lines: list[str]) -> bool:
-    """Load every dataset again with the offline switches eval.sh sets (and its LongBench v2 patch), in a
-    fresh process."""
+    """Load every dataset again with the offline switches eval.sh sets (and eval.py's LongBench v2 and
+    unfinished-folder patches), in a fresh process."""
     script = ("import datasets, json, sys\n"
               f"sys.path.insert(0, {str(ROOT)!r})\n"
               "from litgpt.longbench2_patch import apply_patch\n"
+              "apply_patch()\n"
+              "from litgpt.hf_cache_patch import apply_patch\n"
               "apply_patch()\n"
               "for path, name, split in json.loads(sys.argv[1]):\n"
               "    datasets.load_dataset(path, name=name, split=split)\n"
