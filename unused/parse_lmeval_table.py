@@ -1,15 +1,7 @@
-"""Export eval.py JSON or console tables to CSV/XLSX; --help lists input formats."""
-import argparse
-import csv
-import json
-from pathlib import Path
-import sys
-
 import pandas as pd
-
-# Direct script invocation should not import litgpt (and therefore Torch/CUDA).
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from eval_results import RESULT_COLUMNS, markdown_rows, result_rows
+import numpy as np
+import io
+import re
 
 # 把你的各个模型的原始输出放在这里。这里以 Model_A 为例（填入你提供的原数据）
 model_outputs = {
@@ -449,6 +441,11 @@ ORDERED_COLUMNS += [f"long_ppl_{n}" for n in PPL_LENGTHS] + ["LongBench2"]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
+# 追加新列，不改变旧列名、顺序和平均值口径。无后缀的 NIAH 列仍取 32K。
+for _length in LONG_LENGTHS.values():
+    ORDERED_COLUMNS += [f"{t}@{_length}" for t in NIAH_CUE + NIAH_WORDS]
+ORDERED_COLUMNS += [f"babilong_{n}" for n in BABILONG_LENGTHS]
+ORDERED_COLUMNS += [f"long_ppl_{n}_bits_per_byte" for n in PPL_LENGTHS]
 
 RAW_TO_TARGET_MAP = {
     "boolq": "BoolQ", "piqa": "PIQA", "social_iqa": "SIQA", "hellaswag": "HellaSwag",
@@ -477,12 +474,24 @@ TARGET_METRIC_MAP = {
     "niah_single_1": "32768", "niah_single_2": "32768", "niah_single_3": "32768",
     **{task: "32768" for task in NIAH_MULTI + NIAH_CUE + NIAH_WORDS},
     **{f"babilong_qa{i}_{n}": "acc" for i in range(1, 6) for n in BABILONG_LENGTHS},
+    **{f"babilong_{n}": "acc" for n in BABILONG_LENGTHS},
     **{f"long_ppl_{n}": "ppl" for n in PPL_LENGTHS},
     "LongBench2": "acc",
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
         TARGET_METRIC_MAP[col] = "score"
+
+# 保留旧版优先读取 score 的行为；有些 lm-eval 版本只输出任务专用指标。
+LONGBENCH_METRICS = {
+    "gov_report": "rouge_score", "hotpotqa": "qa_f1_score", "lcc": "code_sim_score",
+    "qasper": "qa_f1_score", "multifieldqa_zh": "qa_f1_zh_score", "multifieldqa_en": "qa_f1_score",
+    "musique": "qa_f1_score", "narrativeqa": "qa_f1_score", "passage_count": "count_score",
+    "passage_retrieval_en": "retrieval_score", "repobench-p": "code_sim_score",
+    "samsum": "rouge_score", "triviaqa": "qa_f1_score", "trec": "classification_score",
+    "lsht": "classification_score", "multi_news": "rouge_score", "qmsum": "rouge_score",
+    "dureader": "rouge_zh_score", "2wikimqa": "qa_f1_score", "vcsum": "rouge_zh_score",
+}
 
 # ==============================================================================
 # 2. 定义各模块的平均值计算范围
@@ -514,158 +523,76 @@ DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words",
 # ==============================================================================
 # 3. 解析与计算核心代码
 # ==============================================================================
-# lm-eval versions may emit both `score` and a task-specific metric, or only the latter.
-LB_METRICS = {
-    "gov_report": "rouge_score", "hotpotqa": "qa_f1_score", "lcc": "code_sim_score",
-    "qasper": "qa_f1_score", "multifieldqa_zh": "qa_f1_zh_score", "multifieldqa_en": "qa_f1_score",
-    "musique": "qa_f1_score", "narrativeqa": "qa_f1_score", "passage_count": "count_score",
-    "passage_retrieval_en": "retrieval_score", "passage_retrieval_zh": "retrieval_zh_score",
-    "repobench-p": "code_sim_score", "samsum": "rouge_score", "triviaqa": "qa_f1_score",
-    "trec": "classification_score", "lsht": "classification_score", "multi_news": "rouge_score",
-    "qmsum": "rouge_score", "dureader": "rouge_zh_score", "2wikimqa": "qa_f1_score", "vcsum": "rouge_zh_score",
-}
-AVG_GROUPS["AVG_LBe_wo"] = [t for t in AVG_GROUPS["AVG_LBe"] if t not in
-                           {"lcc_e", "repobench-p_e", "passage_count_e", "passage_retrieval_en_e"}]
-META_COLUMNS = ["Model", "Source", "Checkpoint", "ContextLimit"]
-
-
-def length_label(length):
-    length = int(length)
-    return f"{length // 1024}k" if length % 1024 == 0 else str(length)
-
-
-def wide_row(model_name, records):
-    row, priorities = {"Model": model_name}, {}
-    for record in records:
-        # The detailed export retains every filter; the historical comparison uses `none`.
-        if record["filter"] != "none":
-            continue
-        task, metric, value = record["dataset"], record["metric"], record["value"]
-        target = RAW_TO_TARGET_MAP.get(task, task)
-        if task.startswith(("niah_", "ruler_")) and metric.isdigit():
-            row[f"{task}@{length_label(metric)}"] = value
-        expected = TARGET_METRIC_MAP.get(target)
-        priority = 2 if metric == expected else 0
-        if task.startswith("longbench_"):
-            name = task.removeprefix("longbench_").removesuffix("_e")
-            if metric == LB_METRICS.get(name):
-                priority = max(priority, 1)
-        if priority and priority > priorities.get(target, 0):
-            row[target], priorities[target] = value, priority
-    return row
-
-
 def parse_single_model(model_name, markdown_text):
-    return wide_row(model_name, markdown_rows(markdown_text))
+    lines = [line for line in markdown_text.strip().split('\n') if not line.strip().startswith('|---')]
+    if not lines: return {"Model": model_name}
+    
+    # 单独粘贴 NIAH/RULER 表时 Metric 全是数字；必须保留为字符串才能匹配长度键。
+    df = pd.read_csv(io.StringIO('\n'.join(lines)), sep='|', dtype=str, keep_default_na=False)
+    df = df.iloc[:, 1:-1]
+    df.columns = df.columns.str.strip()
+    for col in df.columns:  # text columns (object, or pandas 3's string dtype)
+        if not pd.api.types.is_numeric_dtype(df[col]): df[col] = df[col].astype(str).str.strip()
+    
+    df['Tasks'] = df['Tasks'].replace('', np.nan).ffill()
+    row_data = {"Model": model_name}
+    fallback_values = {}
+    
+    for _, row in df.iterrows():
+        raw_task = re.sub(r"^-\s*", "", str(row['Tasks']))  # a group's subtasks are listed as " - name"
+        metric = row['Metric']
+        value = row['Value']
 
+        target_task = RAW_TO_TARGET_MAP.get(raw_task, raw_task)
+        expected_metric = TARGET_METRIC_MAP.get(target_task)
+        if target_task in LONG_RULER + NIAH_CUE + NIAH_WORDS and metric in LONG_LENGTHS:
+            target_column = f"{target_task}@{LONG_LENGTHS[metric]}"
+            try:
+                if target_column in ORDERED_COLUMNS:
+                    row_data[target_column] = float(value)
+            except ValueError:
+                pass
+            continue
 
-def build_table(rows, compact=False):
-    frame = pd.DataFrame(rows)
-    extra = sorted(set(frame.columns) - set(META_COLUMNS + ORDERED_COLUMNS))
-    frame = frame.reindex(columns=META_COLUMNS + ORDERED_COLUMNS + extra)
-    for name, tasks in AVG_GROUPS.items():
-        values = frame.reindex(columns=tasks).apply(pd.to_numeric, errors="coerce")
-        counts = values.count(axis=1)
-        mean = values.mean(axis=1).round(4)
-        # A missing RULER/BABILong task must not silently become a complete benchmark score.
-        if name in DIAGNOSTIC_GROUPS:
-            mean = mean.where(counts == len(tasks))
-        frame[name] = mean
-        frame[f"{name}_n"] = counts
-    base_tasks = sorted({t for group, tasks in AVG_GROUPS.items() if group not in DIAGNOSTIC_GROUPS for t in tasks})
-    values = frame.reindex(columns=base_tasks).apply(pd.to_numeric, errors="coerce")
-    frame["AVG_all"] = values.mean(axis=1).round(4)
-    frame["AVG_all_n"] = values.count(axis=1)
-    if compact:
-        frame = frame.dropna(axis=1, how="all")
-        frame = frame.drop(columns=[c for c in frame if c.endswith("_n") and (frame[c] == 0).all()])
-    return frame.fillna("")
+        if raw_task.startswith("longbench_"):
+            name = raw_task.removeprefix("longbench_").removesuffix("_e")
+            if metric == LONGBENCH_METRICS.get(name):
+                try:
+                    fallback_values[target_task] = float(value)
+                except ValueError:
+                    pass
 
+        if raw_task in {f"long_ppl_{n}" for n in PPL_LENGTHS} and metric == "bits_per_byte":
+            try:
+                row_data[f"{raw_task}_bits_per_byte"] = float(value)
+            except ValueError:
+                pass
 
-def read_input(path):
-    text = path.read_text(encoding="utf-8-sig")
-    if path.suffix.lower() == ".json":
-        payload = json.loads(text)
-        records = result_rows(payload)
-        meta = {"Checkpoint": payload.get("checkpoint_dir"),
-                "ContextLimit": payload.get("model_max_seq_length") or
-                (payload.get("config_overrides") or {}).get("block_size")}
-        # Raw harness cache files do not necessarily contain model configuration.
-        return records, {k: v for k, v in meta.items() if v is not None}
-    return list(markdown_rows(text)), {}
+        if expected_metric and metric == expected_metric:
+            try:
+                row_data[target_task] = float(value)
+            except ValueError:
+                pass # 忽略非数字
+    for task, value in fallback_values.items():
+        row_data.setdefault(task, value)
+    return row_data
 
+# 1. 组合数据为 DataFrame
+final_df = pd.DataFrame([parse_single_model(m, text) for m, text in model_outputs.items()])
+final_df = final_df.reindex(columns=['Model'] + ORDERED_COLUMNS) # 对齐格式
 
-def collect_inputs(specs):
-    grouped, metadata, sources, seen, details = {}, {}, {}, {}, []
-    for label, path in specs:
-        records, meta = read_input(path)
-        if not records:
-            raise ValueError(f"{path}: no numeric evaluation results found")
-        grouped.setdefault(label, [])
-        metadata.setdefault(label, {})
-        sources.setdefault(label, [])
-        seen.setdefault(label, {})
-        for key, value in meta.items():
-            if key in metadata[label] and metadata[label][key] != value:
-                raise ValueError(f"{label}: conflicting {key}; use separate labels for different runs")
-            metadata[label][key] = value
-        for record in records:
-            identity = (record["dataset"], record["metric"], record["filter"])
-            if identity in seen[label]:
-                raise ValueError(f"{label}: duplicate result {identity} in {path}; use separate labels for reruns")
-            seen[label][identity] = path
-            grouped[label].append(record)
-            details.append({"Model": label, "Source": str(path), **meta, **record})
-        sources[label].append(str(path))
-    rows = [{**wide_row(label, records), **metadata[label], "Source": " ; ".join(sources[label])}
-            for label, records in grouped.items()]
-    return rows, details
+# 2. ================= 自动计算各组平均值 =================
+for avg_col, sub_tasks in AVG_GROUPS.items():
+    # 选出有实际成绩的列，利用 pd.to_numeric 把可能混入的字符转为 NaN 并求均值
+    valid_cols = [t for t in sub_tasks if t in final_df.columns]
+    final_df[avg_col] = final_df[valid_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
 
+# 计算全局汇总平均 AVG_all (综合所有分组子任务的基础列)
+all_base_tasks = list(set([task for group, group_tasks in AVG_GROUPS.items() if group not in DIAGNOSTIC_GROUPS
+                           for task in group_tasks]))
+valid_base_tasks = [t for t in all_base_tasks if t in final_df.columns]
+final_df['AVG_all'] = final_df[valid_base_tasks].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("files", nargs="*", type=Path, help="JSON/log files; one row per file")
-    parser.add_argument("--input", action="append", default=[], metavar="LABEL=PATH",
-                        help="repeat a label to join complementary main/NIAH outputs; duplicates are rejected")
-    parser.add_argument("-o", "--output", type=Path, help=".csv or .xlsx; default: CSV on stdout")
-    parser.add_argument("--long-output", type=Path, help="CSV with every task, metric, filter, length and stderr")
-    parser.add_argument("--compact", action="store_true", help="omit empty columns")
-    args = parser.parse_args(argv)
-    specs = [(str(path), path) for path in args.files]
-    for item in args.input:
-        label, sep, filename = item.partition("=")
-        if not sep or not label or not filename:
-            parser.error("--input expects LABEL=PATH")
-        specs.append((label, Path(filename)))
-    try:
-        if specs:
-            rows, details = collect_inputs(specs)
-        else:
-            rows = [parse_single_model(m, text) for m, text in model_outputs.items()]
-            details = [{"Model": m, "Source": "embedded model_outputs", **record}
-                       for m, text in model_outputs.items() for record in markdown_rows(text)]
-        frame = build_table(rows, args.compact)
-        if args.output:
-            if args.output.suffix.lower() not in {".csv", ".xlsx"}:
-                parser.error("--output must end in .csv or .xlsx")
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            if args.output.suffix.lower() == ".xlsx":
-                with pd.ExcelWriter(args.output) as writer:
-                    frame.to_excel(writer, sheet_name="summary", index=False)
-                    pd.DataFrame(details).to_excel(writer, sheet_name="metrics", index=False)
-            else:
-                frame.to_csv(args.output, index=False, encoding="utf-8-sig")
-        else:
-            print(frame.to_csv(index=False), end="")
-        if args.long_output:
-            args.long_output.parent.mkdir(parents=True, exist_ok=True)
-            with args.long_output.open("w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=META_COLUMNS + RESULT_COLUMNS)
-                writer.writeheader()
-                writer.writerows(details)
-    except (OSError, ValueError, ImportError) as error:
-        parser.error(str(error))
-
-
-if __name__ == "__main__":
-    main()
+# 3. 清理空白，输出剪贴板友好格式
+final_df = final_df.fillna("")
+print(final_df.to_csv(sep=',', index=False))
