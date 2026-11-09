@@ -75,3 +75,14 @@ def test_pasted_tables_still_parse_as_before(parse):
     table = parse.build_table({"m": _table({"piqa": {"acc": 0.7}, "niah_single_1": {"32768": 0.9}})}).set_index("Model")
     assert table.loc["m", "PIQA"] == 0.7 and table.loc["m", "niah_single_1"] == 0.9
     assert parse.table_lines("no table here\n|a|b|\n") == []
+
+
+def test_the_header_only_grows_at_the_end(parse):
+    """Tables already filled line up by position: tests/parse_lmeval_table_columns.txt holds the header as it
+    was, and the output must still start with it. Add new columns at the end of ORDERED_COLUMNS and append
+    them to that file."""
+    frozen = (ROOT / "tests" / "parse_lmeval_table_columns.txt").read_text().splitlines()
+    header = list(parse.build_table({"m": ""}).columns)
+    assert header[:len(frozen)] == frozen
+    # The 64K / 128K layout (144 columns, up to LongBench2) comes before everything 256K added.
+    assert frozen[143] == "LongBench2" and frozen[144] == "niah_single_1@256k"

@@ -441,13 +441,25 @@ BABILONG_LENGTHS = ("32k", "64k", "128k", "256k")
 PPL_LENGTHS = ("32k", "64k", "128k", "256k")
 # LongBench v2 的上下文预算来自 block_size：按长度命名的组（eval_tasks/longbench2_long）才能分列。
 LONGBENCH2_LENGTHS = ("64k", "128k", "256k")
-for _length in LONG_LENGTHS.values():
-    ORDERED_COLUMNS += [f"{t}@{_length}" for t in RULER_AT[_length]] + [
-        f"AVG_NIAH@{_length}", f"AVG_NIAH_multi@{_length}", f"AVG_RULER@{_length}"]
-for _length in BABILONG_LENGTHS:
-    ORDERED_COLUMNS += [f"babilong_qa{i}_{_length}" for i in range(1, 6)] + [f"AVG_babilong_{_length}"]
-ORDERED_COLUMNS += [f"long_ppl_{n}" for n in PPL_LENGTHS] + ["LongBench2"] + [
-    f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS]
+
+
+
+def _long_columns(ruler_lengths, babilong_lengths, ppl_lengths):
+    columns = []
+    for _length in ruler_lengths:
+        columns += [f"{t}@{_length}" for t in RULER_AT[_length]] + [
+            f"AVG_NIAH@{_length}", f"AVG_NIAH_multi@{_length}", f"AVG_RULER@{_length}"]
+    for _length in babilong_lengths:
+        columns += [f"babilong_qa{i}_{_length}" for i in range(1, 6)] + [f"AVG_babilong_{_length}"]
+    return columns + [f"long_ppl_{n}" for n in ppl_lengths]
+
+
+# 表头顺序只能往后加，不能改动已有列的位置（已有的表格按位置对齐）；tests/parse_lmeval_table_columns.txt 记着输出的表头，
+# 测试检查它仍是输出的前缀，新列加在这里的末尾，并把它们追加到那个文件。
+# 64K / 128K 的长文本列（以及 LongBench2）：
+ORDERED_COLUMNS += _long_columns(("64k", "128k"), ("32k", "64k", "128k"), ("32k", "64k", "128k")) + ["LongBench2"]
+# 后加：256K（RULER 12 个任务、BABILong、困惑度），按长度命名的 LongBench v2。
+ORDERED_COLUMNS += _long_columns(("256k",), ("256k",), ("256k",)) + [f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS]
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
