@@ -1,0 +1,12 @@
+# 长文本评测的同内存基线（只评测、不重训），评测长度 64k：StreamingLLM：前 4 个位置（attention sink）加最近的 token。
+# 跑在原始 Qwen3-1.7B-Base 上（与 eval_long64k_dense.yaml 同一权重），任务、样本数、YaRN 与 block_size 同
+# eval_long64k_baseline.yaml；它的 log_kv_* 设置只用来给出预算：先按这组设置建 LogKV 缓存、量出其持久缓存的字节数，
+# 再换成每层每个 KV 头能放进这些字节的最多条目（SWA 为窗口），整个请求（预填充按块流式进行）都不超过它。
+# 实际预算与条目数见结果 JSON 的 cache_budget，压缩比见 kv_compression。
+#   bash eval.sh exp/qwen1.7b-32k/eval_long64k_streamingllm.yaml
+config: eval_long64k_baseline.yaml
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
+tokenizer_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
+output_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-new/dense_niah_base_eval/long64k_streamingllm
+kv_baseline: streaming
+kv_baseline_budget: 0
