@@ -1290,6 +1290,11 @@ class LogKVLM(LM):
         for kind, count in self._truncation_counts.items():
             print(f"⚠️ [{_rank_label()}] {kind}: 本 rank 本轮共截断 {count} 次", flush=True)
         self._truncation_counts.clear()
+        if torch.cuda.is_available():  # how close this request type came to the card's limit (long contexts)
+            peak = torch.cuda.max_memory_allocated() / 2**30
+            total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 2**30
+            print(f"[{_rank_label()}] {tag}: 显存峰值 {peak:.1f} / {total:.1f} GiB", flush=True)
+            torch.cuda.reset_peak_memory_stats()
         if not _dist_ready():
             return local_result_list
 
