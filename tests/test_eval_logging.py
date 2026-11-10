@@ -1,5 +1,7 @@
 """Small CPU-only checks for eval logging; no model or lm_eval import required."""
 import ast
+import builtins
+import sys
 import contextlib
 import io
 import logging
@@ -9,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 import tqdm
 
 
@@ -26,7 +29,8 @@ def helpers(monkeypatch):
                  and node.name in {"_warn_truncation", "all_gather_results"})
     fake_dist = SimpleNamespace(is_available=lambda: True, is_initialized=lambda: False,
                                 get_rank=lambda: 0, get_world_size=lambda: 8)
-    scope = dict(os=os, logging=logging, contextlib=contextlib, tqdm=tqdm, dist=fake_dist,
+    scope = dict(os=os, sys=sys, builtins=builtins, torch=torch, logging=logging, contextlib=contextlib, tqdm=tqdm,
+                 dist=fake_dist,
                  time=SimpleNamespace(perf_counter=Mock(return_value=0)))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     return scope
@@ -147,3 +151,18 @@ def test_truncation_warns_once_then_summarizes_each_round(helpers, monkeypatch, 
     assert not capsys.readouterr().out
     helpers["_warn_truncation"](model, "generate_until", 64)
     assert "64" in capsys.readouterr().out
+
+
+def test_harness_drops_the_ruler_builders_prints_only(helpers, capsys):
+    """lm-eval's RULER sample builders print every sizing step on every rank; other prints stay."""
+    ruler = {"__name__": "lm_eval.tasks.ruler.vt_utils"}
+    exec("def size():\n    print('Max length 262144 | Current length 117909 | Noises: 4890')", ruler)
+    original = builtins.print
+    with helpers["_harness_logging"]():
+        ruler["size"]()
+        print("eval progress")
+    assert builtins.print is original
+    out = capsys.readouterr().out
+    assert "Noises" not in out and "eval progress" in out
+    ruler["size"]()  # outside the evaluation it prints again
+    assert "Noises" in capsys.readouterr().out
