@@ -149,7 +149,11 @@ def _harness_logging():
     def quiet_print(*args, **kwargs):
         # lm-eval's RULER builders print as they size each sample ("Max length ... | Current length ...
         # | Noises: ...", once per try and per rank); drop prints made from those modules only.
-        if sys._getframe(1).f_globals.get("__name__", "").startswith("lm_eval.tasks.ruler"):
+        # By the caller's file: lm-eval loads a task's utils through its YAML (!function) under the bare
+        # module name (vt_utils), so __name__ does not say where the code lives.
+        caller = sys._getframe(1)
+        where = caller.f_code.co_filename.replace("\\", "/")
+        if "/lm_eval/tasks/ruler/" in where or caller.f_globals.get("__name__", "").startswith("lm_eval.tasks.ruler"):
             return
         original_print(*args, **kwargs)
 

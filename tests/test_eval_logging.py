@@ -157,8 +157,10 @@ def test_truncation_warns_once_then_summarizes_each_round(helpers, monkeypatch, 
 
 def test_harness_drops_the_ruler_builders_prints_only(helpers, capsys):
     """lm-eval's RULER sample builders print every sizing step on every rank; other prints stay."""
-    ruler = {"__name__": "lm_eval.tasks.ruler.vt_utils"}
-    exec("def size():\n    print('Max length 262144 | Current length 117909 | Noises: 4890')", ruler)
+    # As lm-eval loads it for a task's YAML (!function): module name vt_utils, file under lm_eval/tasks/ruler.
+    ruler = {"__name__": "vt_utils"}
+    exec(compile("def size():\n    print('Max length 262144 | Current length 117909 | Noises: 4890')",
+                 "/site-packages/lm_eval/tasks/ruler/vt_utils.py", "exec"), ruler)
     original = builtins.print
     with helpers["_harness_logging"]():
         ruler["size"]()
