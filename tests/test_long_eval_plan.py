@@ -30,7 +30,8 @@ def test_per_length_passes_take_the_factor_their_length_needs():
     assert len(passes[2]["niah"]) == 13 and len(passes[3]["niah"]) == 12 and "ruler_qa_squad" not in passes[3]["niah"]
     assert passes[1]["main"] == ["babilong_64k", "long_ppl_64k", "long_ppl_books_64k", "niah_turns_64k",
                                  "longbench2_64k"]
-    assert passes[1]["optional"] == ["long_ppl_64k", "long_ppl_books_64k"]  # default suites: data may be missing
+    # Default suites: data may be missing (LongBench v2's files may not be whole).
+    assert passes[1]["optional"] == ["long_ppl_64k", "long_ppl_books_64k", "longbench2_64k"]
 
 
 def test_fixed_passes_share_the_longest_lengths_factor():
@@ -94,7 +95,7 @@ def test_the_launcher_runs_one_pass_per_length(tmp_path):
     assert all("--config_overrides" not in p[6] and "--limit 100" in p[6] for p in passes)  # only the pass's own
     assert passes[3][2] == "babilong_256k,long_ppl_256k,long_ppl_books_256k,niah_turns_256k,longbench2_256k"
     assert "ruler_qa_squad" not in passes[3][3] and passes[3][4] == "[262144]"
-    assert passes[0][5] == "long_ppl_32k,long_ppl_books_32k"
+    assert passes[0][5] == "long_ppl_32k,long_ppl_books_32k,longbench2_32k"
 
     done, passes = _launcher(tmp_path, config, env=dict(EVAL_LENGTHS="128k", EVAL_SUITES="turns", YARN_MODE="fixed"))
     assert done.returncode == 0, done.stderr

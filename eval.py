@@ -436,6 +436,38 @@ def _check_task_lengths(tasks, max_seq_length):
                              + f", but max_seq_length is {max_seq_length}: set config_overrides.block_size")
 
 
+def _longbench2_files_problem():
+    """Why LongBench v2 cannot load offline, or None. Its tasks read the repository snapshot in the hub cache
+    (litgpt/longbench2_patch.py), so every parquet file there must be whole: a cut download, a Git LFS pointer
+    or an error page in its place fails every subset (unused/fetch_long_eval_data.py --longbench2 checks the same)."""
+    try:
+        from litgpt.longbench2_patch import snapshot
+
+        root, files = snapshot()
+    except Exception as error:  # noqa: BLE001 - not in the cache at all
+        return f"no LongBench v2 snapshot in the hub cache ({type(error).__name__}: {str(error)[:200]})"
+    if not files:
+        return f"the LongBench v2 snapshot {root} holds no data file"
+    bad = []
+    for name in files:
+        path = Path(root) / name
+        if not name.endswith(".parquet"):
+            continue
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4)
+                f.seek(-4, os.SEEK_END)
+                whole = path.stat().st_size >= 12 and head == b"PAR1" and f.read(4) == b"PAR1"
+        except OSError:
+            whole = False
+        if not whole:
+            bad.append(name)
+    if bad:
+        return (f"LongBench v2 files in {root} are not whole parquet: {bad[:3]}" + (f" and {len(bad) - 3} more"
+                if len(bad) > 3 else "") + " (unused/fetch_long_eval_data.py --longbench2 downloads them again)")
+    return None
+
+
 def _skip_optional_tasks(tasks, max_seq_length):
     """The launchers' default lists mark tasks that some checkpoints or setups cannot serve (EVAL_OPTIONAL_TASKS,
     e.g. the 32K turns and book curve): such a task is left out, with the reason, when the model's window is
@@ -455,6 +487,8 @@ def _skip_optional_tasks(tasks, max_seq_length):
             elif reason is None and task.startswith("long_ppl_") and not task.startswith("long_ppl_books") \
                     and not os.environ.get("LONG_PPL_DATA"):
                 reason = "LONG_PPL_DATA is not set (unused/fetch_long_eval_data.py --ppl-hub emozilla/pg19-test)"
+            elif reason is None and task.startswith("longbench2_"):
+                reason = _longbench2_files_problem()
         if reason is None:
             kept.append(task)
         elif _is_main():

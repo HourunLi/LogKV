@@ -294,15 +294,16 @@ def test_the_default_lists_end_with_the_optional_32k_tasks():
         assert run(script, "piqa,niah_turns_32k")[1] == ""  # asked for by name: must run
 
 
-def test_optional_tasks_are_left_out_when_the_window_or_data_cannot_serve_them(monkeypatch, capsys):
+def test_optional_tasks_are_left_out_when_the_window_or_data_cannot_serve_them(monkeypatch, capsys, tmp_path):
     import ast
     import re
 
     source = Path(__file__).resolve().parents[1] / "eval.py"
     nodes = [n for n in ast.parse(source.read_text()).body
-             if (isinstance(n, ast.FunctionDef) and n.name in {"_check_task_lengths", "_skip_optional_tasks"})
+             if (isinstance(n, ast.FunctionDef)
+                 and n.name in {"_check_task_lengths", "_skip_optional_tasks", "_longbench2_files_problem"})
              or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_LENGTH_NAMED_TASK")]
-    scope = dict(re=re, os=os, _is_main=lambda: True)
+    scope = dict(re=re, os=os, Path=Path, _is_main=lambda: True)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     skip = scope["_skip_optional_tasks"]
     tasks = ["piqa", "niah_turns_32k", "long_ppl_books_32k"]
@@ -314,6 +315,17 @@ def test_optional_tasks_are_left_out_when_the_window_or_data_cannot_serve_them(m
     monkeypatch.delenv("LONG_PPL_BOOKS")
     assert skip(tasks, 32768) == ["piqa", "niah_turns_32k"]
     assert "LONG_PPL_BOOKS is not set" in capsys.readouterr().out
+    # LongBench v2: skipped when a parquet file of its hub snapshot is not whole (a cut download, an LFS pointer).
+    import litgpt.longbench2_patch as longbench2
+
+    monkeypatch.setenv("EVAL_OPTIONAL_TASKS", "longbench2_64k")
+    (tmp_path / "a.parquet").write_bytes(b"PAR1" + b"x" * 16 + b"PAR1")
+    (tmp_path / "b.parquet").write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
+    monkeypatch.setattr(longbench2, "snapshot", lambda: (str(tmp_path), ["a.parquet", "b.parquet"]))
+    assert skip(["piqa", "longbench2_64k"], 66560) == ["piqa"]
+    assert "not whole parquet: ['b.parquet']" in capsys.readouterr().out
+    (tmp_path / "b.parquet").write_bytes(b"PAR1" + b"y" * 16 + b"PAR1")
+    assert skip(["piqa", "longbench2_64k"], 66560) == ["piqa", "longbench2_64k"]
     monkeypatch.setenv("EVAL_OPTIONAL_TASKS", "")
     assert skip(tasks, 4096) == tasks  # asked for by name: kept, and _check_task_lengths refuses it
     with pytest.raises(ValueError, match="niah_turns_32k"):
