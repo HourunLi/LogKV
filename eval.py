@@ -24,6 +24,7 @@ import glob
 import json
 import builtins
 import sys
+import warnings
 import logging
 import time
 import inspect
@@ -103,7 +104,8 @@ def _eval_print(*args, **kwargs) -> None:
 
 
 def _eval_progress(items, desc: str):
-    """Report rank 0's shard at most every 30s; never synchronize model calls."""
+    """Rank 0's shard as one short line at the start, at every 10% and at the end (with the time left), and at
+    most every 5 minutes in between when items are slow; never synchronizes model calls."""
     if _eval_verbose():
         yield from tqdm.tqdm(items, desc=f"{desc} {_rank_label()}", position=_global_rank())
         return
@@ -114,11 +116,14 @@ def _eval_progress(items, desc: str):
     label = f"{desc} [{_rank_label()} 分片]"
     started = last_report = time.perf_counter()
     print(f"⏳ {label}: 0/{total}", flush=True)
+    step = max(1, -(-total // 10))
     for completed, item in enumerate(items, 1):
         yield item
         now = time.perf_counter()
-        if completed == total or now - last_report >= 30:
-            print(f"⏳ {label}: {completed}/{total}，已用 {now - started:.0f}s", flush=True)
+        if completed == total or completed % step == 0 or now - last_report >= 300:
+            left = (now - started) / completed * (total - completed)
+            print(f"⏳ {label}: {completed}/{total} ({100 * completed // total}%)，已用 {now - started:.0f}s"
+                  + (f"，约剩 {left:.0f}s" if completed < total else ""), flush=True)
             last_report = now
 
 
@@ -148,14 +153,24 @@ def _harness_logging():
             return
         original_print(*args, **kwargs)
 
+    # Rank 0 keeps warnings (but datasets' offline-cache notices, one per dataset load); the other ranks keep
+    # errors only, and Python warnings stay on rank 0. Errors and tracebacks are never filtered.
+    def floor(logger):
+        quiet = not _is_main() or logger.name == "datasets" or logger.name.startswith("datasets.")
+        return logging.ERROR if quiet else logging.WARNING
+
+    warning_filters = warnings.filters[:]
     try:
         for logger in loggers:
-            logger.setLevel(max(logger.getEffectiveLevel(), logging.WARNING))
+            logger.setLevel(max(logger.getEffectiveLevel(), floor(logger)))
+        if not _is_main():
+            warnings.simplefilter("ignore")
         # lm-eval imports tqdm in multiple modules, including locally during bootstrap.
         tqdm.tqdm.__init__ = quiet_init
         builtins.print = quiet_print
         yield
     finally:
+        warnings.filters[:] = warning_filters
         builtins.print = original_print
         tqdm.tqdm.__init__ = original_init
         for logger, level in levels.items():

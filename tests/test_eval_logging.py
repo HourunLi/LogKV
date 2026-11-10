@@ -29,7 +29,7 @@ def helpers(monkeypatch):
                  and node.name in {"_warn_truncation", "all_gather_results"})
     fake_dist = SimpleNamespace(is_available=lambda: True, is_initialized=lambda: False,
                                 get_rank=lambda: 0, get_world_size=lambda: 8)
-    scope = dict(os=os, sys=sys, builtins=builtins, torch=torch, logging=logging, contextlib=contextlib, tqdm=tqdm,
+    scope = dict(os=os, sys=sys, builtins=builtins, warnings=__import__('warnings'), torch=torch, logging=logging, contextlib=contextlib, tqdm=tqdm,
                  dist=fake_dist,
                  time=SimpleNamespace(perf_counter=Mock(return_value=0)))
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
@@ -51,15 +51,17 @@ def test_only_global_main_prints(helpers, monkeypatch, capsys, initialized, rank
     assert capsys.readouterr().out == ("model ready\n" if visible else "")
 
 
-def test_progress_is_plain_text_throttled_and_labels_the_shard(helpers, monkeypatch, capsys):
+def test_progress_is_one_line_per_tenth_with_the_time_left(helpers, monkeypatch, capsys):
     monkeypatch.setenv("WORLD_SIZE", "8")
-    helpers["time"].perf_counter.side_effect = [0, 1, 10, 30, 31, 59, 60, 61]
-    assert list(helpers["_eval_progress"](range(7), "Scoring")) == list(range(7))
+    # 25 items: lines at 0, every 3 items (a tenth, rounded up) and at 25; a 400 s item also reports at 4.
+    helpers["time"].perf_counter.side_effect = [0] + [10 * i for i in range(1, 4)] + [430] + [430 + 10 * i for i in range(1, 22)]
+    assert list(helpers["_eval_progress"](range(25), "Scoring")) == list(range(25))
     output = capsys.readouterr()
     lines = output.out.splitlines()
-    assert len(lines) == 4
+    counts = [int(line.split(": ")[1].split("/")[0]) for line in lines]
+    assert counts == [0, 3, 4, 6, 9, 12, 15, 18, 21, 24, 25]
     assert all("GlobalRank 0/8" in line and "分片" in line for line in lines)
-    assert all(f"{count}/7" in line for count, line in zip((0, 3, 6, 7), lines))
+    assert "(12%)" in lines[1] and "约剩 220s" in lines[1] and "约剩" not in lines[-1]
     assert "\r" not in output.out and "\x1b" not in output.out and not output.err
 
 
@@ -166,3 +168,28 @@ def test_harness_drops_the_ruler_builders_prints_only(helpers, capsys):
     assert "Noises" not in out and "eval progress" in out
     ruler["size"]()  # outside the evaluation it prints again
     assert "Noises" in capsys.readouterr().out
+
+
+def test_other_ranks_keep_errors_only_and_rank_0_drops_datasets_cache_notices(helpers, monkeypatch, capsys):
+    import warnings
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    loggers = {name: logging.getLogger(name) for name in ("lm_eval", "datasets")}
+    for logger in loggers.values():
+        monkeypatch.setattr(logger, "level", logging.INFO)
+        monkeypatch.setattr(logger, "handlers", [handler])
+        monkeypatch.setattr(logger, "propagate", False)
+    for rank, expected in (("0", {"lm_eval warning", "lm_eval error", "datasets error"}),
+                           ("3", {"lm_eval error", "datasets error"})):
+        monkeypatch.setenv("RANK", rank)
+        monkeypatch.setenv("WORLD_SIZE", "8")
+        output.seek(0), output.truncate()
+        with helpers["_harness_logging"]():
+            for name, logger in loggers.items():
+                logger.warning(f"{name} warning")
+                logger.error(f"{name} error")
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.warn("python warning")
+        assert set(output.getvalue().splitlines()) == expected, rank
+        assert len(caught) == (1 if rank == "0" else 0)
+        assert {n: l.level for n, l in loggers.items()} == {"lm_eval": logging.INFO, "datasets": logging.INFO}
