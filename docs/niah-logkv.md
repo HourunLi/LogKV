@@ -262,6 +262,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
 - 长输入分块进 LogKV 缓存：`eval.py` 的打分、生成与逐轮问在输入长于 `LOGKV_EVAL_PREFILL_CHUNK`（默认 32768，0 为一次前向）时分块预填充；
   缓存是流式的，分块与一次前向的 logits 逐位相同（普通、语义聚类、惊异度准入与 Gamma cue 都验证过），只是激活显存有界——256K 一次前向在 80 GB 卡上会爆（MLP 中间张量单个约 3 GiB）。
   惊异度准入本来就在 `GPT.forward` 里按 recent 窗口分块。dense 仍一次前向（后续分块要建块长 × 位置的掩码）。
+  每类请求结束时各 rank 打印显存峰值（`显存峰值 X / Y GiB`）；`LIMIT=2` 临时覆盖 YAML 的每任务条数，用于上长跑之前在单卡上测一下：`GPUS_PER_NODE=1 LIMIT=2 EVAL_LENGTHS=256k EVAL_SUITES=babilong,books,turns bash eval.sh <yaml>` 覆盖生成、打分与逐轮问三条路径。
 - 稠密 KV 缓存不再分配 max_seq_length × max_seq_length 的掩码（128K 时约 17 GB）：从位置 0 开始的预填充直接是因果注意力
   （SDPA 的 is_causal），只读已写入的那部分缓存；其余调用（解码、续接的分块）按需建 T × (最大位置+1) 的掩码。
 - `eval.sh` 从 YAML 读：`eval_max_seq_lengths`（RULER / NIAH 的长度，默认 1K–32K）、`niah_benchmark`（NIAH 任务列表，命令行第

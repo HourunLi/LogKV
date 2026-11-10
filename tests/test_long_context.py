@@ -536,3 +536,13 @@ def test_the_fetch_script_mends_hub_links_flattened_into_files(tmp_path, monkeyp
     assert fetch.repair_parquet(str(snapshot), names, lines, repo="recursal/longbench-v2")
     assert not (snapshot / names[0]).is_symlink() and (snapshot / names[0]).read_bytes() == whole
     assert "the blob copied in its place: ok" in lines[0] and len(calls) == 2
+
+
+def test_limit_overrides_the_yamls_samples_for_one_run(tmp_path, monkeypatch):
+    config = tmp_path / "long.yaml"
+    config.write_text("save_path: /tmp/unused-checkpoint\nlimit: 100\n")
+    args, _, _ = _eval_settings(config)
+    assert args[args.index("--limit") + 1] == "100"
+    monkeypatch.setenv("LIMIT", "2")  # e.g. a quick memory check on one card
+    args, _, _ = _eval_settings(config)
+    assert args[args.index("--limit") + 1] == "2"

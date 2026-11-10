@@ -467,6 +467,7 @@ fi
 if [ -n "${CONFIG_OVERRIDES}" ]; then
     LOG_KV_ARG_LIST+=(--config_overrides "${CONFIG_OVERRIDES}")
 fi
+EVAL_LIMIT=${LIMIT:-${EVAL_LIMIT}}  # LIMIT=2 overrides the YAML's samples per task for one run (e.g. a memory check)
 if [ -n "${EVAL_LIMIT}" ]; then
     LOG_KV_ARG_LIST+=(--limit "${EVAL_LIMIT}")
 fi
