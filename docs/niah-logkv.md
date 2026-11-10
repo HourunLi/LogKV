@@ -307,7 +307,9 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   `bash diag.sh unused/fetch_long_eval_data.py [--longbench2] [--ppl-data <留出数据> --tokenizer <tokenizer 目录>]`
   用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k，与 `RMT-team/babilong` 的 256k）、
   RULER 问答的 SQuAD 与 HotpotQA（`litgpt/ruler_patch.py` 先读的本地文件）与可选的 LongBench v2，再以离线方式重新加载
-  一遍；`--ppl-books-hub emozilla/pg19`（或本地的 `--ppl-books-data`）按文件名顺序逐个下载训练集文件，直到找到 100 本不短于
+  一遍；快照里不是完整 parquet 的文件会修好再用：hub 缓存的软链接被拷贝或同步压平成一个写着 `../../../../blobs/<sha>` 的小文件时，
+  blob 完好就重新建链接（不能建链接的文件系统上复制 blob），否则删掉这个文件、按该快照的版本强制重下（`hf_hub_download` 遇到已存在的
+  快照文件即使 `force_download` 也只刷新 blob，不替换它）；`--ppl-books-hub emozilla/pg19`（或本地的 `--ppl-books-data`）按文件名顺序逐个下载训练集文件，直到找到 100 本不短于
   262144 token 的书（PG19 训练集 2.86 万本里约 4–6%），写入 `long_ppl_books` 的缓存并打印 `LONG_PPL_BOOKS` 的目录；该目录里
   若还有以前下载的其他文件也会被读到，汇总会提醒；给了 `--ppl-data` 时还选出困惑度的两批文档（不短于 131072 与 262144 token）并写入缓存（缓存键按 tokenizer 文件内容，
 与用哪个路径指向它无关），汇总给出 256K 那批选到几篇（一篇没有时只是 `long_ppl_256k` 跑不了，不算下载失败），
