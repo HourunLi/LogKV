@@ -5,7 +5,7 @@
 # 每档：NIAH 阶段跑 RULER（256K 为 12 个，不含 ruler_qa_squad），主阶段跑 BABILong、long_ppl_<L>（LONG_PPL_DATA）、
 # long_ppl_books_<L>（LONG_PPL_BOOKS）、niah_turns_<L> 与 longbench2_<L>，每个任务 100 条。外部变量控制范围：
 #   EVAL_LENGTHS=32k,128k            只测这些长度（默认 eval_lengths 全部）
-#   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2   只跑这些类（默认全部；默认时缺数据的 ppl / books 跳过）
+#   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2   只跑这些类（默认全部；默认时缺数据的 ppl / books、文件不完整的 longbench2 跳过）
 #   NIAH_ONLY=1                      只跑 RULER
 #   YARN_MODE=fixed                  固定倍数的附加实验
 #   bash eval.sh exp/qwen1.7b-32k/eval_long_baseline.yaml

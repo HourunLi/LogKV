@@ -747,7 +747,7 @@ fi
 #   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2 只跑这些类；NIAH_ONLY=1 只跑 RULER。
 # 上面主线已经测过的（主评测的任务、NIAH 阶段在各自长度上的捞针）不再重测，32K 档只补其余的任务。训练长度不到 32K 的
 # checkpoint 跳过（YaRN 以 32K 为原长）。数据：环境变量 LONG_PPL_DATA、LONG_PPL_BOOKS、BABILONG_DATASET，或 YAML 的同名
-# 小写键；缺数据的 long_ppl / long_ppl_books 在默认类别下打印原因后跳过。
+# 小写键；缺数据的 long_ppl / long_ppl_books、文件不完整的 LongBench v2 在默认类别下打印原因后跳过。
 # ==============================================================================
 LONG_EVAL_SETTINGS=$(python - "${CONFIG_FILE}" "${BENCHMARKS}" "${NIAH_BENCHMARKS}" "${EVAL_MAX_SEQ_LENGTHS}" <<'LONG_EVAL_PY'
 import json

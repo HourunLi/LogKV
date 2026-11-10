@@ -330,7 +330,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   `YARN_MODE=fixed` 是附加实验：每档都用所测最长一档的倍数（按该长度部署的模型，静态 YaRN），写到 `<output_path>/yarn<F>/long<L>`。
   YaRN 的频率与温度只取决于倍数、与窗口无关，所以两种模式只差倍数，LongBench v2 的预算仍是各档自己的长度。外部变量控制范围：
   `EVAL_LENGTHS=32k,128k`（默认 YAML 的 `eval_lengths`）、`EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2`（默认全部；
-  默认时缺数据的 `ppl`、`books` 作为可选任务跳过，点名的必须能跑）、`NIAH_ONLY=1`（只跑 RULER）；这种配置不接受任务清单参数。
+  默认时缺数据的 `ppl`、`books`，以及 hub 缓存里文件不是完整 parquet 的 `longbench2`，作为可选任务跳过并打印原因，点名的必须能跑）、`NIAH_ONLY=1`（只跑 RULER）；这种配置不接受任务清单参数。
   每档换一次窗口与 YaRN，要重新加载模型（约一分钟）。注意 `long_ppl_32k` 在这里是 32K 档（不用 YaRN）测的，在
   `eval_long64k_*.yaml` 里是 64K 配置（YaRN 2）测的；32K 档的 8 个捞针任务写进 32K 主线的同名列，其余 5 个 RULER 任务、
   `AVG_RULER@32k` 与 `LongBench2@32k` 是新加的列。按长度拆开的 `eval_long{64k,128k,256k}_*.yaml` 保留，用于复现已有结果。
