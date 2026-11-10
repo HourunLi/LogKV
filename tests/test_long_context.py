@@ -487,3 +487,52 @@ def test_the_fetch_script_downloads_book_files_until_enough_are_long(tmp_path, m
     lines = []
     fetch.fetch_ppl_books("someone/books", word_tokenizer, lines)
     assert any("WARNING" in line and "data/test-0.parquet" in line for line in lines)
+
+
+def test_the_fetch_script_mends_hub_links_flattened_into_files(tmp_path, monkeypatch):
+    """A copy or sync that does not keep the hub cache's links leaves 82-byte files holding '../../../../blobs/<sha>';
+    hf_hub_download keeps an existing snapshot file even with force_download, so the script mends it itself."""
+    pytest.importorskip("lm_eval")
+    import importlib.util
+
+    import huggingface_hub
+
+    spec = importlib.util.spec_from_file_location("fetch_links", ROOT / "unused" / "fetch_long_eval_data.py")
+    fetch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fetch)
+    repo_dir, rev = tmp_path / "datasets--recursal--longbench-v2", "380536fc"
+    snapshot = repo_dir / "snapshots" / rev
+    whole = b"PAR1" + b"rows" * 8 + b"PAR1"
+    (repo_dir / "blobs").mkdir(parents=True)
+    (repo_dir / "blobs" / "aaa").write_bytes(whole)
+    names = ["data/academic_single/train.parquet", "data/detective/train.parquet", "data/table_qa/train.parquet"]
+    for name in names:
+        (snapshot / name).parent.mkdir(parents=True, exist_ok=True)
+    (snapshot / names[0]).write_text("../../../../blobs/aaa")  # flattened, its blob whole
+    (snapshot / names[1]).write_text("../../../../blobs/bbb")  # flattened, its blob missing
+    (snapshot / names[2]).write_bytes(b"PAR1 cut short")  # an ordinary cut download
+    calls = []
+
+    def download(repo, name, repo_type=None, revision=None, force_download=False):
+        calls.append((name, revision, force_download))
+        assert not (snapshot / name).exists()  # the bad file is gone, so the hub writes a fresh one
+        (snapshot / name).write_bytes(whole)
+        return str(snapshot / name)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    lines = []
+    assert fetch.repair_parquet(str(snapshot), names, lines, repo="recursal/longbench-v2")
+    assert (snapshot / names[0]).is_symlink() and fetch.is_parquet(snapshot / names[0])
+    assert "flattened into a file; linked again: ok" in lines[0] and "was 21 bytes" in lines[0]
+    assert calls == [(names[1], rev, True), (names[2], rev, True)]  # in this snapshot's revision
+    assert all(fetch.is_parquet(snapshot / name) for name in names)
+    # Where links do not work, the blob is copied in place of the flattened one.
+    (snapshot / names[0]).unlink()
+    (snapshot / names[0]).write_text("../../../../blobs/aaa")
+
+    def no_links(src, dst):
+        raise OSError(1, "Operation not permitted")
+    monkeypatch.setattr(fetch.os, "symlink", no_links)
+    lines = []
+    assert fetch.repair_parquet(str(snapshot), names, lines, repo="recursal/longbench-v2")
+    assert not (snapshot / names[0]).is_symlink() and (snapshot / names[0]).read_bytes() == whole
+    assert "the blob copied in its place: ok" in lines[0] and len(calls) == 2

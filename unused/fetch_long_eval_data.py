@@ -47,6 +47,7 @@ os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 
 import argparse  # noqa: E402
 import json  # noqa: E402
+import shutil  # noqa: E402
 import subprocess  # noqa: E402
 import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -183,10 +184,45 @@ def describe(path: Path) -> str:
     return f"{path.stat().st_size} bytes, starts {head!r}"
 
 
-def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | None = None) -> bool:
-    """Download again, fresh, every snapshot parquet file that is not a whole parquet file."""
+def flattened_link(path: Path) -> str | None:
+    """The target of a hub-cache link that a copy or sync turned into a small regular file holding the link's text
+    (``../../../../blobs/<sha256>``), or None."""
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 512:
+        return None
+    try:
+        text = path.read_bytes().decode().strip()
+    except UnicodeDecodeError:
+        return None
+    return text if "/blobs/" in text and "\n" not in text else None
+
+
+def refetch(repo: str, name: str, root: str) -> tuple[Path, str]:
+    """Make the snapshot file ``name`` whole again; returns its path and what was done. hf_hub_download leaves a
+    snapshot file that exists as it is, even with force_download (it only refreshes the blob), so a bad one is
+    removed first; a flattened link whose blob is whole is linked again (copied, where links do not work)."""
     from huggingface_hub import hf_hub_download
 
+    pointer = Path(root) / name
+    text = flattened_link(pointer)
+    if text is not None:
+        blob = Path(os.path.normpath(pointer.parent / text))
+        pointer.unlink()
+        if is_parquet(blob):
+            try:
+                os.symlink(text, pointer)
+                return pointer, f"a link to blobs/{blob.name} flattened into a file; linked again"
+            except OSError:
+                shutil.copyfile(blob, pointer)
+                return pointer, f"a link to blobs/{blob.name} flattened into a file; the blob copied in its place"
+    elif pointer.is_symlink() or pointer.exists():
+        pointer.unlink()
+    # The snapshot's own revision, so the file lands in this snapshot folder.
+    fresh = hf_hub_download(repo, name, repo_type="dataset", revision=Path(root).name, force_download=True)
+    return Path(fresh), "downloaded again"
+
+
+def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | None = None) -> bool:
+    """Make every snapshot parquet file that is not a whole parquet file whole again (refetch)."""
     from litgpt.longbench2_patch import REPO
 
     repo = repo or REPO
@@ -194,10 +230,10 @@ def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | No
     ok = True
     for f in bad:
         before = describe(Path(root) / f)
-        fresh = Path(hf_hub_download(repo, f, repo_type="dataset", force_download=True))
+        fresh, done = refetch(repo, f, root)
         good = is_parquet(fresh)
         ok = ok and good
-        lines.append(f"{repo} {f}: was {before}; downloaded again: " + ("ok" if good else describe(fresh)))
+        lines.append(f"{repo} {f}: was {before}; {done}: " + ("ok" if good else describe(fresh)))
     if not bad:
         lines.append(f"{repo} files: all whole parquet")
     return ok
@@ -291,9 +327,10 @@ def fetch_ppl_books(repo: str, tokenizer: str, lines: list[str], pattern: str | 
     found, root = 0, None
     for name in files:
         path = Path(hf_hub_download(repo, name, repo_type="dataset"))
-        if name.endswith(".parquet") and not is_parquet(path):
-            path = Path(hf_hub_download(repo, name, repo_type="dataset", force_download=True))
         root = str(path)[:-len(name)].rstrip("/")
+        if name.endswith(".parquet") and not is_parquet(path):
+            path, done = refetch(repo, name, root)
+            lines.append(f"long_ppl_books {repo} {name}: not whole parquet; {done}")
         found += len(utils.select_documents(str(path), tok, want - found, longest=utils.LONGEST_256K))
         lines.append(f"long_ppl_books {repo} {name}: {found} books of >= {utils.LONGEST_256K} tokens so far")
         if found >= want:
