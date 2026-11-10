@@ -22,6 +22,8 @@ import re
 import csv
 import glob
 import json
+import builtins
+import sys
 import logging
 import time
 import inspect
@@ -137,13 +139,24 @@ def _harness_logging():
         kwargs["disable"] = True
         original_init(self, *args, **kwargs)
 
+    original_print = builtins.print
+
+    def quiet_print(*args, **kwargs):
+        # lm-eval's RULER builders print as they size each sample ("Max length ... | Current length ...
+        # | Noises: ...", once per try and per rank); drop prints made from those modules only.
+        if sys._getframe(1).f_globals.get("__name__", "").startswith("lm_eval.tasks.ruler"):
+            return
+        original_print(*args, **kwargs)
+
     try:
         for logger in loggers:
             logger.setLevel(max(logger.getEffectiveLevel(), logging.WARNING))
         # lm-eval imports tqdm in multiple modules, including locally during bootstrap.
         tqdm.tqdm.__init__ = quiet_init
+        builtins.print = quiet_print
         yield
     finally:
+        builtins.print = original_print
         tqdm.tqdm.__init__ = original_init
         for logger, level in levels.items():
             logger.setLevel(level)
@@ -1293,7 +1306,7 @@ class LogKVLM(LM):
         if torch.cuda.is_available():  # how close this request type came to the card's limit (long contexts)
             peak = torch.cuda.max_memory_allocated() / 2**30
             total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 2**30
-            print(f"[{_rank_label()}] {tag}: 显存峰值 {peak:.1f} / {total:.1f} GiB", flush=True)
+            _eval_print(f"[{_rank_label()}] {tag}: 显存峰值 {peak:.1f} / {total:.1f} GiB", flush=True)
             torch.cuda.reset_peak_memory_stats()
         if not _dist_ready():
             return local_result_list
