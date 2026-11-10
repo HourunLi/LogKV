@@ -1323,6 +1323,50 @@ class LogKVLM(LM):
     # ==========================================
     # 🌟 核心 1：PPL 与 选择题评测
     # ==========================================
+    def _prefill_chunk(self) -> int:
+        """Tokens per forward when a long input enters the LogKV cache (LOGKV_EVAL_PREFILL_CHUNK, default 32768;
+        0 = one forward). The cache streams, so chunked input gives bit-identical logits (tests/test_eval_compression.py),
+        and the activations stay bounded: one forward of 256K tokens overflows an 80 GB card. Dense keeps one
+        forward (a later chunk would need a chunk x position mask)."""
+        if getattr(self, "log_kv_dense_mode", False):
+            return 0
+        return int(os.environ.get("LOGKV_EVAL_PREFILL_CHUNK", "32768"))
+
+    def _forward(self, tokens, start, lm_head_start):
+        """``self.model`` on ``tokens`` at positions start..start+T-1, logits from ``lm_head_start`` on, in chunks
+        of ``_prefill_chunk()`` tokens when the input is longer."""
+        T, chunk = int(tokens.numel()), self._prefill_chunk()
+        if not chunk or T <= chunk:
+            return self.model(tokens[None], input_pos=torch.arange(start, start + T, device=self._device),
+                              input_pos_maxp1=start + T, lm_head_start=lm_head_start)
+        kept = []
+        for a in range(0, T, chunk):
+            b = min(a + chunk, T)
+            first = min(max(lm_head_start - a, 0), b - a - 1)  # a chunk before the scored span keeps one row
+            out = self.model(tokens[None, a:b], input_pos=torch.arange(start + a, start + b, device=self._device),
+                             input_pos_maxp1=start + b, lm_head_start=first)
+            if b > lm_head_start:
+                kept.append(out[:, max(lm_head_start - a, 0) - first:])
+        return torch.cat(kept, dim=1)
+
+    def _generate_chunked(self, prompt, max_returned_tokens, temperature, top_k, top_p):
+        """litgpt's generate for a prompt prefilled in chunks (_forward): the same tokens, the prompt included and
+        the last token (eos or the length limit) not forwarded."""
+        from litgpt.generate.base import sample
+
+        eos, out = self.tokenizer.eos_id, [prompt]
+        logits, pos = self._forward(prompt, 0, prompt.numel() - 1), int(prompt.numel())
+        for step in range(max_returned_tokens - pos):
+            if step:
+                logits = self.model(token.view(1, 1), input_pos=torch.tensor([pos], device=self._device),
+                                    input_pos_maxp1=pos + 1, lm_head_start=0)
+                pos += 1
+            token = sample(logits, temperature=temperature, top_k=top_k, top_p=top_p).to(dtype=torch.int64)
+            out.append(token.view(-1))
+            if eos is not None and int(token) == eos:
+                break
+        return torch.cat(out)
+
     def _score_tokens(
         self, ctx_enc: list[int], cont_enc: list[int], *, request_type: str = "loglikelihood"
     ) -> tuple[float, bool]:
@@ -1364,7 +1408,8 @@ class LogKVLM(LM):
                 # lm_head_start: materialize logits only for the scoring span
                 # [ctx_len-1, seq_len) — full-sequence logits at 32K are ~10 GB
                 # bf16, the sliced tensor is (cont_len + 1) x vocab.
-                logits = self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
+                logits = self._forward(inps[0], 0, ctx_len - 1) if self._prefill_chunk() \
+                    else self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
                 t1 = time.perf_counter()
                 self.compression_metrics.append({
                     "request_type": request_type, "rank": _global_rank(),
@@ -1478,8 +1523,7 @@ class LogKVLM(LM):
                     answer = []
                     for _ in range(max_new_tokens):
                         T = pending.numel()
-                        logits = self.model(pending[None], input_pos=torch.arange(pos, pos + T, device=self._device),
-                                            input_pos_maxp1=pos + T, lm_head_start=T - 1)
+                        logits = self._forward(pending, pos, T - 1)
                         pos += T
                         token = int(logits[0, -1].argmax())
                         answer.append(token)
@@ -1549,15 +1593,18 @@ class LogKVLM(LM):
                     self._set_gamma_query(prompt_tensor)
                 try:
                     t0 = time.perf_counter()
-                    out = litgpt_generate(
-                        self.model,
-                        prompt_tensor,
-                        max_returned_tokens=total_max_len,
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p,
-                        eos_id=self.tokenizer.eos_id,
-                    )
+                    if prompt_len > (self._prefill_chunk() or prompt_len):  # a long prompt: prefill in chunks
+                        out = self._generate_chunked(prompt_tensor, total_max_len, temperature, top_k, top_p)
+                    else:
+                        out = litgpt_generate(
+                            self.model,
+                            prompt_tensor,
+                            max_returned_tokens=total_max_len,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            eos_id=self.tokenizer.eos_id,
+                        )
                     t1 = time.perf_counter()
                     # The last output token has not been forwarded into the cache.
                     self.compression_metrics.append({

@@ -32,10 +32,11 @@ class Tokenizer:
 def wrapper_class():
     cls = next(node for node in ast.parse((ROOT / "eval.py").read_text()).body
                if isinstance(node, ast.ClassDef) and node.name == "LogKVLM")
-    names = {"_generate_turns", "generate_until", "_reset_eval_cache", "_warn_truncation"}
+    names = {"_generate_turns", "generate_until", "_reset_eval_cache", "_warn_truncation", "_prefill_chunk", "_forward",
+             "_generate_chunked"}
     cls.bases, cls.decorator_list = [], []
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    scope = dict(torch=torch, time=time, cache_compression_snapshot=cache_compression_snapshot,
+    scope = dict(os=__import__("os"), torch=torch, time=time, cache_compression_snapshot=cache_compression_snapshot,
                  _eval_progress=lambda items, desc: items, _eval_verbose=lambda: False, _global_rank=lambda: 0,
                  _world_size=lambda: 1, _rank_label=lambda: "CPU",
                  _request_sample_id=lambda req, **kwargs: kwargs["global_request_index"])
@@ -112,6 +113,16 @@ def test_turns_run_on_a_compressing_cache_and_keep_the_context_query_free(wrappe
     assert len(result.split(SEP)) == 2 and calls == [[None]]  # no question is known when the context is cached
     record, = lm.compression_metrics
     assert 0 < record["kv_retention_ratio"] < 1  # the context was compressed before the questions came
+
+
+def test_a_long_context_is_cached_in_chunks_with_the_same_answers(wrapper_class, monkeypatch):
+    answers = []
+    for chunk in ("0", "4"):
+        monkeypatch.setenv("LOGKV_EVAL_PREFILL_CHUNK", chunk)
+        lm, _ = make_lm(wrapper_class, "logkv", recent_size=8)
+        prompt = SEP.join([" ".join(str(t % 30 + 2) for t in range(29)), "13 14", "15 16"])
+        answers += lm.generate_until([SimpleNamespace(args=(prompt, {"max_gen_toks": 3, "turn_separator": SEP}))])
+    assert answers[0] == answers[1]
 
 
 def test_a_context_longer_than_the_window_loses_its_start(wrapper_class):
