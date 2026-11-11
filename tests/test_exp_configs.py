@@ -309,13 +309,14 @@ def test_long_context_evaluations_change_only_the_length_settings(length, tokens
     # The base model's dense run keeps its results apart from its 32K ones.
     assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
         "eval_max_seq_lengths", "niah_benchmark", "benchmark", "limit", "config_overrides", "long_ppl_data",
-        "long_ppl_books", *(("output_path",) if name == "dense" else ())}
+        "long_ppl_books", "infinitebench_dir", *(("output_path",) if name == "dense" else ())}
     assert evaluated["eval_max_seq_lengths"] == [tokens]
     assert evaluated["benchmark"].split(",")[:2] == [f"babilong_{length}", "long_ppl_32k" if length == "64k" else
                                                      f"long_ppl_{length}"]
-    # The book curve, several questions on one cache, and LongBench v2, all under the configuration's length.
-    assert evaluated["benchmark"].split(",")[-3:] == [f"long_ppl_books_{length}", f"niah_turns_{length}",
-                                                      f"longbench2_{length}"]
+    # The book curve, several questions on one cache, LongBench v2 and InfiniteBench, all under the
+    # configuration's length.
+    assert evaluated["benchmark"].split(",")[-4:] == [f"long_ppl_books_{length}", f"niah_turns_{length}",
+                                                      f"longbench2_{length}", f"infinitebench_{length}"]
     # All of RULER; at 256K but SQuAD, whose 1204 dev paragraphs (about 220K tokens) cannot fill the context.
     assert "ruler_qa_hotpot" in evaluated["niah_benchmark"] and len(evaluated["niah_benchmark"]) == (
         12 if length == "256k" else 13)
@@ -331,7 +332,7 @@ def test_one_yaml_per_method_covers_every_length(name):
     (eval.sh computes each pass's window, YaRN and tasks: long_eval_plan.py)."""
     evaluated, base = effective(f"eval_long_{name}.yaml"), effective(LONG[name])
     assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
-        "eval_lengths", "limit", "long_ppl_data", "long_ppl_books"}
+        "eval_lengths", "limit", "long_ppl_data", "long_ppl_books", "infinitebench_dir"}
     assert evaluated["eval_lengths"] == ["32k", "64k", "128k", "256k"] and evaluated["limit"] == 100
     assert "config_overrides" not in evaluated
     if name == "dense":  # passes write to its long<L> folders, where the per-length dense runs wrote

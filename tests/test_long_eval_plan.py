@@ -29,9 +29,10 @@ def test_per_length_passes_take_the_factor_their_length_needs():
     assert [p["ruler_lengths"] for p in passes] == [[32768], [65536], [131072], [262144]]
     assert len(passes[2]["niah"]) == 13 and len(passes[3]["niah"]) == 12 and "ruler_qa_squad" not in passes[3]["niah"]
     assert passes[1]["main"] == ["babilong_64k", "long_ppl_64k", "long_ppl_books_64k", "niah_turns_64k",
-                                 "longbench2_64k"]
-    # Default suites: data may be missing (LongBench v2's files may not be whole).
-    assert passes[1]["optional"] == ["long_ppl_64k", "long_ppl_books_64k", "longbench2_64k"]
+                                 "longbench2_64k", "infinitebench_64k"]
+    # Default suites: data may be missing (LongBench v2's or InfiniteBench's files may not be whole).
+    assert passes[1]["optional"] == ["long_ppl_64k", "long_ppl_books_64k", "longbench2_64k", "infinitebench_64k"]
+    assert "infinitebench_32k" not in passes[0]["main"]  # InfiniteBench from 64K on
 
 
 def test_fixed_passes_share_the_longest_lengths_factor():
@@ -93,7 +94,8 @@ def test_the_launcher_runs_one_pass_per_length(tmp_path):
     assert [o.get("rope_adjustments", {}).get("factor") for o in overrides] == [None, 2., 4., 8.]
     assert all(o["n_layer"] == 28 for o in overrides)
     assert all("--config_overrides" not in p[6] and "--limit 100" in p[6] for p in passes)  # only the pass's own
-    assert passes[3][2] == "babilong_256k,long_ppl_256k,long_ppl_books_256k,niah_turns_256k,longbench2_256k"
+    assert passes[3][2] == ("babilong_256k,long_ppl_256k,long_ppl_books_256k,niah_turns_256k,longbench2_256k,"
+                            "infinitebench_256k")
     assert "ruler_qa_squad" not in passes[3][3] and passes[3][4] == "[262144]"
     assert passes[0][5] == "long_ppl_32k,long_ppl_books_32k,longbench2_32k"
 
@@ -166,7 +168,8 @@ def test_majob_runs_the_long_passes_after_training(tmp_path):
     # stage the eight needles at 32768).
     assert calls[0]["--benchmark"] == "babilong_32k,long_ppl_32k,longbench2_32k"
     assert calls[1]["--benchmark"] == "ruler_vt,ruler_cwe,ruler_fwe,ruler_qa_squad,ruler_qa_hotpot"
-    assert calls[2]["--benchmark"] == "babilong_64k,long_ppl_64k,long_ppl_books_64k,niah_turns_64k,longbench2_64k"
+    assert calls[2]["--benchmark"] == ("babilong_64k,long_ppl_64k,long_ppl_books_64k,niah_turns_64k,longbench2_64k,"
+                                       "infinitebench_64k")
     assert len(calls[7]["--benchmark"].split(",")) == 12 and "ruler_qa_squad" not in calls[7]["--benchmark"]
     overrides = [json.loads(c["--config_overrides"]) for c in calls[::2]]
     assert [o["block_size"] for o in overrides] == [33792, 66560, 132096, 263168]

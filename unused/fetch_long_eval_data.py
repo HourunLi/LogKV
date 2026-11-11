@@ -9,6 +9,8 @@ switches off for itself only, then:
     RULER QA      SQuAD v2 dev and HotpotQA dev (distractor) JSON, into RULER_CACHE_DIR, where
                   litgpt/ruler_patch.py looks first
     LongBench v2  recursal/longbench-v2, every subset lm-eval's longbench2 tasks load (--longbench2)
+    InfiniteBench xinrongzhang2022/InfiniteBench, the jsonl files of the ten tasks eval_tasks/infinitebench reads
+                  (--infinitebench; into the hub cache, where they are read without INFINITEBENCH_DIR)
     long_ppl      --ppl-data: finds the documents of at least 131072 tokens (32K-128K) and of at least
                   262144 (256K) with --tokenizer and caches both selections the long_ppl tasks use, so
                   eval ranks do not tokenize them again (no 256K document only stops long_ppl_256k);
@@ -46,6 +48,7 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 
 import argparse  # noqa: E402
+import importlib.util  # noqa: E402
 import json  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
@@ -196,10 +199,12 @@ def flattened_link(path: Path) -> str | None:
     return text if "/blobs/" in text and "\n" not in text else None
 
 
-def refetch(repo: str, name: str, root: str) -> tuple[Path, str]:
+def refetch(repo: str, name: str, root: str, whole=None) -> tuple[Path, str]:
     """Make the snapshot file ``name`` whole again; returns its path and what was done. hf_hub_download leaves a
     snapshot file that exists as it is, even with force_download (it only refreshes the blob), so a bad one is
-    removed first; a flattened link whose blob is whole is linked again (copied, where links do not work)."""
+    removed first; a flattened link whose blob is whole (``whole``, default a whole parquet file) is linked again
+    (copied, where links do not work)."""
+    whole = whole or is_parquet
     from huggingface_hub import hf_hub_download
 
     pointer = Path(root) / name
@@ -207,7 +212,7 @@ def refetch(repo: str, name: str, root: str) -> tuple[Path, str]:
     if text is not None:
         blob = Path(os.path.normpath(pointer.parent / text))
         pointer.unlink()
-        if is_parquet(blob):
+        if whole(blob):
             try:
                 os.symlink(text, pointer)
                 return pointer, f"a link to blobs/{blob.name} flattened into a file; linked again"
@@ -250,6 +255,49 @@ def fetch_ppl_hub(repo: str, lines: list[str]) -> str:
         raise ValueError(f"some {repo} files are still not parquet after a fresh download (above)")
     lines.append(f"  for eval.sh: export LONG_PPL_DATA={root}")
     return root
+
+
+def jsonl_rows(path: Path) -> int | None:
+    """The rows of a whole jsonl file (its first and last lines parse), or None."""
+    try:
+        first, last, rows = None, None, 0
+        with open(path, "rb") as f:
+            for line in f:
+                if line.strip():
+                    first, last, rows = first or line, line, rows + 1
+        json.loads(first)
+        json.loads(last)
+        return rows
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def fetch_infinitebench(lines: list[str]) -> bool:
+    """InfiniteBench's ten jsonl files into the hub cache (eval_tasks/infinitebench reads them there offline);
+    a file that is not whole jsonl (a cut download, a flattened link) is fetched again."""
+    from huggingface_hub import hf_hub_download
+
+    spec = importlib.util.spec_from_file_location(
+        "infinitebench_utils", ROOT / "eval_tasks" / "infinitebench" / "infinitebench_utils.py")
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+    ok = True
+    for task in utils.TASKS:
+        name = f"{task}.jsonl"
+        try:
+            path = Path(hf_hub_download(utils.REPO, name, repo_type="dataset"))
+            if jsonl_rows(path) is None:
+                before = describe(path)
+                path, done = refetch(utils.REPO, name, str(path.parent), whole=lambda p: jsonl_rows(p) is not None)
+                lines.append(f"InfiniteBench {name}: was {before}; {done}")
+            rows = jsonl_rows(path)
+            ok = ok and rows is not None
+            lines.append(f"InfiniteBench {name}: " + (f"{rows} samples, {path.stat().st_size / 1e6:.0f} MB"
+                                                      if rows else f"NOT whole jsonl ({describe(path)})"))
+        except Exception as error:  # noqa: BLE001
+            ok = False
+            lines.append(f"InfiniteBench {name}: FAILED {type(error).__name__}: {str(error)[:1500]}")
+    return ok
 
 
 def check_offline(loads, lines: list[str]) -> bool:
@@ -391,6 +439,7 @@ def ppl_data_stats(data: str, tokenizer: str, utils, lines: list[str], files: in
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--longbench2", action="store_true", help="also fetch LongBench v2 (every subset)")
+    p.add_argument("--infinitebench", action="store_true", help="also fetch InfiniteBench (ten tasks, jsonl)")
     p.add_argument("--no-babilong", action="store_true")
     p.add_argument("--no-ruler-qa", action="store_true")
     p.add_argument("--ppl-data", default=None, help="held-out ProLong parquet / jsonl file or directory")
@@ -423,6 +472,8 @@ def main():
     ok = ok and fetched
     if loads:
         ok = check_offline(loads, lines) and ok
+    if args.infinitebench:
+        ok = fetch_infinitebench(lines) and ok
     if args.ppl_hub:
         try:
             args.ppl_data = fetch_ppl_hub(args.ppl_hub, lines)
