@@ -178,3 +178,24 @@ def test_the_main_stage_hands_infinitebench_the_tokenizer(launcher):
         done = subprocess.run(["bash", "-c", f'META=m\nBENCHMARKS={tasks}\n{block}\necho "${{MAIN_METADATA_ARGS[0]:-}}"'],
                               capture_output=True, text=True)
         assert done.stdout.strip() == expected, done.stderr
+
+
+def test_a_named_task_without_its_files_fails_before_the_evaluation(tmp_path, monkeypatch, ib):
+    scope = _eval_functions("_check_task_data", "_infinitebench_files_problem")
+    monkeypatch.setenv("INFINITEBENCH_DIR", str(tmp_path))
+    with pytest.raises(FileNotFoundError, match="fetch_long_eval_data.py --infinitebench"):
+        scope["_check_task_data"](["piqa", "infinitebench_64k"])
+    scope["_check_task_data"](["piqa"])  # no InfiniteBench task: nothing to check
+    with pytest.raises(FileNotFoundError, match="must hold the ten jsonl files"):
+        ib.data_file("passkey")
+    _write_data(tmp_path)
+    scope["_check_task_data"](["infinitebench_64k"])
+    monkeypatch.delenv("INFINITEBENCH_DIR")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    import huggingface_hub
+
+    def offline(*args, **kwargs):
+        raise huggingface_hub.errors.LocalEntryNotFoundError("not cached")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", offline)
+    with pytest.raises(FileNotFoundError, match="is not in the hub cache .*fetch_long_eval_data.py .*--infinitebench"):
+        ib.data_file("math_find")

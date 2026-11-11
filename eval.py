@@ -532,6 +532,15 @@ def _infinitebench_files_problem():
     return None
 
 
+def _check_task_data(tasks):
+    """A task asked for by name whose data is not on disk fails here, with what to run, instead of in every rank's
+    dataset loading (InfiniteBench reads its jsonl files offline from INFINITEBENCH_DIR or the hub cache)."""
+    if any(t.strip().startswith("infinitebench_") for t in tasks):
+        problem = _infinitebench_files_problem()
+        if problem:
+            raise FileNotFoundError(problem)
+
+
 def _drop_empty_lengths(results):
     """Remove RULER's per-length metrics that had no sample (value -1).
 
@@ -2186,6 +2195,7 @@ def main(
         if benchmark != "debug":
             benchmark = ",".join(_skip_optional_tasks(benchmark.split(","), lm_model.max_length))
             _check_task_lengths(benchmark.split(","), lm_model.max_length)
+            _check_task_data(benchmark.split(","))
 
         with (
             _harness_logging(),
