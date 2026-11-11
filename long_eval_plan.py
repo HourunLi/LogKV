@@ -16,7 +16,7 @@ from a per_length one only in the factor.
 EVAL_SUITES chooses the tasks (default all): ruler (NIAH stage: all of RULER, 12 tasks at 256K without
 ruler_qa_squad, whose 1204 SQuAD paragraphs cannot fill it), babilong, ppl (long_ppl_<L>, LONG_PPL_DATA), books
 (long_ppl_books_<L>, LONG_PPL_BOOKS), turns (niah_turns_<L>), longbench2 (longbench2_<L>) and infinitebench
-(infinitebench_<L>, 64K / 128K / 256K only; INFINITEBENCH_DIR or the hub cache). NIAH_ONLY=1 keeps ruler only. With
+(infinitebench_<L>; INFINITEBENCH_DIR, <HF_HOME>/infinitebench or the hub cache). NIAH_ONLY=1 keeps ruler only. With
 the default suites the data-bound ones (ppl, books, longbench2, infinitebench) are optional: eval.py leaves them
 out, with the reason, when their data is not given (or their files are not whole); named suites must run.
 
@@ -41,7 +41,6 @@ MARGIN = 1024
 RULER = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
          "niah_multivalue", "niah_multiquery", "ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
 SQUAD_MAX = 131072  # SQuAD's document pool cannot fill longer contexts
-INFINITEBENCH_LENGTHS = ("64k", "128k", "256k")  # its contexts are about 100K-200K tokens: not at 32K
 
 
 def parse_list(text: str, allowed, what: str) -> list[str]:
@@ -59,7 +58,7 @@ def tasks(suite: str, name: str) -> list[str]:
         "books": [f"long_ppl_books_{name}"],
         "turns": [f"niah_turns_{name}"],
         "longbench2": [f"longbench2_{name}"],
-        "infinitebench": [f"infinitebench_{name}"] if name in INFINITEBENCH_LENGTHS else [],
+        "infinitebench": [f"infinitebench_{name}"],
     }[suite]
 
 
