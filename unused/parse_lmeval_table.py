@@ -441,6 +441,12 @@ BOOK_POINTS = {n: [f"{2 ** k}k" for k in range(3, 9) if 2 ** k <= int(n[:-1])] f
 INFINITEBENCH = ["passkey", "number_string", "kv_retrieval", "longbook_sum_eng", "longbook_qa_eng", "longbook_choice_eng",
                  "longbook_qa_chn", "longdialogue_qa_eng", "code_debug", "math_find"]
 INFINITEBENCH_LENGTHS = BLOCK_LENGTHS
+# LongBench v2 的 20 个子任务（lm-eval 的 longbench2_*，各长度的组 longbench2_<长度> 都是这 20 个，日志里子任务名不带长度，
+# 按它所在的组记到该长度），LongBench2_<长度> 是组的总分（按题数加权，即全部题目的正确率，lm-eval 报告的那个）。
+LONGBENCH2_SUBTASKS = ["academic_multi", "academic_single", "agent_history", "code", "detective", "dialogue_history",
+                       "event_order", "fin_multi", "fin_single", "govt_multi", "govt_single", "graph", "legal_multi",
+                       "legal_single", "lit_single", "many_shot", "news_multi", "table", "translate", "user_guide"]
+LONGBENCH2_GROUP = re.compile(r"longbench2_(32k|64k|128k|256k)")
 # 每个长度实际跑的 RULER 任务：256K 没有 ruler_qa_squad（SQuAD 的文档池填不满 256K）。
 RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] for n in BLOCK_LENGTHS}
 
@@ -449,7 +455,8 @@ RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] f
 # 每组的平均紧跟在它平均的任务之后。只列评测会产出结果的列，各块的顺序相同：
 #   RULER 单针 niah_single_1-3、AVG_NIAH；多针 niah_multikey_1-3、niah_multivalue、niah_multiquery、AVG_NIAH_multi；
 #   其余 ruler_vt、ruler_cwe、ruler_fwe、ruler_qa_squad（256K 没有）、ruler_qa_hotpot、AVG_RULER（该长度全部 RULER 任务的
-#   平均：13 个，256K 为 12 个）；BABILong qa1-qa5、AVG_babilong；LongBench v2（longbench2_<长度>）；
+#   平均：13 个，256K 为 12 个）；BABILong qa1-qa5、AVG_babilong；
+#   LongBench v2 的 20 个子任务 longbench2_<子任务>_<长度>、LongBench2_<长度>（组的总分，按题数加权）；
 #   同一份缓存上逐轮问 niah_turns_<长度>_turn1-4、niah_turns_<长度>（四轮平均）；
 #   书的困惑度曲线 long_ppl_books_<长度>_<截断长度>（截断长度 8k 起到该长度，同一批书，越低越好），之后是同长度的
 #   long_ppl_<长度>（PG19 测试集文档末尾的困惑度，越低越好）；
@@ -464,7 +471,7 @@ def _length_block(n):
     columns += [f"{t}_{n}" for t in multi] + [f"AVG_NIAH_multi_{n}"]  # the multi-needle tasks
     columns += [f"{t}_{n}" for t in rest] + [f"AVG_RULER_{n}"]  # the rest; AVG_RULER: all of RULER at n
     columns += [f"babilong_qa{i}_{n}" for i in range(1, 6)] + [f"AVG_babilong_{n}"]
-    columns += [f"LongBench2_{n}"]
+    columns += [f"longbench2_{t}_{n}" for t in LONGBENCH2_SUBTASKS] + [f"LongBench2_{n}"]  # the group's total last
     columns += [f"niah_turns_{n}_turn{i}" for i in range(1, 5)] + [f"niah_turns_{n}"]  # niah_turns: the four turns' mean
     columns += [f"long_ppl_books_{n}_{q}" for q in BOOK_POINTS[n]] + [f"long_ppl_{n}"]
     if n in INFINITEBENCH_LENGTHS:
@@ -580,11 +587,24 @@ def parse_single_model(model_name, markdown_text):
 
     df['Tasks'] = df['Tasks'].replace('', np.nan).ffill()
     row_data = {"Model": model_name}
+    longbench2_length = None  # the length of the longbench2_<length> group whose subtasks follow
 
     for _, row in df.iterrows():
-        raw_task = re.sub(r"^-\s*", "", str(row['Tasks']))  # a group's subtasks are listed as " - name"
+        listed = str(row['Tasks'])
+        raw_task = re.sub(r"^-\s*", "", listed)  # a group's subtasks are listed as " - name"
         metric = row['Metric']
         value = row['Value']
+        if not listed.startswith("-"):
+            group = LONGBENCH2_GROUP.fullmatch(raw_task)
+            longbench2_length = group.group(1) if group else None
+        elif longbench2_length and raw_task.startswith("longbench2_") and metric == "acc":
+            # LongBench v2's subtasks carry no length: they belong to the group above them.
+            if raw_task[len("longbench2_"):] in LONGBENCH2_SUBTASKS:
+                try:
+                    row_data[f"{raw_task}_{longbench2_length}"] = float(value)
+                except ValueError:
+                    pass
+            continue
 
         target_task = RAW_TO_TARGET_MAP.get(raw_task, raw_task)
         expected_metric = TARGET_METRIC_MAP.get(target_task)

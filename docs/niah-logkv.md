@@ -377,14 +377,16 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
 - 汇总表（`unused/parse_lmeval_table.py`）：把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
   日志里 eval.py 打印的结果表会被挑出来（行首前缀会去掉），同一模型的几份日志（如 32K、128K、256K 各一份）接着贴进
   同一个字符串，合成一行。表头按长度分块：前 89 列是 32K 主线（常识、综合、LongBench v1/E、32K 捞针），之后 32K、64K、128K、
-  256K 各一块（论文里 32K-256K 可单独成表），各块顺序相同、只列该长度的评测会产出结果的列（32K 43 列，64K 44 列，128K 与
-  256K 各 45 列），块内按任务分组、每组的平均紧跟在它的任务之后：单针 `niah_single_1-3_<长度>`、`AVG_NIAH_<长度>`；多针 5 个、
+  256K 各一块（论文里 32K-256K 可单独成表），各块顺序相同、只列该长度的评测会产出结果的列（32K 63 列，64K 64 列，128K 与
+  256K 各 65 列），块内按任务分组、每组的平均紧跟在它的任务之后：单针 `niah_single_1-3_<长度>`、`AVG_NIAH_<长度>`；多针 5 个、
   `AVG_NIAH_multi_<长度>`；其余 RULER 任务、`AVG_RULER_<长度>`（该长度全部 RULER 任务的平均；256K 没有 `ruler_qa_squad`，为
-  12 个）；`babilong_qa1-5_<长度>`、`AVG_babilong_<长度>`；`LongBench2_<长度>`；`niah_turns_<长度>_turn1-4`、
+  12 个）；`babilong_qa1-5_<长度>`、`AVG_babilong_<长度>`；LongBench v2 的 20 个子任务
+  `longbench2_<子任务>_<长度>`（日志里子任务名不带长度，按它上面的组 `longbench2_<长度>` 记到该长度）、`LongBench2_<长度>`（组的总分，
+  按题数加权，即全部题目的正确率）；`niah_turns_<长度>_turn1-4`、
   `niah_turns_<长度>`（四轮平均）；书的困惑度曲线 `long_ppl_books_<长度>_<8k…该长度>`，之后是 `long_ppl_<长度>`（越低越好）；
   InfiniteBench 十个任务 `infinitebench_<任务>_<长度>`、`AVG_InfiniteBench_<长度>`。32K 块的捞针列与主线的
   `niah_single_1` 等是同一份结果，重复列出。这些列都不计入 `AVG_all`；不带长度的 `longbench2` 结果（上下文预算不明）不进表。
-  新列加在它所测长度的块里、所属任务组的平均之前；`tests/parse_lmeval_table_columns.txt` 记着表头（共 267 列），
+  新列加在它所测长度的块里、所属任务组的平均之前；`tests/parse_lmeval_table_columns.txt` 记着表头（共 347 列），
   测试检查各块顺序一致、各长度的列连在一起、每个平均紧跟在它的任务之后、每个平均及其任务都在表头里。按位置对齐的旧表格把日志
   重新贴进来再跑一遍即可得到新顺序。
 
