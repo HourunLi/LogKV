@@ -171,6 +171,11 @@ def test_words_are_lexical_and_found_from_the_token_texts():
     assert starts("](", "https", "://", "sep", ".", "sep") == [1, 1, 1, 1, 1, 1]  # a URL is several words
     assert starts("\n", "The", "don", "'t", "_x", "中", "中", "") == [1, 1, 0, 0, 0, 1, 1, 1]
     assert word_starts([tok["3"], tok["."], tok["5"]], classes, positions=[1]).tolist() == [False]
+    # An id past the texts (an added special token such as Qwen's <|im_start|>, which LongBench v2's documents
+    # contain) has no text: it begins a word and joins none.
+    special = len(texts) + 1
+    assert word_starts([tok["The"], special, tok["-om"], tok["ission"], special], classes).tolist() == [
+        True, True, True, False, True]
     model = _model()
     texts = [" w" if i % 3 == 0 else "x" for i in range(41)]  # every third id begins a word
     with pytest.raises(RuntimeError, match="token texts"):

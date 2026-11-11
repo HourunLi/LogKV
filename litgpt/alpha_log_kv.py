@@ -634,14 +634,20 @@ def word_starts(ids, classes, positions=None) -> np.ndarray:
     ids = np.asarray(ids, dtype=np.int64)
     n = len(ids)
     pos = np.arange(n) if positions is None else np.asarray(positions, dtype=np.int64)
-    first = classes[ids[pos], 0]
+
+    def cls(token_ids, column):
+        # A token past the table (an added special token such as <|im_start|>, which documents can contain) has
+        # no text of its own: EMPTY, so it never joins a word.
+        inside = token_ids < len(classes)
+        return np.where(inside, classes[np.where(inside, token_ids, 0), column], EMPTY)
+    first = cls(ids[pos], 0)
     has_prev, has_next = pos >= 1, pos + 1 < n
     prev = ids[np.maximum(pos - 1, 0)]
-    last = np.where(has_prev, classes[prev, 1], EMPTY)
-    before_last = np.where(has_prev, classes[prev, 2], EMPTY)
-    before_last = np.where(before_last == EMPTY, np.where(pos >= 2, classes[ids[np.maximum(pos - 2, 0)], 1], EMPTY),
+    last = np.where(has_prev, cls(prev, 1), EMPTY)
+    before_last = np.where(has_prev, cls(prev, 2), EMPTY)
+    before_last = np.where(before_last == EMPTY, np.where(pos >= 2, cls(ids[np.maximum(pos - 2, 0)], 1), EMPTY),
                            before_last)
-    following = np.where(has_next, classes[ids[np.minimum(pos + 1, n - 1)], 0], EMPTY)
+    following = np.where(has_next, cls(ids[np.minimum(pos + 1, n - 1)], 0), EMPTY)
     word = (first == DIGIT) | (first == LETTER)
     join = ((word & np.isin(last, (DIGIT, LETTER, JOINER)))
             | ((first == JOINER) & np.isin(last, (DIGIT, LETTER)))

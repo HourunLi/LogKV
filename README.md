@@ -72,6 +72,13 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 只训练需像上面一样将两个 benchmark 环境变量都设为 `none`。之后单独评测捞针可用
 `NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/cpt_dense.yaml`，默认全部 20 个任务。
 
+全量评测（32K 主线，再 32K / 64K / 128K / 256K 逐档的长文本评测，主线测过的不重测；任务清单与数据见
+[NIAH 文档](docs/niah-logkv.md)的“全量评测”）：
+
+```bash
+bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
+```
+
 训练完成后只跑捞针评测（默认全部 20 个 NIAH 任务；`majob.sh` 遇到已完成的 checkpoint 会跳过训练）：
 
 ```bash

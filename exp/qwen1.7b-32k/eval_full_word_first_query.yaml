@@ -1,0 +1,19 @@
+# 全量评测（只评测、不重训）：LogKV P=1024 + 惊异度准入 word_first + 查询感知 cue（与 word_first 只差 query）。一条命令跑完论文用到的全部评测：
+# 1. 32K 主线（不限条数，结果写到 output_path）：主阶段为常识推理、综合（MMLU、C-Eval、IFEval、TruthfulQA）、
+#    LongBench v1 与 LongBench-E，以及原生 32K 的逐轮问 niah_turns_32k 与书的困惑度曲线 long_ppl_books_32k；
+#    NIAH 阶段在 1K-32K 跑 RULER 单针与多针、cue 边界变体（qend / preamble / paraphrase）与词值针（*_words）。
+# 2. 按长度逐档的长文本评测（eval_long_word_first_query.yaml 的内容，每个任务 long_limit 条，写到 output_path 下的 long<L>）：
+#    32K / 64K / 128K / 256K 各一档，窗口为长度 + 1024，YaRN 按长度取倍数（32K 不用）；每档 RULER（256K 为 12 个）、
+#    BABILong、LongBench v2、niah_turns、书的困惑度曲线、long_ppl、InfiniteBench。主线已测过的（32K 的逐轮问与书的曲线、
+#    32768 上的 8 个捞针任务）不再重测。
+# 数据：LONG_PPL_DATA、LONG_PPL_BOOKS（或下面的键）、BABILong / LongBench v2 / InfiniteBench 的缓存
+# （unused/fetch_long_eval_data.py 下载，unused/check_long_eval_data.py 核对）；默认清单里缺数据的任务打印原因后跳过。
+# 外部变量：LIMIT=2（每个任务 2 条，先在单卡上试跑）、EVAL_LENGTHS=none（只跑主线）、EVAL_MAIN=0（只跑各长度）、
+# EVAL_LENGTHS / EVAL_SUITES / NIAH_ONLY / YARN_MODE（同 eval_long_*.yaml）。
+#   bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query.yaml
+config: eval_long_word_first_query.yaml
+eval_main: true
+benchmark: null        # 主线用 eval.sh 的默认清单（全量），不用基础配置里的 benchmark
+niah_benchmark: null
+limit: null            # 主线不限条数
+long_limit: 100        # 各长度每个任务 100 条
