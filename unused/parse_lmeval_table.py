@@ -440,37 +440,34 @@ RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] f
 BABILONG_LENGTHS = ("32k", "64k", "128k", "256k")
 PPL_LENGTHS = ("32k", "64k", "128k", "256k")
 # LongBench v2 的上下文预算来自 block_size：按长度命名的组（eval_tasks/longbench2_long）才能分列。
-LONGBENCH2_LENGTHS = ("64k", "128k", "256k", "32k")  # 32k came last (eval_long_*.yaml's 32K pass)
+LONGBENCH2_LENGTHS = ("32k", "64k", "128k", "256k")
 
 
 
-def _long_columns(ruler_lengths, babilong_lengths, ppl_lengths):
-    columns = []
-    for _length in ruler_lengths:
-        columns += [f"{t}@{_length}" for t in RULER_AT[_length]] + [
-            f"AVG_NIAH@{_length}", f"AVG_NIAH_multi@{_length}", f"AVG_RULER@{_length}"]
-    for _length in babilong_lengths:
-        columns += [f"babilong_qa{i}_{_length}" for i in range(1, 6)] + [f"AVG_babilong_{_length}"]
-    return columns + [f"long_ppl_{n}" for n in ppl_lengths]
-
-
-# 表头顺序只能往后加，不能改动已有列的位置（已有的表格按位置对齐）；tests/parse_lmeval_table_columns.txt 记着输出的表头，
-# 测试检查它仍是输出的前缀，新列加在这里的末尾，并把它们追加到那个文件。
-# 64K / 128K 的长文本列（以及 LongBench2）：
-ORDERED_COLUMNS += _long_columns(("64k", "128k"), ("32k", "64k", "128k"), ("32k", "64k", "128k")) + ["LongBench2"]
-# 后加：256K（RULER 12 个任务、BABILong、困惑度），按长度命名的 LongBench v2。
-ORDERED_COLUMNS += _long_columns(("256k",), ("256k",), ("256k",)) + [f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS[:3]]
-# 后加：同一份缓存上逐轮问（eval_tasks/niah_turns：niah_turns_<长度> 为四轮平均，@turnN 为第 N 轮），
-# 书的困惑度曲线（eval_tasks/long_ppl：long_ppl_books_<配置长度>@<截断长度>，同一批书，越低越好）。
+# 长文本列按长度分块：上面 32K 主线之后是 32K、64K、128K、256K 各一块，每块依次是 RULER（及其平均）、BABILong、
+# long_ppl、LongBench v2、同一份缓存上逐轮问（niah_turns_<长度> 为四轮平均，@turnN 为第 N 轮）、书的困惑度曲线
+# （long_ppl_books_<配置长度>@<截断长度>，同一批书，越低越好）。32K 主线已有 8 个捞针任务的 32K 列，所以 32K 块的
+# RULER 只有其余 5 个任务（与 13 个的平均）；不带长度的 LongBench2（旧结果）放在 32K 块。新列加在所属长度块的末尾，
+# 并更新 tests/parse_lmeval_table_columns.txt（测试检查各长度的列连在一起）。
+RULER_32K_EXTRA = ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
 TURN_LENGTHS = ("32k", "64k", "128k", "256k")
 TURN_TASKS = [f"niah_turns_{n}" for n in TURN_LENGTHS]
 BOOK_POINTS = {n: [f"{2 ** k}k" for k in range(3, 9) if 2 ** k <= int(n[:-1])] for n in ("32k", "64k", "128k", "256k")}
-ORDERED_COLUMNS += [c for t in TURN_TASKS for c in [t] + [f"{t}@turn{i}" for i in range(1, 5)]]
-ORDERED_COLUMNS += [f"long_ppl_books_{n}@{q}" for n, points in BOOK_POINTS.items() for q in points]
-# 后加：多长度评测（eval_long_*.yaml）的 32K 档。8 个捞针任务的 32K 写进上面 32K 主线的同名列（同为 32K、不用 YaRN），
-# 这里是其余 5 个 RULER 任务、13 个的平均与 LongBench v2。
-RULER_32K_EXTRA = ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
-ORDERED_COLUMNS += [f"{t}@32k" for t in RULER_32K_EXTRA] + ["AVG_RULER@32k", "LongBench2@32k"]
+
+
+def _length_block(n):
+    if n == "32k":
+        columns = [f"{t}@32k" for t in RULER_32K_EXTRA] + ["AVG_RULER@32k"]
+    else:
+        columns = [f"{t}@{n}" for t in RULER_AT[n]] + [f"AVG_NIAH@{n}", f"AVG_NIAH_multi@{n}", f"AVG_RULER@{n}"]
+    columns += [f"babilong_qa{i}_{n}" for i in range(1, 6)] + [f"AVG_babilong_{n}", f"long_ppl_{n}"]
+    columns += (["LongBench2"] if n == "32k" else []) + [f"LongBench2@{n}"]
+    columns += [f"niah_turns_{n}"] + [f"niah_turns_{n}@turn{i}" for i in range(1, 5)]
+    return columns + [f"long_ppl_books_{n}@{q}" for q in BOOK_POINTS[n]]
+
+
+for _length in ("32k", "64k", "128k", "256k"):
+    ORDERED_COLUMNS += _length_block(_length)
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
