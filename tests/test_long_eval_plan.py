@@ -58,28 +58,35 @@ def test_suites_and_niah_only_narrow_the_tasks():
 
 
 def _launcher(tmp_path, config, env=None, args=()):
-    """eval.sh's config reading, pass plan and pass loop, with run_stages printing what each pass gets."""
+    """eval.sh's config reading, task lists, pass plan and stage loop, with run_stages printing what each run gets."""
     source = (ROOT / "eval.sh").read_text()
 
     def between(start, end_marker):
         i = source.index(start)
         return source[i:source.index(end_marker, i) + len(end_marker)]
     read_config = between('CONFIG_EXPORTS=$("${PYTHON_BIN}" ', 'eval "${CONFIG_EXPORTS}"')
-    plan_block = between("# Several lengths in one job (eval_lengths in the YAML", '"${LONG_EVAL_PASSES[@]}"\nfi\n')
+    lengths_block = between("# Several lengths in one job (eval_lengths in the YAML", "    exit 1\nfi\n")
     build_args = between("LOG_KV_ARG_LIST=(", "\nDIAG_ARGS=")
-    loop = between("if [ ${#LONG_EVAL_PASSES[@]} -eq 0 ]; then", "        run_stages\n    done\nfi\n")
+    task_lists = between('DEFAULT_BENCHMARKS="boolq', "    esac\ndone\n")
+    plan_block = between("# The length passes (long_eval_plan.py)", '"${LONG_EVAL_PASSES[@]}"\nfi\n')
+    loop = between('if [ -z "${EVAL_LENGTHS}" ] || [ "${EVAL_MAIN}" = "1" ]; then', "    run_stages\ndone\n")
     stub = ('run_stages() { echo "PASS|${EVAL_OUTPUT_DIR}|${PASS_ARGS[*]}|${BENCHMARKS}|${NIAH_BENCHMARKS}|'
             '${EVAL_MAX_SEQ_LENGTHS}|${EVAL_OPTIONAL_TASKS}|${LOG_KV_ARG_LIST[*]}"; }')
-    shell = "\n".join(("CONFIG_FILE=$1", read_config, plan_block, build_args, stub, loop))
+    shell = "\n".join(("CONFIG_FILE=$1", read_config, lengths_block, build_args, task_lists, plan_block, stub, loop))
     environment = {**os.environ, "PYTHON_BIN": sys.executable, **(env or {}),
                    "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
-    for name in ("EVAL_LENGTHS", "EVAL_SUITES", "YARN_MODE", "NIAH_ONLY"):
+    for name in ("EVAL_LENGTHS", "EVAL_SUITES", "YARN_MODE", "NIAH_ONLY", "EVAL_MAIN", "LIMIT", "LONG_EVAL_LIMIT"):
         if name not in (env or {}):
             environment.pop(name, None)
     done = subprocess.run(["bash", "-c", shell, "bash", str(config), *args], capture_output=True, text=True,
                           cwd=ROOT, env=environment)
     passes = [line.split("|")[1:] for line in done.stdout.splitlines() if line.startswith("PASS|")]
     return done, passes
+
+
+def _overrides(pass_args):
+    """The JSON of "--config_overrides <json> [--limit N]"."""
+    return json.loads(pass_args.split(" ", 1)[1].rsplit(" --limit ", 1)[0])
 
 
 def test_the_launcher_runs_one_pass_per_length(tmp_path):
@@ -89,11 +96,12 @@ def test_the_launcher_runs_one_pass_per_length(tmp_path):
     done, passes = _launcher(tmp_path, config)
     assert done.returncode == 0, done.stderr
     assert [p[0] for p in passes] == ["/out/long32k", "/out/long64k", "/out/long128k", "/out/long256k"]
-    overrides = [json.loads(p[1].split(" ", 1)[1]) for p in passes]  # "--config_overrides <json>"
+    overrides = [_overrides(p[1]) for p in passes]
     assert [o["block_size"] for o in overrides] == [33792, 66560, 132096, 263168]
     assert [o.get("rope_adjustments", {}).get("factor") for o in overrides] == [None, 2., 4., 8.]
     assert all(o["n_layer"] == 28 for o in overrides)
-    assert all("--config_overrides" not in p[6] and "--limit 100" in p[6] for p in passes)  # only the pass's own
+    assert all(p[1].endswith(" --limit 100") for p in passes)
+    assert all("--config_overrides" not in p[6] and "--limit" not in p[6] for p in passes)  # only the pass's own
     assert passes[3][2] == ("babilong_256k,long_ppl_256k,long_ppl_books_256k,niah_turns_256k,longbench2_256k,"
                             "infinitebench_256k")
     assert "ruler_qa_squad" not in passes[3][3] and passes[3][4] == "[262144]"
@@ -113,11 +121,41 @@ def test_the_launcher_runs_one_pass_per_length(tmp_path):
 
 def test_a_single_length_yaml_runs_as_before(tmp_path):
     config = tmp_path / "plain.yaml"
-    config.write_text("checkpoint_dir: /ckpt\nconfig_overrides:\n  block_size: 66560\n")
+    config.write_text("checkpoint_dir: /ckpt\nlimit: 7\nconfig_overrides:\n  block_size: 66560\n")
     done, passes = _launcher(tmp_path, config)
     assert done.returncode == 0, done.stderr
     (out, args, *_rest, log_kv_args), = passes
-    assert args == "" and '--config_overrides {"block_size": 66560}' in log_kv_args
+    assert args == '--config_overrides {"block_size": 66560} --limit 7' and "--config_overrides" not in log_kv_args
+    done, passes = _launcher(tmp_path, config, env=dict(LIMIT="2"))
+    assert passes[0][1].endswith("--limit 2")
+
+
+def test_the_full_evaluation_runs_the_main_line_then_every_length(tmp_path):
+    """eval_main: the 32K main line (default lists, the YAML's limit, its overrides) into output_path, then the
+    passes with long_limit samples per task, leaving out what the main line measured."""
+    config = tmp_path / "full.yaml"
+    config.write_text("checkpoint_dir: /ckpt\noutput_path: /out\neval_lengths: [32k, 64k]\neval_main: true\n"
+                      "long_limit: 100\nconfig_overrides:\n  n_layer: 28\n")
+    done, passes = _launcher(tmp_path, config)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert [p[0] for p in passes] == ["/out", "/out/long32k", "/out/long64k"]
+    main_line, long32k, long64k = passes
+    assert main_line[1] == '--config_overrides {"n_layer": 28}'  # no limit: the whole main line
+    assert main_line[2].startswith("boolq,") and main_line[2].endswith(",niah_turns_32k,long_ppl_books_32k")
+    assert "niah_single_2_words" in main_line[3] and main_line[4] == "[1024, 2048, 4096, 8192, 16384, 32768]"
+    assert main_line[5] == "niah_turns_32k,long_ppl_books_32k"
+    # 32K: what the main line did not measure (its turns and book curve, its eight needles at 32768).
+    assert long32k[2] == "babilong_32k,long_ppl_32k,longbench2_32k,infinitebench_32k"
+    assert long32k[3] == "ruler_vt,ruler_cwe,ruler_fwe,ruler_qa_squad,ruler_qa_hotpot"
+    assert long64k[2].startswith("babilong_64k,") and len(long64k[3].split(",")) == 13
+    assert all(p[1].endswith(" --limit 100") and _overrides(p[1])["n_layer"] == 28 for p in (long32k, long64k))
+    done, passes = _launcher(tmp_path, config, env=dict(LIMIT="2"))  # a quick check: every run at 2
+    assert [p[1].rsplit(" ", 1)[-1] for p in passes] == ["2", "2", "2"]
+    done, passes = _launcher(tmp_path, config, env=dict(EVAL_LENGTHS="none"))  # the main line only
+    assert [p[0] for p in passes] == ["/out"]
+    done, passes = _launcher(tmp_path, config, env=dict(EVAL_MAIN="0"))  # the lengths only, as eval_long_*.yaml
+    assert [p[0] for p in passes] == ["/out/long32k", "/out/long64k"]
+    assert passes[0][2].endswith("niah_turns_32k,longbench2_32k,infinitebench_32k")
 
 
 def _majob_long_eval(tmp_path, context_length, env=None, main=None, niah=None):
