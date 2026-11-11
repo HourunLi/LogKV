@@ -301,7 +301,8 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   检索类上下文约 128K token，256K 时大多不截，书类与 Code.Debug 多在 10 万到几十万 token。组的 `score` 是十个任务的平均
   （论文的 Avg），每个任务 `--limit` 条。样本留在数据文件里，数据集的每行只记该行在文件中的偏移与答案，`doc_to_text` 只为
   要跑的样本读出、拼提示、分词截断。数据：`xinrongzhang2022/InfiniteBench` 的十个 jsonl，依次找 `INFINITEBENCH_DIR`（YAML 的
-  `infinitebench_dir`）、`<HF_HOME>/infinitebench`、hub 缓存；下载脚本下到 hub 缓存后再拷一份普通文件到
+  `infinitebench_dir`）、`<HF_HOME>/infinitebench`、hub 缓存的快照（软链接被压平成写着 `../../blobs/<sha>` 的小文件、
+  或 `refs/main` 丢失时，按快照条目找到 blobs 里的文件）；下载脚本下到 hub 缓存后再拷一份普通文件到
   `<HF_HOME>/infinitebench`（hub 缓存的快照是指向 blobs 的软链接，缓存目录同步到评测机器时可能丢失或被压平）。
   按名字指定却缺文件时，`eval.py` 在评测开始前报错并给出下载命令。不测 32K：样本多为 10 万 token 以上，32K 只剩首尾。
 - 书的困惑度曲线（组 `long_ppl_books_{32k,64k,128k,256k}`）：另一个数据源 `LONG_PPL_BOOKS`（YAML 的 `long_ppl_books`），取前
