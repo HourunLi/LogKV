@@ -305,7 +305,9 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   `infinitebench_dir`）、`<HF_HOME>/infinitebench`、hub 缓存的快照（软链接被压平成写着 `../../blobs/<sha>` 的小文件、
   或 `refs/main` 丢失时，按快照条目找到 blobs 里的文件）；下载脚本下到 hub 缓存后再拷一份普通文件到
   `<HF_HOME>/infinitebench`（hub 缓存的快照是指向 blobs 的软链接，缓存目录同步到评测机器时可能丢失或被压平）。
-  按名字指定却缺文件时，`eval.py` 在评测开始前报错并给出下载命令。不测 32K：样本多为 10 万 token 以上，32K 只剩首尾。
+  按名字指定却缺文件时，`eval.py` 在评测开始前报错并给出下载命令。32K（训练长度，不用 YaRN）也测，作为参照：样本多为
+  10 万 token 以上，32K 时几乎都只剩首尾各 16K，检索类的针多在中间被截掉，所以 32K 的分数主要说明更长的预算带来了什么，
+  不是检索能力本身。
 - 书的困惑度曲线（组 `long_ppl_books_{32k,64k,128k,256k}`）：另一个数据源 `LONG_PPL_BOOKS`（YAML 的 `long_ppl_books`），取前
   `LONG_PPL_DOCS`（100）本不短于 262144 token 的书，所有组共用这一批（`_documents(..., LONGEST_256K, env="LONG_PPL_BOOKS")`，
   缓存与 `long_ppl_*` 分开）。组 `long_ppl_books_<L>` 的每个任务 `long_ppl_books_<L>_<p>`（p = 8k, 16k, … , L）把每本书截到 p，
@@ -349,7 +351,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   该配置只剩这种目录时报“not completely downloaded”并列出目录，此时等下载结束或联网重跑下载脚本；下载脚本的汇总也会列出残留目录。
 - 一份配置测多个长度：`eval_long_{dense,baseline,word_first}.yaml`（`eval_lengths: [32k, 64k, 128k, 256k]`）。`eval.sh` 用
   `long_eval_plan.py` 按长度逐档评测：每档窗口为长度 + 1024，NIAH 阶段跑该长度的 RULER，主阶段跑该长度的 `babilong_<L>`、
-  `long_ppl_<L>`、`long_ppl_books_<L>`、`niah_turns_<L>`、`longbench2_<L>` 与 `infinitebench_<L>`（64K 起），结果写到
+  `long_ppl_<L>`、`long_ppl_books_<L>`、`niah_turns_<L>`、`longbench2_<L>` 与 `infinitebench_<L>`，结果写到
   `<output_path>/long<L>`。YaRN 默认按长度取倍数
   （`YARN_MODE=per_length`：32K 不用，64K 2、128K 4、256K 8），32K 档与 32K 主线一致、各长度比较的是压缩而不是外推；
   `YARN_MODE=fixed` 是附加实验：每档都用所测最长一档的倍数（按该长度部署的模型，静态 YaRN），写到 `<output_path>/yarn<F>/long<L>`。
@@ -375,14 +377,14 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
 - 汇总表（`unused/parse_lmeval_table.py`）：把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
   日志里 eval.py 打印的结果表会被挑出来（行首前缀会去掉），同一模型的几份日志（如 32K、128K、256K 各一份）接着贴进
   同一个字符串，合成一行。表头按长度分块：前 89 列是 32K 主线（常识、综合、LongBench v1/E、32K 捞针），之后 32K、64K、128K、
-  256K 各一块（论文里 32K-256K 可单独成表），各块顺序相同、只列该长度的评测会产出结果的列（32K 32 列，64K 44 列，128K 与
+  256K 各一块（论文里 32K-256K 可单独成表），各块顺序相同、只列该长度的评测会产出结果的列（32K 43 列，64K 44 列，128K 与
   256K 各 45 列），块内按任务分组、每组的平均紧跟在它的任务之后：单针 `niah_single_1-3_<长度>`、`AVG_NIAH_<长度>`；多针 5 个、
   `AVG_NIAH_multi_<长度>`；其余 RULER 任务、`AVG_RULER_<长度>`（该长度全部 RULER 任务的平均；256K 没有 `ruler_qa_squad`，为
   12 个）；`babilong_qa1-5_<长度>`、`AVG_babilong_<长度>`；`LongBench2_<长度>`；`niah_turns_<长度>_turn1-4`、
   `niah_turns_<长度>`（四轮平均）；书的困惑度曲线 `long_ppl_books_<长度>_<8k…该长度>`，之后是 `long_ppl_<长度>`（越低越好）；
-  InfiniteBench 十个任务 `infinitebench_<任务>_<长度>`、`AVG_InfiniteBench_<长度>`（只在 64K 起的块）。32K 块的捞针列与主线的
+  InfiniteBench 十个任务 `infinitebench_<任务>_<长度>`、`AVG_InfiniteBench_<长度>`。32K 块的捞针列与主线的
   `niah_single_1` 等是同一份结果，重复列出。这些列都不计入 `AVG_all`；不带长度的 `longbench2` 结果（上下文预算不明）不进表。
-  新列加在它所测长度的块里、所属任务组的平均之前；`tests/parse_lmeval_table_columns.txt` 记着表头（共 256 列），
+  新列加在它所测长度的块里、所属任务组的平均之前；`tests/parse_lmeval_table_columns.txt` 记着表头（共 267 列），
   测试检查各块顺序一致、各长度的列连在一起、每个平均紧跟在它的任务之后、每个平均及其任务都在表头里。按位置对齐的旧表格把日志
   重新贴进来再跑一遍即可得到新顺序。
 

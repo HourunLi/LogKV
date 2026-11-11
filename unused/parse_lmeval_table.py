@@ -437,10 +437,10 @@ BABILONG_LENGTHS = PPL_LENGTHS = LONGBENCH2_LENGTHS = TURN_LENGTHS = BLOCK_LENGT
 TURN_TASKS = [f"niah_turns_{n}" for n in TURN_LENGTHS]
 # 书的困惑度曲线的截断点：每个配置长度只到它自己的长度（long_ppl_books_32k 为 8k、16k、32k）。
 BOOK_POINTS = {n: [f"{2 ** k}k" for k in range(3, 9) if 2 ** k <= int(n[:-1])] for n in BLOCK_LENGTHS}
-# InfiniteBench 的十个任务（eval_tasks/infinitebench，只测 64K 起），AVG_InfiniteBench 为十个的平均（论文的 Avg）。
+# InfiniteBench 的十个任务（eval_tasks/infinitebench，32K-256K），AVG_InfiniteBench 为十个的平均（论文的 Avg）。
 INFINITEBENCH = ["passkey", "number_string", "kv_retrieval", "longbook_sum_eng", "longbook_qa_eng", "longbook_choice_eng",
                  "longbook_qa_chn", "longdialogue_qa_eng", "code_debug", "math_find"]
-INFINITEBENCH_LENGTHS = ("64k", "128k", "256k")
+INFINITEBENCH_LENGTHS = BLOCK_LENGTHS
 # 每个长度实际跑的 RULER 任务：256K 没有 ruler_qa_squad（SQuAD 的文档池填不满 256K）。
 RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] for n in BLOCK_LENGTHS}
 
@@ -453,7 +453,7 @@ RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] f
 #   同一份缓存上逐轮问 niah_turns_<长度>_turn1-4、niah_turns_<长度>（四轮平均）；
 #   书的困惑度曲线 long_ppl_books_<长度>_<截断长度>（截断长度 8k 起到该长度，同一批书，越低越好），之后是同长度的
 #   long_ppl_<长度>（PG19 测试集文档末尾的困惑度，越低越好）；
-#   InfiniteBench 十个任务 infinitebench_<任务>_<长度>（官方评分）、AVG_InfiniteBench_<长度>（只有 64K 起的块有）。
+#   InfiniteBench 十个任务 infinitebench_<任务>_<长度>（官方评分）、AVG_InfiniteBench_<长度>。
 # 32K 块的捞针列与 32K 主线的 niah_single_1 等是同一份结果，重复列出。都不计入 AVG_all。新列加在所属任务组里、它的平均
 # 之前，并更新 tests/parse_lmeval_table_columns.txt（测试检查各块顺序一致、各长度的列连在一起、平均紧跟其任务）。
 def _length_block(n):
