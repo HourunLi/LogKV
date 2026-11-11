@@ -352,7 +352,7 @@ def test_one_yaml_per_method_runs_everything(name):
     limit) and long_limit samples per task in the length passes."""
     evaluated, longs = effective(f"eval_full_{name}.yaml"), effective(f"eval_long_{name}.yaml")
     assert {k for k in set(evaluated) | set(longs) if evaluated.get(k) != longs.get(k)} == {
-        "eval_main", "long_limit", "limit", *(("benchmark",) if name == "dense" else ())}
+        "eval_main", "long_limit", "limit", *(("benchmark",) if name == "dense" else ("eval_tag",))}
     assert evaluated["eval_main"] is True and evaluated["long_limit"] == 100 and evaluated.get("limit") is None
     assert not evaluated.get("benchmark") and not evaluated.get("niah_benchmark")  # the default (full) lists
 
@@ -365,5 +365,13 @@ def test_the_query_long_evaluations_differ_only_in_the_question(name, plain):
     for kind in ("long", "full"):
         evaluated, other = effective(f"eval_{kind}_{name}.yaml"), effective(f"eval_{kind}_{plain}.yaml")
         assert {k for k in set(evaluated) | set(other) if evaluated.get(k) != other.get(k)} == {
-            "log_kv_gamma_query_cue", "log_kv_gamma_cue_guard"}, kind
+            "log_kv_gamma_query_cue", "log_kv_gamma_cue_guard", *(("eval_tag",) if kind == "full" else ())}, kind
         assert evaluated["log_kv_gamma_query_cue"] is True and evaluated["log_kv_gamma_cue_guard"] is True
+
+
+
+def test_methods_on_one_checkpoint_write_to_their_own_folders():
+    """baseline, word_first, query and word_first_query share a checkpoint: each full evaluation has its own folder."""
+    tags = {effective(f"eval_full_{m}.yaml")["eval_tag"] for m in ("baseline", "word_first", "query", "word_first_query")}
+    assert len(tags) == 4
+    assert effective("eval_full_dense.yaml").get("eval_tag") is None  # the base model: its own output_path already

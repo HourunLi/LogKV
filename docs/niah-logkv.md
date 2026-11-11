@@ -365,6 +365,9 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   计划跳过，各档每个任务 `long_limit` 条（`LONG_EVAL_LIMIT` 覆盖）。`LIMIT=2` 让每个阶段都只跑 2 条（上长跑前在单卡上试跑），
   `EVAL_LENGTHS=none` 只跑主线，`EVAL_MAIN=0` 只跑各长度（同 `eval_long_*.yaml`），`EVAL_SUITES`、`NIAH_ONLY`、`YARN_MODE` 同下。
   训练后 `majob.sh` 本来就是这个顺序（主线、再逐档）。把一个方法的主线日志与各档日志接着粘进汇总表，就是一行完整结果。
+  同一 checkpoint 上的四种方法（baseline、word_first、query、word_first_query）各用 `eval_tag: full_<方法>`，结果写到
+  `<save_path>/evaluate/full_<方法>` 及其下的 `long<L>`，互不混在一起（`eval_tag` 只改默认目录，显式的 `output_path` 优先；
+  dense 是另一个模型，本来就有自己的 `output_path`）。
   `query` 与 `word_first_query`（`eval_{long,full}_{query,word_first_query}.yaml`）与 `baseline` / `word_first` 同一
   checkpoint、同样的长度与任务，只多开查询感知 cue 与 cue 保护（`eval_gamma_query_p1024.yaml`、
   `eval_gamma_surprisal_word_first_query_p1024.yaml`）。查询感知 cue 只作用于生成请求（RULER、BABILong、InfiniteBench，
