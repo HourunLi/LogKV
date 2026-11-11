@@ -77,15 +77,20 @@ def test_pasted_tables_still_parse_as_before(parse):
     assert parse.table_lines("no table here\n|a|b|\n") == []
 
 
-def test_the_header_only_grows_at_the_end(parse):
-    """Tables already filled line up by position: tests/parse_lmeval_table_columns.txt holds the header as it
-    was, and the output must still start with it. Add new columns at the end of ORDERED_COLUMNS and append
-    them to that file."""
+def test_the_header_keeps_each_length_together(parse):
+    """tests/parse_lmeval_table_columns.txt is the header: the 32K main line (89 columns), then one block per length
+    (32K, 64K, 128K, 256K), each length's columns contiguous. A new column goes at the end of its length's block
+    and into that file."""
+    import re
+
     frozen = (ROOT / "tests" / "parse_lmeval_table_columns.txt").read_text().splitlines()
     header = list(parse.build_table({"m": ""}).columns)
-    assert header[:len(frozen)] == frozen
-    # The 64K / 128K layout (144 columns, up to LongBench2) comes before everything 256K added.
-    assert frozen[143] == "LongBench2" and frozen[144] == "niah_single_1@256k"
+    assert header == frozen
+    assert header[89] == "AVG_NIAH_words" and header[90] == "ruler_vt@32k"  # the main line, then 32K's block
+    lengths = [m.group(1) if (m := re.search(r"(32k|64k|128k|256k)(?:@(?:\d+k|turn\d))?$", c)) else None for c in header[90:]]
+    named = [n for n in lengths if n]  # LongBench2 without a length sits in 32K's block
+    order = [n for i, n in enumerate(named) if i == 0 or n != named[i - 1]]
+    assert order == ["32k", "64k", "128k", "256k"]  # no length comes back after another
 
 
 def test_turn_and_book_curve_columns(parse):
