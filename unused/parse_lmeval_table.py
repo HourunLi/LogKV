@@ -428,8 +428,8 @@ ORDERED_COLUMNS = [
     # niahLogKV 泛化：值为随机英文词、不含数字的针（eval_tasks/niah_cue/*_words），取 32K。
     "niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase", "AVG_NIAH_words",
 ]
-# 长文本（eval_max_seq_lengths 设到 64K/128K/256K 时）：RULER 13 个任务在该长度的得分记为 <任务>@64k 等，
-# AVG_RULER@64k 为 13 个的平均（RULER 的标准报告；256K 没有 ruler_qa_squad，SQuAD 的文档池填不满，为 12 个的平均）；
+# 长文本（eval_max_seq_lengths 设到 64K/128K/256K 时）：RULER 13 个任务在该长度的得分记为 <任务>_64k 等，
+# AVG_RULER_64k 为 13 个的平均（RULER 的标准报告；256K 没有 ruler_qa_squad，SQuAD 的文档池填不满，为 12 个的平均）；
 # BABILong qa1-qa5（eval_tasks/babilong_long，任务名带长度）；长文档困惑度（eval_tasks/long_ppl，越低越好；256K 用另一批
 # 文档）；LongBench v2 总分。都不计入 AVG_all。
 LONG_LENGTHS = {"65536": "64k", "131072": "128k", "262144": "256k"}
@@ -445,8 +445,8 @@ LONGBENCH2_LENGTHS = ("32k", "64k", "128k", "256k")
 
 
 # 长文本列按长度分块：上面 32K 主线之后是 32K、64K、128K、256K 各一块，每块依次是 RULER（及其平均）、BABILong、
-# long_ppl、LongBench v2、同一份缓存上逐轮问（niah_turns_<长度> 为四轮平均，@turnN 为第 N 轮）、书的困惑度曲线
-# （long_ppl_books_<配置长度>@<截断长度>，同一批书，越低越好）。32K 主线已有 8 个捞针任务的 32K 列，所以 32K 块的
+# long_ppl、LongBench v2、同一份缓存上逐轮问（niah_turns_<长度> 为四轮平均，_turnN 为第 N 轮）、书的困惑度曲线
+# （long_ppl_books_<配置长度>_<截断长度>，同一批书，越低越好）。32K 主线已有 8 个捞针任务的 32K 列，所以 32K 块的
 # RULER 只有其余 5 个任务（与 13 个的平均）；不带长度的 LongBench2（旧结果）放在 32K 块。新列加在所属长度块的末尾，
 # 并更新 tests/parse_lmeval_table_columns.txt（测试检查各长度的列连在一起）。
 RULER_32K_EXTRA = ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
@@ -457,13 +457,13 @@ BOOK_POINTS = {n: [f"{2 ** k}k" for k in range(3, 9) if 2 ** k <= int(n[:-1])] f
 
 def _length_block(n):
     if n == "32k":
-        columns = [f"{t}@32k" for t in RULER_32K_EXTRA] + ["AVG_RULER@32k"]
+        columns = [f"{t}_32k" for t in RULER_32K_EXTRA] + ["AVG_RULER_32k"]
     else:
-        columns = [f"{t}@{n}" for t in RULER_AT[n]] + [f"AVG_NIAH@{n}", f"AVG_NIAH_multi@{n}", f"AVG_RULER@{n}"]
+        columns = [f"{t}_{n}" for t in RULER_AT[n]] + [f"AVG_NIAH_{n}", f"AVG_NIAH_multi_{n}", f"AVG_RULER_{n}"]
     columns += [f"babilong_qa{i}_{n}" for i in range(1, 6)] + [f"AVG_babilong_{n}", f"long_ppl_{n}"]
-    columns += (["LongBench2"] if n == "32k" else []) + [f"LongBench2@{n}"]
-    columns += [f"niah_turns_{n}"] + [f"niah_turns_{n}@turn{i}" for i in range(1, 5)]
-    return columns + [f"long_ppl_books_{n}@{q}" for q in BOOK_POINTS[n]]
+    columns += (["LongBench2"] if n == "32k" else []) + [f"LongBench2_{n}"]
+    columns += [f"niah_turns_{n}"] + [f"niah_turns_{n}_turn{i}" for i in range(1, 5)]
+    return columns + [f"long_ppl_books_{n}_{q}" for q in BOOK_POINTS[n]]
 
 
 for _length in ("32k", "64k", "128k", "256k"):
@@ -488,8 +488,8 @@ RAW_TO_TARGET_MAP = {
     "longbench_qasper_e": "qasper_e", "longbench_repobench-p_e": "repobench-p_e", "longbench_samsum_e": "samsum_e",
     "longbench_trec_e": "trec_e", "longbench_triviaqa_e": "triviaqa_e",
     "longbench2": "LongBench2",
-    **{f"longbench2_{n}": f"LongBench2@{n}" for n in LONGBENCH2_LENGTHS},
-    **{f"long_ppl_books_{n}_{q}": f"long_ppl_books_{n}@{q}" for n, points in BOOK_POINTS.items() for q in points},
+    **{f"longbench2_{n}": f"LongBench2_{n}" for n in LONGBENCH2_LENGTHS},
+    **{f"long_ppl_books_{n}_{q}": f"long_ppl_books_{n}_{q}" for n, points in BOOK_POINTS.items() for q in points},
 }
 
 TARGET_METRIC_MAP = {
@@ -503,9 +503,9 @@ TARGET_METRIC_MAP = {
     **{f"babilong_qa{i}_{n}": "acc" for i in range(1, 6) for n in BABILONG_LENGTHS},
     **{f"long_ppl_{n}": "ppl" for n in PPL_LENGTHS},
     "LongBench2": "acc",
-    **{f"LongBench2@{n}": "acc" for n in LONGBENCH2_LENGTHS},
+    **{f"LongBench2_{n}": "acc" for n in LONGBENCH2_LENGTHS},
     **{t: "acc" for t in TURN_TASKS},
-    **{f"long_ppl_books_{n}@{q}": "ppl" for n, points in BOOK_POINTS.items() for q in points},
+    **{f"long_ppl_books_{n}_{q}": "ppl" for n, points in BOOK_POINTS.items() for q in points},
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
@@ -526,18 +526,18 @@ AVG_GROUPS = {
     "AVG_NIAH_multi": NIAH_MULTI,
     "AVG_NIAH_cue": NIAH_CUE,
     "AVG_NIAH_words": NIAH_WORDS,
-    **{f"AVG_NIAH@{n}": [f"niah_single_{k}@{n}" for k in (1, 2, 3)] for n in LONG_LENGTHS.values()},
-    **{f"AVG_NIAH_multi@{n}": [f"{t}@{n}" for t in NIAH_MULTI] for n in LONG_LENGTHS.values()},
-    **{f"AVG_RULER@{n}": [f"{t}@{n}" for t in RULER_AT[n]] for n in LONG_LENGTHS.values()},
+    **{f"AVG_NIAH_{n}": [f"niah_single_{k}_{n}" for k in (1, 2, 3)] for n in LONG_LENGTHS.values()},
+    **{f"AVG_NIAH_multi_{n}": [f"{t}_{n}" for t in NIAH_MULTI] for n in LONG_LENGTHS.values()},
+    **{f"AVG_RULER_{n}": [f"{t}_{n}" for t in RULER_AT[n]] for n in LONG_LENGTHS.values()},
     **{f"AVG_babilong_{n}": [f"babilong_qa{i}_{n}" for i in range(1, 6)] for n in BABILONG_LENGTHS},
-    "AVG_RULER@32k": LONG_NIAH + [f"{t}@32k" for t in RULER_32K_EXTRA],
+    "AVG_RULER_32k": LONG_NIAH + [f"{t}_32k" for t in RULER_32K_EXTRA],
 }
 # 新增的诊断组不计入 AVG_all，旧结果与新结果的总平均保持可比。
 DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words",
-                     *(f"AVG_NIAH@{n}" for n in LONG_LENGTHS.values()),
-                     *(f"AVG_NIAH_multi@{n}" for n in LONG_LENGTHS.values()),
-                     *(f"AVG_RULER@{n}" for n in LONG_LENGTHS.values()),
-                     *(f"AVG_babilong_{n}" for n in BABILONG_LENGTHS), "AVG_RULER@32k"}
+                     *(f"AVG_NIAH_{n}" for n in LONG_LENGTHS.values()),
+                     *(f"AVG_NIAH_multi_{n}" for n in LONG_LENGTHS.values()),
+                     *(f"AVG_RULER_{n}" for n in LONG_LENGTHS.values()),
+                     *(f"AVG_babilong_{n}" for n in BABILONG_LENGTHS), "AVG_RULER_32k"}
 
 # ==============================================================================
 # 3. 解析与计算核心代码
@@ -585,19 +585,19 @@ def parse_single_model(model_name, markdown_text):
         expected_metric = TARGET_METRIC_MAP.get(target_task)
         if target_task in TURN_TASKS and re.fullmatch(r"turn\d", metric):  # niah_turns: one column per turn
             try:
-                row_data[f"{target_task}@{metric}"] = float(value)
+                row_data[f"{target_task}_{metric}"] = float(value)
             except ValueError:
                 pass
             continue
         if target_task in RULER_32K_EXTRA and metric == "32768":  # the other RULER tasks at 32K
             try:
-                row_data[f"{target_task}@32k"] = float(value)
+                row_data[f"{target_task}_32k"] = float(value)
             except ValueError:
                 pass
             continue
         if target_task in LONG_RULER and metric in LONG_LENGTHS:  # RULER at 64K / 128K / 256K
             try:
-                row_data[f"{target_task}@{LONG_LENGTHS[metric]}"] = float(value)
+                row_data[f"{target_task}_{LONG_LENGTHS[metric]}"] = float(value)
             except ValueError:
                 pass
             continue

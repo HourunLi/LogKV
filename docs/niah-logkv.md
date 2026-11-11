@@ -340,7 +340,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   默认时缺数据的 `ppl`、`books`，以及 hub 缓存里文件不是完整 parquet 的 `longbench2`，作为可选任务跳过并打印原因，点名的必须能跑）、`NIAH_ONLY=1`（只跑 RULER）；这种配置不接受任务清单参数。
   每档换一次窗口与 YaRN，要重新加载模型（约一分钟）。注意 `long_ppl_32k` 在这里是 32K 档（不用 YaRN）测的，在
   `eval_long64k_*.yaml` 里是 64K 配置（YaRN 2）测的；32K 档的 8 个捞针任务写进 32K 主线的同名列，其余 5 个 RULER 任务、
-  `AVG_RULER@32k` 与 `LongBench2@32k` 是新加的列。按长度拆开的 `eval_long{64k,128k,256k}_*.yaml` 保留，用于复现已有结果。
+  `AVG_RULER_32k` 与 `LongBench2_32k` 是新加的列。按长度拆开的 `eval_long{64k,128k,256k}_*.yaml` 保留，用于复现已有结果。
 - 训练后自动跑：`majob.sh` 在主评测与 NIAH 阶段之后，用训练 YAML 的缓存设置对刚训好的 checkpoint 跑同样的逐档评测
   （长度默认 YAML 的 `eval_lengths`，否则 32K–256K 全部；`EVAL_LENGTHS=none` 关闭，`EVAL_SUITES`、`YARN_MODE`、`NIAH_ONLY` 同上），
   每个任务 `LONG_EVAL_LIMIT`（默认 100）条，结果写到 `evaluate/long<L>`。主线已经测过的不再重测（主评测的任务、NIAH 阶段在各自
@@ -352,9 +352,9 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER（256K 为上面的 12 个），主阶段跑 BABILong 与困惑度（64K 配置为 32K
   与 64K，128K、256K 配置为各自的长度），再跑 `long_ppl_books_<L>`、`niah_turns_<L>` 与 `longbench2_<L>`，每个任务 100 条。256K 的
   dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset`、`long_ppl_data` 与 `long_ppl_books` 三个键（或同名环境变量）给出本地数据。
-- 汇总表（`unused/parse_lmeval_table.py`）：RULER 13 个任务的 `<任务>@64k`、`AVG_NIAH@64k`、`AVG_NIAH_multi@64k`、
-  `AVG_RULER@64k`（128k、256k 同；256k 没有 `ruler_qa_squad`，为 12 个的平均）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`
-  与 `LongBench2@<长度>`，都不计入 `AVG_all`。把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
+- 汇总表（`unused/parse_lmeval_table.py`）：RULER 13 个任务的 `<任务>_64k`、`AVG_NIAH_64k`、`AVG_NIAH_multi_64k`、
+  `AVG_RULER_64k`（128k、256k 同；256k 没有 `ruler_qa_squad`，为 12 个的平均）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`
+  与 `LongBench2_<长度>`，都不计入 `AVG_all`。把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
   日志里 eval.py 打印的结果表会被挑出来（行首前缀会去掉），同一模型的几份日志（如 32K、128K、256K 各一份）接着贴进
   同一个字符串，合成一行。表头按长度分块：前 89 列是 32K 主线（常识、综合、LongBench v1/E、32K 捞针），之后 32K、64K、128K、256K 各一块，
   每块依次是 RULER 与平均（32K 块只有主线没有的 5 个任务）、BABILong、`long_ppl`、LongBench v2、`niah_turns`（四轮平均与各轮）、

@@ -58,17 +58,17 @@ def test_one_row_from_a_models_logs_at_three_lengths(parse):
     table = parse.build_table({"wf": log_256k + "\n" + log_128k, "wf_256k": log_256k}).set_index("Model")
     row = table.loc["wf"]
     assert list(table.columns[:1]) == ["Common Sense Reasoning (ACC)"] and "Model" not in table.columns
-    assert row["niah_single_1@256k"] == 0.5 and row["ruler_qa_hotpot@256k"] == 0.61
-    assert "ruler_qa_squad@256k" not in table.columns  # SQuAD cannot fill 256K
-    assert row["AVG_RULER@256k"] == pytest.approx(sum(0.5 + i / 100 for i in range(12)) / 12, abs=1e-4)
+    assert row["niah_single_1_256k"] == 0.5 and row["ruler_qa_hotpot_256k"] == 0.61
+    assert "ruler_qa_squad_256k" not in table.columns  # SQuAD cannot fill 256K
+    assert row["AVG_RULER_256k"] == pytest.approx(sum(0.5 + i / 100 for i in range(12)) / 12, abs=1e-4)
     assert row["babilong_qa3_256k"] == 0.3 and row["AVG_babilong_256k"] == pytest.approx(0.3)
     assert row["long_ppl_256k"] == 9.5  # ppl, not bits_per_byte
-    assert row["LongBench2@256k"] == 0.27 and row["LongBench2@128k"] == 0.3
-    assert row["niah_single_1@128k"] == 0.9 and row["ruler_qa_squad@128k"] == 0.4
+    assert row["LongBench2_256k"] == 0.27 and row["LongBench2_128k"] == 0.3
+    assert row["niah_single_1_128k"] == 0.9 and row["ruler_qa_squad_128k"] == 0.4
     assert row["niah_single_1"] != row["niah_single_1"]  # the 32K column stays empty (NaN)
-    assert table.loc["wf_256k", "LongBench2@256k"] == 0.27
+    assert table.loc["wf_256k", "LongBench2_256k"] == 0.27
     columns = list(table.columns)
-    assert columns.index("LongBench2") < columns.index("LongBench2@64k") < columns.index("LongBench2@256k")
+    assert columns.index("LongBench2") < columns.index("LongBench2_64k") < columns.index("LongBench2_256k")
 
 
 def test_pasted_tables_still_parse_as_before(parse):
@@ -86,8 +86,9 @@ def test_the_header_keeps_each_length_together(parse):
     frozen = (ROOT / "tests" / "parse_lmeval_table_columns.txt").read_text().splitlines()
     header = list(parse.build_table({"m": ""}).columns)
     assert header == frozen
-    assert header[89] == "AVG_NIAH_words" and header[90] == "ruler_vt@32k"  # the main line, then 32K's block
-    lengths = [m.group(1) if (m := re.search(r"(32k|64k|128k|256k)(?:@(?:\d+k|turn\d))?$", c)) else None for c in header[90:]]
+    assert header[89] == "AVG_NIAH_words" and header[90] == "ruler_vt_32k"  # the main line, then 32K's block
+    # The task's length: the first _<length> in the name (long_ppl_books_64k_8k is 64K's curve).
+    lengths = [m.group(1) if (m := re.search(r"_(32k|64k|128k|256k)(?=_|$)", c)) else None for c in header[90:]]
     named = [n for n in lengths if n]  # LongBench2 without a length sits in 32K's block
     order = [n for i, n in enumerate(named) if i == 0 or n != named[i - 1]]
     assert order == ["32k", "64k", "128k", "256k"]  # no length comes back after another
@@ -100,6 +101,6 @@ def test_turn_and_book_curve_columns(parse):
     log = _log(_table(turns), _table({k: v for k, v in books.items() if v},
                                      [("long_ppl_books_256k", [k for k in books if k != "long_ppl_books_256k"])]))
     row = parse.build_table({"wf": log}).set_index("Model").loc["wf"]
-    assert row["niah_turns_256k"] == 0.625 and row["niah_turns_256k@turn1"] == 0.9 and row["niah_turns_256k@turn4"] == 0.5
-    assert [row[f"long_ppl_books_256k@{q}"] for q in ("8k", "256k")] == [10., 5.]  # ppl, not bits_per_byte
-    assert row["long_ppl_books_128k@8k"] != row["long_ppl_books_128k@8k"]  # another configuration's curve: empty
+    assert row["niah_turns_256k"] == 0.625 and row["niah_turns_256k_turn1"] == 0.9 and row["niah_turns_256k_turn4"] == 0.5
+    assert [row[f"long_ppl_books_256k_{q}"] for q in ("8k", "256k")] == [10., 5.]  # ppl, not bits_per_byte
+    assert row["long_ppl_books_128k_8k"] != row["long_ppl_books_128k_8k"]  # another configuration's curve: empty
