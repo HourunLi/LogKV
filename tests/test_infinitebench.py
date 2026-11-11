@@ -197,5 +197,22 @@ def test_a_named_task_without_its_files_fails_before_the_evaluation(tmp_path, mo
     def offline(*args, **kwargs):
         raise huggingface_hub.errors.LocalEntryNotFoundError("not cached")
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", offline)
-    with pytest.raises(FileNotFoundError, match="is not in the hub cache .*fetch_long_eval_data.py .*--infinitebench"):
+    with pytest.raises(FileNotFoundError, match="nor in the hub cache .*fetch_long_eval_data.py .*--infinitebench"):
         ib.data_file("math_find")
+
+
+def test_the_plain_copy_under_hf_home_is_read_first(tmp_path, monkeypatch, ib):
+    """The fetch script copies the files to <HF_HOME>/infinitebench: the hub cache's links may not reach the
+    machines that evaluate."""
+    monkeypatch.delenv("INFINITEBENCH_DIR", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    (tmp_path / "infinitebench").mkdir()
+    _write_data(tmp_path / "infinitebench")
+    assert ib.data_file("math_find") == str(tmp_path / "infinitebench" / "math_find.jsonl")
+    scope = _eval_functions("_check_task_data", "_infinitebench_files_problem")
+    scope["_check_task_data"](["infinitebench_256k"])
+    (tmp_path / "infinitebench" / "passkey.jsonl").write_text("../../../../blobs/abc")  # a flattened link
+    import huggingface_hub
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda *a, **k: None)
+    with pytest.raises(FileNotFoundError, match=r"\['passkey'\]"):
+        scope["_check_task_data"](["infinitebench_256k"])

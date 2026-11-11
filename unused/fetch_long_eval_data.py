@@ -10,7 +10,8 @@ switches off for itself only, then:
                   litgpt/ruler_patch.py looks first
     LongBench v2  recursal/longbench-v2, every subset lm-eval's longbench2 tasks load (--longbench2)
     InfiniteBench xinrongzhang2022/InfiniteBench, the jsonl files of the ten tasks eval_tasks/infinitebench reads
-                  (--infinitebench; into the hub cache, where they are read without INFINITEBENCH_DIR)
+                  (--infinitebench; into the hub cache, and copied as plain files to <HF_HOME>/infinitebench, where
+                  they are read without INFINITEBENCH_DIR)
     long_ppl      --ppl-data: finds the documents of at least 131072 tokens (32K-128K) and of at least
                   262144 (256K) with --tokenizer and caches both selections the long_ppl tasks use, so
                   eval ranks do not tokenize them again (no 256K document only stops long_ppl_256k);
@@ -273,8 +274,10 @@ def jsonl_rows(path: Path) -> int | None:
 
 
 def fetch_infinitebench(lines: list[str]) -> bool:
-    """InfiniteBench's ten jsonl files into the hub cache (eval_tasks/infinitebench reads them there offline);
-    a file that is not whole jsonl (a cut download, a flattened link) is fetched again."""
+    """InfiniteBench's ten jsonl files into the hub cache, and copied as plain files to <HF_HOME>/infinitebench,
+    where eval_tasks/infinitebench reads them first (the cache's snapshot links may not survive a copy or sync of
+    the cache to the machines that evaluate); a file that is not whole jsonl (a cut download, a flattened link) is
+    fetched again."""
     from huggingface_hub import hf_hub_download
 
     spec = importlib.util.spec_from_file_location(
@@ -294,6 +297,14 @@ def fetch_infinitebench(lines: list[str]) -> bool:
             ok = ok and rows is not None
             lines.append(f"InfiniteBench {name}: " + (f"{rows} samples, {path.stat().st_size / 1e6:.0f} MB"
                                                       if rows else f"NOT whole jsonl ({describe(path)})"))
+            if rows:  # a plain copy, which survives a copy or sync of the cache that drops links
+                plain = Path(utils.plain_folder()) / name
+                if not (plain.is_file() and not plain.is_symlink() and plain.stat().st_size == path.stat().st_size):
+                    plain.parent.mkdir(parents=True, exist_ok=True)
+                    partial = plain.with_name(name + ".partial")
+                    shutil.copyfile(path, partial)
+                    os.replace(partial, plain)
+                lines.append(f"  copied to {plain}")
         except Exception as error:  # noqa: BLE001
             ok = False
             lines.append(f"InfiniteBench {name}: FAILED {type(error).__name__}: {str(error)[:1500]}")

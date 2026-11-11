@@ -15,8 +15,9 @@ The budget is the length, less what the generation needs beyond the window's 102
 so eval.py never cuts the prompt from its start. Contexts shorter than the budget (most samples at 256K; the
 retrieval contexts are about 128K tokens) are kept whole.
 
-Data: the jsonl files of the dataset xinrongzhang2022/InfiniteBench, from INFINITEBENCH_DIR (a folder holding them)
-or the hub cache (unused/fetch_long_eval_data.py --infinitebench downloads them).
+Data: the jsonl files of the dataset xinrongzhang2022/InfiniteBench, from INFINITEBENCH_DIR (a folder holding them),
+else <HF_HOME>/infinitebench, else the hub cache (unused/fetch_long_eval_data.py --infinitebench downloads them into
+the hub cache and copies them to <HF_HOME>/infinitebench).
 """
 from __future__ import annotations
 
@@ -63,13 +64,24 @@ LENGTHS = {"64k": 65536, "128k": 131072, "256k": 262144}
 FETCH = "bash diag.sh unused/fetch_long_eval_data.py --no-ruler-qa --no-babilong --infinitebench"
 
 
+def plain_folder() -> str:
+    """Where fetch_long_eval_data.py --infinitebench also copies the files, as plain files: <HF_HOME>/infinitebench.
+    The hub cache keeps a snapshot file as a link into blobs/, which a copy or sync of the cache to another machine
+    (an object-store bucket) can drop or flatten."""
+    return os.path.join(os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "infinitebench")
+
+
 def data_file(task: str) -> str:
+    """INFINITEBENCH_DIR, else <HF_HOME>/infinitebench, else the hub cache."""
     folder = os.environ.get("INFINITEBENCH_DIR")
     if folder:
         path = os.path.join(folder, f"{task}.jsonl")
         if not os.path.isfile(path):
             raise FileNotFoundError(f"InfiniteBench: {path} is missing (INFINITEBENCH_DIR={folder} must hold the ten "
                                     f"jsonl files of {REPO})")
+        return path
+    path = os.path.join(plain_folder(), f"{task}.jsonl")
+    if os.path.isfile(path):
         return path
     from huggingface_hub import hf_hub_download
 
@@ -79,7 +91,7 @@ def data_file(task: str) -> str:
         from huggingface_hub.constants import HF_HUB_CACHE
 
         raise FileNotFoundError(
-            f"InfiniteBench: {task}.jsonl of {REPO} is not in the hub cache {HF_HUB_CACHE} "
+            f"InfiniteBench: {task}.jsonl of {REPO} is neither in {plain_folder()} nor in the hub cache {HF_HUB_CACHE} "
             f"({type(error).__name__}). Download it online with the same HF_HOME: {FETCH}; or set INFINITEBENCH_DIR "
             f"to a folder holding the ten jsonl files") from error
 
