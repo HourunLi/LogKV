@@ -273,6 +273,29 @@ def jsonl_rows(path: Path) -> int | None:
         return None
 
 
+def copy_plain(source: Path, target: Path, lines: list[str]) -> bool:
+    """Copy ``source`` to ``target`` as a plain file, unless a whole copy is there. Written in place: an object-store
+    mount (the bucket under HF_HOME) refuses renames, so no temporary name; the copy is checked afterwards (its size,
+    and that its first and last lines parse), and a cut copy is written again on the next run."""
+    size = source.stat().st_size
+    if target.is_file() and not target.is_symlink() and target.stat().st_size == size and jsonl_rows(target):
+        lines.append(f"  plain copy {target}: already there")
+        return True
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink():
+        target.unlink()
+    shutil.copyfile(source, target)
+    leftover = target.with_name(target.name + ".partial")  # from an earlier version, which renamed
+    if leftover.exists():
+        try:
+            leftover.unlink()
+        except OSError:
+            lines.append(f"  could not remove {leftover}; delete it by hand")
+    whole = target.stat().st_size == size and jsonl_rows(target) is not None
+    lines.append(f"  plain copy {target}: " + ("ok" if whole else f"NOT whole ({describe(target)})"))
+    return whole
+
+
 def fetch_infinitebench(lines: list[str]) -> bool:
     """InfiniteBench's ten jsonl files into the hub cache, and copied as plain files to <HF_HOME>/infinitebench,
     where eval_tasks/infinitebench reads them first (the cache's snapshot links may not survive a copy or sync of
@@ -299,12 +322,7 @@ def fetch_infinitebench(lines: list[str]) -> bool:
                                                       if rows else f"NOT whole jsonl ({describe(path)})"))
             if rows:  # a plain copy, which survives a copy or sync of the cache that drops links
                 plain = Path(utils.plain_folder()) / name
-                if not (plain.is_file() and not plain.is_symlink() and plain.stat().st_size == path.stat().st_size):
-                    plain.parent.mkdir(parents=True, exist_ok=True)
-                    partial = plain.with_name(name + ".partial")
-                    shutil.copyfile(path, partial)
-                    os.replace(partial, plain)
-                lines.append(f"  copied to {plain}")
+                ok = copy_plain(path, plain, lines) and ok
         except Exception as error:  # noqa: BLE001
             ok = False
             lines.append(f"InfiniteBench {name}: FAILED {type(error).__name__}: {str(error)[:1500]}")
