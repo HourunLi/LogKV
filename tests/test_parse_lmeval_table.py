@@ -108,7 +108,7 @@ def test_the_header_keeps_each_length_together(parse):
     for n, shape in shapes.items():
         assert shape == [c for c in full if c in shape], n
     assert len(shapes["64k"]) == 44 and len(shapes["256k"]) == 45
-    assert not any(c.startswith("infinitebench") or c == "AVG_InfiniteBench_<n>" for c in shapes["32k"])  # 64K on
+    assert "AVG_InfiniteBench_<n>" in shapes["32k"] and len(shapes["32k"]) == 43
     assert [c for c in shapes["32k"] if c.startswith("long_ppl")] == [
         "long_ppl_books_<n>_8k", "long_ppl_books_<n>_16k", "long_ppl_books_<n>_32k", "long_ppl_<n>"]
     assert "ruler_qa_squad_<n>" not in shapes["256k"] and "long_ppl_books_<n>_256k" in shapes["256k"]
@@ -141,7 +141,7 @@ def test_each_average_follows_its_tasks(parse):
     header = list(parse.build_table({"m": ""}).columns)
     for n in ("32k", "64k", "128k", "256k"):
         for avg in (f"AVG_NIAH_{n}", f"AVG_NIAH_multi_{n}", f"AVG_RULER_{n}", f"AVG_babilong_{n}",
-                    *([f"AVG_InfiniteBench_{n}"] if n != "32k" else [])):
+                    f"AVG_InfiniteBench_{n}"):
             places = sorted(header.index(t) for t in parse.AVG_GROUPS[avg])
             assert header.index(avg) == places[-1] + 1, avg
             if avg != f"AVG_RULER_{n}":  # AVG_RULER averages all of RULER, after its last group

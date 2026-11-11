@@ -3,8 +3,8 @@
 # YaRN 默认按长度取倍数（YARN_MODE=per_length：32K 不用，64K 2、128K 4、256K 8，原长 32768，与 Qwen 的 rope_scaling 相同），
 # YARN_MODE=fixed 时每档都用最长一档的倍数（按该长度部署的模型），结果写到 <output_path>/yarn<F>/long<L>。
 # 每档：NIAH 阶段跑 RULER（256K 为 12 个，不含 ruler_qa_squad），主阶段跑 BABILong、long_ppl_<L>（LONG_PPL_DATA）、
-# long_ppl_books_<L>（LONG_PPL_BOOKS）、niah_turns_<L>、longbench2_<L> 与 infinitebench_<L>（64K 起；
-# INFINITEBENCH_DIR，不设读 hub 缓存），每个任务 100 条。外部变量控制范围：
+# long_ppl_books_<L>（LONG_PPL_BOOKS）、niah_turns_<L>、longbench2_<L> 与 infinitebench_<L>
+#（INFINITEBENCH_DIR，不设读 <HF_HOME>/infinitebench 或 hub 缓存），每个任务 100 条。外部变量控制范围：
 #   EVAL_LENGTHS=32k,128k            只测这些长度（默认 eval_lengths 全部）
 #   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench   只跑这些类（默认全部；默认时缺数据的
 #                                    ppl / books、文件不完整的 longbench2 / infinitebench 跳过）

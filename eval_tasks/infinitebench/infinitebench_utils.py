@@ -1,5 +1,5 @@
 """InfiniteBench (Zhang et al., 2024, "∞Bench: Extending Long Context Evaluation Beyond 100K Tokens") at a fixed
-context budget: infinitebench_<task>_<64k|128k|256k>, grouped as infinitebench_<length>.
+context budget: infinitebench_<task>_<32k|64k|128k|256k>, grouped as infinitebench_<length>.
 
 The ten tasks that KV-cache papers report (MInference, LAVa, ReST-KV ...): Retr.PassKey, Retr.Number, Retr.KV,
 En.Sum, En.QA, En.MC, Zh.QA, En.Dia, Code.Debug, Math.Find. Code.Run and Math.Calc, near zero for every model in
@@ -13,7 +13,9 @@ As the official code (OpenBMB/InfiniteBench, src/eval_yarn_mistral.py, src/compu
   match, option letter, token F1, character F1 for Chinese, ROUGE-Lsum for the summary).
 The budget is the length, less what the generation needs beyond the window's 1024-token margin (En.Sum's 1200),
 so eval.py never cuts the prompt from its start. Contexts shorter than the budget (most samples at 256K; the
-retrieval contexts are about 128K tokens) are kept whole.
+retrieval contexts are about 128K tokens) are kept whole. At 32K (the trained length, no YaRN) almost every context
+is cut to its first and last 16K tokens: a retrieval needle in the middle is gone, so 32K is the reference that shows
+what the longer budgets add, not a test of retrieval.
 
 Data: the jsonl files of the dataset xinrongzhang2022/InfiniteBench, from INFINITEBENCH_DIR (a folder holding them),
 else <HF_HOME>/infinitebench, else the hub cache (unused/fetch_long_eval_data.py --infinitebench downloads them into
@@ -58,7 +60,7 @@ TASKS = {
                    "D. {OPTION_D}\n\nThe correct option is:", 5),
     "math_find": ("{prefix}\n\n{context}\n\n{input}", 3),
 }
-LENGTHS = {"64k": 65536, "128k": 131072, "256k": 262144}
+LENGTHS = {"32k": 32768, "64k": 65536, "128k": 131072, "256k": 262144}
 
 
 FETCH = "bash diag.sh unused/fetch_long_eval_data.py --no-ruler-qa --no-babilong --infinitebench"
