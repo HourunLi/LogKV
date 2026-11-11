@@ -742,7 +742,7 @@ fi
 # ==============================================================================
 # 长文本评测（训练后接着跑，见 long_eval_plan.py）：32K / 64K / 128K / 256K 逐档，每档窗口为长度 + 1024，YaRN 按长度取
 # 倍数（32K 不用，64K 2、128K 4、256K 8；YARN_MODE=fixed 时都用最长一档的倍数），NIAH 阶段跑该长度的 RULER，主阶段跑
-# BABILong、long_ppl、long_ppl_books、niah_turns、longbench2 与 infinitebench（64K 起），每个任务 LONG_EVAL_LIMIT（默认 100）条，结果写到
+# BABILong、long_ppl、long_ppl_books、niah_turns、longbench2 与 infinitebench，每个任务 LONG_EVAL_LIMIT（默认 100）条，结果写到
 # evaluate/long<L>（fixed：evaluate/yarn<F>/long<L>）。
 #   EVAL_LENGTHS=none 关掉；EVAL_LENGTHS=64k,256k 只测这些长度（默认 YAML 的 eval_lengths，否则全部）；
 #   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench 只跑这些类；NIAH_ONLY=1 只跑 RULER。

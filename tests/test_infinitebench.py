@@ -95,7 +95,7 @@ def test_the_groups_cut_long_contexts_in_the_middle(tmp_path, monkeypatch):
     scope = dict(inspect=inspect, EVAL_TASKS_DIR=ROOT / "eval_tasks")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     manager = scope["_task_manager"]({"pretrained": "unused", "max_seq_lengths": [65536]})
-    assert {f"infinitebench_{n}" for n in ("64k", "128k", "256k")} <= set(manager.all_groups)
+    assert {f"infinitebench_{n}" for n in ("32k", "64k", "128k", "256k")} <= set(manager.all_groups)
     tasks = get_task_dict(["infinitebench_64k"], manager)
     flat = {name: task for group in tasks.values() for name, task in group.items()} \
         if all(isinstance(v, dict) for v in tasks.values()) else tasks

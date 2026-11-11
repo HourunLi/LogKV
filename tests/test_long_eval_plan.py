@@ -32,7 +32,7 @@ def test_per_length_passes_take_the_factor_their_length_needs():
                                  "longbench2_64k", "infinitebench_64k"]
     # Default suites: data may be missing (LongBench v2's or InfiniteBench's files may not be whole).
     assert passes[1]["optional"] == ["long_ppl_64k", "long_ppl_books_64k", "longbench2_64k", "infinitebench_64k"]
-    assert "infinitebench_32k" not in passes[0]["main"]  # InfiniteBench from 64K on
+    assert passes[0]["main"][-1] == "infinitebench_32k"  # InfiniteBench at 32K too: the reference
 
 
 def test_fixed_passes_share_the_longest_lengths_factor():
@@ -97,7 +97,7 @@ def test_the_launcher_runs_one_pass_per_length(tmp_path):
     assert passes[3][2] == ("babilong_256k,long_ppl_256k,long_ppl_books_256k,niah_turns_256k,longbench2_256k,"
                             "infinitebench_256k")
     assert "ruler_qa_squad" not in passes[3][3] and passes[3][4] == "[262144]"
-    assert passes[0][5] == "long_ppl_32k,long_ppl_books_32k,longbench2_32k"
+    assert passes[0][5] == "long_ppl_32k,long_ppl_books_32k,longbench2_32k,infinitebench_32k"
 
     done, passes = _launcher(tmp_path, config, env=dict(EVAL_LENGTHS="128k", EVAL_SUITES="turns", YARN_MODE="fixed"))
     assert done.returncode == 0, done.stderr
@@ -166,7 +166,7 @@ def test_majob_runs_the_long_passes_after_training(tmp_path):
         f"/ckpt/evaluate/long{n}" for n in ("64k", "64k", "128k", "128k", "256k", "256k")]
     # 32K: only what the main line did not measure (its main stage ran the turns and the book curve, its NIAH
     # stage the eight needles at 32768).
-    assert calls[0]["--benchmark"] == "babilong_32k,long_ppl_32k,longbench2_32k"
+    assert calls[0]["--benchmark"] == "babilong_32k,long_ppl_32k,longbench2_32k,infinitebench_32k"
     assert calls[1]["--benchmark"] == "ruler_vt,ruler_cwe,ruler_fwe,ruler_qa_squad,ruler_qa_hotpot"
     assert calls[2]["--benchmark"] == ("babilong_64k,long_ppl_64k,long_ppl_books_64k,niah_turns_64k,longbench2_64k,"
                                        "infinitebench_64k")
