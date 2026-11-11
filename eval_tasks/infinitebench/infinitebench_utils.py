@@ -64,36 +64,90 @@ LENGTHS = {"64k": 65536, "128k": 131072, "256k": 262144}
 FETCH = "bash diag.sh unused/fetch_long_eval_data.py --no-ruler-qa --no-babilong --infinitebench"
 
 
+def hf_home() -> str:
+    return os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+
+
 def plain_folder() -> str:
     """Where fetch_long_eval_data.py --infinitebench also copies the files, as plain files: <HF_HOME>/infinitebench.
     The hub cache keeps a snapshot file as a link into blobs/, which a copy or sync of the cache to another machine
     (an object-store bucket) can drop or flatten."""
-    return os.path.join(os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "infinitebench")
+    return os.path.join(hf_home(), "infinitebench")
+
+
+def hub_folder() -> str:
+    cache = os.environ.get("HF_HUB_CACHE") or os.path.join(hf_home(), "hub")
+    return os.path.join(cache, "datasets--" + REPO.replace("/", "--"))
+
+
+def state(path: str) -> str:
+    """What is at ``path``, for an error message: missing, a (dangling) link, or a file and its size."""
+    if os.path.islink(path):
+        return f"a link to {os.readlink(path)}" + ("" if os.path.exists(path) else " (dangling)")
+    return f"{os.path.getsize(path)} bytes" if os.path.exists(path) else "missing"
+
+
+def _whole(path: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) >= 1024  # under 1 KiB: a flattened link, not data
+
+
+def flattened_target(path: str):
+    """The blob a hub-cache link points to, when a copy or sync turned the link into a small file holding its text
+    (``../../blobs/<sha256>``); else None."""
+    if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > 512:
+        return None
+    with open(path, "rb") as f:
+        text = f.read().decode(errors="ignore").strip()
+    if "/blobs/" not in text or "\n" in text:
+        return None
+    return os.path.normpath(os.path.join(os.path.dirname(path), text))
+
+
+def locate(task: str):
+    """(path, "") of the task's jsonl file on disk, or (None, what each place holds). In order: INFINITEBENCH_DIR;
+    <HF_HOME>/infinitebench; the hub cache's snapshots (refs/main's first, then any other), following a live link,
+    or a flattened one to its blob in blobs/."""
+    name = f"{task}.jsonl"
+    folder = os.environ.get("INFINITEBENCH_DIR")
+    if folder:
+        path = os.path.join(folder, name)
+        return (path, "") if _whole(path) else (None, f"{path}: {state(path)}")
+    plain = os.path.join(plain_folder(), name)
+    if _whole(plain):
+        return plain, ""
+    seen = [f"{plain}: {state(plain)}"]
+    hub = hub_folder()
+    ref, snapshots = os.path.join(hub, "refs", "main"), os.path.join(hub, "snapshots")
+    order = []
+    if os.path.isfile(ref):
+        with open(ref) as f:
+            order.append(f.read().strip())
+    if os.path.isdir(snapshots):
+        order += [h for h in sorted(os.listdir(snapshots)) if h not in order]
+    for commit in order:
+        entry = os.path.join(snapshots, commit, name)
+        if _whole(entry):
+            return entry, ""
+        target = flattened_target(entry)
+        if target and _whole(target):
+            return target, ""
+        seen.append(f"snapshots/{commit}/{name}: {state(entry)}" + (f" -> {state(target)}" if target else ""))
+    seen.append(f"hub cache {hub}: refs/main {state(ref)}, {len(order)} snapshot(s)")
+    return None, "; ".join(seen)
 
 
 def data_file(task: str) -> str:
-    """INFINITEBENCH_DIR, else <HF_HOME>/infinitebench, else the hub cache."""
-    folder = os.environ.get("INFINITEBENCH_DIR")
-    if folder:
-        path = os.path.join(folder, f"{task}.jsonl")
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"InfiniteBench: {path} is missing (INFINITEBENCH_DIR={folder} must hold the ten "
-                                    f"jsonl files of {REPO})")
+    path, seen = locate(task)
+    if path:
         return path
-    path = os.path.join(plain_folder(), f"{task}.jsonl")
-    if os.path.isfile(path):
-        return path
-    from huggingface_hub import hf_hub_download
+    if os.environ.get("HF_HUB_OFFLINE") not in ("1", "true", "True", "ON", "on", "yes"):
+        from huggingface_hub import hf_hub_download
 
-    try:
         return hf_hub_download(REPO, f"{task}.jsonl", repo_type="dataset")
-    except Exception as error:  # noqa: BLE001 - offline and not in the cache
-        from huggingface_hub.constants import HF_HUB_CACHE
-
-        raise FileNotFoundError(
-            f"InfiniteBench: {task}.jsonl of {REPO} is neither in {plain_folder()} nor in the hub cache {HF_HUB_CACHE} "
-            f"({type(error).__name__}). Download it online with the same HF_HOME: {FETCH}; or set INFINITEBENCH_DIR "
-            f"to a folder holding the ten jsonl files") from error
+    raise FileNotFoundError(
+        f"InfiniteBench: {task}.jsonl of {REPO} is not on this machine ({seen}). Download it online with the same "
+        f"HF_HOME ({FETCH}), make sure this machine sees the result, or set INFINITEBENCH_DIR to a folder holding the "
+        f"ten jsonl files")
 
 
 def prompt_of(task: str, eg: dict) -> str:

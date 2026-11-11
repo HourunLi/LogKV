@@ -108,7 +108,7 @@ def check_infinitebench(report) -> None:
                         rows += 1
             report(rows > 0, f"InfiniteBench {task}: {rows} samples in {path}")
         except Exception as error:  # noqa: BLE001
-            report(False, f"InfiniteBench {task}: {type(error).__name__}: {str(error)[:200]}")
+            report(False, f"InfiniteBench {task}: {type(error).__name__}: {str(error)[:800]}")
 
 
 def check_ppl(report, tokenizer: str | None) -> None:

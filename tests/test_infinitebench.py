@@ -136,10 +136,10 @@ def _eval_functions(*names):
 
     source = ROOT / "eval.py"
     nodes = [n for n in ast.parse(source.read_text()).body
-             if (isinstance(n, ast.FunctionDef) and n.name in (*names, "_file_state"))
+             if (isinstance(n, ast.FunctionDef) and n.name in names)
              or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") in ("_LENGTH_NAMED_TASK",
                                                                                    "INFINITEBENCH_FILES"))]
-    scope = dict(re=re, os=os, Path=Path, _is_main=lambda: True)
+    scope = dict(re=re, os=os, Path=Path, _is_main=lambda: True, EVAL_TASKS_DIR=ROOT / "eval_tasks")
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
     return scope
 
@@ -186,18 +186,16 @@ def test_a_named_task_without_its_files_fails_before_the_evaluation(tmp_path, mo
     with pytest.raises(FileNotFoundError, match="fetch_long_eval_data.py --infinitebench"):
         scope["_check_task_data"](["piqa", "infinitebench_64k"])
     scope["_check_task_data"](["piqa"])  # no InfiniteBench task: nothing to check
-    with pytest.raises(FileNotFoundError, match="must hold the ten jsonl files"):
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    with pytest.raises(FileNotFoundError, match="passkey.jsonl: missing"):
         ib.data_file("passkey")
     _write_data(tmp_path)
     scope["_check_task_data"](["infinitebench_64k"])
     monkeypatch.delenv("INFINITEBENCH_DIR")
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    import huggingface_hub
-
-    def offline(*args, **kwargs):
-        raise huggingface_hub.errors.LocalEntryNotFoundError("not cached")
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", offline)
-    with pytest.raises(FileNotFoundError, match="nor in the hub cache .*fetch_long_eval_data.py .*--infinitebench"):
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    with pytest.raises(FileNotFoundError, match="not on this machine .*refs/main missing.*fetch_long_eval_data.py "
+                                                ".*--infinitebench"):
         ib.data_file("math_find")
 
 
@@ -205,6 +203,7 @@ def test_the_plain_copy_under_hf_home_is_read_first(tmp_path, monkeypatch, ib):
     """The fetch script copies the files to <HF_HOME>/infinitebench: the hub cache's links may not reach the
     machines that evaluate."""
     monkeypatch.delenv("INFINITEBENCH_DIR", raising=False)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", str(tmp_path))
     (tmp_path / "infinitebench").mkdir()
     _write_data(tmp_path / "infinitebench")
@@ -212,7 +211,35 @@ def test_the_plain_copy_under_hf_home_is_read_first(tmp_path, monkeypatch, ib):
     scope = _eval_functions("_check_task_data", "_infinitebench_files_problem")
     scope["_check_task_data"](["infinitebench_256k"])
     (tmp_path / "infinitebench" / "passkey.jsonl").write_text("../../../../blobs/abc")  # a flattened link
-    import huggingface_hub
-    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda *a, **k: None)
-    with pytest.raises(FileNotFoundError, match=r"\['passkey'\]"):
+    with pytest.raises(FileNotFoundError, match=r"\['passkey'\].*passkey.jsonl: \d+ bytes; hub cache"):
         scope["_check_task_data"](["infinitebench_256k"])
+
+
+def test_the_hub_cache_is_read_through_flattened_links(tmp_path, monkeypatch, ib):
+    """A copy or sync of the hub cache can turn a snapshot's link into a small file holding the link's text, and
+    lose refs/main: the snapshot entry is followed to its blob."""
+    monkeypatch.delenv("INFINITEBENCH_DIR", raising=False)
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    hub = tmp_path / "hub" / "datasets--xinrongzhang2022--InfiniteBench"
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_data(data)
+    (hub / "blobs").mkdir(parents=True)
+    snapshot = hub / "snapshots" / "c0ffee"
+    snapshot.mkdir(parents=True)
+    for i, task in enumerate(ib.TASKS):
+        (hub / "blobs" / f"sha{i}").write_bytes((data / f"{task}.jsonl").read_bytes())
+        link = f"../../blobs/sha{i}"
+        if task == "passkey":
+            (snapshot / f"{task}.jsonl").symlink_to(link)  # a live link
+        else:
+            (snapshot / f"{task}.jsonl").write_text(link)  # flattened
+    assert ib.data_file("passkey") == str(snapshot / "passkey.jsonl")
+    assert ib.data_file("math_find") == str(hub / "blobs" / f"sha{list(ib.TASKS).index('math_find')}")
+    scope = _eval_functions("_check_task_data", "_infinitebench_files_problem")
+    scope["_check_task_data"](["infinitebench_64k"])
+    (hub / "blobs" / "sha1").unlink()  # number_string's blob did not arrive
+    with pytest.raises(FileNotFoundError, match=r"number_string.jsonl: \d+ bytes -> missing"):
+        scope["_check_task_data"](["infinitebench_64k"])
