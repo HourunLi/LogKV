@@ -509,12 +509,16 @@ INFINITEBENCH_FILES = ("passkey", "number_string", "kv_retrieval", "longbook_sum
 
 def _infinitebench_files_problem():
     """Why InfiniteBench's data cannot be read offline, or None: its tasks read the jsonl files from
-    INFINITEBENCH_DIR or the hub cache (eval_tasks/infinitebench; unused/fetch_long_eval_data.py --infinitebench)."""
+    INFINITEBENCH_DIR, else <HF_HOME>/infinitebench, else the hub cache (eval_tasks/infinitebench;
+    unused/fetch_long_eval_data.py --infinitebench). A file under 1 KiB is a flattened hub-cache link, not data."""
     folder = os.environ.get("INFINITEBENCH_DIR")
+    plain = os.path.join(os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "infinitebench")
     missing = []
     for name in INFINITEBENCH_FILES:
         if folder:
             path = os.path.join(folder, f"{name}.jsonl")
+        elif os.path.isfile(os.path.join(plain, f"{name}.jsonl")):
+            path = os.path.join(plain, f"{name}.jsonl")
         else:
             try:
                 from huggingface_hub import try_to_load_from_cache
@@ -525,7 +529,7 @@ def _infinitebench_files_problem():
         if not isinstance(path, str) or not os.path.isfile(path) or os.path.getsize(path) < 1024:
             missing.append(name)
     if missing:
-        where = f"INFINITEBENCH_DIR={folder}" if folder else "the hub cache (INFINITEBENCH_DIR is not set)"
+        where = f"INFINITEBENCH_DIR={folder}" if folder else f"{plain} and the hub cache (INFINITEBENCH_DIR is not set)"
         return (f"InfiniteBench files missing or cut in {where}: {missing[:3]}"
                 + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
                 + " (unused/fetch_long_eval_data.py --infinitebench)")
