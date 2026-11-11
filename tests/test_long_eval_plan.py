@@ -153,6 +153,10 @@ def test_the_full_evaluation_runs_the_main_line_then_every_length(tmp_path):
     assert [p[1].rsplit(" ", 1)[-1] for p in passes] == ["2", "2", "2"]
     done, passes = _launcher(tmp_path, config, env=dict(EVAL_LENGTHS="none"))  # the main line only
     assert [p[0] for p in passes] == ["/out"]
+    tagged = tmp_path / "tagged.yaml"  # several methods on one checkpoint: one folder each
+    tagged.write_text("checkpoint_dir: /ckpt\neval_lengths: [64k]\neval_main: true\neval_tag: full_query\n")
+    done, passes = _launcher(tmp_path, tagged)
+    assert [p[0] for p in passes] == ["/ckpt/evaluate/full_query", "/ckpt/evaluate/full_query/long64k"]
     done, passes = _launcher(tmp_path, config, env=dict(EVAL_MAIN="0"))  # the lengths only, as eval_long_*.yaml
     assert [p[0] for p in passes] == ["/out/long32k", "/out/long64k"]
     assert passes[0][2].endswith("niah_turns_32k,longbench2_32k,infinitebench_32k")
