@@ -79,7 +79,8 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
 GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
     p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml", "eval_gamma_query*.yaml",
                            "arc_niah_*.yaml", "eval_niah_*.yaml", "eval_gamma_surprisal*.yaml",
-                           "eval_long*_baseline.yaml", "eval_long*_word_first.yaml")
+                           "eval_long*_baseline.yaml", "eval_long*_word_first.yaml", "eval_full_baseline.yaml",
+                           "eval_full_word_first.yaml")
     for p in EXP.glob(pattern))
 
 
@@ -281,7 +282,8 @@ def test_only_surprisal_evaluations_rank_by_surprisal(name):
                 "eval_gamma_surprisal_mean_query_p1024.yaml": "mean", "eval_gamma_surprisal_mix_query_p1024.yaml": "mix",
                 "eval_gamma_surprisal_word_first_query_p1024.yaml": "word_first",
                 **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "word_first", "multi_word")},
-                **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k", "256k", "")}}
+                **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k", "256k", "")},
+                "eval_full_word_first.yaml": "word_first"}
     assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
 
 
@@ -337,3 +339,15 @@ def test_one_yaml_per_method_covers_every_length(name):
     assert "config_overrides" not in evaluated
     if name == "dense":  # passes write to its long<L> folders, where the per-length dense runs wrote
         assert evaluated["output_path"] + "/long64k" == effective("eval_long64k_dense.yaml")["output_path"]
+
+
+
+@pytest.mark.parametrize("name", sorted(LONG))
+def test_one_yaml_per_method_runs_everything(name):
+    """eval_full_<method>.yaml: eval_long_<method>.yaml with the 32K main line first (eval.sh's default lists, no
+    limit) and long_limit samples per task in the length passes."""
+    evaluated, longs = effective(f"eval_full_{name}.yaml"), effective(f"eval_long_{name}.yaml")
+    assert {k for k in set(evaluated) | set(longs) if evaluated.get(k) != longs.get(k)} == {
+        "eval_main", "long_limit", "limit", *(("benchmark",) if name == "dense" else ())}
+    assert evaluated["eval_main"] is True and evaluated["long_limit"] == 100 and evaluated.get("limit") is None
+    assert not evaluated.get("benchmark") and not evaluated.get("niah_benchmark")  # the default (full) lists

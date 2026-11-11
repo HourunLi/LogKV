@@ -22,8 +22,10 @@ out, with the reason, when their data is not given (or their files are not whole
 
     python long_eval_plan.py <lengths> <suites or ""> <yarn_mode> <niah_only 0/1> <base overrides json or ""> <output dir> [skip]
 
-skip lists what an earlier stage of the same job already measured (majob.sh's main line): a main task by name,
-a RULER task at a length as task@length (e.g. niah_single_1@32768); a pass left with nothing to run is dropped.
+skip lists what an earlier stage of the same job already measured (majob.sh's main line, eval.sh's full
+evaluation): a main task by name, a RULER task at a length as task@length (e.g. niah_single_1@32768); a pass left
+with nothing to run is dropped. "python long_eval_plan.py measured <main tasks> <NIAH tasks> <lengths json>" prints
+that list for a main line.
 
 prints one line per pass, fields separated by "|": output dir, config overrides (json), RULER lengths (json),
 main tasks, NIAH tasks (comma lists, or none), optional tasks.
@@ -96,7 +98,17 @@ def plan(lengths: str, suites: str = "", yarn_mode: str = "per_length", niah_onl
     return passes
 
 
+def measured(main_tasks: str, niah_tasks: str, lengths: list) -> list[str]:
+    """What a main line with these task lists measured, as plan()'s skip: its tasks by name, its NIAH tasks as
+    task@length at each of its lengths."""
+    done = [t for t in main_tasks.split(",") if t and main_tasks != "none"]
+    return done + [f"{t}@{int(n)}" for t in niah_tasks.split(",") if t and niah_tasks != "none" for n in lengths]
+
+
 def main(argv: list[str]) -> None:
+    if argv and argv[0] == "measured":  # measured <main tasks> <NIAH tasks> <lengths json>
+        print(",".join(measured(argv[1], argv[2], json.loads(argv[3]))))
+        return
     lengths, suites, yarn_mode, niah_only, base, output_dir, *rest = argv
     skip = {t for t in (rest[0] if rest else "").split(",") if t}
     for p in plan(lengths, suites, yarn_mode or "per_length", niah_only == "1",

@@ -50,7 +50,9 @@ def _eval_settings(config):
     start = source.index("# RULER / NIAH context lengths")
     meta = source[start:source.index('\n', source.index("META=", start))]
     shell = '\n'.join(('set -e', 'CONFIG_FILE=$1', 'set --', read_config, build_args, niah, meta,
-                       'printf "%s\\n" "${LOG_KV_ARG_LIST[@]}"', 'echo "NIAH=${NIAH_BENCHMARKS}"', 'echo "META=${META}"'))
+                       # the main stage's arguments: LOG_KV_ARG_LIST and its own overrides and limit
+                       'printf "%s\\n" "${LOG_KV_ARG_LIST[@]}" "${MAIN_ARGS[@]}"', 'echo "NIAH=${NIAH_BENCHMARKS}"',
+                       'echo "META=${META}"'))
     env = {**os.environ, "PYTHON_BIN": sys.executable,
            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
     shell += '\necho "LONG_PPL=${CONFIG_LONG_PPL_DATA}"'

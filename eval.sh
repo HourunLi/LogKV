@@ -10,6 +10,8 @@
 #   Several lengths (a YAML with eval_lengths, e.g. exp/qwen1.7b-32k/eval_long_word_first.yaml; long_eval_plan.py):
 #     [EVAL_LENGTHS=32k,128k] [EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench] [YARN_MODE=fixed] [NIAH_ONLY=1] \
 #         bash eval.sh <yaml>
+#   Everything (the 32K main line, then every length; exp/qwen1.7b-32k/eval_full_<method>.yaml, eval_main: true):
+#     [LIMIT=2] [EVAL_LENGTHS=none] [EVAL_SUITES=...] bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 #
 # Examples:
 #   bash eval.sh exp/qwen1.7b-32k/arc.yaml
@@ -288,6 +290,9 @@ emit("CONFIG_LONG_PPL_BOOKS", cfg.get("long_ppl_books") or "")  # long_ppl_books
 emit("CONFIG_EVAL_LENGTHS", ",".join(str(x) for x in (cfg.get("eval_lengths") or [])))
 emit("CONFIG_BABILONG_DATASET", cfg.get("babilong_dataset") or "")
 emit("CONFIG_INFINITEBENCH_DIR", cfg.get("infinitebench_dir") or "")  # eval_tasks/infinitebench
+# The full evaluation (eval_main: true): the 32K main line, then the length passes with their own samples per task.
+emit("CONFIG_EVAL_MAIN", "1" if cfg.get("eval_main") else "")
+emit("CONFIG_LONG_LIMIT", cfg.get("long_limit") or "")
 EOF
 )
 CONFIG_STATUS=$?
@@ -309,19 +314,17 @@ if [ -n "${INFINITEBENCH_DIR}" ]; then export INFINITEBENCH_DIR; fi
 # Several lengths in one job (eval_lengths in the YAML, or EVAL_LENGTHS=32k,128k): one pass per length with its
 # own window and YaRN factor (YARN_MODE=per_length, the default, or fixed), tasks chosen by EVAL_SUITES and
 # NIAH_ONLY=1; see long_eval_plan.py. Each pass writes to <output_path>/long<L> (fixed: yarn<F>/long<L>).
+# The full evaluation (eval_main: true in the YAML, or EVAL_MAIN=1) runs the 32K main line first (the default task
+# lists, main and NIAH stage, the YAML's limit, into <output_path>), then the passes (long_limit samples per task),
+# which leave out what the main line measured; EVAL_LENGTHS=none keeps the main line only.
 EVAL_LENGTHS=${EVAL_LENGTHS:-${CONFIG_EVAL_LENGTHS}}
-LONG_EVAL_PASSES=()
-if [ -n "${EVAL_LENGTHS}" ]; then
-    if [ -n "${2:-}" ] || [ -n "${3:-}" ]; then
-        echo "ERROR: ${CONFIG_FILE} evaluates several lengths (EVAL_LENGTHS=${EVAL_LENGTHS}): choose tasks with EVAL_SUITES or NIAH_ONLY=1, not task-list arguments."
-        exit 1
-    fi
-    LONG_EVAL_PLAN=$("${PYTHON_BIN}" long_eval_plan.py "${EVAL_LENGTHS}" "${EVAL_SUITES:-}" "${YARN_MODE:-per_length}" \
-        "${NIAH_ONLY:-0}" "${CONFIG_OVERRIDES}" "${EVAL_OUTPUT_DIR}") || exit 1
-    mapfile -t LONG_EVAL_PASSES <<< "${LONG_EVAL_PLAN}"
-    CONFIG_OVERRIDES=""  # each pass brings its own, the YAML's merged in
-    echo "Long-context passes (YARN_MODE=${YARN_MODE:-per_length}, EVAL_SUITES=${EVAL_SUITES:-all}):"
-    printf '  %s\n' "${LONG_EVAL_PASSES[@]}"
+case "$(printf '%s' "${EVAL_LENGTHS}" | tr '[:upper:]' '[:lower:]')" in
+    none|off|false|0) EVAL_LENGTHS="" ;;
+esac
+EVAL_MAIN=${EVAL_MAIN:-${CONFIG_EVAL_MAIN}}
+if [ -n "${EVAL_LENGTHS}" ] && { [ -n "${2:-}" ] || [ -n "${3:-}" ]; }; then
+    echo "ERROR: ${CONFIG_FILE} evaluates several lengths (EVAL_LENGTHS=${EVAL_LENGTHS}): choose tasks with EVAL_SUITES or NIAH_ONLY=1, not task-list arguments."
+    exit 1
 fi
 
 checkpoint_exists() {
@@ -467,12 +470,16 @@ fi
 if [ -n "${SWA_WINDOW_SIZE}" ]; then
     LOG_KV_ARG_LIST+=(--swa_window_size "${SWA_WINDOW_SIZE}")
 fi
-if [ -n "${CONFIG_OVERRIDES}" ]; then
-    LOG_KV_ARG_LIST+=(--config_overrides "${CONFIG_OVERRIDES}")
-fi
 EVAL_LIMIT=${LIMIT:-${EVAL_LIMIT}}  # LIMIT=2 overrides the YAML's samples per task for one run (e.g. a memory check)
+# The length passes' samples per task: long_limit (the full evaluation), else the YAML's limit.
+LONG_EVAL_LIMIT=${LIMIT:-${LONG_EVAL_LIMIT:-${CONFIG_LONG_LIMIT:-${EVAL_LIMIT}}}}
+# What the main line runs with (the length passes bring their own overrides and limit).
+MAIN_ARGS=()
+if [ -n "${CONFIG_OVERRIDES}" ]; then
+    MAIN_ARGS+=(--config_overrides "${CONFIG_OVERRIDES}")
+fi
 if [ -n "${EVAL_LIMIT}" ]; then
-    LOG_KV_ARG_LIST+=(--limit "${EVAL_LIMIT}")
+    MAIN_ARGS+=(--limit "${EVAL_LIMIT}")
 fi
 DIAG_ARGS=${DIAG_ARGS:-}
 # 打分头文件由 retention.sh 写出（训练与评测共用 eval_niah_*.yaml 里的同一路径）；缺失时在加载模型前停下。
@@ -629,6 +636,20 @@ for TASK_LIST in "${BENCHMARKS}" "${NIAH_BENCHMARKS}"; do
             exit 1 ;;
     esac
 done
+# The length passes (long_eval_plan.py), each merging its window and YaRN into the YAML's overrides; after the main
+# line (EVAL_MAIN=1) they leave out its tasks and its NIAH tasks at its lengths.
+LONG_EVAL_PASSES=()
+if [ -n "${EVAL_LENGTHS}" ]; then
+    LONG_EVAL_SKIP=""
+    if [ "${EVAL_MAIN}" = "1" ]; then
+        LONG_EVAL_SKIP=$("${PYTHON_BIN}" long_eval_plan.py measured "${BENCHMARKS}" "${NIAH_BENCHMARKS}" "${EVAL_MAX_SEQ_LENGTHS}") || exit 1
+    fi
+    LONG_EVAL_PLAN=$("${PYTHON_BIN}" long_eval_plan.py "${EVAL_LENGTHS}" "${EVAL_SUITES:-}" "${YARN_MODE:-per_length}" \
+        "${NIAH_ONLY:-0}" "${CONFIG_OVERRIDES}" "${EVAL_OUTPUT_DIR}" "${LONG_EVAL_SKIP}") || exit 1
+    mapfile -t LONG_EVAL_PASSES <<< "${LONG_EVAL_PLAN}"
+    echo "Long-context passes (YARN_MODE=${YARN_MODE:-per_length}, EVAL_SUITES=${EVAL_SUITES:-all}, main line first: ${EVAL_MAIN:-0}):"
+    printf '  %s\n' "${LONG_EVAL_PASSES[@]}"
+fi
 # The main stage, then the NIAH stage, with the current task lists, lengths, output dir and PASS_ARGS.
 run_stages() {
     echo "Main benchmarks: ${BENCHMARKS}"
@@ -696,19 +717,24 @@ run_stages() {
     fi
 }
 
-if [ ${#LONG_EVAL_PASSES[@]} -eq 0 ]; then
-    PASS_ARGS=()
+if [ -z "${EVAL_LENGTHS}" ] || [ "${EVAL_MAIN}" = "1" ]; then
+    PASS_ARGS=("${MAIN_ARGS[@]}")
+    if [ -n "${EVAL_LENGTHS}" ]; then
+        echo "===== 32K main line: ${EVAL_OUTPUT_DIR} ====="
+    fi
     run_stages
-else
-    for PASS in "${LONG_EVAL_PASSES[@]}"; do
-        [ -n "${PASS}" ] || continue
-        IFS='|' read -r EVAL_OUTPUT_DIR PASS_OVERRIDES EVAL_MAX_SEQ_LENGTHS BENCHMARKS NIAH_BENCHMARKS PASS_OPTIONAL <<< "${PASS}"
-        export EVAL_OPTIONAL_TASKS=${PASS_OPTIONAL}
-        PASS_ARGS=(--config_overrides "${PASS_OVERRIDES}")
-        echo "===== Long-context pass: ${EVAL_OUTPUT_DIR} | ${PASS_OVERRIDES} ====="
-        run_stages
-    done
 fi
+for PASS in "${LONG_EVAL_PASSES[@]}"; do
+    [ -n "${PASS}" ] || continue
+    IFS='|' read -r EVAL_OUTPUT_DIR PASS_OVERRIDES EVAL_MAX_SEQ_LENGTHS BENCHMARKS NIAH_BENCHMARKS PASS_OPTIONAL <<< "${PASS}"
+    export EVAL_OPTIONAL_TASKS=${PASS_OPTIONAL}
+    PASS_ARGS=(--config_overrides "${PASS_OVERRIDES}")
+    if [ -n "${LONG_EVAL_LIMIT}" ]; then
+        PASS_ARGS+=(--limit "${LONG_EVAL_LIMIT}")
+    fi
+    echo "===== Long-context pass: ${EVAL_OUTPUT_DIR} | ${PASS_OVERRIDES} ====="
+    run_stages
+done
 
 if [ ${NODE_RANK} -eq 0 ] && [ -d "${BARRIER_DIR}" ]; then
     rm -rf "${BARRIER_DIR}"
