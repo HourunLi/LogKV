@@ -500,6 +500,23 @@ def _longbench2_files_problem():
     return None
 
 
+def _drop_empty_lengths(results):
+    """Remove RULER's per-length metrics that had no sample (value -1).
+
+    lm-eval's RULER scores every sample under its default length too (DEFAULT_SEQ_LENGTHS, 4096) with -1, so a
+    run at other lengths reports "4096 ... -1.0000" for every task. Such an entry says only that no sample had
+    that length; it is dropped (with its stderr) from the table and the saved results."""
+    for section in ("results", "groups"):
+        for metrics in (results.get(section) or {}).values():
+            empty = [k for k, v in metrics.items()
+                     if k.split(",")[0].isdigit() and isinstance(v, (int, float)) and v == -1]
+            for key in empty:
+                metric, _, filt = key.partition(",")
+                metrics.pop(key, None)
+                metrics.pop(f"{metric}_stderr,{filt}", None)
+    return results
+
+
 def _skip_optional_tasks(tasks, max_seq_length):
     """The launchers' default lists mark tasks that some checkpoints or setups cannot serve (EVAL_OPTIONAL_TASKS,
     e.g. the 32K turns and book curve): such a task is left out, with the reason, when the model's window is
@@ -2158,6 +2175,8 @@ def main(
                 log_samples=True,
             )
         _hb("simple_evaluate 已返回")
+        if results:
+            _drop_empty_lengths(results)
         compression_samples = lm_model.all_gather_results(lm_model.compression_metrics, tag="KV compression")
 
         # 落盘阶段：只有 rank 0 写文件（建目录、写 json/csv/xlsx）。其它 rank 什么都
@@ -2404,7 +2423,7 @@ def output_from_cache(
             print(f"缓存内容: {cache_data['results_str'][:500]}...")
             return
 
-        results = cache_data
+        results = _drop_empty_lengths(cache_data)
         print(f"✅ 从缓存读取 results: {cache_path}")
     except Exception as e:
         print(f"❌ 读取缓存失败: {e}")

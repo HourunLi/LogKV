@@ -330,3 +330,27 @@ def test_optional_tasks_are_left_out_when_the_window_or_data_cannot_serve_them(m
     assert skip(tasks, 4096) == tasks  # asked for by name: kept, and _check_task_lengths refuses it
     with pytest.raises(ValueError, match="niah_turns_32k"):
         scope["_check_task_lengths"](skip(tasks, 4096), 4096)
+
+
+def test_rulers_empty_default_length_is_dropped_from_the_results():
+    """lm-eval's RULER scores every sample under 4096 too (-1 when no sample had that length): not reported."""
+    import ast
+
+    pytest.importorskip("lm_eval")
+    from lm_eval.utils import make_table
+
+    source = Path(__file__).resolve().parents[1] / "eval.py"
+    nodes = [n for n in ast.parse(source.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_drop_empty_lengths"]
+    scope = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+    results = dict(
+        results={"niah_multikey_1": {"alias": "niah_multikey_1", "4096,none": -1.0, "4096_stderr,none": "N/A",
+                                     "65536,none": 0.68, "65536_stderr,none": "N/A"},
+                 "babilong_qa1_64k": {"alias": "babilong_qa1_64k", "acc,none": 0.3, "acc_stderr,none": 0.05,
+                                      "delta,none": -1.0}},
+        versions={"niah_multikey_1": 1, "babilong_qa1_64k": 0}, **{"n-shot": {"niah_multikey_1": 0, "babilong_qa1_64k": 2}},
+        higher_is_better={"niah_multikey_1": {}, "babilong_qa1_64k": {}})
+    table = make_table(scope["_drop_empty_lengths"](results))
+    assert "4096" not in table and "delta" in table  # only length metrics go: delta (not a length) stays at -1
+    assert "65536" in table and "0.68" in table and "acc" in table
+    assert set(results["results"]["niah_multikey_1"]) - {"alias"} == {"65536,none", "65536_stderr,none"}  # make_table took alias
