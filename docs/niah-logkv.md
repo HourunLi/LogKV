@@ -208,7 +208,8 @@ python unused/pool_policy_sim.py --niah <niah>.npz --natural <natural>.npz --con
 - 词分数（`word_max`、`word_top2`、`word_first`、`multi_word`）按片段里信息量最大的词计分。词按词法切分（`word_starts`，由
   tokenizer 各 token 单独解码的文本得到每个 token 首末字符的类别）：字母与数字连成一个词，词内可含连字符、撇号、下划线
   （"mid-century"、"don't"、UUID），数字之间的 "." "," 也算词内（"3.14"）；空白、其余标点、每个 CJK 字符以及片段首都开始
-  新词。所以 URL、路径、标记是若干个词，不会因为不含空格就成了一个越长分越高的"词"（只按空白切分时，一条链接所在的
+  新词；文本表之外的 id（tokenizer 另加的特殊 token，如文档里出现的 `<|im_start|>`）没有文字，按无字符处理，自成一词、
+  不与前后相连。所以 URL、路径、标记是若干个词，不会因为不含空格就成了一个越长分越高的"词"（只按空白切分时，一条链接所在的
   64 token 句子以 85–240 比特排在所有针之前，十几个这样的句子就占满 P=1024）。词的编码长度是其
   token 惊异度之和 −log2 p(词 | 上文)，与分词方式无关：数字逐位切分，每位最多 log2 10 ≈ 3.3 比特，按 token 平均或峰值
   会输给单个罕见词，按词算一个 7 位随机数约 23 比特、一个 UUID 上百比特，而普通词只有几比特。`word_max` 取片段中最长的词，
@@ -349,7 +350,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   下载进行中（桶不允许重命名，收尾时先复制再删除，要一段时间）或被中断时，`<配置>/<版本>/` 下有还没写 `dataset_info.json`
   的 `<hash>.incomplete` 目录，`datasets` 离线查找会读到它并报 `FileNotFoundError`；`litgpt/hf_cache_patch.py`（`eval.py` 与下载脚本的离线复查都会应用）让离线查找跳过它，
   该配置只剩这种目录时报“not completely downloaded”并列出目录，此时等下载结束或联网重跑下载脚本；下载脚本的汇总也会列出残留目录。
-- 全量评测：`eval_full_{dense,baseline,word_first}.yaml`（`eval_main: true`），一条命令
+- 全量评测：`eval_full_{dense,baseline,word_first,query,word_first_query}.yaml`（`eval_main: true`），一条命令
   `bash eval.sh exp/qwen1.7b-32k/eval_full_<方法>.yaml` 跑完全部评测，先 32K 主线、再逐档长度，主线测过的不重测：
 
   | 部分 | 长度 | 任务 | 条数 | 结果目录 |
@@ -364,6 +365,11 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   计划跳过，各档每个任务 `long_limit` 条（`LONG_EVAL_LIMIT` 覆盖）。`LIMIT=2` 让每个阶段都只跑 2 条（上长跑前在单卡上试跑），
   `EVAL_LENGTHS=none` 只跑主线，`EVAL_MAIN=0` 只跑各长度（同 `eval_long_*.yaml`），`EVAL_SUITES`、`NIAH_ONLY`、`YARN_MODE` 同下。
   训练后 `majob.sh` 本来就是这个顺序（主线、再逐档）。把一个方法的主线日志与各档日志接着粘进汇总表，就是一行完整结果。
+  `query` 与 `word_first_query`（`eval_{long,full}_{query,word_first_query}.yaml`）与 `baseline` / `word_first` 同一
+  checkpoint、同样的长度与任务，只多开查询感知 cue 与 cue 保护（`eval_gamma_query_p1024.yaml`、
+  `eval_gamma_surprisal_word_first_query_p1024.yaml`）。查询感知 cue 只作用于生成请求（RULER、BABILong、InfiniteBench，
+  取 prompt 末尾 64 个 token 里的问题）；按似然打分的 LongBench v2、困惑度任务不给问题，`niah_turns` 缓存上下文时也不知道
+  问题，这些任务上与只开 cue 保护相同。
 - 一份配置测多个长度：`eval_long_{dense,baseline,word_first}.yaml`（`eval_lengths: [32k, 64k, 128k, 256k]`）。`eval.sh` 用
   `long_eval_plan.py` 按长度逐档评测：每档窗口为长度 + 1024，NIAH 阶段跑该长度的 RULER，主阶段跑该长度的 `babilong_<L>`、
   `long_ppl_<L>`、`long_ppl_books_<L>`、`niah_turns_<L>`、`longbench2_<L>` 与 `infinitebench_<L>`，结果写到
