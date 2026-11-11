@@ -352,14 +352,16 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER（256K 为上面的 12 个），主阶段跑 BABILong 与困惑度（64K 配置为 32K
   与 64K，128K、256K 配置为各自的长度），再跑 `long_ppl_books_<L>`、`niah_turns_<L>` 与 `longbench2_<L>`，每个任务 100 条。256K 的
   dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset`、`long_ppl_data` 与 `long_ppl_books` 三个键（或同名环境变量）给出本地数据。
-- 汇总表（`unused/parse_lmeval_table.py`）：RULER 13 个任务的 `<任务>_64k`、`AVG_NIAH_64k`、`AVG_NIAH_multi_64k`、
-  `AVG_RULER_64k`（128k、256k 同；256k 没有 `ruler_qa_squad`，为 12 个的平均）、`babilong_qaN_<长度>`、`AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2`
-  与 `LongBench2_<长度>`，都不计入 `AVG_all`。把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
+- 汇总表（`unused/parse_lmeval_table.py`）：把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
   日志里 eval.py 打印的结果表会被挑出来（行首前缀会去掉），同一模型的几份日志（如 32K、128K、256K 各一份）接着贴进
-  同一个字符串，合成一行。表头按长度分块：前 89 列是 32K 主线（常识、综合、LongBench v1/E、32K 捞针），之后 32K、64K、128K、256K 各一块，
-  每块依次是 RULER 与平均（32K 块只有主线没有的 5 个任务）、BABILong、`long_ppl`、LongBench v2、`niah_turns`（四轮平均与各轮）、
-  书的困惑度曲线；不带长度的旧 `LongBench2` 在 32K 块。新列加在所属长度块的末尾；`tests/parse_lmeval_table_columns.txt` 记着表头，
-  测试检查各长度的列连在一起。按位置对齐的旧表格把日志重新贴进来再跑一遍即可得到新顺序。
+  同一个字符串，合成一行。表头按长度分块：前 89 列是 32K 主线（常识、综合、LongBench v1/E、32K 捞针），之后 32K、64K、128K、
+  256K 各一块，四块的列除长度后缀外完全相同（论文里 32K-256K 可单独成表），每块 35 列：RULER 13 个任务 `<任务>_<长度>`、
+  `AVG_NIAH_<长度>`（3 个单针）、`AVG_NIAH_multi_<长度>`（5 个多针）、`AVG_RULER_<长度>`（13 个）、`babilong_qaN_<长度>` 与
+  `AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2_<长度>`、`niah_turns_<长度>`（四轮平均与 `_turnN`）、书的
+  困惑度曲线 `long_ppl_books_<长度>_<8k…256k>`。32K 块的捞针列与主线的 `niah_single_1` 等是同一份结果，重复列出；没有结果的
+  列留空（256K 的 `ruler_qa_squad`，`AVG_RULER_256k` 为其余 12 个的平均；曲线上超过配置长度的点）。这些列都不计入 `AVG_all`。
+  不带长度的旧 `LongBench2` 在最后一列。新列在四块里同时加；`tests/parse_lmeval_table_columns.txt` 记着表头，
+  测试检查四块同构、各长度的列连在一起。按位置对齐的旧表格把日志重新贴进来再跑一遍即可得到新顺序。
 
 测试：`tests/test_yarn.py`（YaRN 的 cos/sin 与 transformers 一致），`tests/test_long_context.py`（YaRN 进入 LogKV 缓存且 recent
 窗口内与不缓存一致、启动脚本读长度/任务/覆盖/样本数/数据路径、BABILong 按长度加载、困惑度任务取同一批长文档的末尾、下载脚本预建困惑度缓存、稠密缓存无方阵掩码且

@@ -88,11 +88,21 @@ niah_single_2_words
 niah_single_2_words_qend
 niah_single_2_words_paraphrase
 AVG_NIAH_words
+niah_single_1_32k
+niah_single_2_32k
+niah_single_3_32k
+niah_multikey_1_32k
+niah_multikey_2_32k
+niah_multikey_3_32k
+niah_multivalue_32k
+niah_multiquery_32k
 ruler_vt_32k
 ruler_cwe_32k
 ruler_fwe_32k
 ruler_qa_squad_32k
 ruler_qa_hotpot_32k
+AVG_NIAH_32k
+AVG_NIAH_multi_32k
 AVG_RULER_32k
 babilong_qa1_32k
 babilong_qa2_32k
@@ -101,7 +111,6 @@ babilong_qa4_32k
 babilong_qa5_32k
 AVG_babilong_32k
 long_ppl_32k
-LongBench2
 LongBench2_32k
 niah_turns_32k
 niah_turns_32k_turn1
@@ -111,6 +120,9 @@ niah_turns_32k_turn4
 long_ppl_books_32k_8k
 long_ppl_books_32k_16k
 long_ppl_books_32k_32k
+long_ppl_books_32k_64k
+long_ppl_books_32k_128k
+long_ppl_books_32k_256k
 niah_single_1_64k
 niah_single_2_64k
 niah_single_3_64k
@@ -144,6 +156,8 @@ long_ppl_books_64k_8k
 long_ppl_books_64k_16k
 long_ppl_books_64k_32k
 long_ppl_books_64k_64k
+long_ppl_books_64k_128k
+long_ppl_books_64k_256k
 niah_single_1_128k
 niah_single_2_128k
 niah_single_3_128k
@@ -178,6 +192,7 @@ long_ppl_books_128k_16k
 long_ppl_books_128k_32k
 long_ppl_books_128k_64k
 long_ppl_books_128k_128k
+long_ppl_books_128k_256k
 niah_single_1_256k
 niah_single_2_256k
 niah_single_3_256k
@@ -189,6 +204,7 @@ niah_multiquery_256k
 ruler_vt_256k
 ruler_cwe_256k
 ruler_fwe_256k
+ruler_qa_squad_256k
 ruler_qa_hotpot_256k
 AVG_NIAH_256k
 AVG_NIAH_multi_256k
@@ -212,3 +228,4 @@ long_ppl_books_256k_32k
 long_ppl_books_256k_64k
 long_ppl_books_256k_128k
 long_ppl_books_256k_256k
+LongBench2

@@ -428,46 +428,35 @@ ORDERED_COLUMNS = [
     # niahLogKV 泛化：值为随机英文词、不含数字的针（eval_tasks/niah_cue/*_words），取 32K。
     "niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase", "AVG_NIAH_words",
 ]
-# 长文本（eval_max_seq_lengths 设到 64K/128K/256K 时）：RULER 13 个任务在该长度的得分记为 <任务>_64k 等，
-# AVG_RULER_64k 为 13 个的平均（RULER 的标准报告；256K 没有 ruler_qa_squad，SQuAD 的文档池填不满，为 12 个的平均）；
-# BABILong qa1-qa5（eval_tasks/babilong_long，任务名带长度）；长文档困惑度（eval_tasks/long_ppl，越低越好；256K 用另一批
-# 文档）；LongBench v2 总分。都不计入 AVG_all。
-LONG_LENGTHS = {"65536": "64k", "131072": "128k", "262144": "256k"}
+LONG_LENGTHS = {"32768": "32k", "65536": "64k", "131072": "128k", "262144": "256k"}
 LONG_NIAH = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2",
              "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 LONG_RULER = LONG_NIAH + ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
-RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] for n in LONG_LENGTHS.values()}
-BABILONG_LENGTHS = ("32k", "64k", "128k", "256k")
-PPL_LENGTHS = ("32k", "64k", "128k", "256k")
-# LongBench v2 的上下文预算来自 block_size：按长度命名的组（eval_tasks/longbench2_long）才能分列。
-LONGBENCH2_LENGTHS = ("32k", "64k", "128k", "256k")
-
-
-
-# 长文本列按长度分块：上面 32K 主线之后是 32K、64K、128K、256K 各一块，每块依次是 RULER（及其平均）、BABILong、
-# long_ppl、LongBench v2、同一份缓存上逐轮问（niah_turns_<长度> 为四轮平均，_turnN 为第 N 轮）、书的困惑度曲线
-# （long_ppl_books_<配置长度>_<截断长度>，同一批书，越低越好）。32K 主线已有 8 个捞针任务的 32K 列，所以 32K 块的
-# RULER 只有其余 5 个任务（与 13 个的平均）；不带长度的 LongBench2（旧结果）放在 32K 块。新列加在所属长度块的末尾，
-# 并更新 tests/parse_lmeval_table_columns.txt（测试检查各长度的列连在一起）。
-RULER_32K_EXTRA = ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
-TURN_LENGTHS = ("32k", "64k", "128k", "256k")
+BLOCK_LENGTHS = ("32k", "64k", "128k", "256k")
+BABILONG_LENGTHS = PPL_LENGTHS = LONGBENCH2_LENGTHS = TURN_LENGTHS = BLOCK_LENGTHS
 TURN_TASKS = [f"niah_turns_{n}" for n in TURN_LENGTHS]
-BOOK_POINTS = {n: [f"{2 ** k}k" for k in range(3, 9) if 2 ** k <= int(n[:-1])] for n in ("32k", "64k", "128k", "256k")}
+# 书的困惑度曲线的截断点：每个长度块都列全 8K-256K，超过该块长度的点没有结果、留空。
+BOOK_POINTS = [f"{2 ** k}k" for k in range(3, 9)]
 
 
+# 长文本列按长度分块：上面 32K 主线之后是 32K、64K、128K、256K 各一块。四块的列完全同构（论文里 32K-256K 可以单独成表），
+# 只是长度后缀不同：RULER 13 个任务（<任务>_<长度>）及 AVG_NIAH（3 个单针）、AVG_NIAH_multi（5 个多针）、AVG_RULER
+# （13 个，RULER 的标准报告）；BABILong qa1-qa5 及平均；长文档困惑度 long_ppl（越低越好）；LongBench v2；同一份缓存上
+# 逐轮问（niah_turns_<长度> 为四轮平均，_turnN 为第 N 轮）；书的困惑度曲线（long_ppl_books_<配置长度>_<截断长度>，同一批
+# 书，越低越好）。32K 块的捞针列与 32K 主线的 niah_single_1 等是同一份结果，重复列出。没有结果的列留空：256K 没有
+# ruler_qa_squad（SQuAD 的文档池填不满 256K，AVG_RULER_256k 为其余 12 个的平均），曲线上超过配置长度的点。都不计入
+# AVG_all。不带长度的 LongBench2（按长度分组之前的旧结果，上下文预算不明）放在最后。新列在四块里同时加，并更新
+# tests/parse_lmeval_table_columns.txt（测试检查四块同构、各长度的列连在一起）。
 def _length_block(n):
-    if n == "32k":
-        columns = [f"{t}_32k" for t in RULER_32K_EXTRA] + ["AVG_RULER_32k"]
-    else:
-        columns = [f"{t}_{n}" for t in RULER_AT[n]] + [f"AVG_NIAH_{n}", f"AVG_NIAH_multi_{n}", f"AVG_RULER_{n}"]
+    columns = [f"{t}_{n}" for t in LONG_RULER] + [f"AVG_NIAH_{n}", f"AVG_NIAH_multi_{n}", f"AVG_RULER_{n}"]
     columns += [f"babilong_qa{i}_{n}" for i in range(1, 6)] + [f"AVG_babilong_{n}", f"long_ppl_{n}"]
-    columns += (["LongBench2"] if n == "32k" else []) + [f"LongBench2_{n}"]
-    columns += [f"niah_turns_{n}"] + [f"niah_turns_{n}_turn{i}" for i in range(1, 5)]
-    return columns + [f"long_ppl_books_{n}_{q}" for q in BOOK_POINTS[n]]
+    columns += [f"LongBench2_{n}", f"niah_turns_{n}"] + [f"niah_turns_{n}_turn{i}" for i in range(1, 5)]
+    return columns + [f"long_ppl_books_{n}_{q}" for q in BOOK_POINTS]
 
 
-for _length in ("32k", "64k", "128k", "256k"):
+for _length in BLOCK_LENGTHS:
     ORDERED_COLUMNS += _length_block(_length)
+ORDERED_COLUMNS.append("LongBench2")
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
@@ -489,7 +478,6 @@ RAW_TO_TARGET_MAP = {
     "longbench_trec_e": "trec_e", "longbench_triviaqa_e": "triviaqa_e",
     "longbench2": "LongBench2",
     **{f"longbench2_{n}": f"LongBench2_{n}" for n in LONGBENCH2_LENGTHS},
-    **{f"long_ppl_books_{n}_{q}": f"long_ppl_books_{n}_{q}" for n, points in BOOK_POINTS.items() for q in points},
 }
 
 TARGET_METRIC_MAP = {
@@ -505,7 +493,7 @@ TARGET_METRIC_MAP = {
     "LongBench2": "acc",
     **{f"LongBench2_{n}": "acc" for n in LONGBENCH2_LENGTHS},
     **{t: "acc" for t in TURN_TASKS},
-    **{f"long_ppl_books_{n}_{q}": "ppl" for n, points in BOOK_POINTS.items() for q in points},
+    **{f"long_ppl_books_{n}_{q}": "ppl" for n in BLOCK_LENGTHS for q in BOOK_POINTS},
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
@@ -526,18 +514,15 @@ AVG_GROUPS = {
     "AVG_NIAH_multi": NIAH_MULTI,
     "AVG_NIAH_cue": NIAH_CUE,
     "AVG_NIAH_words": NIAH_WORDS,
-    **{f"AVG_NIAH_{n}": [f"niah_single_{k}_{n}" for k in (1, 2, 3)] for n in LONG_LENGTHS.values()},
-    **{f"AVG_NIAH_multi_{n}": [f"{t}_{n}" for t in NIAH_MULTI] for n in LONG_LENGTHS.values()},
-    **{f"AVG_RULER_{n}": [f"{t}_{n}" for t in RULER_AT[n]] for n in LONG_LENGTHS.values()},
+    **{f"AVG_NIAH_{n}": [f"niah_single_{k}_{n}" for k in (1, 2, 3)] for n in BLOCK_LENGTHS},
+    **{f"AVG_NIAH_multi_{n}": [f"{t}_{n}" for t in NIAH_MULTI] for n in BLOCK_LENGTHS},
+    **{f"AVG_RULER_{n}": [f"{t}_{n}" for t in LONG_RULER] for n in BLOCK_LENGTHS},
     **{f"AVG_babilong_{n}": [f"babilong_qa{i}_{n}" for i in range(1, 6)] for n in BABILONG_LENGTHS},
-    "AVG_RULER_32k": LONG_NIAH + [f"{t}_32k" for t in RULER_32K_EXTRA],
 }
 # 新增的诊断组不计入 AVG_all，旧结果与新结果的总平均保持可比。
 DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words",
-                     *(f"AVG_NIAH_{n}" for n in LONG_LENGTHS.values()),
-                     *(f"AVG_NIAH_multi_{n}" for n in LONG_LENGTHS.values()),
-                     *(f"AVG_RULER_{n}" for n in LONG_LENGTHS.values()),
-                     *(f"AVG_babilong_{n}" for n in BABILONG_LENGTHS), "AVG_RULER_32k"}
+                     *(f"AVG_NIAH_{n}" for n in BLOCK_LENGTHS), *(f"AVG_NIAH_multi_{n}" for n in BLOCK_LENGTHS),
+                     *(f"AVG_RULER_{n}" for n in BLOCK_LENGTHS), *(f"AVG_babilong_{n}" for n in BABILONG_LENGTHS)}
 
 # ==============================================================================
 # 3. 解析与计算核心代码
@@ -589,18 +574,13 @@ def parse_single_model(model_name, markdown_text):
             except ValueError:
                 pass
             continue
-        if target_task in RULER_32K_EXTRA and metric == "32768":  # the other RULER tasks at 32K
-            try:
-                row_data[f"{target_task}_32k"] = float(value)
-            except ValueError:
-                pass
-            continue
-        if target_task in LONG_RULER and metric in LONG_LENGTHS:  # RULER at 64K / 128K / 256K
+        if target_task in LONG_RULER and metric in LONG_LENGTHS:  # RULER at 32K-256K: <task>_<length>
             try:
                 row_data[f"{target_task}_{LONG_LENGTHS[metric]}"] = float(value)
             except ValueError:
                 pass
-            continue
+            if metric != "32768":
+                continue  # 32K 的捞针结果另外还填进 32K 主线的 niah_single_1 等列（下面的通用匹配）
 
         if expected_metric and metric == expected_metric:
             try:
