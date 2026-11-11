@@ -332,6 +332,36 @@ def test_longbench2_subsets_come_from_the_snapshot_files_when_the_card_has_no_co
         datasets.load_dataset(patch.REPO, name="table_qa")
 
 
+
+def test_longbench2_reads_a_hub_cache_whose_links_were_flattened(tmp_path, monkeypatch):
+    """On the machines that evaluate, a synced hub cache may hold each snapshot link as a small file with the link's
+    text, and no refs/main: the snapshot is still found, and each file read from its blob."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    import datasets
+
+    from litgpt import longbench2_patch as patch
+
+    hub = tmp_path / "hub" / ("datasets--" + patch.REPO.replace("/", "--"))
+    (hub / "blobs").mkdir(parents=True)
+    pq.write_table(pa.table({"question": ["q1", "q2"], "answer": [0, 1]}), hub / "blobs" / "sha-a")
+    shot = hub / "snapshots" / "c0ffee" / "academic_single"
+    shot.mkdir(parents=True)
+    (shot / "train-0.parquet").write_text("../../../blobs/sha-a")  # flattened: 20 bytes of link text
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    import huggingface_hub
+
+    def not_cached(*args, **kwargs):
+        raise huggingface_hub.errors.LocalEntryNotFoundError("no refs/main")
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", not_cached)
+    root, files = patch.snapshot()
+    assert root == str(hub / "snapshots" / "c0ffee") and files == ["academic_single/train-0.parquet"]
+    assert patch.real_file(shot / "train-0.parquet") == str(hub / "blobs" / "sha-a")
+    loaded = patch.load_subset(datasets.load_dataset, "academic_single", "train")
+    assert loaded["question"] == ["q1", "q2"]
+
+
 def test_the_fetch_script_skips_certificate_checks_and_waits_out_rate_limits(monkeypatch):
     import importlib.util
     import io

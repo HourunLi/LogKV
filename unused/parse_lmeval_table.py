@@ -435,42 +435,45 @@ LONG_RULER = LONG_NIAH + ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad"
 BLOCK_LENGTHS = ("32k", "64k", "128k", "256k")
 BABILONG_LENGTHS = PPL_LENGTHS = LONGBENCH2_LENGTHS = TURN_LENGTHS = BLOCK_LENGTHS
 TURN_TASKS = [f"niah_turns_{n}" for n in TURN_LENGTHS]
-# 书的困惑度曲线的截断点：每个长度块都列全 8K-256K，超过该块长度的点没有结果、留空。
-BOOK_POINTS = [f"{2 ** k}k" for k in range(3, 9)]
-# InfiniteBench 的十个任务（eval_tasks/infinitebench，64K 起；32K 块的这些列留空），AVG_InfiniteBench 为十个的平均（论文的 Avg）。
+# 书的困惑度曲线的截断点：每个配置长度只到它自己的长度（long_ppl_books_32k 为 8k、16k、32k）。
+BOOK_POINTS = {n: [f"{2 ** k}k" for k in range(3, 9) if 2 ** k <= int(n[:-1])] for n in BLOCK_LENGTHS}
+# InfiniteBench 的十个任务（eval_tasks/infinitebench，只测 64K 起），AVG_InfiniteBench 为十个的平均（论文的 Avg）。
 INFINITEBENCH = ["passkey", "number_string", "kv_retrieval", "longbook_sum_eng", "longbook_qa_eng", "longbook_choice_eng",
                  "longbook_qa_chn", "longdialogue_qa_eng", "code_debug", "math_find"]
+INFINITEBENCH_LENGTHS = ("64k", "128k", "256k")
+# 每个长度实际跑的 RULER 任务：256K 没有 ruler_qa_squad（SQuAD 的文档池填不满 256K）。
+RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] for n in BLOCK_LENGTHS}
 
 
-# 长文本列先按长度分块，块内再按任务分组、每组的平均紧跟在它平均的任务之后：上面 32K 主线之后是 32K、64K、128K、256K
-# 各一块，四块的列完全同构（论文里 32K-256K 可以单独成表），只是长度后缀不同。每块依次是：
+# 长文本列先按长度分块（32K 主线之后是 32K、64K、128K、256K 各一块，论文里 32K-256K 可以单独成表），块内再按任务分组、
+# 每组的平均紧跟在它平均的任务之后。只列评测会产出结果的列，各块的顺序相同：
 #   RULER 单针 niah_single_1-3、AVG_NIAH；多针 niah_multikey_1-3、niah_multivalue、niah_multiquery、AVG_NIAH_multi；
-#   其余 ruler_vt、ruler_cwe、ruler_fwe、ruler_qa_squad、ruler_qa_hotpot、AVG_RULER（13 个的平均，RULER 的标准报告）；
-#   BABILong qa1-qa5、AVG_babilong；长文档困惑度 long_ppl（越低越好）；LongBench v2；
+#   其余 ruler_vt、ruler_cwe、ruler_fwe、ruler_qa_squad（256K 没有）、ruler_qa_hotpot、AVG_RULER（该长度全部 RULER 任务的
+#   平均：13 个，256K 为 12 个）；BABILong qa1-qa5、AVG_babilong；LongBench v2（longbench2_<长度>）；
 #   同一份缓存上逐轮问 niah_turns_<长度>_turn1-4、niah_turns_<长度>（四轮平均）；
-#   书的困惑度曲线 long_ppl_books_<配置长度>_<截断长度>（同一批书，越低越好，无平均）；
-#   InfiniteBench 十个任务 infinitebench_<任务>_<长度>（官方评分）、AVG_InfiniteBench_<长度>。
-# 32K 块的捞针列与 32K 主线的 niah_single_1 等是同一份结果，重复列出。没有结果的列留空：256K 的 ruler_qa_squad（SQuAD
-# 的文档池填不满 256K，AVG_RULER_256k 为其余 12 个的平均），曲线上超过配置长度的点，32K 的 InfiniteBench（只测 64K 起）。
-# 都不计入 AVG_all。不带长度的 LongBench2（按长度分组之前的旧结果，上下文预算不明）放在最后。新列在四块里同时加（加在
-# 所属任务组里、它的平均之前），并更新 tests/parse_lmeval_table_columns.txt（测试检查四块同构、各长度的列连在一起）。
+#   书的困惑度曲线 long_ppl_books_<长度>_<截断长度>（截断长度 8k 起到该长度，同一批书，越低越好），之后是同长度的
+#   long_ppl_<长度>（PG19 测试集文档末尾的困惑度，越低越好）；
+#   InfiniteBench 十个任务 infinitebench_<任务>_<长度>（官方评分）、AVG_InfiniteBench_<长度>（只有 64K 起的块有）。
+# 32K 块的捞针列与 32K 主线的 niah_single_1 等是同一份结果，重复列出。都不计入 AVG_all。新列加在所属任务组里、它的平均
+# 之前，并更新 tests/parse_lmeval_table_columns.txt（测试检查各块顺序一致、各长度的列连在一起、平均紧跟其任务）。
 def _length_block(n):
     """One length's columns: grouped by task, each average right after the tasks it averages."""
     single, multi = LONG_NIAH[:3], LONG_NIAH[3:]
-    rest = [t for t in LONG_RULER if t not in LONG_NIAH]
+    rest = [t for t in RULER_AT[n] if t not in LONG_NIAH]
     columns = [f"{t}_{n}" for t in single] + [f"AVG_NIAH_{n}"]  # RULER: the single needles
     columns += [f"{t}_{n}" for t in multi] + [f"AVG_NIAH_multi_{n}"]  # the multi-needle tasks
-    columns += [f"{t}_{n}" for t in rest] + [f"AVG_RULER_{n}"]  # the other five; AVG_RULER: all 13
+    columns += [f"{t}_{n}" for t in rest] + [f"AVG_RULER_{n}"]  # the rest; AVG_RULER: all of RULER at n
     columns += [f"babilong_qa{i}_{n}" for i in range(1, 6)] + [f"AVG_babilong_{n}"]
-    columns += [f"long_ppl_{n}", f"LongBench2_{n}"]
+    columns += [f"LongBench2_{n}"]
     columns += [f"niah_turns_{n}_turn{i}" for i in range(1, 5)] + [f"niah_turns_{n}"]  # niah_turns: the four turns' mean
-    columns += [f"long_ppl_books_{n}_{q}" for q in BOOK_POINTS]
-    return columns + [f"infinitebench_{t}_{n}" for t in INFINITEBENCH] + [f"AVG_InfiniteBench_{n}"]
+    columns += [f"long_ppl_books_{n}_{q}" for q in BOOK_POINTS[n]] + [f"long_ppl_{n}"]
+    if n in INFINITEBENCH_LENGTHS:
+        columns += [f"infinitebench_{t}_{n}" for t in INFINITEBENCH] + [f"AVG_InfiniteBench_{n}"]
+    return columns
 
 
 for _length in BLOCK_LENGTHS:
     ORDERED_COLUMNS += _length_block(_length)
-ORDERED_COLUMNS.append("LongBench2")
 NIAH_MULTI = ["niah_multikey_1", "niah_multikey_2", "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
 NIAH_CUE = [f"niah_single_{n}_{v}" for n in (1, 2, 3) for v in ("qend", "preamble", "paraphrase")]
 NIAH_WORDS = ["niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase"]
@@ -490,7 +493,6 @@ RAW_TO_TARGET_MAP = {
     "longbench_passage_count_e": "passage_count_e", "longbench_passage_retrieval_en_e": "passage_retrieval_en_e",
     "longbench_qasper_e": "qasper_e", "longbench_repobench-p_e": "repobench-p_e", "longbench_samsum_e": "samsum_e",
     "longbench_trec_e": "trec_e", "longbench_triviaqa_e": "triviaqa_e",
-    "longbench2": "LongBench2",
     **{f"longbench2_{n}": f"LongBench2_{n}" for n in LONGBENCH2_LENGTHS},
 }
 
@@ -504,10 +506,9 @@ TARGET_METRIC_MAP = {
     **{task: "32768" for task in NIAH_MULTI + NIAH_CUE + NIAH_WORDS},
     **{f"babilong_qa{i}_{n}": "acc" for i in range(1, 6) for n in BABILONG_LENGTHS},
     **{f"long_ppl_{n}": "ppl" for n in PPL_LENGTHS},
-    "LongBench2": "acc",
     **{f"LongBench2_{n}": "acc" for n in LONGBENCH2_LENGTHS},
     **{t: "acc" for t in TURN_TASKS},
-    **{f"long_ppl_books_{n}_{q}": "ppl" for n in BLOCK_LENGTHS for q in BOOK_POINTS},
+    **{f"long_ppl_books_{n}_{q}": "ppl" for n in BLOCK_LENGTHS for q in BOOK_POINTS[n]},
 }
 for col in ORDERED_COLUMNS:
     if col not in TARGET_METRIC_MAP and not col.startswith(("AVG", "Common", "recall", "LongBench")):
@@ -530,15 +531,18 @@ AVG_GROUPS = {
     "AVG_NIAH_words": NIAH_WORDS,
     **{f"AVG_NIAH_{n}": [f"niah_single_{k}_{n}" for k in (1, 2, 3)] for n in BLOCK_LENGTHS},
     **{f"AVG_NIAH_multi_{n}": [f"{t}_{n}" for t in NIAH_MULTI] for n in BLOCK_LENGTHS},
-    **{f"AVG_RULER_{n}": [f"{t}_{n}" for t in LONG_RULER] for n in BLOCK_LENGTHS},
+    **{f"AVG_RULER_{n}": [f"{t}_{n}" for t in RULER_AT[n]] for n in BLOCK_LENGTHS},
     **{f"AVG_babilong_{n}": [f"babilong_qa{i}_{n}" for i in range(1, 6)] for n in BABILONG_LENGTHS},
-    **{f"AVG_InfiniteBench_{n}": [f"infinitebench_{t}_{n}" for t in INFINITEBENCH] for n in BLOCK_LENGTHS},
+    **{f"AVG_InfiniteBench_{n}": [f"infinitebench_{t}_{n}" for t in INFINITEBENCH] for n in INFINITEBENCH_LENGTHS},
 }
+# 每个平均及其任务都是表头里的列（否则 build_table 会在表尾多出一列、或悄悄少平均一项）。
+assert all(c in ORDERED_COLUMNS for avg, tasks in AVG_GROUPS.items() for c in (avg, *tasks)), \
+    [c for avg, tasks in AVG_GROUPS.items() for c in (avg, *tasks) if c not in ORDERED_COLUMNS]
 # 新增的诊断组不计入 AVG_all，旧结果与新结果的总平均保持可比。
 DIAGNOSTIC_GROUPS = {"AVG_NIAH_multi", "AVG_NIAH_cue", "AVG_NIAH_words",
                      *(f"AVG_NIAH_{n}" for n in BLOCK_LENGTHS), *(f"AVG_NIAH_multi_{n}" for n in BLOCK_LENGTHS),
                      *(f"AVG_RULER_{n}" for n in BLOCK_LENGTHS), *(f"AVG_babilong_{n}" for n in BABILONG_LENGTHS),
-                     *(f"AVG_InfiniteBench_{n}" for n in BLOCK_LENGTHS)}
+                     *(f"AVG_InfiniteBench_{n}" for n in INFINITEBENCH_LENGTHS)}
 
 # ==============================================================================
 # 3. 解析与计算核心代码

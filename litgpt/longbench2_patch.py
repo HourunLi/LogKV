@@ -30,11 +30,41 @@ def subset_files(files, name: str) -> list[str]:
     return sorted(chosen)
 
 
+def real_file(path) -> str:
+    """``path``, or the blob it points to when a copy or sync of the hub cache turned the snapshot's link into a small
+    file holding the link's text (``../../blobs/<sha256>``), which is what the machines that evaluate may see."""
+    p = Path(path)
+    if p.is_symlink() or not p.is_file() or p.stat().st_size > 512:
+        return str(p)
+    text = p.read_bytes().decode(errors="ignore").strip()
+    if "/blobs/" in text and "\n" not in text:
+        blob = os.path.normpath(p.parent / text)
+        if os.path.isfile(blob):
+            return blob
+    return str(p)
+
+
+def _cached_snapshot() -> str | None:
+    """A snapshot folder of the hub cache when refs/main is lost (the newest one)."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    folder = Path(os.environ.get("HF_HUB_CACHE") or HF_HUB_CACHE) / ("datasets--" + REPO.replace("/", "--")) / "snapshots"
+    shots = sorted((p for p in folder.glob("*") if p.is_dir()), key=lambda p: p.stat().st_mtime) if folder.is_dir() else []
+    return str(shots[-1]) if shots else None
+
+
 def snapshot() -> tuple[str, list[str]]:
-    """The repository snapshot's folder and data files (offline: the hub cache only)."""
+    """The repository snapshot's folder and data files (offline: the hub cache only, any snapshot there when
+    refs/main is lost). A data file may be a flattened link: read it through real_file."""
     from huggingface_hub import snapshot_download
 
-    root = snapshot_download(REPO, repo_type="dataset", local_files_only=os.environ.get("HF_HUB_OFFLINE") == "1")
+    offline = os.environ.get("HF_HUB_OFFLINE") == "1"
+    try:
+        root = snapshot_download(REPO, repo_type="dataset", local_files_only=offline)
+    except Exception:
+        root = _cached_snapshot() if offline else None
+        if root is None:
+            raise
     files = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*") if p.is_file() and p.suffix in BUILDERS)
     return root, files
 
@@ -45,7 +75,7 @@ def load_subset(load, name: str, split=None):
     if not chosen:
         raise ValueError(f"no file of {REPO} matches subset {name!r}; its data files: {files}")
     builder = BUILDERS[Path(chosen[0]).suffix]
-    data = load(builder, data_files={"train": [os.path.join(root, f) for f in chosen]})
+    data = load(builder, data_files={"train": [real_file(os.path.join(root, f)) for f in chosen]})
     return data[split] if split else data
 
 
