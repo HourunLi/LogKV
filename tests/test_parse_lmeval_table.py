@@ -127,3 +127,17 @@ def test_infinitebench_columns(parse):
     assert row["infinitebench_passkey_128k"] == 0.0 and row["infinitebench_math_find_128k"] == 0.9
     assert row["AVG_InfiniteBench_128k"] == pytest.approx(0.45)
     assert row["AVG_InfiniteBench_64k"] != row["AVG_InfiniteBench_64k"]  # another length: empty
+
+
+def test_each_average_follows_its_tasks(parse):
+    """Inside a length's block the columns are grouped by task, each average right after what it averages."""
+    header = list(parse.build_table({"m": ""}).columns)
+    for n in ("32k", "64k", "128k", "256k"):
+        for avg in (f"AVG_NIAH_{n}", f"AVG_NIAH_multi_{n}", f"AVG_RULER_{n}", f"AVG_babilong_{n}",
+                    f"AVG_InfiniteBench_{n}"):
+            places = sorted(header.index(t) for t in parse.AVG_GROUPS[avg])
+            assert header.index(avg) == places[-1] + 1, avg
+            if avg != f"AVG_RULER_{n}":  # AVG_RULER averages all 13, after the last group of RULER
+                assert places == list(range(places[0], places[-1] + 1)), avg  # its tasks side by side
+        turns = [header.index(f"niah_turns_{n}_turn{i}") for i in range(1, 5)]
+        assert header.index(f"niah_turns_{n}") == turns[-1] + 1 and turns == list(range(turns[0], turns[0] + 4))

@@ -442,20 +442,28 @@ INFINITEBENCH = ["passkey", "number_string", "kv_retrieval", "longbook_sum_eng",
                  "longbook_qa_chn", "longdialogue_qa_eng", "code_debug", "math_find"]
 
 
-# 长文本列按长度分块：上面 32K 主线之后是 32K、64K、128K、256K 各一块。四块的列完全同构（论文里 32K-256K 可以单独
-# 成表），只是长度后缀不同：RULER 13 个任务（<任务>_<长度>）及 AVG_NIAH（3 个单针）、AVG_NIAH_multi（5 个多针）、
-# AVG_RULER（13 个，RULER 的标准报告）；BABILong qa1-qa5 及平均；长文档困惑度 long_ppl（越低越好）；LongBench v2；
-# 同一份缓存上逐轮问（niah_turns_<长度> 为四轮平均，_turnN 为第 N 轮）；书的困惑度曲线（long_ppl_books_<配置长度>_
-# <截断长度>，同一批书，越低越好）；InfiniteBench 十个任务（infinitebench_<任务>_<长度>，官方评分）与
-# AVG_InfiniteBench_<长度>。32K 块的捞针列与 32K 主线的 niah_single_1 等是同一份结果，重复列出。没有结果的列留空：
-# 256K 的 ruler_qa_squad（SQuAD 的文档池填不满 256K，AVG_RULER_256k 为其余 12 个的平均），曲线上超过配置长度的点，
-# 32K 的 InfiniteBench（只测 64K 起）。都不计入 AVG_all。不带长度的 LongBench2（按长度分组之前的旧结果，上下文预算
-# 不明）放在最后。新列在四块里同时加（加在块末），并更新 tests/parse_lmeval_table_columns.txt（测试检查四块同构、
-# 各长度的列连在一起）。
+# 长文本列先按长度分块，块内再按任务分组、每组的平均紧跟在它平均的任务之后：上面 32K 主线之后是 32K、64K、128K、256K
+# 各一块，四块的列完全同构（论文里 32K-256K 可以单独成表），只是长度后缀不同。每块依次是：
+#   RULER 单针 niah_single_1-3、AVG_NIAH；多针 niah_multikey_1-3、niah_multivalue、niah_multiquery、AVG_NIAH_multi；
+#   其余 ruler_vt、ruler_cwe、ruler_fwe、ruler_qa_squad、ruler_qa_hotpot、AVG_RULER（13 个的平均，RULER 的标准报告）；
+#   BABILong qa1-qa5、AVG_babilong；长文档困惑度 long_ppl（越低越好）；LongBench v2；
+#   同一份缓存上逐轮问 niah_turns_<长度>_turn1-4、niah_turns_<长度>（四轮平均）；
+#   书的困惑度曲线 long_ppl_books_<配置长度>_<截断长度>（同一批书，越低越好，无平均）；
+#   InfiniteBench 十个任务 infinitebench_<任务>_<长度>（官方评分）、AVG_InfiniteBench_<长度>。
+# 32K 块的捞针列与 32K 主线的 niah_single_1 等是同一份结果，重复列出。没有结果的列留空：256K 的 ruler_qa_squad（SQuAD
+# 的文档池填不满 256K，AVG_RULER_256k 为其余 12 个的平均），曲线上超过配置长度的点，32K 的 InfiniteBench（只测 64K 起）。
+# 都不计入 AVG_all。不带长度的 LongBench2（按长度分组之前的旧结果，上下文预算不明）放在最后。新列在四块里同时加（加在
+# 所属任务组里、它的平均之前），并更新 tests/parse_lmeval_table_columns.txt（测试检查四块同构、各长度的列连在一起）。
 def _length_block(n):
-    columns = [f"{t}_{n}" for t in LONG_RULER] + [f"AVG_NIAH_{n}", f"AVG_NIAH_multi_{n}", f"AVG_RULER_{n}"]
-    columns += [f"babilong_qa{i}_{n}" for i in range(1, 6)] + [f"AVG_babilong_{n}", f"long_ppl_{n}"]
-    columns += [f"LongBench2_{n}", f"niah_turns_{n}"] + [f"niah_turns_{n}_turn{i}" for i in range(1, 5)]
+    """One length's columns: grouped by task, each average right after the tasks it averages."""
+    single, multi = LONG_NIAH[:3], LONG_NIAH[3:]
+    rest = [t for t in LONG_RULER if t not in LONG_NIAH]
+    columns = [f"{t}_{n}" for t in single] + [f"AVG_NIAH_{n}"]  # RULER: the single needles
+    columns += [f"{t}_{n}" for t in multi] + [f"AVG_NIAH_multi_{n}"]  # the multi-needle tasks
+    columns += [f"{t}_{n}" for t in rest] + [f"AVG_RULER_{n}"]  # the other five; AVG_RULER: all 13
+    columns += [f"babilong_qa{i}_{n}" for i in range(1, 6)] + [f"AVG_babilong_{n}"]
+    columns += [f"long_ppl_{n}", f"LongBench2_{n}"]
+    columns += [f"niah_turns_{n}_turn{i}" for i in range(1, 5)] + [f"niah_turns_{n}"]  # niah_turns: the four turns' mean
     columns += [f"long_ppl_books_{n}_{q}" for q in BOOK_POINTS]
     return columns + [f"infinitebench_{t}_{n}" for t in INFINITEBENCH] + [f"AVG_InfiniteBench_{n}"]
 
