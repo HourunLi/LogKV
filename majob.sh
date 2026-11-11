@@ -682,9 +682,10 @@ META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENG
 
 # 评测结果：rank0 写入 JSON（带时间戳），与 litgpt evaluate 惯例一致放在 checkpoint 下 evaluate/
 EVAL_OUTPUT_DIR="${SAVE_DIR}/evaluate"
-# 用 tokenizer 生成样本的任务（RULER、niah_turns、long_ppl）也在主评测里时，主评测同样要 metadata（同 eval.sh）。
+# 用 tokenizer 生成样本或截断提示的任务（RULER、niah_turns、long_ppl、infinitebench）也在主评测里时，主评测同样要 metadata（同 eval.sh）。
 MAIN_METADATA_ARGS=()
-if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* ]]; then
+if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* \
+        || "${BENCHMARKS}" == *infinitebench* ]]; then
     MAIN_METADATA_ARGS=(--metadata "${META}")
 fi
 
@@ -741,13 +742,14 @@ fi
 # ==============================================================================
 # 长文本评测（训练后接着跑，见 long_eval_plan.py）：32K / 64K / 128K / 256K 逐档，每档窗口为长度 + 1024，YaRN 按长度取
 # 倍数（32K 不用，64K 2、128K 4、256K 8；YARN_MODE=fixed 时都用最长一档的倍数），NIAH 阶段跑该长度的 RULER，主阶段跑
-# BABILong、long_ppl、long_ppl_books、niah_turns 与 longbench2，每个任务 LONG_EVAL_LIMIT（默认 100）条，结果写到
+# BABILong、long_ppl、long_ppl_books、niah_turns、longbench2 与 infinitebench（64K 起），每个任务 LONG_EVAL_LIMIT（默认 100）条，结果写到
 # evaluate/long<L>（fixed：evaluate/yarn<F>/long<L>）。
 #   EVAL_LENGTHS=none 关掉；EVAL_LENGTHS=64k,256k 只测这些长度（默认 YAML 的 eval_lengths，否则全部）；
-#   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2 只跑这些类；NIAH_ONLY=1 只跑 RULER。
+#   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench 只跑这些类；NIAH_ONLY=1 只跑 RULER。
 # 上面主线已经测过的（主评测的任务、NIAH 阶段在各自长度上的捞针）不再重测，32K 档只补其余的任务。训练长度不到 32K 的
-# checkpoint 跳过（YaRN 以 32K 为原长）。数据：环境变量 LONG_PPL_DATA、LONG_PPL_BOOKS、BABILONG_DATASET，或 YAML 的同名
-# 小写键；缺数据的 long_ppl / long_ppl_books、文件不完整的 LongBench v2 在默认类别下打印原因后跳过。
+# checkpoint 跳过（YaRN 以 32K 为原长）。数据：环境变量 LONG_PPL_DATA、LONG_PPL_BOOKS、BABILONG_DATASET、INFINITEBENCH_DIR
+# （不设则读 hub 缓存），或 YAML 的同名小写键；缺数据的 long_ppl / long_ppl_books、文件不完整的 LongBench v2 与
+# InfiniteBench 在默认类别下打印原因后跳过。
 # ==============================================================================
 LONG_EVAL_SETTINGS=$(python - "${CONFIG_FILE}" "${BENCHMARKS}" "${NIAH_BENCHMARKS}" "${EVAL_MAX_SEQ_LENGTHS}" <<'LONG_EVAL_PY'
 import json
@@ -777,6 +779,7 @@ values = dict(
     CONFIG_LONG_PPL_DATA=cfg.get("long_ppl_data") or "",
     CONFIG_LONG_PPL_BOOKS=cfg.get("long_ppl_books") or "",
     CONFIG_BABILONG_DATASET=cfg.get("babilong_dataset") or "",
+    CONFIG_INFINITEBENCH_DIR=cfg.get("infinitebench_dir") or "",
     LONG_EVAL_SKIP=",".join(done),
 )
 for name, value in values.items():
@@ -796,9 +799,11 @@ else
     LONG_PPL_DATA=${LONG_PPL_DATA:-${CONFIG_LONG_PPL_DATA}}
     LONG_PPL_BOOKS=${LONG_PPL_BOOKS:-${CONFIG_LONG_PPL_BOOKS}}
     BABILONG_DATASET=${BABILONG_DATASET:-${CONFIG_BABILONG_DATASET}}
+    INFINITEBENCH_DIR=${INFINITEBENCH_DIR:-${CONFIG_INFINITEBENCH_DIR}}
     if [ -n "${LONG_PPL_DATA}" ]; then export LONG_PPL_DATA; fi
     if [ -n "${LONG_PPL_BOOKS}" ]; then export LONG_PPL_BOOKS; fi
     if [ -n "${BABILONG_DATASET}" ]; then export BABILONG_DATASET; fi
+    if [ -n "${INFINITEBENCH_DIR}" ]; then export INFINITEBENCH_DIR; fi
     LONG_EVAL_PLAN=$("${PYTHON_BIN}" long_eval_plan.py "${LONG_EVAL_LENGTHS}" "${EVAL_SUITES:-}" "${YARN_MODE:-per_length}" \
         "${NIAH_ONLY:-0}" "" "${EVAL_OUTPUT_DIR}" "${LONG_EVAL_SKIP}") || exit 1
     mapfile -t LONG_EVAL_PASSES <<< "${LONG_EVAL_PLAN}"

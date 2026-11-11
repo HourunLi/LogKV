@@ -7,15 +7,18 @@
 # long_ppl_books_64k：同一批不短于 256K 的书（long_ppl_books 或 LONG_PPL_BOOKS，PG19 训练集：fetch_long_eval_data.py
 # --ppl-books-hub emozilla/pg19）截到 8k…64k 各算末尾 4096 个 token 的困惑度；niah_turns_64k：niah_multiquery 的
 # 四个键在同一份缓存上逐轮问（缓存时不知道问题）。
+# infinitebench_64k：InfiniteBench 的十个任务（官方提示与评分）从中间截到 64k（数据 infinitebench_dir 或
+# INFINITEBENCH_DIR，不设读 hub 缓存：fetch_long_eval_data.py --infinitebench）。
 #   bash eval.sh exp/qwen1.7b-32k/eval_long64k_baseline.yaml
 config: arc_gamma_k12_b128_p1024_2k.yaml
 eval_max_seq_lengths: [65536]
 niah_benchmark: [niah_single_1, niah_single_2, niah_single_3, niah_multikey_1, niah_multikey_2, niah_multikey_3,
   niah_multivalue, niah_multiquery, ruler_vt, ruler_cwe, ruler_fwe, ruler_qa_squad, ruler_qa_hotpot]
-benchmark: babilong_64k,long_ppl_32k,long_ppl_64k,long_ppl_books_64k,niah_turns_64k,longbench2_64k
+benchmark: babilong_64k,long_ppl_32k,long_ppl_64k,long_ppl_books_64k,niah_turns_64k,longbench2_64k,infinitebench_64k
 limit: 100
 long_ppl_data: ${LONG_PPL_DATA:-}
 long_ppl_books: ${LONG_PPL_BOOKS:-}
+infinitebench_dir: ${INFINITEBENCH_DIR:-}
 config_overrides:
   block_size: 66560
   rope_adjustments: {factor: 2.0, beta_fast: 32, beta_slow: 1, original_max_seq_len: 32768}

@@ -99,7 +99,7 @@ def test_the_header_keeps_each_length_together(parse):
                or re.fullmatch(rf"long_ppl_books_{n}_\d+k", c)] for n in ("32k", "64k", "128k", "256k")]
     shapes = [[re.sub(rf"_{n}(?=_|$)", "_<n>", c, count=1) for c in block]
               for n, block in zip(("32k", "64k", "128k", "256k"), blocks)]
-    assert all(shape == shapes[0] for shape in shapes) and len(shapes[0]) == 35
+    assert all(shape == shapes[0] for shape in shapes) and len(shapes[0]) == 46
     # The task's length: the first _<length> in the name (long_ppl_books_64k_8k is 64K's curve).
     lengths = [m.group(1) if (m := re.search(r"_(32k|64k|128k|256k)(?=_|$)", c)) else None for c in header[90:]]
     named = [n for n in lengths if n]  # LongBench2 without a length sits in 32K's block
@@ -117,3 +117,13 @@ def test_turn_and_book_curve_columns(parse):
     assert row["niah_turns_256k"] == 0.625 and row["niah_turns_256k_turn1"] == 0.9 and row["niah_turns_256k_turn4"] == 0.5
     assert [row[f"long_ppl_books_256k_{q}"] for q in ("8k", "256k")] == [10., 5.]  # ppl, not bits_per_byte
     assert row["long_ppl_books_128k_8k"] != row["long_ppl_books_128k_8k"]  # another configuration's curve: empty
+
+
+def test_infinitebench_columns(parse):
+    names = [f"infinitebench_{t}_128k" for t in parse.INFINITEBENCH]
+    scores = {name: {"score": i / 10} for i, name in enumerate(names)}
+    log = _log(_table({"infinitebench_128k": {"score": 0.45}, **scores}, [("infinitebench_128k", names)]))
+    row = parse.build_table({"wf": log}).set_index("Model").loc["wf"]
+    assert row["infinitebench_passkey_128k"] == 0.0 and row["infinitebench_math_find_128k"] == 0.9
+    assert row["AVG_InfiniteBench_128k"] == pytest.approx(0.45)
+    assert row["AVG_InfiniteBench_64k"] != row["AVG_InfiniteBench_64k"]  # another length: empty

@@ -8,6 +8,8 @@ with LONG_PPL_DATA / LONG_PPL_BOOKS exported as for eval.sh. Each line says OK o
     LongBench v2  the hub snapshot's files are whole parquet, and every subset lm-eval's longbench2 reads loads
                   (503 questions in all)
     RULER QA      SQuAD v2 dev and HotpotQA dev in RULER_CACHE_DIR
+    InfiniteBench the ten tasks' jsonl files (INFINITEBENCH_DIR, or the hub cache) are whole, and every sample
+                  makes a prompt and an answer
     long_ppl      LONG_PPL_DATA: documents of >= 131072 and >= 262144 tokens
     books         LONG_PPL_BOOKS: books of >= 262144 tokens (want LONG_PPL_DOCS, 100)
 The ppl lines need --tokenizer (they read the cached selection, or select again when it is missing).
@@ -87,6 +89,28 @@ def check_ruler_qa(report) -> None:
                f"RULER QA {path}: " + (f"{path.stat().st_size / 1e6:.1f} MB" if path.is_file() else "missing"))
 
 
+def check_infinitebench(report) -> None:
+    import json
+
+    spec = importlib.util.spec_from_file_location(
+        "infinitebench_utils", ROOT / "eval_tasks" / "infinitebench" / "infinitebench_utils.py")
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+    for task in utils.TASKS:
+        try:
+            path = utils.data_file(task)
+            rows = 0
+            with open(path, encoding="utf8") as f:
+                for line in f:
+                    if line.strip():
+                        eg = json.loads(line)
+                        utils.prompt_of(task, eg), utils.answer_of(task, eg)
+                        rows += 1
+            report(rows > 0, f"InfiniteBench {task}: {rows} samples in {path}")
+        except Exception as error:  # noqa: BLE001
+            report(False, f"InfiniteBench {task}: {type(error).__name__}: {str(error)[:200]}")
+
+
 def check_ppl(report, tokenizer: str | None) -> None:
     spec = importlib.util.spec_from_file_location("long_ppl_utils", ROOT / "eval_tasks" / "long_ppl" / "long_ppl_utils.py")
     utils = importlib.util.module_from_spec(spec)
@@ -121,7 +145,7 @@ def main():
         print(("OK       " if ok else "MISSING  ") + text, flush=True)
         if not ok:
             failures.append(text)
-    for check in (check_babilong, check_longbench2, check_ruler_qa):
+    for check in (check_babilong, check_longbench2, check_ruler_qa, check_infinitebench):
         check(report)
     check_ppl(report, args.tokenizer)
     print(f"\n{len(failures)} problem(s)" + ("" if failures else ": the long-context data is complete"))

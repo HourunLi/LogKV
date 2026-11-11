@@ -15,9 +15,10 @@ from a per_length one only in the factor.
 
 EVAL_SUITES chooses the tasks (default all): ruler (NIAH stage: all of RULER, 12 tasks at 256K without
 ruler_qa_squad, whose 1204 SQuAD paragraphs cannot fill it), babilong, ppl (long_ppl_<L>, LONG_PPL_DATA), books
-(long_ppl_books_<L>, LONG_PPL_BOOKS), turns (niah_turns_<L>) and longbench2 (longbench2_<L>). NIAH_ONLY=1 keeps
-ruler only. With the default suites the data-bound ones (ppl, books, longbench2) are optional: eval.py leaves them
-out, with the reason, when their data is not given (or LongBench v2's files are not whole); named suites must run.
+(long_ppl_books_<L>, LONG_PPL_BOOKS), turns (niah_turns_<L>), longbench2 (longbench2_<L>) and infinitebench
+(infinitebench_<L>, 64K / 128K / 256K only; INFINITEBENCH_DIR or the hub cache). NIAH_ONLY=1 keeps ruler only. With
+the default suites the data-bound ones (ppl, books, longbench2, infinitebench) are optional: eval.py leaves them
+out, with the reason, when their data is not given (or their files are not whole); named suites must run.
 
     python long_eval_plan.py <lengths> <suites or ""> <yarn_mode> <niah_only 0/1> <base overrides json or ""> <output dir> [skip]
 
@@ -33,13 +34,14 @@ import json
 import sys
 
 LENGTHS = {"32k": 32768, "64k": 65536, "128k": 131072, "256k": 262144}
-SUITES = ("ruler", "babilong", "ppl", "books", "turns", "longbench2")
-DATA_SUITES = ("ppl", "books", "longbench2")  # optional with the default suites: their data may be missing
+SUITES = ("ruler", "babilong", "ppl", "books", "turns", "longbench2", "infinitebench")
+DATA_SUITES = ("ppl", "books", "longbench2", "infinitebench")  # optional with the default suites: their data may be missing
 ORIGINAL = 32768  # the trained length, YaRN's original_max_seq_len
 MARGIN = 1024
 RULER = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
          "niah_multivalue", "niah_multiquery", "ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
 SQUAD_MAX = 131072  # SQuAD's document pool cannot fill longer contexts
+INFINITEBENCH_LENGTHS = ("64k", "128k", "256k")  # its contexts are about 100K-200K tokens: not at 32K
 
 
 def parse_list(text: str, allowed, what: str) -> list[str]:
@@ -57,6 +59,7 @@ def tasks(suite: str, name: str) -> list[str]:
         "books": [f"long_ppl_books_{name}"],
         "turns": [f"niah_turns_{name}"],
         "longbench2": [f"longbench2_{name}"],
+        "infinitebench": [f"infinitebench_{name}"] if name in INFINITEBENCH_LENGTHS else [],
     }[suite]
 
 

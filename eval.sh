@@ -8,7 +8,7 @@
 #   (niah_csv defaults to every NIAH task: DEFAULT_NIAH_BENCHMARKS below)
 #   NIAH only: bash eval.sh <yaml> none   or   NIAH_ONLY=1 bash eval.sh <yaml>
 #   Several lengths (a YAML with eval_lengths, e.g. exp/qwen1.7b-32k/eval_long_word_first.yaml; long_eval_plan.py):
-#     [EVAL_LENGTHS=32k,128k] [EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2] [YARN_MODE=fixed] [NIAH_ONLY=1] \
+#     [EVAL_LENGTHS=32k,128k] [EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench] [YARN_MODE=fixed] [NIAH_ONLY=1] \
 #         bash eval.sh <yaml>
 #
 # Examples:
@@ -287,6 +287,7 @@ emit("CONFIG_LONG_PPL_BOOKS", cfg.get("long_ppl_books") or "")  # long_ppl_books
 # Several lengths in one job (long_eval_plan.py): a list such as [32k, 64k, 128k, 256k].
 emit("CONFIG_EVAL_LENGTHS", ",".join(str(x) for x in (cfg.get("eval_lengths") or [])))
 emit("CONFIG_BABILONG_DATASET", cfg.get("babilong_dataset") or "")
+emit("CONFIG_INFINITEBENCH_DIR", cfg.get("infinitebench_dir") or "")  # eval_tasks/infinitebench
 EOF
 )
 CONFIG_STATUS=$?
@@ -299,9 +300,11 @@ eval "${CONFIG_EXPORTS}"
 LONG_PPL_DATA=${LONG_PPL_DATA:-${CONFIG_LONG_PPL_DATA}}
 LONG_PPL_BOOKS=${LONG_PPL_BOOKS:-${CONFIG_LONG_PPL_BOOKS}}
 BABILONG_DATASET=${BABILONG_DATASET:-${CONFIG_BABILONG_DATASET}}
+INFINITEBENCH_DIR=${INFINITEBENCH_DIR:-${CONFIG_INFINITEBENCH_DIR}}
 if [ -n "${LONG_PPL_DATA}" ]; then export LONG_PPL_DATA; fi
 if [ -n "${LONG_PPL_BOOKS}" ]; then export LONG_PPL_BOOKS; fi
 if [ -n "${BABILONG_DATASET}" ]; then export BABILONG_DATASET; fi
+if [ -n "${INFINITEBENCH_DIR}" ]; then export INFINITEBENCH_DIR; fi
 
 # Several lengths in one job (eval_lengths in the YAML, or EVAL_LENGTHS=32k,128k): one pass per length with its
 # own window and YaRN factor (YARN_MODE=per_length, the default, or fixed), tasks chosen by EVAL_SUITES and
@@ -633,8 +636,10 @@ run_stages() {
     # RULER / NIAH context lengths: the YAML's eval_max_seq_lengths (default 1K-32K).
     META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENGTHS}"'}'
     MAIN_METADATA_ARGS=()
-    # Tasks that build their samples with the tokenizer (RULER, long_ppl) need the metadata.
-    if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* ]]; then
+    # Tasks that build their samples or cut their prompts with the tokenizer (RULER, long_ppl, InfiniteBench) need
+    # the metadata.
+    if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* \
+        || "${BENCHMARKS}" == *infinitebench* ]]; then
         MAIN_METADATA_ARGS=(--metadata "${META}")
     fi
 

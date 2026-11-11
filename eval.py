@@ -447,23 +447,26 @@ from lm_eval.api.model import LM
 EVAL_TASKS_DIR = Path(__file__).resolve().parent / "eval_tasks"
 
 
-# Tasks named for a context length (eval_tasks/babilong_long, long_ppl, longbench2_long, niah_turns); a
-# long_ppl_books_<L>_<point> task is named for its configuration's length L.
-_LENGTH_NAMED_TASK = re.compile(r"^(babilong(?:_qa\d+)?|long_ppl(?:_books)?|longbench2|niah_turns)_(\d+)k(?:_\d+k)?$")
+# Tasks named for a context length (eval_tasks/babilong_long, long_ppl, longbench2_long, niah_turns, infinitebench);
+# a long_ppl_books_<L>_<point> task is named for its configuration's length L.
+_LENGTH_NAMED_TASK = re.compile(
+    r"^(babilong(?:_qa\d+)?|long_ppl(?:_books)?|longbench2|niah_turns|infinitebench(?:_[a-z_]+)?)_(\d+)k(?:_\d+k)?$")
 
 
 def _check_task_lengths(tasks, max_seq_length):
     """A task named for a context length must fit the model's window: longer inputs are cut from the start
     without a word, and the result would still carry the name. LongBench v2's per-length groups take their
     budget from the window itself, so for them the window must not be larger either (block_size = length plus
-    a generation margin of at most 4096)."""
+    a generation margin of at most 4096). InfiniteBench cuts its prompts to the length itself and generates in a
+    1024-token margin beyond it (eval_tasks/infinitebench), so it needs that margin."""
     for task in tasks:
         match = _LENGTH_NAMED_TASK.match(task.strip())
         if not match:
             continue
         length = int(match.group(2)) * 1024
-        if max_seq_length < length or (match.group(1) == "longbench2" and max_seq_length > length + 4096):
-            raise ValueError(f"task {task} needs a model window of {length} tokens"
+        need = length + (1024 if match.group(1).startswith("infinitebench") else 0)  # long_eval_plan.MARGIN
+        if max_seq_length < need or (match.group(1) == "longbench2" and max_seq_length > length + 4096):
+            raise ValueError(f"task {task} needs a model window of {need} tokens"
                              + (f" (at most {length + 4096})" if match.group(1) == "longbench2" else "")
                              + f", but max_seq_length is {max_seq_length}: set config_overrides.block_size")
 
@@ -497,6 +500,35 @@ def _longbench2_files_problem():
     if bad:
         return (f"LongBench v2 files in {root} are not whole parquet: {bad[:3]}" + (f" and {len(bad) - 3} more"
                 if len(bad) > 3 else "") + " (unused/fetch_long_eval_data.py --longbench2 downloads them again)")
+    return None
+
+
+INFINITEBENCH_FILES = ("passkey", "number_string", "kv_retrieval", "longbook_sum_eng", "longbook_qa_eng",
+                       "longbook_choice_eng", "longbook_qa_chn", "longdialogue_qa_eng", "code_debug", "math_find")
+
+
+def _infinitebench_files_problem():
+    """Why InfiniteBench's data cannot be read offline, or None: its tasks read the jsonl files from
+    INFINITEBENCH_DIR or the hub cache (eval_tasks/infinitebench; unused/fetch_long_eval_data.py --infinitebench)."""
+    folder = os.environ.get("INFINITEBENCH_DIR")
+    missing = []
+    for name in INFINITEBENCH_FILES:
+        if folder:
+            path = os.path.join(folder, f"{name}.jsonl")
+        else:
+            try:
+                from huggingface_hub import try_to_load_from_cache
+
+                path = try_to_load_from_cache("xinrongzhang2022/InfiniteBench", f"{name}.jsonl", repo_type="dataset")
+            except Exception:  # noqa: BLE001
+                path = None
+        if not isinstance(path, str) or not os.path.isfile(path) or os.path.getsize(path) < 1024:
+            missing.append(name)
+    if missing:
+        where = f"INFINITEBENCH_DIR={folder}" if folder else "the hub cache (INFINITEBENCH_DIR is not set)"
+        return (f"InfiniteBench files missing or cut in {where}: {missing[:3]}"
+                + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
+                + " (unused/fetch_long_eval_data.py --infinitebench)")
     return None
 
 
@@ -538,6 +570,8 @@ def _skip_optional_tasks(tasks, max_seq_length):
                 reason = "LONG_PPL_DATA is not set (unused/fetch_long_eval_data.py --ppl-hub emozilla/pg19-test)"
             elif reason is None and task.startswith("longbench2_"):
                 reason = _longbench2_files_problem()
+            elif reason is None and task.startswith("infinitebench_"):
+                reason = _infinitebench_files_problem()
         if reason is None:
             kept.append(task)
         elif _is_main():

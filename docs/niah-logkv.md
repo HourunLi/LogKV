@@ -290,6 +290,18 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   （`babilong_*_<L>`、`long_ppl_<L>`、`longbench2_<L>`）要求 max_seq_length 不小于 L，`longbench2_<L>` 还要求不超过 L+4096，
   否则报错（长于窗口的输入会被悄悄截短，结果却仍带着这个长度的名字）。LongBench v1（`longbench_*`）平均约 6.7K 词，
   绝大多数样本不到 32K token，没有按长度的版本。
+- InfiniteBench（`infinitebench_{64k,128k,256k}`，`eval_tasks/infinitebench`；Zhang et al., 2024）：64K 以上的真实任务，KV cache
+  压缩论文（MInference、LAVa、ReST-KV 等）在 LongBench、RULER 之外报告的那组。取这些论文报告的十个任务：Retr.PassKey、
+  Retr.Number、Retr.KV（检索），En.Sum、En.QA、En.MC、Zh.QA（整本书的摘要、问答、选择），En.Dia（剧本里被遮住的角色名），
+  Code.Debug（找出有错的函数，四选一），Math.Find（长列表里的最大 / 最小值）；Code.Run 与 Math.Calc 在原文里所有模型都接近 0，
+  不测。照官方代码（OpenBMB/InfiniteBench 的 `eval_yarn_mistral.py`、`compute_scores.py`）：用它给 base 模型的提示模板，整段提示
+  从中间截到预算（保留前一半与后一半，开头的指令和结尾的问题都在；官方截到 128K），贪心生成，官方的生成长度与评分规则
+  （首个整数、词匹配、选项字母、词 F1、中文按字的 F1、摘要 ROUGE-Lsum）。预算是长度本身，生成超出窗口 1024 余量的部分
+  从预算里扣（En.Sum 生成 1200），所以 `eval.py` 不会再从开头截；`eval.py` 要求窗口不小于 L+1024。样本本身短于预算的整段保留：
+  检索类上下文约 128K token，256K 时大多不截，书类与 Code.Debug 多在 10 万到几十万 token。组的 `score` 是十个任务的平均
+  （论文的 Avg），每个任务 `--limit` 条。样本留在数据文件里，数据集的每行只记该行在文件中的偏移与答案，`doc_to_text` 只为
+  要跑的样本读出、拼提示、分词截断。数据：`xinrongzhang2022/InfiniteBench` 的十个 jsonl（`INFINITEBENCH_DIR` / YAML 的
+  `infinitebench_dir` 指向放这些文件的目录，不设则读 hub 缓存）。不测 32K：样本多为 10 万 token 以上，32K 只剩首尾。
 - 书的困惑度曲线（组 `long_ppl_books_{32k,64k,128k,256k}`）：另一个数据源 `LONG_PPL_BOOKS`（YAML 的 `long_ppl_books`），取前
   `LONG_PPL_DOCS`（100）本不短于 262144 token 的书，所有组共用这一批（`_documents(..., LONGEST_256K, env="LONG_PPL_BOOKS")`，
   缓存与 `long_ppl_*` 分开）。组 `long_ppl_books_<L>` 的每个任务 `long_ppl_books_<L>_<p>`（p = 8k, 16k, … , L）把每本书截到 p，
@@ -308,11 +320,12 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   `eval.py` 打印原因后跳过（`_skip_optional_tasks`）；按名字指定的任务不可选，放不进窗口就报错。主阶段清单里有用 tokenizer
   生成样本的任务（`niah_*`、`ruler*`、`long_ppl*`）时，两个脚本都传 metadata。与 32K 的 `niah_multiquery` 对比，且不受 YaRN 外推影响。
 - 数据：`eval.sh` 离线运行（`HF_HUB_OFFLINE=1`、`HF_DATASETS_OFFLINE=1`），新数据要先在联网时放进它读的缓存：
-  `bash diag.sh unused/fetch_long_eval_data.py [--longbench2] [--ppl-data <留出数据> --tokenizer <tokenizer 目录>]`
+  `bash diag.sh unused/fetch_long_eval_data.py [--longbench2] [--infinitebench] [--ppl-data <留出数据> --tokenizer <tokenizer 目录>]`
   用与 `eval.sh` 相同的 `HF_HOME` / `HF_DATASETS_CACHE` / `RULER_CACHE_DIR`，只为自己打开联网，下载 BABILong（32k / 64k / 128k，与 `RMT-team/babilong` 的 256k）、
-  RULER 问答的 SQuAD 与 HotpotQA（`litgpt/ruler_patch.py` 先读的本地文件）与可选的 LongBench v2，再以离线方式重新加载
+  RULER 问答的 SQuAD 与 HotpotQA（`litgpt/ruler_patch.py` 先读的本地文件）与可选的 LongBench v2、InfiniteBench（十个 jsonl，
+  进 hub 缓存，不完整的重新下载），再以离线方式重新加载
   一遍（之后可随时用 `bash diag.sh unused/check_long_eval_data.py --tokenizer <目录>` 以评测时的离线环境只读地核对：BABILong 各长度、
-  LongBench v2 快照与 20 个子集共 503 题、RULER 问答文件、`LONG_PPL_DATA` 与 `LONG_PPL_BOOKS` 的文档数）；快照里不是完整 parquet 的文件会修好再用：hub 缓存的软链接被拷贝或同步压平成一个写着 `../../../../blobs/<sha>` 的小文件时，
+  LongBench v2 快照与 20 个子集共 503 题、RULER 问答文件、InfiniteBench 十个文件的样本数、`LONG_PPL_DATA` 与 `LONG_PPL_BOOKS` 的文档数）；快照里不是完整 parquet 的文件会修好再用：hub 缓存的软链接被拷贝或同步压平成一个写着 `../../../../blobs/<sha>` 的小文件时，
   blob 完好就重新建链接（不能建链接的文件系统上复制 blob），否则删掉这个文件、按该快照的版本强制重下（`hf_hub_download` 遇到已存在的
   快照文件即使 `force_download` 也只刷新 blob，不替换它）；`--ppl-books-hub emozilla/pg19`（或本地的 `--ppl-books-data`）按文件名顺序逐个下载训练集文件，直到找到 100 本不短于
   262144 token 的书（PG19 训练集 2.86 万本里约 4–6%），写入 `long_ppl_books` 的缓存并打印 `LONG_PPL_BOOKS` 的目录；该目录里
@@ -332,12 +345,14 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   该配置只剩这种目录时报“not completely downloaded”并列出目录，此时等下载结束或联网重跑下载脚本；下载脚本的汇总也会列出残留目录。
 - 一份配置测多个长度：`eval_long_{dense,baseline,word_first}.yaml`（`eval_lengths: [32k, 64k, 128k, 256k]`）。`eval.sh` 用
   `long_eval_plan.py` 按长度逐档评测：每档窗口为长度 + 1024，NIAH 阶段跑该长度的 RULER，主阶段跑该长度的 `babilong_<L>`、
-  `long_ppl_<L>`、`long_ppl_books_<L>`、`niah_turns_<L>` 与 `longbench2_<L>`，结果写到 `<output_path>/long<L>`。YaRN 默认按长度取倍数
+  `long_ppl_<L>`、`long_ppl_books_<L>`、`niah_turns_<L>`、`longbench2_<L>` 与 `infinitebench_<L>`（64K 起），结果写到
+  `<output_path>/long<L>`。YaRN 默认按长度取倍数
   （`YARN_MODE=per_length`：32K 不用，64K 2、128K 4、256K 8），32K 档与 32K 主线一致、各长度比较的是压缩而不是外推；
   `YARN_MODE=fixed` 是附加实验：每档都用所测最长一档的倍数（按该长度部署的模型，静态 YaRN），写到 `<output_path>/yarn<F>/long<L>`。
   YaRN 的频率与温度只取决于倍数、与窗口无关，所以两种模式只差倍数，LongBench v2 的预算仍是各档自己的长度。外部变量控制范围：
-  `EVAL_LENGTHS=32k,128k`（默认 YAML 的 `eval_lengths`）、`EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2`（默认全部；
-  默认时缺数据的 `ppl`、`books`，以及 hub 缓存里文件不是完整 parquet 的 `longbench2`，作为可选任务跳过并打印原因，点名的必须能跑）、`NIAH_ONLY=1`（只跑 RULER）；这种配置不接受任务清单参数。
+  `EVAL_LENGTHS=32k,128k`（默认 YAML 的 `eval_lengths`）、`EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench`
+  （默认全部；默认时缺数据的 `ppl`、`books`，hub 缓存里文件不是完整 parquet 的 `longbench2`，以及找不到十个文件的
+  `infinitebench`，作为可选任务跳过并打印原因，点名的必须能跑）、`NIAH_ONLY=1`（只跑 RULER）；这种配置不接受任务清单参数。
   每档换一次窗口与 YaRN，要重新加载模型（约一分钟）。注意 `long_ppl_32k` 在这里是 32K 档（不用 YaRN）测的，在
   `eval_long64k_*.yaml` 里是 64K 配置（YaRN 2）测的；32K 档的 8 个捞针任务写进 32K 主线的同名列，其余 5 个 RULER 任务、
   `AVG_RULER_32k` 与 `LongBench2_32k` 是新加的列。按长度拆开的 `eval_long{64k,128k,256k}_*.yaml` 保留，用于复现已有结果。
@@ -346,20 +361,21 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   每个任务 `LONG_EVAL_LIMIT`（默认 100）条，结果写到 `evaluate/long<L>`。主线已经测过的不再重测（主评测的任务、NIAH 阶段在各自
   长度上的捞针，`long_eval_plan.py` 的 skip），所以 32K 档只补 BABILong、`long_ppl_32k`、LongBench v2 与其余 5 个 RULER 任务，
   主线 500 条的 32K 捞针不会被 100 条的结果覆盖。训练长度（`context_length`）不到 32K 的 checkpoint 跳过：长文本的 YaRN 以 32K
-  为原长。数据取环境变量 `LONG_PPL_DATA`、`LONG_PPL_BOOKS`、`BABILONG_DATASET`，或 YAML 的同名小写键。
+  为原长。数据取环境变量 `LONG_PPL_DATA`、`LONG_PPL_BOOKS`、`BABILONG_DATASET`、`INFINITEBENCH_DIR`，或 YAML 的同名小写键。
 - 配置：`eval_long{64k,128k,256k}_{dense,baseline,word_first}.yaml`，分别是原始 Qwen3-1.7B-Base 的 dense（未经 CPT，继承
   `dense_niah_base.yaml`，结果写到其 `long64k` / `long128k` / `long256k` 子目录）、同 checkpoint 的 K/V 准入基线与 `word_first`，
   与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER（256K 为上面的 12 个），主阶段跑 BABILong 与困惑度（64K 配置为 32K
-  与 64K，128K、256K 配置为各自的长度），再跑 `long_ppl_books_<L>`、`niah_turns_<L>` 与 `longbench2_<L>`，每个任务 100 条。256K 的
-  dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset`、`long_ppl_data` 与 `long_ppl_books` 三个键（或同名环境变量）给出本地数据。
+  与 64K，128K、256K 配置为各自的长度），再跑 `long_ppl_books_<L>`、`niah_turns_<L>`、`longbench2_<L>` 与 `infinitebench_<L>`，
+  每个任务 100 条。256K 的 dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset`、`long_ppl_data`、`long_ppl_books` 与
+  `infinitebench_dir` 四个键（或同名环境变量）给出本地数据。
 - 汇总表（`unused/parse_lmeval_table.py`）：把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
   日志里 eval.py 打印的结果表会被挑出来（行首前缀会去掉），同一模型的几份日志（如 32K、128K、256K 各一份）接着贴进
   同一个字符串，合成一行。表头按长度分块：前 89 列是 32K 主线（常识、综合、LongBench v1/E、32K 捞针），之后 32K、64K、128K、
-  256K 各一块，四块的列除长度后缀外完全相同（论文里 32K-256K 可单独成表），每块 35 列：RULER 13 个任务 `<任务>_<长度>`、
+  256K 各一块，四块的列除长度后缀外完全相同（论文里 32K-256K 可单独成表），每块 46 列：RULER 13 个任务 `<任务>_<长度>`、
   `AVG_NIAH_<长度>`（3 个单针）、`AVG_NIAH_multi_<长度>`（5 个多针）、`AVG_RULER_<长度>`（13 个）、`babilong_qaN_<长度>` 与
   `AVG_babilong_<长度>`、`long_ppl_<长度>`（越低越好）、`LongBench2_<长度>`、`niah_turns_<长度>`（四轮平均与 `_turnN`）、书的
-  困惑度曲线 `long_ppl_books_<长度>_<8k…256k>`。32K 块的捞针列与主线的 `niah_single_1` 等是同一份结果，重复列出；没有结果的
-  列留空（256K 的 `ruler_qa_squad`，`AVG_RULER_256k` 为其余 12 个的平均；曲线上超过配置长度的点）。这些列都不计入 `AVG_all`。
+  困惑度曲线 `long_ppl_books_<长度>_<8k…256k>`、InfiniteBench 十个任务 `infinitebench_<任务>_<长度>` 与 `AVG_InfiniteBench_<长度>`。32K 块的捞针列与主线的 `niah_single_1` 等是同一份结果，重复列出；没有结果的
+  列留空（256K 的 `ruler_qa_squad`，`AVG_RULER_256k` 为其余 12 个的平均；曲线上超过配置长度的点；32K 的 InfiniteBench）。这些列都不计入 `AVG_all`。
   不带长度的旧 `LongBench2` 在最后一列。新列在四块里同时加；`tests/parse_lmeval_table_columns.txt` 记着表头，
   测试检查四块同构、各长度的列连在一起。按位置对齐的旧表格把日志重新贴进来再跑一遍即可得到新顺序。
 
@@ -368,4 +384,5 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
 与不缓存一致、书的曲线逐点取同一批书且 `--limit` 按书计、下载脚本逐个文件下载到书够为止），
 `tests/test_long_eval_plan.py`（每档的窗口、YaRN 倍数、任务、输出目录与可选任务，两种 YaRN 模式，`eval.sh` 逐档传参、单长度配置
 照旧），`tests/test_niah_turns.py`（缓存精确时逐轮答案与不用缓存逐 token 重算一致、压缩缓存上不给 query cue、样本切成上下文与四个问题、
-任务把 `turn_separator` 交给 eval.py），`tests/test_exp_configs.py`（长文本配置只差长度相关的几项）。
+任务把 `turn_separator` 交给 eval.py），`tests/test_infinitebench.py`（官方评分规则、提示与预算、三个组从中间截断长上下文、
+窗口须含生成余量、缺文件时默认清单跳过），`tests/test_exp_configs.py`（长文本配置只差长度相关的几项）。
