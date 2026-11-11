@@ -60,13 +60,28 @@ TASKS = {
 LENGTHS = {"64k": 65536, "128k": 131072, "256k": 262144}
 
 
+FETCH = "bash diag.sh unused/fetch_long_eval_data.py --no-ruler-qa --no-babilong --infinitebench"
+
+
 def data_file(task: str) -> str:
     folder = os.environ.get("INFINITEBENCH_DIR")
     if folder:
-        return os.path.join(folder, f"{task}.jsonl")
+        path = os.path.join(folder, f"{task}.jsonl")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"InfiniteBench: {path} is missing (INFINITEBENCH_DIR={folder} must hold the ten "
+                                    f"jsonl files of {REPO})")
+        return path
     from huggingface_hub import hf_hub_download
 
-    return hf_hub_download(REPO, f"{task}.jsonl", repo_type="dataset")
+    try:
+        return hf_hub_download(REPO, f"{task}.jsonl", repo_type="dataset")
+    except Exception as error:  # noqa: BLE001 - offline and not in the cache
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        raise FileNotFoundError(
+            f"InfiniteBench: {task}.jsonl of {REPO} is not in the hub cache {HF_HUB_CACHE} "
+            f"({type(error).__name__}). Download it online with the same HF_HOME: {FETCH}; or set INFINITEBENCH_DIR "
+            f"to a folder holding the ten jsonl files") from error
 
 
 def prompt_of(task: str, eg: dict) -> str:
