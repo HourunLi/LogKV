@@ -136,7 +136,7 @@ def _eval_functions(*names):
 
     source = ROOT / "eval.py"
     nodes = [n for n in ast.parse(source.read_text()).body
-             if (isinstance(n, ast.FunctionDef) and n.name in names)
+             if (isinstance(n, ast.FunctionDef) and n.name in (*names, "_file_state"))
              or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") in ("_LENGTH_NAMED_TASK",
                                                                                    "INFINITEBENCH_FILES"))]
     scope = dict(re=re, os=os, Path=Path, _is_main=lambda: True)
