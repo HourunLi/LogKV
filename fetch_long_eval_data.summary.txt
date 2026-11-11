@@ -1,0 +1,14 @@
+HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
+HF_DATASETS_CACHE=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
+RULER_CACHE_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/ruler_cache
+HTTPS certificate checks: off (--verify-ssl turns them on)
+InfiniteBench passkey.jsonl: 590 samples, 277 MB
+InfiniteBench number_string.jsonl: 590 samples, 277 MB
+InfiniteBench kv_retrieval.jsonl: 500 samples, 105 MB
+InfiniteBench longbook_sum_eng.jsonl: 103 samples, 79 MB
+InfiniteBench longbook_qa_eng.jsonl: 351 samples, 298 MB
+InfiniteBench longbook_choice_eng.jsonl: 229 samples, 186 MB
+InfiniteBench longbook_qa_chn.jsonl: 189 samples, 863 MB
+InfiniteBench longdialogue_qa_eng.jsonl: 200 samples, 84 MB
+InfiniteBench code_debug.jsonl: 394 samples, 200 MB
+InfiniteBench math_find.jsonl: 350 samples, 41 MB
