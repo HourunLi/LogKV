@@ -5,8 +5,8 @@ put into eval.sh's caches). Run it the way eval.sh runs, with diag.sh's offline 
 
 with LONG_PPL_DATA / LONG_PPL_BOOKS exported as for eval.sh. Each line says OK or MISSING / BAD:
     BABILong      RMT-team/babilong-1k-samples 32k / 64k / 128k and RMT-team/babilong 256k, qa1 ... qa5 (rows)
-    LongBench v2  the hub snapshot's files are whole parquet, and every subset lm-eval's longbench2 reads loads
-                  (503 questions in all)
+    LongBench v2  the hub snapshot's files are whole parquet (through flattened links to their blobs, as eval.py
+                  reads them), and every subset lm-eval's longbench2 reads loads (503 questions in all)
     RULER QA      SQuAD v2 dev and HotpotQA dev in RULER_CACHE_DIR
     InfiniteBench the ten tasks' jsonl files (INFINITEBENCH_DIR, or the hub cache) are whole, and every sample
                   makes a prompt and an answer
@@ -55,16 +55,19 @@ def check_longbench2(report) -> None:
     import datasets
     import lm_eval
 
-    from litgpt.longbench2_patch import REPO, apply_patch, snapshot
+    from litgpt.longbench2_patch import REPO, apply_patch, real_file, snapshot
 
     try:
         root, files = snapshot()
     except Exception as error:  # noqa: BLE001
         report(False, f"LongBench v2: no snapshot in the hub cache ({type(error).__name__}: {str(error)[:200]})")
         return
-    bad = [f for f in files if f.endswith(".parquet") and not whole_parquet(Path(root) / f)]
+    # A snapshot link flattened into a small file by a copy or sync is read from its blob, as eval.py does.
+    flattened = [f for f in files if real_file(Path(root) / f) != str(Path(root) / f)]
+    bad = [f for f in files if f.endswith(".parquet") and not whole_parquet(Path(real_file(Path(root) / f)))]
     report(bool(files) and not bad, f"LongBench v2 snapshot {root}: {len(files)} files"
-           + (f", not whole parquet: {bad}" if bad else ", all whole parquet"))
+           + (f", not whole parquet: {bad}" if bad else ", all whole parquet")
+           + (f" ({len(flattened)} read through flattened links to blobs/)" if flattened else ""))
     apply_patch()  # as eval.py
     folder = Path(lm_eval.__file__).parent / "tasks" / "longbench2"
     subsets = sorted({line.split(":", 1)[1].strip() for p in folder.glob("*.yaml")
