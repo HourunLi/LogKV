@@ -107,8 +107,8 @@ def test_the_header_keeps_each_length_together(parse):
     full.insert(full.index("long_ppl_<n>"), "long_ppl_books_<n>_256k")
     for n, shape in shapes.items():
         assert shape == [c for c in full if c in shape], n
-    assert len(shapes["64k"]) == 44 and len(shapes["256k"]) == 45
-    assert "AVG_InfiniteBench_<n>" in shapes["32k"] and len(shapes["32k"]) == 43
+    assert len(shapes["64k"]) == 64 and len(shapes["256k"]) == 65
+    assert "AVG_InfiniteBench_<n>" in shapes["32k"] and len(shapes["32k"]) == 63
     assert [c for c in shapes["32k"] if c.startswith("long_ppl")] == [
         "long_ppl_books_<n>_8k", "long_ppl_books_<n>_16k", "long_ppl_books_<n>_32k", "long_ppl_<n>"]
     assert "ruler_qa_squad_<n>" not in shapes["256k"] and "long_ppl_books_<n>_256k" in shapes["256k"]
@@ -148,3 +148,48 @@ def test_each_average_follows_its_tasks(parse):
                 assert places == list(range(places[0], places[-1] + 1)), avg  # its tasks side by side
         turns = [header.index(f"niah_turns_{n}_turn{i}") for i in range(1, 5)]
         assert header.index(f"niah_turns_{n}") == turns[-1] + 1 and turns == list(range(turns[0], turns[0] + 4))
+
+
+LONGBENCH2_64K = """|longbench2_64k                |      0|none  |      |acc   |↑  |0.2565|±  |0.0195|
+| - longbench2_academic_multi  |      0|none  |     0|acc   |↑  |0.4000|±  |0.0700|
+| - longbench2_academic_single |      0|none  |     0|acc   |↑  |0.2727|±  |0.0679|
+| - longbench2_agent_history   |      0|none  |     0|acc   |↑  |0.2500|±  |0.0993|
+| - longbench2_code            |      0|none  |     0|acc   |↑  |0.2200|±  |0.0592|
+| - longbench2_detective       |      0|none  |     0|acc   |↑  |0.1364|±  |0.0749|
+| - longbench2_dialogue_history|      0|none  |     0|acc   |↑  |0.2105|±  |0.0961|
+| - longbench2_event_order     |      0|none  |     0|acc   |↑  |0.1000|±  |0.0688|
+| - longbench2_fin_multi       |      0|none  |     0|acc   |↑  |0.1333|±  |0.0909|
+| - longbench2_fin_single      |      0|none  |     0|acc   |↑  |0.2727|±  |0.0972|
+| - longbench2_govt_multi      |      0|none  |     0|acc   |↑  |0.3043|±  |0.0981|
+| - longbench2_govt_single     |      0|none  |     0|acc   |↑  |0.3333|±  |0.1143|
+| - longbench2_graph           |      0|none  |     0|acc   |↑  |0.2000|±  |0.1069|
+| - longbench2_legal_multi     |      0|none  |     0|acc   |↑  |0.2143|±  |0.1138|
+| - longbench2_legal_single    |      0|none  |     0|acc   |↑  |0.2632|±  |0.1038|
+| - longbench2_lit_single      |      0|none  |     0|acc   |↑  |0.2333|±  |0.0785|
+| - longbench2_many_shot       |      0|none  |     0|acc   |↑  |0.2857|±  |0.1010|
+| - longbench2_news_multi      |      0|none  |     0|acc   |↑  |0.1304|±  |0.0718|
+| - longbench2_table           |      0|none  |     0|acc   |↑  |0.2222|±  |0.1008|
+| - longbench2_translate       |      0|none  |     0|acc   |↑  |0.4500|±  |0.1141|
+| - longbench2_user_guide      |      0|none  |     0|acc   |↑  |0.2750|±  |0.0715|"""
+
+
+def test_longbench2_subtasks_go_to_their_groups_length(parse):
+    """LongBench v2's subtasks are listed without a length, under their longbench2_<length> group: a model's logs of
+    several lengths, one after the other, fill each length's columns; the group's total comes after its subtasks."""
+    log_128k = LONGBENCH2_64K.replace("longbench2_64k  ", "longbench2_128k ").replace("0.4000", "0.5000")
+    lines = ["|Tasks|Version|Filter|n-shot|Metric| |Value| |Stderr|", "|---|--:|---|--:|---|---|--:|---|--:|"]
+    log = "\n".join(["[eval] 结果:", *lines, LONGBENCH2_64K, "|piqa|1|none|0|acc|↑|0.7|±|0.01|",
+                     "|longbench2_academic_multi|0|none|0|acc|↑|0.9|±|0.1|",  # alone, not under a group: dropped
+                     "[eval] 结果:", *lines, log_128k])
+    table = parse.build_table({"wf": log}).set_index("Model")
+    row = table.loc["wf"]
+    assert row["longbench2_academic_multi_64k"] == 0.4 and row["longbench2_user_guide_64k"] == 0.275
+    assert row["LongBench2_64k"] == 0.2565  # lm-eval's total over all questions, not a mean of the 20
+    assert row["longbench2_academic_multi_128k"] == 0.5 and row["LongBench2_128k"] == 0.2565
+    assert row["longbench2_academic_multi_32k"] != row["longbench2_academic_multi_32k"]  # no 32K log: empty
+    assert row["PIQA"] == 0.7
+    filled = [c for c in table.columns if c.startswith("longbench2_") and c.endswith("_64k")]
+    assert len(filled) == 20 and all(row[c] == row[c] for c in filled)
+    header = list(table.columns)
+    assert header.index("LongBench2_64k") == header.index("longbench2_user_guide_64k") + 1
+    assert header.index("longbench2_academic_multi_64k") == header.index("AVG_babilong_64k") + 1
