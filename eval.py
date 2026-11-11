@@ -507,13 +507,26 @@ INFINITEBENCH_FILES = ("passkey", "number_string", "kv_retrieval", "longbook_sum
                        "longbook_choice_eng", "longbook_qa_chn", "longdialogue_qa_eng", "code_debug", "math_find")
 
 
+def _file_state(path):
+    """What is at ``path``, for an error message: missing, a dangling or live link, or a file and its size."""
+    if os.path.islink(path):
+        target = os.readlink(path)
+        return f"a link to {target}" + ("" if os.path.exists(path) else " (dangling)")
+    if not os.path.exists(path):
+        return "missing"
+    return f"{os.path.getsize(path)} bytes"
+
+
 def _infinitebench_files_problem():
     """Why InfiniteBench's data cannot be read offline, or None: its tasks read the jsonl files from
     INFINITEBENCH_DIR, else <HF_HOME>/infinitebench, else the hub cache (eval_tasks/infinitebench;
-    unused/fetch_long_eval_data.py --infinitebench). A file under 1 KiB is a flattened hub-cache link, not data."""
+    unused/fetch_long_eval_data.py --infinitebench). A file under 1 KiB is a flattened hub-cache link, not data.
+    The message says what each place holds for the first missing file."""
     folder = os.environ.get("INFINITEBENCH_DIR")
     plain = os.path.join(os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "infinitebench")
-    missing = []
+    hub = os.path.join(os.environ.get("HF_HUB_CACHE") or os.path.join(os.path.dirname(plain), "hub"),
+                       "datasets--xinrongzhang2022--InfiniteBench")
+    missing, seen = [], ""
     for name in INFINITEBENCH_FILES:
         if folder:
             path = os.path.join(folder, f"{name}.jsonl")
@@ -528,11 +541,24 @@ def _infinitebench_files_problem():
                 path = None
         if not isinstance(path, str) or not os.path.isfile(path) or os.path.getsize(path) < 1024:
             missing.append(name)
+            if not seen:
+                file = f"{name}.jsonl"
+                if folder:
+                    seen = f"{os.path.join(folder, file)}: {_file_state(os.path.join(folder, file))}"
+                else:
+                    ref = os.path.join(hub, "refs", "main")
+                    snapshots = os.path.join(hub, "snapshots")
+                    shots = sorted(os.listdir(snapshots)) if os.path.isdir(snapshots) else []
+                    seen = (f"{os.path.join(plain, file)}: {_file_state(os.path.join(plain, file))}; "
+                            f"{plain}: {'holds ' + str(sorted(os.listdir(plain))[:12]) if os.path.isdir(plain) else 'missing'}; "
+                            f"hub cache {hub}: refs/main {_file_state(ref)}, snapshots {shots}"
+                            + "".join(f", snapshots/{h}/{file}: {_file_state(os.path.join(snapshots, h, file))}"
+                                      for h in shots[:2]))
     if missing:
         where = f"INFINITEBENCH_DIR={folder}" if folder else f"{plain} and the hub cache (INFINITEBENCH_DIR is not set)"
         return (f"InfiniteBench files missing or cut in {where}: {missing[:3]}"
                 + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
-                + " (unused/fetch_long_eval_data.py --infinitebench)")
+                + f". Seen: {seen}. (unused/fetch_long_eval_data.py --infinitebench, run where HF_HOME is this same folder)")
     return None
 
 
