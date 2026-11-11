@@ -110,7 +110,6 @@ babilong_qa3_32k
 babilong_qa4_32k
 babilong_qa5_32k
 AVG_babilong_32k
-long_ppl_32k
 LongBench2_32k
 niah_turns_32k_turn1
 niah_turns_32k_turn2
@@ -120,20 +119,7 @@ niah_turns_32k
 long_ppl_books_32k_8k
 long_ppl_books_32k_16k
 long_ppl_books_32k_32k
-long_ppl_books_32k_64k
-long_ppl_books_32k_128k
-long_ppl_books_32k_256k
-infinitebench_passkey_32k
-infinitebench_number_string_32k
-infinitebench_kv_retrieval_32k
-infinitebench_longbook_sum_eng_32k
-infinitebench_longbook_qa_eng_32k
-infinitebench_longbook_choice_eng_32k
-infinitebench_longbook_qa_chn_32k
-infinitebench_longdialogue_qa_eng_32k
-infinitebench_code_debug_32k
-infinitebench_math_find_32k
-AVG_InfiniteBench_32k
+long_ppl_32k
 niah_single_1_64k
 niah_single_2_64k
 niah_single_3_64k
@@ -156,7 +142,6 @@ babilong_qa3_64k
 babilong_qa4_64k
 babilong_qa5_64k
 AVG_babilong_64k
-long_ppl_64k
 LongBench2_64k
 niah_turns_64k_turn1
 niah_turns_64k_turn2
@@ -167,8 +152,7 @@ long_ppl_books_64k_8k
 long_ppl_books_64k_16k
 long_ppl_books_64k_32k
 long_ppl_books_64k_64k
-long_ppl_books_64k_128k
-long_ppl_books_64k_256k
+long_ppl_64k
 infinitebench_passkey_64k
 infinitebench_number_string_64k
 infinitebench_kv_retrieval_64k
@@ -202,7 +186,6 @@ babilong_qa3_128k
 babilong_qa4_128k
 babilong_qa5_128k
 AVG_babilong_128k
-long_ppl_128k
 LongBench2_128k
 niah_turns_128k_turn1
 niah_turns_128k_turn2
@@ -214,7 +197,7 @@ long_ppl_books_128k_16k
 long_ppl_books_128k_32k
 long_ppl_books_128k_64k
 long_ppl_books_128k_128k
-long_ppl_books_128k_256k
+long_ppl_128k
 infinitebench_passkey_128k
 infinitebench_number_string_128k
 infinitebench_kv_retrieval_128k
@@ -239,7 +222,6 @@ AVG_NIAH_multi_256k
 ruler_vt_256k
 ruler_cwe_256k
 ruler_fwe_256k
-ruler_qa_squad_256k
 ruler_qa_hotpot_256k
 AVG_RULER_256k
 babilong_qa1_256k
@@ -248,7 +230,6 @@ babilong_qa3_256k
 babilong_qa4_256k
 babilong_qa5_256k
 AVG_babilong_256k
-long_ppl_256k
 LongBench2_256k
 niah_turns_256k_turn1
 niah_turns_256k_turn2
@@ -261,6 +242,7 @@ long_ppl_books_256k_32k
 long_ppl_books_256k_64k
 long_ppl_books_256k_128k
 long_ppl_books_256k_256k
+long_ppl_256k
 infinitebench_passkey_256k
 infinitebench_number_string_256k
 infinitebench_kv_retrieval_256k
@@ -272,4 +254,3 @@ infinitebench_longdialogue_qa_eng_256k
 infinitebench_code_debug_256k
 infinitebench_math_find_256k
 AVG_InfiniteBench_256k
-LongBench2

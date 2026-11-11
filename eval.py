@@ -476,7 +476,7 @@ def _longbench2_files_problem():
     (litgpt/longbench2_patch.py), so every parquet file there must be whole: a cut download, a Git LFS pointer
     or an error page in its place fails every subset (unused/fetch_long_eval_data.py --longbench2 checks the same)."""
     try:
-        from litgpt.longbench2_patch import snapshot
+        from litgpt.longbench2_patch import real_file, snapshot
 
         root, files = snapshot()
     except Exception as error:  # noqa: BLE001 - not in the cache at all
@@ -485,7 +485,7 @@ def _longbench2_files_problem():
         return f"the LongBench v2 snapshot {root} holds no data file"
     bad = []
     for name in files:
-        path = Path(root) / name
+        path = Path(real_file(Path(root) / name))  # through a flattened hub-cache link to its blob
         if not name.endswith(".parquet"):
             continue
         try:
