@@ -59,7 +59,7 @@ def test_one_row_from_a_models_logs_at_three_lengths(parse):
     row = table.loc["wf"]
     assert list(table.columns[:1]) == ["Common Sense Reasoning (ACC)"] and "Model" not in table.columns
     assert row["niah_single_1_256k"] == 0.5 and row["ruler_qa_hotpot_256k"] == 0.61
-    assert "ruler_qa_squad_256k" not in table.columns  # SQuAD cannot fill 256K
+    assert row["ruler_qa_squad_256k"] != row["ruler_qa_squad_256k"]  # SQuAD cannot fill 256K: the column stays empty
     assert row["AVG_RULER_256k"] == pytest.approx(sum(0.5 + i / 100 for i in range(12)) / 12, abs=1e-4)
     assert row["babilong_qa3_256k"] == 0.3 and row["AVG_babilong_256k"] == pytest.approx(0.3)
     assert row["long_ppl_256k"] == 9.5  # ppl, not bits_per_byte
@@ -68,25 +68,38 @@ def test_one_row_from_a_models_logs_at_three_lengths(parse):
     assert row["niah_single_1"] != row["niah_single_1"]  # the 32K column stays empty (NaN)
     assert table.loc["wf_256k", "LongBench2_256k"] == 0.27
     columns = list(table.columns)
-    assert columns.index("LongBench2") < columns.index("LongBench2_64k") < columns.index("LongBench2_256k")
+    assert columns.index("LongBench2_32k") < columns.index("LongBench2_64k") < columns.index("LongBench2_256k")
+    assert columns[-1] == "LongBench2"  # the old result without a length, after the length blocks
 
 
 def test_pasted_tables_still_parse_as_before(parse):
-    table = parse.build_table({"m": _table({"piqa": {"acc": 0.7}, "niah_single_1": {"32768": 0.9}})}).set_index("Model")
-    assert table.loc["m", "PIQA"] == 0.7 and table.loc["m", "niah_single_1"] == 0.9
+    table = parse.build_table({"m": _table({"piqa": {"acc": 0.7}, "niah_single_1": {"32768": 0.9},
+                                            "ruler_vt": {"32768": 0.4}})}).set_index("Model")
+    row = table.loc["m"]
+    assert row["PIQA"] == 0.7 and row["niah_single_1"] == 0.9
+    # The 32K block repeats the main line's needles under the names every length uses.
+    assert row["niah_single_1_32k"] == 0.9 and row["AVG_NIAH_32k"] == 0.9 and row["ruler_vt_32k"] == 0.4
+    assert row["AVG_RULER_32k"] == pytest.approx(0.65)
+    assert row["AVG_all"] == pytest.approx(0.8)  # the length blocks stay out of AVG_all
+    assert row["niah_single_1_64k"] != row["niah_single_1_64k"]
     assert parse.table_lines("no table here\n|a|b|\n") == []
 
 
 def test_the_header_keeps_each_length_together(parse):
     """tests/parse_lmeval_table_columns.txt is the header: the 32K main line (89 columns), then one block per length
-    (32K, 64K, 128K, 256K), each length's columns contiguous. A new column goes at the end of its length's block
-    and into that file."""
+    (32K, 64K, 128K, 256K), each length's columns contiguous and the four blocks the same but for the length. A new
+    column goes into all four blocks and into that file."""
     import re
 
     frozen = (ROOT / "tests" / "parse_lmeval_table_columns.txt").read_text().splitlines()
     header = list(parse.build_table({"m": ""}).columns)
     assert header == frozen
-    assert header[89] == "AVG_NIAH_words" and header[90] == "ruler_vt_32k"  # the main line, then 32K's block
+    assert header[89] == "AVG_NIAH_words" and header[90] == "niah_single_1_32k"  # the main line, then 32K's block
+    blocks = [[c for c in header if re.search(rf"_{n}(?=_|$)", c) and not re.search(r"_(32k|64k|128k|256k)_\d+k$", c)
+               or re.fullmatch(rf"long_ppl_books_{n}_\d+k", c)] for n in ("32k", "64k", "128k", "256k")]
+    shapes = [[re.sub(rf"_{n}(?=_|$)", "_<n>", c, count=1) for c in block]
+              for n, block in zip(("32k", "64k", "128k", "256k"), blocks)]
+    assert all(shape == shapes[0] for shape in shapes) and len(shapes[0]) == 35
     # The task's length: the first _<length> in the name (long_ppl_books_64k_8k is 64K's curve).
     lengths = [m.group(1) if (m := re.search(r"_(32k|64k|128k|256k)(?=_|$)", c)) else None for c in header[90:]]
     named = [n for n in lengths if n]  # LongBench2 without a length sits in 32K's block
