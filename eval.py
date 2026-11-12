@@ -1867,7 +1867,7 @@ class LogKVLM(LM):
     def tok_decode(self, tokens): return self.tokenizer.decode(torch.tensor(tokens))
 
 def _resolve_checkpoint_dir(checkpoint_dir: str, group=None) -> str:
-    """自动检测分段 checkpoint。若存在 step_* 子目录（含 lit_model.pth）则选最大 step，否则直接用原路径。
+    """优先使用指定目录自身的 lit_model.pth；仅在它不存在时回退到最大的 step_* 保存点。
 
     glob + exists() 必须只由 rank 0 判定再广播：训练刚写完最后一个 step_* 时，
     其它节点的共享盘元数据缓存可能还看不到它，各 rank 各自 glob 就会选到**不同的
@@ -1877,16 +1877,20 @@ def _resolve_checkpoint_dir(checkpoint_dir: str, group=None) -> str:
     resolved: str | None = None
     if _is_main():
         base = Path(os.path.expandvars(os.path.expanduser(checkpoint_dir)))
-        step_dirs = [
-            d for d in base.glob("step_*")
-            if d.is_dir() and (d / "lit_model.pth").exists()
-        ]
-        if step_dirs:
-            max_dir = max(step_dirs, key=lambda d: int(d.name.split("_")[1]))
-            print(f"🔍 检测到分段 checkpoint，自动选择最新: {max_dir}")
-            resolved = str(max_dir)
+        if (base / "lit_model.pth").exists():
+            resolved = str(base)
+            print(f"Checkpoint weights: {base / 'lit_model.pth'}", flush=True)
         else:
-            resolved = checkpoint_dir
+            step_dirs = [
+                d for d in base.glob("step_*")
+                if d.is_dir() and (d / "lit_model.pth").exists()
+            ]
+            if step_dirs:
+                max_dir = max(step_dirs, key=lambda d: int(d.name.split("_")[1]))
+                print(f"🔍 检测到分段 checkpoint，自动选择最新: {max_dir}")
+                resolved = str(max_dir)
+            else:
+                resolved = checkpoint_dir
 
     return _broadcast_obj(resolved, group=group)
 
