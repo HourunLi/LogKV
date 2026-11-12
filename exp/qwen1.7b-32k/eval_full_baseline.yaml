@@ -17,3 +17,4 @@ benchmark: null        # 主线用 eval.sh 的默认清单（全量），不用�
 niah_benchmark: null
 limit: null            # 主线不限条数
 long_limit: 100        # 各长度每个任务 100 条
+eval_tag: full_baseline   # 结果写到 checkpoint 的 evaluate/full_baseline（及其下的 long<L>），各方法分开

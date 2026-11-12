@@ -29,7 +29,7 @@ litgpt finetune_adapter stabilityai/stablelm-base-alpha-3b \
 or for Adapter V2
 
 ```bash
-litgpt finetune adapter_v2 stabilityai/stablelm-base-alpha-3b \
+litgpt finetune_adapter_v2 stabilityai/stablelm-base-alpha-3b \
   --data Alpaca \
 ```
 
@@ -134,7 +134,7 @@ You can easily train on your own instruction dataset saved in JSON format.
     ]
     ```
 
-2. Run `litgpt adapter` or `litgpt adapter_v2` by passing in the location of your data (and optionally other parameters):
+2. Run `litgpt finetune_adapter` or `litgpt finetune_adapter_v2` by passing in the location of your data (and optionally other parameters):
 
     ```bash
     litgpt finetune_adapter tiiuae/falcon-7b \

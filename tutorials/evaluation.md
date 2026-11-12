@@ -1,5 +1,9 @@
 # LLM Evaluation
 
+本页介绍通用 LitGPT 评测与示例输出，不自动启用 SemanticLogKV。当前压缩模型使用
+仓库根目录的 `eval.sh` / `eval.py`，运行方式见 [README](../README.md#运行入口)，
+字段定义见 [评测指标](../docs/evaluation-metrics.md)，论文对照见 [Baseline 选型](../docs/baselines.md)。
+
 &nbsp;
 
 ## Using lm-evaluation-harness
@@ -186,8 +190,9 @@ from tqdm import tqdm
 def generate_model_scores(data_dict, model, response_field="response", target_field="output"):
     scores = []
     for entry in tqdm(data_dict, desc="Scoring entries"):
+        input_text = prompt_style.apply(prompt=entry["instruction"], **entry)
         prompt = (
-            f"Given the input `{format_input(entry)}` "
+            f"Given the input `{input_text}` "
             f"and correct output `{entry[target_field]}`, "
             f"score the model response `{entry[response_field]}`"
             f" on a scale from 0 to 100, where 100 is the best score. "
@@ -205,7 +210,8 @@ def generate_model_scores(data_dict, model, response_field="response", target_fi
 
 ```python
 scores = generate_model_scores(test_data, model=scorer)
-print(f"\n{llm}")
+if not scores:
+    raise ValueError("The scoring model returned no valid integer scores.")
 print(f"Number of scores: {len(scores)} of {len(test_data)}")
 print(f"Average score: {sum(scores)/len(scores):.2f}\n")
 ```

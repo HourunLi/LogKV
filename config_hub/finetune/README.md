@@ -1,5 +1,8 @@
 ## Config files
 
+下表是通用 LitGPT 微调配置的既有测量，不是 SemanticLogKV CPT 结果或当前云价格承诺。
+项目压缩实验入口见 [README](../../README.md)，指标口径见 [评测指标](../../docs/evaluation-metrics.md)。
+
 The table below lists the performances you can expect from the provided config files. Note that you can achieve lower memory consumption by lowering the micro batch size as needed. In addition, you can lower the rank (`lora_r`) in the LoRA configuration files and disable LoRA for certain layers (for example, setting `lora_projection` and other LoRA layer-specific parameters to `false`).
 For more information, see the [Dealing with out-of-memory (OOM) errors](../../tutorials/oom.md) on lowering the memory requirements.
 The "Cost" column refers to the on-demand compute cost on [Lightning AI Studios where these benchmarks were executed](https://lightning.ai/lightning-ai/studios/automated-benchmarks-for-litgpt).
@@ -92,14 +95,14 @@ If you require a longer sequence length than the one used in a given config file
 If you are training on GPUs without bfloat-16 support, you need to change the `precision` option to `16-true` (16-bit floating point precision) or `16-mixed` (16/32-bit mixed precision) training:
 
 ```bash
-litgpt finetune lora \
+litgpt finetune_lora \
   --config config_hub/finetune/phi-2/lora.yaml \
   --precision 16-true
 ```
 or
 
 ```bash
-litgpt finetune lora \
+litgpt finetune_lora \
   --config config_hub/finetune/phi-2/lora.yaml \
   --precision 16-mixed
 ```
@@ -113,7 +116,7 @@ All runs are single-GPU experiments, use `--devices 4` to utilize more than one 
 
 
 ```bash
-litgpt finetune lora \
+litgpt finetune_lora \
   --config config_hub/finetune/phi-2/lora.yaml \
   --devices 4
 ```
