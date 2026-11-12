@@ -1,0 +1,6 @@
+# Qwen3-8B 长文本评测：同一 CPT checkpoint，开启问题 cue 与 cue 保护。
+# 继承本目录的 32K / 64K / 128K / 256K 任务、长度与数据配置。
+# query 作用于生成请求；LongBench v2、困惑度与上下文缓存阶段看不到问题。
+config: eval_long_baseline.yaml
+log_kv_gamma_cue_guard: true
+log_kv_gamma_query_cue: true

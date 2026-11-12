@@ -93,6 +93,40 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 ```
 
+8B 全量评测统一入口（默认 `word_first`，读取 8B CPT checkpoint）：
+
+```bash
+bash eval8b_full.sh
+```
+
+先跑 32K 主线的常识推理、综合、LongBench v1 / LongBench-E、逐轮问与困惑度曲线，以及 1K–32K 捞针；
+再逐档跑 32K / 64K / 128K / 256K 的 RULER、BABILong、LongBench v2、逐轮问、困惑度与 InfiniteBench。
+主线不限条数，逐档默认每个任务 100 条。`eval.sh` 的环境变量覆盖仍有效，如 `LIMIT=2` 先试跑。
+
+| 命令参数 | 8B 权重与评测方式 |
+|---|---|
+| `word_first`（默认） | CPT checkpoint，惊异度准入 |
+| `baseline` | 同一 CPT checkpoint，K/V 分数准入 |
+| `query` | 同一 CPT checkpoint，问题 cue 与 cue 保护 |
+| `word_first_query` | 同一 CPT checkpoint，惊异度准入加问题 cue |
+| `cpt_dense` | 同一 CPT checkpoint，完整 KV 对照 |
+| `dense` | 原始 Qwen3-8B-Base，完整 KV、未经 CPT |
+
+例如 `bash eval8b_full.sh query`。各方法结果分目录保存，配置只在 `exp/qwen8b-32k/` 内继承；
+也可直接调用 `bash eval.sh exp/qwen8b-32k/eval_full_<方法>.yaml`。
+
+同一份 8B CPT 权重的五种全量评测命令如下，均从
+`/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k/lit_model.pth`
+加载权重，各自写入该 checkpoint 的 `evaluate/full_<方法>/`：
+
+```bash
+bash eval8b_full.sh cpt_dense
+bash eval8b_full.sh baseline
+bash eval8b_full.sh word_first
+bash eval8b_full.sh query
+bash eval8b_full.sh word_first_query
+```
+
 1.7B 与 8B 的全量评测均必跑 32K / 64K / 128K / 256K 的 LongBench v2；缓存缺失、缺子集或文件损坏会明确报错。
 先用相同 `HF_HOME` 准备数据，再补测已有配置的 LongBench v2（不重跑其它指标）。下载脚本还会把 20 个子集、
 503 道题复制为 `<HF_HOME>/longbench2` 下的普通 parquet 文件，逐文件校验 SHA256 和行数；已有数据完整时只需复制。
