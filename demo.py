@@ -1221,15 +1221,9 @@ def main(
     optimizer.zero_grad(set_to_none=True)
     step_active = False
     fabric.print(
-<<<<<<< HEAD
-        f"LogKV timing: host counters every optimizer step; CUDA profile steps={sorted(profile_steps)}. "
+        f"Training timing: host counters every optimizer step; CUDA profile steps={sorted(profile_steps)}. "
         "Stage breakdowns are rank 0 only; throughput uses all ranks and synchronized step boundaries. "
         "CUDA spans include stream waits; forward/backward totals contain the LogKV breakdown."
-=======
-        f"Training timing: host counters every optimizer step; CUDA profile steps={sorted(profile_steps)}. "
-        "Console/TensorBoard timings are rank 0 only. CUDA spans include stream waits; "
-        "forward/backward totals contain the LogKV breakdown."
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
     )
     step_stats = MicroStepMeanStats()
     if global_step > 0:
@@ -1242,7 +1236,6 @@ def main(
         loaded_data_epoch = loaded_data_epoch.item()
     data_epoch = int(loaded_data_epoch)
     loader_iter = iter(dataloader)
-<<<<<<< HEAD
     run_start_step = global_step
     run_time_s = 0.0
     run_tokens = 0
@@ -1250,14 +1243,12 @@ def main(
     if fabric.global_rank == 0:
         speed_log_path.parent.mkdir(parents=True, exist_ok=True)
     fabric.print(f"Training speed metrics: {speed_log_path} (appended; cumulative values cover this run only)")
-=======
     synthetic_kit = None
     if synthetic_retrieval_prob > 0:
         from litgpt.synthetic_retrieval import KINDS, RetrievalKit
         from litgpt.tokenizer import Tokenizer
         synthetic_kit = RetrievalKit.from_tokenizer(
             Tokenizer(tok_dir), tuple(synthetic_kinds.split(",")) if synthetic_kinds else KINDS)
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 
     while global_step < max_steps and not training_finished:
         if not step_active:
@@ -1289,6 +1280,8 @@ def main(
 
         is_accumulating = (micro_batch_idx + 1) % gradient_accumulation_steps != 0
         micro_batch_idx += 1
+        step_tokens += inputs.numel()
+        step_samples += inputs.size(0)
         current_second_order_scale = 0.0
         if not log_kv_dense_mode:
             current_second_order_scale = get_log_kv_second_order_scale(
