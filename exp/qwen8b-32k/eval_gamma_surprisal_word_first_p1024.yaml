@@ -1,0 +1,5 @@
+# niahLogKV 惊异度准入 word_first（只评测、不重训）：Qwen3-8B 的 P=1024 checkpoint（arc_gamma_k12_b128_p1024_2k），
+# 与 1.7B 的同名 YAML 相同，只是底模换成 8B。
+#   NIAH_ONLY=1 bash eval.sh exp/qwen8b-32k/eval_gamma_surprisal_word_first_p1024.yaml
+config: arc_gamma_k12_b128_p1024_2k.yaml
+log_kv_gamma_surprisal: word_first

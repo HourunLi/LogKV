@@ -1,0 +1,10 @@
+# Dense（未压缩）attention baseline · 未经 CPT 的原始 Qwen3-8B-Base，与 1.7B 的同名 YAML 相同，只换底模与输出目录。
+# 底模目录需先有 lit_model.pth（python -m litgpt convert_to_litgpt <底模目录>）。
+#   bash eval.sh exp/qwen8b-32k/dense_niah_base.yaml none niah_single_1,niah_single_2,niah_single_3
+config: ../qwen1.7b-32k/dense_niah_base.yaml
+checkpoint_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/
+tokenizer_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/
+output_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-new/qwen8b_dense_niah_base_eval
+metadata:
+  pretrained: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/
+  max_seq_lengths: [32768]
