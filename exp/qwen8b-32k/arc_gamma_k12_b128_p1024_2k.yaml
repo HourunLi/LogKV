@@ -1,12 +1,13 @@
 # Qwen3-8B-Base 上的 LogKV P=1024 checkpoint（baseline 与 word_first 共用，对应 1.7B 的同名实验）。
 # 训练超参与 LogKV 设置全部继承 1.7B 的同名 YAML（1200 步、全局 batch 32、学习率 5e-6、K=12、B=128、recent 2048、
-# 精确池 1024、cue 0），这里只换模型与输出位置；两边的差别只有底模。
+# 精确池 1024、cue 0）；8B 另启用 FSDP 低显存模式，以更多通信换取参数/梯度及时分片。
 # 先把 HF 下载转成 LitGPT 格式（写出 lit_model.pth 与 model_config.yaml），再训练：
 #   python -m litgpt convert_to_litgpt /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base
 #   BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen8b-32k/arc_gamma_k12_b128_p1024_2k.yaml
 config: ../qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml
 arch_name: "Qwen/Qwen3-8B-Base"  # demo.py 按它建模型（Config.from_name）
 ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/
+fsdp_low_memory: true  # FULL_SHARD + 每个 micro-batch 同步梯度 + AdamW foreach=False
 
 expid: qwen8b-32k-gamma_k12_b128_p1024_2k
 save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k

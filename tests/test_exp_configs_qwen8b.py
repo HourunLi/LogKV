@@ -1,4 +1,4 @@
-"""exp/qwen8b-32k: the 1.7B experiments on Qwen3-8B-Base, differing from them only in the model and output paths."""
+"""8B uses the 1.7B training recipe and LogKV settings, with a lower-memory distributed execution mode."""
 
 from pathlib import Path
 
@@ -9,8 +9,8 @@ EXP = Path(__file__).resolve().parents[1] / "exp"
 QWEN8B, QWEN17B = EXP / "qwen8b-32k", EXP / "qwen1.7b-32k"
 BASE_8B = "/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/"
 SAVE_8B = "/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k"
-# The keys an 8B run changes: the model it starts from and where it writes.
-TRAINED = {"arch_name", "ckpt_dir", "expid", "save_path", "merged_state_staging_dir", "tensorboard_root"}
+# The model, output paths and distributed memory policy; no change to the training recipe or KV budget.
+TRAINED = {"arch_name", "ckpt_dir", "expid", "save_path", "merged_state_staging_dir", "tensorboard_root", "fsdp_low_memory"}
 DENSE = {"checkpoint_dir", "tokenizer_dir", "output_path", "metadata"}
 METHODS = {"dense": DENSE, "baseline": TRAINED, "word_first": TRAINED}
 
@@ -33,6 +33,8 @@ def test_each_8b_config_is_its_17b_namesake_on_the_8b_model(name):
     dense = name == "dense_niah_base.yaml" or name.endswith("_dense.yaml")
     assert changed(name) == (DENSE if dense else TRAINED), name
     cfg = resolve(QWEN8B / name)
+    if not dense:
+        assert cfg["fsdp_low_memory"] is True
     leftovers = [f"{k}={v}" for k, v in cfg.items() if "1.7b" in str(v).lower()]
     assert not leftovers, leftovers
 

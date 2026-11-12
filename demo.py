@@ -625,6 +625,8 @@ def main(
     synthetic_kinds: str | None = None,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
+    # Reshard parameters/gradients promptly and avoid AdamW's tensor-list workspace.
+    fsdp_low_memory: bool = False,
     # ── Eval ──
     run_eval: str = "",  # "before" | "after" | "both"
     eval_benchmark: str = "debug",
@@ -774,6 +776,7 @@ def main(
     )
     log_kv_semantic_merge_passes = int(_o("log_kv_semantic_merge_passes", log_kv_semantic_merge_passes))
     activation_checkpointing = bool(_o("activation_checkpointing", activation_checkpointing))
+    fsdp_low_memory = bool(_o("fsdp_low_memory", fsdp_low_memory))
     run_eval = _o("run_eval", run_eval)
     eval_benchmark = _o("eval_benchmark", eval_benchmark)
 
@@ -817,7 +820,7 @@ def main(
         strategy = DDPStrategy(timeout=timedelta(days=3650))
     else:
         strategy = FSDPStrategy(
-            sharding_strategy="SHARD_GRAD_OP",
+            sharding_strategy="FULL_SHARD" if fsdp_low_memory else "SHARD_GRAD_OP",
             state_dict_type="full",
             auto_wrap_policy={Block},
             # Bound saved Q/K/V, norm and projection activations across layers
@@ -838,6 +841,8 @@ def main(
         loggers=loggers,
     )
     fabric.launch()
+    if use_fsdp and fsdp_low_memory:
+        fabric.print("FSDP low-memory mode: FULL_SHARD; gradients synchronized/sharded every micro-batch.")
     if any(type(size) is not int or size < 1 for size in (global_batch_size, micro_batch_size)):
         raise ValueError("global_batch_size and micro_batch_size must be positive integers")
     distributed_micro_batch = micro_batch_size * fabric.world_size
@@ -942,6 +947,12 @@ def main(
         # memory for large checkpoints without being used.
         load_checkpoint(fabric, model, initial_ckpt_path, strict=True)
         fabric.print("Weights loaded successfully.")
+
+    if fsdp_low_memory:
+        # Apply after restore: checkpoint param groups can re-enable foreach.
+        for group in optimizer.param_groups:
+            group["foreach"] = False
+        fabric.print("AdamW low-memory update: foreach=False (also applied to restored optimizer state).")
 
     # ── Evaluation helper ──
     # Same code path AND same semantics as a standalone `eval.py --config
@@ -1289,7 +1300,8 @@ def main(
             )
             model.set_log_kv_second_order_scale(current_second_order_scale)
 
-        with fabric.no_backward_sync(model, enabled=is_accumulating):
+        # FSDP no_sync retains full gradients; synchronized shards still accumulate until optimizer.step().
+        with fabric.no_backward_sync(model, enabled=is_accumulating and not (use_fsdp and fsdp_low_memory)):
             # Dense uses ordinary causal attention; LogKV uses streaming replay.
             # Both reuse the chunked LM-head loss to avoid full-sequence logits.
             with logkv_timed("forward"):

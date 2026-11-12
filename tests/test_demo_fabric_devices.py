@@ -2,10 +2,25 @@
 
 import ast
 from pathlib import Path
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
+
+@pytest.mark.parametrize("low_memory,expected", [(False, "SHARD_GRAD_OP"), (True, "FULL_SHARD")])
+def test_fsdp_memory_policy_preserves_block_checkpointing(low_memory, expected):
+    from lightning.fabric.strategies import FSDPStrategy
+
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "demo.py").read_text())
+    call = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "FSDPStrategy")
+    scope = dict(FSDPStrategy=FSDPStrategy, fsdp_low_memory=low_memory, activation_checkpointing=True,
+                 Block=type("Block", (), {}), timedelta=timedelta)
+    strategy = eval(compile(ast.Expression(call), "demo.py", "eval"), scope)
+    assert strategy.sharding_strategy.name == expected
+    assert strategy._activation_checkpointing_kwargs["auto_wrap_policy"]._module_classes == {scope["Block"]}
 
 
 def test_fabric_devices_follow_launcher():
@@ -49,7 +64,7 @@ def _batch_setup():
 @pytest.mark.parametrize("world_size,expected", [(1, 32), (2, 16), (4, 8), (8, 4)])
 def test_accumulation_preserves_global_batch(world_size, expected):
     fabric = SimpleNamespace(world_size=world_size, print=Mock())
-    scope = dict(fabric=fabric, global_batch_size=32, micro_batch_size=1)
+    scope = dict(fabric=fabric, global_batch_size=32, micro_batch_size=1, use_fsdp=False, fsdp_low_memory=False)
     exec(_batch_setup(), scope)
     assert scope["gradient_accumulation_steps"] == expected
     assert expected * world_size * scope["micro_batch_size"] == scope["global_batch_size"]
@@ -72,6 +87,6 @@ def test_accumulation_preserves_global_batch(world_size, expected):
 ])
 def test_invalid_batches_fail_before_model_loading(global_batch, micro_batch, world_size, error):
     scope = dict(fabric=SimpleNamespace(world_size=world_size, print=Mock()),
-                 global_batch_size=global_batch, micro_batch_size=micro_batch)
+                 global_batch_size=global_batch, micro_batch_size=micro_batch, use_fsdp=False, fsdp_low_memory=False)
     with pytest.raises(ValueError, match=error):
         exec(_batch_setup(), scope)

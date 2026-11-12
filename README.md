@@ -70,6 +70,14 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 当前每卡 micro batch 为 1、全局 batch 为 32，单机 1/2/4/8 卡分别累积 32/16/8/4 次；
 多机按全部进程数计算。无法整除时在加载模型前报错，不静默改变全局 batch。
 
+8B 训练配置 `exp/qwen8b-32k/arc_gamma_k12_b128_p1024_2k.yaml` 启用 `fsdp_low_memory: true`：
+使用 `FULL_SHARD`，前向后重新分片参数，并在每个 micro-batch 反向后同步和分片梯度，
+避免梯度累积期间常驻完整参数与梯度。同时关闭 AdamW 的 `foreach` 批量更新，避免 `optimizer.step()`
+为整组参数的二阶矩同时分配开平方结果；恢复旧 checkpoint 后也强制应用此设置。
+全局 batch、优化器更新频率、32K 长度和 LogKV 配置不变；代价是更多通信与优化器 kernel 启动，
+浮点运算顺序也会变化。仅多卡 FSDP 能获得分片收益；该开关不减少缓存与回放记录。
+未设置时保留原 `SHARD_GRAD_OP` 与延迟梯度同步行为。
+
 `NIAH_ONLY=1` 只跳过主评测，仍会跑捞针；在 `majob.sh` 中也不会跳过尚未完成的训练。
 只训练需像上面一样将两个 benchmark 环境变量都设为 `none`。之后单独评测捞针可用
 `NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/cpt_dense.yaml`，默认全部 20 个任务。
