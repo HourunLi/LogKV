@@ -9,7 +9,7 @@ arch_name: Qwen/Qwen3-8B-Base
 context_length: 32768
 expid: qwen8b-32k-gamma_k12_b128_p1024_2k
 ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/
-global_batch_size: 64
+global_batch_size: 128
 micro_batch_size: 1
 max_steps: 2000
 learning_rate: 5e-6
