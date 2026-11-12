@@ -3,8 +3,8 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: bash eval8b_full.sh [word_first|baseline|query|word_first_query|dense]"
-    echo "Default: word_first (8B CPT checkpoint). dense evaluates the original 8B Base model."
+    echo "Usage: bash eval8b_full.sh [word_first|baseline|query|word_first_query|cpt_dense|dense]"
+    echo "Default: word_first (8B CPT checkpoint). cpt_dense uses full KV on that checkpoint; dense uses the original Base."
     echo "eval.sh environment overrides remain available, for example LIMIT=2 for a smoke run."
 }
 
@@ -14,7 +14,7 @@ if [ "$#" -gt 1 ]; then
 fi
 EVAL8B_METHOD=${1:-word_first}
 case "${EVAL8B_METHOD}" in
-    word_first|baseline|query|word_first_query|dense) ;;
+    word_first|baseline|query|word_first_query|cpt_dense|dense) ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
 esac

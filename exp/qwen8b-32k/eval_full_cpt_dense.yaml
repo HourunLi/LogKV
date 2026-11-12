@@ -1,0 +1,10 @@
+# 8B CPT checkpoint 的全量完整 KV 评测；从训练配置的 save_path 读取 lit_model.pth。
+# 先跑 32K 主线，再跑 32K / 64K / 128K / 256K 长文本，独立保存结果。
+#   bash eval8b_full.sh cpt_dense
+config: eval_long_cpt_dense.yaml
+eval_main: true
+benchmark: null
+niah_benchmark: null
+limit: null
+long_limit: 100
+eval_tag: full_cpt_dense
