@@ -442,9 +442,6 @@ from litgpt.model import GPT
 from litgpt.tokenizer import Tokenizer
 from lm_eval import evaluator
 from lm_eval.api.model import LM
-<<<<<<< HEAD
-from lm_eval.tasks import TaskManager
-=======
 
 # Repository tasks (e.g. eval_tasks/niah_cue) beside lm-eval's own.
 EVAL_TASKS_DIR = Path(__file__).resolve().parent / "eval_tasks"
@@ -597,7 +594,6 @@ def _task_manager(metadata):
     if not EVAL_TASKS_DIR.is_dir() or "metadata" not in inspect.signature(TaskManager).parameters:
         return None  # simple_evaluate builds its own, with lm-eval's tasks only.
     return TaskManager(include_path=str(EVAL_TASKS_DIR), metadata=dict(metadata or {}))
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 from litgpt.generate.base import generate as litgpt_generate
 from litgpt.kv_compression import cache_compression_snapshot, summarize_compression
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
@@ -1516,11 +1512,15 @@ class LogKVLM(LM):
                 kept.append(out[:, max(lm_head_start - a, 0) - first:])
         return torch.cat(kept, dim=1)
 
-    def _generate_chunked(self, prompt, max_returned_tokens, temperature, top_k, top_p):
+    def _generate_chunked(self, prompt, max_returned_tokens, temperature, top_k, top_p, *, timing=None):
         """litgpt's generate for a prompt prefilled in chunks (_forward): the same tokens, the prompt included and
         the last token (eos or the length limit) not forwarded."""
         from litgpt.generate.base import sample
 
+        if timing is not None:
+            timing.clear()
+            _synchronize_inference_device(self._device)
+            generation_start = time.perf_counter()
         eos, out = self.tokenizer.eos_id, [prompt]
         logits, pos = self._forward(prompt, 0, prompt.numel() - 1), int(prompt.numel())
         for step in range(max_returned_tokens - pos):
@@ -1530,7 +1530,18 @@ class LogKVLM(LM):
                 pos += 1
             token = sample(logits, temperature=temperature, top_k=top_k, top_p=top_p).to(dtype=torch.int64)
             out.append(token.view(-1))
-            if eos is not None and int(token) == eos:
+            int_token = token.item()
+            if timing is not None:
+                elapsed = time.perf_counter() - generation_start
+                if step == 0:
+                    timing["prefill_time_s"] = elapsed
+                timing.update(
+                    total_time_s=elapsed,
+                    decode_time_s=elapsed - timing["prefill_time_s"],
+                    generated_tokens=step + 1,
+                    decode_tokens=step,
+                )
+            if eos is not None and int_token == eos:
                 break
         return torch.cat(out)
 
@@ -1577,13 +1588,9 @@ class LogKVLM(LM):
                 # lm_head_start: materialize logits only for the scoring span
                 # [ctx_len-1, seq_len) — full-sequence logits at 32K are ~10 GB
                 # bf16, the sliced tensor is (cont_len + 1) x vocab.
-<<<<<<< HEAD
-                logits = self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
-                _synchronize_inference_device(self._device)
-=======
                 logits = self._forward(inps[0], 0, ctx_len - 1) if self._prefill_chunk() \
                     else self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
+                _synchronize_inference_device(self._device)
                 t1 = time.perf_counter()
                 peak_memory = _inference_peak_memory(self._device)
                 self.compression_metrics.append({
@@ -1771,26 +1778,13 @@ class LogKVLM(LM):
                         and getattr(self.model, "log_kv_cue_stream", None) is not None):
                     self._set_gamma_query(prompt_tensor)
                 try:
-<<<<<<< HEAD
                     _synchronize_inference_device(self._device)
                     _reset_inference_peak_memory(self._device)
                     timing = {}
-                    out = litgpt_generate(
-                        self.model,
-                        prompt_tensor,
-                        max_returned_tokens=total_max_len,
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p,
-                        eos_id=self.tokenizer.eos_id,
-                        timing=timing,
-                    )
-                    _synchronize_inference_device(self._device)
-                    peak_memory = _inference_peak_memory(self._device)
-=======
-                    t0 = time.perf_counter()
                     if prompt_len > (self._prefill_chunk() or prompt_len):  # a long prompt: prefill in chunks
-                        out = self._generate_chunked(prompt_tensor, total_max_len, temperature, top_k, top_p)
+                        out = self._generate_chunked(
+                            prompt_tensor, total_max_len, temperature, top_k, top_p, timing=timing,
+                        )
                     else:
                         out = litgpt_generate(
                             self.model,
@@ -1800,9 +1794,10 @@ class LogKVLM(LM):
                             top_k=top_k,
                             top_p=top_p,
                             eos_id=self.tokenizer.eos_id,
+                            timing=timing,
                         )
-                    t1 = time.perf_counter()
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
+                    _synchronize_inference_device(self._device)
+                    peak_memory = _inference_peak_memory(self._device)
                     # The last output token has not been forwarded into the cache.
                     self.compression_metrics.append({
                         "request_type": "generate_until", "rank": dp_rank, "sample_id": sample_id,
@@ -2322,15 +2317,7 @@ def main(
             results = evaluator.simple_evaluate(
                 model=lm_model,
                 tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
-<<<<<<< HEAD
-                # 内置任务之外再注册 eval_tasks/（如多针 NIAH）；传入 task_manager 后
-                # metadata 只经由它到达任务。
-                task_manager=TaskManager(
-                    include_path=str(Path(__file__).resolve().parent / "eval_tasks"), metadata=metadata
-                ),
-=======
                 task_manager=_task_manager(metadata),
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
                 confirm_run_unsafe_code=True,
                 batch_size=1,
                 metadata=metadata,

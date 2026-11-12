@@ -118,9 +118,11 @@ def test_score_snapshot_precedes_reset_and_preserves_score(wrapper_class, backen
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("chunk", ["0", "2"])
 @pytest.mark.parametrize("backend", ["dense", "logkv"])
 @pytest.mark.parametrize("eos_id,generated_count", [(0, 1), (None, 3)])
-def test_generation_excludes_unforwarded_last_token(wrapper_class, backend, eos_id, generated_count):
+def test_generation_excludes_unforwarded_last_token(wrapper_class, monkeypatch, chunk, backend, eos_id, generated_count):
+    monkeypatch.setenv("LOGKV_EVAL_PREFILL_CHUNK", chunk)
     lm = make_lm(wrapper_class, backend)
     lm.model.lm_head.weight.zero_()  # Greedy generation deterministically returns token 0.
     lm.tokenizer.eos_id = eos_id
@@ -166,7 +168,6 @@ def test_rolling_reports_each_window_with_rolling_request_type(wrapper_class):
     assert_cache_reset(lm)
 
 
-<<<<<<< HEAD
 def test_speed_summary_weights_tokens_by_time_and_handles_empty_decode():
     source = Path(__file__).resolve().parents[1] / "eval.py"
     helper = next(node for node in ast.parse(source.read_text()).body
@@ -195,7 +196,8 @@ def test_speed_summary_weights_tokens_by_time_and_handles_empty_decode():
 
 
 @pytest.mark.parametrize("eos_id,expected_count", [(0, 1), (None, 3)])
-def test_generation_timing_has_exact_stage_boundaries(monkeypatch, eos_id, expected_count):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_generation_timing_has_exact_stage_boundaries(wrapper_class, monkeypatch, eos_id, expected_count, chunked):
     import litgpt.generate.base as generation
 
     clock = [10.]
@@ -208,12 +210,21 @@ def test_generation_timing_has_exact_stage_boundaries(monkeypatch, eos_id, expec
     monkeypatch.setattr(generation.time, "perf_counter", lambda: clock[0])
     model = SimpleNamespace(max_seq_length=8, modules=lambda: [])
     timing = {"old": "discarded"}
-    out = generation.generate(model, torch.tensor([1, 2]), 5, eos_id=eos_id, timing=timing)
+    if chunked:
+        lm = wrapper_class()
+        lm._device, lm.tokenizer = "cpu", SimpleNamespace(eos_id=eos_id)
+        lm._forward = lambda tokens, *args: next_token(None, None, tokens)
+        lm.model = lambda tokens, **kwargs: next_token(None, None, tokens)
+        monkeypatch.setattr(generation, "sample", lambda *args, **kwargs: torch.tensor([0]))
+        out = lm._generate_chunked(torch.tensor([1, 2]), 5, 0., None, 0., timing=timing)
+    else:
+        out = generation.generate(model, torch.tensor([1, 2]), 5, eos_id=eos_id, timing=timing)
     assert out.tolist() == [1, 2] + [0] * expected_count
     assert timing == dict(prefill_time_s=4., decode_time_s=2. * (expected_count - 1),
                           total_time_s=4. + 2. * (expected_count - 1),
                           generated_tokens=expected_count, decode_tokens=expected_count - 1)
-=======
+
+
 @torch.no_grad()
 @pytest.mark.parametrize("request_type", ["loglikelihood", "generate_until"])
 def test_long_inputs_enter_the_logkv_cache_in_chunks_with_the_same_result(wrapper_class, monkeypatch, request_type):
@@ -237,4 +248,3 @@ def test_long_inputs_enter_the_logkv_cache_in_chunks_with_the_same_result(wrappe
     monkeypatch.setenv("LOGKV_EVAL_PREFILL_CHUNK", "5")
     lm = make_lm(wrapper_class, "dense")
     assert lm._prefill_chunk() == 0  # dense keeps one forward
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
