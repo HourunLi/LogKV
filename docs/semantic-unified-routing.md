@@ -1,7 +1,8 @@
 # 统一语义路由与增量实现
 
 本页定义可选的 `semantic_unified_route=true` 路径。当前默认是 attach 路由
-（规则见 [算法规格 §3.1](algorithm-spec.md)）；unified 实验 NIAH 明显退化，保留为对照，
+（规则见 [算法规格 §3.1](algorithm-spec.md)）；unified 保留为对照，质量差异需绑定具体
+checkpoint、配置与评测产物，不能仅由路由名称推断。
 `arc_semantic_unified*.yaml`、`arc_alpha_*`、`arc_beta_cpt100.yaml` 仍显式开启它。
 入口见 [`log_kv_cache.py`](../litgpt/log_kv_cache.py) 的 `_semantic_route_unified`，
 GPU 实现在 [`log_kv_route_triton.py`](../litgpt/log_kv_route_triton.py)。
@@ -116,3 +117,5 @@ semantic 路由；比较时固定 B、输入形状、后端与预热方式。
 - `--profile-dir` 记录最后一次 flush 的 CPU/CUDA 算子和 Python 调用。
   `route` 包含 `alpha_select`；阶段嵌套计时不能相加当总时间。
 - 训练 `logKV_host` 是累计主机墙钟时间，可能含 GPU 等待；短路由不能证明整步训练达到目标。
+  全局 step 吞吐使用同步边界和最慢 rank 耗时，区别于这里的阶段计时，见
+  [评测指标与性能口径](evaluation-metrics.md)。

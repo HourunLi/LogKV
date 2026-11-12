@@ -2,6 +2,10 @@
 
 This document provides an overview and explanation of how new LLM architectures and model weights can be added to LitGPT.
 
+通用模型支持不自动代表支持 SemanticLogKV。压缩路径还需核对 Q/K normalization、GQA、
+RoPE、共享连续位置、cache 写入和训练回放，支持边界见
+[算法规格](../../docs/algorithm-spec.md#8-支持边界与真实限制)。
+
 &nbsp;
 
 > [!NOTE]
@@ -28,7 +32,7 @@ Then, install it with the "editable" mode for development:
 
 ```bash
 cd litgpt
-pip install litgpt -e ".[all]"
+pip install -e ".[all]"
 ```
 
 &nbsp;
@@ -164,7 +168,7 @@ Finally, also in the same file, update the `model_name_to_prompt_style` function
 def model_name_to_prompt_style(model_name: str) -> PromptStyle:
     ...
     if re.search("Llama-3.*-Instruct", model_name):
-    return Llama3()
+        return Llama3()
 ```
 
 &nbsp;

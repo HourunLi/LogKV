@@ -1,0 +1,10 @@
+# 长文本评测（只评测、不重训）：Qwen3-8B 的 LogKV P=1024，K/V 分数准入（同 checkpoint 的基线）。
+# 与 exp/qwen1.7b-32k/eval_long_baseline.yaml 相同（32K / 64K / 128K / 256K，每档窗口为长度 + 1024，YaRN 按长度取倍数，
+# 每个任务 100 条；EVAL_LENGTHS / EVAL_SUITES / NIAH_ONLY / YARN_MODE 的用法见那份 YAML），只是底模换成 8B。
+#   bash eval.sh exp/qwen8b-32k/eval_long_baseline.yaml
+config: arc_gamma_k12_b128_p1024_2k.yaml
+eval_lengths: [32k, 64k, 128k, 256k]
+limit: 100
+long_ppl_data: ${LONG_PPL_DATA:-}
+long_ppl_books: ${LONG_PPL_BOOKS:-}
+infinitebench_dir: ${INFINITEBENCH_DIR:-}

@@ -82,10 +82,10 @@ You can easily train on your own instruction dataset saved in JSON format.
     ]
     ```
 
-2. Run `litgpt finetune` by passing in the location of your data (and optionally other parameters):
+2. Run `litgpt finetune_full` by passing in the location of your data (and optionally other parameters):
 
     ```bash
-    litgpt finetune tiiuae/falcon-7b \
+    litgpt finetune_full tiiuae/falcon-7b \
         --data JSON \
         --data.json_path data/mydata.json \
         --out_dir data/mydata-finetuned

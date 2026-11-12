@@ -1,5 +1,8 @@
 # Zero to LitGPT: Getting Started with Pretraining, Finetuning, and Using LLMs
 
+本文为通用 LitGPT 教程；SemanticLogKV 的运行配置和实验结论以
+[项目 README](../README.md) 为准。其他教程入口见 [索引](README.md)。
+
 
 
 This tutorial walks you through the main features and usage patterns for ⚡️LitGPT, a library for pretraining, finetuning, and using LLMs that focuses on an efficient user experience while being developer-friendly.

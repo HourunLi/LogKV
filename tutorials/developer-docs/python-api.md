@@ -1,108 +1,18 @@
-# LitGPT High-level Python API
+# LitGPT Python API 开发入口
 
-This is a work-in-progress draft for a high-level LitGPT Python API.
+面向使用者的例子统一维护在 [Python API 教程](../python-api.md)，实现为
+[`litgpt/api.py`](../../litgpt/api.py)。这里不再维护与源码不一致的 API 设计草稿；旧提案可由 Git 查看。
 
-&nbsp;
-## Model loading & saving
+当前 `LLM.load` 参数为 `model`、`init`、`tokenizer_dir`、`access_token`、`distribute`；
+设备、精度和量化等分发设置通过 `LLM.distribute` 配置。`LLM.save` 保存 LitGPT checkpoint，
+不接受旧草稿中的 `format="lightning | ollama | hf"`。
+HF 转换使用 [转换入口](../convert_lit_models.md)。
 
-The `LLM.load` command loads an `llm` object, which contains both the model object (a PyTorch module) and a preprocessor.
+`LLM` 当前有 `forward`、`trainer_setup`、`save`、`load`、`distribute`、`generate` 和
+`benchmark` 等方法，没有旧草稿中的 `prepare_dataset`、`instruction_finetune`、`pretrain`
+或 `serve` 实例方法。训练与服务分别见 [训练教程](../pretrain.md)、[微调教程](../finetune.md)
+和 [部署教程](../deploy.md)。
 
-```python
-from litgpt import LLM
-
-llm = LLM.load(
-    model="url | local_path",
-    # high-level user only needs to care about those:
-    memory_reduction="none | medium | strong"
-    # advanced options for technical users:
-    source="hf | local | other"
-    quantize="bnb.nf4",
-    precision="bf16-true",
-    device=""auto | cuda | cpu",
-)
-```
-
-Here,
-
--  `llm.model` contains the PyTorch Module
-- and `llm.preprocessor.tokenizer`  contains the tokenizer
-
-The `llm.save` command saves the model weights, tokenizer, and configuration information.
-
-
-```python
-llm.save(checkpoint_dir, format="lightning | ollama | hf")
-```
-
-
-&nbsp;
-## Inference / Chat
-
-```
-response = llm.generate(
-    prompt="What do Llamas eat?",
-    temperature=0.1,
-    top_p=0.8,
-    ...
-)
-```
-
-
-&nbsp;
-## Dataset
-
-The `llm.prepare_dataset` command prepares a dataset for training.
-
-```
-llm.download_dataset(
-    URL,
-    ...
-)
-```
-
-```
-dataset = llm.prepare_dataset(
-    path,
-    task="pretrain | instruction_finetune",
-    test_portion=0.1,
-    ...
-)
-```
-
-&nbsp;
-## Training
-
-
-```python
-llm.instruction_finetune(
-    config=None,
-    dataset=dataset,
-    max_iter=10,
-    method="full | lora | adapter | adapter_v2"
-)
-```
-
-```python
-llm.pretrain(config=None, dataset=dataset, max_iter=10, ...)
-```
-
-&nbsp;
-## Serving
-
-
-```python
-llm.serve(port=8000)
-```
-
-Then in another Python session:
-
-```python
-import requests, json
-
-response = requests.post(
-    "http://127.0.0.1:8000/predict",
-    json={"prompt": "Fix typos in the following sentence: Example input"}
-)
-
-print(response.json()["output"])
-```
+修改接口时同步检查公开签名、[API 测试](../../tests/test_api.py) 和使用者教程。
+SemanticLogKV 使用独立的 [训练与评测入口](../../README.md#运行入口)，不能从通用 API
+支持某模型推断它已通过压缩缓存和重放验证。

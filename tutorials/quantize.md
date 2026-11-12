@@ -1,5 +1,8 @@
 # Quantize the model
 
+本页的 bitsandbytes 选项针对模型权重，不是 KV cache 量化。论文中的 4-bit KV / KIVI
+对照另见 [Baseline 选型](../docs/baselines.md)，不能用本页权重量化结果替代。
+
 This document provides different strategies for quantizing the various models available in LitGPT to reduce GPU memory usage, which is useful for running larger models on certain GPU hardware.
 
 **All the examples below were run on an A100 40GB GPU with CUDA 12.1.**

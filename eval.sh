@@ -206,7 +206,9 @@ if not save_dir:
 ckpt_dir = cfg.get("ckpt_dir") or os.path.join("checkpoints", arch_name)
 resume_dir = cfg.get("resume_dir")
 tokenizer_dir = cfg.get("tokenizer_dir")
-output_path = cfg.get("output_path") or os.path.join(save_dir, "evaluate")
+# eval_tag: methods evaluated on one checkpoint (baseline, word_first, query, ...) each get their own folder,
+# <save_path>/evaluate/<eval_tag>, instead of sharing <save_path>/evaluate; an explicit output_path wins.
+output_path = cfg.get("output_path") or os.path.join(save_dir, "evaluate", *([str(cfg["eval_tag"])] if cfg.get("eval_tag") else []))
 benchmark = cfg.get("benchmark") or ""
 
 try:

@@ -34,7 +34,7 @@ Please read the [tutorials/finetune_*.md](.) documents for more information abou
 
 > [!IMPORTANT]
 > By default, the maximum sequence length is obtained from the model configuration file. In case you run into out-of-memory errors, especially in the cases of LIMA and Dolly,
-> you can try to lower the context length by setting the `--train.max_seq_length` parameter, for example, `litgpt finetune lora --train.max_seq_length 256`. For more information on truncating datasets, see the *Truncating datasets* section in the Alpaca section near the top of this article.
+> you can try to lower the context length by setting the `--train.max_seq_length` parameter, for example, `litgpt finetune_lora --train.max_seq_length 256`. For more information on truncating datasets, see the *Truncating datasets* section in the Alpaca section near the top of this article.
 
 &nbsp;
 
@@ -105,7 +105,7 @@ dataset consists of 52,000 instructions and responses.
 The original [Alpaca-GPT4](https://github.com/Instruction-Tuning-with-GPT-4/GPT-4-LLM) dataset can be used as follows:
 
 ```bash
-litgpt finetune lora "tiiuae/falcon-7b" \
+litgpt finetune_lora "tiiuae/falcon-7b" \
   --data AlpacaGPT4
 ```
 
@@ -287,7 +287,7 @@ The usage is similar to the Dolly dataset described above except that it require
 ```bash
 export HF_TOKEN="insert_your_huggingface_token_here"
 
-litgpt finetune lora \
+litgpt finetune_lora \
   --data LIMA \
   --checkpoint_dir "tiiuae/falcon-7b"
 ```
@@ -332,7 +332,7 @@ litgpt finetune_lora tiiuae/falcon-7b \
 However, you can also select individual subsets via comma-separated strings as follows:
 
 ```bash
-litgpt finetune lora tiiuae/falcon-7b \
+litgpt finetune_lora tiiuae/falcon-7b \
   --data FLAN \
   --data.subsets "aeslc_10templates,ag_news_subset_10templates,anli_r1_10templates"
 ```

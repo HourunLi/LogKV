@@ -1,5 +1,8 @@
 # Resource Tables
 
+本页保留下述版本与硬件的历史测量，不代表当前 SemanticLogKV 的吞吐或显存。
+当前项目测量边界见 [评测指标](../docs/evaluation-metrics.md)。
+
 - Last updated: 10/20/2023
 - LitGPT version: commit 8641822
 - Hardware: NVIDIA A100-SXM4-40GB
