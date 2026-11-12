@@ -101,7 +101,8 @@ def test_cuda_events_are_consumed_once_at_step_end_and_disabled_afterwards():
         assert sync.call_count == 1
 
 
-def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time(tmp_path):
+@pytest.mark.parametrize("use_fsdp,low_memory", [(False, False), (False, True), (True, False), (True, True)])
+def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time(tmp_path, use_fsdp, low_memory):
     # Execute the actual training loop without loading datasets/model checkpoints.
     source = ast.parse((Path(__file__).resolve().parents[1] / "demo.py").read_text())
     main = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == "main")
@@ -137,7 +138,7 @@ def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time(tmp_pa
         global_step=2, max_steps=4, training_finished=False, step_active=False,
         profile_steps={3}, micro_batch_idx=0, gradient_accumulation_steps=2,
         loader_iter=iter([torch.ones(1, 5)] * 4), context_length=4, data_epoch=1, num_epochs=1, synthetic_kit=None,
-        log_kv_dense_mode=False,
+        log_kv_dense_mode=False, use_fsdp=use_fsdp, fsdp_low_memory=low_memory,
         fabric=fabric, model=model, optimizer=optimizer, step_stats=step_stats,
         log_kv_second_order_warmup_steps=0, log_kv_second_order_scale=0., entropy_chunk_size=4,
         get_log_kv_second_order_scale=lambda *args: 0., get_lr=lambda *args: .1,
@@ -154,6 +155,11 @@ def test_training_loop_profiles_global_steps_and_excludes_checkpoint_time(tmp_pa
                         if isinstance(node, ast.FunctionDef) and node.name == "_training_speed_metrics")
     exec(compile(ast.Module(body=[speed_helper, loop], type_ignores=[]), "demo.py", "exec"), scope)
     assert selections == [True, False]  # resumed global steps 3 and 4
+    assert [call.kwargs["enabled"] for call in fabric.no_backward_sync.call_args_list] == (
+        [False] * 4 if use_fsdp and low_memory else [True, False, True, False]
+    )
+    assert optimizer.step.call_count == 2  # Syncing each micro-batch must not increase optimizer updates.
+    assert [call.args[0].item() for call in fabric.backward.call_args_list] == [0.5] * 4
     assert scope["global_step"] == 4 and not scope["step_active"]
     assert clock[0] == 218  # two 9-second steps plus two 100-second checkpoint writes
     for call in fabric.log_dict.call_args_list:

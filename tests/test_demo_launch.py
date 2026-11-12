@@ -1,6 +1,7 @@
 """Exercise actual launch/selection code without starting GPUs or installing packages."""
 import ast
 import __future__
+from copy import deepcopy
 import os
 from pathlib import Path
 import re
@@ -14,6 +15,48 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_low_memory_adam_updates_without_foreach_even_after_resume(monkeypatch, resume, dtype):
+    import torch
+
+    torch.manual_seed(7)
+    params = [torch.nn.Parameter(torch.randn(shape, dtype=getattr(torch, dtype))) for shape in ((4, 3), (3,))]
+    reference_params = [torch.nn.Parameter(p.detach().clone()) for p in params]
+    optimizer = torch.optim.AdamW([{"params": [params[0]]}, {"params": [params[1]], "weight_decay": 0.}],
+                                 lr=0.01, betas=(0.9, 0.95), foreach=True)
+    reference = torch.optim.AdamW(
+        [{"params": [reference_params[0]]}, {"params": [reference_params[1]], "weight_decay": 0.}],
+        lr=0.01, betas=(0.9, 0.95), foreach=True,
+    )
+    if resume:
+        for p, ref in zip(params, reference_params):
+            ref.grad = torch.ones_like(ref)
+        reference.step()
+        for p, ref in zip(params, reference_params):
+            p.data.copy_(ref.data)
+        optimizer.load_state_dict(deepcopy(reference.state_dict()))
+
+    tree = ast.parse((ROOT / "demo.py").read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    policy = next(node for node in main.body if isinstance(node, ast.If)
+                  and isinstance(node.test, ast.Name) and node.test.id == "fsdp_low_memory")
+    exec(compile(ast.Module(body=[policy], type_ignores=[]), "demo.py", "exec"),
+         dict(fsdp_low_memory=True, optimizer=optimizer, fabric=SimpleNamespace(print=lambda *args: None)))
+    for p, ref in zip(params, reference_params):
+        p.grad = torch.randn_like(p)
+        ref.grad = p.grad.clone()
+    reference.step()
+    foreach = Mock(side_effect=AssertionError("low-memory AdamW must not allocate a foreach sqrt tensor list"))
+    monkeypatch.setattr(torch, "_foreach_sqrt", foreach)
+    optimizer.step()
+    foreach.assert_not_called()
+    for p, ref in zip(params, reference_params):
+        torch.testing.assert_close(p, ref)
+        for key in ("step", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(optimizer.state[p][key], reference.state[ref][key])
 
 
 @pytest.mark.parametrize('strategy', ['fsdp', 'model_parallel', 'single'])
