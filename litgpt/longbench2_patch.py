@@ -5,12 +5,15 @@ dataset card defines no configs, datasets only offers "default" (all 20 files) a
 "BuilderConfig '<subset>' not found". This patch keeps the normal call and, when it fails, reads the
 subset's files from the repository snapshot instead (downloaded online, or from the hub cache when
 HF_HUB_OFFLINE=1): a file belongs to the subset when its stem or its folder is the subset's name, or its
-stem starts with the name and "-" or ".". Applied by eval.py; unused/fetch_long_eval_data.py uses it to
-fetch and check the same files.
+stem starts with the name and "-" or ".". The fetch script also makes ordinary, byte-verified copies in
+LONGBENCH2_DIR or <HF_HOME>/longbench2. These take precedence over both hub links and datasets caches,
+so a snapshot that is readable only on the download node cannot silently become the evaluation source.
+Applied by eval.py; unused/fetch_long_eval_data.py uses it to fetch and check the same files.
 """
 from __future__ import annotations
 
 import os
+import socket
 from pathlib import Path
 
 import yaml
@@ -65,9 +68,33 @@ def _cached_snapshot() -> str | None:
     return str(shots[-1]) if shots else None
 
 
-def snapshot() -> tuple[str, list[str]]:
-    """The repository snapshot's folder and data files (offline: the hub cache only, any snapshot there when
-    refs/main is lost). A data file may be a flattened link: read it through real_file."""
+def plain_folder() -> Path:
+    """Shared ordinary files survive cache-link flattening and missing node-local blobs."""
+    home = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
+    return Path(os.environ.get("LONGBENCH2_DIR") or home / "longbench2").expanduser()
+
+
+def _data_files(root: Path) -> list[str]:
+    return sorted(str(path.relative_to(root)) for path in root.rglob("*")
+                  if path.is_file() and path.suffix in BUILDERS)
+
+
+def plain_snapshot() -> tuple[str, list[str]] | None:
+    root = plain_folder()
+    files = _data_files(root) if root.is_dir() else []
+    if files or os.environ.get("LONGBENCH2_DIR"):
+        return str(root), files
+    return None
+
+
+def snapshot(prefer_plain: bool = True) -> tuple[str, list[str]]:
+    """The data source and its relative file names. Prefer the shared ordinary files; the downloader passes
+    False to inspect/repair the hub source. Offline hub reads accept cached snapshots with lost refs/main.
+    A hub file may be a flattened link: read it through real_file."""
+    if prefer_plain:
+        plain = plain_snapshot()
+        if plain is not None:
+            return plain
     from huggingface_hub import snapshot_download
 
     offline = os.environ.get("HF_HUB_OFFLINE") == "1"
@@ -77,13 +104,27 @@ def snapshot() -> tuple[str, list[str]]:
         root = _cached_snapshot() if offline else None
         if root is None:
             raise
-    files = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*") if p.is_file() and p.suffix in BUILDERS)
-    return root, files
+    return root, _data_files(Path(root))
+
+
+def file_state(path) -> str:
+    """What this node actually reads, rather than assuming the downloader's cache view is shared."""
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as stream:
+            head = stream.read(64)
+            stream.seek(max(0, size - 4))
+            tail = stream.read(4)
+        return (f"{path}: {size} bytes, symlink={path.is_symlink()}, target={path.resolve()}, "
+                f"starts={head!r}, ends={tail!r}")
+    except OSError as error:
+        return f"{path}: {type(error).__name__}: {error}"
 
 
 def data_problem() -> str | None:
     """Why the offline data is incomplete; use the same subset list for fetching and evaluation."""
-    repair = ("Run bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong "
+    repair = ("Run bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong --no-ruler-qa "
               "with the evaluation job's HF_HOME, then retry.")
     try:
         root, files = snapshot()
@@ -107,7 +148,9 @@ def data_problem() -> str | None:
         if not whole:
             bad.append(name)
     if bad:
-        return f"LongBench v2 files in {root} are not whole parquet: {bad}. {repair}"
+        observed = "; ".join(file_state(real_file(Path(root) / name)) for name in bad[:3])
+        return (f"LongBench v2 files in {root} are not whole parquet: {bad}. "
+                f"Observed on host {socket.gethostname()}: {observed}. {repair}")
     return None
 
 
@@ -131,6 +174,9 @@ def apply_patch() -> None:
     def load_dataset(path=None, name=None, *args, **kwargs):
         if path != REPO or not name:
             return original(path, name, *args, **kwargs)
+        # Use the same ordinary files that preflight checked, even if an older datasets cache exists.
+        if plain_snapshot() is not None:
+            return load_subset(original, name, kwargs.get("split"))
         try:
             return original(path, name, *args, **kwargs)
         except Exception as error:  # no such config (online), or no cache for it (offline)

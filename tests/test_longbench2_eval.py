@@ -1,10 +1,12 @@
 """Required LongBench v2 passes and task loading on the pinned lm-eval version, without GPUs or downloads."""
 import ast
+import hashlib
 import importlib.util
 import inspect
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 
 import pytest
@@ -104,6 +106,82 @@ def test_download_discovers_all_subsets_without_installed_task_definitions(data_
     exec(compile(ast.Module(body=[discover], type_ignores=[]), "fetch_long_eval_data.py", "exec"), scope)
     assert scope["longbench2_subsets"]() == data_module.subsets()
     assert len(scope["longbench2_subsets"]()) == 20
+
+
+def test_plain_copy_survives_the_hub_blobs_disappearing(data_module, monkeypatch, tmp_path):
+    datasets = pytest.importorskip("datasets")
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "shared"))
+    monkeypatch.delenv("LONGBENCH2_DIR", raising=False)
+    hub = tmp_path / "hub"
+    root = hub / "snapshots" / "revision"
+    blobs = hub / "blobs"
+    blobs.mkdir(parents=True)
+    names = data_module.subsets()
+    files = []
+    for index, name in enumerate(names):
+        count = 26 if index < 3 else 25  # 503 synthetic rows across the 20 subsets.
+        blob = blobs / name
+        pq.write_table(pa.table({"context": ["context"] * count, "question": ["question"] * count,
+                                 "choices": [["a", "b", "c", "d"]] * count, "answer": [0] * count}), blob)
+        relative = f"data/{name}/train.parquet"
+        path = root / relative
+        path.parent.mkdir(parents=True)
+        path.write_text(os.path.relpath(blob, path.parent))  # How copied hub links appear on the training mount.
+        files.append(relative)
+
+    source = ast.parse((ROOT / "unused/fetch_long_eval_data.py").read_text())
+    nodes = [node for node in source.body if isinstance(node, ast.FunctionDef)
+             and node.name in {"is_parquet", "materialize_longbench2"}]
+    scope = dict(Path=Path, hashlib=hashlib, shutil=shutil, os=os)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "fetch_long_eval_data.py", "exec"), scope)
+    lines = []
+    plain = scope["materialize_longbench2"](str(root), files, lines)
+    assert "20 subsets, 503 questions; no cache links" in lines[-1]
+    assert all((plain / name).is_file() and not (plain / name).is_symlink() for name in files)
+    # A partial copy and a flattened cache link are repaired as ordinary bytes, without renaming on the mount.
+    (plain / files[0]).write_bytes(b"PAR1 cut short")
+    (plain / files[1]).unlink()
+    (plain / files[1]).write_text(str(root / files[1]))
+    scope["materialize_longbench2"](str(root), files, [])
+    assert not (plain / files[1]).is_symlink()
+    for blob in blobs.iterdir():
+        blob.unlink()
+
+    def no_snapshot(*args, **kwargs):
+        raise AssertionError("evaluation must not depend on the broken hub snapshot")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", no_snapshot)
+    assert data_module.snapshot() == (str(plain), sorted(files))
+    assert data_module.data_problem() is None
+    real_load = datasets.load_dataset
+
+    def only_plain(path=None, name=None, **kwargs):
+        assert path == "parquet", "an existing datasets/hub cache must not override the verified plain files"
+        return real_load(path, name=name, cache_dir=str(tmp_path / "datasets"), **kwargs)
+
+    monkeypatch.setattr(datasets, "load_dataset", only_plain)
+    data_module.apply_patch()
+    rows = datasets.load_dataset(data_module.REPO, name=names[0], split="train")
+    assert len(rows) == 26 and rows[0]["context"] == "context"
+
+
+def test_explicit_plain_directory_and_bad_file_diagnostics(data_module, monkeypatch, tmp_path):
+    monkeypatch.setenv("LONGBENCH2_DIR", str(tmp_path / "plain"))
+    assert data_module.snapshot() == (str(tmp_path / "plain"), [])
+    assert "missing subsets" in data_module.data_problem()
+    files = [f"{name}.parquet" for name in data_module.subsets()]
+    (tmp_path / "plain").mkdir()
+    for name in files:
+        (tmp_path / "plain" / name).write_bytes(b"PAR1" + b"x" * 16 + b"PAR1")
+    bad = tmp_path / "plain" / files[0]
+    bad.write_text("../../blobs/missing")
+    problem = data_module.data_problem()
+    assert "Observed on host" in problem and "symlink=False" in problem
+    assert "../../blobs/missing" in problem and "starts=" in problem
 
 
 @pytest.mark.parametrize("size", ["qwen1.7b-32k", "qwen8b-32k"])

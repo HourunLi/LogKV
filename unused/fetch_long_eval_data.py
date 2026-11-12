@@ -9,6 +9,8 @@ switches off for itself only, then:
     RULER QA      SQuAD v2 dev and HotpotQA dev (distractor) JSON, into RULER_CACHE_DIR, where
                   litgpt/ruler_patch.py looks first
     LongBench v2  recursal/longbench-v2, every subset lm-eval's longbench2 tasks load (--longbench2)
+                  plus byte-verified ordinary parquet copies in <HF_HOME>/longbench2 (or LONGBENCH2_DIR),
+                  which evaluation reads before the hub/datasets caches; 20 subsets, 503 questions
     InfiniteBench xinrongzhang2022/InfiniteBench, the jsonl files of the ten tasks eval_tasks/infinitebench reads
                   (--infinitebench; into the hub cache, and copied as plain files to <HF_HOME>/infinitebench, where
                   they are read without INFINITEBENCH_DIR)
@@ -49,6 +51,7 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 
 import argparse  # noqa: E402
+import hashlib  # noqa: E402
 import importlib.util  # noqa: E402
 import json  # noqa: E402
 import shutil  # noqa: E402
@@ -144,10 +147,11 @@ def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> tuple[
     for label, group in groups:
         try:
             if label == "LongBench v2":
-                root, files = snapshot()
+                root, files = snapshot(prefer_plain=False)
                 lines.append(f"LongBench v2 snapshot {root}: {len(files)} data files, e.g. {files[:4]}")
                 if not repair_parquet(root, files, lines):
                     raise ValueError("some LongBench v2 files are still not parquet after a fresh download (above)")
+                materialize_longbench2(root, files, lines)
             for path, name, split in group:
                 rows = len(datasets.load_dataset(path, name=name, split=split))
                 lines.append(f"{path} {name} {split}: {rows} rows")
@@ -197,8 +201,8 @@ def flattened_link(path: Path) -> str | None:
 def refetch(repo: str, name: str, root: str, whole=None) -> tuple[Path, str]:
     """Make the snapshot file ``name`` whole again; returns its path and what was done. hf_hub_download leaves a
     snapshot file that exists as it is, even with force_download (it only refreshes the blob), so a bad one is
-    removed first; a flattened link whose blob is whole (``whole``, default a whole parquet file) is linked again
-    (copied, where links do not work)."""
+    removed first. A flattened link whose blob is whole (``whole``, default a whole parquet file) is always
+    replaced with ordinary copied bytes: the training filesystem does not support symlinks."""
     whole = whole or is_parquet
     from huggingface_hub import hf_hub_download
 
@@ -208,17 +212,24 @@ def refetch(repo: str, name: str, root: str, whole=None) -> tuple[Path, str]:
         blob = Path(os.path.normpath(pointer.parent / text))
         pointer.unlink()
         if whole(blob):
-            try:
-                os.symlink(text, pointer)
-                return pointer, f"a link to blobs/{blob.name} flattened into a file; linked again"
-            except OSError:
-                shutil.copyfile(blob, pointer)
-                return pointer, f"a link to blobs/{blob.name} flattened into a file; the blob copied in its place"
+            shutil.copyfile(blob, pointer)
+            return pointer, f"a link to blobs/{blob.name} flattened into a file; the blob copied in its place"
     elif pointer.is_symlink() or pointer.exists():
         pointer.unlink()
     # The snapshot's own revision, so the file lands in this snapshot folder.
     fresh = hf_hub_download(repo, name, repo_type="dataset", revision=Path(root).name, force_download=True)
-    return Path(fresh), "downloaded again"
+    fresh = Path(fresh)
+    text = flattened_link(fresh)
+    if fresh.is_symlink():
+        blob = fresh.resolve()
+    elif text is not None:
+        blob = Path(os.path.normpath(fresh.parent / text))
+    else:
+        blob = fresh
+    if blob != fresh and whole(blob):
+        fresh.unlink()
+        shutil.copyfile(blob, fresh)
+    return fresh, "downloaded again as an ordinary file"
 
 
 def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | None = None) -> bool:
@@ -237,6 +248,59 @@ def repair_parquet(root: str, files: list[str], lines: list[str], repo: str | No
     if not bad:
         lines.append(f"{repo} files: all whole parquet")
     return ok
+
+
+def materialize_longbench2(root: str, files: list[str], lines: list[str]) -> Path:
+    """Copy every subset as ordinary bytes on the shared mount, then verify rows and byte identity.
+
+    A valid snapshot on the download node can be unreadable on evaluation nodes when its links or blobs
+    do not survive the cache sync. These copies never point into blobs/ and need no rename support.
+    """
+    import pyarrow.parquet as pq
+
+    from litgpt.longbench2_patch import plain_folder, real_file, subset_files, subsets
+
+    def digest(path):
+        value = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                value.update(chunk)
+        return value.digest()
+
+    target_root = plain_folder()
+    if target_root.resolve() == Path(root).resolve():
+        raise ValueError("LONGBENCH2_DIR must differ from the hub snapshot directory")
+    total = 0
+    names = subsets()
+    for subset in names:
+        selected = subset_files(files, subset)
+        if not selected or any(not name.endswith(".parquet") for name in selected):
+            raise ValueError(f"LongBench v2 subset {subset!r} has no complete parquet source in {root}")
+        rows = 0
+        for name in selected:
+            source = Path(real_file(Path(root) / name))
+            expected = pq.ParquetFile(source).metadata.num_rows
+            expected_hash = digest(source)
+            target = target_root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            same = (target.is_file() and not target.is_symlink() and target.stat().st_size == source.stat().st_size
+                    and digest(target) == expected_hash)
+            if not same:
+                if target.is_symlink():
+                    target.unlink()
+                shutil.copyfile(source, target)
+            if (target.is_symlink() or not is_parquet(target) or digest(target) != expected_hash
+                    or pq.ParquetFile(target).metadata.num_rows != expected):
+                raise ValueError(f"LongBench v2 plain copy did not verify on this node: {target}")
+            rows += expected
+        if not rows:
+            raise ValueError(f"LongBench v2 subset {subset!r} is empty in {target_root}")
+        total += rows
+        lines.append(f"LongBench v2 plain {subset}: {rows} rows, SHA256 verified")
+    if total != 503:
+        raise ValueError(f"LongBench v2 plain data has {total} questions in {len(names)} subsets; expected 503")
+    lines.append(f"LongBench v2 plain files: {target_root} ({len(names)} subsets, {total} questions; no cache links)")
+    return target_root
 
 
 def fetch_ppl_hub(repo: str, lines: list[str]) -> str:
