@@ -13,8 +13,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import yaml
+
 REPO = "recursal/longbench-v2"
 BUILDERS = {".parquet": "parquet", ".jsonl": "json", ".json": "json", ".csv": "csv", ".arrow": "arrow"}
+TASKS_DIR = Path(__file__).resolve().parents[1] / "eval_tasks" / "longbench2"
+
+
+def subsets() -> list[str]:
+    """The subsets evaluated by our pinned task definitions, including on lm-eval 0.4.9."""
+    names = {(yaml.safe_load(path.read_text()) or {}).get("dataset_name") for path in TASKS_DIR.glob("*.yaml")}
+    names.discard(None)
+    if not names:
+        raise FileNotFoundError(f"LongBench v2 task definitions missing from {TASKS_DIR}")
+    return sorted(names)
 
 
 def subset_files(files, name: str) -> list[str]:
@@ -67,6 +79,36 @@ def snapshot() -> tuple[str, list[str]]:
             raise
     files = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*") if p.is_file() and p.suffix in BUILDERS)
     return root, files
+
+
+def data_problem() -> str | None:
+    """Why the offline data is incomplete; use the same subset list for fetching and evaluation."""
+    repair = ("Run bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong "
+              "with the evaluation job's HF_HOME, then retry.")
+    try:
+        root, files = snapshot()
+    except Exception as error:
+        return f"no LongBench v2 snapshot in the hub cache ({type(error).__name__}: {str(error)[:200]}). {repair}"
+    missing = [name for name in subsets() if not subset_files(files, name)]
+    if missing:
+        return f"LongBench v2 snapshot {root} is missing subsets: {missing}. {repair}"
+    bad = []
+    for name in files:
+        if not name.endswith(".parquet"):
+            continue
+        path = Path(real_file(Path(root) / name))
+        try:
+            with path.open("rb") as stream:
+                head = stream.read(4)
+                stream.seek(-4, os.SEEK_END)
+                whole = path.stat().st_size >= 12 and head == b"PAR1" and stream.read(4) == b"PAR1"
+        except OSError:
+            whole = False
+        if not whole:
+            bad.append(name)
+    if bad:
+        return f"LongBench v2 files in {root} are not whole parquet: {bad}. {repair}"
+    return None
 
 
 def load_subset(load, name: str, split=None):

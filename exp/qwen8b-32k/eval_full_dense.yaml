@@ -4,6 +4,7 @@
 # eval_long_dense.yaml（每个任务 long_limit 条）。外部变量：LIMIT=2（每个任务 2 条，先试跑）、EVAL_LENGTHS=none（只跑主线）、
 # EVAL_MAIN=0（只跑各长度）。
 #   bash eval.sh exp/qwen8b-32k/eval_full_dense.yaml
+# LongBench v2 在 32K / 64K / 128K / 256K 均为必跑项，不因缓存问题跳过。
 config: eval_long_dense.yaml
 eval_main: true
 benchmark: null        # 主线用 eval.sh 的默认清单（全量），不用基础配置里的 benchmark

@@ -243,7 +243,7 @@ def test_per_length_longbench2_groups_are_lm_evals_longbench2(monkeypatch):
     manager = scope["_task_manager"]({"pretrained": "unused"})
     theirs = sorted(get_subtask_list(get_task_dict(["longbench2"], manager))["longbench2"])
     assert len(theirs) == 20
-    for n in ("64k", "128k", "256k"):
+    for n in ("32k", "64k", "128k", "256k"):
         assert sorted(get_subtask_list(get_task_dict([f"longbench2_{n}"], manager))[f"longbench2_{n}"]) == theirs
     check = scope["_check_task_lengths"]
     check(["babilong_256k", "long_ppl_256k", "longbench2_256k"], 263168)

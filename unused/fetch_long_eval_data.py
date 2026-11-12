@@ -102,15 +102,9 @@ def patch_requests(verify_ssl: bool, retries: int = 10) -> None:
 
 
 def longbench2_subsets() -> list[str]:
-    import lm_eval
+    from litgpt.longbench2_patch import subsets
 
-    folder = Path(lm_eval.__file__).parent / "tasks" / "longbench2"
-    names = set()
-    for path in folder.glob("*.yaml"):
-        for line in path.read_text().splitlines():
-            if line.startswith("dataset_name:"):
-                names.add(line.split(":", 1)[1].strip())
-    return sorted(names)
+    return subsets()
 
 
 def ruler_cache_dir() -> Path:

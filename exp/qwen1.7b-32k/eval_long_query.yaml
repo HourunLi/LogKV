@@ -8,7 +8,7 @@
 # 困惑度不给问题，niah_turns 缓存上下文时也不知道问题，这些任务上与只开 cue 保护相同。外部变量控制范围：
 #   EVAL_LENGTHS=32k,128k            只测这些长度（默认 eval_lengths 全部）
 #   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench   只跑这些类（默认全部；默认时缺数据的
-#                                    ppl / books、文件不完整的 longbench2 / infinitebench 跳过）
+#                                    ppl / books、文件不完整的 infinitebench 跳过；longbench2 缺数据时报错）
 #   NIAH_ONLY=1                      只跑 RULER
 #   YARN_MODE=fixed                  固定倍数的附加实验
 #   bash eval.sh exp/qwen1.7b-32k/eval_long_query.yaml

@@ -7,10 +7,11 @@
 #    BABILong、LongBench v2、niah_turns、书的困惑度曲线、long_ppl、InfiniteBench。主线已测过的（32K 的逐轮问与书的曲线、
 #    32768 上的 8 个捞针任务）不再重测。
 # 数据：LONG_PPL_DATA、LONG_PPL_BOOKS（或下面的键）、BABILong / LongBench v2 / InfiniteBench 的缓存
-# （unused/fetch_long_eval_data.py 下载，unused/check_long_eval_data.py 核对）；默认清单里缺数据的任务打印原因后跳过。
+# （unused/fetch_long_eval_data.py 下载，unused/check_long_eval_data.py 核对）；LongBench v2 必跑，缺失子集或文件损坏时报错并提示下载命令；其余可选任务缺数据时打印原因后跳过。
 # 外部变量：LIMIT=2（每个任务 2 条，先在单卡上试跑）、EVAL_LENGTHS=none（只跑主线）、EVAL_MAIN=0（只跑各长度）、
 # EVAL_LENGTHS / EVAL_SUITES / NIAH_ONLY / YARN_MODE（同 eval_long_*.yaml）。
 #   bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query.yaml
+# LongBench v2 在 32K / 64K / 128K / 256K 均为必跑项，不因缓存问题跳过。
 config: eval_long_word_first_query.yaml
 eval_main: true
 benchmark: null        # 主线用 eval.sh 的默认清单（全量），不用基础配置里的 benchmark

@@ -93,6 +93,15 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 ```
 
+1.7B 与 8B 的全量评测均必跑 32K / 64K / 128K / 256K 的 LongBench v2；缓存缺失、缺子集或文件损坏会明确报错。
+先用相同 `HF_HOME` 准备数据，再补测已有配置的 LongBench v2（不重跑其它指标）：
+
+```bash
+bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong
+EVAL_MAIN=0 EVAL_SUITES=longbench2 bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
+EVAL_MAIN=0 EVAL_SUITES=longbench2 bash eval.sh exp/qwen8b-32k/eval_full_word_first.yaml
+```
+
 训练完成后只跑捞针评测（默认全部 20 个 NIAH 任务；`majob.sh` 遇到已完成的 checkpoint 会跳过训练）：
 
 ```bash
