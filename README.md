@@ -100,6 +100,8 @@ bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 `LONGBENCH2_DIR`（默认 `<HF_HOME>/longbench2`），也可用它指定另一份共享副本目录，
 下载和评测时须一致。多节点作业须确保每个节点都能读到该目录；失败信息会标明节点、文件大小、链接状态和文件首尾字节。
 训练文件系统不支持软链接，缓存修复也直接复制完整 blob，不尝试创建软链接；下载源里末尾带 NUL 的链接文本会先去掉终止符。
+LongBench v2 通过 PyArrow 只读加载 parquet，并在内存中构造 Dataset；不生成共享目录中的 Arrow builder 缓存，
+避免 `datasets` 将 `.incomplete` 目录重命名时触发 `Operation not permitted`。已有完整副本无需重新下载。
 
 ```bash
 bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong --no-ruler-qa

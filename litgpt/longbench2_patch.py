@@ -5,6 +5,7 @@ Evaluation never falls back to hub snapshots or an older datasets cache, includi
 is missing. The download script alone opens hub snapshots and resolves flattened links (with optional NUL
 terminators) to make ordinary copies. A file belongs to a subset when its stem or folder is the subset's
 name, or its stem starts with that name plus '-' or '.'. No symlink creation is needed.
+Parquet is read with PyArrow into in-memory datasets, bypassing the datasets builder's cache-directory rename.
 """
 from __future__ import annotations
 
@@ -155,14 +156,25 @@ def data_problem() -> str | None:
     return None
 
 
-def load_subset(load, name: str, split=None):
+def load_subset(name: str, split=None):
+    """Read the small evaluation dataset into memory without creating a datasets builder/cache directory.
+
+    load_dataset('parquet', ...) finalizes an Arrow cache by renaming its .incomplete directory. The shared
+    training mount forbids that operation, including with keep_in_memory=True on the builder. Constructing
+    Dataset from the Arrow table avoids cache writes, locks and rename races between evaluation ranks.
+    """
+    from datasets import Dataset, DatasetDict
+    import pyarrow.parquet as pq
+
     root, files = snapshot()
     chosen = subset_files(files, name)
     if not chosen:
         raise FileNotFoundError(f"LongBench v2 plain directory {root} has no file for subset {name!r}")
-    builder = BUILDERS[Path(chosen[0]).suffix]
-    data = load(builder, data_files={"train": [os.path.join(root, f) for f in chosen]})
-    return data[split] if split else data
+    if any(Path(path).suffix != ".parquet" for path in chosen):
+        raise ValueError(f"LongBench v2 subset {name!r} must consist of ordinary parquet files in {root}")
+    table = pq.read_table([os.path.join(root, path) for path in chosen], partitioning=None)
+    data = Dataset(table, split="train")
+    return DatasetDict(train=data)[split] if split else DatasetDict(train=data)
 
 
 def apply_patch() -> None:
@@ -176,7 +188,7 @@ def apply_patch() -> None:
         if path != REPO or not name:
             return original(path, name, *args, **kwargs)
         # Use the same ordinary files that preflight checked, even if an older datasets cache exists.
-        return load_subset(original, name, kwargs.get("split"))
+        return load_subset(name, kwargs.get("split"))
 
     load_dataset._longbench2_patched = True
     datasets.load_dataset = load_dataset
