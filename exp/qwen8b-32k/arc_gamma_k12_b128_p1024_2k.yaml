@@ -1,15 +1,76 @@
-# Qwen3-8B-Base 上的 LogKV P=1024 checkpoint（baseline 与 word_first 共用，对应 1.7B 的同名实验）。
-# 训练超参与 LogKV 设置全部继承 1.7B 的同名 YAML（1200 步、全局 batch 32、学习率 5e-6、K=12、B=128、recent 2048、
-# 精确池 1024、cue 0）；8B 另启用 FSDP 低显存模式，以更多通信换取参数/梯度及时分片。
-# 先把 HF 下载转成 LitGPT 格式（写出 lit_model.pth 与 model_config.yaml），再训练：
+# Qwen3-8B-Base 的独立 32K LogKV P=1024 训练配置。
+# 本文件完整声明训练与 LogKV 参数；本目录的评测入口复用这份配置。
+# 全局 batch 64、每卡 micro batch 1：64 个训练进程时每步更新一次；更少进程按比例累积。
+# 保留 1200 个优化器步；全局 batch 改为 64 后，相同步数处理的样本数翻倍。
+# 先转换底模，再从仓库根目录启动训练：
 #   python -m litgpt convert_to_litgpt /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base
 #   BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen8b-32k/arc_gamma_k12_b128_p1024_2k.yaml
-config: ../qwen1.7b-32k/arc_gamma_k12_b128_p1024_2k.yaml
-arch_name: "Qwen/Qwen3-8B-Base"  # demo.py 按它建模型（Config.from_name）
-ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/
-fsdp_low_memory: true  # FULL_SHARD + 每个 micro-batch 同步梯度 + AdamW foreach=False
-
+arch_name: Qwen/Qwen3-8B-Base
+context_length: 32768
 expid: qwen8b-32k-gamma_k12_b128_p1024_2k
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/
+global_batch_size: 64
+micro_batch_size: 1
+max_steps: 1200
+learning_rate: 5e-6
+weight_decay: 0.1
+num_devices: 8
+warmup_steps: 100
+min_lr: 3e-6
+entropy_chunk_size: 1024
+dataset_name: prolong
+dataset_dir: data
+data_dir: /home/ma-user/work/bucket-pangu-green/lihourun/longcontext/prolong/data
+num_workers: 16
+save_ckpt: true
+save_interval: 400
+enable_tensorboard: true
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb/tb-32k-qwen8b-gamma_k12_b128_p1024_2k
 save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k
 merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging-qwen8b-gamma_k12_b128_p1024_2k
-tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb/tb-32k-qwen8b-gamma_k12_b128_p1024_2k
+log_kv_B: 128
+log_kv_recent_size: 2048
+log_kv_train_block: 2048
+log_kv_prefill_block: 2048
+log_kv_second_order_scale: 0
+log_kv_second_order_warmup_steps: 100
+log_kv_semantic_clusters: true
+log_kv_cluster_k_max: 12
+log_kv_cluster_lambda_rel: 1.0
+log_kv_seg_eta: 1.0
+log_kv_seg_g0: 2048.0
+log_kv_seg_gap_max: null
+log_kv_seg_block_level: 0
+log_kv_seg_forget: 0.5
+log_kv_semantic_s_h_path: null
+log_kv_semantic_flush_granularity: 2048
+log_kv_semantic_capacity_beta: 0.0
+log_kv_semantic_capacity_hard_cap_mult: 0.0
+log_kv_alpha_exact_tokens: 1024
+log_kv_beta_novelty: true
+log_kv_beta_adaptive_merge: true
+log_kv_gamma_level0_reinsert: true
+log_kv_gamma_top_merge: lightest
+log_kv_gamma_level_slack: 2
+log_kv_gamma_cue_tokens: 0
+auto_resume: true
+log_kv_semantic_cluster_chunk_size: 0
+log_kv_semantic_legacy_route: null
+log_kv_semantic_anchor_mode: mid
+log_kv_semantic_pack_backend: auto
+log_kv_profile_steps: null
+activation_checkpointing: true
+log_kv_semantic_centroid_backend: parallel
+log_kv_semantic_replay_updates: true
+log_kv_semantic_unified_route: false
+log_kv_alpha_span_max_tokens: 64
+log_kv_gamma_literals: false
+log_kv_gamma_cue_guard: false
+log_kv_gamma_query_cue: false
+log_kv_retention_heads: null
+log_kv_gamma_surprisal: null
+synthetic_retrieval_prob: 0.0
+resume_dir: null
+run_eval: ''
+# FULL_SHARD、每个 micro-batch 同步并分片梯度，AdamW foreach=False。
+fsdp_low_memory: true

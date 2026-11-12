@@ -67,15 +67,19 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 遵守 `CUDA_VISIBLE_DEVICES`；ModelArts 的 `MA_NUM_GPUS` 作为分配上限。
 可用 `GPUS_PER_NODE=2` 限制进程数，指定数量不得超过可见卡数或分配上限。
 启动时打印检测结果，YAML 中的 `num_devices: 8` 不会覆盖 torchrun 的实际卡数。
-当前每卡 micro batch 为 1、全局 batch 为 32，单机 1/2/4/8 卡分别累积 32/16/8/4 次；
+1.7B 配置每卡 micro batch 为 1、全局 batch 为 32，单机 1/2/4/8 卡分别累积 32/16/8/4 次；
 多机按全部进程数计算。无法整除时在加载模型前报错，不静默改变全局 batch。
 
-8B 训练配置 `exp/qwen8b-32k/arc_gamma_k12_b128_p1024_2k.yaml` 启用 `fsdp_low_memory: true`：
-使用 `FULL_SHARD`，前向后重新分片参数，并在每个 micro-batch 反向后同步和分片梯度，
-避免梯度累积期间常驻完整参数与梯度。同时关闭 AdamW 的 `foreach` 批量更新，避免 `optimizer.step()`
-为整组参数的二阶矩同时分配开平方结果；恢复旧 checkpoint 后也强制应用此设置。
-全局 batch、优化器更新频率、32K 长度和 LogKV 配置不变；代价是更多通信与优化器 kernel 启动，
-浮点运算顺序也会变化。仅多卡 FSDP 能获得分片收益；该开关不减少缓存与回放记录。
+8B 训练配置 `exp/qwen8b-32k/arc_gamma_k12_b128_p1024_2k.yaml` 完整声明训练与 LogKV 参数，
+8B 的训练与评测配置只在 `exp/qwen8b-32k/` 内继承。全局 batch 为 64、每卡 micro batch 为 1，
+64 个训练进程时累积 1 次，单机 1/2/4/8 卡分别累积 64/32/16/8 次。
+保留 1200 个优化器步，因此相较 batch 32，相同步数处理的样本数翻倍。
+
+8B 启用 `fsdp_low_memory: true`：使用 `FULL_SHARD`，前向后重新分片参数，并在每个 micro-batch
+反向后同步和分片梯度，避免梯度累积期间常驻完整参数与梯度。同时关闭 AdamW 的 `foreach`
+批量更新，避免 `optimizer.step()` 为整组参数的二阶矩同时分配开平方结果；恢复旧 checkpoint
+后也强制应用此设置。代价是更多通信与优化器 kernel 启动，浮点运算顺序也会变化。
+仅多卡 FSDP 能获得分片收益；该开关不减少缓存与回放记录。
 未设置时保留原 `SHARD_GRAD_OP` 与延迟梯度同步行为。
 
 `NIAH_ONLY=1` 只跳过主评测，仍会跑捞针；在 `majob.sh` 中也不会跳过尚未完成的训练。
