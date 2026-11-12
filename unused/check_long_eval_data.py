@@ -53,9 +53,8 @@ def check_babilong(report) -> None:
 
 def check_longbench2(report) -> None:
     import datasets
-    import lm_eval
 
-    from litgpt.longbench2_patch import REPO, apply_patch, real_file, snapshot
+    from litgpt.longbench2_patch import REPO, apply_patch, real_file, snapshot, subsets
 
     try:
         root, files = snapshot()
@@ -69,18 +68,16 @@ def check_longbench2(report) -> None:
            + (f", not whole parquet: {bad}" if bad else ", all whole parquet")
            + (f" ({len(flattened)} read through flattened links to blobs/)" if flattened else ""))
     apply_patch()  # as eval.py
-    folder = Path(lm_eval.__file__).parent / "tasks" / "longbench2"
-    subsets = sorted({line.split(":", 1)[1].strip() for p in folder.glob("*.yaml")
-                      for line in p.read_text().splitlines() if line.startswith("dataset_name:")})
+    names = subsets()
     total = 0
-    for name in subsets:
+    for name in names:
         try:
             rows = len(datasets.load_dataset(REPO, name, split="train"))
             total += rows
             report(rows > 0, f"LongBench v2 {name}: {rows} questions")
         except Exception as error:  # noqa: BLE001
             report(False, f"LongBench v2 {name}: {type(error).__name__}: {str(error)[:200]}")
-    report(total == 503, f"LongBench v2: {total} questions in {len(subsets)} subsets (want 503)")
+    report(total == 503, f"LongBench v2: {total} questions in {len(names)} subsets (want 503)")
 
 
 def check_ruler_qa(report) -> None:

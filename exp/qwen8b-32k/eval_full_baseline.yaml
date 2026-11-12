@@ -1,9 +1,10 @@
 # 全量评测（只评测、不重训）：Qwen3-8B 的 LogKV P=1024，K/V 分数准入（同 checkpoint 的基线）。
-# 与 exp/qwen1.7b-32k/eval_full_baseline.yaml 相同：先跑 32K 主线（eval.sh 的默认清单，不限条数；主阶段为常识推理、综合、
+# 先跑 32K 主线（eval.sh 的默认清单，不限条数；主阶段为常识推理、综合、
 # LongBench v1 / LongBench-E、niah_turns_32k、long_ppl_books_32k，NIAH 阶段在 1K-32K 跑全部捞针任务），再按长度逐档跑
 # eval_long_baseline.yaml（每个任务 long_limit 条）。外部变量：LIMIT=2（每个任务 2 条，先试跑）、EVAL_LENGTHS=none（只跑主线）、
 # EVAL_MAIN=0（只跑各长度）。
 #   bash eval.sh exp/qwen8b-32k/eval_full_baseline.yaml
+# LongBench v2 在 32K / 64K / 128K / 256K 均为必跑项，不因缓存问题跳过。
 config: eval_long_baseline.yaml
 eval_main: true
 benchmark: null        # 主线用 eval.sh 的默认清单（全量），不用基础配置里的 benchmark
