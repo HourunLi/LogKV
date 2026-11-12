@@ -114,6 +114,9 @@ def test_plain_copy_survives_the_hub_blobs_disappearing(data_module, monkeypatch
     huggingface_hub = pytest.importorskip("huggingface_hub")
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
+    pytest.importorskip("lm_eval")
+    from lm_eval.evaluator_utils import get_subtask_list
+    from lm_eval.tasks import get_task_dict
 
     monkeypatch.setenv("HF_HOME", str(tmp_path / "shared"))
     monkeypatch.delenv("LONGBENCH2_DIR", raising=False)
@@ -159,16 +162,29 @@ def test_plain_copy_survives_the_hub_blobs_disappearing(data_module, monkeypatch
     monkeypatch.setattr(huggingface_hub, "snapshot_download", no_snapshot)
     assert data_module.snapshot() == (str(plain), sorted(files))
     assert data_module.data_problem() is None
-    real_load = datasets.load_dataset
+    def no_builder(*args, **kwargs):
+        raise AssertionError("LongBench v2 must not call the datasets builder, including the parquet builder")
+    def no_rename(*args, **kwargs):
+        raise PermissionError("the training mount does not support directory rename")
 
-    def only_plain(path=None, name=None, **kwargs):
-        assert path == "parquet", "an existing datasets/hub cache must not override the verified plain files"
-        return real_load(path, name=name, cache_dir=str(tmp_path / "datasets"), **kwargs)
-
-    monkeypatch.setattr(datasets, "load_dataset", only_plain)
+    monkeypatch.setattr(datasets, "load_dataset", no_builder)
+    monkeypatch.setattr(os, "rename", no_rename)
+    monkeypatch.setattr(os, "replace", no_rename)
+    monkeypatch.setattr(shutil, "move", no_rename)
     data_module.apply_patch()
     rows = datasets.load_dataset(data_module.REPO, name=names[0], split="train")
     assert len(rows) == 26 and rows[0]["context"] == "context"
+    assert rows.cache_files == [] and rows.select(range(2)).cache_files == []
+    manager = eval_helpers()["_task_manager"]({"pretrained": "unused"})
+    loaded = get_task_dict(["longbench2_128k"], manager)
+    assert len(get_subtask_list(loaded)["longbench2_128k"]) == 20
+    def check_memory_only(tasks):
+        for task in tasks.values():
+            if isinstance(task, dict):
+                check_memory_only(task)
+            else:
+                assert task.dataset["train"].cache_files == []
+    check_memory_only(loaded)
 
 
 def test_explicit_plain_directory_and_bad_file_diagnostics(data_module, monkeypatch, tmp_path):
@@ -197,7 +213,7 @@ def test_empty_default_plain_directory_never_falls_back_to_hub(data_module, monk
     problem = data_module.data_problem()
     assert str(tmp_path / "longbench2") in problem and "does not fall back" in problem
     with pytest.raises(FileNotFoundError, match="plain directory"):
-        data_module.load_subset(forbidden, "academic_single", "train")
+        data_module.load_subset("academic_single", "train")
 
 
 def test_nul_terminated_source_link_is_copied_without_a_download(data_module, monkeypatch, tmp_path):
