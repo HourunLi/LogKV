@@ -1,4 +1,5 @@
 # 全量评测（只评测、不重训）：Qwen3-8B 的 LogKV P=1024 + 惊异度准入 word_first。
+# 入口只选择本方法；权重从同一份 8B CPT 配置的 save_path/lit_model.pth 加载。
 # 先跑 32K 主线（eval.sh 的默认清单，不限条数；主阶段为常识推理、综合、
 # LongBench v1 / LongBench-E、niah_turns_32k、long_ppl_books_32k，NIAH 阶段在 1K-32K 跑全部捞针任务），再按长度逐档跑
 # eval_long_word_first.yaml（每个任务 long_limit 条）。外部变量：LIMIT=2（每个任务 2 条，先试跑）、EVAL_LENGTHS=none（只跑主线）、
