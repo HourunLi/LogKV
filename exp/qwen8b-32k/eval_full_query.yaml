@@ -1,0 +1,11 @@
+# Qwen3-8B 全量评测：同一 CPT checkpoint，开启问题 cue 与 cue 保护。
+# 先跑 32K 主线（全部默认指标与 1K–32K 捞针），再跑 32K / 64K / 128K / 256K 长文本。
+# 主线不限条数，逐档每个任务 long_limit 条；LongBench v2 在四档均为必跑项。
+#   bash eval8b_full.sh query
+config: eval_long_query.yaml
+eval_main: true
+benchmark: null
+niah_benchmark: null
+limit: null
+long_limit: 100
+eval_tag: full_query
