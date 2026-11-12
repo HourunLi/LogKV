@@ -8,14 +8,6 @@
 稀有 token 的片段加分（cue）。目标是固定簇数与窗口大小下 O(log N) 的推理 KV 存储。
 
 当前默认：attach 路由、K=12、recent/flush=2048、精确池 256 token、片段上限 64 token、
-<<<<<<< HEAD
-Beta 两项开启、mid anchor、一阶 attention。精确池从原 B=128 的预算中扣除，实际 B 由代码计算。
-训练/评测入口对语义簇默认开启 Alpha/Beta、关闭 unified；YAML 写
-`log_kv_alpha_exact_tokens: 0` 关闭 Alpha 与 Beta，`log_kv_beta_*: false` 只关 Beta，
-`log_kv_semantic_unified_route: true` 切回 unified 对照。这一组合（attach + Alpha + Beta）
-的质量与速度应由对应 checkpoint、完整配置和结果文件确认；本页不把旧实验结果
-当作当前组合的结论。精确槽选择是启发式，不保证远程事实无损。
-=======
 Beta 两项开启、Gamma 第 0 层重排、最轻对顶层合并与 cue（开头 64 个 token）开启、mid anchor、
 一阶 attention。精确池从原 B=128 的预算中扣除，实际 B 由代码计算。训练/评测入口对语义簇默认开启
 Alpha/Beta/Gamma、关闭 unified；YAML 写 `log_kv_alpha_exact_tokens: 0` 关闭 Alpha、Beta 与 cue，
@@ -24,7 +16,6 @@ Alpha/Beta/Gamma、关闭 unified；YAML 写 `log_kv_alpha_exact_tokens: 0` 关�
 `log_kv_semantic_unified_route: true` 切回 unified 对照。更早的实验 YAML 显式写回各自训练时的开关。
 attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启发式（cue 只在 RULER 代理上验证过），
 收益需实测确认。
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 
 ## 文档
 
@@ -150,16 +141,12 @@ essay 草堆总量有限，1M 时可能不足，此时会告警，该长度的�
 `save_path/training_metrics.jsonl`。输出文件、计算公式、计时边界以及新旧指标差异统一见
 [评测指标与性能口径](docs/evaluation-metrics.md)。
 
-<<<<<<< HEAD
 有效槽位比例、持久缓存分配字节和 CUDA 峰值是三种不同指标。当前
 `decode_ms_per_token` 只计首 token 之后的 decode；跨 rank 推理汇总是单设备有效吞吐，
 不能直接当作集群吞吐。指标采集不自动执行 Full KV 对照，也不代表已证明性能收益。
-=======
-此处统计存储条目，`multi` 的虚拟 attention 锚点不重复计数。槽位比例不是显存比例：预分配空位、
-元数据、额外 K 副本、打包工作区及临时峰值不在该指标内；原有 `cache_budget` 仍仅报告持久缓冲预算。
+
 Gamma 之前开启 Alpha 时，延迟归档反复合并旧条目，存活条目偏少、报告的压缩倍数偏高；Gamma 把条目数
 恢复到设计值，压缩倍数随之下降而分配不变（见 [Gamma](docs/gamma-logkv.md)）。
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 
 更早实验的 YAML 显式写出训练时的开关，复评不受新默认值影响：纯 attach / unified 基线为
 `arc_semantic_attach_route_*`、`arc_semantic_unified_route_*`；unified + Alpha 为 `arc_alpha_*`；
