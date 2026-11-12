@@ -290,6 +290,8 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   下载脚本将 20 个子集、503 道题额外复制为 `<HF_HOME>/longbench2`（或 `LONGBENCH2_DIR`）下的普通 parquet 文件，
   校验 SHA256 与行数。评测与离线检查只读取该副本，目录缺失或为空就报错，不回退到 hub 快照；
   `diag.sh`、`eval.sh`、`majob.sh` 统一导出并打印 `LONGBENCH2_DIR`。
+  parquet 由 PyArrow 直接读入内存后构造 `datasets.Dataset`，不会调用 `load_dataset("parquet", ...)` 生成 Arrow builder
+  缓存，避免对象存储挂载不允许 `.incomplete` 目录重命名的问题；数据准备脚本的离线重载也走同一读取方式。
   已有完整 hub 数据时重新执行下载脚本即可生成副本，不必重新下载。多节点作业要求各节点能读取同一副本目录。
   它的上下文预算就是 block_size，所以长文本配置跑按长度命名的组 `longbench2_{32k,64k,128k,256k}`（`eval_tasks/longbench2_long`，
   与 `longbench2` 同样的 20 个子任务、提示和打分），各长度的结果才能分开。`eval.py` 在评测前检查：名字带长度的任务
