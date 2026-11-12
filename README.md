@@ -96,6 +96,8 @@ bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 8B CPT 使用五个独立的全量评测 YAML，运行方式与 1.7B 相同：`bash eval.sh <yaml>`。
 五个入口均在 `exp/qwen8b-32k/` 内继承配置，并读取同一份训练产物：
 `/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k/lit_model.pth`。
+`eval.sh` 从训练配置的 `save_path` 取得该目录并传入 `eval.py`；加载器优先读取目录自身的 `lit_model.pth`。
+仅当目录自身没有权重时，才选择其中最大的 `step_*` 保存点。启动日志会打印实际使用的权重路径。
 
 | YAML 文件 | 评测方式 | 结果子目录 |
 |---|---|---|
