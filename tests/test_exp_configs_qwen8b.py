@@ -14,7 +14,7 @@ EXP = Path(__file__).resolve().parents[1] / "exp"
 QWEN8B = EXP / "qwen8b-32k"
 BASE_8B = "/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/"
 SAVE_8B = "/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k"
-METHODS = ("baseline", "dense", "query", "word_first", "word_first_query")
+METHODS = ("baseline", "cpt_dense", "dense", "query", "word_first", "word_first_query")
 
 
 def resolve(path):
@@ -29,7 +29,7 @@ def test_each_8b_config_loads_without_other_model_configs(name, tmp_path):
     isolated = tmp_path / QWEN8B.name
     shutil.copytree(QWEN8B, isolated)
     cfg = resolve(isolated / name)
-    dense = name == "dense_niah_base.yaml" or name.endswith("_dense.yaml")
+    dense = name in {"dense_niah_base.yaml", "eval_long_dense.yaml", "eval_full_dense.yaml"}
     if not dense:
         assert cfg["fsdp_low_memory"] is True
         assert cfg["global_batch_size"] == 64 and cfg["micro_batch_size"] == 1
@@ -71,6 +71,7 @@ def test_full_evaluations_read_the_8b_checkpoint_and_write_apart(method):
     else:
         assert cfg["arch_name"] == "Qwen/Qwen3-8B-Base" and cfg["ckpt_dir"] == BASE_8B
         assert cfg["eval_tag"] == f"full_{method}" and cfg.get("output_path") is None
+        assert bool(cfg.get("log_kv_dense_mode")) == (method == "cpt_dense")
     assert cfg["eval_main"] is True and cfg["long_limit"] == 100 and cfg.get("limit") is None
 
 

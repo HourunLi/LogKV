@@ -109,10 +109,23 @@ bash eval8b_full.sh
 | `baseline` | 同一 CPT checkpoint，K/V 分数准入 |
 | `query` | 同一 CPT checkpoint，问题 cue 与 cue 保护 |
 | `word_first_query` | 同一 CPT checkpoint，惊异度准入加问题 cue |
+| `cpt_dense` | 同一 CPT checkpoint，完整 KV 对照 |
 | `dense` | 原始 Qwen3-8B-Base，完整 KV、未经 CPT |
 
 例如 `bash eval8b_full.sh query`。各方法结果分目录保存，配置只在 `exp/qwen8b-32k/` 内继承；
 也可直接调用 `bash eval.sh exp/qwen8b-32k/eval_full_<方法>.yaml`。
+
+同一份 8B CPT 权重的五种全量评测命令如下，均从
+`/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k/lit_model.pth`
+加载权重，各自写入该 checkpoint 的 `evaluate/full_<方法>/`：
+
+```bash
+bash eval8b_full.sh cpt_dense
+bash eval8b_full.sh baseline
+bash eval8b_full.sh word_first
+bash eval8b_full.sh query
+bash eval8b_full.sh word_first_query
+```
 
 1.7B 与 8B 的全量评测均必跑 32K / 64K / 128K / 256K 的 LongBench v2；缓存缺失、缺子集或文件损坏会明确报错。
 先用相同 `HF_HOME` 准备数据，再补测已有配置的 LongBench v2（不重跑其它指标）。下载脚本还会把 20 个子集、

@@ -1,0 +1,4 @@
+# 8B CPT checkpoint 的完整 KV 对照：与 LogKV 评测读取同一份训练产物。
+# 32K / 64K / 128K / 256K 的任务、长度和数据参数继承本目录的 baseline。
+config: eval_long_baseline.yaml
+log_kv_dense_mode: true
