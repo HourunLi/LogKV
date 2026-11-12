@@ -96,9 +96,10 @@ bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 1.7B 与 8B 的全量评测均必跑 32K / 64K / 128K / 256K 的 LongBench v2；缓存缺失、缺子集或文件损坏会明确报错。
 先用相同 `HF_HOME` 准备数据，再补测已有配置的 LongBench v2（不重跑其它指标）。下载脚本还会把 20 个子集、
 503 道题复制为 `<HF_HOME>/longbench2` 下的普通 parquet 文件，逐文件校验 SHA256 和行数；已有数据完整时只需复制。
-1.7B 和 8B 的评测都优先读取这份副本，不依赖下载节点的 hub 软链接或 blobs。可用 `LONGBENCH2_DIR` 指定另一份共享副本目录，
+1.7B 和 8B 的评测只读取这份副本，目录缺失或为空也不回退到 hub 快照。三个启动脚本统一导出并打印
+`LONGBENCH2_DIR`（默认 `<HF_HOME>/longbench2`），也可用它指定另一份共享副本目录，
 下载和评测时须一致。多节点作业须确保每个节点都能读到该目录；失败信息会标明节点、文件大小、链接状态和文件首尾字节。
-训练文件系统不支持软链接，缓存修复也直接复制完整 blob，不尝试创建软链接。
+训练文件系统不支持软链接，缓存修复也直接复制完整 blob，不尝试创建软链接；下载源里末尾带 NUL 的链接文本会先去掉终止符。
 
 ```bash
 bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong --no-ruler-qa

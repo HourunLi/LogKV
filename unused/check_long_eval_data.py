@@ -54,19 +54,17 @@ def check_babilong(report) -> None:
 def check_longbench2(report) -> None:
     import datasets
 
-    from litgpt.longbench2_patch import REPO, apply_patch, real_file, snapshot, subsets
+    from litgpt.longbench2_patch import REPO, apply_patch, snapshot, subsets
 
     try:
         root, files = snapshot()
     except Exception as error:  # noqa: BLE001
         report(False, f"LongBench v2: no snapshot in the hub cache ({type(error).__name__}: {str(error)[:200]})")
         return
-    # A snapshot link flattened into a small file by a copy or sync is read from its blob, as eval.py does.
-    flattened = [f for f in files if real_file(Path(root) / f) != str(Path(root) / f)]
-    bad = [f for f in files if f.endswith(".parquet") and not whole_parquet(Path(real_file(Path(root) / f)))]
-    report(bool(files) and not bad, f"LongBench v2 snapshot {root}: {len(files)} files"
-           + (f", not whole parquet: {bad}" if bad else ", all whole parquet")
-           + (f" ({len(flattened)} read through flattened links to blobs/)" if flattened else ""))
+    bad = [f for f in files if f.endswith(".parquet")
+           and ((Path(root) / f).is_symlink() or not whole_parquet(Path(root) / f))]
+    report(bool(files) and not bad, f"LongBench v2 plain directory {root}: {len(files)} files"
+           + (f", not ordinary whole parquet: {bad}" if bad else ", all ordinary whole parquet"))
     apply_patch()  # as eval.py
     names = subsets()
     total = 0

@@ -189,13 +189,9 @@ def describe(path: Path) -> str:
 def flattened_link(path: Path) -> str | None:
     """The target of a hub-cache link that a copy or sync turned into a small regular file holding the link's text
     (``../../../../blobs/<sha256>``), or None."""
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 512:
-        return None
-    try:
-        text = path.read_bytes().decode().strip()
-    except UnicodeDecodeError:
-        return None
-    return text if "/blobs/" in text and "\n" not in text else None
+    from litgpt.longbench2_patch import flattened_link as read_link
+
+    return read_link(path)
 
 
 def refetch(repo: str, name: str, root: str, whole=None) -> tuple[Path, str]:

@@ -7,6 +7,7 @@ fi
 
 # Set caches before Python imports Hugging Face and freezes its cache paths.
 export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
+export LONGBENCH2_DIR=${LONGBENCH2_DIR:-${HF_HOME}/longbench2}
 export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
 export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
 export HF_MODULES_CACHE="${HF_HOME}/modules"
@@ -23,6 +24,7 @@ export HF_ALLOW_CODE_EVAL=1
 
 PYTHON_BIN=$(python -c 'import sys; print(sys.executable)') || exit 1
 echo "🐍 流水线 Python: ${PYTHON_BIN}"
+echo "LongBench v2 data directory (ordinary files): ${LONGBENCH2_DIR}"
 # DeepSeek 3Bv2 Sandwich Training Script with YAML Configuration
 # Optimized for H200 GPUs (141GB VRAM)
 
@@ -747,9 +749,9 @@ fi
 #   EVAL_LENGTHS=none 关掉；EVAL_LENGTHS=64k,256k 只测这些长度（默认 YAML 的 eval_lengths，否则全部）；
 #   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench 只跑这些类；NIAH_ONLY=1 只跑 RULER。
 # 上面主线已经测过的（主评测的任务、NIAH 阶段在各自长度上的捞针）不再重测，32K 档只补其余的任务。训练长度不到 32K 的
-# checkpoint 跳过（YaRN 以 32K 为原长）。数据：环境变量 LONG_PPL_DATA、LONG_PPL_BOOKS、BABILONG_DATASET、INFINITEBENCH_DIR
-# （不设则读 hub 缓存），或 YAML 的同名小写键；缺数据的 long_ppl / long_ppl_books、文件不完整的 LongBench v2 与
-# InfiniteBench 在默认类别下打印原因后跳过。
+# checkpoint 跳过（YaRN 以 32K 为原长）。LongBench v2 只读 LONGBENCH2_DIR 的普通文件，缺数据时报错。
+# 其它数据由 LONG_PPL_DATA、LONG_PPL_BOOKS、BABILONG_DATASET、INFINITEBENCH_DIR 或 YAML 同名小写键给出；
+# long_ppl / long_ppl_books / InfiniteBench 在默认类别下缺数据时打印原因后跳过。
 # ==============================================================================
 LONG_EVAL_SETTINGS=$(python - "${CONFIG_FILE}" "${BENCHMARKS}" "${NIAH_BENCHMARKS}" "${EVAL_MAX_SEQ_LENGTHS}" <<'LONG_EVAL_PY'
 import json
