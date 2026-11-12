@@ -2,13 +2,28 @@ HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
 HF_DATASETS_CACHE=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
 RULER_CACHE_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/ruler_cache
 HTTPS certificate checks: off (--verify-ssl turns them on)
-InfiniteBench passkey.jsonl: 590 samples, 277 MB
-InfiniteBench number_string.jsonl: 590 samples, 277 MB
-InfiniteBench kv_retrieval.jsonl: 500 samples, 105 MB
-InfiniteBench longbook_sum_eng.jsonl: 103 samples, 79 MB
-InfiniteBench longbook_qa_eng.jsonl: 351 samples, 298 MB
-InfiniteBench longbook_choice_eng.jsonl: 229 samples, 186 MB
-InfiniteBench longbook_qa_chn.jsonl: 189 samples, 863 MB
-InfiniteBench longdialogue_qa_eng.jsonl: 200 samples, 84 MB
-InfiniteBench code_debug.jsonl: 394 samples, 200 MB
-InfiniteBench math_find.jsonl: 350 samples, 41 MB
+RULER QA dev-v2.0.json: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/ruler_cache/dev-v2.0.json (4.4 MB)
+RULER QA hotpot_dev_distractor_v1.json: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/ruler_cache/hotpot_dev_distractor_v1.json (46.3 MB)
+LongBench v2 snapshot /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub/datasets--recursal--longbench-v2/snapshots/380536fcbe7aac4a1d3e3b6502c2abd612399231: 20 data files, e.g. ['data/academic_multi/train-00000-of-00001.parquet', 'data/academic_single/train-00000-of-00001.parquet', 'data/agent_history_qa/train-00000-of-00001.parquet', 'data/code_repo_qa/train-00000-of-00001.parquet']
+recursal/longbench-v2 files: all whole parquet
+recursal/longbench-v2 academic_multi train: 50 rows
+recursal/longbench-v2 academic_single train: 44 rows
+recursal/longbench-v2 agent_history_qa train: 20 rows
+recursal/longbench-v2 code_repo_qa train: 50 rows
+recursal/longbench-v2 detective train: 22 rows
+recursal/longbench-v2 dialogue_history_qa train: 19 rows
+recursal/longbench-v2 event_ordering train: 20 rows
+recursal/longbench-v2 financial_multi train: 15 rows
+recursal/longbench-v2 financial_single train: 22 rows
+recursal/longbench-v2 government_multi train: 23 rows
+recursal/longbench-v2 government_single train: 18 rows
+recursal/longbench-v2 graph_reasoning train: 15 rows
+recursal/longbench-v2 legal_multi train: 14 rows
+recursal/longbench-v2 legal_single train: 19 rows
+recursal/longbench-v2 literary train: 30 rows
+recursal/longbench-v2 manyshot_learning train: 21 rows
+recursal/longbench-v2 multinews train: 23 rows
+recursal/longbench-v2 new_language_translation train: 20 rows
+recursal/longbench-v2 table_qa train: 18 rows
+recursal/longbench-v2 user_guide_qa train: 40 rows
+offline reload: ok

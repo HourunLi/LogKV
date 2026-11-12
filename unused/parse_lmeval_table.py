@@ -13,235 +13,573 @@ import re
 # 把你的各个模型的原始输出放在这里。这里以 Model_A 为例（填入你提供的原数据）
 model_outputs = {
     "base-prolong": """
-|                 Tasks                  |Version|Filter|n-shot|Metric|   |Value |   |Stderr|
-|----------------------------------------|------:|------|-----:|------|---|-----:|---|-----:|
-|infinitebench_64k                       |      1|none  |      |score |↑  |0.3432|±  |0.0093|
-| - infinitebench_code_debug_64k         |      1|none  |     0|score |↑  |0.3600|±  |0.0482|
-| - infinitebench_kv_retrieval_64k       |      1|none  |     0|score |↑  |0.0000|±  |0.0000|
-| - infinitebench_longbook_choice_eng_64k|      1|none  |     0|score |↑  |0.3700|±  |0.0485|
-| - infinitebench_longbook_qa_chn_64k    |      1|none  |     0|score |↑  |0.1343|±  |0.0220|
-| - infinitebench_longbook_qa_eng_64k    |      1|none  |     0|score |↑  |0.0856|±  |0.0152|
-| - infinitebench_longbook_sum_eng_64k   |      1|none  |     0|score |↑  |0.1225|±  |0.0079|
-| - infinitebench_longdialogue_qa_eng_64k|      1|none  |     0|score |↑  |0.0400|±  |0.0197|
-| - infinitebench_math_find_64k          |      1|none  |     0|score |↑  |0.3700|±  |0.0485|
-| - infinitebench_number_string_64k      |      1|none  |     0|score |↑  |1.0000|±  |0.0000|
-| - infinitebench_passkey_64k            |      1|none  |     0|score |↑  |0.9500|±  |0.0219|
-|infinitebench_128k                       |      1|none  |      |score |↑  |0.3147|±  |0.0098|
-| - infinitebench_code_debug_128k         |      1|none  |     0|score |↑  |0.2800|±  |0.0451|
-| - infinitebench_kv_retrieval_128k       |      1|none  |     0|score |↑  |0.0000|±  |0.0000|
-| - infinitebench_longbook_choice_eng_128k|      1|none  |     0|score |↑  |0.3200|±  |0.0469|
-| - infinitebench_longbook_qa_chn_128k    |      1|none  |     0|score |↑  |0.1003|±  |0.0161|
-| - infinitebench_longbook_qa_eng_128k    |      1|none  |     0|score |↑  |0.0581|±  |0.0118|
-| - infinitebench_longbook_sum_eng_128k   |      1|none  |     0|score |↑  |0.1183|±  |0.0080|
-| - infinitebench_longdialogue_qa_eng_128k|      1|none  |     0|score |↑  |0.0100|±  |0.0100|
-| - infinitebench_math_find_128k          |      1|none  |     0|score |↑  |0.5300|±  |0.0502|
-| - infinitebench_number_string_128k      |      1|none  |     0|score |↑  |0.7900|±  |0.0409|
-| - infinitebench_passkey_128k            |      1|none  |     0|score |↑  |0.9400|±  |0.0239|
-|infinitebench_256k                       |      1|none  |      |score |↑  |0.2121|±  |0.0106|
-| - infinitebench_code_debug_256k         |      1|none  |     0|score |↑  |0.3100|±  |0.0465|
-| - infinitebench_kv_retrieval_256k       |      1|none  |     0|score |↑  |0.0000|±  |0.0000|
-| - infinitebench_longbook_choice_eng_256k|      1|none  |     0|score |↑  |0.1400|±  |0.0349|
-| - infinitebench_longbook_qa_chn_256k    |      1|none  |     0|score |↑  |0.0642|±  |0.0111|
-| - infinitebench_longbook_qa_eng_256k    |      1|none  |     0|score |↑  |0.0297|±  |0.0080|
-| - infinitebench_longbook_sum_eng_256k   |      1|none  |     0|score |↑  |0.0869|±  |0.0074|
-| - infinitebench_longdialogue_qa_eng_256k|      1|none  |     0|score |↑  |0.0400|±  |0.0197|
-| - infinitebench_math_find_256k          |      1|none  |     0|score |↑  |0.4300|±  |0.0498|
-| - infinitebench_number_string_256k      |      1|none  |     0|score |↑  |0.3800|±  |0.0488|
-| - infinitebench_passkey_256k            |      1|none  |     0|score |↑  |0.6400|±  |0.0482|
-|babilong_32k             |      0|none  |      |acc          |↑  | 0.0320|±  |0.0078|
-| - babilong_qa1_32k      |      0|none  |     2|acc          |↑  | 0.0200|±  |0.0141|
-| - babilong_qa2_32k      |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-| - babilong_qa3_32k      |      0|none  |     2|acc          |↑  | 0.0300|±  |0.0171|
-| - babilong_qa4_32k      |      0|none  |     2|acc          |↑  | 0.0800|±  |0.0273|
-| - babilong_qa5_32k      |      0|none  |     2|acc          |↑  | 0.0300|±  |0.0171|
-|long_ppl_32k             |      1|none  |     0|bits_per_byte|↓  | 0.9304|±  |   N/A|
-|                         |       |none  |     0|ppl          |↓  |14.8278|±  |   N/A|
-|long_ppl_books_32k       |    N/A|      |      |             |   |       |   |      |
-| - long_ppl_books_32k_16k|      1|none  |     0|bits_per_byte|↓  | 0.8973|±  |   N/A|
-|                         |       |none  |     0|ppl          |↓  |11.9243|±  |   N/A|
-| - long_ppl_books_32k_32k|      1|none  |     0|bits_per_byte|↓  | 0.9304|±  |   N/A|
-|                         |       |none  |     0|ppl          |↓  |13.0461|±  |   N/A|
-| - long_ppl_books_32k_8k |      1|none  |     0|bits_per_byte|↓  | 0.8587|±  |   N/A|
-|                         |       |none  |     0|ppl          |↓  |10.6681|±  |   N/A|
-|niah_turns_32k           |      1|none  |     0|acc          |↑  | 0.9550|±  |0.0114|
-|                         |       |none  |     0|turn1        |↑  | 0.9500|±  |0.0219|
-|                         |       |none  |     0|turn2        |↑  | 0.9600|±  |0.0197|
-|                         |       |none  |     0|turn3        |↑  | 0.9800|±  |0.0141|
-|                         |       |none  |     0|turn4        |↑  | 0.9300|±  |0.0256|
-|niah_multikey_1|      1|none  |     0| 32768|↑  | 0.9400|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multikey_2|      1|none  |     0| 32768|↑  | 0.1200|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multikey_3|      1|none  |     0| 32768|↑  | 0.0100|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multiquery|      1|none  |     0| 32768|↑  | 0.9300|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multivalue|      1|none  |     0| 32768|↑  | 0.8825|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_single_1  |      1|none  |     0| 32768|↑  | 1.0000|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_single_2  |      1|none  |     0| 32768|↑  | 1.0000|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_single_3  |      1|none  |     0| 32768|↑  | 1.0000|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_cwe      |      1|none  |     0| 32768|↑  | 0.1200|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_fwe      |      1|none  |     0| 32768|↑  | 0.5667|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_qa_hotpot|      1|none  |     0| 32768|↑  | 0.2800|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_qa_squad |      1|none  |     0| 32768|↑  | 0.0608|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_vt       |      1|none  |     0| 32768|↑  | 0.6640|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|babilong_64k             |      0|none  |      |acc          |↑  | 0.0120|±  |0.0049|
-| - babilong_qa1_64k      |      0|none  |     2|acc          |↑  | 0.0100|±  |0.0100|
-| - babilong_qa2_64k      |      0|none  |     2|acc          |↑  | 0.0200|±  |0.0141|
-| - babilong_qa3_64k      |      0|none  |     2|acc          |↑  | 0.0100|±  |0.0100|
-| - babilong_qa4_64k      |      0|none  |     2|acc          |↑  | 0.0200|±  |0.0141|
-| - babilong_qa5_64k      |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-|long_ppl_64k             |      1|none  |     0|bits_per_byte|↓  | 0.9498|±  |   N/A|
-|                         |       |none  |     0|ppl          |↓  |15.3417|±  |   N/A|
-|long_ppl_books_64k       |    N/A|      |      |             |   |       |   |      |
-| - long_ppl_books_64k_16k|      1|none  |     0|bits_per_byte|↓  | 0.9162|±  |   N/A|
-|                         |       |none  |     0|ppl          |↓  |12.5604|±  |   N/A|
-| - long_ppl_books_64k_32k|      1|none  |     0|bits_per_byte|↓  | 0.9554|±  |   N/A|
-|                         |       |none  |     0|ppl          |↓  |13.9788|±  |   N/A|
-| - long_ppl_books_64k_64k|      1|none  |     0|bits_per_byte|↓  | 0.9544|±  |   N/A|
-|                         |       |none  |     0|ppl          |↓  |14.0424|±  |   N/A|
-| - long_ppl_books_64k_8k |      1|none  |     0|bits_per_byte|↓  | 0.8668|±  |   N/A|
-|                         |       |none  |     0|ppl          |↓  |10.9093|±  |   N/A|
-|niah_turns_64k           |      1|none  |     0|acc          |↑  | 0.6950|±  |0.0270|
-|                         |       |none  |     0|turn1        |↑  | 0.7400|±  |0.0441|
-|                         |       |none  |     0|turn2        |↑  | 0.6900|±  |0.0465|
-|                         |       |none  |     0|turn3        |↑  | 0.6900|±  |0.0465|
-|                         |       |none  |     0|turn4        |↑  | 0.6600|±  |0.0476|
-|niah_multikey_1|      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.6200|±  |   N/A|
-|niah_multikey_2|      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.0500|±  |   N/A|
-|niah_multikey_3|      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.0000|±  |   N/A|
-|niah_multiquery|      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.7925|±  |   N/A|
-|niah_multivalue|      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.7850|±  |   N/A|
-|niah_single_1  |      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 1.0000|±  |   N/A|
-|niah_single_2  |      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.9800|±  |   N/A|
-|niah_single_3  |      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.9700|±  |   N/A|
-|ruler_cwe      |      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.0240|±  |   N/A|
-|ruler_fwe      |      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.5733|±  |   N/A|
-|ruler_qa_hotpot|      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.1200|±  |   N/A|
-|ruler_qa_squad |      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.0867|±  |   N/A|
-|ruler_vt       |      1|none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|               |       |none  |     0| 65536|↑  | 0.4760|±  |   N/A|
-|babilong_128k              |      0|none  |      |acc          |↑  | 0.0020|±  | 0.002|
-| - babilong_qa1_128k       |      0|none  |     2|acc          |↑  | 0.0100|±  | 0.010|
-| - babilong_qa2_128k       |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-| - babilong_qa3_128k       |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-| - babilong_qa4_128k       |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-| - babilong_qa5_128k       |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-|long_ppl_128k              |      1|none  |     0|bits_per_byte|↓  | 1.1428|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |24.5276|±  |   N/A|
-|long_ppl_books_128k        |    N/A|      |      |             |   |       |   |      |
-| - long_ppl_books_128k_128k|      1|none  |     0|bits_per_byte|↓  | 1.0591|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |18.5649|±  |   N/A|
-| - long_ppl_books_128k_16k |      1|none  |     0|bits_per_byte|↓  | 1.0302|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |17.2091|±  |   N/A|
-| - long_ppl_books_128k_32k |      1|none  |     0|bits_per_byte|↓  | 1.0503|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |18.1675|±  |   N/A|
-| - long_ppl_books_128k_64k |      1|none  |     0|bits_per_byte|↓  | 1.0395|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |17.7757|±  |   N/A|
-| - long_ppl_books_128k_8k  |      1|none  |     0|bits_per_byte|↓  | 0.9037|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |12.0773|±  |   N/A|
-|niah_turns_128k            |      1|none  |     0|acc          |↑  | 0.5150|±  |0.0243|
-|                           |       |none  |     0|turn1        |↑  | 0.4000|±  |0.0492|
-|                           |       |none  |     0|turn2        |↑  | 0.5600|±  |0.0499|
-|                           |       |none  |     0|turn3        |↑  | 0.4600|±  |0.0501|
-|                           |       |none  |     0|turn4        |↑  | 0.6400|±  |0.0482|
-|niah_multikey_1|      1|none  |     0|131072|↑  | 0.4800|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multikey_2|      1|none  |     0|131072|↑  | 0.0200|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multikey_3|      1|none  |     0|131072|↑  | 0.0000|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multiquery|      1|none  |     0|131072|↑  | 0.4475|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multivalue|      1|none  |     0|131072|↑  | 0.3200|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_single_1  |      1|none  |     0|131072|↑  | 0.9800|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_single_2  |      1|none  |     0|131072|↑  | 0.9800|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_single_3  |      1|none  |     0|131072|↑  | 0.7200|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_cwe      |      1|none  |     0|131072|↑  | 0.0050|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_fwe      |      1|none  |     0|131072|↑  | 0.2933|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_qa_hotpot|      1|none  |     0|131072|↑  | 0.0800|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_qa_squad |      1|none  |     0|131072|↑  | 0.0075|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_vt       |      1|none  |     0|131072|↑  | 0.1520|±  |   N/A|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|babilong_256k              |      0|none  |      |acc          |↑  | 0.0000|±  |     0|
-| - babilong_qa1_256k       |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-| - babilong_qa2_256k       |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-| - babilong_qa3_256k       |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-| - babilong_qa4_256k       |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-| - babilong_qa5_256k       |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
-|long_ppl_256k              |      1|none  |     0|bits_per_byte|↓  | 1.0639|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |22.3354|±  |   N/A|
-|long_ppl_books_256k        |    N/A|      |      |             |   |       |   |      |
-| - long_ppl_books_256k_128k|      1|none  |     0|bits_per_byte|↓  | 1.2183|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |28.8041|±  |   N/A|
-| - long_ppl_books_256k_16k |      1|none  |     0|bits_per_byte|↓  | 1.2341|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |30.2295|±  |   N/A|
-| - long_ppl_books_256k_256k|      1|none  |     0|bits_per_byte|↓  | 1.1920|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |25.7483|±  |   N/A|
-| - long_ppl_books_256k_32k |      1|none  |     0|bits_per_byte|↓  | 1.2538|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |31.8646|±  |   N/A|
-| - long_ppl_books_256k_64k |      1|none  |     0|bits_per_byte|↓  | 1.2536|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |32.1495|±  |   N/A|
-| - long_ppl_books_256k_8k  |      1|none  |     0|bits_per_byte|↓  | 1.0484|±  |   N/A|
-|                           |       |none  |     0|ppl          |↓  |17.9958|±  |   N/A|
-|niah_turns_256k            |      1|none  |     0|acc          |↑  | 0.0500|±  |0.0101|
-|                           |       |none  |     0|turn1        |↑  | 0.0500|±  |0.0219|
-|                           |       |none  |     0|turn2        |↑  | 0.0700|±  |0.0256|
-|                           |       |none  |     0|turn3        |↑  | 0.0500|±  |0.0219|
-|                           |       |none  |     0|turn4        |↑  | 0.0300|±  |0.0171|
-|niah_multikey_1|      1|none  |     0|262144|   | 0.1000|±  |0.0302|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multikey_2|      1|none  |     0|262144|   | 0.0000|±  |     0|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multikey_3|      1|none  |     0|262144|   | 0.0100|±  |0.0100|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multiquery|      1|none  |     0|262144|   | 0.0250|±  |0.0075|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_multivalue|      1|none  |     0|262144|   | 0.0525|±  |0.0108|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_single_1  |      1|none  |     0|262144|   | 0.0500|±  |0.0219|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_single_2  |      1|none  |     0|262144|   | 0.1100|±  |0.0314|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|niah_single_3  |      1|none  |     0|262144|   | 0.2100|±  |0.0409|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_cwe      |      1|none  |     0|262144|   | 0.0040|±  |0.0020|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_fwe      |      1|none  |     0|262144|   | 0.0733|±  |0.0147|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_qa_hotpot|      1|none  |     0|262144|   | 0.0800|±  |0.0273|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
-|ruler_vt       |      1|none  |     0|262144|   | 0.0080|±  |0.0056|
-|               |       |none  |     0|  4096|↑  |-1.0000|±  |   N/A|
+|                         Tasks                         |Version|Filter|n-shot|        Metric         |   | Value |   |Stderr|
+|-------------------------------------------------------|-------|------|-----:|-----------------------|---|------:|---|------|
+|arc_challenge                                          |      1|none  |     0|acc                    |↑  | 0.4130|±  |0.0144|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4497|±  |0.0145|
+|arc_easy                                               |      1|none  |     0|acc                    |↑  | 0.7374|±  |0.0090|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6852|±  |0.0095|
+|boolq                                                  |      2|none  |     0|acc                    |↑  | 0.7914|±  |0.0071|
+|ceval-valid                                            |      2|none  |      |acc                    |↑  | 0.6493|±  |0.0126|
+|                                                       |       |none  |      |acc_norm               |↑  | 0.6493|±  |0.0126|
+| - ceval-valid_accountant                              |      2|none  |     0|acc                    |↑  | 0.5510|±  |0.0718|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5510|±  |0.0718|
+| - ceval-valid_advanced_mathematics                    |      2|none  |     0|acc                    |↑  | 0.3684|±  |0.1137|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.3684|±  |0.1137|
+| - ceval-valid_art_studies                             |      2|none  |     0|acc                    |↑  | 0.5758|±  |0.0874|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5758|±  |0.0874|
+| - ceval-valid_basic_medicine                          |      2|none  |     0|acc                    |↑  | 0.6842|±  |0.1096|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6842|±  |0.1096|
+| - ceval-valid_business_administration                 |      2|none  |     0|acc                    |↑  | 0.6364|±  |0.0850|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6364|±  |0.0850|
+| - ceval-valid_chinese_language_and_literature         |      2|none  |     0|acc                    |↑  | 0.5652|±  |0.1057|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5652|±  |0.1057|
+| - ceval-valid_civil_servant                           |      2|none  |     0|acc                    |↑  | 0.5319|±  |0.0736|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5319|±  |0.0736|
+| - ceval-valid_clinical_medicine                       |      2|none  |     0|acc                    |↑  | 0.5455|±  |0.1087|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5455|±  |0.1087|
+| - ceval-valid_college_chemistry                       |      2|none  |     0|acc                    |↑  | 0.5833|±  |0.1028|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5833|±  |0.1028|
+| - ceval-valid_college_economics                       |      2|none  |     0|acc                    |↑  | 0.5818|±  |0.0671|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5818|±  |0.0671|
+| - ceval-valid_college_physics                         |      2|none  |     0|acc                    |↑  | 0.5789|±  |0.1164|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5789|±  |0.1164|
+| - ceval-valid_college_programming                     |      2|none  |     0|acc                    |↑  | 0.7027|±  |0.0762|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7027|±  |0.0762|
+| - ceval-valid_computer_architecture                   |      2|none  |     0|acc                    |↑  | 0.7619|±  |0.0952|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7619|±  |0.0952|
+| - ceval-valid_computer_network                        |      2|none  |     0|acc                    |↑  | 0.5263|±  |0.1177|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5263|±  |0.1177|
+| - ceval-valid_discrete_mathematics                    |      2|none  |     0|acc                    |↑  | 0.3750|±  |0.1250|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.3750|±  |0.1250|
+| - ceval-valid_education_science                       |      2|none  |     0|acc                    |↑  | 0.7931|±  |0.0766|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7931|±  |0.0766|
+| - ceval-valid_electrical_engineer                     |      2|none  |     0|acc                    |↑  | 0.4324|±  |0.0826|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4324|±  |0.0826|
+| - ceval-valid_environmental_impact_assessment_engineer|      2|none  |     0|acc                    |↑  | 0.7097|±  |0.0829|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7097|±  |0.0829|
+| - ceval-valid_fire_engineer                           |      2|none  |     0|acc                    |↑  | 0.4839|±  |0.0912|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4839|±  |0.0912|
+| - ceval-valid_high_school_biology                     |      2|none  |     0|acc                    |↑  | 0.7368|±  |0.1038|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7368|±  |0.1038|
+| - ceval-valid_high_school_chemistry                   |      2|none  |     0|acc                    |↑  | 0.4737|±  |0.1177|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4737|±  |0.1177|
+| - ceval-valid_high_school_chinese                     |      2|none  |     0|acc                    |↑  | 0.5263|±  |0.1177|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5263|±  |0.1177|
+| - ceval-valid_high_school_geography                   |      2|none  |     0|acc                    |↑  | 0.6842|±  |0.1096|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6842|±  |0.1096|
+| - ceval-valid_high_school_history                     |      2|none  |     0|acc                    |↑  | 0.7500|±  |0.0993|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7500|±  |0.0993|
+| - ceval-valid_high_school_mathematics                 |      2|none  |     0|acc                    |↑  | 0.4444|±  |0.1205|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4444|±  |0.1205|
+| - ceval-valid_high_school_physics                     |      2|none  |     0|acc                    |↑  | 0.6842|±  |0.1096|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6842|±  |0.1096|
+| - ceval-valid_high_school_politics                    |      2|none  |     0|acc                    |↑  | 0.8947|±  |0.0723|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8947|±  |0.0723|
+| - ceval-valid_ideological_and_moral_cultivation       |      2|none  |     0|acc                    |↑  | 0.9474|±  |0.0526|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.9474|±  |0.0526|
+| - ceval-valid_law                                     |      2|none  |     0|acc                    |↑  | 0.5417|±  |0.1039|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5417|±  |0.1039|
+| - ceval-valid_legal_professional                      |      2|none  |     0|acc                    |↑  | 0.4348|±  |0.1057|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.4348|±  |0.1057|
+| - ceval-valid_logic                                   |      2|none  |     0|acc                    |↑  | 0.5909|±  |0.1073|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5909|±  |0.1073|
+| - ceval-valid_mao_zedong_thought                      |      2|none  |     0|acc                    |↑  | 0.8333|±  |0.0777|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8333|±  |0.0777|
+| - ceval-valid_marxism                                 |      2|none  |     0|acc                    |↑  | 0.9474|±  |0.0526|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.9474|±  |0.0526|
+| - ceval-valid_metrology_engineer                      |      2|none  |     0|acc                    |↑  | 0.7917|±  |0.0847|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7917|±  |0.0847|
+| - ceval-valid_middle_school_biology                   |      2|none  |     0|acc                    |↑  | 0.9524|±  |0.0476|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.9524|±  |0.0476|
+| - ceval-valid_middle_school_chemistry                 |      2|none  |     0|acc                    |↑  | 0.9000|±  |0.0688|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.9000|±  |0.0688|
+| - ceval-valid_middle_school_geography                 |      2|none  |     0|acc                    |↑  | 0.6667|±  |0.1421|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6667|±  |0.1421|
+| - ceval-valid_middle_school_history                   |      2|none  |     0|acc                    |↑  | 0.9545|±  |0.0455|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.9545|±  |0.0455|
+| - ceval-valid_middle_school_mathematics               |      2|none  |     0|acc                    |↑  | 0.5263|±  |0.1177|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5263|±  |0.1177|
+| - ceval-valid_middle_school_physics                   |      2|none  |     0|acc                    |↑  | 0.7368|±  |0.1038|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7368|±  |0.1038|
+| - ceval-valid_middle_school_politics                  |      2|none  |     0|acc                    |↑  | 0.8571|±  |0.0782|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8571|±  |0.0782|
+| - ceval-valid_modern_chinese_history                  |      2|none  |     0|acc                    |↑  | 0.8261|±  |0.0808|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8261|±  |0.0808|
+| - ceval-valid_operating_system                        |      2|none  |     0|acc                    |↑  | 0.6316|±  |0.1137|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6316|±  |0.1137|
+| - ceval-valid_physician                               |      2|none  |     0|acc                    |↑  | 0.6531|±  |0.0687|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6531|±  |0.0687|
+| - ceval-valid_plant_protection                        |      2|none  |     0|acc                    |↑  | 0.8182|±  |0.0842|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.8182|±  |0.0842|
+| - ceval-valid_probability_and_statistics              |      2|none  |     0|acc                    |↑  | 0.3889|±  |0.1182|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.3889|±  |0.1182|
+| - ceval-valid_professional_tour_guide                 |      2|none  |     0|acc                    |↑  | 0.5517|±  |0.0940|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5517|±  |0.0940|
+| - ceval-valid_sports_science                          |      2|none  |     0|acc                    |↑  | 0.6842|±  |0.1096|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6842|±  |0.1096|
+| - ceval-valid_tax_accountant                          |      2|none  |     0|acc                    |↑  | 0.5714|±  |0.0714|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.5714|±  |0.0714|
+| - ceval-valid_teacher_qualification                   |      2|none  |     0|acc                    |↑  | 0.7727|±  |0.0639|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7727|±  |0.0639|
+| - ceval-valid_urban_and_rural_planner                 |      2|none  |     0|acc                    |↑  | 0.6739|±  |0.0699|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6739|±  |0.0699|
+| - ceval-valid_veterinary_medicine                     |      2|none  |     0|acc                    |↑  | 0.7391|±  |0.0936|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7391|±  |0.0936|
+|hellaswag                                              |      1|none  |     0|acc                    |↑  | 0.4931|±  |0.0050|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.6639|±  |0.0047|
+|ifeval                                                 |      4|none  |     0|inst_level_loose_acc   |↑  | 0.3561|±  |   N/A|
+|                                                       |       |none  |     0|inst_level_strict_acc  |↑  | 0.3333|±  |   N/A|
+|                                                       |       |none  |     0|prompt_level_loose_acc |↑  | 0.2384|±  |0.0183|
+|                                                       |       |none  |     0|prompt_level_strict_acc|↑  | 0.2144|±  |0.0177|
+|long_ppl_books_32k                                     |    N/A|      |      |                       |   |       |   |      |
+| - long_ppl_books_32k_16k                              |      1|none  |     0|bits_per_byte          |↓  | 0.8701|±  |   N/A|
+|                                                       |       |none  |     0|ppl                    |↓  |11.0588|±  |   N/A|
+| - long_ppl_books_32k_32k                              |      1|none  |     0|bits_per_byte          |↓  | 0.8810|±  |   N/A|
+|                                                       |       |none  |     0|ppl                    |↓  |11.3850|±  |   N/A|
+| - long_ppl_books_32k_8k                               |      1|none  |     0|bits_per_byte          |↓  | 0.8544|±  |   N/A|
+|                                                       |       |none  |     0|ppl                    |↓  |10.5433|±  |   N/A|
+|longbench_2wikimqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.2046|±  |0.0257|
+|                                                       |       |none  |     0|score                  |↑  | 0.2046|±  |0.0257|
+|longbench_2wikimqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.2554|±  |0.0225|
+|                                                       |       |none  |     0|score                  |↑  | 0.2554|±  |0.0225|
+|longbench_dureader                                     |      5|none  |     0|rouge_zh_score         |↑  | 0.3198|±  |0.0180|
+|                                                       |       |none  |     0|score                  |↑  | 0.3198|±  |0.0180|
+|longbench_gov_report                                   |      5|none  |     0|rouge_score            |↑  | 0.3059|±  |0.0061|
+|                                                       |       |none  |     0|score                  |↑  | 0.3059|±  |0.0061|
+|longbench_gov_report_e                                 |      5|none  |     0|rouge_score            |↑  | 0.3044|±  |0.0044|
+|                                                       |       |none  |     0|score                  |↑  | 0.3044|±  |0.0044|
+|longbench_hotpotqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.3626|±  |0.0294|
+|                                                       |       |none  |     0|score                  |↑  | 0.3626|±  |0.0294|
+|longbench_hotpotqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.3785|±  |0.0243|
+|                                                       |       |none  |     0|score                  |↑  | 0.3785|±  |0.0243|
+|longbench_lcc                                          |      5|none  |     0|code_sim_score         |↑  | 0.0525|±  |0.0041|
+|                                                       |       |none  |     0|score                  |↑  | 0.0525|±  |0.0041|
+|longbench_lcc_e                                        |      5|none  |     0|code_sim_score         |↑  | 0.0662|±  |0.0081|
+|                                                       |       |none  |     0|score                  |↑  | 0.0662|±  |0.0081|
+|longbench_lsht                                         |      5|none  |     0|classification_score   |↑  | 0.3750|±  |0.0330|
+|                                                       |       |none  |     0|score                  |↑  | 0.3750|±  |0.0330|
+|longbench_multi_news                                   |      5|none  |     0|rouge_score            |↑  | 0.2541|±  |0.0052|
+|                                                       |       |none  |     0|score                  |↑  | 0.2541|±  |0.0052|
+|longbench_multi_news_e                                 |      5|none  |     0|rouge_score            |↑  | 0.2293|±  |0.0036|
+|                                                       |       |none  |     0|score                  |↑  | 0.2293|±  |0.0036|
+|longbench_multifieldqa_en                              |      5|none  |     0|qa_f1_score            |↑  | 0.4899|±  |0.0269|
+|                                                       |       |none  |     0|score                  |↑  | 0.4899|±  |0.0269|
+|longbench_multifieldqa_en_e                            |      5|none  |     0|qa_f1_score            |↑  | 0.4899|±  |0.0269|
+|                                                       |       |none  |     0|score                  |↑  | 0.4899|±  |0.0269|
+|longbench_multifieldqa_zh                              |      5|none  |     0|qa_f1_zh_score         |↑  | 0.5047|±  |0.0226|
+|                                                       |       |none  |     0|score                  |↑  | 0.5047|±  |0.0226|
+|longbench_musique                                      |      5|none  |     0|qa_f1_score            |↑  | 0.1620|±  |0.0211|
+|                                                       |       |none  |     0|score                  |↑  | 0.1620|±  |0.0211|
+|longbench_narrativeqa                                  |      5|none  |     0|qa_f1_score            |↑  | 0.1914|±  |0.0163|
+|                                                       |       |none  |     0|score                  |↑  | 0.1914|±  |0.0163|
+|longbench_passage_count                                |      5|none  |     0|count_score            |↑  | 0.0250|±  |0.0111|
+|                                                       |       |none  |     0|score                  |↑  | 0.0250|±  |0.0111|
+|longbench_passage_count_e                              |      5|none  |     0|count_score            |↑  | 0.0333|±  |0.0104|
+|                                                       |       |none  |     0|score                  |↑  | 0.0333|±  |0.0104|
+|longbench_passage_retrieval_en                         |      5|none  |     0|retrieval_score        |↑  | 0.5150|±  |0.0354|
+|                                                       |       |none  |     0|score                  |↑  | 0.5150|±  |0.0354|
+|longbench_passage_retrieval_en_e                       |      5|none  |     0|retrieval_score        |↑  | 0.7267|±  |0.0258|
+|                                                       |       |none  |     0|score                  |↑  | 0.7267|±  |0.0258|
+|longbench_qasper                                       |      5|none  |     0|qa_f1_score            |↑  | 0.3736|±  |0.0244|
+|                                                       |       |none  |     0|score                  |↑  | 0.3736|±  |0.0244|
+|longbench_qasper_e                                     |      5|none  |     0|qa_f1_score            |↑  | 0.3538|±  |0.0232|
+|                                                       |       |none  |     0|score                  |↑  | 0.3538|±  |0.0232|
+|longbench_qmsum                                        |      5|none  |     0|rouge_score            |↑  | 0.2378|±  |0.0051|
+|                                                       |       |none  |     0|score                  |↑  | 0.2378|±  |0.0051|
+|longbench_repobench-p                                  |      5|none  |     0|code_sim_score         |↑  | 0.0690|±  |0.0053|
+|                                                       |       |none  |     0|score                  |↑  | 0.0690|±  |0.0053|
+|longbench_repobench-p_e                                |      5|none  |     0|code_sim_score         |↑  | 0.0615|±  |0.0057|
+|                                                       |       |none  |     0|score                  |↑  | 0.0615|±  |0.0057|
+|longbench_samsum                                       |      5|none  |     0|rouge_score            |↑  | 0.3031|±  |0.0078|
+|                                                       |       |none  |     0|score                  |↑  | 0.3031|±  |0.0078|
+|longbench_samsum_e                                     |      5|none  |     0|rouge_score            |↑  | 0.3058|±  |0.0064|
+|                                                       |       |none  |     0|score                  |↑  | 0.3058|±  |0.0064|
+|longbench_trec                                         |      5|none  |     0|classification_score   |↑  | 0.4527|±  |0.0264|
+|                                                       |       |none  |     0|score                  |↑  | 0.4527|±  |0.0264|
+|longbench_trec_e                                       |      5|none  |     0|classification_score   |↑  | 0.4100|±  |0.0204|
+|                                                       |       |none  |     0|score                  |↑  | 0.4100|±  |0.0204|
+|longbench_triviaqa                                     |      5|none  |     0|qa_f1_score            |↑  | 0.2143|±  |0.0093|
+|                                                       |       |none  |     0|score                  |↑  | 0.2143|±  |0.0093|
+|longbench_triviaqa_e                                   |      5|none  |     0|qa_f1_score            |↑  | 0.2178|±  |0.0086|
+|                                                       |       |none  |     0|score                  |↑  | 0.2178|±  |0.0086|
+|longbench_vcsum                                        |      5|none  |     0|rouge_zh_score         |↑  | 0.1574|±  |0.0029|
+|                                                       |       |none  |     0|score                  |↑  | 0.1574|±  |0.0029|
+|mmlu                                                   |      2|none  |      |acc                    |↑  | 0.6039|±  |0.0039|
+| - humanities                                          |      2|none  |      |acc                    |↑  | 0.5120|±  |0.0068|
+|  - formal_logic                                       |      1|none  |     0|acc                    |↑  | 0.5079|±  |0.0447|
+|  - high_school_european_history                       |      1|none  |     0|acc                    |↑  | 0.7333|±  |0.0345|
+|  - high_school_us_history                             |      1|none  |     0|acc                    |↑  | 0.7108|±  |0.0318|
+|  - high_school_world_history                          |      1|none  |     0|acc                    |↑  | 0.7764|±  |0.0271|
+|  - international_law                                  |      1|none  |     0|acc                    |↑  | 0.7190|±  |0.0410|
+|  - jurisprudence                                      |      1|none  |     0|acc                    |↑  | 0.7222|±  |0.0433|
+|  - logical_fallacies                                  |      1|none  |     0|acc                    |↑  | 0.7607|±  |0.0335|
+|  - moral_disputes                                     |      1|none  |     0|acc                    |↑  | 0.6590|±  |0.0255|
+|  - moral_scenarios                                    |      1|none  |     0|acc                    |↑  | 0.2402|±  |0.0143|
+|  - philosophy                                         |      1|none  |     0|acc                    |↑  | 0.6431|±  |0.0272|
+|  - prehistory                                         |      1|none  |     0|acc                    |↑  | 0.6512|±  |0.0265|
+|  - professional_law                                   |      1|none  |     0|acc                    |↑  | 0.4042|±  |0.0125|
+|  - world_religions                                    |      1|none  |     0|acc                    |↑  | 0.7719|±  |0.0322|
+| - other                                               |      2|none  |      |acc                    |↑  | 0.6572|±  |0.0083|
+|  - business_ethics                                    |      1|none  |     0|acc                    |↑  | 0.6500|±  |0.0479|
+|  - clinical_knowledge                                 |      1|none  |     0|acc                    |↑  | 0.6981|±  |0.0283|
+|  - college_medicine                                   |      1|none  |     0|acc                    |↑  | 0.5954|±  |0.0374|
+|  - global_facts                                       |      1|none  |     0|acc                    |↑  | 0.3300|±  |0.0473|
+|  - human_aging                                        |      1|none  |     0|acc                    |↑  | 0.6592|±  |0.0318|
+|  - management                                         |      1|none  |     0|acc                    |↑  | 0.7476|±  |0.0430|
+|  - marketing                                          |      1|none  |     0|acc                    |↑  | 0.8333|±  |0.0244|
+|  - medical_genetics                                   |      1|none  |     0|acc                    |↑  | 0.7000|±  |0.0461|
+|  - miscellaneous                                      |      1|none  |     0|acc                    |↑  | 0.7267|±  |0.0159|
+|  - nutrition                                          |      1|none  |     0|acc                    |↑  | 0.6993|±  |0.0263|
+|  - professional_accounting                            |      1|none  |     0|acc                    |↑  | 0.4752|±  |0.0298|
+|  - professional_medicine                              |      1|none  |     0|acc                    |↑  | 0.6176|±  |0.0295|
+|  - virology                                           |      1|none  |     0|acc                    |↑  | 0.4940|±  |0.0389|
+| - social sciences                                     |      2|none  |      |acc                    |↑  | 0.7124|±  |0.0080|
+|  - econometrics                                       |      1|none  |     0|acc                    |↑  | 0.5439|±  |0.0469|
+|  - high_school_geography                              |      1|none  |     0|acc                    |↑  | 0.7929|±  |0.0289|
+|  - high_school_government_and_politics                |      1|none  |     0|acc                    |↑  | 0.7824|±  |0.0298|
+|  - high_school_macroeconomics                         |      1|none  |     0|acc                    |↑  | 0.6487|±  |0.0242|
+|  - high_school_microeconomics                         |      1|none  |     0|acc                    |↑  | 0.7353|±  |0.0287|
+|  - high_school_psychology                             |      1|none  |     0|acc                    |↑  | 0.8422|±  |0.0156|
+|  - human_sexuality                                    |      1|none  |     0|acc                    |↑  | 0.7099|±  |0.0398|
+|  - professional_psychology                            |      1|none  |     0|acc                    |↑  | 0.6176|±  |0.0197|
+|  - public_relations                                   |      1|none  |     0|acc                    |↑  | 0.6091|±  |0.0467|
+|  - security_studies                                   |      1|none  |     0|acc                    |↑  | 0.6612|±  |0.0303|
+|  - sociology                                          |      1|none  |     0|acc                    |↑  | 0.7662|±  |0.0299|
+|  - us_foreign_policy                                  |      1|none  |     0|acc                    |↑  | 0.8100|±  |0.0394|
+| - stem                                                |      2|none  |      |acc                    |↑  | 0.5826|±  |0.0085|
+|  - abstract_algebra                                   |      1|none  |     0|acc                    |↑  | 0.3700|±  |0.0485|
+|  - anatomy                                            |      1|none  |     0|acc                    |↑  | 0.6370|±  |0.0415|
+|  - astronomy                                          |      1|none  |     0|acc                    |↑  | 0.7039|±  |0.0372|
+|  - college_biology                                    |      1|none  |     0|acc                    |↑  | 0.7500|±  |0.0362|
+|  - college_chemistry                                  |      1|none  |     0|acc                    |↑  | 0.5000|±  |0.0503|
+|  - college_computer_science                           |      1|none  |     0|acc                    |↑  | 0.5300|±  |0.0502|
+|  - college_mathematics                                |      1|none  |     0|acc                    |↑  | 0.4300|±  |0.0498|
+|  - college_physics                                    |      1|none  |     0|acc                    |↑  | 0.5000|±  |0.0498|
+|  - computer_security                                  |      1|none  |     0|acc                    |↑  | 0.8000|±  |0.0402|
+|  - conceptual_physics                                 |      1|none  |     0|acc                    |↑  | 0.6468|±  |0.0312|
+|  - electrical_engineering                             |      1|none  |     0|acc                    |↑  | 0.6069|±  |0.0407|
+|  - elementary_mathematics                             |      1|none  |     0|acc                    |↑  | 0.5476|±  |0.0256|
+|  - high_school_biology                                |      1|none  |     0|acc                    |↑  | 0.7839|±  |0.0234|
+|  - high_school_chemistry                              |      1|none  |     0|acc                    |↑  | 0.6010|±  |0.0345|
+|  - high_school_computer_science                       |      1|none  |     0|acc                    |↑  | 0.7200|±  |0.0451|
+|  - high_school_mathematics                            |      1|none  |     0|acc                    |↑  | 0.4074|±  |0.0300|
+|  - high_school_physics                                |      1|none  |     0|acc                    |↑  | 0.4172|±  |0.0403|
+|  - high_school_statistics                             |      1|none  |     0|acc                    |↑  | 0.5370|±  |0.0340|
+|  - machine_learning                                   |      1|none  |     0|acc                    |↑  | 0.4375|±  |0.0471|
+|niah_turns_32k                                         |      1|none  |     0|acc                    |↑  | 0.9700|±  |0.0108|
+|                                                       |       |none  |     0|turn1                  |↑  | 0.9700|±  |0.0171|
+|                                                       |       |none  |     0|turn2                  |↑  | 0.9700|±  |0.0171|
+|                                                       |       |none  |     0|turn3                  |↑  | 0.9800|±  |0.0141|
+|                                                       |       |none  |     0|turn4                  |↑  | 0.9600|±  |0.0197|
+|openbookqa                                             |      1|none  |     0|acc                    |↑  | 0.3000|±  |0.0205|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.3880|±  |0.0218|
+|piqa                                                   |      1|none  |     0|acc                    |↑  | 0.7568|±  |0.0100|
+|                                                       |       |none  |     0|acc_norm               |↑  | 0.7595|±  |0.0100|
+|social_iqa                                             |      0|none  |     0|acc                    |↑  | 0.4882|±  |0.0113|
+|truthfulqa_gen                                         |      3|none  |     0|bleu_acc               |↑  | 0.3231|±  |0.0164|
+|                                                       |       |none  |     0|bleu_diff              |↑  |-0.1780|±  |0.0426|
+|                                                       |       |none  |     0|bleu_max               |↑  | 1.3020|±  |0.0743|
+|                                                       |       |none  |     0|rouge1_acc             |↑  | 0.3390|±  |0.0166|
+|                                                       |       |none  |     0|rouge1_diff            |↑  |-0.2994|±  |0.0826|
+|                                                       |       |none  |     0|rouge1_max             |↑  | 5.2326|±  |0.1612|
+|                                                       |       |none  |     0|rouge2_acc             |↑  | 0.2803|±  |0.0157|
+|                                                       |       |none  |     0|rouge2_diff            |↑  |-0.4267|±  |0.0907|
+|                                                       |       |none  |     0|rouge2_max             |↑  | 3.1285|±  |0.1364|
+|                                                       |       |none  |     0|rougeL_acc             |↑  | 0.3280|±  |0.0164|
+|                                                       |       |none  |     0|rougeL_diff            |↑  |-0.3549|±  |0.0859|
+|                                                       |       |none  |     0|rougeL_max             |↑  | 4.8723|±  |0.1518|
+|truthfulqa_mc1                                         |      2|none  |     0|acc                    |↑  | 0.3182|±  |0.0163|
+|truthfulqa_mc2                                         |      3|none  |     0|acc                    |↑  | 0.4880|±  |0.0148|
+|winogrande                                             |      1|none  |     0|acc                    |↑  | 0.6448|±  |0.0135|
+|niah_multikey_1               |      1|none  |     0|  1024|   |1.0000|±  |     0|
+|                              |       |none  |     0| 16384|↑  |0.9740|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |     0|
+|                              |       |none  |     0| 32768|↑  |0.9660|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9960|±  |   N/A|
+|niah_multikey_2               |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |0.9500|±  |   N/A|
+|                              |       |none  |     0|  2048|   |0.9980|±  |0.0020|
+|                              |       |none  |     0| 32768|↑  |0.8500|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |0.9920|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9820|±  |   N/A|
+|niah_multikey_3               |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |0.5440|±  |   N/A|
+|                              |       |none  |     0|  2048|   |0.9880|±  |0.0049|
+|                              |       |none  |     0| 32768|↑  |0.1340|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |0.9820|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.8580|±  |   N/A|
+|niah_multiquery               |      1|none  |     0|  1024|   |0.9995|±  |0.0005|
+|                              |       |none  |     0| 16384|↑  |0.9645|±  |   N/A|
+|                              |       |none  |     0|  2048|   |0.9995|±  |0.0005|
+|                              |       |none  |     0| 32768|↑  |0.9225|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |0.9805|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9670|±  |   N/A|
+|niah_multivalue               |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |0.9645|±  |   N/A|
+|                              |       |none  |     0|  2048|   |0.9910|±  |0.0025|
+|                              |       |none  |     0| 32768|↑  |0.9045|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |0.9650|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9670|±  |   N/A|
+|niah_single_1                 |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |1.0000|±  |   N/A|
+|niah_single_1_paraphrase      |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |1.0000|±  |   N/A|
+|niah_single_1_preamble        |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |1.0000|±  |   N/A|
+|niah_single_1_qend            |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |1.0000|±  |   N/A|
+|niah_single_2                 |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |0.9980|±  |0.0020|
+|                              |       |none  |     0| 32768|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9980|±  |   N/A|
+|niah_single_2_paraphrase      |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |0.9980|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |1.0000|±  |   N/A|
+|niah_single_2_preamble        |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |0.9980|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |1.0000|±  |   N/A|
+|niah_single_2_qend            |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |0.9980|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9980|±  |   N/A|
+|niah_single_2_words           |      1|none  |     0|  1024|   |0.9880|±  |0.0049|
+|                              |       |none  |     0| 16384|↑  |0.9180|±  |   N/A|
+|                              |       |none  |     0|  2048|   |0.9940|±  |0.0035|
+|                              |       |none  |     0| 32768|↑  |0.8400|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |0.9920|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9720|±  |   N/A|
+|niah_single_2_words_paraphrase|      1|none  |     0|  1024|   |0.9820|±  |0.0060|
+|                              |       |none  |     0| 16384|↑  |0.9800|±  |   N/A|
+|                              |       |none  |     0|  2048|   |0.9920|±  |0.0040|
+|                              |       |none  |     0| 32768|↑  |0.9140|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |0.9900|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9860|±  |   N/A|
+|niah_single_2_words_qend      |      1|none  |     0|  1024|   |0.9700|±  |0.0076|
+|                              |       |none  |     0| 16384|↑  |0.9640|±  |   N/A|
+|                              |       |none  |     0|  2048|   |0.9900|±  |0.0045|
+|                              |       |none  |     0| 32768|↑  |0.9080|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |0.9780|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9840|±  |   N/A|
+|niah_single_3                 |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |0.9980|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9980|±  |   N/A|
+|niah_single_3_paraphrase      |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |0.9980|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |0.9980|±  |   N/A|
+|niah_single_3_preamble        |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |1.0000|±  |   N/A|
+|niah_single_3_qend            |      1|none  |     0|  1024|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 16384|↑  |1.0000|±  |   N/A|
+|                              |       |none  |     0|  2048|   |1.0000|±  |0.0000|
+|                              |       |none  |     0| 32768|↑  |0.9980|±  |   N/A|
+|                              |       |none  |     0|  4096|↑  |0.9980|±  |   N/A|
+|                              |       |none  |     0|  8192|↑  |1.0000|±  |   N/A|
+|babilong_32k                            |      0|none  |      |acc          |↑  | 0.2420|±  |0.0190|
+| - babilong_qa1_32k                     |      0|none  |     2|acc          |↑  | 0.2500|±  |0.0435|
+| - babilong_qa2_32k                     |      0|none  |     2|acc          |↑  | 0.1400|±  |0.0349|
+| - babilong_qa3_32k                     |      0|none  |     2|acc          |↑  | 0.2300|±  |0.0423|
+| - babilong_qa4_32k                     |      0|none  |     2|acc          |↑  | 0.3400|±  |0.0476|
+| - babilong_qa5_32k                     |      0|none  |     2|acc          |↑  | 0.2500|±  |0.0435|
+|infinitebench_32k                       |      1|none  |      |score        |↑  | 0.3095|±  |0.0108|
+| - infinitebench_code_debug_32k         |      1|none  |     0|score        |↑  | 0.3200|±  |0.0469|
+| - infinitebench_kv_retrieval_32k       |      1|none  |     0|score        |↑  | 0.0300|±  |0.0171|
+| - infinitebench_longbook_choice_eng_32k|      1|none  |     0|score        |↑  | 0.3900|±  |0.0490|
+| - infinitebench_longbook_qa_chn_32k    |      1|none  |     0|score        |↑  | 0.1970|±  |0.0251|
+| - infinitebench_longbook_qa_eng_32k    |      1|none  |     0|score        |↑  | 0.1644|±  |0.0269|
+| - infinitebench_longbook_sum_eng_32k   |      1|none  |     0|score        |↑  | 0.1340|±  |0.0069|
+| - infinitebench_longdialogue_qa_eng_32k|      1|none  |     0|score        |↑  | 0.0500|±  |0.0219|
+| - infinitebench_math_find_32k          |      1|none  |     0|score        |↑  | 0.2100|±  |0.0409|
+| - infinitebench_number_string_32k      |      1|none  |     0|score        |↑  | 0.8000|±  |0.0402|
+| - infinitebench_passkey_32k            |      1|none  |     0|score        |↑  | 0.8000|±  |0.0402|
+|long_ppl_32k                            |      1|none  |     0|bits_per_byte|↓  | 0.8853|±  |   N/A|
+|                                        |       |none  |     0|ppl          |↓  |13.0134|±  |   N/A|
+|ruler_cwe      |      1|none  |     0| 32768|↑  |0.0860|±  |   N/A|
+|ruler_fwe      |      1|none  |     0| 32768|↑  |0.8267|±  |   N/A|
+|ruler_qa_hotpot|      1|none  |     0| 32768|↑  |0.4200|±  |   N/A|
+|ruler_qa_squad |      1|none  |     0| 32768|↑  |0.4367|±  |   N/A|
+|ruler_vt       |      1|none  |     0| 32768|↑  |0.6740|±  |   N/A|
+|babilong_64k                            |      0|none  |      |acc          |↑  | 0.1020|±  |0.0133|
+| - babilong_qa1_64k                     |      0|none  |     2|acc          |↑  | 0.0900|±  |0.0288|
+| - babilong_qa2_64k                     |      0|none  |     2|acc          |↑  | 0.0400|±  |0.0197|
+| - babilong_qa3_64k                     |      0|none  |     2|acc          |↑  | 0.0800|±  |0.0273|
+| - babilong_qa4_64k                     |      0|none  |     2|acc          |↑  | 0.2300|±  |0.0423|
+| - babilong_qa5_64k                     |      0|none  |     2|acc          |↑  | 0.0700|±  |0.0256|
+|infinitebench_64k                       |      1|none  |      |score        |↑  | 0.3605|±  |0.0093|
+| - infinitebench_code_debug_64k         |      1|none  |     0|score        |↑  | 0.3300|±  |0.0473|
+| - infinitebench_kv_retrieval_64k       |      1|none  |     0|score        |↑  | 0.0300|±  |0.0171|
+| - infinitebench_longbook_choice_eng_64k|      1|none  |     0|score        |↑  | 0.4900|±  |0.0502|
+| - infinitebench_longbook_qa_chn_64k    |      1|none  |     0|score        |↑  | 0.2155|±  |0.0248|
+| - infinitebench_longbook_qa_eng_64k    |      1|none  |     0|score        |↑  | 0.1318|±  |0.0238|
+| - infinitebench_longbook_sum_eng_64k   |      1|none  |     0|score        |↑  | 0.1577|±  |0.0078|
+| - infinitebench_longdialogue_qa_eng_64k|      1|none  |     0|score        |↑  | 0.0700|±  |0.0256|
+| - infinitebench_math_find_64k          |      1|none  |     0|score        |↑  | 0.1900|±  |0.0394|
+| - infinitebench_number_string_64k      |      1|none  |     0|score        |↑  | 0.9900|±  |0.0100|
+| - infinitebench_passkey_64k            |      1|none  |     0|score        |↑  | 1.0000|±  |     0|
+|long_ppl_64k                            |      1|none  |     0|bits_per_byte|↓  | 0.8868|±  |   N/A|
+|                                        |       |none  |     0|ppl          |↓  |12.8004|±  |   N/A|
+|long_ppl_books_64k                      |    N/A|      |      |             |   |       |   |      |
+| - long_ppl_books_64k_16k               |      1|none  |     0|bits_per_byte|↓  | 0.8807|±  |   N/A|
+|                                        |       |none  |     0|ppl          |↓  |11.3895|±  |   N/A|
+| - long_ppl_books_64k_32k               |      1|none  |     0|bits_per_byte|↓  | 0.8923|±  |   N/A|
+|                                        |       |none  |     0|ppl          |↓  |11.7453|±  |   N/A|
+| - long_ppl_books_64k_64k               |      1|none  |     0|bits_per_byte|↓  | 0.8673|±  |   N/A|
+|                                        |       |none  |     0|ppl          |↓  |11.0359|±  |   N/A|
+| - long_ppl_books_64k_8k                |      1|none  |     0|bits_per_byte|↓  | 0.8622|±  |   N/A|
+|                                        |       |none  |     0|ppl          |↓  |10.7706|±  |   N/A|
+|niah_turns_64k                          |      1|none  |     0|acc          |↑  | 0.7750|±  |0.0262|
+|                                        |       |none  |     0|turn1        |↑  | 0.8100|±  |0.0394|
+|                                        |       |none  |     0|turn2        |↑  | 0.7300|±  |0.0446|
+|                                        |       |none  |     0|turn3        |↑  | 0.7700|±  |0.0423|
+|                                        |       |none  |     0|turn4        |↑  | 0.7900|±  |0.0409|
+|niah_multikey_1|      1|none  |     0| 65536|↑  |0.6800|±  |   N/A|
+|niah_multikey_2|      1|none  |     0| 65536|↑  |0.5100|±  |   N/A|
+|niah_multikey_3|      1|none  |     0| 65536|↑  |0.0100|±  |   N/A|
+|niah_multiquery|      1|none  |     0| 65536|↑  |0.8150|±  |   N/A|
+|niah_multivalue|      1|none  |     0| 65536|↑  |0.7675|±  |   N/A|
+|niah_single_1  |      1|none  |     0| 65536|↑  |1.0000|±  |   N/A|
+|niah_single_2  |      1|none  |     0| 65536|↑  |0.8800|±  |   N/A|
+|niah_single_3  |      1|none  |     0| 65536|↑  |1.0000|±  |   N/A|
+|ruler_cwe      |      1|none  |     0| 65536|↑  |0.0480|±  |   N/A|
+|ruler_fwe      |      1|none  |     0| 65536|↑  |0.7167|±  |   N/A|
+|ruler_qa_hotpot|      1|none  |     0| 65536|↑  |0.3600|±  |   N/A|
+|ruler_qa_squad |      1|none  |     0| 65536|↑  |0.3575|±  |   N/A|
+|ruler_vt       |      1|none  |     0| 65536|↑  |0.6680|±  |   N/A|
+|babilong_128k                            |      0|none  |      |acc          |↑  | 0.0220|±  |0.0066|
+| - babilong_qa1_128k                     |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
+| - babilong_qa2_128k                     |      0|none  |     2|acc          |↑  | 0.0200|±  |0.0141|
+| - babilong_qa3_128k                     |      0|none  |     2|acc          |↑  | 0.0100|±  |0.0100|
+| - babilong_qa4_128k                     |      0|none  |     2|acc          |↑  | 0.0400|±  |0.0197|
+| - babilong_qa5_128k                     |      0|none  |     2|acc          |↑  | 0.0400|±  |0.0197|
+|infinitebench_128k                       |      1|none  |      |score        |↑  | 0.3242|±  |0.0102|
+| - infinitebench_code_debug_128k         |      1|none  |     0|score        |↑  | 0.3300|±  |0.0473|
+| - infinitebench_kv_retrieval_128k       |      1|none  |     0|score        |↑  | 0.0000|±  |     0|
+| - infinitebench_longbook_choice_eng_128k|      1|none  |     0|score        |↑  | 0.3800|±  |0.0488|
+| - infinitebench_longbook_qa_chn_128k    |      1|none  |     0|score        |↑  | 0.1210|±  |0.0160|
+| - infinitebench_longbook_qa_eng_128k    |      1|none  |     0|score        |↑  | 0.1098|±  |0.0220|
+| - infinitebench_longbook_sum_eng_128k   |      1|none  |     0|score        |↑  | 0.1512|±  |0.0066|
+| - infinitebench_longdialogue_qa_eng_128k|      1|none  |     0|score        |↑  | 0.0500|±  |0.0219|
+| - infinitebench_math_find_128k          |      1|none  |     0|score        |↑  | 0.4000|±  |0.0492|
+| - infinitebench_number_string_128k      |      1|none  |     0|score        |↑  | 0.7000|±  |0.0461|
+| - infinitebench_passkey_128k            |      1|none  |     0|score        |↑  | 1.0000|±  |     0|
+|long_ppl_128k                            |      1|none  |     0|bits_per_byte|↓  | 0.9815|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |15.6106|±  |   N/A|
+|long_ppl_books_128k                      |    N/A|      |      |             |   |       |   |      |
+| - long_ppl_books_128k_128k              |      1|none  |     0|bits_per_byte|↓  | 0.9546|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |13.9162|±  |   N/A|
+| - long_ppl_books_128k_16k               |      1|none  |     0|bits_per_byte|↓  | 1.0966|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |20.6746|±  |   N/A|
+| - long_ppl_books_128k_32k               |      1|none  |     0|bits_per_byte|↓  | 1.0728|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |19.3295|±  |   N/A|
+| - long_ppl_books_128k_64k               |      1|none  |     0|bits_per_byte|↓  | 0.9945|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |15.6907|±  |   N/A|
+| - long_ppl_books_128k_8k                |      1|none  |     0|bits_per_byte|↓  | 0.9026|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |12.0401|±  |   N/A|
+|niah_turns_128k                          |      1|none  |     0|acc          |↑  | 0.6225|±  |0.0272|
+|                                         |       |none  |     0|turn1        |↑  | 0.5700|±  |0.0498|
+|                                         |       |none  |     0|turn2        |↑  | 0.7000|±  |0.0461|
+|                                         |       |none  |     0|turn3        |↑  | 0.6500|±  |0.0479|
+|                                         |       |none  |     0|turn4        |↑  | 0.5700|±  |0.0498|
+|niah_multikey_1|      1|none  |     0|131072|↑  |0.6700|±  |   N/A|
+|niah_multikey_2|      1|none  |     0|131072|↑  |0.0700|±  |   N/A|
+|niah_multikey_3|      1|none  |     0|131072|↑  |0.0000|±  |   N/A|
+|niah_multiquery|      1|none  |     0|131072|↑  |0.4350|±  |   N/A|
+|niah_multivalue|      1|none  |     0|131072|↑  |0.4500|±  |   N/A|
+|niah_single_1  |      1|none  |     0|131072|↑  |0.9700|±  |   N/A|
+|niah_single_2  |      1|none  |     0|131072|↑  |0.7200|±  |   N/A|
+|niah_single_3  |      1|none  |     0|131072|↑  |0.9400|±  |   N/A|
+|ruler_cwe      |      1|none  |     0|131072|↑  |0.0460|±  |   N/A|
+|ruler_fwe      |      1|none  |     0|131072|↑  |0.3767|±  |   N/A|
+|ruler_qa_hotpot|      1|none  |     0|131072|↑  |0.2600|±  |   N/A|
+|ruler_qa_squad |      1|none  |     0|131072|↑  |0.1983|±  |   N/A|
+|ruler_vt       |      1|none  |     0|131072|↑  |0.0040|±  |   N/A|
+|babilong_256k                            |      0|none  |      |acc          |↑  | 0.0040|±  |0.0028|
+| - babilong_qa1_256k                     |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
+| - babilong_qa2_256k                     |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
+| - babilong_qa3_256k                     |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
+| - babilong_qa4_256k                     |      0|none  |     2|acc          |↑  | 0.0000|±  |     0|
+| - babilong_qa5_256k                     |      0|none  |     2|acc          |↑  | 0.0200|±  |0.0141|
+|infinitebench_256k                       |      1|none  |      |score        |↑  | 0.2035|±  |0.0087|
+| - infinitebench_code_debug_256k         |      1|none  |     0|score        |↑  | 0.0000|±  |     0|
+| - infinitebench_kv_retrieval_256k       |      1|none  |     0|score        |↑  | 0.0000|±  |     0|
+| - infinitebench_longbook_choice_eng_256k|      1|none  |     0|score        |↑  | 0.2400|±  |0.0429|
+| - infinitebench_longbook_qa_chn_256k    |      1|none  |     0|score        |↑  | 0.0329|±  |0.0056|
+| - infinitebench_longbook_qa_eng_256k    |      1|none  |     0|score        |↑  | 0.0140|±  |0.0048|
+| - infinitebench_longbook_sum_eng_256k   |      1|none  |     0|score        |↑  | 0.0782|±  |0.0043|
+| - infinitebench_longdialogue_qa_eng_256k|      1|none  |     0|score        |↑  | 0.0100|±  |0.0100|
+| - infinitebench_math_find_256k          |      1|none  |     0|score        |↑  | 0.5000|±  |0.0503|
+| - infinitebench_number_string_256k      |      1|none  |     0|score        |↑  | 0.2800|±  |0.0451|
+| - infinitebench_passkey_256k            |      1|none  |     0|score        |↑  | 0.8800|±  |0.0327|
+|long_ppl_256k                            |      1|none  |     0|bits_per_byte|↓  | 1.1171|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |26.0855|±  |   N/A|
+|long_ppl_books_256k                      |    N/A|      |      |             |   |       |   |      |
+| - long_ppl_books_256k_128k              |      1|none  |     0|bits_per_byte|↓  | 1.3032|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |36.3972|±  |   N/A|
+| - long_ppl_books_256k_16k               |      1|none  |     0|bits_per_byte|↓  | 1.2828|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |34.5800|±  |   N/A|
+| - long_ppl_books_256k_256k              |      1|none  |     0|bits_per_byte|↓  | 1.1893|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |25.5616|±  |   N/A|
+| - long_ppl_books_256k_32k               |      1|none  |     0|bits_per_byte|↓  | 1.3029|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |36.4858|±  |   N/A|
+| - long_ppl_books_256k_64k               |      1|none  |     0|bits_per_byte|↓  | 1.3152|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |38.1300|±  |   N/A|
+| - long_ppl_books_256k_8k                |      1|none  |     0|bits_per_byte|↓  | 1.0785|±  |   N/A|
+|                                         |       |none  |     0|ppl          |↓  |19.5530|±  |   N/A|
+|niah_turns_256k                          |      1|none  |     0|acc          |↑  | 0.0150|±  |0.0060|
+|                                         |       |none  |     0|turn1        |↑  | 0.0500|±  |0.0219|
+|                                         |       |none  |     0|turn2        |↑  | 0.0100|±  |0.0100|
+|                                         |       |none  |     0|turn3        |↑  | 0.0000|±  |0.0000|
+|                                         |       |none  |     0|turn4        |↑  | 0.0000|±  |0.0000|
+|niah_multikey_1|      1|none  |     0|262144|   |0.0400|±  |0.0197|
+|niah_multikey_2|      1|none  |     0|262144|   |0.0000|±  |0.0000|
+|niah_multikey_3|      1|none  |     0|262144|   |0.0000|±  |0.0000|
+|niah_multiquery|      1|none  |     0|262144|   |0.0000|±  |0.0000|
+|niah_multivalue|      1|none  |     0|262144|   |0.0050|±  |0.0035|
+|niah_single_1  |      1|none  |     0|262144|   |0.1200|±  |0.0327|
+|niah_single_2  |      1|none  |     0|262144|   |0.0200|±  |0.0141|
+|niah_single_3  |      1|none  |     0|262144|   |0.0000|±  |0.0000|
+|ruler_cwe      |      1|none  |     0|262144|   |0.0040|±  |0.0020|
+|ruler_fwe      |      1|none  |     0|262144|   |0.0167|±  |0.0073|
+|ruler_qa_hotpot|      1|none  |     0|262144|   |0.0700|±  |0.0256|
+|ruler_vt       |      1|none  |     0|262144|   |0.0000|±  |0.0000|
+
     """
 }
 
