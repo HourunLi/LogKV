@@ -532,6 +532,9 @@ def test_the_fetch_script_mends_hub_links_flattened_into_files(tmp_path, monkeyp
     spec = importlib.util.spec_from_file_location("fetch_links", ROOT / "unused" / "fetch_long_eval_data.py")
     fetch = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fetch)
+    def no_links(src, dst, **kwargs):
+        raise AssertionError("the training filesystem does not support symlinks")
+    monkeypatch.setattr(fetch.os, "symlink", no_links)
     repo_dir, rev = tmp_path / "datasets--recursal--longbench-v2", "380536fc"
     snapshot = repo_dir / "snapshots" / rev
     whole = b"PAR1" + b"rows" * 8 + b"PAR1"
@@ -553,21 +556,27 @@ def test_the_fetch_script_mends_hub_links_flattened_into_files(tmp_path, monkeyp
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
     lines = []
     assert fetch.repair_parquet(str(snapshot), names, lines, repo="recursal/longbench-v2")
-    assert (snapshot / names[0]).is_symlink() and fetch.is_parquet(snapshot / names[0])
-    assert "flattened into a file; linked again: ok" in lines[0] and "was 21 bytes" in lines[0]
+    assert not (snapshot / names[0]).is_symlink() and fetch.is_parquet(snapshot / names[0])
+    assert "the blob copied in its place: ok" in lines[0] and "was 21 bytes" in lines[0]
     assert calls == [(names[1], rev, True), (names[2], rev, True)]  # in this snapshot's revision
     assert all(fetch.is_parquet(snapshot / name) for name in names)
-    # Where links do not work, the blob is copied in place of the flattened one.
+    # Repeating the repair also copies the blob without attempting a symlink.
     (snapshot / names[0]).unlink()
     (snapshot / names[0]).write_text("../../../../blobs/aaa")
 
-    def no_links(src, dst):
-        raise OSError(1, "Operation not permitted")
-    monkeypatch.setattr(fetch.os, "symlink", no_links)
     lines = []
     assert fetch.repair_parquet(str(snapshot), names, lines, repo="recursal/longbench-v2")
     assert not (snapshot / names[0]).is_symlink() and (snapshot / names[0]).read_bytes() == whole
     assert "the blob copied in its place: ok" in lines[0] and len(calls) == 2
+    # Some mounts expose even a fresh hub download as the text of a link. Materialize that result too.
+    (snapshot / names[2]).write_bytes(b"PAR1 cut short")
+    def download_flattened(repo, name, **kwargs):
+        (repo_dir / "blobs" / "ccc").write_bytes(whole)
+        (snapshot / name).write_text("../../../../blobs/ccc")
+        return str(snapshot / name)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download_flattened)
+    fresh, _ = fetch.refetch("recursal/longbench-v2", names[2], str(snapshot))
+    assert fresh.read_bytes() == whole and not fresh.is_symlink()
 
 
 def test_limit_overrides_the_yamls_samples_for_one_run(tmp_path, monkeypatch):

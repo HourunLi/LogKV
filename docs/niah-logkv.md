@@ -286,7 +286,10 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   在 `dataset_kwargs` 里指定 `RMT-team/babilong`（每个长度 100 条，是另一批样本），`BABILONG_DATASET` 不替换它）；LongBench v2
   （仓库内固定的上游 `longbench2` 任务定义，兼容 `lm-eval 0.4.9`，数据 `recursal/longbench-v2`，四选一按似然打分，每题四次预填充；长于 block_size 的上下文
   从开头截断，保留问题。数据集卡片没有按子集的配置时，`litgpt/longbench2_patch.py` 改从仓库快照里按文件名读出该子集；评测机器上的 hub 缓存
-  若把快照的软链接压平成写着 `../../blobs/<sha>` 的小文件、或丢了 `refs/main`，按快照条目读 blobs 里的文件）；
+  若把快照的软链接压平成写着 `../../blobs/<sha>` 的小文件、或丢了 `refs/main`，按快照条目读 blobs 里的文件）。
+  下载脚本将 20 个子集、503 道题额外复制为 `<HF_HOME>/longbench2`（或 `LONGBENCH2_DIR`）下的普通 parquet 文件，
+  校验 SHA256 与行数。评测与离线检查优先读取该副本，避免下载节点的软链接/本地 blobs 在评测节点不可用；
+  已有完整 hub 数据时重新执行下载脚本即可生成副本，不必重新下载。多节点作业要求各节点能读取同一副本目录。
   它的上下文预算就是 block_size，所以长文本配置跑按长度命名的组 `longbench2_{32k,64k,128k,256k}`（`eval_tasks/longbench2_long`，
   与 `longbench2` 同样的 20 个子任务、提示和打分），各长度的结果才能分开。`eval.py` 在评测前检查：名字带长度的任务
   （`babilong_*_<L>`、`long_ppl_<L>`、`longbench2_<L>`）要求 max_seq_length 不小于 L，`longbench2_<L>` 还要求不超过 L+4096，
@@ -382,7 +385,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   YaRN 的频率与温度只取决于倍数、与窗口无关，所以两种模式只差倍数，LongBench v2 的预算仍是各档自己的长度。外部变量控制范围：
   `EVAL_LENGTHS=32k,128k`（默认 YAML 的 `eval_lengths`）、`EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench`
   （默认全部；LongBench v2 在四档均为必跑项，缺失子集或文件不是完整 parquet 时会在模型加载前报错，
-  按提示用同一 `HF_HOME` 运行 `bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong`。
+  按提示用同一 `HF_HOME` 运行 `bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong --no-ruler-qa`。
   默认时缺数据的 `ppl`、`books` 与找不到十个文件的 `infinitebench` 作为可选任务跳过并打印原因，点名的必须能跑）、`NIAH_ONLY=1`（只跑 RULER）；这种配置不接受任务清单参数。
   每档换一次窗口与 YaRN，要重新加载模型（约一分钟）。注意 `long_ppl_32k` 在这里是 32K 档（不用 YaRN）测的，在
   `eval_long64k_*.yaml` 里是 64K 配置（YaRN 2）测的；32K 档的 8 个捞针任务写进 32K 主线的同名列，其余 5 个 RULER 任务、
