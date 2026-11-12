@@ -29,6 +29,7 @@ fi
 
 # Set caches before Python imports Hugging Face and freezes its cache paths.
 export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
+export LONGBENCH2_DIR=${LONGBENCH2_DIR:-${HF_HOME}/longbench2}
 export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
 export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
 export HF_MODULES_CACHE="${HF_HOME}/modules"
@@ -45,6 +46,7 @@ export HF_ALLOW_CODE_EVAL=1
 
 PYTHON_BIN=$(python -c 'import sys; print(sys.executable)') || exit 1
 echo "Eval Python: ${PYTHON_BIN}"
+echo "LongBench v2 data directory (ordinary files): ${LONGBENCH2_DIR}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=32
 export CUDNN_LOGERR_DBG=1

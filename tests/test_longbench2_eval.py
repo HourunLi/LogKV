@@ -48,7 +48,7 @@ def test_longbench2_is_required_even_with_a_stale_optional_list(data_module, mon
         helpers["_check_task_lengths"](tasks, 32768)
 
 
-def test_missing_and_damaged_subsets_fail_but_complete_and_flattened_cache_loads(data_module, monkeypatch, tmp_path):
+def test_missing_damaged_and_flattened_plain_files_fail(data_module, monkeypatch, tmp_path):
     files = [f"{name}.parquet" for name in data_module.subsets()]
     assert len(files) == 20
     for name in files:
@@ -64,7 +64,8 @@ def test_missing_and_damaged_subsets_fail_but_complete_and_flattened_cache_loads
     blobs.mkdir()
     (blobs / "whole").write_bytes(b"PAR1" + b"y" * 16 + b"PAR1")
     (tmp_path / files[0]).write_text("./blobs/whole")
-    assert data_module.data_problem() is None
+    assert "not whole parquet" in data_module.data_problem()
+    assert data_module.real_file(tmp_path / files[0]) == str(blobs / "whole")  # The downloader can repair it.
 
 
 def test_every_length_loads_all_twenty_tasks_on_lm_eval(monkeypatch, data_module):
@@ -124,13 +125,14 @@ def test_plain_copy_survives_the_hub_blobs_disappearing(data_module, monkeypatch
     files = []
     for index, name in enumerate(names):
         count = 26 if index < 3 else 25  # 503 synthetic rows across the 20 subsets.
-        blob = blobs / name
+        blob = blobs / hashlib.sha256(name.encode()).hexdigest()
         pq.write_table(pa.table({"context": ["context"] * count, "question": ["question"] * count,
                                  "choices": [["a", "b", "c", "d"]] * count, "answer": [0] * count}), blob)
         relative = f"data/{name}/train.parquet"
         path = root / relative
         path.parent.mkdir(parents=True)
-        path.write_text(os.path.relpath(blob, path.parent))  # How copied hub links appear on the training mount.
+        path.write_bytes(os.path.relpath(blob, path.parent).encode() + b"\0")
+        assert path.stat().st_size == 83  # Exact mount representation from the failing evaluation.
         files.append(relative)
 
     source = ast.parse((ROOT / "unused/fetch_long_eval_data.py").read_text())
@@ -182,6 +184,64 @@ def test_explicit_plain_directory_and_bad_file_diagnostics(data_module, monkeypa
     problem = data_module.data_problem()
     assert "Observed on host" in problem and "symlink=False" in problem
     assert "../../blobs/missing" in problem and "starts=" in problem
+
+
+def test_empty_default_plain_directory_never_falls_back_to_hub(data_module, monkeypatch, tmp_path):
+    hub = pytest.importorskip("huggingface_hub")
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.delenv("LONGBENCH2_DIR", raising=False)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("evaluation must never fall back to hub snapshots")
+    monkeypatch.setattr(hub, "snapshot_download", forbidden)
+    assert data_module.snapshot() == (str(tmp_path / "longbench2"), [])
+    problem = data_module.data_problem()
+    assert str(tmp_path / "longbench2") in problem and "does not fall back" in problem
+    with pytest.raises(FileNotFoundError, match="plain directory"):
+        data_module.load_subset(forbidden, "academic_single", "train")
+
+
+def test_nul_terminated_source_link_is_copied_without_a_download(data_module, monkeypatch, tmp_path):
+    hub = pytest.importorskip("huggingface_hub")
+    root = tmp_path / "snapshots" / "revision"
+    path = root / "data" / "academic_single" / "train.parquet"
+    path.parent.mkdir(parents=True)
+    blob = tmp_path / "blobs" / ("a" * 64)
+    blob.parent.mkdir()
+    whole = b"PAR1" + b"rows" * 8 + b"PAR1"
+    blob.write_bytes(whole)
+    target = os.path.relpath(blob, path.parent)
+    path.write_bytes(target.encode() + b"\0")
+    assert path.stat().st_size == 83 and data_module.flattened_link(path) == target
+    assert data_module.real_file(path) == str(blob)
+    source = ast.parse((ROOT / "unused/fetch_long_eval_data.py").read_text())
+    names = {"is_parquet", "flattened_link", "refetch"}
+    scope = dict(Path=Path, os=os, shutil=shutil)
+    exec(compile(ast.Module(body=[node for node in source.body
+                                if isinstance(node, ast.FunctionDef) and node.name in names], type_ignores=[]),
+                 "fetch_long_eval_data.py", "exec"), scope)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("an intact blob must be copied without downloading or creating symlinks")
+    monkeypatch.setattr(hub, "hf_hub_download", forbidden)
+    monkeypatch.setattr(os, "symlink", forbidden)
+    copied, _ = scope["refetch"](data_module.REPO, "data/academic_single/train.parquet", str(root))
+    assert copied == path and path.read_bytes() == whole and not path.is_symlink()
+
+
+@pytest.mark.parametrize("script", ["eval.sh", "majob.sh", "diag.sh"])
+def test_launchers_export_the_same_plain_directory(script, monkeypatch, tmp_path):
+    import subprocess
+    text = (ROOT / script).read_text()
+    header = text[text.index("export HF_HOME="):text.index("PYTHON_BIN=")]
+    monkeypatch.delenv("LONGBENCH2_DIR", raising=False)
+    for override in (None, str(tmp_path / "plain files")):
+        environment = dict(os.environ)
+        if override is not None:
+            environment["LONGBENCH2_DIR"] = override
+        run = subprocess.run(["bash", "-c", header + '\nprintf "%s\\n" "$LONGBENCH2_DIR"'],
+                             env=environment, capture_output=True, text=True)
+        assert run.returncode == 0, run.stderr
+        expected = override or "/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/longbench2"
+        assert run.stdout.strip() == expected
 
 
 @pytest.mark.parametrize("size", ["qwen1.7b-32k", "qwen8b-32k"])

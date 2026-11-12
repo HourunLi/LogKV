@@ -1,14 +1,10 @@
-"""LongBench v2 by subset when recursal/longbench-v2 exposes no per-subset configs.
+"""LongBench v2 from ordinary local parquet files, using the same subset names as lm-eval.
 
-lm-eval's longbench2 tasks load ``datasets.load_dataset("recursal/longbench-v2", "<subset>")``; when the
-dataset card defines no configs, datasets only offers "default" (all 20 files) and every task fails with
-"BuilderConfig '<subset>' not found". This patch keeps the normal call and, when it fails, reads the
-subset's files from the repository snapshot instead (downloaded online, or from the hub cache when
-HF_HUB_OFFLINE=1): a file belongs to the subset when its stem or its folder is the subset's name, or its
-stem starts with the name and "-" or ".". The fetch script also makes ordinary, byte-verified copies in
-LONGBENCH2_DIR or <HF_HOME>/longbench2. These take precedence over both hub links and datasets caches,
-so a snapshot that is readable only on the download node cannot silently become the evaluation source.
-Applied by eval.py; unused/fetch_long_eval_data.py uses it to fetch and check the same files.
+Requests for recursal/longbench-v2 load the byte-verified copies in LONGBENCH2_DIR or <HF_HOME>/longbench2.
+Evaluation never falls back to hub snapshots or an older datasets cache, including when the copy directory
+is missing. The download script alone opens hub snapshots and resolves flattened links (with optional NUL
+terminators) to make ordinary copies. A file belongs to a subset when its stem or folder is the subset's
+name, or its stem starts with that name plus '-' or '.'. No symlink creation is needed.
 """
 from __future__ import annotations
 
@@ -45,14 +41,23 @@ def subset_files(files, name: str) -> list[str]:
     return sorted(chosen)
 
 
-def real_file(path) -> str:
-    """``path``, or the blob it points to when a copy or sync of the hub cache turned the snapshot's link into a small
-    file holding the link's text (``../../blobs/<sha256>``), which is what the machines that evaluate may see."""
+def flattened_link(path) -> str | None:
+    """Read a mount-flattened hub link, including the terminating NUL used by the training filesystem."""
     p = Path(path)
     if p.is_symlink() or not p.is_file() or p.stat().st_size > 512:
-        return str(p)
-    text = p.read_bytes().decode(errors="ignore").strip()
-    if "/blobs/" in text and "\n" not in text:
+        return None
+    try:
+        text = p.read_bytes().decode().strip(" \t\r\n\0")
+    except UnicodeDecodeError:
+        return None
+    return text if "/blobs/" in text and "\n" not in text and "\0" not in text else None
+
+
+def real_file(path) -> str:
+    """Resolve a flattened source-cache link for the downloader; evaluation reads ordinary files directly."""
+    p = Path(path)
+    text = flattened_link(p)
+    if text is not None:
         blob = os.path.normpath(p.parent / text)
         if os.path.isfile(blob):
             return blob
@@ -79,22 +84,17 @@ def _data_files(root: Path) -> list[str]:
                   if path.is_file() and path.suffix in BUILDERS)
 
 
-def plain_snapshot() -> tuple[str, list[str]] | None:
+def plain_snapshot() -> tuple[str, list[str]]:
     root = plain_folder()
     files = _data_files(root) if root.is_dir() else []
-    if files or os.environ.get("LONGBENCH2_DIR"):
-        return str(root), files
-    return None
+    return str(root), files
 
 
 def snapshot(prefer_plain: bool = True) -> tuple[str, list[str]]:
-    """The data source and its relative file names. Prefer the shared ordinary files; the downloader passes
-    False to inspect/repair the hub source. Offline hub reads accept cached snapshots with lost refs/main.
-    A hub file may be a flattened link: read it through real_file."""
+    """Evaluation uses ordinary files exclusively, even when the selected directory is missing/empty.
+    Only the downloader passes False to inspect/repair the hub source; it resolves flattened source links."""
     if prefer_plain:
-        plain = plain_snapshot()
-        if plain is not None:
-            return plain
+        return plain_snapshot()
     from huggingface_hub import snapshot_download
 
     offline = os.environ.get("HF_HUB_OFFLINE") == "1"
@@ -129,26 +129,27 @@ def data_problem() -> str | None:
     try:
         root, files = snapshot()
     except Exception as error:
-        return f"no LongBench v2 snapshot in the hub cache ({type(error).__name__}: {str(error)[:200]}). {repair}"
+        return f"cannot read LongBench v2 plain directory {plain_folder()} ({type(error).__name__}: {error}). {repair}"
     missing = [name for name in subsets() if not subset_files(files, name)]
     if missing:
-        return f"LongBench v2 snapshot {root} is missing subsets: {missing}. {repair}"
+        return (f"LongBench v2 plain directory {root} on host {socket.gethostname()} is missing subsets: {missing}. "
+                f"Evaluation does not fall back to hub snapshots. {repair}")
     bad = []
     for name in files:
         if not name.endswith(".parquet"):
             continue
-        path = Path(real_file(Path(root) / name))
+        path = Path(root) / name
         try:
             with path.open("rb") as stream:
                 head = stream.read(4)
                 stream.seek(-4, os.SEEK_END)
-                whole = path.stat().st_size >= 12 and head == b"PAR1" and stream.read(4) == b"PAR1"
+                whole = not path.is_symlink() and path.stat().st_size >= 12 and head == b"PAR1" and stream.read(4) == b"PAR1"
         except OSError:
             whole = False
         if not whole:
             bad.append(name)
     if bad:
-        observed = "; ".join(file_state(real_file(Path(root) / name)) for name in bad[:3])
+        observed = "; ".join(file_state(Path(root) / name) for name in bad[:3])
         return (f"LongBench v2 files in {root} are not whole parquet: {bad}. "
                 f"Observed on host {socket.gethostname()}: {observed}. {repair}")
     return None
@@ -158,9 +159,9 @@ def load_subset(load, name: str, split=None):
     root, files = snapshot()
     chosen = subset_files(files, name)
     if not chosen:
-        raise ValueError(f"no file of {REPO} matches subset {name!r}; its data files: {files}")
+        raise FileNotFoundError(f"LongBench v2 plain directory {root} has no file for subset {name!r}")
     builder = BUILDERS[Path(chosen[0]).suffix]
-    data = load(builder, data_files={"train": [real_file(os.path.join(root, f)) for f in chosen]})
+    data = load(builder, data_files={"train": [os.path.join(root, f) for f in chosen]})
     return data[split] if split else data
 
 
@@ -175,15 +176,7 @@ def apply_patch() -> None:
         if path != REPO or not name:
             return original(path, name, *args, **kwargs)
         # Use the same ordinary files that preflight checked, even if an older datasets cache exists.
-        if plain_snapshot() is not None:
-            return load_subset(original, name, kwargs.get("split"))
-        try:
-            return original(path, name, *args, **kwargs)
-        except Exception as error:  # no such config (online), or no cache for it (offline)
-            try:
-                return load_subset(original, name, kwargs.get("split"))
-            except Exception as fallback:
-                raise fallback from error
+        return load_subset(original, name, kwargs.get("split"))
 
     load_dataset._longbench2_patched = True
     datasets.load_dataset = load_dataset
