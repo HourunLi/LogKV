@@ -1,0 +1,189 @@
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from litgpt.alpha_log_kv import SURPRISAL_BASE, SURPRISAL_SCALE, SurprisalStream
+from litgpt.config import Config
+from litgpt.model import GPT
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unused"))
+from niah_surprisal import token_surprisal  # noqa: E402
+
+KWARGS = dict(batch_size=1, B=8, prefill_block=8, second_order_scale=0., semantic_clusters=True, cluster_k_max=4,
+              semantic_flush_granularity=8, semantic_anchor_mode="mid", semantic_replay_updates=True,
+              alpha_exact_tokens=8, alpha_span_max_tokens=4)
+
+
+def _model():
+    torch.manual_seed(7)
+    config = Config(block_size=256, n_layer=2, n_embd=32, n_head=4, n_query_groups=2, vocab_size=41,
+                    padding_multiple=1, rotary_percentage=1.)
+    model = GPT(config).eval()
+    model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7])
+    return model
+
+
+def test_span_values_grow_exponentially_with_the_mean_or_top4_surprisal():
+    def value(bits):
+        return SURPRISAL_SCALE * SURPRISAL_BASE ** bits
+    stream = SurprisalStream("top4")
+    stream.add(0, 0, [np.nan, 1., 2., 3., 4., 5., 9.])
+    assert stream.span_values(0, np.arange(7), [2, 5], 7).tolist() == pytest.approx(
+        [value(0.5), value((3 + 4 + 5 + 9) / 4)])
+    stream = SurprisalStream("mean")
+    stream.add(0, 0, [np.nan, 1., 2., 3.])
+    stream.add(0, 4, [5.])
+    assert stream.span_values(0, np.array([1, 2, 3, 4]), [3, 1], 5).tolist() == pytest.approx(
+        [value(2.), value(5.)])
+    with pytest.raises(RuntimeError, match="not known yet"):
+        stream.span_values(0, np.array([5]), [1], 6)
+    stream = SurprisalStream("mix")
+    stream.add(0, 0, [1., 1., 1., 1., 1., 9.])
+    assert stream.span_values(0, np.arange(6), [6], 6).tolist() == pytest.approx([value((14 / 6 + 3) / 2)])
+    # Word scores: a word's code length is the sum of its tokens' bits. Span 0 is " is 1234567" (a word of
+    # 2 bits, a space, then a number of seven 3.3-bit digits); span 1 is four one-token words of 12, 9, 2
+    # and 1 bits.
+    from litgpt.alpha_log_kv import word_classes
+    classes = word_classes([" is", " ", "1", " w"])
+    bits, ids = [2.] + [0.] + [3.3] * 7 + [12., 9., 2., 1.], [0, 1] + [2] * 7 + [3] * 4
+    lengths = [9, 4]
+    for score, expected in (("word_max", [23.1, 12.]), ("word_top2", [(23.1 + 2) / 2, 10.5])):
+        stream = SurprisalStream(score, classes)
+        stream.add(0, 0, bits, ids)
+        assert stream.span_values(0, np.arange(13), lengths, 13).tolist() == pytest.approx(
+            [SURPRISAL_SCALE * 2 ** e / n for e, n in zip(expected, lengths)])  # the span's value, per token
+    with pytest.raises(ValueError, match="word_classes"):
+        SurprisalStream("word_max")
+    with pytest.raises(ValueError, match="token ids"):
+        SurprisalStream("word_max", classes).add(0, 0, [1.])
+    # word_first: a word read again (the same ids) keeps the code length of its first mention; spans
+    # are scored oldest first, as the cache archives them, and a second layer reads the same credit.
+    stream = SurprisalStream("word_first", word_classes([" w"] * 10))
+    stream.add(0, 0, [20., 3., 1., 2., 24.], [9, 5, 9, 6, 7])
+    first = stream.span_values(0, np.arange(2), [2], 2)
+    assert first.tolist() == pytest.approx([SURPRISAL_SCALE * 2 ** 20 / 2])
+    for _ in range(2):
+        assert stream.span_values(0, np.arange(2, 5), [2, 1], 5).tolist() == pytest.approx(
+            [SURPRISAL_SCALE * 2 ** 20 / 2, SURPRISAL_SCALE * 2 ** 24])
+
+
+def test_multi_scores_a_span_by_the_dimension_it_stands_out_in():
+    from litgpt.alpha_log_kv import SURPRISAL_MIN_SPREAD
+    # 20 dull 4-token spans, a uniformly surprising one (mean) and a long one with one peak (top4).
+    dull = [1., 2., 1., 2.] * 20
+    bits = np.r_[dull, [6.] * 4, [1.] * 15 + [12.]]
+    lengths = [4] * 20 + [4, 16]
+    stream = SurprisalStream("multi")
+    stream.add(0, 0, bits)
+    values = stream.span_values(0, np.arange(len(bits)), lengths, len(bits))
+    assert values[20] > values[0] * 100 and values[21] > values[0] * 100
+    # A later call for the same flush (another layer) sees the same statistics.
+    assert stream.span_values(0, np.arange(len(bits)), lengths, len(bits)).tolist() == pytest.approx(values.tolist())
+    assert stream._stats[0].count == 22 and SURPRISAL_MIN_SPREAD > 0
+
+
+def test_the_model_feeds_each_tokens_surprisal_in_chunks_and_returns_the_asked_logits():
+    model = _model()
+    ids = torch.randint(0, 41, (40,))
+    plain = token_surprisal(model, ids.tolist())
+    with torch.no_grad():
+        full = model(ids[None]).float()
+    # Inside the recent window the cache is exact, so chunked prefill reproduces the uncached model.
+    model.set_log_kv_cache(recent_size=64, gamma_surprisal="mean", **KWARGS)
+    assert model.log_kv_surprisal_chunk == 8
+    with torch.no_grad():
+        out = model(ids[None], input_pos=torch.arange(40), lm_head_start=35).float()
+    assert out.shape == (1, 5, full.size(-1)) and torch.allclose(out, full[:, 35:], atol=1e-4)
+    stream = model.log_kv_surprisal_stream._rows[0]
+    assert stream[0] == 0. and stream[1:].tolist() == pytest.approx(plain[1:].tolist(), abs=1e-3)
+    # Token-by-token decode feeds the same values.
+    model.set_log_kv_cache(recent_size=64, gamma_surprisal="mean", **KWARGS)
+    with torch.no_grad():
+        for t in range(40):
+            model(ids[None, t:t + 1], input_pos=torch.tensor([t]))
+    assert model.log_kv_surprisal_stream._rows[0][1:].tolist() == pytest.approx(plain[1:].tolist(), abs=1e-3)
+
+
+def test_a_surprising_span_takes_the_exact_pool():
+    model = _model()
+    ids = torch.full((64,), 1, dtype=torch.long)
+    ids[3::4] = 3  # spans of four tokens
+    bits = np.full(64, 1.)
+    bits[20:24] = 12.  # one surprising span, long out of the recent window by the end
+    pools = {}
+    model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7], literal_texts=[" w"] * 41)  # one-token words
+    for score in ("mean", "top4", "word_max"):
+        model.set_log_kv_cache(recent_size=16, gamma_surprisal=score, **KWARGS)
+        # Given values: run the cache without the model's feed.
+        model.log_kv_surprisal_stream.add(0, 0, bits, ids.numpy())
+        model._surprisal_inner = True
+        try:
+            with torch.no_grad():
+                model(ids[None], input_pos=torch.arange(64))
+        finally:
+            model._surprisal_inner = False
+        pools[score] = [set(block.attn.kv_cache._alpha_positions[0]) for block in model.transformer.h]
+    assert all(set(range(20, 24)) <= pool for layers in pools.values() for pool in layers)
+    from niah_surprisal import exact_layers
+    assert exact_layers(model, [[20, 24], [60, 64], [4, 8]]) == [1., 1., 0.]  # pool, recent window, gone
+    with pytest.raises(ValueError, match="requires alpha_exact_tokens"):
+        model.set_log_kv_cache(recent_size=16, gamma_surprisal="mean", **{**KWARGS, "alpha_exact_tokens": 0})
+
+
+def test_a_short_surprising_span_evicts_a_long_dull_one():
+    from litgpt.alpha_log_kv import SpanCut, choose_spans
+    # The pool holds one 64-token span of 3 bits; a 20-token span of 6 bits arrives.
+    cut = SpanCut([np.arange(84)], [np.arange(84)], [np.array([64, 20])], [np.array([True, False])],
+                  [np.array([True, True])])
+    stream = SurprisalStream("mean")
+    stream.add(0, 0, np.r_[np.full(64, 3.), np.full(20, 6.)])
+    exponential = stream.span_values(0, np.arange(84), [64, 20], 84).tolist()
+    assert choose_spans(cut, exponential, 64).keep[0] == list(range(64, 84))
+    linear = [3. * SURPRISAL_SCALE, 6. * SURPRISAL_SCALE]  # 20 x 6 < 64 x 3 x 1.1: the swap would fail
+    assert choose_spans(cut, linear, 64).keep[0] == list(range(64))
+    # Word scores value the whole span at its word: a 22-token span with a 26-bit word evicts a 64-token
+    # one whose longest word has 25 bits (valued per token, 22 x 2^26 < 1.1 x 64 x 2^25 would block it).
+    cut = SpanCut([np.arange(86)], [np.arange(86)], [np.array([64, 22])], [np.array([True, False])],
+                  [np.array([True, True])])
+    from litgpt.alpha_log_kv import word_classes
+    stream = SurprisalStream("word_max", word_classes([" w"]))  # every token a word
+    stream.add(0, 0, np.r_[25., np.zeros(63), 26., np.zeros(21)], np.zeros(86, dtype=np.int64))
+    assert choose_spans(cut, stream.span_values(0, np.arange(86), [64, 22], 86).tolist(), 64).keep[0] == list(
+        range(64, 86))
+
+
+def test_words_are_lexical_and_found_from_the_token_texts():
+    from litgpt.alpha_log_kv import word_classes, word_starts
+    texts = [" upset", "-om", "ission", " is", ":", " ", "6", "5", ".", "\n", "The", "](", "https", "://", "sep",
+             "don", "'t", "中", "", "_x", "3"]
+    classes = word_classes(texts)
+    tok = {t: i for i, t in enumerate(texts)}
+
+    def starts(*pieces):
+        return word_starts([tok[x] for x in pieces], classes).astype(int).tolist()
+    # A hyphenated key and a number are one word each; ":", the space and the final "." stand alone.
+    assert starts(" upset", "-om", "ission", " is", ":", " ", "6", "5", ".") == [1, 0, 0, 1, 1, 1, 1, 0, 1]
+    assert starts("3", ".", "5", "5") == [1, 0, 0, 0]            # a decimal stays whole
+    assert starts("](", "https", "://", "sep", ".", "sep") == [1, 1, 1, 1, 1, 1]  # a URL is several words
+    assert starts("\n", "The", "don", "'t", "_x", "中", "中", "") == [1, 1, 0, 0, 0, 1, 1, 1]
+    assert word_starts([tok["3"], tok["."], tok["5"]], classes, positions=[1]).tolist() == [False]
+    # An id past the texts (an added special token such as Qwen's <|im_start|>, which LongBench v2's documents
+    # contain) has no text: it begins a word and joins none.
+    special = len(texts) + 1
+    assert word_starts([tok["The"], special, tok["-om"], tok["ission"], special], classes).tolist() == [
+        True, True, True, False, True]
+    model = _model()
+    texts = [" w" if i % 3 == 0 else "x" for i in range(41)]  # every third id begins a word
+    with pytest.raises(RuntimeError, match="token texts"):
+        model.set_log_kv_cache(recent_size=64, gamma_surprisal="word_max", **KWARGS)
+    model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7], literal_texts=texts)
+    ids = torch.randint(0, 41, (40,))
+    model.set_log_kv_cache(recent_size=64, gamma_surprisal="word_first", **KWARGS)
+    with torch.no_grad():
+        model(ids[None], input_pos=torch.arange(40))
+    stream = model.log_kv_surprisal_stream
+    assert stream._id_rows[0].tolist() == ids.tolist() and stream.word_classes is model.log_kv_word_classes

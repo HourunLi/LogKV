@@ -1,0 +1,4 @@
+# 只在评测时打开 cue 保护：复评已训练的 cue checkpoint（arc_gamma_cue_k12_b128_2k，不重训）。
+# 开头区域不以换行结束时不用 cue，出现超过 16 次的 cue 词不计证据；只改变精确池的片段选择。
+config: arc_gamma_cue_k12_b128_2k.yaml
+log_kv_gamma_cue_guard: true

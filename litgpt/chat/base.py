@@ -84,7 +84,7 @@ def process_prompt(
     if max_new_tokens is None:
         max_returned_tokens = model.max_seq_length
     else:
-        first_turn = model.mask_cache is None
+        first_turn = model.transformer.h[0].attn.kv_cache is None
         max_returned_tokens = encoded_prompt.size(0) + max_new_tokens
         if first_turn or max_returned_tokens > model.max_seq_length:
             model.max_seq_length = max_returned_tokens

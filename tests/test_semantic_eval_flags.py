@@ -8,25 +8,7 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
-@pytest.mark.parametrize("route", ["legacy_route", "unified_route"])
-@pytest.mark.parametrize("anchor_mode,pack_backend", [("mid", "triton"), ("multi", "torch")])
-@pytest.mark.parametrize("setting, expected", [("true", "true"), ("false", "false"), ("null", "false"), (None, "false")])
-def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting, expected, anchor_mode, pack_backend):
-    parent = tmp_path / "base.yaml"
-    # Unset Alpha keys must fall back to the default-on 256/64.
-    alpha = "" if setting is None else "log_kv_alpha_exact_tokens: 256\nlog_kv_alpha_span_max_tokens: 64\n"
-    parent.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\n"
-                      "log_kv_cluster_k_max: 8\nlog_kv_B: 64\n" + alpha +
-                      f"log_kv_semantic_merge_passes: {4 if anchor_mode == 'mid' else 'null'}\n"
-                      f"log_kv_semantic_centroid_backend: {'parallel' if anchor_mode == 'mid' else 'null'}\n"
-                      f"log_kv_semantic_replay_updates: {'true' if anchor_mode == 'mid' else 'null'}\n"
-                      f"log_kv_semantic_anchor_mode: {anchor_mode}\nlog_kv_semantic_pack_backend: {pack_backend}\n")
-    if setting is not None:
-        parent.write_text(parent.read_text() + f"log_kv_semantic_{route}: {setting}\n"
-                          f"log_kv_beta_novelty: {setting}\nlog_kv_beta_adaptive_merge: {setting}\n")
-    config = tmp_path / "run.yaml"
-    config.write_text("config: base.yaml\n")
+def _eval_arguments(config, script):
     source = (Path(__file__).resolve().parents[1] / script).read_text()
     # Execute the source's extraction/assembly blocks without environment setup,
     # dependency installation, training, filesystem barriers, or GPU launches.
@@ -51,7 +33,35 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
     result = subprocess.run(["bash", "-c", shell, "bash", str(config)],
                             capture_output=True, text=True, check=True, env=env)
-    args = result.stdout.splitlines()
+    return result.stdout.splitlines()
+
+
+@pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
+@pytest.mark.parametrize("route", ["legacy_route", "unified_route"])
+@pytest.mark.parametrize("anchor_mode,pack_backend", [("mid", "triton"), ("multi", "torch")])
+@pytest.mark.parametrize("setting, expected", [("true", "true"), ("false", "false"), ("null", "false"), (None, "false")])
+def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting, expected, anchor_mode, pack_backend):
+    parent = tmp_path / "base.yaml"
+    # Unset Alpha keys must fall back to the default-on 256/64.
+    alpha = "" if setting is None else "log_kv_alpha_exact_tokens: 256\nlog_kv_alpha_span_max_tokens: 64\n"
+    parent.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\n"
+                      "log_kv_cluster_k_max: 8\nlog_kv_B: 64\n" + alpha +
+                      f"log_kv_semantic_merge_passes: {4 if anchor_mode == 'mid' else 'null'}\n"
+                      f"log_kv_semantic_centroid_backend: {'parallel' if anchor_mode == 'mid' else 'null'}\n"
+                      f"log_kv_semantic_replay_updates: {'true' if anchor_mode == 'mid' else 'null'}\n"
+                      f"log_kv_semantic_anchor_mode: {anchor_mode}\nlog_kv_semantic_pack_backend: {pack_backend}\n")
+    if setting is not None:
+        top = {"true": "lightest", "false": "fold"}.get(setting, "null")
+        parent.write_text(parent.read_text() + f"log_kv_semantic_{route}: {setting}\n"
+                          f"log_kv_beta_novelty: {setting}\nlog_kv_beta_adaptive_merge: {setting}\n"
+                          f"log_kv_gamma_level0_reinsert: {setting}\nlog_kv_gamma_top_merge: {top}\n"
+                          f"log_kv_gamma_level_slack: {1 if setting == 'false' else 'null'}\n"
+                          f"log_kv_gamma_cue_tokens: {0 if setting == 'false' else 'null'}\n"
+                          f"log_kv_gamma_literals: {setting}\nlog_kv_gamma_cue_guard: {setting}\n"
+                          f"log_kv_gamma_query_cue: {setting}\n")
+    config = tmp_path / "run.yaml"
+    config.write_text("config: base.yaml\n")
+    args = _eval_arguments(config, script)
     for name in ("legacy_route", "unified_route"):
         flag = "--log_kv_semantic_" + name
         assert args.count(flag) == 1
@@ -67,9 +77,95 @@ def test_semantic_route_reaches_eval_arguments(tmp_path, script, route, setting,
         assert args.count(flag) == 1
         # Beta is on unless the YAML turns it off; routes stay off (attach) unless turned on.
         assert args[args.index(flag) + 1] == ("false" if setting == "false" else "true")
+    # Gamma is on unless the YAML restores the earlier ladder and scores; slack keeps two spare levels.
+    for flag, value in (("--log_kv_gamma_level0_reinsert", "false" if setting == "false" else "true"),
+                        ("--log_kv_gamma_top_merge", "fold" if setting == "false" else "lightest"),
+                        ("--log_kv_gamma_level_slack", "1" if setting == "false" else "2"),
+                        ("--log_kv_gamma_cue_tokens", "0" if setting == "false" else "64"),
+                        # Literals are off unless the YAML turns them on.
+                        ("--log_kv_gamma_literals", "true" if setting == "true" else "false"),
+                        ("--log_kv_gamma_cue_guard", "true" if setting == "true" else "false"),
+                        ("--log_kv_gamma_query_cue", "true" if setting == "true" else "false")):
+        assert args.count(flag) == 1
+        assert args[args.index(flag) + 1] == value
     assert args[args.index("--log_kv_semantic_anchor_mode") + 1] == anchor_mode
     assert args[args.index("--log_kv_semantic_pack_backend") + 1] == pack_backend
 
     values = ("parallel", "true") if anchor_mode == "mid" else ("sequential", "false")
     for name, value in zip(("centroid_backend", "replay_updates"), values):
         assert args[args.index("--log_kv_semantic_" + name) + 1] == value
+
+
+@pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
+@pytest.mark.parametrize("setting, expected", [("true", "true"), ("false", "false"), ("null", "false"), (None, "false")])
+def test_dense_mode_reaches_eval_arguments(tmp_path, script, setting, expected):
+    parent = tmp_path / "base.yaml"
+    parent.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: false\n"
+                      "log_kv_B: 64\nlog_kv_recent_size: 128\nlog_kv_prefill_block: 32\n")
+    if setting is not None:
+        parent.write_text(parent.read_text() + f"log_kv_dense_mode: {setting}\n")
+    config = tmp_path / "run.yaml"
+    config.write_text("config: base.yaml\n")
+    args = _eval_arguments(config, script)
+    assert args.count("--log_kv_dense_mode") == 1
+    assert args[args.index("--log_kv_dense_mode") + 1] == expected
+    assert args[args.index("--log_kv_B") + 1] == "64"
+    assert args[args.index("--log_kv_recent_size") + 1] == "128"
+    assert args[args.index("--log_kv_prefill_block") + 1] == "32"
+    assert "--log_kv_semantic_clusters" not in args
+
+
+@pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
+@pytest.mark.parametrize("heads", [None, "/tmp/unused/retention_heads.pth"])
+def test_retention_heads_reach_eval_arguments_only_when_set(tmp_path, script, heads):
+    config = tmp_path / "run.yaml"
+    config.write_text("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\nlog_kv_cluster_k_max: 8\n"
+                      "log_kv_semantic_anchor_mode: mid\n" + (f"log_kv_retention_heads: {heads}\n" if heads else ""))
+    args = _eval_arguments(config, script)
+    if heads:
+        assert args.count("--log_kv_retention_heads") == 1 and args[args.index("--log_kv_retention_heads") + 1] == heads
+    else:
+        assert "--log_kv_retention_heads" not in args
+
+
+def _heads_check(config, script):
+    source = (Path(__file__).resolve().parents[1] / script).read_text()
+    start = source.index("# 打分头文件由 retention.sh 写出")
+    check = source[start:source.index("    exit 1\nfi\n", start) + len("    exit 1\nfi\n")]
+    if script == "majob.sh":
+        start = source.index("read -r LOG_KV_B ")
+        read_config = source[start:source.index('\n)"', start) + len('\n)"')]
+    else:
+        start = source.index('CONFIG_EXPORTS=$("${PYTHON_BIN}" ')
+        stop = source.index('eval "${CONFIG_EXPORTS}"', start) + len('eval "${CONFIG_EXPORTS}"')
+        read_config = source[start:stop]
+    shell = '\n'.join(('set -e', 'CONFIG_FILE=$1', read_config, check, 'echo ok'))
+    env = {**os.environ, "PYTHON_BIN": sys.executable,
+           "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
+    return subprocess.run(["bash", "-c", shell, "bash", str(config)], capture_output=True, text=True, env=env)
+
+
+@pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
+def test_launchers_stop_on_missing_heads_and_name_the_yaml_that_trains_them(tmp_path, script):
+    heads = tmp_path / "heads" / "h.pth"
+    cfg = ("save_path: /tmp/unused-checkpoint\nlog_kv_semantic_clusters: true\nlog_kv_cluster_k_max: 8\n"
+           "log_kv_semantic_anchor_mode: mid\n")
+    (tmp_path / "eval_niah_heads_x.yaml").write_text(cfg + f"log_kv_retention_heads: {heads}\n")
+    (tmp_path / "eval_niah_heads_other.yaml").write_text(cfg + f"log_kv_retention_heads: {heads}.other\n")
+    run = tmp_path / "arc_niah_run.yaml"
+    run.write_text(cfg + f"log_kv_retention_heads: {heads}\n")
+    result = _heads_check(run, script)
+    assert result.returncode == 1 and "ok" not in result.stdout
+    assert f"bash retention.sh {tmp_path / 'eval_niah_heads_x.yaml'}" in result.stdout
+    assert "eval_niah_heads_other.yaml" not in result.stdout
+    run.write_text(cfg + f"log_kv_retention_heads: {heads}.nobody\n")
+    result = _heads_check(run, script)
+    assert result.returncode == 1 and "先用 retention.sh 训练它" in result.stdout
+    run.write_text(cfg + f"log_kv_retention_heads: {heads}\n")
+    heads.parent.mkdir()
+    heads.write_bytes(b"")
+    assert _heads_check(run, script).stdout.strip().endswith("ok")
+    # Alpha off: eval.py ignores the heads, so a missing file does not stop the run.
+    heads.unlink()
+    run.write_text(cfg + "log_kv_alpha_exact_tokens: 0\n" + f"log_kv_retention_heads: {heads}\n")
+    assert _heads_check(run, script).stdout.strip().endswith("ok")

@@ -1,7 +1,8 @@
 """
 logKV adaptation CPT: continue pre-training under simulated compressed-KV
 (log-structured) streaming attention, so the model learns to read merged slots.
-Run on already-pretrained base weights. This script has no dense route.
+Run on already-pretrained base weights. Set log_kv_dense_mode=true for ordinary
+full causal attention throughout CPT; LogKV remains the default.
 
 Usage:
     # Single GPU debug
@@ -12,9 +13,9 @@ Usage:
 
 Architecture:
     - Training: model(idx) routes through the logKV streaming simulation
-      (enable_log_kv_training; chunked slot attention, 2:1 compaction)
+      by default; dense mode uses ordinary causal attention without a KV cache.
     - Inference (eval): log-structured KV cache with O(recent + B*log N) memory
-      via model.set_log_kv_cache() + model(idx, input_pos=input_pos)
+      by default; dense mode uses the standard full KV cache with O(N) memory.
 """
 
 import os
@@ -350,6 +351,22 @@ def get_lr(current_step, total_steps, warmup_steps, max_lr, min_lr):
     return min_lr + coeff * (max_lr - min_lr)
 
 
+def _with_synthetic_facts(train_data, kit, prob, seed, facts, questions):
+    """Insert synthetic facts and questions into some rows of a training batch (same shape)."""
+    from litgpt.synthetic_retrieval import insert_facts
+
+    rng = np.random.default_rng(seed)
+    pick = rng.random(train_data.size(0)) < prob
+    if not pick.any():
+        return train_data
+    rows = train_data.cpu().numpy().copy()
+    low, high = (int(x) for x in facts.split(","))
+    q_low, q_high = (int(x) for x in questions.split(","))
+    for b in np.flatnonzero(pick):
+        rows[b], _ = insert_facts(rows[b], rng, kit, facts=(low, high), questions=(q_low, q_high))
+    return torch.as_tensor(rows, dtype=train_data.dtype, device=train_data.device)
+
+
 def build_train_dataset(
     *,
     context_length: int,
@@ -515,10 +532,10 @@ def main(
     tensorboard_root: str = "./tb",
     # ── Experiment ──
     expid: str = "debug",
-    # ── Log-structured KV cache (always on) ──
-    # This script IS the logKV adaptation phase: training always simulates the
-    # compressed-KV streaming attention so the model learns to read merged
-    # slots. Run it after dense pretraining, on already-pretrained base weights.
+    # ── Attention mode ──
+    # Dense CPT uses ordinary causal attention, without a training KV cache.
+    # The default LogKV route simulates compressed-KV streaming attention.
+    log_kv_dense_mode: bool = False,
     log_kv_B: int = 512,
     log_kv_recent_size: int = 1024,
     # Training replay block size. 2 = strict 2-token streaming semantics but
@@ -577,6 +594,35 @@ def main(
     log_kv_alpha_span_max_tokens: int = 64,
     log_kv_beta_novelty: bool = True,
     log_kv_beta_adaptive_merge: bool = True,
+    # Gamma (on by default): delayed Alpha evictions re-sort only ladder level 0 instead
+    # of re-merging the whole cluster, and a saturated top level merges its lightest
+    # adjacent pair instead of folding into slot 0. level_slack 2 keeps the classic
+    # spare levels; fewer spends the same bytes on a wider B' (more live entries).
+    log_kv_gamma_level0_reinsert: bool = True,
+    log_kv_gamma_top_merge: str = "lightest",
+    log_kv_gamma_level_slack: int = 2,
+    # Gamma cues (on by default): exact-pool selection also values spans that repeat
+    # rare tokens of the stream's opening region (up to this many tokens, cut at its
+    # last line end); 0 keeps the K/V-only span scores.
+    log_kv_gamma_cue_tokens: int = 64,
+    # Gamma literals (off by default): exact-pool selection also values spans holding the
+    # first occurrence of a random-looking literal (digit strings, codes).
+    log_kv_gamma_literals: bool = False,
+    # Gamma cue guard (off by default): cues need an opening region that ends at a line end,
+    # and a cue counted more than 16 times gives no evidence. Only with cues on.
+    log_kv_gamma_cue_guard: bool = False,
+    # Gamma query-aware cue (off by default): only evaluation prompts carry a question;
+    # training accepts the switch so that majob.sh can pass one argument list to both.
+    log_kv_gamma_query_cue: bool = False,
+    # niahLogKV: frozen learned retention heads (train_retention.py output) score Alpha's exact
+    # spans during CPT; None = off. They are not trained here and are not in the LM checkpoint.
+    log_kv_retention_heads: str | None = None,
+    # niahLogKV synthetic retrieval data: each training block gets facts and questions with
+    # this probability (litgpt.synthetic_retrieval); 0 = off.
+    synthetic_retrieval_prob: float = 0.0,
+    synthetic_facts: str = "2,8",
+    synthetic_questions: str = "1,3",
+    synthetic_kinds: str | None = None,
     log_kv_profile_steps: list[int] | None = None,
     activation_checkpointing: bool = True,
     # ── Eval ──
@@ -642,6 +688,7 @@ def main(
     enable_tensorboard = _o("enable_tensorboard", enable_tensorboard)
     tensorboard_root = _o("tensorboard_root", tensorboard_root)
     expid = _o("expid", expid)
+    log_kv_dense_mode = bool(_o("log_kv_dense_mode", log_kv_dense_mode))
     log_kv_B = _o("log_kv_B", log_kv_B)
     log_kv_recent_size = _o("log_kv_recent_size", log_kv_recent_size)
     log_kv_train_block = _o("log_kv_train_block", log_kv_train_block)
@@ -666,11 +713,31 @@ def main(
     log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
     log_kv_beta_novelty = bool(_o("log_kv_beta_novelty", log_kv_beta_novelty))
     log_kv_beta_adaptive_merge = bool(_o("log_kv_beta_adaptive_merge", log_kv_beta_adaptive_merge))
+    log_kv_gamma_level0_reinsert = bool(_o("log_kv_gamma_level0_reinsert", log_kv_gamma_level0_reinsert))
+    log_kv_gamma_top_merge = str(_o("log_kv_gamma_top_merge", log_kv_gamma_top_merge))
+    log_kv_gamma_level_slack = int(_o("log_kv_gamma_level_slack", log_kv_gamma_level_slack))
+    log_kv_gamma_cue_tokens = int(_o("log_kv_gamma_cue_tokens", log_kv_gamma_cue_tokens))
+    log_kv_gamma_literals = bool(_o("log_kv_gamma_literals", log_kv_gamma_literals))
+    log_kv_gamma_cue_guard = bool(_o("log_kv_gamma_cue_guard", log_kv_gamma_cue_guard))
+    log_kv_gamma_query_cue = bool(_o("log_kv_gamma_query_cue", log_kv_gamma_query_cue))
+    log_kv_retention_heads = _o("log_kv_retention_heads", log_kv_retention_heads) or None
+    synthetic_retrieval_prob = float(_o("synthetic_retrieval_prob", synthetic_retrieval_prob))
+    synthetic_facts = str(_o("synthetic_facts", synthetic_facts))
+    synthetic_questions = str(_o("synthetic_questions", synthetic_questions))
+    synthetic_kinds = _o("synthetic_kinds", synthetic_kinds) or None
+    if not 0.0 <= synthetic_retrieval_prob <= 1.0:
+        raise ValueError("synthetic_retrieval_prob must be in [0, 1]")
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
-        # Beta extends the Alpha exact pool; disabling Alpha disables both Beta changes.
+        # Beta and Gamma cues and literals score the Alpha exact pool; disabling Alpha disables them.
         log_kv_beta_novelty = log_kv_beta_adaptive_merge = False
+        log_kv_gamma_cue_tokens = 0
+        log_kv_gamma_literals = False
+        log_kv_gamma_query_cue = False
+        log_kv_retention_heads = None
+    if not (log_kv_gamma_cue_tokens or log_kv_gamma_query_cue):
+        log_kv_gamma_cue_guard = False  # the guard only acts on cues
     log_kv_profile_steps = _o("log_kv_profile_steps", log_kv_profile_steps)
     if log_kv_profile_steps is not None and (
         not isinstance(log_kv_profile_steps, (list, tuple))
@@ -753,8 +820,8 @@ def main(
             sharding_strategy="SHARD_GRAD_OP",
             state_dict_type="full",
             auto_wrap_policy={Block},
-            # Streaming replay bounds attention's inner graph, but Q/K/V,
-            # RMSNorm and projection activations still accumulate across layers.
+            # Bound saved Q/K/V, norm and projection activations across layers
+            # for both dense and streaming attention.
             activation_checkpointing_policy={Block} if activation_checkpointing else None,
             timeout=timedelta(days=3650),
         )
@@ -771,6 +838,20 @@ def main(
         loggers=loggers,
     )
     fabric.launch()
+    if any(type(size) is not int or size < 1 for size in (global_batch_size, micro_batch_size)):
+        raise ValueError("global_batch_size and micro_batch_size must be positive integers")
+    distributed_micro_batch = micro_batch_size * fabric.world_size
+    if global_batch_size % distributed_micro_batch:
+        raise ValueError(
+            f"global_batch_size={global_batch_size} must be divisible by "
+            f"micro_batch_size={micro_batch_size} * world_size={fabric.world_size} "
+            f"({distributed_micro_batch}) to preserve the requested batch size"
+        )
+    gradient_accumulation_steps = global_batch_size // distributed_micro_batch
+    fabric.print(
+        f"Training batch: world_size={fabric.world_size}, micro_batch_size={micro_batch_size}, "
+        f"global_batch_size={global_batch_size}, gradient_accumulation_steps={gradient_accumulation_steps}"
+    )
     fabric.print("Tensorboard root:", tensorboard_root)
     # Checkpoint 去向尽早入日志：save_path 为相对路径时跟随作业的 cwd，
     # 训练完“找不到 checkpoint”十有八九是在另一个目录里找。save_ckpt=False
@@ -813,7 +894,8 @@ def main(
     with fabric.init_module(empty_init=True):
         model = GPT(config_obj)
     model = fabric.setup_module(model)
-    if use_fsdp and activation_checkpointing and log_kv_semantic_clusters and log_kv_cluster_k_max > 1:
+    if (not log_kv_dense_mode and use_fsdp and activation_checkpointing
+            and log_kv_semantic_clusters and log_kv_cluster_k_max > 1):
         checkpoint_blocks = enable_logkv_checkpoint_replay(model, Block)
         fabric.print(f"LogKV checkpoint routing replay: enabled for {checkpoint_blocks} Blocks (strict, no rerouting fallback)")
 
@@ -864,7 +946,7 @@ def main(
     # ── Evaluation helper ──
     # Same code path AND same semantics as a standalone `eval.py --config
     # exp/.../eval.yaml` run and as majob.sh: the checkpoint is evaluated under
-    # the same compressed-KV (logKV) attention it was trained with, with the
+    # same dense or LogKV attention mode it was trained with. LogKV uses the
     # training-time B/recent_size and the same prefill block. Results land in
     # {save_path}/evaluate (majob.sh's EVAL_OUTPUT_DIR) — also for the "before"
     # eval, whose base checkpoint dir may be read-only; each timestamped JSON
@@ -876,6 +958,7 @@ def main(
             checkpoint_dir=ckpt,
             benchmark=benchmark,
             output_path=f"{save_path}/evaluate",
+            log_kv_dense_mode=log_kv_dense_mode,
             log_kv_B=log_kv_B,
             log_kv_recent_size=log_kv_recent_size,
             log_kv_prefill_block=log_kv_prefill_block,
@@ -907,6 +990,14 @@ def main(
             log_kv_alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
             log_kv_beta_novelty=log_kv_beta_novelty,
             log_kv_beta_adaptive_merge=log_kv_beta_adaptive_merge,
+            log_kv_gamma_level0_reinsert=log_kv_gamma_level0_reinsert,
+            log_kv_gamma_top_merge=log_kv_gamma_top_merge,
+            log_kv_gamma_level_slack=log_kv_gamma_level_slack,
+            log_kv_gamma_cue_tokens=log_kv_gamma_cue_tokens,
+            log_kv_gamma_literals=log_kv_gamma_literals,
+            log_kv_gamma_cue_guard=log_kv_gamma_cue_guard,
+            log_kv_gamma_query_cue=log_kv_gamma_query_cue,
+            log_kv_retention_heads=log_kv_retention_heads,
             tokenizer_dir=tokenizer_dir,
         )
 
@@ -1007,101 +1098,138 @@ def main(
     if isinstance(loaded_global_step, torch.Tensor):
         loaded_global_step = loaded_global_step.item()
     global_step = int(loaded_global_step)
-    initial_second_order_scale = get_log_kv_second_order_scale(
-        global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
-    )
-    semantic_s_h = (
-        load_log_kv_semantic_s_h(
-            log_kv_semantic_s_h_path,
-            n_layer=config_obj.n_layer,
-            n_groups=config_obj.n_query_groups,
+    if log_kv_dense_mode:
+        model.disable_log_kv_training()
+        fabric.print("Dense CPT ENABLED: full causal attention; no LogKV compression or training KV cache.")
+    else:
+        initial_second_order_scale = get_log_kv_second_order_scale(
+            global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
         )
-        if log_kv_semantic_clusters
-        else None
-    )
+        semantic_s_h = (
+            load_log_kv_semantic_s_h(
+                log_kv_semantic_s_h_path,
+                n_layer=config_obj.n_layer,
+                n_groups=config_obj.n_query_groups,
+            )
+            if log_kv_semantic_clusters
+            else None
+        )
 
-    # Always simulate the logKV compressed-KV streaming attention during
-    # training — this script only supports the logKV adaptation route.
-    if log_kv_alpha_exact_tokens:
-        from litgpt.tokenizer import Tokenizer
-        model.set_alpha_span_boundary_ids(Tokenizer(tok_dir).alpha_span_boundary_ids)
-    model.enable_log_kv_training(
-        batch_size=micro_batch_size,
-        max_seq_length=context_length,
-        device=fabric.device,
-        # Allocate cache buffers in the activation dtype instead of relying on
-        # the process default; keeps them aligned with the bf16-true params.
-        dtype=next(model.parameters()).dtype,
-        B=log_kv_B,
-        recent_size=log_kv_recent_size,
-        train_block=log_kv_train_block,
-        second_order_scale=initial_second_order_scale,
-        allocate_second_order=log_kv_second_order_scale != 0.0,
-        importance_pooling=log_kv_importance_pooling,
-        importance_pooling_lambda=log_kv_importance_pooling_lambda,
-        importance_pooling_temperature=log_kv_importance_pooling_temperature,
-        semantic_clusters=log_kv_semantic_clusters,
-        cluster_k_max=log_kv_cluster_k_max,
-        cluster_lambda_rel=log_kv_cluster_lambda_rel,
-        seg_eta=log_kv_seg_eta,
-        seg_g0=log_kv_seg_g0,
-        seg_gap_max=log_kv_seg_gap_max,
-        seg_block_level=log_kv_seg_block_level,
-        seg_forget=log_kv_seg_forget,
-        semantic_s_h=semantic_s_h,
-        semantic_flush_granularity=log_kv_semantic_flush_granularity,
-        semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
-        semantic_capacity_beta=log_kv_semantic_capacity_beta,
-        semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
-        semantic_legacy_route=log_kv_semantic_legacy_route,
-        semantic_unified_route=log_kv_semantic_unified_route,
-        semantic_merge_passes=log_kv_semantic_merge_passes,
-        semantic_anchor_mode=log_kv_semantic_anchor_mode,
-        semantic_pack_backend=log_kv_semantic_pack_backend,
-        semantic_centroid_backend=log_kv_semantic_centroid_backend,
-        semantic_replay_updates=log_kv_semantic_replay_updates,
-        alpha_exact_tokens=log_kv_alpha_exact_tokens,
-        alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
-        beta_novelty=log_kv_beta_novelty,
-        beta_adaptive_merge=log_kv_beta_adaptive_merge,
-    )
-    effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
-    fabric.print(
-        f"logKV training ENABLED: B={log_kv_B}, "
-        f"recent_size={log_kv_recent_size}, "
-        f"train_block={log_kv_train_block} "
-        f"(effective={effective_log_kv_train_block}), "
-        f"second_order_scale={initial_second_order_scale:.4f} "
-        f"(target={log_kv_second_order_scale:.4f}, "
-        f"warmup_steps={log_kv_second_order_warmup_steps}), "
-        f"blocks/seq={math.ceil(context_length / effective_log_kv_train_block)}, "
-        f"importance_pooling={log_kv_importance_pooling} "
-        f"(lambda={log_kv_importance_pooling_lambda}, temperature={log_kv_importance_pooling_temperature}), "
-        f"semantic={log_kv_semantic_clusters} "
-        f"(K={log_kv_cluster_k_max}, lambda_rel={log_kv_cluster_lambda_rel}, "
-        f"g_max={log_kv_seg_gap_max}, l_block={log_kv_seg_block_level}, "
-        f"flush={log_kv_semantic_flush_granularity}, tree_chunk={log_kv_semantic_cluster_chunk_size}, "
-        f"s_h={log_kv_semantic_s_h_path}, "
-        f"capacity_beta={log_kv_semantic_capacity_beta}, "
-        f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
-        f"legacy_route={log_kv_semantic_legacy_route}, "
-        f"unified_route={log_kv_semantic_unified_route}, "
-        f"merge_passes={log_kv_semantic_merge_passes}, "
-        f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
-        f"centroid={log_kv_semantic_centroid_backend}, "
-        f"replay_updates={log_kv_semantic_replay_updates}, "
-        f"alpha_exact={log_kv_alpha_exact_tokens}, alpha_span_max={log_kv_alpha_span_max_tokens}, "
-        f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
-        f"effective_B={model.transformer.h[0].attn.kv_cache.B})"
-    )
+        # Simulate compressed-KV streaming attention only on the LogKV route.
+        if log_kv_alpha_exact_tokens:
+            from litgpt.tokenizer import Tokenizer
+            boundary_tokenizer = Tokenizer(tok_dir)
+            model.set_alpha_span_boundary_ids(
+                boundary_tokenizer.alpha_span_boundary_ids,
+                boundary_tokenizer.alpha_line_end_ids if log_kv_gamma_cue_tokens else None,
+                boundary_tokenizer.gamma_literal_texts if log_kv_gamma_literals else None,
+            )
+        retention_heads = None
+        if log_kv_retention_heads:
+            from litgpt.retention import RetentionHeads
+            retention_heads = RetentionHeads.load(log_kv_retention_heads, device=fabric.device)
+            model.set_retention_heads(retention_heads)
+            if fabric.global_rank == 0 and save_path:
+                # The checkpoint is only meaningful with these heads; keep a copy beside it.
+                os.makedirs(save_path, exist_ok=True)
+                shutil.copy2(log_kv_retention_heads, os.path.join(save_path, "retention_heads.pth"))
+        model.enable_log_kv_training(
+            batch_size=micro_batch_size,
+            max_seq_length=context_length,
+            device=fabric.device,
+            # Allocate cache buffers in the activation dtype instead of relying on
+            # the process default; keeps them aligned with the bf16-true params.
+            dtype=next(model.parameters()).dtype,
+            B=log_kv_B,
+            recent_size=log_kv_recent_size,
+            train_block=log_kv_train_block,
+            second_order_scale=initial_second_order_scale,
+            allocate_second_order=log_kv_second_order_scale != 0.0,
+            importance_pooling=log_kv_importance_pooling,
+            importance_pooling_lambda=log_kv_importance_pooling_lambda,
+            importance_pooling_temperature=log_kv_importance_pooling_temperature,
+            semantic_clusters=log_kv_semantic_clusters,
+            cluster_k_max=log_kv_cluster_k_max,
+            cluster_lambda_rel=log_kv_cluster_lambda_rel,
+            seg_eta=log_kv_seg_eta,
+            seg_g0=log_kv_seg_g0,
+            seg_gap_max=log_kv_seg_gap_max,
+            seg_block_level=log_kv_seg_block_level,
+            seg_forget=log_kv_seg_forget,
+            semantic_s_h=semantic_s_h,
+            semantic_flush_granularity=log_kv_semantic_flush_granularity,
+            semantic_cluster_chunk_size=log_kv_semantic_cluster_chunk_size,
+            semantic_capacity_beta=log_kv_semantic_capacity_beta,
+            semantic_capacity_hard_cap_mult=log_kv_semantic_capacity_hard_cap_mult,
+            semantic_legacy_route=log_kv_semantic_legacy_route,
+            semantic_unified_route=log_kv_semantic_unified_route,
+            semantic_merge_passes=log_kv_semantic_merge_passes,
+            semantic_anchor_mode=log_kv_semantic_anchor_mode,
+            semantic_pack_backend=log_kv_semantic_pack_backend,
+            semantic_centroid_backend=log_kv_semantic_centroid_backend,
+            semantic_replay_updates=log_kv_semantic_replay_updates,
+            alpha_exact_tokens=log_kv_alpha_exact_tokens,
+            alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
+            beta_novelty=log_kv_beta_novelty,
+            beta_adaptive_merge=log_kv_beta_adaptive_merge,
+            gamma_level0_reinsert=log_kv_gamma_level0_reinsert,
+            gamma_top_merge=log_kv_gamma_top_merge,
+            gamma_level_slack=log_kv_gamma_level_slack,
+            gamma_cue_tokens=log_kv_gamma_cue_tokens,
+            gamma_literals=log_kv_gamma_literals,
+            gamma_cue_guard=log_kv_gamma_cue_guard,
+            gamma_query_cue=log_kv_gamma_query_cue,
+            retention_head=retention_heads is not None,
+        )
+        effective_log_kv_train_block = max(2, min(int(log_kv_train_block), int(log_kv_recent_size)))
+        fabric.print(
+            f"logKV training ENABLED: B={log_kv_B}, "
+            f"recent_size={log_kv_recent_size}, "
+            f"train_block={log_kv_train_block} "
+            f"(effective={effective_log_kv_train_block}), "
+            f"second_order_scale={initial_second_order_scale:.4f} "
+            f"(target={log_kv_second_order_scale:.4f}, "
+            f"warmup_steps={log_kv_second_order_warmup_steps}), "
+            f"blocks/seq={math.ceil(context_length / effective_log_kv_train_block)}, "
+            f"importance_pooling={log_kv_importance_pooling} "
+            f"(lambda={log_kv_importance_pooling_lambda}, temperature={log_kv_importance_pooling_temperature}), "
+            f"semantic={log_kv_semantic_clusters} "
+            f"(K={log_kv_cluster_k_max}, lambda_rel={log_kv_cluster_lambda_rel}, "
+            f"g_max={log_kv_seg_gap_max}, l_block={log_kv_seg_block_level}, "
+            f"flush={log_kv_semantic_flush_granularity}, tree_chunk={log_kv_semantic_cluster_chunk_size}, "
+            f"s_h={log_kv_semantic_s_h_path}, "
+            f"capacity_beta={log_kv_semantic_capacity_beta}, "
+            f"hard_cap_mult={log_kv_semantic_capacity_hard_cap_mult}, "
+            f"legacy_route={log_kv_semantic_legacy_route}, "
+            f"unified_route={log_kv_semantic_unified_route}, "
+            f"merge_passes={log_kv_semantic_merge_passes}, "
+            f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
+            f"centroid={log_kv_semantic_centroid_backend}, "
+            f"replay_updates={log_kv_semantic_replay_updates}, "
+            f"alpha_exact={log_kv_alpha_exact_tokens}, alpha_span_max={log_kv_alpha_span_max_tokens}, "
+            f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
+            f"gamma_level0_reinsert={log_kv_gamma_level0_reinsert}, gamma_top_merge={log_kv_gamma_top_merge}, "
+            f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens}, "
+            f"gamma_literals={log_kv_gamma_literals}, gamma_cue_guard={log_kv_gamma_cue_guard}, "
+            f"gamma_query_cue={log_kv_gamma_query_cue}, "
+            f"retention_heads={log_kv_retention_heads}"
+            f"{'' if retention_heads is None else ' (tag ' + retention_heads.tag() + ')'}, "
+            f"synthetic_retrieval_prob={synthetic_retrieval_prob}, "
+            f"effective_B={model.transformer.h[0].attn.kv_cache.B}, levels={model.transformer.h[0].attn.kv_cache.L_alloc})"
+        )
 
-    gradient_accumulation_steps = max(1, global_batch_size // (micro_batch_size * fabric.world_size))
     optimizer.zero_grad(set_to_none=True)
     step_active = False
     fabric.print(
+<<<<<<< HEAD
         f"LogKV timing: host counters every optimizer step; CUDA profile steps={sorted(profile_steps)}. "
         "Stage breakdowns are rank 0 only; throughput uses all ranks and synchronized step boundaries. "
         "CUDA spans include stream waits; forward/backward totals contain the LogKV breakdown."
+=======
+        f"Training timing: host counters every optimizer step; CUDA profile steps={sorted(profile_steps)}. "
+        "Console/TensorBoard timings are rank 0 only. CUDA spans include stream waits; "
+        "forward/backward totals contain the LogKV breakdown."
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
     )
     step_stats = MicroStepMeanStats()
     if global_step > 0:
@@ -1114,6 +1242,7 @@ def main(
         loaded_data_epoch = loaded_data_epoch.item()
     data_epoch = int(loaded_data_epoch)
     loader_iter = iter(dataloader)
+<<<<<<< HEAD
     run_start_step = global_step
     run_time_s = 0.0
     run_tokens = 0
@@ -1121,6 +1250,14 @@ def main(
     if fabric.global_rank == 0:
         speed_log_path.parent.mkdir(parents=True, exist_ok=True)
     fabric.print(f"Training speed metrics: {speed_log_path} (appended; cumulative values cover this run only)")
+=======
+    synthetic_kit = None
+    if synthetic_retrieval_prob > 0:
+        from litgpt.synthetic_retrieval import KINDS, RetrievalKit
+        from litgpt.tokenizer import Tokenizer
+        synthetic_kit = RetrievalKit.from_tokenizer(
+            Tokenizer(tok_dir), tuple(synthetic_kinds.split(",")) if synthetic_kinds else KINDS)
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 
     while global_step < max_steps and not training_finished:
         if not step_active:
@@ -1136,6 +1273,10 @@ def main(
         try:
             with logkv_timed("data", cuda=False):
                 train_data = next(loader_iter)
+                if synthetic_kit is not None:
+                    train_data = _with_synthetic_facts(train_data, synthetic_kit, synthetic_retrieval_prob,
+                                                       [data_shuffle_seed, fabric.global_rank, data_epoch,
+                                                        micro_batch_idx], synthetic_facts, synthetic_questions)
                 inputs = train_data[:, 0:context_length].contiguous().long()
                 targets = train_data[:, 1:context_length + 1].contiguous().long()
         except StopIteration:
@@ -1148,20 +1289,25 @@ def main(
 
         is_accumulating = (micro_batch_idx + 1) % gradient_accumulation_steps != 0
         micro_batch_idx += 1
+<<<<<<< HEAD
         step_tokens += inputs.numel()
         step_samples += inputs.size(0)
         current_second_order_scale = get_log_kv_second_order_scale(
             global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
         )
         model.set_log_kv_second_order_scale(current_second_order_scale)
+=======
+        current_second_order_scale = 0.0
+        if not log_kv_dense_mode:
+            current_second_order_scale = get_log_kv_second_order_scale(
+                global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
+            )
+            model.set_log_kv_second_order_scale(current_second_order_scale)
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            # Routes through _log_kv_train_lowmem_forward (training_log_kv is on
-            # and input_pos is None): chunked slot attention over the simulated
-            # compressed-KV stream, not a standard dense causal forward. The
-            # low-memory Function streams the forward without a graph and
-            # replays block-by-block in backward, so per-layer activation
-            # memory is O(T + train_block*S) instead of the naive O(T/2*S).
+            # Dense uses ordinary causal attention; LogKV uses streaming replay.
+            # Both reuse the chunked LM-head loss to avoid full-sequence logits.
             with logkv_timed("forward"):
                 loss = model(inputs, targets=targets, loss_chunk_size=entropy_chunk_size)
                 step_stats.accumulate(loss=loss.detach().item())
