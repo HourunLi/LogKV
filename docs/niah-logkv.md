@@ -285,10 +285,11 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   的 `babilong_qaN`；数据 `RMT-team/babilong-1k-samples`，环境变量 `BABILONG_DATASET` 可指向本地副本；它只到 128k，256k 的任务
   在 `dataset_kwargs` 里指定 `RMT-team/babilong`（每个长度 100 条，是另一批样本），`BABILONG_DATASET` 不替换它）；LongBench v2
   （仓库内固定的上游 `longbench2` 任务定义，兼容 `lm-eval 0.4.9`，数据 `recursal/longbench-v2`，四选一按似然打分，每题四次预填充；长于 block_size 的上下文
-  从开头截断，保留问题。数据集卡片没有按子集的配置时，`litgpt/longbench2_patch.py` 改从仓库快照里按文件名读出该子集；评测机器上的 hub 缓存
-  若把快照的软链接压平成写着 `../../blobs/<sha>` 的小文件、或丢了 `refs/main`，按快照条目读 blobs 里的文件）。
+  从开头截断，保留问题。`litgpt/longbench2_patch.py` 按文件名读取普通文件副本中的子集。只有数据准备脚本读取 hub 源缓存：
+  它会解析末尾可带 NUL 的 `../../blobs/<sha>` 链接文本，复制完整 blob，并兼容 `refs/main` 丢失的快照）。
   下载脚本将 20 个子集、503 道题额外复制为 `<HF_HOME>/longbench2`（或 `LONGBENCH2_DIR`）下的普通 parquet 文件，
-  校验 SHA256 与行数。评测与离线检查优先读取该副本，避免下载节点的软链接/本地 blobs 在评测节点不可用；
+  校验 SHA256 与行数。评测与离线检查只读取该副本，目录缺失或为空就报错，不回退到 hub 快照；
+  `diag.sh`、`eval.sh`、`majob.sh` 统一导出并打印 `LONGBENCH2_DIR`。
   已有完整 hub 数据时重新执行下载脚本即可生成副本，不必重新下载。多节点作业要求各节点能读取同一副本目录。
   它的上下文预算就是 block_size，所以长文本配置跑按长度命名的组 `longbench2_{32k,64k,128k,256k}`（`eval_tasks/longbench2_long`，
   与 `longbench2` 同样的 20 个子任务、提示和打分），各长度的结果才能分开。`eval.py` 在评测前检查：名字带长度的任务
