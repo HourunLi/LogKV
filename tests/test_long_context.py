@@ -330,14 +330,13 @@ def test_longbench2_subsets_come_from_the_snapshot_files_when_the_card_has_no_co
     loaded = datasets.load_dataset(path=patch.REPO, name="academic_single")  # as lm-eval's task calls it
     assert loaded["train"]["question"] == ["q1", "q2"]
     assert datasets.load_dataset(patch.REPO, name="multinews", split="train")["question"] == ["other"]
-    with pytest.raises(ValueError, match="no file"):
+    with pytest.raises(FileNotFoundError, match="plain directory"):
         datasets.load_dataset(patch.REPO, name="table_qa")
 
 
 
 def test_longbench2_reads_a_hub_cache_whose_links_were_flattened(tmp_path, monkeypatch):
-    """On the machines that evaluate, a synced hub cache may hold each snapshot link as a small file with the link's
-    text, and no refs/main: the snapshot is still found, and each file read from its blob."""
+    """The downloader can locate old source snapshots and resolve flattened links; evaluation uses copies."""
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     import datasets
@@ -349,7 +348,7 @@ def test_longbench2_reads_a_hub_cache_whose_links_were_flattened(tmp_path, monke
     pq.write_table(pa.table({"question": ["q1", "q2"], "answer": [0, 1]}), hub / "blobs" / "sha-a")
     shot = hub / "snapshots" / "c0ffee" / "academic_single"
     shot.mkdir(parents=True)
-    (shot / "train-0.parquet").write_text("../../../blobs/sha-a")  # flattened: 20 bytes of link text
+    (shot / "train-0.parquet").write_bytes(b"../../../blobs/sha-a\0")
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     import huggingface_hub
@@ -357,10 +356,10 @@ def test_longbench2_reads_a_hub_cache_whose_links_were_flattened(tmp_path, monke
     def not_cached(*args, **kwargs):
         raise huggingface_hub.errors.LocalEntryNotFoundError("no refs/main")
     monkeypatch.setattr(huggingface_hub, "snapshot_download", not_cached)
-    root, files = patch.snapshot()
+    root, files = patch.snapshot(prefer_plain=False)
     assert root == str(hub / "snapshots" / "c0ffee") and files == ["academic_single/train-0.parquet"]
     assert patch.real_file(shot / "train-0.parquet") == str(hub / "blobs" / "sha-a")
-    loaded = patch.load_subset(datasets.load_dataset, "academic_single", "train")
+    loaded = datasets.load_dataset("parquet", data_files={"train": [patch.real_file(shot / "train-0.parquet")]}, split="train")
     assert loaded["question"] == ["q1", "q2"]
 
 
@@ -572,7 +571,7 @@ def test_the_fetch_script_mends_hub_links_flattened_into_files(tmp_path, monkeyp
     (snapshot / names[2]).write_bytes(b"PAR1 cut short")
     def download_flattened(repo, name, **kwargs):
         (repo_dir / "blobs" / "ccc").write_bytes(whole)
-        (snapshot / name).write_text("../../../../blobs/ccc")
+        (snapshot / name).write_bytes(b"../../../../blobs/ccc\0")
         return str(snapshot / name)
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", download_flattened)
     fresh, _ = fetch.refetch("recursal/longbench-v2", names[2], str(snapshot))

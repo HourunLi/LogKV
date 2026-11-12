@@ -2135,8 +2135,12 @@ def main(
 
     # LongBench v2 cannot be dropped from a requested evaluation, even if an old launcher marks it optional.
     # Check its data before CUDA initialization and checkpoint/model loading.
-    _check_task_data([task for task in benchmark.split(",")
-                      if task.strip() == "longbench2" or task.strip().startswith("longbench2_")])
+    longbench2_tasks = [task for task in benchmark.split(",")
+                       if task.strip() == "longbench2" or task.strip().startswith("longbench2_")]
+    if longbench2_tasks and _is_main():
+        from litgpt.longbench2_patch import plain_folder
+        print(f"LongBench v2 evaluation data (ordinary files): {plain_folder()}", flush=True)
+    _check_task_data(longbench2_tasks)
 
     local_rank = _local_rank()
     world_size = _world_size()
