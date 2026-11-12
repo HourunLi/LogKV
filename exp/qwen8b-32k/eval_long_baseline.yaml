@@ -1,6 +1,6 @@
 # 长文本评测（只评测、不重训）：Qwen3-8B 的 LogKV P=1024，K/V 分数准入（同 checkpoint 的基线）。
 # 逐档评测 32K / 64K / 128K / 256K；每档窗口为长度 + 1024，YaRN 按长度取倍数。
-# 每个任务 100 条；模型与缓存参数继承本目录的配置。
+# 每个任务 100 条；模型与缓存参数继承本目录的配置。LongBench v2 必跑，缺数据时报错。
 #   bash eval.sh exp/qwen8b-32k/eval_long_baseline.yaml
 config: arc_gamma_k12_b128_p1024_2k.yaml
 eval_lengths: [32k, 64k, 128k, 256k]

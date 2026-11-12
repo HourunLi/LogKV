@@ -17,8 +17,9 @@ EVAL_SUITES chooses the tasks (default all): ruler (NIAH stage: all of RULER, 12
 ruler_qa_squad, whose 1204 SQuAD paragraphs cannot fill it), babilong, ppl (long_ppl_<L>, LONG_PPL_DATA), books
 (long_ppl_books_<L>, LONG_PPL_BOOKS), turns (niah_turns_<L>), longbench2 (longbench2_<L>) and infinitebench
 (infinitebench_<L>; INFINITEBENCH_DIR, <HF_HOME>/infinitebench or the hub cache). NIAH_ONLY=1 keeps ruler only. With
-the default suites the data-bound ones (ppl, books, longbench2, infinitebench) are optional: eval.py leaves them
-out, with the reason, when their data is not given (or their files are not whole); named suites must run.
+the default suites ppl, books and infinitebench are optional: eval.py leaves them out, with the reason, when
+their data is not given (or their files are not whole). LongBench v2 must run at every selected length;
+missing or incomplete data is an error with a download command. Named suites must run.
 
     python long_eval_plan.py <lengths> <suites or ""> <yarn_mode> <niah_only 0/1> <base overrides json or ""> <output dir> [skip]
 
@@ -37,7 +38,7 @@ import sys
 
 LENGTHS = {"32k": 32768, "64k": 65536, "128k": 131072, "256k": 262144}
 SUITES = ("ruler", "babilong", "ppl", "books", "turns", "longbench2", "infinitebench")
-DATA_SUITES = ("ppl", "books", "longbench2", "infinitebench")  # optional with the default suites: their data may be missing
+DATA_SUITES = ("ppl", "books", "infinitebench")  # optional with the default suites: their data may be missing
 ORIGINAL = 32768  # the trained length, YaRN's original_max_seq_len
 MARGIN = 1024
 RULER = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",

@@ -472,35 +472,10 @@ def _check_task_lengths(tasks, max_seq_length):
 
 
 def _longbench2_files_problem():
-    """Why LongBench v2 cannot load offline, or None. Its tasks read the repository snapshot in the hub cache
-    (litgpt/longbench2_patch.py), so every parquet file there must be whole: a cut download, a Git LFS pointer
-    or an error page in its place fails every subset (unused/fetch_long_eval_data.py --longbench2 checks the same)."""
-    try:
-        from litgpt.longbench2_patch import real_file, snapshot
+    """LongBench v2 is required; report missing subsets and damaged cache files before loading a model."""
+    from litgpt.longbench2_patch import data_problem
 
-        root, files = snapshot()
-    except Exception as error:  # noqa: BLE001 - not in the cache at all
-        return f"no LongBench v2 snapshot in the hub cache ({type(error).__name__}: {str(error)[:200]})"
-    if not files:
-        return f"the LongBench v2 snapshot {root} holds no data file"
-    bad = []
-    for name in files:
-        path = Path(real_file(Path(root) / name))  # through a flattened hub-cache link to its blob
-        if not name.endswith(".parquet"):
-            continue
-        try:
-            with open(path, "rb") as f:
-                head = f.read(4)
-                f.seek(-4, os.SEEK_END)
-                whole = path.stat().st_size >= 12 and head == b"PAR1" and f.read(4) == b"PAR1"
-        except OSError:
-            whole = False
-        if not whole:
-            bad.append(name)
-    if bad:
-        return (f"LongBench v2 files in {root} are not whole parquet: {bad[:3]}" + (f" and {len(bad) - 3} more"
-                if len(bad) > 3 else "") + " (unused/fetch_long_eval_data.py --longbench2 downloads them again)")
-    return None
+    return data_problem()
 
 
 INFINITEBENCH_FILES = ("passkey", "number_string", "kv_retrieval", "longbook_sum_eng", "longbook_qa_eng",
@@ -534,6 +509,10 @@ def _infinitebench_files_problem():
 def _check_task_data(tasks):
     """A task asked for by name whose data is not on disk fails here, with what to run, instead of in every rank's
     dataset loading (InfiniteBench reads its jsonl files offline from INFINITEBENCH_DIR or the hub cache)."""
+    if any(t.strip() == "longbench2" or t.strip().startswith("longbench2_") for t in tasks):
+        problem = _longbench2_files_problem()
+        if problem:
+            raise FileNotFoundError(problem)
     if any(t.strip().startswith("infinitebench_") for t in tasks):
         problem = _infinitebench_files_problem()
         if problem:
@@ -566,7 +545,7 @@ def _skip_optional_tasks(tasks, max_seq_length):
     kept = []
     for task in tasks:
         reason = None
-        if task in optional:
+        if task in optional and not task.startswith("longbench2_"):
             try:
                 _check_task_lengths([task], max_seq_length)
             except ValueError as error:
@@ -576,8 +555,6 @@ def _skip_optional_tasks(tasks, max_seq_length):
             elif reason is None and task.startswith("long_ppl_") and not task.startswith("long_ppl_books") \
                     and not os.environ.get("LONG_PPL_DATA"):
                 reason = "LONG_PPL_DATA is not set (unused/fetch_long_eval_data.py --ppl-hub emozilla/pg19-test)"
-            elif reason is None and task.startswith("longbench2_"):
-                reason = _longbench2_files_problem()
             elif reason is None and task.startswith("infinitebench_"):
                 reason = _infinitebench_files_problem()
         if reason is None:
@@ -2155,6 +2132,11 @@ def main(
     log_kv_diag_second_order_max_layer = _o(
         "log_kv_diag_second_order_max_layer", log_kv_diag_second_order_max_layer
     )
+
+    # LongBench v2 cannot be dropped from a requested evaluation, even if an old launcher marks it optional.
+    # Check its data before CUDA initialization and checkpoint/model loading.
+    _check_task_data([task for task in benchmark.split(",")
+                      if task.strip() == "longbench2" or task.strip().startswith("longbench2_")])
 
     local_rank = _local_rank()
     world_size = _world_size()
