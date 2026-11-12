@@ -1,7 +1,7 @@
 # Qwen3-8B-Base 的独立 32K LogKV P=1024 训练配置。
 # 本文件完整声明训练与 LogKV 参数；本目录的评测入口复用这份配置。
 # 全局 batch 64、每卡 micro batch 1：64 个训练进程时每步更新一次；更少进程按比例累积。
-# 保留 1200 个优化器步；全局 batch 改为 64 后，相同步数处理的样本数翻倍。
+# CPT 训练目标为 2000 个优化器步；中断后从本实验的 checkpoint 自动续训。
 # 先转换底模，再从仓库根目录启动训练：
 #   python -m litgpt convert_to_litgpt /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base
 #   BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen8b-32k/arc_gamma_k12_b128_p1024_2k.yaml
@@ -11,7 +11,7 @@ expid: qwen8b-32k-gamma_k12_b128_p1024_2k
 ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/
 global_batch_size: 64
 micro_batch_size: 1
-max_steps: 1200
+max_steps: 2000
 learning_rate: 5e-6
 weight_decay: 0.1
 num_devices: 8
