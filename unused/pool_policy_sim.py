@@ -1,0 +1,523 @@
+"""Offline replay of exact-pool policies on saved token surprisal (CPU only, no model).
+
+Input: the .npz files that ``--save-surprisal`` writes (unused/niah_surprisal.py for NIAH prompts,
+unused/reuse_label_stats.py for natural training blocks). They hold token ids, each token's
+surprisal in bits and the cache settings: recent window R, flush granularity F, span cap, exact pool
+P and the span-boundary tokens.
+
+The replay follows the cache's rhythm: tokens enter one at a time; once R + F are waiting, the oldest
+F leave the recent window, every candidate span (Alpha's cut) that has fully left it competes with
+the spans already in the pool, and the cache's own selection (alpha_log_kv.choose_spans: whole-span
+swaps by value density, pool spans x1.1) fills P tokens. A span that is not kept is gone (it is
+averaged into the ladder). Scores become densities as in the cache: SURPRISAL_BASE ** score per token
+for the token scores and z scores, 2 ** bits for sum, and for the word scores the word's inverse
+probability 2 ** bits for the whole span (density 2 ** bits / length; per_span=False gives it per
+token instead, as the cache did before).
+
+A policy gives each span the value
+
+    v(T) = (I + beta * M(T)) * g(T - last(T))
+
+    I        admission information: the span's surprisal score (mean | top4 | topq | max | mix | sum),
+             a word score (word_max: the code length of the span's most informative word, a word being
+             a token that begins one and the tokens up to the next, its code length the sum of their
+             surprisal; word_top2: the mean of its two highest; word_first: word_max with every word
+             credited the code length it had at its first mention in the stream, so a sentence that
+             names a rare entity again keeps its weight), a multi-dimensional z score (multi:
+             mean and top4; multi_word: mean and word_max), or 1 for the recency baseline
+    g        forgetting: none, power (1 + age / tau) ** -alpha, or exp(-age / tau)
+    last(T)  the span's end, or with reuse on, the latest re-occurrence up to T of one of its
+             informative n-grams (n-grams whose surprisal inside the span is at least reuse_bits)
+    M(T)     with reuse boost, the summed surprisal of those re-occurrences up to T (0 otherwise)
+
+Everything is causal: a value at T uses only tokens before T. Reported per policy:
+
+    NIAH     the share of prompts whose needle value is still exact (pool or recent) when the
+             prompt ends, per task, and for needles in the first third of the prompt (early)
+    natural  hit rate of far reuse (unused/reuse_label_stats.py's label, n-gram n_label, first
+             occurrence >= label_bits, b - a >= R): is the copy at a exact when b is read; streams
+             of 1 and --concat blocks (positions continue across the joined blocks)
+    reused   the share of pool tokens (by span) whose span saw a re-occurrence while kept
+
+    python unused/pool_policy_sim.py --niah niah.npz --natural natural.npz --concat 4 --out sim.json
+
+The table (all policies, then the ten best by mean NIAH and by the longest streams' hit rate) is also
+written to ``<out stem>.summary.txt``; ``--report <out>.json`` rebuilds it from a finished run.
+``--explain K`` also writes ``<out stem>.explain.txt``: for each policy, up to K prompts per task whose
+needle was lost, the needle's span and the spans the pool ended up holding, with their text and scores.
+"""
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "unused"))
+from litgpt.alpha_log_kv import (CJK, EMPTY, SPACE, SURPRISAL_BASE, SURPRISAL_CAP,  # noqa: E402
+                                 SURPRISAL_WORD_CAP, RunningStats, SpanCut, choose_spans, word_classes,
+                                 word_starts)
+from niah_surprisal import SurprisalStore, cut, write_summary  # noqa: E402
+from reuse_label_stats import reuse_pairs  # noqa: E402
+
+SCORES = ("mean", "top4", "topq", "max", "mix", "sum", "word_max", "word_top2", "word_first")
+MULTI = {"multi": ("mean", "top4"), "multi_word": ("mean", "word_max")}  # z per dimension, max over them
+WORD_SCORES = ("word_max", "word_top2", "word_first", "multi_word")
+
+
+@dataclass(frozen=True)
+class Policy:
+    score: str = "mean"          # one of SCORES, multi, multi_word or recency
+    decay: str = "none"          # none | power | exp
+    tau: float = 16384.
+    alpha: float = 1.
+    reuse: str = "none"          # none | refresh | boost
+    beta: float = 0.5
+    hysteresis: float = 1.1
+    per_span: bool = True        # word scores: the word's value is the whole span's (density / length)
+
+    @property
+    def name(self) -> str:
+        decay = {"none": "none", "power": f"pow(tau={self.tau:g},a={self.alpha:g})",
+                 "exp": f"exp(tau={self.tau:g})"}[self.decay]
+        reuse = f"boost(b={self.beta:g})" if self.reuse == "boost" else self.reuse
+        return (f"{self.score}|{decay}|{reuse}" + (f"|h={self.hysteresis:g}" if self.hysteresis != 1.1 else "")
+                + ("" if self.per_span or self.score not in WORD_SCORES else "|per_token"))
+
+
+def default_policies() -> list[Policy]:
+    """The grid the first replay compares: admission score x forgetting x reuse, plus recency."""
+    decays = [dict(decay="none"), dict(decay="power", tau=4096., alpha=.5), dict(decay="power", tau=4096., alpha=1.),
+              dict(decay="power", tau=16384., alpha=.5), dict(decay="power", tau=16384., alpha=1.),
+              dict(decay="exp", tau=16384.)]
+    reuses = [dict(reuse="none"), dict(reuse="refresh"), dict(reuse="boost", beta=.5)]
+    out = [Policy(score=s, **d, **r) for s, d, r in itertools.product(("mean", "top4", "topq"), decays, reuses)]
+    return out + [Policy(score="recency", decay="exp", tau=4096.)] + [
+        Policy(score=s) for s in ("mix", "multi", "sum", "word_max", "word_top2", "word_first", "multi_word")]
+
+
+def word_code_lengths(s, starts, word_starts):
+    """Each word's first position and code length (the sum of its tokens' surprisal); a word also
+    begins at every span start, so no word crosses spans."""
+    begin = np.asarray(word_starts, dtype=bool).copy()
+    begin[np.asarray(starts, dtype=np.int64)] = True
+    first = np.flatnonzero(begin)
+    return first, np.add.reduceat(np.nan_to_num(np.asarray(s, dtype=np.float64)), first)
+
+
+def first_mention_bits(ids, first, bits) -> np.ndarray:
+    """Each word's code length at the first mention of the same word (the same token ids) so far."""
+    ids = np.asarray(ids, dtype=np.int64)
+    seen, out = {}, np.empty(len(first))
+    for k, (a, b) in enumerate(zip(first.tolist(), np.r_[first[1:], len(ids)].tolist())):
+        out[k] = seen.setdefault(ids[a:b].tobytes(), bits[k])
+    return out
+
+
+def span_base(s, starts, stops, word_starts=None, ids=None) -> dict[str, np.ndarray]:
+    """Admission scores per span from token surprisal (nan tokens ignored, empty spans score 0); the
+    word scores need ``word_starts`` (and word_first the token ``ids``), else they stay 0."""
+    out = {name: np.zeros(len(starts)) for name in SCORES}
+    if word_starts is not None and len(starts):
+        first, bits = word_code_lengths(s, starts, word_starts)
+        mention = first_mention_bits(ids, first, bits) if ids is not None else np.zeros(len(first))
+        bounds = np.searchsorted(first, np.r_[starts, len(s)])
+        for i in range(len(starts)):
+            words = np.sort(bits[bounds[i]:bounds[i + 1]])
+            if len(words):
+                out["word_max"][i], out["word_top2"][i] = words[-1], words[-2:].mean()
+                out["word_first"][i] = mention[bounds[i]:bounds[i + 1]].max()
+    for i, (a, b) in enumerate(zip(starts, stops)):
+        part = s[a:b]
+        part = np.sort(part[np.isfinite(part)])
+        if len(part):
+            out["mean"][i], out["max"][i] = part.mean(), part[-1]
+            out["top4"][i] = part[-4:].mean()
+            out["topq"][i] = part[-max(1, len(part) // 4):].mean()
+            out["sum"][i] = part.sum()  # -log2 p(span), as log_kv_gamma_surprisal: sum ranks spans
+    out["mix"] = (out["mean"] + out["top4"]) / 2
+    out["recency"] = np.ones(len(starts))
+    return out
+
+
+class Stream:
+    """One token sequence prepared for replay: spans, admission scores, n-gram re-occurrence index."""
+
+    def __init__(self, ids, s, boundary, max_span, reuse_n=2, reuse_bits=6., label_n=3, label_bits=6.,
+                 recent=2048, word_starts=None, **fields):
+        self.ids, self.s = np.asarray(ids, dtype=np.int64), np.asarray(s, dtype=np.float64)
+        self.fields = fields
+        # word_starts flags the tokens that begin a word (the word scores need it).
+        self.starts, self.stops = cut(self.ids, boundary, max_span)
+        self.base = span_base(self.s, self.starts, self.stops, word_starts, self.ids)
+        n = reuse_n
+        self.span_keys: list[np.ndarray] = [np.empty(0, dtype=np.int64)] * len(self.starts)
+        self.occurrences: dict[int, np.ndarray] = {}
+        self.info = np.zeros(len(self.ids))
+        if len(self.ids) > n:
+            windows = np.lib.stride_tricks.sliding_window_view(self.ids, n)
+            _, group = np.unique(windows, axis=0, return_inverse=True)
+            group = np.asarray(group).reshape(-1)
+            ends = np.arange(n - 1, len(self.ids))  # an n-gram is known once its last token is read
+            values = np.lib.stride_tricks.sliding_window_view(np.nan_to_num(self.s, nan=0.), n).mean(1)
+            self.key = np.full(len(self.ids), -1, dtype=np.int64)
+            self.key[ends] = group
+            self.info[ends] = values
+            order = np.argsort(group, kind="stable")
+            split = np.flatnonzero(np.diff(group[order])) + 1
+            for chunk in np.split(order, split):
+                self.occurrences[int(group[chunk[0]])] = ends[chunk]
+            for i, (a, b) in enumerate(zip(self.starts, self.stops)):
+                inside = np.arange(max(a + n - 1, n - 1), b)
+                inside = inside[self.info[inside] >= reuse_bits]
+                self.span_keys[i] = np.unique(self.key[inside])
+        a, b, first, _, _ = reuse_pairs(self.ids, self.s, label_n, recent)
+        keep = first >= label_bits
+        order = np.argsort(b[keep], kind="stable")
+        self.events_a, self.events_b = a[keep][order], b[keep][order]
+        self._memo: dict[tuple[int, int], tuple] = {}
+
+    def span_of(self, positions):
+        return np.searchsorted(self.stops, positions, side="right")
+
+    def reuse(self, span: int, time: int):
+        """Latest re-occurrence (< time) after the span of one of its informative n-grams, and the summed
+        surprisal of all such re-occurrences; (None, 0.) when there is none."""
+        if (span, time) in self._memo:  # every policy replays the same flush times
+            return self._memo[(span, time)]
+        latest, mass, stop = None, 0., int(self.stops[span])
+        for key in self.span_keys[span]:
+            occ = self.occurrences[int(key)]
+            lo, hi = np.searchsorted(occ, stop), np.searchsorted(occ, time)
+            if hi > lo:
+                latest = int(occ[hi - 1]) if latest is None else max(latest, int(occ[hi - 1]))
+                mass += float(self.info[occ[lo:hi]].sum())
+        self._memo[(span, time)] = latest, mass
+        return latest, mass
+
+
+def concat(rows):
+    """One stream from several rows of a SurprisalStore (positions continue)."""
+    return dict(ids=np.concatenate([r["ids"] for r in rows]), surprisal=np.concatenate([r["surprisal"] for r in rows]))
+
+
+def density(policy: Policy, score, lengths) -> np.ndarray:
+    """The cache's value density for a score (before forgetting)."""
+    if policy.score == "recency":
+        return np.ones(len(score))
+    if policy.score == "sum":
+        return 2. ** np.minimum(score, 512.)
+    if policy.score in ("word_max", "word_top2", "word_first"):
+        value = 2. ** np.minimum(score, SURPRISAL_WORD_CAP)
+        return value / np.maximum(lengths, 1) if policy.per_span else value
+    return SURPRISAL_BASE ** np.minimum(score, SURPRISAL_CAP)
+
+
+def value(policy: Policy, stream: Stream, spans: np.ndarray, time: int, base=None) -> np.ndarray:
+    base = stream.base[policy.score][spans].copy() if base is None else base
+    last = stream.stops[spans].astype(np.float64)
+    if policy.reuse != "none":
+        for j, span in enumerate(spans):
+            latest, mass = stream.reuse(int(span), time)
+            if latest is not None:
+                last[j] = max(last[j], latest + 1)
+            if policy.reuse == "boost":
+                base[j] += policy.beta * mass
+    age = np.maximum(time - last, 0.)
+    base = density(policy, base, (stream.stops - stream.starts)[spans])
+    if policy.decay == "power":
+        return base * (1. + age / policy.tau) ** -policy.alpha
+    if policy.decay == "exp":
+        return base * np.exp(-age / policy.tau)
+    return base
+
+
+def replay(stream: Stream, policy: Policy, pool: int, recent: int, flush: int) -> dict:
+    """Run one policy over one stream; returns the final pool, the archived prefix and hit counts."""
+    n = len(stream.ids)
+    lengths = stream.stops - stream.starts
+    kept = np.zeros(0, dtype=np.int64)
+    snapshots = []  # (time, kept spans) after every flush
+    archived, next_span, reused_tokens, kept_tokens = 0, 0, 0, 0
+    time = recent + flush
+    multi = policy.score in MULTI
+    stats = RunningStats(2)  # multi scores: each dimension against the spans archived so far
+    features = np.stack([stream.base[d] for d in MULTI[policy.score]], 1) if multi else None
+    while time <= n:
+        archived += flush
+        first = next_span
+        while next_span < len(stream.stops) and stream.stops[next_span] <= archived:
+            next_span += 1
+        candidates = np.arange(first, next_span)
+        spans = np.concatenate((kept, candidates))
+        base = None
+        if multi:
+            stats.update(features[candidates])
+            base = stats.z(features[spans]).max(1)
+        v = value(policy, stream, spans, time, base)
+        v[:len(kept)] *= policy.hysteresis / 1.1  # choose_spans applies the cache's 1.1
+        chosen = select(spans, lengths[spans], len(kept), v, pool)
+        dropped = np.setdiff1d(kept, chosen)
+        for span in dropped:  # a span leaving the pool: was it re-occurred while kept?
+            reused_tokens += lengths[span] * (stream.reuse(int(span), time)[0] is not None)
+            kept_tokens += lengths[span]
+        kept = np.sort(np.asarray(chosen, dtype=np.int64))
+        snapshots.append((time, set(kept.tolist())))
+        time += flush
+    end = n
+    for span in kept:
+        reused_tokens += lengths[span] * (stream.reuse(int(span), end)[0] is not None)
+        kept_tokens += lengths[span]
+    # Far reuse: is the copy at a exact when b is read? Exact: in the pool, or its span has not fully
+    # left the recent window yet (the cache holds such a span open).
+    hits, times = 0, [t for t, _ in snapshots]
+    for a, b in zip(stream.events_a, stream.events_b):
+        k = int(np.searchsorted(times, b, side="right")) - 1
+        span = int(stream.span_of(a))
+        archived_then = 0 if k < 0 else (k + 1) * flush
+        if stream.stops[span] > archived_then or span in snapshots[k][1]:
+            hits += 1
+    return dict(kept=set(kept.tolist()), archived=archived, hits=hits, events=len(stream.events_a),
+                reused_tokens=reused_tokens, kept_tokens=kept_tokens)
+
+
+def select(spans, lengths, n_old, densities, pool) -> np.ndarray:
+    """The spans the cache's choose_spans keeps of [pool | candidates] (all closed)."""
+    total = int(lengths.sum())
+    old = np.arange(len(spans)) < n_old
+    cut = SpanCut([np.arange(total)], [np.arange(total)], [np.asarray(lengths, dtype=np.int64)], [old],
+                  [np.ones(len(spans), dtype=bool)])
+    kept = np.zeros(total, dtype=bool)
+    kept[choose_spans(cut, np.asarray(densities, dtype=np.float64).tolist(), pool).keep[0]] = True
+    return spans[kept[np.cumsum(lengths) - lengths]]
+
+
+def needle_spans(stream: Stream) -> list[np.ndarray]:
+    """The spans of each asked needle value (multi-needle prompts saved with ``asked_values``; else the
+    one saved value)."""
+    asked = json.loads(stream.fields["asked_values"]) if "asked_values" in stream.fields else [
+        [stream.fields["value_start"], stream.fields["value_stop"]]]
+    return [np.unique(stream.span_of(np.arange(lo, hi))) for lo, hi in asked]
+
+
+def needle_kept(stream: Stream, result: dict) -> float:
+    """The share of asked needle values whose every token is exact when the prompt ends."""
+    values = needle_spans(stream)
+    return sum(all(stream.stops[s] > result["archived"] or s in result["kept"] for s in spans)
+               for spans in values) / len(values)
+
+
+def static_score(policy: Policy, stream: Stream, archived: int) -> np.ndarray:
+    """The policy's admission score per span without forgetting or reuse (multi scores: z against all
+    the archived spans), for explaining a replay."""
+    if policy.score not in MULTI:
+        return stream.base[policy.score]
+    features = np.stack([stream.base[d] for d in MULTI[policy.score]], 1)
+    stats = RunningStats(2)
+    stats.update(features[stream.stops <= archived])
+    return stats.z(features).max(1)
+
+
+def explain(policy: Policy, stream: Stream, result: dict, decode, top: int = 5) -> list[str]:
+    """The lost needle's spans and the pool's best spans: text, length, scores and rank."""
+    score = static_score(policy, stream, result["archived"])
+    archived = np.flatnonzero(stream.stops <= result["archived"])
+    order = archived[np.argsort(-score[archived], kind="stable")]
+    rank = {int(span): i + 1 for i, span in enumerate(order)}
+
+    def line(span):
+        a, b = int(stream.starts[span]), int(stream.stops[span])
+        fields = " ".join(f"{k}={stream.base[k][span]:.1f}" for k in ("mean", "top4", "sum", "word_max"))
+        text = decode(stream.ids[a:b]).replace("\n", "⏎")
+        return (f"    span {span} [{a},{b}) rank {rank.get(int(span), '-')}/{len(archived)} {policy.score}="
+                f"{score[span]:.2f} {fields}: {text[:160]!r}")
+
+    kept = sorted(result["kept"], key=lambda span: -score[span])
+    out = [f"[{policy.name}] {stream.fields.get('task')} #{stream.fields.get('index')} "
+           f"depth={stream.fields.get('depth', float('nan')):.2f}; pool {len(kept)} spans, "
+           f"lowest kept rank {max((rank.get(int(s), 0) for s in kept), default=0)}", "  needle:"]
+    out += [line(span) for spans in needle_spans(stream) for span in spans]
+    out += [f"  pool (best {top}):"] + [line(span) for span in kept[:top]]
+    return out
+
+
+def evaluate(policies, niah, natural, pool, recent, flush, explain_k=0, decode=None):
+    rows, explained = [], []
+    for policy in policies:
+        row = dict(policy=policy.name, **asdict(policy))
+        by_task: dict[str, list[bool]] = {}
+        early = []
+        reused = kept = 0
+        for stream in niah:
+            result = replay(stream, policy, pool, recent, flush)
+            ok = needle_kept(stream, result)
+            by_task.setdefault(stream.fields["task"], []).append(ok)
+            if ok < 1 and sum(v < 1 for v in by_task[stream.fields["task"]]) <= explain_k:
+                explained += explain(policy, stream, result, decode) + [""]
+            if stream.fields["depth"] < 1 / 3:
+                early.append(ok)
+            reused, kept = reused + result["reused_tokens"], kept + result["kept_tokens"]
+        row["niah"] = {task: float(np.mean(v)) for task, v in by_task.items()}
+        row["niah_early"] = float(np.mean(early)) if early else float("nan")
+        for label, streams in natural.items():
+            hits = events = 0
+            for stream in streams:
+                result = replay(stream, policy, pool, recent, flush)
+                hits, events = hits + result["hits"], events + result["events"]
+                reused, kept = reused + result["reused_tokens"], kept + result["kept_tokens"]
+            row[f"natural_{label}"] = hits / events if events else float("nan")
+        row["reused"] = reused / kept if kept else float("nan")
+        rows.append(row)
+        print(format_row(row), flush=True)
+    return rows, explained
+
+
+def summary(saved: dict) -> str:
+    """All policies in grid order, then the ten best by mean NIAH and by the longest natural hit rate."""
+    rows = saved["rows"]
+    lines = [f"code {saved.get('code', '?')}; pool {saved['pool']}, recent {saved['recent']}, flush {saved['flush']}"
+             f"{'; words end at whitespace only' if saved.get('space_words') else ''}; "
+             f"reuse {saved['reuse_n']}-grams >= {saved['reuse_bits']:g} bits; "
+             f"far-reuse label {saved['label_n']}-grams >= {saved['label_bits']:g} bits"
+             + (f"; {saved['streams']}" if saved.get("streams") else ""), "", "all policies:"]
+    lines += [format_row(row) for row in rows]
+
+    def niah_mean(row):
+        return float(np.mean(list(row["niah"].values()))) if row["niah"] else float("nan")
+
+    lines += ["", "best 10 by mean NIAH:"] + [format_row(r) for r in sorted(rows, key=niah_mean, reverse=True)[:10]]
+    natural = [k for k in (rows[0] if rows else {}) if k.startswith("natural_")]
+    if natural:
+        key = natural[-1]
+        best = sorted(rows, key=lambda r: r[key], reverse=True)[:10]
+        lines += ["", f"best 10 by {key}:"] + [format_row(r) for r in best]
+    return "\n".join(lines)
+
+
+def format_row(row) -> str:
+    niah = " ".join(f"{task.replace('niah_single_', 's')}={v:.2f}" for task, v in row["niah"].items())
+    natural = " ".join(f"{k[len('natural_'):]}={row[k]:.3f}" for k in row if k.startswith("natural_"))
+    return f"{row['policy']:42s} {niah} early={row['niah_early']:.2f} | hit {natural} | reused={row['reused']:.2f}"
+
+
+def load_tokenizer(tokenizer_dir, config):
+    """The tokenizer (``tokenizer_dir``, else the one of the saved config: the YAML's tokenizer_dir /
+    resume_dir / ckpt_dir, then its checkpoint directory)."""
+    from litgpt.tokenizer import Tokenizer
+    if tokenizer_dir is None:
+        import importlib
+        import train_retention as tr
+        cfg = tr.load_config(config)
+        tokenizer_dir = tr.tokenizer_dir(cfg) or importlib.import_module("eval")._resolve_checkpoint_dir(cfg["save_path"])
+    return Tokenizer(tokenizer_dir)
+
+
+def code_version() -> str:
+    """The checkout's commit (with "+dirty" for uncommitted changes), so a summary names its code."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True).stdout.strip()
+    try:
+        return (git("rev-parse", "--short", "HEAD") or "?") + ("+dirty" if git("status", "--porcelain", "-uno") else "")
+    except OSError:
+        return "?"
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--niah", default=None, help="unused/niah_surprisal.py --save-surprisal output")
+    p.add_argument("--natural", default=None, help="unused/reuse_label_stats.py --save-surprisal output")
+    p.add_argument("--concat", default="4", help="also join this many natural blocks per stream (comma list)")
+    p.add_argument("--pool", type=int, default=None, help="exact pool tokens (default: the saved P)")
+    p.add_argument("--recent", type=int, default=None)
+    p.add_argument("--flush", type=int, default=None)
+    p.add_argument("--reuse-n", type=int, default=2, help="n-gram length the policies watch for re-occurrence")
+    p.add_argument("--reuse-bits", type=float, default=6., help="informative n-grams: surprisal in the span")
+    p.add_argument("--label-n", type=int, default=3, help="far-reuse label n-gram (natural hit rate)")
+    p.add_argument("--label-bits", type=float, default=6., help="far-reuse label first-occurrence threshold")
+    p.add_argument("--policies", default=None, help="JSON list of Policy fields (default: the built-in grid)")
+    p.add_argument("--tokenizer", default=None,
+                   help="tokenizer dir for word boundaries and --explain text (default: the one of the saved config)")
+    p.add_argument("--space-words", action="store_true",
+                   help="words end only at whitespace (and CJK), the rule before lexical words")
+    p.add_argument("--explain", type=int, default=0,
+                   help="per policy, explain up to this many lost needles per task (<out stem>.explain.txt)")
+    p.add_argument("--out", default="pool_policy_sim.json")
+    p.add_argument("--report", default=None, help="a finished run's .json: write its summary, replay nothing")
+    args = p.parse_args()
+    if args.report:
+        with open(args.report) as f:
+            write_summary(args.report, summary(json.load(f)))
+        return
+    if not args.niah and not args.natural:
+        raise SystemExit("give --niah and/or --natural (.npz from --save-surprisal)")
+
+    loaded = {name: SurprisalStore.load(path) for name, path in (("niah", args.niah), ("natural", args.natural)) if path}
+    meta = next(iter(loaded.values()))[0]
+    pool, recent, flush = args.pool or meta["pool"], args.recent or meta["recent"], args.flush or meta["flush"]
+    boundary = np.zeros(max(max(meta["boundary_ids"]) + 1, 1), dtype=bool)
+    boundary[meta["boundary_ids"]] = True
+    policies = default_policies() if args.policies is None else [Policy(**d) for d in json.loads(args.policies)]
+    classes = decode = None
+    if args.explain or any(p.score in WORD_SCORES for p in policies):
+        import torch
+        tokenizer = load_tokenizer(args.tokenizer, meta["config"])
+        classes = word_classes(tokenizer.gamma_literal_texts)
+        def decode(ids):
+            return tokenizer.decode(torch.as_tensor(np.asarray(ids)))
+
+    def words_of(ids):
+        if classes is None:
+            return None
+        if args.space_words:
+            starts = np.isin(classes[ids, 0], (SPACE, CJK, EMPTY))
+            starts[:1] = True
+            return starts
+        return word_starts(ids, classes)
+
+    def prepare(row, **fields):
+        ids = row["ids"]
+        table = boundary if boundary.size > ids.max() else np.pad(boundary, (0, int(ids.max()) + 1 - boundary.size))
+        return Stream(ids, row["surprisal"], table, meta["max_span"], args.reuse_n, args.reuse_bits, args.label_n,
+                      args.label_bits, recent, words_of(ids), **fields)
+
+    niah = []
+    if "niah" in loaded:
+        for row in loaded["niah"][1]:
+            niah.append(prepare(row, **{k: v for k, v in row.items() if k not in ("ids", "surprisal")}))
+    natural = {}
+    if "natural" in loaded:
+        rows = loaded["natural"][1]
+        natural["32k"] = [prepare(row) for row in rows]
+        for k in (int(x) for x in args.concat.split(",") if x):
+            if k > 1 and len(rows) >= k:
+                natural[f"{k}x"] = [prepare(concat(rows[i:i + k])) for i in range(0, len(rows) - k + 1, k)]
+    print(f"pool {pool}, recent {recent}, flush {flush}; {len(niah)} NIAH prompts, "
+          + ", ".join(f"{len(v)} natural streams ({k})" for k, v in natural.items()) + f"; {len(policies)} policies",
+          flush=True)
+    rows, explained = evaluate(policies, niah, natural, pool, recent, flush, args.explain, decode)
+    saved = dict(code=code_version(), pool=pool, recent=recent, flush=flush, space_words=args.space_words,
+                 reuse_n=args.reuse_n,
+                 reuse_bits=args.reuse_bits,
+                 label_n=args.label_n, label_bits=args.label_bits, rows=rows,
+                 streams=f"{len(niah)} NIAH prompts, " + ", ".join(f"{len(v)} natural streams ({k})"
+                                                                    for k, v in natural.items()))
+    Path(args.out).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+    with open(args.out, "w") as f:
+        json.dump(saved, f, indent=1)
+    print(f"saved {args.out}")
+    write_summary(args.out, summary(saved))
+    if args.explain:
+        path = Path(args.out).expanduser().resolve().with_suffix(".explain.txt")
+        path.write_text("\n".join(explained) + "\n")
+        print(f"lost needles explained in {path}")
+
+
+if __name__ == "__main__":
+    main()

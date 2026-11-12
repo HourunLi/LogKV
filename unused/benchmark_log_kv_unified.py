@@ -20,9 +20,11 @@ import sys
 import time
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from litgpt.alpha_log_kv import CueStream
 from litgpt.log_kv_cache import LogStructuredKVCache, _UnifiedReduceTorch, _triton_route, _triton_updates
 
 
@@ -303,6 +305,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--device', default='cuda')
     p.add_argument('--pattern', choices=('random', 'clustered'), default='random')
+    p.add_argument('--cluster-skew', type=float, default=0.,
+                   help='clustered pattern: draw cluster c with weight exp(-skew * c / clusters); skewed clusters '
+                        'saturate top levels sooner (with --gamma-level-slack 0 within 32K)')
     p.add_argument('--profile-dir', help='Write CPU/CUDA operator tables, trace and Python profile; replaces stage diagnostics')
     for name, default in [('tokens', 2048), ('dim', 128), ('batch', 1), ('groups', 1),
                           ('clusters', 12), ('B', 256), ('flushes', 2), ('iters', 3)]:
@@ -314,6 +319,12 @@ def main():
     p.add_argument('--alpha-span-max-tokens', type=int, default=64)
     p.add_argument('--beta-novelty', action='store_true')
     p.add_argument('--beta-adaptive-merge', action='store_true')
+    p.add_argument('--gamma-level0-reinsert', action='store_true',
+                   help='Gamma: delayed Alpha evictions re-sort only ladder level 0')
+    p.add_argument('--gamma-top-merge', choices=('fold', 'lightest'), default='fold')
+    p.add_argument('--gamma-level-slack', type=int, default=2)
+    p.add_argument('--gamma-cue-tokens', type=int, default=0,
+                   help='Gamma cues: score exact spans against this many opening tokens of synthetic Zipf ids')
     args = p.parse_args()
     if min(args.tokens, args.dim, args.batch, args.groups, args.clusters, args.B, args.flushes, args.iters) < 1:
         p.error('all sizes and iteration counts must be positive')
@@ -334,9 +345,18 @@ def main():
         semantic_merge_passes=args.merge_passes,
         alpha_exact_tokens=args.alpha_exact_tokens, alpha_span_max_tokens=args.alpha_span_max_tokens,
         beta_novelty=args.beta_novelty, beta_adaptive_merge=args.beta_adaptive_merge,
+        gamma_level0_reinsert=args.gamma_level0_reinsert, gamma_top_merge=args.gamma_top_merge,
+        gamma_level_slack=args.gamma_level_slack, gamma_cue_tokens=args.gamma_cue_tokens,
         device=device, dtype=dtype, cos_cache=torch.ones(n, args.dim, device=device),
         sin_cache=torch.zeros(n, args.dim, device=device), rope_n_elem=args.dim,
     )
+    if args.gamma_cue_tokens:
+        # Synthetic Zipf ids so that some opening tokens recur; mechanics and host cost only.
+        ids = np.random.default_rng(17).zipf(1.3, size=(args.batch, n)) % 50000
+        kinds = np.zeros_like(ids)
+        kinds[:, args.gamma_cue_tokens // 2] = 2
+        cache.cue_stream = CueStream(args.gamma_cue_tokens)
+        cache.cue_stream.ingest(ids, kinds, [0] * args.batch)
     fused = device.type == 'cuda' and _triton_route() is not None
     if fused:
         check_round_pairs(cache, device)
@@ -349,7 +369,11 @@ def main():
     for step in range(args.flushes):
         k = torch.randn(args.batch, args.groups, args.tokens, args.dim, device=device, dtype=dtype)
         if args.pattern == 'clustered':
-            labels = torch.randint(args.clusters, k.shape[:-1], device=device)
+            if args.cluster_skew:
+                weights = torch.exp(-args.cluster_skew * torch.arange(args.clusters, device=device) / args.clusters)
+                labels = torch.multinomial(weights, k.shape[:-1].numel(), replacement=True).view(k.shape[:-1])
+            else:
+                labels = torch.randint(args.clusters, k.shape[:-1], device=device)
             k = .03 * k + prototypes.gather(2, labels[..., None].expand_as(k))
         pos = torch.arange(step * args.tokens, (step + 1) * args.tokens, device=device)
         host = [list(range(step * args.tokens, (step + 1) * args.tokens))] * args.batch
@@ -393,7 +417,9 @@ def main():
                           'route_backend': 'triton' if fused else 'torch',
                           'pairing_rule': 'frozen_mnn' if args.merge_passes > 1 else 'mnn',
                           'route_group_tile': cache._semantic_unified_tile(args.batch * args.groups, args.tokens, device),
-                          'effective_B': cache.B, 'exact_count': cache.alpha_count,
+                          'effective_B': cache.B, 'levels': cache.L_alloc, 'exact_count': cache.alpha_count,
+                          'saturated_top_levels': sum(c[-1] == cache.B for row in cache._semantic_counts
+                                                      for lane in row for c in lane),
                           'reference_checks_scope': 'shared_unified_route_and_pairwise_updates',
                           'reference_pairs_verified': True if fused else None,
                           'reference_updates_verified': True if fused else None,

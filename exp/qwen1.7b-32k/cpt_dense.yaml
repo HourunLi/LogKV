@@ -1,0 +1,29 @@
+# Qwen3-1.7B-Base 全程 dense CPT；数据与训练超参对齐 Gamma cue 32K 实验。
+# 只训练，不评测：
+#   BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/cpt_dense.yaml
+# 训练后只评测捞针：
+#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/cpt_dense.yaml
+config: base.yaml
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
+resume_dir: null
+auto_resume: true
+
+expid: qwen1.7b-32k-cpt-dense
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-dense
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging-cpt-dense
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb/tb-32k-cpt-dense
+
+max_steps: 1200
+learning_rate: 5e-6
+min_lr: 3e-6
+warmup_steps: 100
+save_interval: 400
+entropy_chunk_size: 1024
+activation_checkpointing: true
+run_eval: ""
+
+# 训练为完整因果 attention，后续评测使用完整 KV；不分簇、不压缩。
+log_kv_dense_mode: true
+log_kv_semantic_clusters: false
+log_kv_alpha_exact_tokens: 0
+log_kv_second_order_scale: 0

@@ -78,6 +78,70 @@ def test_vectorized_span_runs_match_token_loop():
             _token_loop_runs(new_pos, ends, pending, pending_pos, max_span)
 
 
+def _span_loop_cut(old_spans, old_positions, new_positions, ends, old_width, max_span):
+    """The per-span candidate loop `cut_spans` vectorizes: (ranges, old, closed) per span."""
+    from litgpt.alpha_log_kv import _new_runs
+
+    rows = []
+    for spans, old_pos, new_pos, boundaries in zip(old_spans, old_positions, new_positions, ends):
+        row, offset, pending = [], 0, None
+        for length, closed in spans:
+            if closed:
+                row.append(([(offset, offset + length)], True, True))
+            else:
+                pending = (offset, offset + length)
+            offset += length
+        all_pos = [*old_pos, *[0] * (old_width - len(old_pos)), *new_pos]
+        pending_len = 0 if pending is None else pending[1] - pending[0]
+        pending_closed, starts, stops, closed = _new_runs(
+            new_pos, boundaries, pending_len, all_pos[pending[1] - 1] if pending_len else 0, max_span)
+        if pending_closed:
+            row.append(([pending], False, True))
+        for i, (start, stop, done) in enumerate(zip(starts.tolist(), stops.tolist(), closed.tolist())):
+            ranges = [(start + old_width, stop + old_width)]
+            if not i and pending_len and not pending_closed:
+                ranges.insert(0, pending)
+            row.append((ranges, False, done))
+        if pending_len and not pending_closed and not len(starts):
+            row.append(([pending], False, False))
+        rows.append((row, all_pos))
+    return rows
+
+
+def test_vectorized_span_cut_matches_span_loop():
+    from litgpt.alpha_log_kv import choose_spans, cut_spans
+
+    generator = torch.Generator().manual_seed(12)
+    randint = lambda low, high: int(torch.randint(low, high, (), generator=generator))
+    for _ in range(300):
+        max_span, count = randint(1, 8), randint(0, 16)
+        old_spans, old_positions, ends = [], [], []
+        for _ in range(randint(1, 4)):
+            # Random closed flags, including an unfinished span before the last.
+            spans = [(randint(0, max_span + 2), bool(randint(0, 4))) for _ in range(randint(0, 6))]
+            old_spans.append(spans)
+            old_positions.append(list(range(sum(n for n, _ in spans))))
+            ends.append((torch.rand(count, generator=generator) < .3).tolist())
+        steps = 1 + (torch.rand(count, generator=generator) < .15).long() * torch.randint(1, 4, (count,), generator=generator)
+        new_positions = [(100 + steps.cumsum(0)).tolist()] * len(old_spans)
+        width = max(map(len, old_positions))
+        cut = cut_spans(old_spans, old_positions, new_positions, ends, width, max_span)
+        rows = _span_loop_cut(old_spans, old_positions, new_positions, ends, width, max_span)
+        if not any(row for row, _ in rows):
+            assert cut is None
+            continue
+        for b, (row, all_pos) in enumerate(rows):
+            assert cut.positions[b].tolist() == all_pos
+            assert cut.token_rows[b].tolist() == [t for ranges, _, _ in row for a, z in ranges for t in range(a, z)]
+            assert cut.length_rows[b].tolist() == [sum(z - a for a, z in ranges) for ranges, _, _ in row]
+            assert cut.old_rows[b].tolist() == [old for _, old, _ in row]
+            assert cut.closed_rows[b].tolist() == [closed for _, _, closed in row]
+        scores = torch.rand(sum(len(row) for row, _ in rows), generator=generator).tolist()
+        selection = choose_spans(cut, scores, randint(0, 12))
+        for b, (archive, positions) in enumerate(zip(selection.archive, selection.archive_positions)):
+            assert positions.tolist() == [cut.positions[b][t] for t in archive]
+
+
 def test_spans_are_whole_and_pending_crosses_flush_and_cap():
     k = torch.randn(1, 2, 7, 8)
     result = select_spans(k, k, [[(2, False)]], [[0, 1]], [[2, 3, 4, 5, 6]],
@@ -120,9 +184,11 @@ def test_fused_exact_partition_copies_payload_and_padding(archive_width, dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("route", ROUTES)
-def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta, route):
+@pytest.mark.parametrize("gamma", [False, True])
+def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta, route, gamma):
     torch.manual_seed(17)
-    c = cache_for(dtype=dtype, device=device, route=route, beta_novelty=beta, beta_adaptive_merge=beta)
+    c = cache_for(dtype=dtype, device=device, route=route, beta_novelty=beta, beta_adaptive_merge=beta,
+                  gamma_level0_reinsert=gamma, gamma_top_merge="lightest" if gamma else "fold")
     baseline = cache_for(dtype=dtype, device=device, route=route, alpha_exact_tokens=0)
     payload_bytes = lambda cache: sum(x.numel() * x.element_size() for x in cache.buffers())
     assert payload_bytes(c) <= payload_bytes(baseline)
@@ -161,9 +227,10 @@ def test_mass_payload_positions_and_budget_are_conserved(dtype, device, beta, ro
 
 
 @pytest.mark.parametrize("route", ROUTES)
-def test_ordinary_and_delayed_joins_share_one_ladder_append(route):
+@pytest.mark.parametrize("gamma", [False, True])
+def test_ordinary_and_delayed_joins_share_one_ladder_append(route, gamma):
     torch.manual_seed(5)
-    c = cache_for(route=route, beta_novelty=True, beta_adaptive_merge=True)
+    c = cache_for(route=route, beta_novelty=True, beta_adaptive_merge=True, gamma_level0_reinsert=gamma)
     c.begin_op_log()
     commit, append = c._alpha_commit_joins, c._semantic_append_entries_batched
     checked = []
@@ -195,8 +262,9 @@ def test_ordinary_and_delayed_joins_share_one_ladder_append(route):
     assert checked
 
 
-def test_delayed_archive_updates_hi_and_preserves_original_weighted_positions():
-    c = cache_for()
+@pytest.mark.parametrize("gamma", [False, True])
+def test_delayed_archive_updates_hi_and_preserves_original_weighted_positions(gamma):
+    c = cache_for(gamma_level0_reinsert=gamma)
     k = torch.randn(2, 2, 8, 8)
     with torch.no_grad():
         c._semantic_new_clusters([(0, 0, 0, 0)], k, k, torch.tensor([[40] * 8, [0] * 8]), [[40] * 8, [0] * 8], record=False)
@@ -281,13 +349,15 @@ def test_alpha_rejects_routes_and_layouts_it_cannot_archive_into(overrides):
 
 @pytest.mark.parametrize("route,merge_passes", [("attach", 1), ("unified", 1), ("unified", 4)])
 @pytest.mark.parametrize("beta", [False, True])
-def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(route, merge_passes, beta):
+@pytest.mark.parametrize("gamma", [False, True])
+def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(route, merge_passes, beta, gamma):
     torch.manual_seed(31)
     originals = [torch.randn(2, 2, 40, 8) for _ in range(3)]
     results, grads = [], []
     ends = boundaries(40)
     for lowmem in (False, True):
-        c = cache_for(route=route, semantic_merge_passes=merge_passes, beta_novelty=beta, beta_adaptive_merge=beta)
+        c = cache_for(route=route, semantic_merge_passes=merge_passes, beta_novelty=beta, beta_adaptive_merge=beta,
+                      gamma_level0_reinsert=gamma, gamma_top_merge="lightest" if gamma else "fold")
         q, k, v = [x.clone().requires_grad_() for x in originals]
         if lowmem:
             y = LogKVStreamTrainingAttention.apply(q, k, v, c, .3, 8, 0., k, ends)
@@ -348,23 +418,37 @@ def test_packing_includes_exact_rope_mask_and_current_gradients(device, dtype):
 
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("route", ROUTES)
-def test_model_checkpoint_and_odd_prefill_decode(beta, route):
+@pytest.mark.parametrize("cues", [0, 6])
+def test_model_checkpoint_and_odd_prefill_decode(beta, route, cues):
+    # Zero thresholds give these short streams cue evidence, so cues change selection.
+    with patch("litgpt.alpha_log_kv.CUE_TAU", 0.), patch("litgpt.alpha_log_kv.CUE_FLOOR", 0.), \
+         patch("litgpt.alpha_log_kv.CUE_PRIOR", 0):
+        _model_checkpoint_and_odd_prefill_decode(beta, route, cues)
+
+
+def _model_checkpoint_and_odd_prefill_decode(beta, route, cues):
     torch.manual_seed(55)
     config = Config(block_size=64, n_layer=2, n_embd=32, n_head=4, n_query_groups=2,
                     vocab_size=41, padding_multiple=1, rotary_percentage=1.)
     original = GPT(config)
-    models = [deepcopy(original), deepcopy(original)]
+    models = [deepcopy(original), deepcopy(original), deepcopy(original)]
     kwargs = dict(batch_size=2, B=8, recent_size=8, second_order_scale=0., semantic_clusters=True,
                   cluster_k_max=4, semantic_unified_route=route == "unified", semantic_merge_passes=1,
                   semantic_flush_granularity=8,
                   semantic_anchor_mode="mid", allocate_second_order=False, semantic_replay_updates=True,
-                  alpha_exact_tokens=8, alpha_span_max_tokens=4, beta_novelty=beta, beta_adaptive_merge=beta)
+                  alpha_exact_tokens=8, alpha_span_max_tokens=4, beta_novelty=beta, beta_adaptive_merge=beta,
+                  gamma_cue_tokens=cues)
     for model in models:
-        model.set_alpha_span_boundary_ids([0, 3, 7])
+        model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7])
         model.enable_log_kv_training(train_block=8, **kwargs)
     apply_activation_checkpointing(models[1], check_fn=lambda m: isinstance(m, Block))
     enable_logkv_checkpoint_replay(models[1], Block)
-    xs = [torch.randint(41, (2, n)) for n in (24, 32)]
+    # Long enough that later chunks attend pools the cues changed.
+    xs = [torch.randint(41, (2, n)) for n in (40, 48)]
+    reference = models.pop()
+    reference.enable_log_kv_training(train_block=8, **{**kwargs, "gamma_cue_tokens": 0})
+    with torch.no_grad():
+        without_cues = torch.stack([reference(x).square().mean() for x in xs])
     losses, grads = [], []
     for model in models:
         ys = [model(x).square().mean() for x in xs]
@@ -376,8 +460,9 @@ def test_model_checkpoint_and_odd_prefill_decode(beta, route):
         grads.append([p.grad.clone() for p in model.parameters()])
     for a, b in zip([losses[0]] + grads[0], [losses[1]] + grads[1]):
         torch.testing.assert_close(a, b, atol=2e-6, rtol=2e-5)
+    assert (losses[0] != without_cues).all() if cues else torch.equal(losses[0], without_cues)
     model = original.eval()
-    model.set_alpha_span_boundary_ids([0, 3, 7])
+    model.set_alpha_span_boundary_ids([0, 3, 7], line_end_ids=[7])
     model.set_log_kv_cache(prefill_block=8, **{k: v for k, v in kwargs.items() if k != "allocate_second_order"})
     with torch.no_grad():
         model(xs[0][:, :17], input_pos=torch.arange(17))
@@ -391,13 +476,22 @@ def test_model_checkpoint_and_odd_prefill_decode(beta, route):
 
 @pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.parametrize("beta", [False, True])
-def test_score_prefetch_reproduces_on_demand_selection(route, beta):
+@pytest.mark.parametrize("cues", [0, 4])
+@patch("litgpt.alpha_log_kv.CUE_TAU", 0.)  # Short streams then carry cue evidence.
+@patch("litgpt.alpha_log_kv.CUE_FLOOR", 0.)
+@patch("litgpt.alpha_log_kv.CUE_PRIOR", 0)
+def test_score_prefetch_reproduces_on_demand_selection(route, beta, cues):
+    from litgpt.alpha_log_kv import CueStream
     torch.manual_seed(91)
     k, v = torch.randn(2, 2, 96, 8), torch.randn(2, 2, 96, 8)
     ends = boundaries(96)
+    ids = torch.randint(24, (2, 96)).numpy()  # A small vocabulary, so cues recur.
     caches, hits = [], []
     for prefetch in (False, True):
-        c = cache_for(route=route, beta_novelty=beta, beta_adaptive_merge=beta)
+        c = cache_for(route=route, beta_novelty=beta, beta_adaptive_merge=beta, gamma_cue_tokens=cues)
+        if cues:
+            c.cue_stream = CueStream(cues)
+            c.cue_stream.ingest(ids, [[2 * e for e in row] for row in ends], [0, 0])
         used, original = [], c._alpha_take_prefetch
 
         def take(*args):

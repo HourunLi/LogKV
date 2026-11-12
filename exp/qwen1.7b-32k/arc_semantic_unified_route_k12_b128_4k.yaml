@@ -9,7 +9,7 @@ auto_resume: true
 expid: qwen1.7b-32k-semantic-unified-route_k12_b128_4k
 save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-semantic-unified-route_k12_b128_4k
 merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_semantic-unified-route_k12_b128_4k
-tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-semantic-unified-route_k12_b128_4k
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb/tb-32k-semantic-unified-route_k12_b128_4k
 
 max_steps: 1200
 learning_rate: 5e-6
@@ -30,3 +30,9 @@ log_kv_recent_size: 4096
 log_kv_alpha_exact_tokens: 0
 log_kv_beta_novelty: false
 log_kv_beta_adaptive_merge: false
+
+# Gamma 之前的实验：保持旧梯子行为，复评与训练时一致（延迟归档整簇重入层级、顶层左折叠）。
+log_kv_gamma_level0_reinsert: false
+log_kv_gamma_top_merge: fold
+log_kv_gamma_level_slack: 2
+log_kv_gamma_cue_tokens: 0

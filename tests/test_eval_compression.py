@@ -2,6 +2,7 @@
 
 import ast
 import math
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,15 +34,16 @@ def wrapper_class():
     tree = ast.parse(source.read_text())
     cls = next(node for node in tree.body
                if isinstance(node, ast.ClassDef) and node.name == "LogKVLM")
-    names = {"_score_tokens", "generate_until", "loglikelihood_rolling", "_reset_eval_cache"}
+    names = {"_score_tokens", "generate_until", "loglikelihood_rolling", "_reset_eval_cache", "_warn_truncation",
+             "_prefill_chunk", "_forward", "_generate_chunked"}
     cls.bases, cls.decorator_list = [], []
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
     scope = dict(
-        torch=torch, time=time, litgpt_generate=generate,
+        os=os, torch=torch, time=time, litgpt_generate=generate,
         cache_compression_snapshot=cache_compression_snapshot,
-        tqdm=SimpleNamespace(tqdm=lambda items, **kwargs: items),
+        _eval_progress=lambda items, desc: items, _eval_verbose=lambda: False,
         _global_rank=lambda: 0, _world_size=lambda: 1, _local_rank=lambda: 0,
-        _rank_label=lambda: "CPU", _tqdm_position=lambda: 0,
+        _rank_label=lambda: "CPU",
         _request_sample_id=lambda req, **kwargs: kwargs["global_request_index"],
     )
     helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {
@@ -70,6 +72,7 @@ def make_lm(wrapper_class, backend, block_size=32):
     lm._set_eval_cache = lm._reset_eval_cache
     lm.all_gather_results = lambda items, tag: items
     lm.compression_metrics, lm.ppl_metrics, lm.gen_metrics = [], [], []
+    lm._truncation_counts = {}
     lm.max_gen_toks = 3
     return lm
 
@@ -163,6 +166,7 @@ def test_rolling_reports_each_window_with_rolling_request_type(wrapper_class):
     assert_cache_reset(lm)
 
 
+<<<<<<< HEAD
 def test_speed_summary_weights_tokens_by_time_and_handles_empty_decode():
     source = Path(__file__).resolve().parents[1] / "eval.py"
     helper = next(node for node in ast.parse(source.read_text()).body
@@ -209,3 +213,28 @@ def test_generation_timing_has_exact_stage_boundaries(monkeypatch, eos_id, expec
     assert timing == dict(prefill_time_s=4., decode_time_s=2. * (expected_count - 1),
                           total_time_s=4. + 2. * (expected_count - 1),
                           generated_tokens=expected_count, decode_tokens=expected_count - 1)
+=======
+@torch.no_grad()
+@pytest.mark.parametrize("request_type", ["loglikelihood", "generate_until"])
+def test_long_inputs_enter_the_logkv_cache_in_chunks_with_the_same_result(wrapper_class, monkeypatch, request_type):
+    """A long input is prefilled in chunks (LOGKV_EVAL_PREFILL_CHUNK; one forward of 256K tokens overflows an 80 GB
+    card): the cache streams, so scores and generated tokens equal one forward's while it compresses."""
+    results = []
+    for chunk in ("0", "5"):
+        monkeypatch.setenv("LOGKV_EVAL_PREFILL_CHUNK", chunk)
+        lm = make_lm(wrapper_class, "logkv")
+        if request_type == "loglikelihood":
+            tokens = torch.arange(1, 29) % 31 + 1
+            results.append(lm._score_tokens(tokens[:20].tolist(), tokens[20:].tolist()))
+        else:
+            lm.tokenizer.eos_id = None
+            prompt = " ".join(str(t % 31 + 1) for t in range(2, 27))
+            results.append(lm.generate_until([SimpleNamespace(args=(prompt, {"max_gen_toks": 3}))]))
+        record, = lm.compression_metrics
+        assert 0 < record["kv_retention_ratio"] < 1  # the cache compressed
+        results.append(record["processed_tokens"])
+    assert results[0] == pytest.approx(results[2], abs=0) and results[1] == results[3]
+    monkeypatch.setenv("LOGKV_EVAL_PREFILL_CHUNK", "5")
+    lm = make_lm(wrapper_class, "dense")
+    assert lm._prefill_chunk() == 0  # dense keeps one forward
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78

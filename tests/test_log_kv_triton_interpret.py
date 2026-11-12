@@ -23,3 +23,8 @@ def _run(*args, timeout=3000):
 def test_route_kernels_match_torch_reference():
     result = _run(str(ROOT / "tests" / "interpret_route_check.py"))
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
+
+
+def test_update_kernels_match_torch_reference():
+    result = _run(str(ROOT / "tests" / "interpret_update_check.py"))
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]

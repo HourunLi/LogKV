@@ -1,0 +1,8 @@
+# niahLogKV 技巧单列（只评测、不重训）：惊异度准入（word_first）再加查询感知 cue（问题作为 cue，加 cue 保护），
+# 在不带 cue 的 P=1024 checkpoint（arc_gamma_k12_b128_p1024_2k）上；与 eval_gamma_surprisal_word_first_p1024.yaml 只差 query，
+# 与 eval_gamma_query_p1024.yaml 只差惊异度：看问题能否补上不看问题时的容量缺口（如 multikey_2 的草堆全是针）。
+#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_surprisal_word_first_query_p1024.yaml
+config: arc_gamma_k12_b128_p1024_2k.yaml
+log_kv_gamma_surprisal: word_first
+log_kv_gamma_cue_guard: true
+log_kv_gamma_query_cue: true

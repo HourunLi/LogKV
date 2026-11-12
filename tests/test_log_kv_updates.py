@@ -1,6 +1,7 @@
 """Exact reference checks for fused cache writes and ordered centroid updates."""
 
 from copy import deepcopy
+import os
 from unittest.mock import patch
 
 import pytest
@@ -10,6 +11,14 @@ import litgpt.log_kv_cache as kv
 
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/Triton")
+# With TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1 the fused kernels run on CPU, but the
+# interpreter truncates fp32->bf16 while CUDA Triton and Torch round to nearest.
+INTERPRETED = os.environ.get("TRITON_INTERPRET") == "1" and os.environ.get("LOGKV_TRITON_CPU") == "1"
+
+
+def _expect_interpreter_bf16(dtype, device="cpu"):
+    if INTERPRETED and dtype == torch.bfloat16 and device == "cpu":
+        pytest.xfail("the Triton interpreter truncates fp32->bf16; CUDA Triton and Torch round to nearest")
 
 
 def cache_for(device, dtype, B=3, dim=8, groups=2, vdim=None):
@@ -92,6 +101,7 @@ def test_fused_ladder_carry_survivors_and_clears(dtype, B, dim, vdim):
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fused_route_replay_output_and_gradients(dtype, device):
+    _expect_interpreter_bf16(dtype, device)
     # The CPU case also validates this fixture when CUDA tests are skipped.
     if device == "cuda":
         assert kv._triton_updates() is not None
@@ -188,23 +198,31 @@ def test_centroid_feature_warps_read_same_old_count(dtype, dim):
 
 @pytest.mark.parametrize("B", [2, 3, 64])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype):
+@pytest.mark.parametrize("expand_on_device", [False, True])
+def test_batched_ladder_plan_partitions_rows_and_matches_scalar(B, dtype, expand_on_device):
+    _expect_interpreter_bf16(dtype)
     torch.manual_seed(713)
     cache = cache_for("cpu", dtype, B=B)
+    # CUDA uploads only the index ranges and expands them on the device.
+    cache._semantic_expand_on_device = lambda device: expand_on_device
     reference = deepcopy(cache)
     lanes = [(0, 0, 0), (0, 1, 7), (1, 0, 4), (1, 1, 1)]
     make_indices = cache._semantic_index_tensors
 
     def checked_indices(*args, **kwargs):
-        fs, fd, si, gi, pi, vi, sd, cd = result = make_indices(*args, **kwargs)
-        for index in (fs, fd, si, gi, sd, cd):
-            assert index.unique().numel() == index.numel()
-        assert pi.numel() % 2 == 0
-        # Each pool row participates in exactly one pair OR survives.
-        torch.testing.assert_close(torch.cat((pi, vi)).sort().values,
-                                   torch.arange(si.numel() + gi.numel()))
-        destinations = torch.cat((sd, cd))
-        assert destinations.unique().numel() == destinations.numel()
+        # One call plans every level: eight index tensors per level.
+        result = make_indices(*args, **kwargs)
+        assert len(result) % 8 == 0
+        for level in range(0, len(result), 8):
+            fs, fd, si, gi, pi, vi, sd, cd = result[level:level + 8]
+            for index in (fs, fd, si, gi, sd, cd):
+                assert index.unique().numel() == index.numel()
+            assert pi.numel() % 2 == 0
+            # Each pool row participates in exactly one pair OR survives.
+            torch.testing.assert_close(torch.cat((pi, vi)).sort().values,
+                                       torch.arange(si.numel() + gi.numel()))
+            destinations = torch.cat((sd, cd))
+            assert destinations.unique().numel() == destinations.numel()
         return result
 
     mass = 0.
@@ -254,7 +272,7 @@ def test_benchmark_checks_later_iterations(monkeypatch):
 
 def _scalar_top_overflow(cache):
     """The former per-entry top-level path, as a reference for the batched fold."""
-    def overflow(jobs, stage):
+    def overflow(jobs, stage, fused=None):
         for b, g, c, start, n in jobs:
             cache._semantic_append_top_level_overflow(b, g, c, cache._semantic_slice_block(stage, start, start + n))
     return overflow
@@ -263,7 +281,10 @@ def _scalar_top_overflow(cache):
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("beta", [False, True])
-def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta):
+@pytest.mark.parametrize("top_merge", ["fold", "lightest"])
+def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta, top_merge):
+    if top_merge == "lightest":
+        _expect_interpreter_bf16(dtype, device)  # The fused top-level kernel rounds merged K/V.
     torch.manual_seed(13)
     caches = []
     for _ in range(2):
@@ -271,7 +292,7 @@ def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta):
             (2, 2, 16, 8), (2, 2, 16, 8), B=3, recent_size=4, device=device, dtype=dtype,
             semantic_clusters=True, cluster_k_max=2, allocate_second_order=False, semantic_anchor_mode="mid",
             semantic_unified_route=True, alpha_exact_tokens=2, alpha_span_max_tokens=2,
-            beta_adaptive_merge=beta, beta_novelty=beta,
+            beta_adaptive_merge=beta, beta_novelty=beta, gamma_top_merge=top_merge,
             cos_cache=torch.ones(64, 8, device=device), sin_cache=torch.zeros(64, 8, device=device), rope_n_elem=8,
         )
         caches.append(cache)
@@ -301,3 +322,53 @@ def test_batched_top_level_overflow_matches_scalar_fold(device, dtype, beta):
     assert fold.call_count  # The last burst overflows every saturated ladder.
     top = batched.L_alloc - 1
     assert all(batched._semantic_counts[b][g][c][top] == batched.B for b, g, c in lanes)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_lightest_top_merge_matches_scalar_and_stays_balanced(device, dtype):
+    """Gamma's top level: batched == per-entry reference, and no slot hoards the old mass."""
+    _expect_interpreter_bf16(dtype, device)  # The fused top-level kernel rounds merged K/V.
+    torch.manual_seed(17)
+    caches = {}
+    for top_merge in ("fold", "lightest"):
+        for path in ("batched", "scalar"):
+            caches[top_merge, path] = kv.LogStructuredKVCache(
+                (2, 2, 64, 8), (2, 2, 64, 8), B=8, recent_size=4, device=device, dtype=dtype,
+                semantic_clusters=True, cluster_k_max=2, allocate_second_order=False, semantic_anchor_mode="mid",
+                gamma_top_merge=top_merge,
+                cos_cache=torch.ones(64, 8, device=device), sin_cache=torch.zeros(64, 8, device=device), rope_n_elem=8,
+            )
+    reference = caches["fold", "batched"]
+    lanes = [(0, 0, 0), (0, 1, 1), (1, 0, 0), (1, 1, 1)]
+    capacity = reference.B * (2 ** reference.L_alloc - 1)
+    position = 0
+    for counts in ([capacity - 1, 2, capacity, 1], [5, capacity + 3, 1, 7], [9, 4, 2 * capacity, 3],
+                   [3 * capacity, capacity, capacity, 2 * capacity]):
+        total = sum(counts)
+        k, v = (torch.randn(total, 8, device=device).to(dtype) for _ in range(2))
+        pos = torch.arange(position, position + total, device=device)
+        position += total
+        block = (k, v, torch.ones(total, device=device), *reference._empty_stats(k, v), pos, pos, pos,
+                 torch.arange(total, device=device), torch.zeros(total, dtype=torch.bool, device=device))
+        for (top_merge, path), cache in caches.items():
+            if path == "batched":
+                cache._semantic_append_entries_batched(lanes, counts, block)
+            else:
+                with patch.object(cache, "_semantic_append_top_level_overflow_batched", _scalar_top_overflow(cache)):
+                    cache._semantic_append_entries_batched(lanes, counts, block)
+    for top_merge in ("fold", "lightest"):
+        batched, scalar = caches[top_merge, "batched"], caches[top_merge, "scalar"]
+        assert batched._semantic_counts == scalar._semantic_counts
+        for name, value in batched.named_buffers():
+            torch.testing.assert_close(value, scalar.get_buffer(name), rtol=0, atol=0, msg=f"{top_merge}: {name}")
+    top = reference.L_alloc - 1
+    for top_merge in ("fold", "lightest"):
+        cache = caches[top_merge, "batched"]
+        assert torch.equal(cache.level_w.sum(), reference.level_w.sum())  # Mass is conserved either way.
+        w = torch.stack([cache.level_w[b, g, c, top] for b, g, c in lanes])
+        share = w.amax(-1) / w.sum(-1)  # Mass held by the heaviest top-level slot.
+        if top_merge == "lightest":
+            assert float(share.max()) <= 0.25  # Close to 1/B: coarsened evenly.
+        else:
+            assert float(share.min()) >= 0.5 and bool((w.argmax(-1) == 0).all())  # Piled into slot 0.

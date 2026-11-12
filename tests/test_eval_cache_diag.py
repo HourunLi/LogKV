@@ -10,13 +10,15 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 def test_cache_failure_is_visible_and_original_behavior_is_preserved():
     source = Path(__file__).resolve().parents[1] / "eval.py"
     node = next(n for n in ast.parse(source.read_text()).body
                 if isinstance(n, ast.FunctionDef) and n.name == "_trace_hf_cache_resolution")
     scope = dict(contextlib=contextlib, os=os, json=json, Path=Path,
-                 __file__=str(source), _global_rank=lambda: 7)
+                 __file__=str(source), _global_rank=lambda: 7, _eval_verbose=lambda: False)
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
     result = object()
     failure = PermissionError("cannot enumerate cached configurations")
@@ -56,7 +58,7 @@ def test_cache_failure_is_visible_and_original_behavior_is_preserved():
             raise AssertionError("diagnostic swallowed the original exception")
         assert Factory.get_module is original
     events = [json.loads(line.removeprefix("[hf-cache] ")) for line in output.getvalue().splitlines()]
-    assert [event["event"] for event in events] == ["runtime", "runtime", "local_cache_failure"]
+    assert [event["event"] for event in events] == ["local_cache_failure"]
     assert events[-1]["rank"] == 7
     assert events[-1]["effective_cache_dir"] == "/explicit/cache"
     assert "PermissionError: cannot enumerate cached configurations" in events[-1]["traceback"]
@@ -97,10 +99,122 @@ def test_path_walk_names_the_component_that_blocks_traversal():
             assert steps[-1]["listing_of"] == str(root)
 
 
+def test_unreadable_dataset_info_is_named_with_its_context():
+    import tempfile
+    source = Path(__file__).resolve().parents[1] / "eval.py"
+    node = next(n for n in ast.parse(source.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == "_unreadable_dataset_infos")
+    scope = dict(json=json, Path=Path, time=__import__("time"))
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
+    find = scope["_unreadable_dataset_infos"]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        good = root / "allenai___social_i_qa" / "default" / "0.1.0" / "aaaa" / "dataset_info.json"
+        bad = root / "allenai___social_i_qa" / "default" / "0.1.0" / "bbbb" / "dataset_info.json"
+        other = root / "other___dataset" / "default" / "0.1.0" / "cccc" / "dataset_info.json"
+        for info in (good, bad, other):
+            info.parent.mkdir(parents=True)
+        good.write_text('{"config_name": "default"}')
+        # A trailing comma; Python 3.10 reports "Expecting property name enclosed in double quotes".
+        bad.write_text('{\n    "config_name": "default",\n}')
+        other.write_text("not json")
+        found = find(root, "allenai/social_i_qa")
+        assert [item["path"] for item in found] == [str(bad)]
+        # Python 3.10 points at the brace, 3.13 at the comma; the context shows both.
+        assert found[0]["context"][-2:] == ['    "config_name": "default",', "}"]
+        # Size and time say whether a copy was cut short, and when it was written.
+        assert found[0]["size"] == bad.stat().st_size and found[0]["modified"][:4].isdigit()
+        assert find(root / "missing", "allenai/social_i_qa")[0]["error"].startswith("FileNotFoundError")
+
+
+def test_repair_hf_cache_runs_on_node_zero_before_its_barrier():
+    import tempfile
+    root = Path(__file__).resolve().parents[1]
+    for script in ("majob.sh", "eval.sh"):
+        source = (root / script).read_text()
+        start = source.index("HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-")
+        block = source[start:source.index("\nfi\n", start) + 4]
+        assert source.index(block) < source.index('touch "${BARRIER_DIR}/node_${NODE_RANK}"'), script
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp, "calls")
+            stub = Path(tmp, "python")
+            stub.write_text(f'#!/bin/sh\necho "$@" >> {log}\nexit "${{STUB_STATUS:-0}}"\n')
+            stub.chmod(0o755)
+            run = lambda **env: subprocess.run(["bash", "-c", block + "\necho reached"], capture_output=True,
+                                               text=True, env=dict(os.environ, PYTHON_BIN=str(stub), **env))
+            assert "reached" in run(NODE_RANK="0").stdout and not log.exists()  # Off by default.
+            assert "reached" in run(NODE_RANK="1", REPAIR_HF_CACHE="1").stdout and not log.exists()
+            assert "reached" in run(NODE_RANK="0", REPAIR_HF_CACHE="1", HF_DATASETS_ROOT="/cache").stdout
+            assert log.read_text() == "unused/repair_dataset_info.py --scan /cache --write --check\n"
+            failed = run(NODE_RANK="0", REPAIR_HF_CACHE="1", STUB_STATUS="1")
+            assert failed.returncode == 1 and "reached" not in failed.stdout, script
+
+
+def test_both_launchers_default_to_every_niah_task():
+    root = Path(__file__).resolve().parents[1]
+    variants = sorted(p.stem for p in (root / "eval_tasks" / "niah_cue").glob("niah_*.yaml"))
+    ruler = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2",
+             "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
+    try:  # lm-eval's own RULER needle tasks, when it is installed here.
+        import lm_eval.tasks
+        found = sorted(p.stem for p in (Path(lm_eval.tasks.__file__).parent / "ruler").glob("niah_*.yaml"))
+        assert found == sorted(ruler)
+    except ImportError:
+        pass
+    # Prompt perturbations (9) and, on niahLogKV, the word-valued needles (3).
+    assert len(variants) == 12 and sum("_words" in v for v in variants) == 3
+    defaults = {}
+    for script in ("majob.sh", "eval.sh"):
+        source = (root / script).read_text()
+        lines = [line for line in source.splitlines() if line.startswith("DEFAULT_NIAH_BENCHMARKS=")]
+        result = subprocess.run(["bash", "-c", "\n".join(lines) + '\necho "$DEFAULT_NIAH_BENCHMARKS"'],
+                                capture_output=True, text=True, check=True)
+        defaults[script] = result.stdout.strip().split(",")
+        assert "NIAH_BENCHMARKS:-${DEFAULT_NIAH_BENCHMARKS}" in source or \
+            "NIAH_BENCHMARKS=${3:-${DEFAULT_NIAH_BENCHMARKS}}" in source, script
+    assert defaults["majob.sh"] == defaults["eval.sh"]
+    assert sorted(defaults["eval.sh"]) == sorted(ruler + variants) and len(set(defaults["eval.sh"])) == 20
+
+
+def test_task_selection_skips_blank_or_none_stages_and_supports_niah_only():
+    root = Path(__file__).resolve().parents[1]
+
+    def select(script, env=(), args=()):
+        source = (root / script).read_text()
+        # eval.sh runs its stages in run_stages (once, or once per length); majob.sh inline.
+        end = source.index("\nMETA=") if "\nMETA=" in source else source.index("\n# The main stage, then the NIAH stage")
+        block = source[source.index('DEFAULT_BENCHMARKS="boolq'):end]
+        result = subprocess.run(["bash", "-c", block + '\necho "MAIN=$BENCHMARKS"; echo "NIAH=$NIAH_BENCHMARKS"',
+                                 script, *args], capture_output=True, text=True,
+                                env={"PATH": os.environ["PATH"], "NODE_RANK": "0", **dict(env)})
+        lines = dict(line.split("=", 1) for line in result.stdout.splitlines() if line[:5] in ("MAIN=", "NIAH="))
+        return result.returncode, lines.get("MAIN"), lines.get("NIAH"), result.stdout
+
+    for script, as_env in (("majob.sh", True), ("eval.sh", False)):
+        def run(main=None, niah=None, **env):
+            if as_env:
+                env.update({k: v for k, v in (("BENCHMARKS", main), ("NIAH_BENCHMARKS", niah)) if v is not None})
+                return select(script, env)
+            return select(script, env, ["config.yaml", main or "", niah or ""])  # eval.sh <yaml> <main> <niah>
+
+        code, main, niah, _ = run()
+        assert code == 0 and main.startswith("boolq,piqa") and niah.startswith("niah_single_1,"), script
+        assert run(main="none")[1] == "none" and run(main="none")[2] == niah
+        assert run(NIAH_ONLY="1")[1:3] == ("none", niah), script
+        assert run(main=" ", niah="NONE")[1:3] == ("none", "none"), script
+        assert run(main=" piqa, ,boolq ,", niah="niah_single_2 ,niah_single_3")[1:3] == (
+            "piqa,boolq", "niah_single_2,niah_single_3"), script
+        code, _, _, out = run(main="--limit")
+        assert code == 1 and "DIAG_ARGS" in out, script
+    for script in ("majob.sh", "eval.sh"):
+        source = (root / script).read_text()
+        assert '--benchmark "${BENCHMARKS}"' in source and '--benchmark "${NIAH_BENCHMARKS}"' in source
+
+
 def test_eval_launch_uses_selected_python_for_both_jobs():
     source = (Path(__file__).resolve().parents[1] / "eval.sh").read_text()
-    start = source.index('if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then')
-    # The trailing barrier cleanup is inert with NODE_RANK=1.
+    # The stages (run_stages), run once for a single-length YAML; the trailing barrier cleanup is inert with NODE_RANK=1.
+    start = source.index("# The main stage, then the NIAH stage")
     shell = '''
 PYTHON_BIN=selected_python
 BENCHMARKS=social_iqa
@@ -117,8 +231,126 @@ torchrun() { echo WRONG_INTERPRETER; return 99; }
     assert "WRONG_INTERPRETER" not in result.stdout
 
 
+def test_eval_barrier_is_one_folder_per_job(tmp_path=None):
+    import tempfile
+    source = (Path(__file__).resolve().parents[1] / "eval.sh").read_text()
+    snippet = source[source.index("BARRIER_DIR="):source.index('echo "All nodes are ready. Starting eval.py"')]
+    shell = 'sleep() { :; }\nSAVE_DIR=$1\nNODE_RANK=0\nNUM_NODES=2\nMASTER_ADDR=host-a\n' + snippet + 'echo "DIR=${BARRIER_DIR}"\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        shared = Path(tmp, ".eval_only_barrier_d")
+        (shared / "job-a").mkdir(parents=True)
+        for name in ("node_0", "node_1", "job-a/node_0", "job-a/node_1"):  # a failed run's, another job's
+            (shared / name).touch()
+        (shared / "job-b").mkdir()
+        (shared / "job-b" / "node_1").touch()  # this job's other node has arrived
+        env = {**os.environ, "MA_VJ_NAME": "job-b"}
+        done = subprocess.run(["bash", "-c", shell, "_", tmp], env=env, capture_output=True, text=True, timeout=30)
+        assert done.returncode == 0 and f"DIR={shared}/job-b" in done.stdout, done.stdout + done.stderr
+        # Alone, a job waits for its own nodes: the leftovers and the other job's files do not count.
+        try:
+            subprocess.run(["bash", "-c", shell, "_", tmp], env={**os.environ, "MA_VJ_NAME": "job-c"},
+                           capture_output=True, text=True, timeout=3)
+            raise AssertionError("job-c passed its barrier on files that are not its own")
+        except subprocess.TimeoutExpired:
+            pass
+        assert sorted(p.name for p in (shared / "job-a").iterdir()) == ["node_0", "node_1"]
+
+
 if __name__ == "__main__":
     test_cache_failure_is_visible_and_original_behavior_is_preserved()
     test_path_walk_names_the_component_that_blocks_traversal()
+    test_unreadable_dataset_info_is_named_with_its_context()
+    test_repair_hf_cache_runs_on_node_zero_before_its_barrier()
+    test_both_launchers_default_to_every_niah_task()
+    test_task_selection_skips_blank_or_none_stages_and_supports_niah_only()
     test_eval_launch_uses_selected_python_for_both_jobs()
+    test_eval_barrier_is_one_folder_per_job()
     print("HF cache diagnostic check passed")
+
+
+def test_the_default_lists_end_with_the_optional_32k_tasks():
+    """Both launchers run the 32K turns and book curve by default, marked optional; a list given by name is not."""
+    root = Path(__file__).resolve().parents[1]
+    blocks = {}
+    for script, given in (("eval.sh", 'BENCHMARKS=${2:-}'), ("majob.sh", None)):
+        source = (root / script).read_text().splitlines()
+        start = next(i for i, line in enumerate(source) if line.startswith('DEFAULT_BENCHMARKS="boolq'))
+        end = next(i for i, line in enumerate(source) if i > start and line.startswith("BENCHMARKS=${BENCHMARKS:-")) \
+            if script == "majob.sh" else next(i for i, line in enumerate(source)
+                                              if i > start and line == "fi" and "EVAL_OPTIONAL_TASKS" in source[i - 1])
+        blocks[script] = "\n".join(source[start:end + 1])
+
+    def run(script, benchmarks):
+        env = {"PATH": os.environ["PATH"], **({"BENCHMARKS": benchmarks} if script == "majob.sh" and benchmarks else {})}
+        args = ["x", benchmarks] if script == "eval.sh" and benchmarks else []
+        out = subprocess.run(["bash", "-c", blocks[script] + '\necho "$DEFAULT_BENCHMARKS|$EVAL_OPTIONAL_TASKS"', "_", *args],
+                             capture_output=True, text=True, check=True, env=env).stdout.strip()
+        return out.split("|")
+    defaults = {script: run(script, "") for script in blocks}
+    assert defaults["eval.sh"] == defaults["majob.sh"]
+    names, optional = defaults["eval.sh"]
+    assert names.split(",")[-2:] == ["niah_turns_32k", "long_ppl_books_32k"] and optional == "niah_turns_32k,long_ppl_books_32k"
+    for script in blocks:
+        assert run(script, "piqa,niah_turns_32k")[1] == ""  # asked for by name: must run
+
+
+def test_optional_tasks_are_left_out_when_the_window_or_data_cannot_serve_them(monkeypatch, capsys, tmp_path):
+    import ast
+    import re
+
+    source = Path(__file__).resolve().parents[1] / "eval.py"
+    nodes = [n for n in ast.parse(source.read_text()).body
+             if (isinstance(n, ast.FunctionDef)
+                 and n.name in {"_check_task_lengths", "_skip_optional_tasks", "_longbench2_files_problem"})
+             or (isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "_LENGTH_NAMED_TASK")]
+    scope = dict(re=re, os=os, Path=Path, _is_main=lambda: True)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+    skip = scope["_skip_optional_tasks"]
+    tasks = ["piqa", "niah_turns_32k", "long_ppl_books_32k"]
+    monkeypatch.setenv("EVAL_OPTIONAL_TASKS", "niah_turns_32k,long_ppl_books_32k")
+    monkeypatch.setenv("LONG_PPL_BOOKS", "/data/pg19-train")
+    assert skip(tasks, 32768) == tasks
+    assert skip(tasks, 4096) == ["piqa"]  # a 4K run: neither fits
+    assert "niah_turns_32k needs a model window of 32768" in capsys.readouterr().out
+    monkeypatch.delenv("LONG_PPL_BOOKS")
+    assert skip(tasks, 32768) == ["piqa", "niah_turns_32k"]
+    assert "LONG_PPL_BOOKS is not set" in capsys.readouterr().out
+    # LongBench v2: skipped when a parquet file of its hub snapshot is not whole (a cut download, an LFS pointer).
+    import litgpt.longbench2_patch as longbench2
+
+    monkeypatch.setenv("EVAL_OPTIONAL_TASKS", "longbench2_64k")
+    (tmp_path / "a.parquet").write_bytes(b"PAR1" + b"x" * 16 + b"PAR1")
+    (tmp_path / "b.parquet").write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
+    monkeypatch.setattr(longbench2, "snapshot", lambda: (str(tmp_path), ["a.parquet", "b.parquet"]))
+    assert skip(["piqa", "longbench2_64k"], 66560) == ["piqa"]
+    assert "not whole parquet: ['b.parquet']" in capsys.readouterr().out
+    (tmp_path / "b.parquet").write_bytes(b"PAR1" + b"y" * 16 + b"PAR1")
+    assert skip(["piqa", "longbench2_64k"], 66560) == ["piqa", "longbench2_64k"]
+    monkeypatch.setenv("EVAL_OPTIONAL_TASKS", "")
+    assert skip(tasks, 4096) == tasks  # asked for by name: kept, and _check_task_lengths refuses it
+    with pytest.raises(ValueError, match="niah_turns_32k"):
+        scope["_check_task_lengths"](skip(tasks, 4096), 4096)
+
+
+def test_rulers_empty_default_length_is_dropped_from_the_results():
+    """lm-eval's RULER scores every sample under 4096 too (-1 when no sample had that length): not reported."""
+    import ast
+
+    pytest.importorskip("lm_eval")
+    from lm_eval.utils import make_table
+
+    source = Path(__file__).resolve().parents[1] / "eval.py"
+    nodes = [n for n in ast.parse(source.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == "_drop_empty_lengths"]
+    scope = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), scope)
+    results = dict(
+        results={"niah_multikey_1": {"alias": "niah_multikey_1", "4096,none": -1.0, "4096_stderr,none": "N/A",
+                                     "65536,none": 0.68, "65536_stderr,none": "N/A"},
+                 "babilong_qa1_64k": {"alias": "babilong_qa1_64k", "acc,none": 0.3, "acc_stderr,none": 0.05,
+                                      "delta,none": -1.0}},
+        versions={"niah_multikey_1": 1, "babilong_qa1_64k": 0}, **{"n-shot": {"niah_multikey_1": 0, "babilong_qa1_64k": 2}},
+        higher_is_better={"niah_multikey_1": {}, "babilong_qa1_64k": {}})
+    table = make_table(scope["_drop_empty_lengths"](results))
+    assert "4096" not in table and "delta" in table  # only length metrics go: delta (not a length) stays at -1
+    assert "65536" in table and "0.68" in table and "acc" in table
+    assert set(results["results"]["niah_multikey_1"]) - {"alias"} == {"65536,none", "65536_stderr,none"}  # make_table took alias

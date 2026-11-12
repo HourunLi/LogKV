@@ -1,0 +1,4 @@
+# niahLogKV 惊异度准入（只评测、不重训）：与 eval_gamma_surprisal_p1024.yaml 相同，只是片段分数取所有 token 惊异度的均值（mean）。
+#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_surprisal_mean_p1024.yaml
+config: arc_gamma_k12_b128_p1024_2k.yaml
+log_kv_gamma_surprisal: mean

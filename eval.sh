@@ -5,6 +5,13 @@
 #
 # Usage:
 #   bash eval.sh <training_yaml_or_eval_yaml> [benchmark_csv|none] [niah_csv|none]
+#   (niah_csv defaults to every NIAH task: DEFAULT_NIAH_BENCHMARKS below)
+#   NIAH only: bash eval.sh <yaml> none   or   NIAH_ONLY=1 bash eval.sh <yaml>
+#   Several lengths (a YAML with eval_lengths, e.g. exp/qwen1.7b-32k/eval_long_word_first.yaml; long_eval_plan.py):
+#     [EVAL_LENGTHS=32k,128k] [EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench] [YARN_MODE=fixed] [NIAH_ONLY=1] \
+#         bash eval.sh <yaml>
+#   Everything (the 32K main line, then every length; exp/qwen1.7b-32k/eval_full_<method>.yaml, eval_main: true):
+#     [LIMIT=2] [EVAL_LENGTHS=none] [EVAL_SUITES=...] bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 #
 # Examples:
 #   bash eval.sh exp/qwen1.7b-32k/arc.yaml
@@ -64,7 +71,32 @@ export LOGKV_ROUTE_OVERLAP=${LOGKV_ROUTE_OVERLAP:-0}
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_MIN_NCHANNELS=4
 
-GPUS_PER_NODE=${MA_NUM_GPUS:-${LOCAL_WORLD_SIZE:-8}}
+# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); ModelArts
+# allocation is an upper bound. GPUS_PER_NODE may explicitly select fewer GPUs.
+GPUS_PER_NODE=$("${PYTHON_BIN}" - <<'PY_GPU_COUNT'
+import os
+import sys
+
+import torch
+
+visible = torch.cuda.device_count()
+if visible < 1:
+    raise SystemExit("ERROR: no CUDA GPUs are visible; check CUDA_VISIBLE_DEVICES and the CUDA runtime.")
+try:
+    allocated = int(os.environ.get("MA_NUM_GPUS") or visible)
+    available = min(visible, allocated)
+    selected = int(os.environ.get("GPUS_PER_NODE") or available)
+except ValueError:
+    raise SystemExit("ERROR: GPUS_PER_NODE and MA_NUM_GPUS must be positive integers.")
+if allocated < 1 or not 1 <= selected <= available:
+    raise SystemExit(
+        f"ERROR: GPUS_PER_NODE={selected} must be within 1..{available} "
+        f"(visible={visible}, MA_NUM_GPUS={allocated})."
+    )
+print(f"GPU detection: visible={visible}, MA_NUM_GPUS={allocated}, using={selected}", file=sys.stderr)
+print(selected)
+PY_GPU_COUNT
+) || exit 1
 NUM_NODES=${MA_NUM_HOSTS:-${GROUP_WORLD_SIZE:-1}}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 if [ -n "${MA_VJ_NAME:-}" ]; then
@@ -111,6 +143,7 @@ fi
 echo "Reading eval settings from ${CONFIG_FILE}"
 
 CONFIG_EXPORTS=$("${PYTHON_BIN}" - "${CONFIG_FILE}" <<'EOF'
+import json
 import os
 import re
 import shlex
@@ -173,7 +206,9 @@ if not save_dir:
 ckpt_dir = cfg.get("ckpt_dir") or os.path.join("checkpoints", arch_name)
 resume_dir = cfg.get("resume_dir")
 tokenizer_dir = cfg.get("tokenizer_dir")
-output_path = cfg.get("output_path") or os.path.join(save_dir, "evaluate")
+# eval_tag: methods evaluated on one checkpoint (baseline, word_first, query, ...) each get their own folder,
+# <save_path>/evaluate/<eval_tag>, instead of sharing <save_path>/evaluate; an explicit output_path wins.
+output_path = cfg.get("output_path") or os.path.join(save_dir, "evaluate", *([str(cfg["eval_tag"])] if cfg.get("eval_tag") else []))
 benchmark = cfg.get("benchmark") or ""
 
 try:
@@ -197,6 +232,10 @@ emit("LOG_KV_B", value_or("log_kv_B", 512))
 emit("LOG_KV_RECENT", value_or("log_kv_recent_size", 1024))
 emit("LOG_KV_PREFILL", value_or("log_kv_prefill_block", 256))
 emit("LOG_KV_SECOND_ORDER_SCALE", value_or("log_kv_second_order_scale", 1.0))
+emit("LOG_KV_DENSE_MODE", str(bool(cfg.get("log_kv_dense_mode", False))).lower())
+# Full SWA at the same memory (0 = window matched to the LogKV cache's allocated bytes).
+swa = cfg.get("swa_window_size")
+emit("SWA_WINDOW_SIZE", "" if swa is None else int(swa))
 emit("LOG_KV_SEMANTIC", str(bool(cfg.get("log_kv_semantic_clusters", False))).lower())
 emit("LOG_KV_SEMANTIC_LEGACY_ROUTE", str(bool(cfg.get("log_kv_semantic_legacy_route", False))).lower())
 emit("LOG_KV_SEMANTIC_UNIFIED_ROUTE", str(bool(cfg.get("log_kv_semantic_unified_route", False))).lower())
@@ -210,6 +249,21 @@ emit("LOG_KV_ALPHA_EXACT_TOKENS", int(value_or("log_kv_alpha_exact_tokens", 256)
 emit("LOG_KV_ALPHA_SPAN_MAX_TOKENS", int(value_or("log_kv_alpha_span_max_tokens", 64)))
 emit("LOG_KV_BETA_NOVELTY", str(bool(value_or("log_kv_beta_novelty", True))).lower())
 emit("LOG_KV_BETA_ADAPTIVE_MERGE", str(bool(value_or("log_kv_beta_adaptive_merge", True))).lower())
+# Gamma defaults on; YAML false / "fold" restores the earlier ladder behaviour.
+emit("LOG_KV_GAMMA_LEVEL0_REINSERT", str(bool(value_or("log_kv_gamma_level0_reinsert", True))).lower())
+emit("LOG_KV_GAMMA_TOP_MERGE", value_or("log_kv_gamma_top_merge", "lightest"))
+emit("LOG_KV_GAMMA_LEVEL_SLACK", int(value_or("log_kv_gamma_level_slack", 2)))
+# Gamma cues default on (64 opening tokens); YAML 0 keeps the K/V-only span scores.
+emit("LOG_KV_GAMMA_CUE_TOKENS", int(value_or("log_kv_gamma_cue_tokens", 64)))
+# Gamma literals default off; YAML true values first occurrences of random-looking literals.
+emit("LOG_KV_GAMMA_LITERALS", str(bool(value_or("log_kv_gamma_literals", False))).lower())
+# Gamma cue guard default off; YAML true keeps cues from ordinary openings and topic words.
+emit("LOG_KV_GAMMA_CUE_GUARD", str(bool(value_or("log_kv_gamma_cue_guard", False))).lower())
+# Gamma query-aware cue default off; YAML true also takes cues from each prompt's closing question.
+emit("LOG_KV_GAMMA_QUERY_CUE", str(bool(value_or("log_kv_gamma_query_cue", False))).lower())
+# niahLogKV learned retention heads (train_retention.py output); unset = off.
+emit("LOG_KV_RETENTION_HEADS", cfg.get("log_kv_retention_heads") or "")
+emit("LOG_KV_GAMMA_SURPRISAL", cfg.get("log_kv_gamma_surprisal") or "")
 emit("LOG_KV_CLUSTER_K_MAX", value_or("log_kv_cluster_k_max", 1))
 emit("LOG_KV_CLUSTER_LAMBDA_REL", value_or("log_kv_cluster_lambda_rel", 1.0))
 emit("LOG_KV_SEG_ETA", value_or("log_kv_seg_eta", 1.0))
@@ -222,6 +276,25 @@ emit("LOG_KV_SEMANTIC_FLUSH_GRANULARITY", value_or("log_kv_semantic_flush_granul
 emit("MAX_STEPS", max_steps)
 emit("NUM_EPOCHS", num_epochs)
 emit("TOKENIZER_CANDIDATES", ":".join(candidates))
+# Long-context evaluation: the RULER / NIAH context lengths, the NIAH task list, and model config
+# overrides (e.g. block_size and YaRN rope_adjustments) handed to eval.py as JSON.
+lengths = cfg.get("eval_max_seq_lengths") or [1024, 2048, 4096, 8192, 16384, 32768]
+emit("EVAL_MAX_SEQ_LENGTHS", json.dumps([int(x) for x in lengths]))
+niah = cfg.get("niah_benchmark")
+emit("CONFIG_NIAH_BENCHMARKS", ",".join(niah) if isinstance(niah, (list, tuple)) else (niah or ""))
+overrides = cfg.get("config_overrides")
+emit("CONFIG_OVERRIDES", json.dumps(overrides) if overrides else "")
+emit("EVAL_LIMIT", cfg.get("limit") or "")  # samples per task (lm-eval's --limit), every stage
+# Data of the repository's long-context tasks (eval_tasks/long_ppl, eval_tasks/babilong_long).
+emit("CONFIG_LONG_PPL_DATA", cfg.get("long_ppl_data") or "")
+emit("CONFIG_LONG_PPL_BOOKS", cfg.get("long_ppl_books") or "")  # long_ppl_books_<L>: books of >= 256K tokens
+# Several lengths in one job (long_eval_plan.py): a list such as [32k, 64k, 128k, 256k].
+emit("CONFIG_EVAL_LENGTHS", ",".join(str(x) for x in (cfg.get("eval_lengths") or [])))
+emit("CONFIG_BABILONG_DATASET", cfg.get("babilong_dataset") or "")
+emit("CONFIG_INFINITEBENCH_DIR", cfg.get("infinitebench_dir") or "")  # eval_tasks/infinitebench
+# The full evaluation (eval_main: true): the 32K main line, then the length passes with their own samples per task.
+emit("CONFIG_EVAL_MAIN", "1" if cfg.get("eval_main") else "")
+emit("CONFIG_LONG_LIMIT", cfg.get("long_limit") or "")
 EOF
 )
 CONFIG_STATUS=$?
@@ -230,6 +303,31 @@ if [ ${CONFIG_STATUS} -ne 0 ]; then
     exit ${CONFIG_STATUS}
 fi
 eval "${CONFIG_EXPORTS}"
+# An environment variable wins over the YAML; eval.py's tasks read these.
+LONG_PPL_DATA=${LONG_PPL_DATA:-${CONFIG_LONG_PPL_DATA}}
+LONG_PPL_BOOKS=${LONG_PPL_BOOKS:-${CONFIG_LONG_PPL_BOOKS}}
+BABILONG_DATASET=${BABILONG_DATASET:-${CONFIG_BABILONG_DATASET}}
+INFINITEBENCH_DIR=${INFINITEBENCH_DIR:-${CONFIG_INFINITEBENCH_DIR}}
+if [ -n "${LONG_PPL_DATA}" ]; then export LONG_PPL_DATA; fi
+if [ -n "${LONG_PPL_BOOKS}" ]; then export LONG_PPL_BOOKS; fi
+if [ -n "${BABILONG_DATASET}" ]; then export BABILONG_DATASET; fi
+if [ -n "${INFINITEBENCH_DIR}" ]; then export INFINITEBENCH_DIR; fi
+
+# Several lengths in one job (eval_lengths in the YAML, or EVAL_LENGTHS=32k,128k): one pass per length with its
+# own window and YaRN factor (YARN_MODE=per_length, the default, or fixed), tasks chosen by EVAL_SUITES and
+# NIAH_ONLY=1; see long_eval_plan.py. Each pass writes to <output_path>/long<L> (fixed: yarn<F>/long<L>).
+# The full evaluation (eval_main: true in the YAML, or EVAL_MAIN=1) runs the 32K main line first (the default task
+# lists, main and NIAH stage, the YAML's limit, into <output_path>), then the passes (long_limit samples per task),
+# which leave out what the main line measured; EVAL_LENGTHS=none keeps the main line only.
+EVAL_LENGTHS=${EVAL_LENGTHS:-${CONFIG_EVAL_LENGTHS}}
+case "$(printf '%s' "${EVAL_LENGTHS}" | tr '[:upper:]' '[:lower:]')" in
+    none|off|false|0) EVAL_LENGTHS="" ;;
+esac
+EVAL_MAIN=${EVAL_MAIN:-${CONFIG_EVAL_MAIN}}
+if [ -n "${EVAL_LENGTHS}" ] && { [ -n "${2:-}" ] || [ -n "${3:-}" ]; }; then
+    echo "ERROR: ${CONFIG_FILE} evaluates several lengths (EVAL_LENGTHS=${EVAL_LENGTHS}): choose tasks with EVAL_SUITES or NIAH_ONLY=1, not task-list arguments."
+    exit 1
+fi
 
 checkpoint_exists() {
     [ -f "$1" ] || { [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
@@ -325,7 +423,7 @@ for TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
     fi
 done
 
-LOG_KV_ARG_LIST=(--log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}")
+LOG_KV_ARG_LIST=(--log_kv_dense_mode "${LOG_KV_DENSE_MODE}" --log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}")
 if [ -n "${LOG_KV_SECOND_ORDER_SCALE}" ]; then
     LOG_KV_ARG_LIST+=(--log_kv_second_order_scale "${LOG_KV_SECOND_ORDER_SCALE}")
 fi
@@ -343,6 +441,13 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
         --log_kv_alpha_span_max_tokens "${LOG_KV_ALPHA_SPAN_MAX_TOKENS}"
         --log_kv_beta_novelty "${LOG_KV_BETA_NOVELTY}"
         --log_kv_beta_adaptive_merge "${LOG_KV_BETA_ADAPTIVE_MERGE}"
+        --log_kv_gamma_level0_reinsert "${LOG_KV_GAMMA_LEVEL0_REINSERT}"
+        --log_kv_gamma_top_merge "${LOG_KV_GAMMA_TOP_MERGE}"
+        --log_kv_gamma_level_slack "${LOG_KV_GAMMA_LEVEL_SLACK}"
+        --log_kv_gamma_cue_tokens "${LOG_KV_GAMMA_CUE_TOKENS}"
+        --log_kv_gamma_literals "${LOG_KV_GAMMA_LITERALS}"
+        --log_kv_gamma_cue_guard "${LOG_KV_GAMMA_CUE_GUARD}"
+        --log_kv_gamma_query_cue "${LOG_KV_GAMMA_QUERY_CUE}"
         --log_kv_cluster_k_max "${LOG_KV_CLUSTER_K_MAX}"
         --log_kv_cluster_lambda_rel "${LOG_KV_CLUSTER_LAMBDA_REL}"
         --log_kv_seg_eta "${LOG_KV_SEG_ETA}"
@@ -357,8 +462,45 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
     if [ -n "${LOG_KV_SEMANTIC_S_H_PATH}" ]; then
         LOG_KV_ARG_LIST+=(--log_kv_semantic_s_h_path "${LOG_KV_SEMANTIC_S_H_PATH}")
     fi
+    if [ -n "${LOG_KV_RETENTION_HEADS}" ]; then
+        LOG_KV_ARG_LIST+=(--log_kv_retention_heads "${LOG_KV_RETENTION_HEADS}")
+    fi
+    if [ -n "${LOG_KV_GAMMA_SURPRISAL}" ]; then
+        LOG_KV_ARG_LIST+=(--log_kv_gamma_surprisal "${LOG_KV_GAMMA_SURPRISAL}")
+    fi
+fi
+if [ -n "${SWA_WINDOW_SIZE}" ]; then
+    LOG_KV_ARG_LIST+=(--swa_window_size "${SWA_WINDOW_SIZE}")
+fi
+EVAL_LIMIT=${LIMIT:-${EVAL_LIMIT}}  # LIMIT=2 overrides the YAML's samples per task for one run (e.g. a memory check)
+# The length passes' samples per task: long_limit (the full evaluation), else the YAML's limit.
+LONG_EVAL_LIMIT=${LIMIT:-${LONG_EVAL_LIMIT:-${CONFIG_LONG_LIMIT:-${EVAL_LIMIT}}}}
+# What the main line runs with (the length passes bring their own overrides and limit).
+MAIN_ARGS=()
+if [ -n "${CONFIG_OVERRIDES}" ]; then
+    MAIN_ARGS+=(--config_overrides "${CONFIG_OVERRIDES}")
+fi
+if [ -n "${EVAL_LIMIT}" ]; then
+    MAIN_ARGS+=(--limit "${EVAL_LIMIT}")
 fi
 DIAG_ARGS=${DIAG_ARGS:-}
+# 打分头文件由 retention.sh 写出（训练与评测共用 eval_niah_*.yaml 里的同一路径）；缺失时在加载模型前停下。
+if [ "${LOG_KV_SEMANTIC}" = "true" ] && [ "${LOG_KV_ALPHA_EXACT_TOKENS}" != "0" ] \
+        && [ -n "${LOG_KV_RETENTION_HEADS}" ] && [ "${LOG_KV_RETENTION_HEADS}" != "__none__" ] \
+        && [ ! -f "${LOG_KV_RETENTION_HEADS}" ]; then
+    echo "❌ 致命错误：打分头文件 ${LOG_KV_RETENTION_HEADS} 不存在（${CONFIG_FILE} 的 log_kv_retention_heads）。"
+    HEADS_TRAINERS=$(grep -lE "^(log_kv_retention_heads|retention_out):[[:space:]]*${LOG_KV_RETENTION_HEADS}[[:space:]]*$" \
+        "$(dirname "${CONFIG_FILE}")"/eval_niah_*.yaml 2>/dev/null || true)
+    if [ -n "${HEADS_TRAINERS}" ]; then
+        echo "   先用写出它的 YAML 训练打分头："
+        for HEADS_TRAINER in ${HEADS_TRAINERS}; do
+            echo "   bash retention.sh ${HEADS_TRAINER}"
+        done
+    else
+        echo "   先用 retention.sh 训练它：YAML 的 log_kv_retention_heads（或 retention_out）指向这个路径。"
+    fi
+    exit 1
+fi
 TOKENIZER_ARGS=""
 if [ -n "${TOKENIZER_SOURCE}" ]; then
     TOKENIZER_ARGS="--tokenizer_dir ${TOKENIZER_SOURCE}"
@@ -370,7 +512,13 @@ fi
 
 echo "Checkpoint: ${SAVE_DIR}"
 echo "Output dir: ${EVAL_OUTPUT_DIR}"
-echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, unified_route=${LOG_KV_SEMANTIC_UNIFIED_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND})"
+if [ "${LOG_KV_DENSE_MODE}" = "true" ]; then
+    echo "dense eval: 普通因果注意力，使用完整 KV"
+elif [ -n "${SWA_WINDOW_SIZE}" ]; then
+    echo "SWA eval: window ${SWA_WINDOW_SIZE} (0 = LogKV bytes: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, K=${LOG_KV_CLUSTER_K_MAX})"
+else
+    echo "logKV eval: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, unified_route=${LOG_KV_SEMANTIC_UNIFIED_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND})"
+fi
 if [ -n "${DIAG_ARGS}" ]; then
     echo "Extra eval args: ${DIAG_ARGS}"
 fi
@@ -402,7 +550,22 @@ if ! ensure_checkpoint_tokenizer; then
     exit 1
 fi
 
-BARRIER_DIR="${SAVE_DIR}/.eval_only_barrier_d"
+# REPAIR_HF_CACHE=1: node 0 first repairs unreadable dataset_info.json files in the shared HF cache
+# (eval.py's HF_DATASETS_CACHE), keeping originals as *.truncated. Its barrier file comes after, so the
+# other nodes start evaluating only once the repair is done.
+HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache}
+if [ "${REPAIR_HF_CACHE:-0}" = "1" ] && [ "${NODE_RANK}" = "0" ]; then
+    echo "Node 0: repairing unreadable dataset_info.json under ${HF_DATASETS_ROOT}"
+    if ! "${PYTHON_BIN}" unused/repair_dataset_info.py --scan "${HF_DATASETS_ROOT}" --write --check; then
+        echo "ERROR: HF cache repair failed (see above); not starting eval."
+        exit 1
+    fi
+fi
+
+# One barrier folder per job (MA_VJ_NAME names the ModelArts job, MASTER_ADDR elsewhere): evals of the same
+# checkpoint may run at once, and node 0 of one must not count or remove another's node files, nor a
+# failed run's leftovers.
+BARRIER_DIR="${SAVE_DIR}/.eval_only_barrier_d/${MA_VJ_NAME:-${MASTER_ADDR}}"
 mkdir -p "${BARRIER_DIR}"
 touch "${BARRIER_DIR}/node_${NODE_RANK}"
 
@@ -427,71 +590,153 @@ DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_qasper,longbench_qmsum,longb
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
+# At the native 32K: several questions on one cache (eval_tasks/niah_turns) and the book perplexity curve
+# (eval_tasks/long_ppl, data LONG_PPL_BOOKS). Optional in the default list: eval.py leaves them out, with a
+# warning, for a checkpoint whose window is shorter (a 4K run) or when LONG_PPL_BOOKS is not set.
+DEFAULT_OPTIONAL_BENCHMARKS="niah_turns_32k,long_ppl_books_32k"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},${DEFAULT_OPTIONAL_BENCHMARKS}"
 
 BENCHMARKS=${2:-}
 if [ -z "${BENCHMARKS}" ]; then
     BENCHMARKS=${CONFIG_BENCHMARKS:-}
 fi
+export EVAL_OPTIONAL_TASKS=  # tasks asked for by name must run
 if [ -z "${BENCHMARKS}" ]; then
     BENCHMARKS=${DEFAULT_BENCHMARKS}
+    export EVAL_OPTIONAL_TASKS=${DEFAULT_OPTIONAL_BENCHMARKS}
 fi
 
-NIAH_BENCHMARKS=${3:-niah_single_1,niah_single_2,niah_single_3}
-META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
-MAIN_METADATA_ARGS=()
-if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* ]]; then
-    MAIN_METADATA_ARGS=(--metadata "${META}")
+# Every needle-in-a-haystack eval: RULER single needles, lm-eval's multi-needle tasks and the
+# cue-boundary prompt variants in eval_tasks/niah_cue. Pass none to skip, or a comma list for a subset.
+DEFAULT_NIAH_BENCHMARKS="niah_single_1,niah_single_2,niah_single_3"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_multikey_1,niah_multikey_2,niah_multikey_3,niah_multivalue,niah_multiquery"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_1_qend,niah_single_1_preamble,niah_single_1_paraphrase"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_qend,niah_single_2_preamble,niah_single_2_paraphrase"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_3_qend,niah_single_3_preamble,niah_single_3_paraphrase"
+# niahLogKV: word-valued needles (no digit), the generalisation check for learned retention heads.
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_words,niah_single_2_words_qend,niah_single_2_words_paraphrase"
+NIAH_BENCHMARKS=${3:-${CONFIG_NIAH_BENCHMARKS:-${DEFAULT_NIAH_BENCHMARKS}}}
+
+# Task lists lose whitespace and stray commas; none / skip / off / false / 0 or nothing left skips that
+# stage instead of handing eval.py an empty --benchmark. NIAH_ONLY=1 skips the main stage.
+normalize_benchmarks() {
+    local value
+    value=$(printf '%s' "$1" | tr -d '[:space:]' | tr -s ',' | sed -e 's/^,//' -e 's/,$//')
+    case "$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')" in
+        ""|none|skip|off|false|0) echo none ;;
+        *) echo "${value}" ;;
+    esac
+}
+BENCHMARKS=$(normalize_benchmarks "${BENCHMARKS}")
+NIAH_BENCHMARKS=$(normalize_benchmarks "${NIAH_BENCHMARKS}")
+if [ "${NIAH_ONLY:-0}" = "1" ]; then
+    BENCHMARKS=none
 fi
-
-if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
-    "${PYTHON_BIN}" -m torch.distributed.run \
-        --nnodes=${NUM_NODES} \
-        --nproc_per_node=${GPUS_PER_NODE} \
-        --node_rank=${NODE_RANK} \
-        --master_addr=${MASTER_ADDR} \
-        --master_port=${MAIN_EVAL_MASTER_PORT} \
-        eval.py \
-        --checkpoint_dir "${SAVE_DIR}" \
-        --benchmark "${BENCHMARKS}" \
-        --output_path "${EVAL_OUTPUT_DIR}" \
-        "${MAIN_METADATA_ARGS[@]}" \
-        "${LOG_KV_ARG_LIST[@]}" \
-        ${DIAG_ARGS} \
-        ${TOKENIZER_ARGS}
-
-    EVAL_STATUS=$?
-    if [ ${EVAL_STATUS} -ne 0 ]; then
-        echo "ERROR: main eval failed with exit code ${EVAL_STATUS}"
-        exit ${EVAL_STATUS}
+for TASK_LIST in "${BENCHMARKS}" "${NIAH_BENCHMARKS}"; do
+    case "${TASK_LIST}" in
+        -*) echo "ERROR: task list '${TASK_LIST}' starts with '-': put eval.py options in DIAG_ARGS, not in the task arguments."
+            exit 1 ;;
+    esac
+done
+# The length passes (long_eval_plan.py), each merging its window and YaRN into the YAML's overrides; after the main
+# line (EVAL_MAIN=1) they leave out its tasks and its NIAH tasks at its lengths.
+LONG_EVAL_PASSES=()
+if [ -n "${EVAL_LENGTHS}" ]; then
+    LONG_EVAL_SKIP=""
+    if [ "${EVAL_MAIN}" = "1" ]; then
+        LONG_EVAL_SKIP=$("${PYTHON_BIN}" long_eval_plan.py measured "${BENCHMARKS}" "${NIAH_BENCHMARKS}" "${EVAL_MAX_SEQ_LENGTHS}") || exit 1
     fi
-else
-    echo "Skipping main benchmark eval."
+    LONG_EVAL_PLAN=$("${PYTHON_BIN}" long_eval_plan.py "${EVAL_LENGTHS}" "${EVAL_SUITES:-}" "${YARN_MODE:-per_length}" \
+        "${NIAH_ONLY:-0}" "${CONFIG_OVERRIDES}" "${EVAL_OUTPUT_DIR}" "${LONG_EVAL_SKIP}") || exit 1
+    mapfile -t LONG_EVAL_PASSES <<< "${LONG_EVAL_PLAN}"
+    echo "Long-context passes (YARN_MODE=${YARN_MODE:-per_length}, EVAL_SUITES=${EVAL_SUITES:-all}, main line first: ${EVAL_MAIN:-0}):"
+    printf '  %s\n' "${LONG_EVAL_PASSES[@]}"
 fi
-
-if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
-    "${PYTHON_BIN}" -m torch.distributed.run \
-        --nnodes=${NUM_NODES} \
-        --nproc_per_node=${GPUS_PER_NODE} \
-        --node_rank=${NODE_RANK} \
-        --master_addr=${MASTER_ADDR} \
-        --master_port=${NIAH_EVAL_MASTER_PORT} \
-        eval.py \
-        --checkpoint_dir "${SAVE_DIR}" \
-        --benchmark "${NIAH_BENCHMARKS}" \
-        --metadata "${META}" \
-        --output_path "${EVAL_OUTPUT_DIR}" \
-        "${LOG_KV_ARG_LIST[@]}" \
-        ${DIAG_ARGS} \
-        ${TOKENIZER_ARGS}
-
-    EVAL_STATUS=$?
-    if [ ${EVAL_STATUS} -ne 0 ]; then
-        echo "ERROR: NIAH eval failed with exit code ${EVAL_STATUS}"
-        exit ${EVAL_STATUS}
+# The main stage, then the NIAH stage, with the current task lists, lengths, output dir and PASS_ARGS.
+run_stages() {
+    echo "Main benchmarks: ${BENCHMARKS}"
+    echo "NIAH benchmarks: ${NIAH_BENCHMARKS}"
+    # RULER / NIAH context lengths: the YAML's eval_max_seq_lengths (default 1K-32K).
+    META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENGTHS}"'}'
+    MAIN_METADATA_ARGS=()
+    # Tasks that build their samples or cut their prompts with the tokenizer (RULER, long_ppl, InfiniteBench) need
+    # the metadata.
+    if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* \
+        || "${BENCHMARKS}" == *infinitebench* ]]; then
+        MAIN_METADATA_ARGS=(--metadata "${META}")
     fi
-else
-    echo "Skipping NIAH eval."
+
+    if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
+        "${PYTHON_BIN}" -m torch.distributed.run \
+            --nnodes=${NUM_NODES} \
+            --nproc_per_node=${GPUS_PER_NODE} \
+            --node_rank=${NODE_RANK} \
+            --master_addr=${MASTER_ADDR} \
+            --master_port=${MAIN_EVAL_MASTER_PORT} \
+            eval.py \
+            --checkpoint_dir "${SAVE_DIR}" \
+            --benchmark "${BENCHMARKS}" \
+            --output_path "${EVAL_OUTPUT_DIR}" \
+            "${MAIN_METADATA_ARGS[@]}" \
+            "${LOG_KV_ARG_LIST[@]}" \
+            "${PASS_ARGS[@]}" \
+            ${DIAG_ARGS} \
+            ${TOKENIZER_ARGS}
+
+        EVAL_STATUS=$?
+        if [ ${EVAL_STATUS} -ne 0 ]; then
+            echo "ERROR: main eval failed with exit code ${EVAL_STATUS}"
+            exit ${EVAL_STATUS}
+        fi
+    else
+        echo "Skipping main benchmark eval."
+    fi
+
+    if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
+        "${PYTHON_BIN}" -m torch.distributed.run \
+            --nnodes=${NUM_NODES} \
+            --nproc_per_node=${GPUS_PER_NODE} \
+            --node_rank=${NODE_RANK} \
+            --master_addr=${MASTER_ADDR} \
+            --master_port=${NIAH_EVAL_MASTER_PORT} \
+            eval.py \
+            --checkpoint_dir "${SAVE_DIR}" \
+            --benchmark "${NIAH_BENCHMARKS}" \
+            --metadata "${META}" \
+            --output_path "${EVAL_OUTPUT_DIR}" \
+            "${LOG_KV_ARG_LIST[@]}" \
+            "${PASS_ARGS[@]}" \
+            ${DIAG_ARGS} \
+            ${TOKENIZER_ARGS}
+
+        EVAL_STATUS=$?
+        if [ ${EVAL_STATUS} -ne 0 ]; then
+            echo "ERROR: NIAH eval failed with exit code ${EVAL_STATUS}"
+            exit ${EVAL_STATUS}
+        fi
+    else
+        echo "Skipping NIAH eval."
+    fi
+}
+
+if [ -z "${EVAL_LENGTHS}" ] || [ "${EVAL_MAIN}" = "1" ]; then
+    PASS_ARGS=("${MAIN_ARGS[@]}")
+    if [ -n "${EVAL_LENGTHS}" ]; then
+        echo "===== 32K main line: ${EVAL_OUTPUT_DIR} ====="
+    fi
+    run_stages
 fi
+for PASS in "${LONG_EVAL_PASSES[@]}"; do
+    [ -n "${PASS}" ] || continue
+    IFS='|' read -r EVAL_OUTPUT_DIR PASS_OVERRIDES EVAL_MAX_SEQ_LENGTHS BENCHMARKS NIAH_BENCHMARKS PASS_OPTIONAL <<< "${PASS}"
+    export EVAL_OPTIONAL_TASKS=${PASS_OPTIONAL}
+    PASS_ARGS=(--config_overrides "${PASS_OVERRIDES}")
+    if [ -n "${LONG_EVAL_LIMIT}" ]; then
+        PASS_ARGS+=(--limit "${LONG_EVAL_LIMIT}")
+    fi
+    echo "===== Long-context pass: ${EVAL_OUTPUT_DIR} | ${PASS_OVERRIDES} ====="
+    run_stages
+done
 
 if [ ${NODE_RANK} -eq 0 ] && [ -d "${BARRIER_DIR}" ]; then
     rm -rf "${BARRIER_DIR}"

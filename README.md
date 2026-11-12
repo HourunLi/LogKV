@@ -1,18 +1,30 @@
-# SemanticLogKV（attach + Alpha + Beta）
+# SemanticLogKV（attach + Alpha + Beta + Gamma）
 
 基于 LitGPT 的流式 KV 压缩：flush 时把新 token 用 attach 路由分给冻结中心的旧簇，
 远离所有旧簇的 orphan 开新簇；每个簇维护有界层级缓存。Alpha 在同一缓存预算内保留可替换的
 短片段精确槽，尝试减少孤立事实被均值压缩的损失；Beta 在 Alpha 上增加旧簇新颖度评分，
-以及簇内局部四进二的自适应切分，不增加持久 KV 预算。目标是固定簇数与窗口大小下
-O(log N) 的推理 KV 存储。
+以及簇内局部四进二的自适应切分，不增加持久 KV 预算。Gamma 修正 Alpha 延迟归档对旧内容的
+重复压缩（只重排第 0 层），让饱和顶层合并最轻的相邻对，并在精确池选片段时给重复开头指令里
+稀有 token 的片段加分（cue）。目标是固定簇数与窗口大小下 O(log N) 的推理 KV 存储。
 
 当前默认：attach 路由、K=12、recent/flush=2048、精确池 256 token、片段上限 64 token、
+<<<<<<< HEAD
 Beta 两项开启、mid anchor、一阶 attention。精确池从原 B=128 的预算中扣除，实际 B 由代码计算。
 训练/评测入口对语义簇默认开启 Alpha/Beta、关闭 unified；YAML 写
 `log_kv_alpha_exact_tokens: 0` 关闭 Alpha 与 Beta，`log_kv_beta_*: false` 只关 Beta，
 `log_kv_semantic_unified_route: true` 切回 unified 对照。这一组合（attach + Alpha + Beta）
 的质量与速度应由对应 checkpoint、完整配置和结果文件确认；本页不把旧实验结果
 当作当前组合的结论。精确槽选择是启发式，不保证远程事实无损。
+=======
+Beta 两项开启、Gamma 第 0 层重排、最轻对顶层合并与 cue（开头 64 个 token）开启、mid anchor、
+一阶 attention。精确池从原 B=128 的预算中扣除，实际 B 由代码计算。训练/评测入口对语义簇默认开启
+Alpha/Beta/Gamma、关闭 unified；YAML 写 `log_kv_alpha_exact_tokens: 0` 关闭 Alpha、Beta 与 cue，
+`log_kv_beta_*: false` 只关 Beta，`log_kv_gamma_level0_reinsert: false` 与
+`log_kv_gamma_top_merge: fold` 恢复旧梯子，`log_kv_gamma_cue_tokens: 0` 关闭 cue，
+`log_kv_semantic_unified_route: true` 切回 unified 对照。更早的实验 YAML 显式写回各自训练时的开关。
+attach + Alpha + Beta + Gamma 本身尚无评测结果；精确槽选择是启发式（cue 只在 RULER 代理上验证过），
+收益需实测确认。
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 
 ## 文档
 
@@ -21,6 +33,8 @@ Beta 两项开启、mid anchor、一阶 attention。精确池从原 B=128 的预
 | [共享算法规格](docs/algorithm-spec.md) | 缓存结构、attach / unified 路由、层级压缩、训推边界 |
 | [Alpha 精确片段算法](docs/alpha-logkv.md) | 分段、打分、替换、预算，以及延迟归档 |
 | [Beta 算法与运行入口](docs/beta-logkv.md) | 新颖度评分、低失真切分、回放约束、训练与评测 |
+| [Gamma 梯子修正与 cue](docs/gamma-logkv.md) | 延迟归档只重排第 0 层、顶层最轻对合并、同字节余量层、精确池的开头提示词与字面量选择、针的去向诊断 |
+| [niahLogKV 学习保留打分](docs/niah-logkv.md) | 不看开头与问题的精确池打分头、合成检索数据、`train_retention.py`、惊异度准入与诊断、评测与 CPT 配置 |
 | [统一路由实现](docs/semantic-unified-routing.md) | 可选 unified 路由的 Ward/半径公式、增量更新和数值约束 |
 | [位置与注意力](docs/position.md) | pre-RoPE 内容、mid/multi 锚点、质量偏置 |
 | [全程 SWA 对照](docs/swa-niah-comparison.md) | 同权重、同持久缓存字节预算的比较口径 |
@@ -29,22 +43,78 @@ Beta 两项开启、mid anchor、一阶 attention。精确池从原 B=128 的预
 
 ## 运行入口
 
-默认训练配置是 `exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml`（`_4k` 为 recent 4096），
-算法开关集中在其父配置 `arc_semantic_fast.yaml`。只训练、不触发默认的全套后续评测：
+默认训练配置是 `exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml`，算法开关集中在其父配置
+`arc_semantic_fast.yaml`。同目录不带 cue 的 `arc_gamma_k12_*` 是梯子修正的对照（B=256、精确池 1024、
+`level_slack: 0` 等）；`arc_gamma_cue_k12_b128_p1024*_2k` 在同字节下把 cue 与 P=1024（及 `level_slack: 0`）组合；
+`eval_gamma_cue.yaml` 只在评测时给已训练的 checkpoint 打开 cue。精确池的字面量选择（随机数字串、编码的
+首次出现）默认关闭：`eval_gamma_literal*.yaml` 只在评测时打开，`arc_gamma_cue_literal_k12_b128_2k.yaml` 在 cue 之上训练。
+cue 保护（开头须以换行结束、出现超过 16 次的 cue 词不计）默认关闭，`eval_gamma_cue_guard*.yaml` 只在评测时打开。
+查询感知 cue（生成请求 prompt 末尾的问题也作为 cue，字面量降到 cue 之下一档）默认关闭，`eval_gamma_query*.yaml` 只在评测时打开。
+学习到的保留打分头（niahLogKV：每层一个小打分头按片段 K/V 估计不可压缩度，不看开头与问题）默认关闭，
+`bash retention.sh <eval_niah_*.yaml>` 训练（同 `majob.sh` 的训练环境），`eval_niah_*.yaml` 只评测、`arc_niah_*.yaml` 训练，见 [niahLogKV](docs/niah-logkv.md)。cue 在多针与改写提示下的适用边界评测见
+[Gamma 文档](docs/gamma-logkv.md)（RULER 多针任务与 `eval_tasks/niah_cue`；两个启动脚本的 NIAH 阶段默认跑全部
+20 个捞针任务，含 niahLogKV 的 3 个 words 针）。只训练、
+不触发默认的全套后续评测：
 
 ```bash
 BENCHMARKS=none NIAH_BENCHMARKS=none \
-  bash majob.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml
+  bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
+```
+
+全程 dense CPT 对照使用 `exp/qwen1.7b-32k/cpt_dense.yaml`：从 Qwen3-1.7B-Base
+初始化，沿用 Gamma cue 的 32K 数据与训练超参，独立保存为 `qwen1.7b-32k-cpt-dense`。
+`log_kv_dense_mode: true` 在训练中使用完整因果 attention，后续评测使用完整 KV；
+保留 Block activation checkpoint 与分块 LM-head loss，不启用压缩缓存或路由重放。
+该 dense 对照的推理 KV 为 O(N)，不属于 O(log N) 压缩路线。
+
+```bash
+BENCHMARKS=none NIAH_BENCHMARKS=none \
+  bash majob.sh exp/qwen1.7b-32k/cpt_dense.yaml
+```
+
+`majob.sh` 与 `eval.sh` 自动检测当前进程可见的 CUDA GPU 数量，支持 1、2、4、8 卡，
+遵守 `CUDA_VISIBLE_DEVICES`；ModelArts 的 `MA_NUM_GPUS` 作为分配上限。
+可用 `GPUS_PER_NODE=2` 限制进程数，指定数量不得超过可见卡数或分配上限。
+启动时打印检测结果，YAML 中的 `num_devices: 8` 不会覆盖 torchrun 的实际卡数。
+当前每卡 micro batch 为 1、全局 batch 为 32，单机 1/2/4/8 卡分别累积 32/16/8/4 次；
+多机按全部进程数计算。无法整除时在加载模型前报错，不静默改变全局 batch。
+
+`NIAH_ONLY=1` 只跳过主评测，仍会跑捞针；在 `majob.sh` 中也不会跳过尚未完成的训练。
+只训练需像上面一样将两个 benchmark 环境变量都设为 `none`。之后单独评测捞针可用
+`NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/cpt_dense.yaml`，默认全部 20 个任务。
+
+全量评测（32K 主线，再 32K / 64K / 128K / 256K 逐档的长文本评测，主线测过的不重测；任务清单与数据见
+[NIAH 文档](docs/niah-logkv.md)的“全量评测”）：
+
+```bash
+bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
+```
+
+训练完成后只跑捞针评测（默认全部 20 个 NIAH 任务；`majob.sh` 遇到已完成的 checkpoint 会跳过训练）：
+
+```bash
+NIAH_ONLY=1 bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
+NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
 ```
 
 训练后仅评测 32K single2/3（`eval.sh` 从 YAML 的 `save_path` 加载产物，不转发 YAML metadata）：
 
 ```bash
 DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
-  bash eval.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml niah_single_2,niah_single_3 none
+  bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 
-多卡评测各 rank 汇合时每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印仍未到达的 rank，
+评测默认只由全局 rank 0 输出阶段信息与低频进度（每 30s，另含起止），进度标明是本 rank 的分片；
+全部 rank 汇总完成后再报告总条数，最终指标和结果文件不变。关闭 lm-eval 内部进度条及 INFO 日志，
+截断警告保留每 rank 首次详情和本轮次数汇总，其它异常诊断保留。排查多卡问题时恢复详细输出：
+
+```bash
+LOGKV_EVAL_VERBOSE=1 bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
+```
+
+该环境变量也适用于 `majob.sh` 的评测阶段和直接运行 `eval.py`。
+多卡评测各 rank 汇合时仍每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印缺席 rank，
+保留每个等待进程的低频心跳，避免 ModelArts 将等待误判为卡死。
 超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
 
 ### 多针 NIAH（RULER）
@@ -80,13 +150,21 @@ essay 草堆总量有限，1M 时可能不足，此时会告警，该长度的�
 `save_path/training_metrics.jsonl`。输出文件、计算公式、计时边界以及新旧指标差异统一见
 [评测指标与性能口径](docs/evaluation-metrics.md)。
 
+<<<<<<< HEAD
 有效槽位比例、持久缓存分配字节和 CUDA 峰值是三种不同指标。当前
 `decode_ms_per_token` 只计首 token 之后的 decode；跨 rank 推理汇总是单设备有效吞吐，
 不能直接当作集群吞吐。指标采集不自动执行 Full KV 对照，也不代表已证明性能收益。
+=======
+此处统计存储条目，`multi` 的虚拟 attention 锚点不重复计数。槽位比例不是显存比例：预分配空位、
+元数据、额外 K 副本、打包工作区及临时峰值不在该指标内；原有 `cache_budget` 仍仅报告持久缓冲预算。
+Gamma 之前开启 Alpha 时，延迟归档反复合并旧条目，存活条目偏少、报告的压缩倍数偏高；Gamma 把条目数
+恢复到设计值，压缩倍数随之下降而分配不变（见 [Gamma](docs/gamma-logkv.md)）。
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 
 更早实验的 YAML 显式写出训练时的开关，复评不受新默认值影响：纯 attach / unified 基线为
 `arc_semantic_attach_route_*`、`arc_semantic_unified_route_*`；unified + Alpha 为 `arc_alpha_*`；
-unified + Alpha + Beta 为 `arc_beta_cpt100.yaml`。在训练环境、仓库根目录运行，并核对配置中的
+unified + Alpha + Beta 为 `arc_beta_cpt100.yaml`；attach + Alpha + Beta（Gamma 之前）为
+`arc_attach_alpha_beta_*`；只带 Gamma 梯子修正、不带 cue 的为 `arc_gamma_k12_*`。在训练环境、仓库根目录运行，并核对配置中的
 模型和输出路径。CPT 从 Base 初始化；若实验输出目录已有 checkpoint，`auto_resume` 会恢复它。
 
 ## 性能开关与无 GPU 检查
@@ -98,7 +176,7 @@ unified + Alpha + Beta 为 `arc_beta_cpt100.yaml`。在训练环境、仓库根�
 | `LOGKV_ROUTE_TILE_MB` | `1024` | unified 路由每 tile 距离矩阵目标大小；显存紧张设 `256` |
 
 无 GPU 时可用 Triton 解释器在 CPU 上运行融合路径（路由归约、融合距离、attach 核、Alpha
-分区等），与 Torch 参考逐位比较：
+分区与片段打分、join 暂存与清空等），与 Torch 参考比较（片段打分按舍入容差，其余逐位）：
 
 ```bash
 TRITON_INTERPRET=1 LOGKV_TRITON_CPU=1 python -m pytest -q tests/test_alpha_log_kv.py

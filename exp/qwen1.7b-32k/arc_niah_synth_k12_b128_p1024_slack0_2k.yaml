@@ -1,0 +1,11 @@
+# niahLogKV 对照：与 arc_niah_heads_k12_b128_p1024_slack0_2k 相同的数据（0.5 概率插入合成事实与问答）与结构
+# （P=1024 + level_slack 0，不开 cue/query/字面量），只是不用学习保留头，精确池只按 K/V 分数选择。
+config: arc_gamma_k12_b128_p1024_2k.yaml
+
+expid: qwen1.7b-32k-niah_synth_k12_b128_p1024_slack0_2k
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-niah_synth_k12_b128_p1024_slack0_2k
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging-niah_synth_k12_b128_p1024_slack0_2k
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb/tb-32k-niah_synth_k12_b128_p1024_slack0_2k
+
+log_kv_gamma_level_slack: 0
+synthetic_retrieval_prob: 0.5

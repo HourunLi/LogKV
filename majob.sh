@@ -57,7 +57,32 @@ export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
 # ==============================================================================
 # Distributed Training Setup
 # ==============================================================================
-GPUS_PER_NODE=${MA_NUM_GPUS:-${LOCAL_WORLD_SIZE:-8}}
+# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); ModelArts
+# allocation is an upper bound. GPUS_PER_NODE may explicitly select fewer GPUs.
+GPUS_PER_NODE=$("${PYTHON_BIN}" - <<'PY_GPU_COUNT'
+import os
+import sys
+
+import torch
+
+visible = torch.cuda.device_count()
+if visible < 1:
+    raise SystemExit("ERROR: no CUDA GPUs are visible; check CUDA_VISIBLE_DEVICES and the CUDA runtime.")
+try:
+    allocated = int(os.environ.get("MA_NUM_GPUS") or visible)
+    available = min(visible, allocated)
+    selected = int(os.environ.get("GPUS_PER_NODE") or available)
+except ValueError:
+    raise SystemExit("ERROR: GPUS_PER_NODE and MA_NUM_GPUS must be positive integers.")
+if allocated < 1 or not 1 <= selected <= available:
+    raise SystemExit(
+        f"ERROR: GPUS_PER_NODE={selected} must be within 1..{available} "
+        f"(visible={visible}, MA_NUM_GPUS={allocated})."
+    )
+print(f"GPU detection: visible={visible}, MA_NUM_GPUS={allocated}, using={selected}", file=sys.stderr)
+print(selected)
+PY_GPU_COUNT
+) || exit 1
 NUM_NODES=${MA_NUM_HOSTS:-${GROUP_WORLD_SIZE:-1}}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 if [ -n "${MA_VJ_NAME:-}" ]; then
@@ -144,11 +169,10 @@ fi
 echo "✅ 成功提取模型保存路径: ${SAVE_DIR}"
 
 # ==============================================================================
-# 🧩 logKV 专属：从训练 YAML（跟随 'config:' 继承）提取 logKV 设置，
-# 让评测使用与模型适配时相同的压缩注意力。这是 logKV 分支独有的开发代码。
-# 本管线只跑 logKV 压缩路线，评测恒定启用（无 dense 分支）。
+# 从训练 YAML（跟随 'config:' 继承）提取注意力设置，
+# 让评测与训练使用相同的 dense 或 logKV 模式。
 # ==============================================================================
-read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_UNIFIED_ROUTE LOG_KV_SEMANTIC_MERGE_PASSES LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_REPLAY_UPDATES LOG_KV_ALPHA_EXACT_TOKENS LOG_KV_ALPHA_SPAN_MAX_TOKENS LOG_KV_BETA_NOVELTY LOG_KV_BETA_ADAPTIVE_MERGE ENABLE_TENSORBOARD TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
+read -r LOG_KV_B LOG_KV_RECENT LOG_KV_PREFILL LOG_KV_SECOND_ORDER_SCALE LOG_KV_DENSE_MODE LOG_KV_SEMANTIC LOG_KV_CLUSTER_K_MAX LOG_KV_CLUSTER_LAMBDA_REL LOG_KV_SEG_ETA LOG_KV_SEG_G0 LOG_KV_SEG_GAP_MAX LOG_KV_SEG_BLOCK_LEVEL LOG_KV_SEG_FORGET LOG_KV_SEMANTIC_S_H_PATH LOG_KV_SEMANTIC_FLUSH_GRANULARITY LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE LOG_KV_SEMANTIC_CAPACITY_BETA LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT LOG_KV_SEMANTIC_LEGACY_ROUTE LOG_KV_SEMANTIC_UNIFIED_ROUTE LOG_KV_SEMANTIC_MERGE_PASSES LOG_KV_SEMANTIC_ANCHOR_MODE LOG_KV_SEMANTIC_PACK_BACKEND LOG_KV_SEMANTIC_CENTROID_BACKEND LOG_KV_SEMANTIC_REPLAY_UPDATES LOG_KV_ALPHA_EXACT_TOKENS LOG_KV_ALPHA_SPAN_MAX_TOKENS LOG_KV_BETA_NOVELTY LOG_KV_BETA_ADAPTIVE_MERGE LOG_KV_GAMMA_LEVEL0_REINSERT LOG_KV_GAMMA_TOP_MERGE LOG_KV_GAMMA_LEVEL_SLACK LOG_KV_GAMMA_CUE_TOKENS LOG_KV_GAMMA_LITERALS LOG_KV_GAMMA_CUE_GUARD LOG_KV_GAMMA_QUERY_CUE LOG_KV_RETENTION_HEADS ENABLE_TENSORBOARD TRAIN_L_ALLOC TRAIN_PERSISTENT TRAIN_S SAVE_CKPT MAX_STEPS NUM_EPOCHS TOKENIZER_CANDIDATES <<< "$(python - "${CONFIG_FILE}" <<'EOF'
 import math
 import os
 import sys
@@ -214,6 +238,7 @@ print(
     cfg.get("log_kv_recent_size", 1024),
     cfg.get("log_kv_prefill_block", 256),
     cfg.get("log_kv_second_order_scale", 1.0),
+    str(bool(cfg.get("log_kv_dense_mode", False))).lower(),
     str(bool(cfg.get("log_kv_semantic_clusters", False))).lower(),
     cfg.get("log_kv_cluster_k_max", 1),
     cfg.get("log_kv_cluster_lambda_rel", 1.0),
@@ -239,6 +264,20 @@ print(
     64 if cfg.get("log_kv_alpha_span_max_tokens") is None else cfg["log_kv_alpha_span_max_tokens"],
     str(True if cfg.get("log_kv_beta_novelty") is None else bool(cfg["log_kv_beta_novelty"])).lower(),
     str(True if cfg.get("log_kv_beta_adaptive_merge") is None else bool(cfg["log_kv_beta_adaptive_merge"])).lower(),
+    # Gamma defaults on; YAML false / "fold" restores the earlier ladder behaviour.
+    str(True if cfg.get("log_kv_gamma_level0_reinsert") is None else bool(cfg["log_kv_gamma_level0_reinsert"])).lower(),
+    cfg.get("log_kv_gamma_top_merge") or "lightest",
+    2 if cfg.get("log_kv_gamma_level_slack") is None else int(cfg["log_kv_gamma_level_slack"]),
+    # Gamma cues default on (64 opening tokens); YAML 0 keeps the K/V-only span scores.
+    64 if cfg.get("log_kv_gamma_cue_tokens") is None else int(cfg["log_kv_gamma_cue_tokens"]),
+    # Gamma literals default off; YAML true values first occurrences of random-looking literals.
+    str(bool(cfg.get("log_kv_gamma_literals") or False)).lower(),
+    # Gamma cue guard default off; YAML true keeps cues from ordinary openings and topic words.
+    str(bool(cfg.get("log_kv_gamma_cue_guard") or False)).lower(),
+    # Gamma query-aware cue default off; YAML true also takes cues from each prompt closing question.
+    str(bool(cfg.get("log_kv_gamma_query_cue") or False)).lower(),
+    # niahLogKV learned retention heads (train_retention.py output); unset = off.
+    cfg.get("log_kv_retention_heads") or "__none__",
     str(True if cfg.get("enable_tensorboard") is None else bool(cfg["enable_tensorboard"])).lower(),
     train_l_alloc,
     train_persistent,
@@ -377,20 +416,40 @@ for RAW_TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
     fi
 done
 
-LOG_KV_ARGS="--log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
+LOG_KV_ARGS="--log_kv_dense_mode ${LOG_KV_DENSE_MODE} --log_kv_B ${LOG_KV_B} --log_kv_recent_size ${LOG_KV_RECENT} --log_kv_prefill_block ${LOG_KV_PREFILL} --log_kv_second_order_scale ${LOG_KV_SECOND_ORDER_SCALE}"
 if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
-    LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_cluster_chunk_size ${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE} --log_kv_semantic_capacity_beta ${LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT} --log_kv_semantic_legacy_route ${LOG_KV_SEMANTIC_LEGACY_ROUTE} --log_kv_semantic_unified_route ${LOG_KV_SEMANTIC_UNIFIED_ROUTE} --log_kv_semantic_merge_passes ${LOG_KV_SEMANTIC_MERGE_PASSES} --log_kv_semantic_anchor_mode ${LOG_KV_SEMANTIC_ANCHOR_MODE} --log_kv_semantic_pack_backend ${LOG_KV_SEMANTIC_PACK_BACKEND} --log_kv_semantic_centroid_backend ${LOG_KV_SEMANTIC_CENTROID_BACKEND} --log_kv_semantic_replay_updates ${LOG_KV_SEMANTIC_REPLAY_UPDATES} --log_kv_alpha_exact_tokens ${LOG_KV_ALPHA_EXACT_TOKENS} --log_kv_alpha_span_max_tokens ${LOG_KV_ALPHA_SPAN_MAX_TOKENS} --log_kv_beta_novelty ${LOG_KV_BETA_NOVELTY} --log_kv_beta_adaptive_merge ${LOG_KV_BETA_ADAPTIVE_MERGE}"
+    LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_clusters true --log_kv_cluster_k_max ${LOG_KV_CLUSTER_K_MAX} --log_kv_cluster_lambda_rel ${LOG_KV_CLUSTER_LAMBDA_REL} --log_kv_seg_eta ${LOG_KV_SEG_ETA} --log_kv_seg_g0 ${LOG_KV_SEG_G0} --log_kv_seg_block_level ${LOG_KV_SEG_BLOCK_LEVEL} --log_kv_seg_forget ${LOG_KV_SEG_FORGET} --log_kv_semantic_flush_granularity ${LOG_KV_SEMANTIC_FLUSH_GRANULARITY} --log_kv_semantic_cluster_chunk_size ${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE} --log_kv_semantic_capacity_beta ${LOG_KV_SEMANTIC_CAPACITY_BETA} --log_kv_semantic_capacity_hard_cap_mult ${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT} --log_kv_semantic_legacy_route ${LOG_KV_SEMANTIC_LEGACY_ROUTE} --log_kv_semantic_unified_route ${LOG_KV_SEMANTIC_UNIFIED_ROUTE} --log_kv_semantic_merge_passes ${LOG_KV_SEMANTIC_MERGE_PASSES} --log_kv_semantic_anchor_mode ${LOG_KV_SEMANTIC_ANCHOR_MODE} --log_kv_semantic_pack_backend ${LOG_KV_SEMANTIC_PACK_BACKEND} --log_kv_semantic_centroid_backend ${LOG_KV_SEMANTIC_CENTROID_BACKEND} --log_kv_semantic_replay_updates ${LOG_KV_SEMANTIC_REPLAY_UPDATES} --log_kv_alpha_exact_tokens ${LOG_KV_ALPHA_EXACT_TOKENS} --log_kv_alpha_span_max_tokens ${LOG_KV_ALPHA_SPAN_MAX_TOKENS} --log_kv_beta_novelty ${LOG_KV_BETA_NOVELTY} --log_kv_beta_adaptive_merge ${LOG_KV_BETA_ADAPTIVE_MERGE} --log_kv_gamma_level0_reinsert ${LOG_KV_GAMMA_LEVEL0_REINSERT} --log_kv_gamma_top_merge ${LOG_KV_GAMMA_TOP_MERGE} --log_kv_gamma_level_slack ${LOG_KV_GAMMA_LEVEL_SLACK} --log_kv_gamma_cue_tokens ${LOG_KV_GAMMA_CUE_TOKENS} --log_kv_gamma_literals ${LOG_KV_GAMMA_LITERALS} --log_kv_gamma_cue_guard ${LOG_KV_GAMMA_CUE_GUARD} --log_kv_gamma_query_cue ${LOG_KV_GAMMA_QUERY_CUE}"
     if [ "${LOG_KV_SEG_GAP_MAX}" != "__none__" ]; then
         LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_seg_gap_max ${LOG_KV_SEG_GAP_MAX}"
     fi
     if [ "${LOG_KV_SEMANTIC_S_H_PATH}" != "__none__" ]; then
         LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_semantic_s_h_path ${LOG_KV_SEMANTIC_S_H_PATH}"
     fi
+    if [ "${LOG_KV_RETENTION_HEADS}" != "__none__" ]; then
+        LOG_KV_ARGS="${LOG_KV_ARGS} --log_kv_retention_heads ${LOG_KV_RETENTION_HEADS}"
+    fi
 fi
 
 EVAL_LOG_KV_ARGS="${LOG_KV_ARGS}"
 
 DIAG_ARGS=${DIAG_ARGS:-}
+# 打分头文件由 retention.sh 写出（训练与评测共用 eval_niah_*.yaml 里的同一路径）；缺失时在加载模型前停下。
+if [ "${LOG_KV_SEMANTIC}" = "true" ] && [ "${LOG_KV_ALPHA_EXACT_TOKENS}" != "0" ] \
+        && [ -n "${LOG_KV_RETENTION_HEADS}" ] && [ "${LOG_KV_RETENTION_HEADS}" != "__none__" ] \
+        && [ ! -f "${LOG_KV_RETENTION_HEADS}" ]; then
+    echo "❌ 致命错误：打分头文件 ${LOG_KV_RETENTION_HEADS} 不存在（${CONFIG_FILE} 的 log_kv_retention_heads）。"
+    HEADS_TRAINERS=$(grep -lE "^(log_kv_retention_heads|retention_out):[[:space:]]*${LOG_KV_RETENTION_HEADS}[[:space:]]*$" \
+        "$(dirname "${CONFIG_FILE}")"/eval_niah_*.yaml 2>/dev/null || true)
+    if [ -n "${HEADS_TRAINERS}" ]; then
+        echo "   先用写出它的 YAML 训练打分头："
+        for HEADS_TRAINER in ${HEADS_TRAINERS}; do
+            echo "   bash retention.sh ${HEADS_TRAINER}"
+        done
+    else
+        echo "   先用 retention.sh 训练它：YAML 的 log_kv_retention_heads（或 retention_out）指向这个路径。"
+    fi
+    exit 1
+fi
 TOKENIZER_ARGS=""
 if [ -n "${TOKENIZER_SOURCE}" ]; then
     TOKENIZER_ARGS="--tokenizer_dir ${TOKENIZER_SOURCE}"
@@ -399,8 +458,12 @@ else
     echo "⚠️ 未在候选目录中找到 tokenizer.json/tokenizer.model: ${TOKENIZER_CANDIDATES}"
     echo "   如 eval 仍报 tokenizer 缺失，请在 YAML 中设置 tokenizer_dir。"
 fi
-echo "🧩 logKV train config: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, tree_chunk=${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE}, capacity_beta=${LOG_KV_SEMANTIC_CAPACITY_BETA}, hard_cap_mult=${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND}, centroid=${LOG_KV_SEMANTIC_CENTROID_BACKEND}, replay_updates=${LOG_KV_SEMANTIC_REPLAY_UPDATES})"
-echo "🧮 semantic budget: K=${LOG_KV_CLUSTER_K_MAX},B=${LOG_KV_B} -> L_alloc=${TRAIN_L_ALLOC}, persistent_entries=${TRAIN_PERSISTENT}, readout_S=${TRAIN_S}"
+if [ "${LOG_KV_DENSE_MODE}" = "true" ]; then
+    echo "🧩 dense train/eval: 普通因果注意力，评测使用完整 KV"
+else
+    echo "🧩 logKV train config: B=${LOG_KV_B}, recent_size=${LOG_KV_RECENT}, prefill_block=${LOG_KV_PREFILL}, second_order_scale=${LOG_KV_SECOND_ORDER_SCALE}, semantic=${LOG_KV_SEMANTIC} (K=${LOG_KV_CLUSTER_K_MAX}, g_max=${LOG_KV_SEG_GAP_MAX}, l_block=${LOG_KV_SEG_BLOCK_LEVEL}, flush=${LOG_KV_SEMANTIC_FLUSH_GRANULARITY}, tree_chunk=${LOG_KV_SEMANTIC_CLUSTER_CHUNK_SIZE}, capacity_beta=${LOG_KV_SEMANTIC_CAPACITY_BETA}, hard_cap_mult=${LOG_KV_SEMANTIC_CAPACITY_HARD_CAP_MULT}, legacy_route=${LOG_KV_SEMANTIC_LEGACY_ROUTE}, anchors=${LOG_KV_SEMANTIC_ANCHOR_MODE}, pack=${LOG_KV_SEMANTIC_PACK_BACKEND}, centroid=${LOG_KV_SEMANTIC_CENTROID_BACKEND}, replay_updates=${LOG_KV_SEMANTIC_REPLAY_UPDATES})"
+    echo "🧮 semantic budget: K=${LOG_KV_CLUSTER_K_MAX},B=${LOG_KV_B} -> L_alloc=${TRAIN_L_ALLOC}, persistent_entries=${TRAIN_PERSISTENT}, readout_S=${TRAIN_S}"
+fi
 if [ -n "${DIAG_ARGS}" ]; then
     echo "🧪 extra eval args: ${DIAG_ARGS}"
 fi
@@ -509,6 +572,17 @@ echo "================================================="
 echo "🎯 [Node ${NODE_RANK}] 写入 Barrier 文件，等待所有 ${NUM_NODES} 个节点就绪..."
 echo "================================================="
 
+# REPAIR_HF_CACHE=1：节点 0 先修复共享 HF 缓存（与 eval.py 的 HF_DATASETS_CACHE 相同）里不可读的
+# dataset_info.json，原件留作 *.truncated；修完才写本节点的 barrier，其他节点因此在修复结束后才开始评测。
+HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache}
+if [ "${REPAIR_HF_CACHE:-0}" = "1" ] && [ "${NODE_RANK}" = "0" ]; then
+    echo "🛠 [Node 0] 修复 ${HF_DATASETS_ROOT} 下不可读的 dataset_info.json"
+    if ! "${PYTHON_BIN}" unused/repair_dataset_info.py --scan "${HF_DATASETS_ROOT}" --write --check; then
+        echo "❌ [Node 0] HF 缓存修复失败（见上方输出），不进入评测。"
+        exit 1
+    fi
+fi
+
 # 每个节点写自己的独立 barrier 文件（文件存在性比文件内容跨节点可见更快）
 touch "${BARRIER_DIR}/node_${NODE_RANK}"
 
@@ -528,7 +602,7 @@ echo "✅ [Node ${NODE_RANK}] 所有 ${NUM_NODES} 个节点已就绪，启动评
 sleep 30
 
 # 拼接 benchmark 列表（避免换行空格被解析进 task 名）。支持用环境变量覆盖；
-# BENCHMARKS=none 可跳过主评测，只跑 NIAH 诊断。
+# BENCHMARKS=none（或 NIAH_ONLY=1）跳过主评测，只跑 NIAH。
 DEFAULT_BENCHMARKS="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},mmlu,ceval-valid,ifeval,truthfulqa_gen,truthfulqa_mc1,truthfulqa_mc2"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa,longbench_dureader,longbench_gov_report,longbench_hotpotqa"
@@ -538,15 +612,82 @@ DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_qasper,longbench_qmsum,longb
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_2wikimqa_e,longbench_gov_report_e,longbench_hotpotqa_e,longbench_lcc_e,longbench_multi_news_e"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_multifieldqa_en_e,longbench_passage_count_e,longbench_passage_retrieval_en_e,longbench_qasper_e"
 DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},longbench_repobench-p_e,longbench_samsum_e,longbench_trec_e,longbench_triviaqa_e"
+# 原生 32K 下的逐轮问（eval_tasks/niah_turns）与书的困惑度曲线（eval_tasks/long_ppl，数据 LONG_PPL_BOOKS）。
+# 默认清单里是可选的：窗口不到 32K（4K 训练）或没设 LONG_PPL_BOOKS 时，eval.py 打印原因后跳过。
+DEFAULT_OPTIONAL_BENCHMARKS="niah_turns_32k,long_ppl_books_32k"
+DEFAULT_BENCHMARKS="${DEFAULT_BENCHMARKS},${DEFAULT_OPTIONAL_BENCHMARKS}"
+export EVAL_OPTIONAL_TASKS=  # 按名字指定的任务必须跑
+if [ -z "${BENCHMARKS:-}" ]; then
+    export EVAL_OPTIONAL_TASKS=${DEFAULT_OPTIONAL_BENCHMARKS}
+fi
 BENCHMARKS=${BENCHMARKS:-${DEFAULT_BENCHMARKS}}
-NIAH_BENCHMARKS=${NIAH_BENCHMARKS:-niah_single_1,niah_single_2,niah_single_3}
+# 全部捞针评测：RULER 单针（single_1/2/3）、lm-eval 自带的多针，以及 eval_tasks/niah_cue 里改写提示的
+# cue 适用边界变体。NIAH_BENCHMARKS=none 跳过；只跑一部分时写逗号分隔的任务名。
+DEFAULT_NIAH_BENCHMARKS="niah_single_1,niah_single_2,niah_single_3"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_multikey_1,niah_multikey_2,niah_multikey_3,niah_multivalue,niah_multiquery"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_1_qend,niah_single_1_preamble,niah_single_1_paraphrase"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_qend,niah_single_2_preamble,niah_single_2_paraphrase"
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_3_qend,niah_single_3_preamble,niah_single_3_paraphrase"
+# niahLogKV: word-valued needles (no digit), the generalisation check for learned retention heads.
+DEFAULT_NIAH_BENCHMARKS="${DEFAULT_NIAH_BENCHMARKS},niah_single_2_words,niah_single_2_words_qend,niah_single_2_words_paraphrase"
+NIAH_BENCHMARKS=${NIAH_BENCHMARKS:-${DEFAULT_NIAH_BENCHMARKS}}
 
-# NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度
-# max_seq_lengths 可根据模型实际最大上下文调整
-META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": [1024, 2048, 4096, 8192, 16384, 32768]}'
+# 任务列表去掉空白和多余逗号；none / skip / off / false / 0 或只剩空白都表示跳过该阶段，
+# 不会把空值交给 eval.py（否则 --benchmark 没有参数）。NIAH_ONLY=1 跳过主评测、只跑 NIAH。
+normalize_benchmarks() {
+    local value
+    value=$(printf '%s' "$1" | tr -d '[:space:]' | tr -s ',' | sed -e 's/^,//' -e 's/,$//')
+    case "$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')" in
+        ""|none|skip|off|false|0) echo none ;;
+        *) echo "${value}" ;;
+    esac
+}
+BENCHMARKS=$(normalize_benchmarks "${BENCHMARKS}")
+NIAH_BENCHMARKS=$(normalize_benchmarks "${NIAH_BENCHMARKS}")
+if [ "${NIAH_ONLY:-0}" = "1" ]; then
+    BENCHMARKS=none
+fi
+for TASK_LIST in "${BENCHMARKS}" "${NIAH_BENCHMARKS}"; do
+    case "${TASK_LIST}" in
+        -*) echo "❌ 任务列表 '${TASK_LIST}' 以 - 开头：eval.py 的参数请放进 DIAG_ARGS，不要写在任务列表的位置。"
+            exit 1 ;;
+    esac
+done
+echo "🧭 [Node ${NODE_RANK}] 主评测: ${BENCHMARKS}"
+echo "🧭 [Node ${NODE_RANK}] NIAH 评测: ${NIAH_BENCHMARKS}"
+
+# NIAH 任务需要的 metadata：tokenizer 路径 + 测试的上下文长度（YAML 的 eval_max_seq_lengths，默认 1K-32K）。
+# 长于训练长度的评测（YaRN、block_size 覆盖）在最后的长文本评测里逐档跑（见下面）；单独评测用 eval.sh。
+EVAL_MAX_SEQ_LENGTHS=$(python - "${CONFIG_FILE}" <<'EOF'
+import json
+import os
+import sys
+
+import yaml
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if "config" in cfg:
+        base = load(os.path.join(os.path.dirname(path), cfg.pop("config")))
+        cfg = {**base, **cfg}
+    return cfg
+
+
+print(json.dumps([int(x) for x in load(sys.argv[1]).get("eval_max_seq_lengths") or [1024, 2048, 4096, 8192, 16384, 32768]]))
+EOF
+)
+META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${EVAL_MAX_SEQ_LENGTHS}"'}'
 
 # 评测结果：rank0 写入 JSON（带时间戳），与 litgpt evaluate 惯例一致放在 checkpoint 下 evaluate/
 EVAL_OUTPUT_DIR="${SAVE_DIR}/evaluate"
+# 用 tokenizer 生成样本或截断提示的任务（RULER、niah_turns、long_ppl、infinitebench）也在主评测里时，主评测同样要 metadata（同 eval.sh）。
+MAIN_METADATA_ARGS=()
+if [ "${BENCHMARKS}" != "none" ] && [[ "${BENCHMARKS}" == *niah_* || "${BENCHMARKS}" == *ruler* || "${BENCHMARKS}" == *long_ppl* \
+        || "${BENCHMARKS}" == *infinitebench* ]]; then
+    MAIN_METADATA_ARGS=(--metadata "${META}")
+fi
 
 if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
     "${PYTHON_BIN}" -m torch.distributed.run \
@@ -557,8 +698,9 @@ if [ "${BENCHMARKS}" != "none" ] && [ -n "${BENCHMARKS}" ]; then
         --master_port=${EVAL_MASTER_PORT} \
         eval.py \
         --checkpoint_dir ${SAVE_DIR} \
-        --benchmark ${BENCHMARKS} \
+        --benchmark "${BENCHMARKS}" \
         --output_path "${EVAL_OUTPUT_DIR}" \
+        "${MAIN_METADATA_ARGS[@]}" \
         ${EVAL_LOG_KV_ARGS} \
         ${DIAG_ARGS} \
         ${TOKENIZER_ARGS}
@@ -581,7 +723,7 @@ if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
         --master_port=${NIAH_MASTER_PORT} \
         eval.py \
         --checkpoint_dir ${SAVE_DIR} \
-        --benchmark ${NIAH_BENCHMARKS} \
+        --benchmark "${NIAH_BENCHMARKS}" \
         --metadata "${META}" \
         --output_path "${EVAL_OUTPUT_DIR}" \
         ${EVAL_LOG_KV_ARGS} \
@@ -595,6 +737,114 @@ if [ "${NIAH_BENCHMARKS}" != "none" ] && [ -n "${NIAH_BENCHMARKS}" ]; then
     fi
 else
     echo "⏩ [Node ${NODE_RANK}] 跳过 NIAH 评测 NIAH_BENCHMARKS=${NIAH_BENCHMARKS}"
+fi
+
+# ==============================================================================
+# 长文本评测（训练后接着跑，见 long_eval_plan.py）：32K / 64K / 128K / 256K 逐档，每档窗口为长度 + 1024，YaRN 按长度取
+# 倍数（32K 不用，64K 2、128K 4、256K 8；YARN_MODE=fixed 时都用最长一档的倍数），NIAH 阶段跑该长度的 RULER，主阶段跑
+# BABILong、long_ppl、long_ppl_books、niah_turns、longbench2 与 infinitebench，每个任务 LONG_EVAL_LIMIT（默认 100）条，结果写到
+# evaluate/long<L>（fixed：evaluate/yarn<F>/long<L>）。
+#   EVAL_LENGTHS=none 关掉；EVAL_LENGTHS=64k,256k 只测这些长度（默认 YAML 的 eval_lengths，否则全部）；
+#   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench 只跑这些类；NIAH_ONLY=1 只跑 RULER。
+# 上面主线已经测过的（主评测的任务、NIAH 阶段在各自长度上的捞针）不再重测，32K 档只补其余的任务。训练长度不到 32K 的
+# checkpoint 跳过（YaRN 以 32K 为原长）。数据：环境变量 LONG_PPL_DATA、LONG_PPL_BOOKS、BABILONG_DATASET、INFINITEBENCH_DIR
+# （不设则读 hub 缓存），或 YAML 的同名小写键；缺数据的 long_ppl / long_ppl_books、文件不完整的 LongBench v2 与
+# InfiniteBench 在默认类别下打印原因后跳过。
+# ==============================================================================
+LONG_EVAL_SETTINGS=$(python - "${CONFIG_FILE}" "${BENCHMARKS}" "${NIAH_BENCHMARKS}" "${EVAL_MAX_SEQ_LENGTHS}" <<'LONG_EVAL_PY'
+import json
+import os
+import shlex
+import sys
+
+import yaml
+
+
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    if "config" in cfg:
+        base = load(os.path.join(os.path.dirname(path), cfg.pop("config")))
+        cfg = {**base, **cfg}
+    return cfg
+
+
+cfg = load(sys.argv[1])
+main, niah, lengths = sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+done = [t for t in main.split(",") if t and main != "none"]
+done += [f"{t}@{n}" for t in niah.split(",") if t and niah != "none" for n in lengths]
+values = dict(
+    TRAIN_CONTEXT=int(float(cfg.get("context_length") or cfg.get("max_seq_length") or 32768)),
+    CONFIG_EVAL_LENGTHS=",".join(str(x) for x in (cfg.get("eval_lengths") or [])),
+    CONFIG_LONG_PPL_DATA=cfg.get("long_ppl_data") or "",
+    CONFIG_LONG_PPL_BOOKS=cfg.get("long_ppl_books") or "",
+    CONFIG_BABILONG_DATASET=cfg.get("babilong_dataset") or "",
+    CONFIG_INFINITEBENCH_DIR=cfg.get("infinitebench_dir") or "",
+    LONG_EVAL_SKIP=",".join(done),
+)
+for name, value in values.items():
+    print(f"{name}={shlex.quote(str(value))}")
+LONG_EVAL_PY
+) || exit 1
+eval "${LONG_EVAL_SETTINGS}"
+LONG_EVAL_LENGTHS=${EVAL_LENGTHS:-${CONFIG_EVAL_LENGTHS:-32k,64k,128k,256k}}
+case "$(printf '%s' "${LONG_EVAL_LENGTHS}" | tr '[:upper:]' '[:lower:]')" in
+    none|off|false|0) LONG_EVAL_LENGTHS="" ;;
+esac
+if [ -z "${LONG_EVAL_LENGTHS}" ]; then
+    echo "⏩ [Node ${NODE_RANK}] 跳过长文本评测 EVAL_LENGTHS=${EVAL_LENGTHS}"
+elif [ "${TRAIN_CONTEXT}" -lt 32768 ]; then
+    echo "⏩ [Node ${NODE_RANK}] 跳过长文本评测：训练长度 ${TRAIN_CONTEXT} 不到 32K（长文本的 YaRN 以 32K 为原长；要测请用 eval.sh）"
+else
+    LONG_PPL_DATA=${LONG_PPL_DATA:-${CONFIG_LONG_PPL_DATA}}
+    LONG_PPL_BOOKS=${LONG_PPL_BOOKS:-${CONFIG_LONG_PPL_BOOKS}}
+    BABILONG_DATASET=${BABILONG_DATASET:-${CONFIG_BABILONG_DATASET}}
+    INFINITEBENCH_DIR=${INFINITEBENCH_DIR:-${CONFIG_INFINITEBENCH_DIR}}
+    if [ -n "${LONG_PPL_DATA}" ]; then export LONG_PPL_DATA; fi
+    if [ -n "${LONG_PPL_BOOKS}" ]; then export LONG_PPL_BOOKS; fi
+    if [ -n "${BABILONG_DATASET}" ]; then export BABILONG_DATASET; fi
+    if [ -n "${INFINITEBENCH_DIR}" ]; then export INFINITEBENCH_DIR; fi
+    LONG_EVAL_PLAN=$("${PYTHON_BIN}" long_eval_plan.py "${LONG_EVAL_LENGTHS}" "${EVAL_SUITES:-}" "${YARN_MODE:-per_length}" \
+        "${NIAH_ONLY:-0}" "" "${EVAL_OUTPUT_DIR}" "${LONG_EVAL_SKIP}") || exit 1
+    mapfile -t LONG_EVAL_PASSES <<< "${LONG_EVAL_PLAN}"
+    echo "🧭 [Node ${NODE_RANK}] 长文本评测 (YARN_MODE=${YARN_MODE:-per_length}, EVAL_SUITES=${EVAL_SUITES:-all}):"
+    printf '   %s\n' "${LONG_EVAL_PASSES[@]}"
+    for PASS in "${LONG_EVAL_PASSES[@]}"; do
+        [ -n "${PASS}" ] || continue
+        IFS='|' read -r PASS_OUTPUT PASS_OVERRIDES PASS_LENGTHS PASS_MAIN PASS_NIAH PASS_OPTIONAL <<< "${PASS}"
+        export EVAL_OPTIONAL_TASKS=${PASS_OPTIONAL}
+        PASS_META='{"pretrained": "'"${SAVE_DIR}"'", "max_seq_lengths": '"${PASS_LENGTHS}"'}'
+        for STAGE in main niah; do
+            if [ "${STAGE}" = main ]; then
+                PASS_TASKS=${PASS_MAIN}; PASS_PORT=${EVAL_MASTER_PORT}
+            else
+                PASS_TASKS=${PASS_NIAH}; PASS_PORT=${NIAH_MASTER_PORT}
+            fi
+            [ "${PASS_TASKS}" != "none" ] || continue
+            echo "🧭 [Node ${NODE_RANK}] 长文本 ${PASS_OUTPUT} ${STAGE}: ${PASS_TASKS} | ${PASS_OVERRIDES}"
+            "${PYTHON_BIN}" -m torch.distributed.run \
+                --nnodes=${NUM_NODES} \
+                --nproc_per_node=${GPUS_PER_NODE} \
+                --node_rank=${NODE_RANK} \
+                --master_addr=${MASTER_ADDR} \
+                --master_port=${PASS_PORT} \
+                eval.py \
+                --checkpoint_dir ${SAVE_DIR} \
+                --benchmark "${PASS_TASKS}" \
+                --metadata "${PASS_META}" \
+                --output_path "${PASS_OUTPUT}" \
+                --config_overrides "${PASS_OVERRIDES}" \
+                --limit "${LONG_EVAL_LIMIT:-100}" \
+                ${EVAL_LOG_KV_ARGS} \
+                ${DIAG_ARGS} \
+                ${TOKENIZER_ARGS}
+            EVAL_STATUS=$?
+            if [ $EVAL_STATUS -ne 0 ]; then
+                echo "❌ [Node ${NODE_RANK}] 长文本评测 ${PASS_OUTPUT} ${STAGE} 崩溃 (Exit Code: $EVAL_STATUS)！"
+                exit $EVAL_STATUS
+            fi
+        done
+    done
 fi
 
 # 清理 barrier 目录（rank 0 负责）

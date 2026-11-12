@@ -1,0 +1,9 @@
+# 只在评测时打开 Gamma cue：复评已训练的 attach + Alpha + Beta checkpoint（旧梯子，不重训），
+# 只改变精确池的片段选择。换成 B=256 的 checkpoint：config 改为 arc_attach_alpha_beta_k12_b256_2k.yaml。
+config: arc_attach_alpha_beta_k12_b128_2k.yaml
+log_kv_gamma_cue_tokens: 64
+benchmark: niah_single_2,niah_single_3
+limit: null
+metadata:
+  pretrained: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
+  max_seq_lengths: [32768]

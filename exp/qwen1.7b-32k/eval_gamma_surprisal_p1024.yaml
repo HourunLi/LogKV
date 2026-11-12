@@ -1,0 +1,5 @@
+# niahLogKV 惊异度准入（只评测、不重训）：在不带 cue 的 P=1024 梯子 checkpoint（arc_gamma_k12_b128_p1024_2k）上，
+# 精确池按片段内 token 惊异度最大的 4 个的均值（top4，比特）排序；不看开头、不看问题、不训练。
+#   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_surprisal_p1024.yaml
+config: arc_gamma_k12_b128_p1024_2k.yaml
+log_kv_gamma_surprisal: top4

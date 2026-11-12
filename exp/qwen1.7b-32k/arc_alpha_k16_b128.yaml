@@ -5,7 +5,7 @@ resume_dir: null
 expid: qwen1.7b-32k-alpha_k16_b128
 save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-alpha_k16_b128
 merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_alpha_k16_b128
-tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-alpha_k16_b128
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb/tb-32k-alpha_k16_b128
 
 # Total exact token budget, including an unfinished span crossing a flush.
 # B=128 is the original byte budget; the cache deducts exact storage from B.

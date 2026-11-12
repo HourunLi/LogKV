@@ -22,6 +22,10 @@ import re
 import csv
 import glob
 import json
+import builtins
+import sys
+import warnings
+import logging
 import time
 import inspect
 import contextlib
@@ -76,10 +80,105 @@ def _rank_label() -> str:
     return f"GlobalRank {_global_rank()}/{_world_size()} (local {_local_rank()})"
 
 
-def _tqdm_position() -> int:
-    # Use global rank so aggregated multi-node stdout gets one tqdm row per
-    # process instead of collapsing every node onto local ranks 0..7.
-    return _global_rank()
+def _code_version() -> dict:
+    """The git commit this eval ran from and whether tracked files differed from it (None outside git)."""
+    import subprocess
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        commit = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                timeout=10, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", root, "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return {"git_commit": None, "git_dirty": None}
+    return {"git_commit": commit, "git_dirty": bool(dirty)}
+
+
+def _eval_verbose() -> bool:
+    return os.environ.get("LOGKV_EVAL_VERBOSE", "0") == "1"
+
+
+def _eval_print(*args, **kwargs) -> None:
+    if _is_main() or _eval_verbose():
+        print(*args, **kwargs)
+
+
+def _eval_progress(items, desc: str):
+    """Rank 0's shard as one short line at the start, at every 10% and at the end (with the time left), and at
+    most every 5 minutes in between when items are slow; never synchronizes model calls."""
+    if _eval_verbose():
+        yield from tqdm.tqdm(items, desc=f"{desc} {_rank_label()}", position=_global_rank())
+        return
+    if not _is_main():
+        yield from items
+        return
+    total = len(items)
+    label = f"{desc} [{_rank_label()} 分片]"
+    started = last_report = time.perf_counter()
+    print(f"⏳ {label}: 0/{total}", flush=True)
+    step = max(1, -(-total // 10))
+    for completed, item in enumerate(items, 1):
+        yield item
+        now = time.perf_counter()
+        if completed == total or completed % step == 0 or now - last_report >= 300:
+            left = (now - started) / completed * (total - completed)
+            print(f"⏳ {label}: {completed}/{total} ({100 * completed // total}%)，已用 {now - started:.0f}s"
+                  + (f"，约剩 {left:.0f}s" if completed < total else ""), flush=True)
+            last_report = now
+
+
+@contextlib.contextmanager
+def _harness_logging():
+    """Silence harness progress/INFO only during evaluation, preserving warnings and errors."""
+    if _eval_verbose():
+        yield
+        return
+    names = ("lm_eval", "datasets", "huggingface_hub", "transformers")
+    loggers = {logging.getLogger(name) for name in names}
+    loggers.update(logger for name, logger in logging.Logger.manager.loggerDict.copy().items()
+                   if isinstance(logger, logging.Logger) and name.startswith(tuple(n + "." for n in names)))
+    levels = {logger: logger.level for logger in loggers}
+    original_init = tqdm.tqdm.__init__
+
+    def quiet_init(self, *args, **kwargs):
+        kwargs["disable"] = True
+        original_init(self, *args, **kwargs)
+
+    original_print = builtins.print
+
+    def quiet_print(*args, **kwargs):
+        # lm-eval's RULER builders print as they size each sample ("Max length ... | Current length ...
+        # | Noises: ...", once per try and per rank); drop prints made from those modules only.
+        # By the caller's file: lm-eval loads a task's utils through its YAML (!function) under the bare
+        # module name (vt_utils), so __name__ does not say where the code lives.
+        caller = sys._getframe(1)
+        where = caller.f_code.co_filename.replace("\\", "/")
+        if "/lm_eval/tasks/ruler/" in where or caller.f_globals.get("__name__", "").startswith("lm_eval.tasks.ruler"):
+            return
+        original_print(*args, **kwargs)
+
+    # Rank 0 keeps warnings (but datasets' offline-cache notices, one per dataset load); the other ranks keep
+    # errors only, and Python warnings stay on rank 0. Errors and tracebacks are never filtered.
+    def floor(logger):
+        quiet = not _is_main() or logger.name == "datasets" or logger.name.startswith("datasets.")
+        return logging.ERROR if quiet else logging.WARNING
+
+    warning_filters = warnings.filters[:]
+    try:
+        for logger in loggers:
+            logger.setLevel(max(logger.getEffectiveLevel(), floor(logger)))
+        if not _is_main():
+            warnings.simplefilter("ignore")
+        # lm-eval imports tqdm in multiple modules, including locally during bootstrap.
+        tqdm.tqdm.__init__ = quiet_init
+        builtins.print = quiet_print
+        yield
+    finally:
+        warnings.filters[:] = warning_filters
+        builtins.print = original_print
+        tqdm.tqdm.__init__ = original_init
+        for logger, level in levels.items():
+            logger.setLevel(level)
 
 
 def _request_sample_id(req: Any, *, global_request_index: int, rank: int) -> str:
@@ -142,6 +241,8 @@ def _check_expected_world_size(stage: str) -> None:
 
 
 def _rendezvous_snapshot(stage: str) -> None:
+    if not _eval_verbose():
+        return
     import socket
 
     ts = datetime.now().strftime("%H:%M:%S")
@@ -222,16 +323,11 @@ def _wait_all_ranks(stage: str) -> float:
 
 
 def _hb(stage: str) -> None:
-    """无条件心跳打印（所有 rank，不受 is_main 限制），排查多机卡死用。
-
-    标记 dist.init_process_group / 模型加载完成这类一次性里程碑（真正的逐条
-    计算进度由 loglikelihood/generate_until 里每个 rank 各自的 tqdm 负责，
-    不需要在这里重复打印）。带 hostname，方便从日志里按 rank 分组核对。
-    """
+    """阶段里程碑默认只打印主进程；详细模式带上所有 rank。"""
     import socket
     host = socket.gethostname()
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"💓 [{ts}][{_rank_label()}][{host}] {stage}", flush=True)
+    _eval_print(f"💓 [{ts}][{_rank_label()}][{host}] {stage}", flush=True)
 
 
 class SafeJSONEncoder(json.JSONEncoder):
@@ -302,9 +398,6 @@ def extract_results_to_csv(results: dict, benchmark: str, output_path: Path) -> 
     except Exception as e:
         print(f"❌ 保存 CSV 失败: {e}")
 
-# if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
-print("设置HF_DATASETS_CACHE环境变量...")
-
 BASE = '/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache'
 os.environ['HF_HOME'] = BASE
 os.environ['HF_DATASETS_CACHE'] = f'{BASE}/hf_cache'
@@ -323,15 +416,16 @@ os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 
 # 每个 rank 各自独立加载一遍数据集，HF datasets 的 "Found the latest cached
 # dataset configuration ..." 日志和内部 tqdm 进度条会被重复打印 rank 份，
-# 跟评测本身的计算进度混在一起。这里关掉，只留下面每个 rank 自己的计算进度。
+# 跟评测本身的计算进度混在一起。这里关掉，计算进度由 _eval_progress 报告。
 os.environ.setdefault("HF_DATASETS_DISABLE_PROGRESS_BARS", "1")
 import datasets.config as _hf_datasets_config
 import huggingface_hub.constants as _hf_hub_constants
 
-print(f"[{_rank_label()}] 环境变量 datasets: {os.environ.get('HF_DATASETS_CACHE')}", flush=True)
-print(f"[{_rank_label()}] 库实际使用 datasets: {_hf_datasets_config.HF_DATASETS_CACHE}", flush=True)
-print(f"[{_rank_label()}] 环境变量 hub: {os.environ.get('HF_HUB_CACHE')}", flush=True)
-print(f"[{_rank_label()}] 库实际使用 hub: {_hf_hub_constants.HF_HUB_CACHE}", flush=True)
+if _eval_verbose():
+    print(f"[{_rank_label()}] 环境变量 datasets: {os.environ.get('HF_DATASETS_CACHE')}", flush=True)
+    print(f"[{_rank_label()}] 库实际使用 datasets: {_hf_datasets_config.HF_DATASETS_CACHE}", flush=True)
+    print(f"[{_rank_label()}] 环境变量 hub: {os.environ.get('HF_HUB_CACHE')}", flush=True)
+    print(f"[{_rank_label()}] 库实际使用 hub: {_hf_hub_constants.HF_HUB_CACHE}", flush=True)
 
 try:
     import datasets as _hf_datasets
@@ -343,18 +437,217 @@ except Exception:
 import dataclasses
 
 from litgpt.config import Config
+from litgpt.alpha_log_kv import WORD_SCORES
 from litgpt.model import GPT
 from litgpt.tokenizer import Tokenizer
 from lm_eval import evaluator
 from lm_eval.api.model import LM
+<<<<<<< HEAD
 from lm_eval.tasks import TaskManager
+=======
+
+# Repository tasks (e.g. eval_tasks/niah_cue) beside lm-eval's own.
+EVAL_TASKS_DIR = Path(__file__).resolve().parent / "eval_tasks"
+
+
+# Tasks named for a context length (eval_tasks/babilong_long, long_ppl, longbench2_long, niah_turns, infinitebench);
+# a long_ppl_books_<L>_<point> task is named for its configuration's length L.
+_LENGTH_NAMED_TASK = re.compile(
+    r"^(babilong(?:_qa\d+)?|long_ppl(?:_books)?|longbench2|niah_turns|infinitebench(?:_[a-z_]+)?)_(\d+)k(?:_\d+k)?$")
+
+
+def _check_task_lengths(tasks, max_seq_length):
+    """A task named for a context length must fit the model's window: longer inputs are cut from the start
+    without a word, and the result would still carry the name. LongBench v2's per-length groups take their
+    budget from the window itself, so for them the window must not be larger either (block_size = length plus
+    a generation margin of at most 4096). InfiniteBench cuts its prompts to the length itself and generates in a
+    1024-token margin beyond it (eval_tasks/infinitebench), so it needs that margin."""
+    for task in tasks:
+        match = _LENGTH_NAMED_TASK.match(task.strip())
+        if not match:
+            continue
+        length = int(match.group(2)) * 1024
+        need = length + (1024 if match.group(1).startswith("infinitebench") else 0)  # long_eval_plan.MARGIN
+        if max_seq_length < need or (match.group(1) == "longbench2" and max_seq_length > length + 4096):
+            raise ValueError(f"task {task} needs a model window of {need} tokens"
+                             + (f" (at most {length + 4096})" if match.group(1) == "longbench2" else "")
+                             + f", but max_seq_length is {max_seq_length}: set config_overrides.block_size")
+
+
+def _longbench2_files_problem():
+    """Why LongBench v2 cannot load offline, or None. Its tasks read the repository snapshot in the hub cache
+    (litgpt/longbench2_patch.py), so every parquet file there must be whole: a cut download, a Git LFS pointer
+    or an error page in its place fails every subset (unused/fetch_long_eval_data.py --longbench2 checks the same)."""
+    try:
+        from litgpt.longbench2_patch import real_file, snapshot
+
+        root, files = snapshot()
+    except Exception as error:  # noqa: BLE001 - not in the cache at all
+        return f"no LongBench v2 snapshot in the hub cache ({type(error).__name__}: {str(error)[:200]})"
+    if not files:
+        return f"the LongBench v2 snapshot {root} holds no data file"
+    bad = []
+    for name in files:
+        path = Path(real_file(Path(root) / name))  # through a flattened hub-cache link to its blob
+        if not name.endswith(".parquet"):
+            continue
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4)
+                f.seek(-4, os.SEEK_END)
+                whole = path.stat().st_size >= 12 and head == b"PAR1" and f.read(4) == b"PAR1"
+        except OSError:
+            whole = False
+        if not whole:
+            bad.append(name)
+    if bad:
+        return (f"LongBench v2 files in {root} are not whole parquet: {bad[:3]}" + (f" and {len(bad) - 3} more"
+                if len(bad) > 3 else "") + " (unused/fetch_long_eval_data.py --longbench2 downloads them again)")
+    return None
+
+
+INFINITEBENCH_FILES = ("passkey", "number_string", "kv_retrieval", "longbook_sum_eng", "longbook_qa_eng",
+                       "longbook_choice_eng", "longbook_qa_chn", "longdialogue_qa_eng", "code_debug", "math_find")
+
+
+def _infinitebench_files_problem():
+    """Why InfiniteBench's data cannot be read offline, or None: its tasks read the jsonl files from
+    INFINITEBENCH_DIR, else <HF_HOME>/infinitebench, else the hub cache, following flattened links to their blobs
+    (eval_tasks/infinitebench: locate). The message says what this machine holds for the first missing file."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "infinitebench_utils", EVAL_TASKS_DIR / "infinitebench" / "infinitebench_utils.py")
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+    missing, first = [], ""
+    for name in INFINITEBENCH_FILES:
+        path, seen = utils.locate(name)
+        if path is None:
+            missing.append(name)
+            first = first or seen
+    if missing:
+        return (f"InfiniteBench files missing on this machine: {missing[:3]}"
+                + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
+                + f". Seen for {missing[0]}: {first}. (unused/fetch_long_eval_data.py --infinitebench with this HF_HOME,"
+                + " then make sure this machine sees it; or INFINITEBENCH_DIR)")
+    return None
+
+
+def _check_task_data(tasks):
+    """A task asked for by name whose data is not on disk fails here, with what to run, instead of in every rank's
+    dataset loading (InfiniteBench reads its jsonl files offline from INFINITEBENCH_DIR or the hub cache)."""
+    if any(t.strip().startswith("infinitebench_") for t in tasks):
+        problem = _infinitebench_files_problem()
+        if problem:
+            raise FileNotFoundError(problem)
+
+
+def _drop_empty_lengths(results):
+    """Remove RULER's per-length metrics that had no sample (value -1).
+
+    lm-eval's RULER scores every sample under its default length too (DEFAULT_SEQ_LENGTHS, 4096) with -1, so a
+    run at other lengths reports "4096 ... -1.0000" for every task. Such an entry says only that no sample had
+    that length; it is dropped (with its stderr) from the table and the saved results."""
+    for section in ("results", "groups"):
+        for metrics in (results.get(section) or {}).values():
+            empty = [k for k, v in metrics.items()
+                     if k.split(",")[0].isdigit() and isinstance(v, (int, float)) and v == -1]
+            for key in empty:
+                metric, _, filt = key.partition(",")
+                metrics.pop(key, None)
+                metrics.pop(f"{metric}_stderr,{filt}", None)
+    return results
+
+
+def _skip_optional_tasks(tasks, max_seq_length):
+    """The launchers' default lists mark tasks that some checkpoints or setups cannot serve (EVAL_OPTIONAL_TASKS,
+    e.g. the 32K turns and book curve): such a task is left out, with the reason, when the model's window is
+    shorter than its length (a 4K run) or its data is not given; a task asked for by name must fit or fails
+    (_check_task_lengths)."""
+    optional = {t for t in os.environ.get("EVAL_OPTIONAL_TASKS", "").split(",") if t}
+    kept = []
+    for task in tasks:
+        reason = None
+        if task in optional:
+            try:
+                _check_task_lengths([task], max_seq_length)
+            except ValueError as error:
+                reason = str(error)
+            if reason is None and task.startswith("long_ppl_books") and not os.environ.get("LONG_PPL_BOOKS"):
+                reason = "LONG_PPL_BOOKS is not set (unused/fetch_long_eval_data.py --ppl-books-hub emozilla/pg19)"
+            elif reason is None and task.startswith("long_ppl_") and not task.startswith("long_ppl_books") \
+                    and not os.environ.get("LONG_PPL_DATA"):
+                reason = "LONG_PPL_DATA is not set (unused/fetch_long_eval_data.py --ppl-hub emozilla/pg19-test)"
+            elif reason is None and task.startswith("longbench2_"):
+                reason = _longbench2_files_problem()
+            elif reason is None and task.startswith("infinitebench_"):
+                reason = _infinitebench_files_problem()
+        if reason is None:
+            kept.append(task)
+        elif _is_main():
+            print(f"⚠️ [eval] 默认清单跳过 {task}: {reason}", flush=True)
+    return kept
+
+
+def _task_manager(metadata):
+    """lm-eval's task index plus ``eval_tasks/``, carrying ``metadata`` as ``simple_evaluate`` would."""
+    from lm_eval.tasks import TaskManager
+
+    if not EVAL_TASKS_DIR.is_dir() or "metadata" not in inspect.signature(TaskManager).parameters:
+        return None  # simple_evaluate builds its own, with lm-eval's tasks only.
+    return TaskManager(include_path=str(EVAL_TASKS_DIR), metadata=dict(metadata or {}))
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 from litgpt.generate.base import generate as litgpt_generate
 from litgpt.kv_compression import cache_compression_snapshot, summarize_compression
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
 from litgpt.ruler_patch import apply_patch
 apply_patch()
+from litgpt.longbench2_patch import apply_patch as apply_longbench2_patch  # noqa: E402
+apply_longbench2_patch()
+from litgpt.hf_cache_patch import apply_patch as apply_hf_cache_patch  # noqa: E402
+apply_hf_cache_patch()  # offline loads skip <hash>.incomplete folders
 
 _CONFIG_FIELDS = {f.name for f in dataclasses.fields(Config)}
+
+
+def _unreadable_dataset_infos(root, dataset):
+    """Cached ``dataset_info.json`` files of ``dataset`` that are not valid JSON.
+
+    Offline, ``datasets`` reads every cached version of the dataset to pick a
+    configuration, so one broken file fails the whole load without naming it.
+    Size and modification time tell a cut-short copy, and when it was written.
+    """
+    try:
+        from datasets.naming import camelcase_to_snakecase
+    except ImportError:  # Diagnostics only; the cache itself needs datasets.
+        camelcase_to_snakecase = str.lower
+    name = camelcase_to_snakecase(str(dataset).rstrip("/").split("/")[-1])
+    root = Path(root)
+    try:
+        entries = [entry for entry in root.iterdir() if entry.name == name or entry.name.endswith("___" + name)]
+    except OSError as exc:
+        return [dict(path=str(root), error=f"{type(exc).__name__}: {exc}")]
+    broken = []
+    for entry in sorted(entries):
+        # <dataset>/<config>/<version>/<hash>/dataset_info.json
+        for info in sorted(entry.glob("*/*/*/dataset_info.json")):
+            try:
+                json.loads(info.read_text(encoding="utf-8"))
+                continue
+            except json.JSONDecodeError as exc:
+                lines = exc.doc.splitlines()
+                broken.append(dict(path=str(info), error=str(exc),
+                                   context=lines[max(0, exc.lineno - 3):exc.lineno + 1]))
+            except (OSError, UnicodeDecodeError) as exc:
+                broken.append(dict(path=str(info), error=f"{type(exc).__name__}: {exc}"))
+            try:
+                stat = info.stat()
+                broken[-1].update(size=stat.st_size, modified=time.strftime(
+                    "%Y-%m-%d %H:%M:%S %z", time.localtime(stat.st_mtime)))
+            except OSError:
+                pass
+    return broken
 
 
 def _walk_cache_path(path):
@@ -460,6 +753,8 @@ def _trace_hf_cache_resolution():
     identity = dict(rank=_global_rank(), host=socket.gethostname(), pid=os.getpid(), python=sys.executable)
 
     def emit(event, **details):
+        if event == "runtime" and not _eval_verbose():
+            return
         # One line per event keeps rank and exception together in aggregated logs.
         print("[hf-cache] " + json.dumps(dict(event=event, **identity, **details),
                                         ensure_ascii=False, default=str), file=sys.stderr, flush=True)
@@ -518,6 +813,13 @@ def _trace_hf_cache_resolution():
         cache_misses.clear()
         try:
             return original_load(*args, **kwargs)
+        except json.JSONDecodeError:
+            path = args[0] if args else kwargs.get("path")
+            root = Path(kwargs.get("cache_dir") or cfg.HF_DATASETS_CACHE).expanduser()
+            emit("dataset_info_unreadable", dataset=path, cache_root=str(root),
+                 files=_unreadable_dataset_infos(root, path),
+                 fix="repair or re-copy the listed dataset_info.json; a duplicate hash directory may be removed")
+            raise
         except (ConnectionError, FileNotFoundError):
             path = args[0] if args else kwargs.get("path")
             if not (cfg.HF_DATASETS_OFFLINE and isinstance(path, str) and path.count("/") == 1
@@ -585,7 +887,7 @@ def _parse_csv_ints(s: str) -> list[int]:
 
 def _filter_config_dict(d: dict[str, Any]) -> dict[str, Any]:
     dropped = sorted(k for k in d if k not in _CONFIG_FIELDS)
-    if dropped:
+    if dropped and (_is_main() or _eval_verbose()):
         print(f"[eval] 过滤掉非 Config 字段: {dropped}")
     return {k: v for k, v in d.items() if k in _CONFIG_FIELDS}
 
@@ -853,6 +1155,15 @@ class LogKVLM(LM):
         log_kv_alpha_span_max_tokens: int = 64,
         log_kv_beta_novelty: bool = False,
         log_kv_beta_adaptive_merge: bool = False,
+        log_kv_gamma_level0_reinsert: bool = False,
+        log_kv_gamma_top_merge: str = "fold",
+        log_kv_gamma_level_slack: int = 2,
+        log_kv_gamma_cue_tokens: int = 0,
+        log_kv_gamma_literals: bool = False,
+        log_kv_gamma_cue_guard: bool = False,
+        log_kv_gamma_query_cue: bool = False,
+        log_kv_retention_heads: str | None = None,
+        log_kv_gamma_surprisal: str | None = None,
         tokenizer_dir: str | None = None,
         process_group=None,
     ):
@@ -869,6 +1180,7 @@ class LogKVLM(LM):
             raise ValueError("swa_window_size must be >= 0 and cannot be combined with dense mode")
         self.swa_window_size = swa_window_size
         self.cache_budget = {}
+        self._truncation_counts = {}
         if swa_window_size:
             config_overrides = {**(config_overrides or {}), "sliding_window_size": swa_window_size,
                                 "sliding_window_indices": None}
@@ -899,6 +1211,15 @@ class LogKVLM(LM):
         self.log_kv_alpha_span_max_tokens = log_kv_alpha_span_max_tokens
         self.log_kv_beta_novelty = bool(log_kv_beta_novelty)
         self.log_kv_beta_adaptive_merge = bool(log_kv_beta_adaptive_merge)
+        self.log_kv_gamma_level0_reinsert = bool(log_kv_gamma_level0_reinsert)
+        self.log_kv_gamma_top_merge = str(log_kv_gamma_top_merge)
+        self.log_kv_gamma_level_slack = int(log_kv_gamma_level_slack)
+        self.log_kv_gamma_cue_tokens = int(log_kv_gamma_cue_tokens)
+        self.log_kv_gamma_literals = bool(log_kv_gamma_literals)
+        self.log_kv_gamma_cue_guard = bool(log_kv_gamma_cue_guard)
+        self.log_kv_gamma_query_cue = bool(log_kv_gamma_query_cue)
+        self.log_kv_retention_heads = log_kv_retention_heads or None
+        self.log_kv_gamma_surprisal = log_kv_gamma_surprisal or None
 
         # 控制打印：在多卡下尽量只让主进程打印，防止刷屏
         is_master = _is_main()
@@ -941,7 +1262,23 @@ class LogKVLM(LM):
         if is_master: print(f"🔧 正在初始化 Transformer ({mode_name})...")
         self.model = GPT(self.config).to(device).bfloat16()
         if log_kv_alpha_exact_tokens:
-            self.model.set_alpha_span_boundary_ids(self.tokenizer.alpha_span_boundary_ids)
+            self.model.set_alpha_span_boundary_ids(
+                self.tokenizer.alpha_span_boundary_ids,
+                self.tokenizer.alpha_line_end_ids if self.log_kv_gamma_cue_tokens else None,
+                self.tokenizer.gamma_literal_texts
+                if self.log_kv_gamma_literals or self.log_kv_gamma_surprisal in WORD_SCORES else None,
+            )
+        # Query-aware cue: host table of line-ending tokens, built once; each request's
+        # question is cut from the last CUE_QUERY_TOKENS prompt ids only.
+        self._query_line_ends = self._query_line_end_table() if self.log_kv_gamma_query_cue else None
+        # niahLogKV: frozen learned retention heads, loaded apart from the LM weights.
+        self._retention_heads = None
+        if self.log_kv_retention_heads:
+            from litgpt.retention import RetentionHeads
+            self._retention_heads = RetentionHeads.load(self.log_kv_retention_heads, device=device)
+            self.model.set_retention_heads(self._retention_heads)
+            if is_master:
+                print(f"🎯 retention heads {self.log_kv_retention_heads} (tag {self._retention_heads.tag()})")
 
         if is_master: print(f"🔄 正在加载权重...")
         checkpoint = _load_lit_model_checkpoint(checkpoint_dir, map_location=device)
@@ -1034,6 +1371,15 @@ class LogKVLM(LM):
             alpha_span_max_tokens=self.log_kv_alpha_span_max_tokens,
             beta_novelty=self.log_kv_beta_novelty,
             beta_adaptive_merge=self.log_kv_beta_adaptive_merge,
+            gamma_level0_reinsert=self.log_kv_gamma_level0_reinsert,
+            gamma_top_merge=self.log_kv_gamma_top_merge,
+            gamma_level_slack=self.log_kv_gamma_level_slack,
+            gamma_cue_tokens=self.log_kv_gamma_cue_tokens,
+            gamma_literals=self.log_kv_gamma_literals,
+            gamma_cue_guard=self.log_kv_gamma_cue_guard,
+            gamma_query_cue=self.log_kv_gamma_query_cue,
+            retention_head=getattr(self, "_retention_heads", None) is not None,
+            gamma_surprisal=self.log_kv_gamma_surprisal,
         )
         if self.swa_window_size == 0:
             # Match allocated persistent cache buffers, including metadata and
@@ -1075,6 +1421,14 @@ class LogKVLM(LM):
             self.cache_budget.update(alpha_exact_tokens=first.alpha_exact_tokens, effective_B=first.B,
                                      alpha_span_max_tokens=first.alpha_span_max_tokens,
                                      beta_novelty=first.beta_novelty, beta_adaptive_merge=first.beta_adaptive_merge)
+        if getattr(first, "semantic_clusters", False):
+            self.cache_budget.update(effective_B=first.B, levels=first.L_alloc,
+                                     gamma_level0_reinsert=first.gamma_level0_reinsert,
+                                     gamma_top_merge=first.gamma_top_merge, gamma_level_slack=first.gamma_level_slack,
+                                     gamma_cue_tokens=getattr(first, "gamma_cue_tokens", 0),
+                                     gamma_literals=getattr(first, "gamma_literals", False),
+                                     gamma_cue_guard=getattr(first, "gamma_cue_guard", False),
+                                     gamma_query_cue=getattr(first, "gamma_query_cue", False))
         if _is_main():
             print(f"🧮 persistent cache budget (excluding shared RoPE / transient workspace): {self.cache_budget}")
 
@@ -1087,15 +1441,30 @@ class LogKVLM(LM):
     # ==========================================
     # 🌟 分布式结果收集
     # ==========================================
+    def _warn_truncation(self, kind: str, kept: int) -> None:
+        count = self._truncation_counts.get(kind, 0) + 1
+        self._truncation_counts[kind] = count
+        if count == 1 or _eval_verbose():
+            print(f"⚠️ [{_rank_label()}] {kind}: 触发截断，保留 context/prompt 长度 {kept}；"
+                  "本轮截断总数将在汇总时报告", flush=True)
+
     def all_gather_results(self, local_result_list: list, tag: str = ""):
+        for kind, count in self._truncation_counts.items():
+            print(f"⚠️ [{_rank_label()}] {kind}: 本 rank 本轮共截断 {count} 次", flush=True)
+        self._truncation_counts.clear()
+        if torch.cuda.is_available():  # how close this request type came to the card's limit (long contexts)
+            peak = torch.cuda.max_memory_allocated() / 2**30
+            total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 2**30
+            _eval_print(f"[{_rank_label()}] {tag}: 显存峰值 {peak:.1f} / {total:.1f} GiB", flush=True)
+            torch.cuda.reset_peak_memory_stats()
         if not _dist_ready():
             return local_result_list
 
         # 结果只有 float/bool/str，不必经 GPU/NCCL 序列化与通信。
         # 汇合等待长上下文的负载差异；等待期间的心跳与超时见 _wait_all_ranks。
-        print(f"⏳ [{_rank_label()}] {tag} 本 rank {len(local_result_list)} 条已完成，等待其它 rank", flush=True)
+        _eval_print(f"⏳ [{_rank_label()}] {tag} 本 rank {len(local_result_list)} 条已完成，等待其它 rank", flush=True)
         wait_s = _wait_all_ranks(f"{tag} 汇总")
-        print(
+        _eval_print(
             f"🤝 [{_rank_label()}] {tag} 全部 rank 已就绪，等待用时 {wait_s:.1f}s；开始 Gloo 结果汇总",
             flush=True,
         )
@@ -1111,7 +1480,7 @@ class LogKVLM(LM):
             for rank_id in range(dp_size):
                 if i < len(all_results_list[rank_id]):
                     final_results.append(all_results_list[rank_id][i])
-        print(
+        _eval_print(
             f"✅ [{_rank_label()}] {tag} Gloo 结果汇总完成，共 {len(final_results)} 条，"
             f"用时 {time.perf_counter() - t0:.1f}s",
             flush=True,
@@ -1121,6 +1490,50 @@ class LogKVLM(LM):
     # ==========================================
     # 🌟 核心 1：PPL 与 选择题评测
     # ==========================================
+    def _prefill_chunk(self) -> int:
+        """Tokens per forward when a long input enters the LogKV cache (LOGKV_EVAL_PREFILL_CHUNK, default 32768;
+        0 = one forward). The cache streams, so chunked input gives bit-identical logits (tests/test_eval_compression.py),
+        and the activations stay bounded: one forward of 256K tokens overflows an 80 GB card. Dense keeps one
+        forward (a later chunk would need a chunk x position mask)."""
+        if getattr(self, "log_kv_dense_mode", False):
+            return 0
+        return int(os.environ.get("LOGKV_EVAL_PREFILL_CHUNK", "32768"))
+
+    def _forward(self, tokens, start, lm_head_start):
+        """``self.model`` on ``tokens`` at positions start..start+T-1, logits from ``lm_head_start`` on, in chunks
+        of ``_prefill_chunk()`` tokens when the input is longer."""
+        T, chunk = int(tokens.numel()), self._prefill_chunk()
+        if not chunk or T <= chunk:
+            return self.model(tokens[None], input_pos=torch.arange(start, start + T, device=self._device),
+                              input_pos_maxp1=start + T, lm_head_start=lm_head_start)
+        kept = []
+        for a in range(0, T, chunk):
+            b = min(a + chunk, T)
+            first = min(max(lm_head_start - a, 0), b - a - 1)  # a chunk before the scored span keeps one row
+            out = self.model(tokens[None, a:b], input_pos=torch.arange(start + a, start + b, device=self._device),
+                             input_pos_maxp1=start + b, lm_head_start=first)
+            if b > lm_head_start:
+                kept.append(out[:, max(lm_head_start - a, 0) - first:])
+        return torch.cat(kept, dim=1)
+
+    def _generate_chunked(self, prompt, max_returned_tokens, temperature, top_k, top_p):
+        """litgpt's generate for a prompt prefilled in chunks (_forward): the same tokens, the prompt included and
+        the last token (eos or the length limit) not forwarded."""
+        from litgpt.generate.base import sample
+
+        eos, out = self.tokenizer.eos_id, [prompt]
+        logits, pos = self._forward(prompt, 0, prompt.numel() - 1), int(prompt.numel())
+        for step in range(max_returned_tokens - pos):
+            if step:
+                logits = self.model(token.view(1, 1), input_pos=torch.tensor([pos], device=self._device),
+                                    input_pos_maxp1=pos + 1, lm_head_start=0)
+                pos += 1
+            token = sample(logits, temperature=temperature, top_k=top_k, top_p=top_p).to(dtype=torch.int64)
+            out.append(token.view(-1))
+            if eos is not None and int(token) == eos:
+                break
+        return torch.cat(out)
+
     def _score_tokens(
         self, ctx_enc: list[int], cont_enc: list[int], *, request_type: str = "loglikelihood"
     ) -> tuple[float, bool]:
@@ -1132,8 +1545,6 @@ class LogKVLM(LM):
         the continuation is left-truncated to its last ``max_len - 1`` tokens —
         scoring is then partial but the forward stays in bounds.
         """
-        rank_label = _rank_label()
-
         # 🌟 安全阀：如果 题干 + 选项 > max_seq_length，必须切掉题干最前面的部分
         max_len = self.model.max_seq_length
         if len(ctx_enc) + len(cont_enc) > max_len:
@@ -1143,7 +1554,7 @@ class LogKVLM(LM):
                 ctx_enc = []
             else:
                 ctx_enc = ctx_enc[-keep_ctx_len:]
-            print(f"⚠️ [{rank_label}] 警告: 触发截断，剩余 context 长度: {len(ctx_enc)}")
+            self._warn_truncation(request_type, len(ctx_enc))
 
         if len(ctx_enc) == 0:
             ctx_enc = [self.tokenizer.bos_id]
@@ -1166,8 +1577,13 @@ class LogKVLM(LM):
                 # lm_head_start: materialize logits only for the scoring span
                 # [ctx_len-1, seq_len) — full-sequence logits at 32K are ~10 GB
                 # bf16, the sliced tensor is (cont_len + 1) x vocab.
+<<<<<<< HEAD
                 logits = self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
                 _synchronize_inference_device(self._device)
+=======
+                logits = self._forward(inps[0], 0, ctx_len - 1) if self._prefill_chunk() \
+                    else self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
                 t1 = time.perf_counter()
                 peak_memory = _inference_peak_memory(self._device)
                 self.compression_metrics.append({
@@ -1220,9 +1636,7 @@ class LogKVLM(LM):
         local_requests = requests[dp_rank::dp_size]
         results = []
 
-        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
-        desc = f"loglikelihood GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
-        for req in tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position()):
+        for req in _eval_progress(local_requests, "loglikelihood"):
             context, continuation = req.args[0], req.args[1]
 
             ctx_enc = self.tokenizer.encode(context).tolist()
@@ -1239,6 +1653,74 @@ class LogKVLM(LM):
     # ==========================================
     # 🌟 核心 2：自回归生成任务 (LongBench)
     # ==========================================
+    def _query_line_end_table(self):
+        """Line-ending tokens over every id the model embeds.
+
+        ``tokenizer.vocab_size`` leaves out added tokens, and the end-of-text
+        token (a line end) is one of them.
+        """
+        ends = list(self.tokenizer.alpha_line_end_ids)
+        table = np.zeros(max(self.config.padded_vocab_size, max(ends, default=-1) + 1), dtype=bool)
+        table[ends] = True
+        return table
+
+    def _set_gamma_query(self, prompt_tensor) -> None:
+        """Hand this request's closing question to the query-aware cue (one small host copy)."""
+        from litgpt.alpha_log_kv import CUE_QUERY_TOKENS, query_region
+
+        tail = prompt_tensor[-CUE_QUERY_TOKENS:].tolist()
+        self.model.set_gamma_queries([query_region(tail, self._query_line_ends)])
+
+    def _generate_turns(self, prompt, separator, max_new_tokens, sample_id):
+        """Questions asked one after another on one cache (SCBench's multi-turn mode).
+
+        ``prompt`` is the shared context, then each question, joined by ``separator``. The context is
+        prefilled before any question is known (no query cue: a compressed cache must serve whatever is
+        asked later); each question and each greedy answer are appended to the same cache, and an answer
+        ends at a line end (or the end of text) or after ``max_new_tokens``. A context too long for the
+        window loses its start. Returns the answers joined by ``separator``.
+        """
+        context, *questions = prompt.split(separator)
+        stops = set(self.tokenizer.alpha_line_end_ids)
+        asked = [self.tokenizer.encode(q, device=self._device, bos=False) for q in questions]
+        pending = self.tokenizer.encode(context, device=self._device)
+        room = self.model.max_seq_length - sum(q.numel() for q in asked) - len(asked) * max_new_tokens
+        if pending.numel() > room:
+            pending = pending[-max(room, 1):]
+            self._warn_truncation("generate_until", pending.numel())
+        context_len, pos, answers = int(pending.numel()), 0, []
+        with torch.no_grad():
+            self._set_eval_cache()
+            if (getattr(self, "_query_line_ends", None) is not None
+                    and getattr(self.model, "log_kv_cue_stream", None) is not None):
+                self.model.set_gamma_queries([None])
+            try:
+                t0 = time.perf_counter()
+                for question in asked:
+                    # The previous answer's last token has not been forwarded yet: it leads this chunk.
+                    pending = torch.cat([pending, question])
+                    answer = []
+                    for _ in range(max_new_tokens):
+                        T = pending.numel()
+                        logits = self._forward(pending, pos, T - 1)
+                        pos += T
+                        token = int(logits[0, -1].argmax())
+                        answer.append(token)
+                        pending = torch.tensor([token], device=self._device, dtype=torch.long)
+                        if token in stops:
+                            break
+                    answers.append(self.tokenizer.decode(torch.tensor(answer, dtype=torch.long)))
+                t1 = time.perf_counter()
+                self.compression_metrics.append({
+                    "request_type": "generate_turns", "rank": _global_rank(), "sample_id": sample_id,
+                    "prompt_len": context_len, "turns": len(asked), **cache_compression_snapshot(self.model, pos),
+                })
+            finally:
+                self._reset_eval_cache()
+        self.gen_metrics.append({"prompt_len": context_len, "turns": len(asked), "processed_tokens": pos,
+                                 "total_time_s": round(t1 - t0, 4)})
+        return separator.join(answers)
+
     def generate_until(self, requests):
         dp_rank = _global_rank()
         dp_size = _world_size()
@@ -1246,9 +1728,7 @@ class LogKVLM(LM):
         local_requests = requests[dp_rank::dp_size]
         results = []
 
-        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
-        desc = f"generate_until GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
-        for local_i, req in enumerate(tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position())):
+        for local_i, req in enumerate(_eval_progress(local_requests, "generate_until")):
             global_request_index = local_i * dp_size + dp_rank
             sample_id = _request_sample_id(req, global_request_index=global_request_index, rank=dp_rank)
             prompt = req.args[0]
@@ -1264,6 +1744,9 @@ class LogKVLM(LM):
                 # litgpt.generate.sample 仅在 temperature<=0 且 top_p<=0 时走 argmax；仅设 temperature=0 而 top_p=1 仍会多项式采样
                 temperature = 0.0
                 top_p = 0.0
+            if gen_args.get("turn_separator"):  # several questions on one cache (eval_tasks/niah_turns)
+                results.append(self._generate_turns(prompt, gen_args["turn_separator"], max_new_tokens, sample_id))
+                continue
 
             prompt_tensor = self.tokenizer.encode(prompt, device=self._device)
             original_prompt_tokens = int(prompt_tensor.size(0))
@@ -1275,7 +1758,7 @@ class LogKVLM(LM):
                 keep_prompt_len = max_len - max_new_tokens
                 prompt_token_offset = int(prompt_tensor.size(0) - keep_prompt_len)
                 prompt_tensor = prompt_tensor[-keep_prompt_len:]
-                print(f"⚠️ [{_rank_label()}] 警告: 触发生成截断，Prompt 被切至: {keep_prompt_len}")
+                self._warn_truncation("generate_until", keep_prompt_len)
 
             total_max_len = prompt_tensor.size(0) + max_new_tokens
             prompt_len = prompt_tensor.size(0)
@@ -1284,7 +1767,11 @@ class LogKVLM(LM):
                 # 🧩 长上下文生成使用所选 cache（LogKV slot cache 或 dense KV）。
                 # 建一次、按请求原地重置，不逐样本重分配 — 见 _set_eval_cache。
                 self._set_eval_cache()
+                if (getattr(self, "_query_line_ends", None) is not None
+                        and getattr(self.model, "log_kv_cue_stream", None) is not None):
+                    self._set_gamma_query(prompt_tensor)
                 try:
+<<<<<<< HEAD
                     _synchronize_inference_device(self._device)
                     _reset_inference_peak_memory(self._device)
                     timing = {}
@@ -1300,6 +1787,22 @@ class LogKVLM(LM):
                     )
                     _synchronize_inference_device(self._device)
                     peak_memory = _inference_peak_memory(self._device)
+=======
+                    t0 = time.perf_counter()
+                    if prompt_len > (self._prefill_chunk() or prompt_len):  # a long prompt: prefill in chunks
+                        out = self._generate_chunked(prompt_tensor, total_max_len, temperature, top_k, top_p)
+                    else:
+                        out = litgpt_generate(
+                            self.model,
+                            prompt_tensor,
+                            max_returned_tokens=total_max_len,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            eos_id=self.tokenizer.eos_id,
+                        )
+                    t1 = time.perf_counter()
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
                     # The last output token has not been forwarded into the cache.
                     self.compression_metrics.append({
                         "request_type": "generate_until", "rank": dp_rank, "sample_id": sample_id,
@@ -1356,9 +1859,7 @@ class LogKVLM(LM):
         results = []
 
         max_len = self.model.max_seq_length
-        # 每个 rank 都显示自己的进度条（不再只有 rank 0 可见）。
-        desc = f"loglikelihood_rolling GlobalRank {dp_rank}/{dp_size} (local {_local_rank()})"
-        for req in tqdm.tqdm(local_requests, desc=desc, position=_tqdm_position()):
+        for req in _eval_progress(local_requests, "loglikelihood_rolling"):
             (text,) = req.args
             tokens = self.tokenizer.encode(text, bos=False).tolist()
 
@@ -1483,6 +1984,33 @@ def main(
     log_kv_alpha_span_max_tokens: int = 64,
     log_kv_beta_novelty: bool = True,
     log_kv_beta_adaptive_merge: bool = True,
+    # Gamma (on by default): delayed Alpha evictions re-sort only ladder level 0 instead
+    # of re-merging the whole cluster, and a saturated top level merges its lightest
+    # adjacent pair instead of folding into slot 0. level_slack 2 keeps the classic
+    # spare levels; fewer spends the same bytes on a wider B' (more live entries).
+    log_kv_gamma_level0_reinsert: bool = True,
+    log_kv_gamma_top_merge: str = "lightest",
+    log_kv_gamma_level_slack: int = 2,
+    # Gamma cues (on by default): exact-pool selection also values spans that repeat
+    # rare tokens of the stream's opening region (up to this many tokens, cut at its
+    # last line end); 0 keeps the K/V-only span scores.
+    log_kv_gamma_cue_tokens: int = 64,
+    # Gamma literals (off by default): exact-pool selection also values spans holding the
+    # first occurrence of a random-looking literal (digit strings, codes).
+    log_kv_gamma_literals: bool = False,
+    # Gamma cue guard (off by default): cues need an opening region that ends at a line end,
+    # and a cue counted more than 16 times gives no evidence. Only with cues on.
+    log_kv_gamma_cue_guard: bool = False,
+    # Gamma query-aware cue (off by default): the closing question of each generation prompt
+    # (its last 64 tokens, after their first line end) is a cue too; literals then rank below cues.
+    log_kv_gamma_query_cue: bool = False,
+    # niahLogKV learned retention heads (train_retention.py output); None = off. They score
+    # Alpha's exact spans query-agnostically and hold no KV.
+    log_kv_retention_heads: str | None = None,
+    # niahLogKV surprisal admission (litgpt.alpha_log_kv.SURPRISAL_SCORES; None = off): the exact pool
+    # ranks spans by their tokens' surprisal under the model itself (prefill runs in recent-window
+    # chunks); the word scores count a span by its most informative words.
+    log_kv_gamma_surprisal: str | None = None,
     # ── 🧩 logKV：tokenizer 回退（checkpoint 目录缺 tokenizer 文件时用）──
     tokenizer_dir: str | None = None,
     # ── 只跑一小批样本（Phase 0 诊断用；见 log_kv_diag_mode）。int = 绝对条数，
@@ -1535,7 +2063,7 @@ def main(
             )
         _valid = set(inspect.signature(main).parameters)
         for _k in _yaml:
-            if _k != "config" and _k not in _valid:
+            if _k != "config" and _k not in _valid and (_is_main() or _eval_verbose()):
                 print(f"[eval] WARNING: unknown YAML key ignored: {_k}")
 
     def _o(name, current):
@@ -1569,11 +2097,27 @@ def main(
     log_kv_alpha_span_max_tokens = int(_o("log_kv_alpha_span_max_tokens", log_kv_alpha_span_max_tokens))
     log_kv_beta_novelty = bool(_o("log_kv_beta_novelty", log_kv_beta_novelty))
     log_kv_beta_adaptive_merge = bool(_o("log_kv_beta_adaptive_merge", log_kv_beta_adaptive_merge))
+    log_kv_gamma_level0_reinsert = bool(_o("log_kv_gamma_level0_reinsert", log_kv_gamma_level0_reinsert))
+    log_kv_gamma_top_merge = str(_o("log_kv_gamma_top_merge", log_kv_gamma_top_merge))
+    log_kv_gamma_level_slack = int(_o("log_kv_gamma_level_slack", log_kv_gamma_level_slack))
+    log_kv_gamma_cue_tokens = int(_o("log_kv_gamma_cue_tokens", log_kv_gamma_cue_tokens))
+    log_kv_gamma_literals = bool(_o("log_kv_gamma_literals", log_kv_gamma_literals))
+    log_kv_gamma_cue_guard = bool(_o("log_kv_gamma_cue_guard", log_kv_gamma_cue_guard))
+    log_kv_gamma_query_cue = bool(_o("log_kv_gamma_query_cue", log_kv_gamma_query_cue))
+    log_kv_retention_heads = _o("log_kv_retention_heads", log_kv_retention_heads) or None
+    log_kv_gamma_surprisal = _o("log_kv_gamma_surprisal", log_kv_gamma_surprisal) or None
     if not log_kv_semantic_clusters:
         log_kv_alpha_exact_tokens = 0  # exact spans live on semantic clusters only
     if not log_kv_alpha_exact_tokens:
-        # Beta extends the Alpha exact pool; disabling Alpha disables both Beta changes.
+        # Beta and Gamma cues and literals score the Alpha exact pool; disabling Alpha disables them.
         log_kv_beta_novelty = log_kv_beta_adaptive_merge = False
+        log_kv_gamma_cue_tokens = 0
+        log_kv_gamma_literals = False
+        log_kv_gamma_query_cue = False
+        log_kv_retention_heads = None
+        log_kv_gamma_surprisal = None
+    if not (log_kv_gamma_cue_tokens or log_kv_gamma_query_cue):
+        log_kv_gamma_cue_guard = False  # the guard only acts on cues
     log_kv_cluster_k_max = int(_o("log_kv_cluster_k_max", log_kv_cluster_k_max))
     log_kv_cluster_lambda_rel = float(_o("log_kv_cluster_lambda_rel", log_kv_cluster_lambda_rel))
     log_kv_seg_eta = float(_o("log_kv_seg_eta", log_kv_seg_eta))
@@ -1669,7 +2213,12 @@ def main(
                 f"anchors={log_kv_semantic_anchor_mode}, pack={log_kv_semantic_pack_backend}, "
                 f"centroid={log_kv_semantic_centroid_backend}, "
                 f"replay_updates={log_kv_semantic_replay_updates}, "
-                f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge})"
+                f"beta_novelty={log_kv_beta_novelty}, beta_adaptive_merge={log_kv_beta_adaptive_merge}, "
+                f"gamma_level0_reinsert={log_kv_gamma_level0_reinsert}, gamma_top_merge={log_kv_gamma_top_merge}, "
+                f"gamma_level_slack={log_kv_gamma_level_slack}, gamma_cue_tokens={log_kv_gamma_cue_tokens}, "
+                f"gamma_literals={log_kv_gamma_literals}, gamma_cue_guard={log_kv_gamma_cue_guard}, "
+                f"gamma_query_cue={log_kv_gamma_query_cue}, retention_heads={log_kv_retention_heads}, "
+                f"gamma_surprisal={log_kv_gamma_surprisal})"
             )
         if diag_active:
             print(
@@ -1740,13 +2289,27 @@ def main(
             log_kv_alpha_span_max_tokens=log_kv_alpha_span_max_tokens,
             log_kv_beta_novelty=log_kv_beta_novelty,
             log_kv_beta_adaptive_merge=log_kv_beta_adaptive_merge,
+            log_kv_gamma_level0_reinsert=log_kv_gamma_level0_reinsert,
+            log_kv_gamma_top_merge=log_kv_gamma_top_merge,
+            log_kv_gamma_level_slack=log_kv_gamma_level_slack,
+            log_kv_gamma_cue_tokens=log_kv_gamma_cue_tokens,
+            log_kv_gamma_literals=log_kv_gamma_literals,
+            log_kv_gamma_cue_guard=log_kv_gamma_cue_guard,
+            log_kv_gamma_query_cue=log_kv_gamma_query_cue,
+            log_kv_retention_heads=log_kv_retention_heads,
+            log_kv_gamma_surprisal=log_kv_gamma_surprisal,
             tokenizer_dir=tokenizer_dir,
             process_group=eval_group,
         )
         if world_size > 1:
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
+        if benchmark != "debug":
+            benchmark = ",".join(_skip_optional_tasks(benchmark.split(","), lm_model.max_length))
+            _check_task_lengths(benchmark.split(","), lm_model.max_length)
+            _check_task_data(benchmark.split(","))
 
         with (
+            _harness_logging(),
             _trace_hf_cache_resolution(),
             diag_mode(
                 log_kv_diag_mode,
@@ -1759,11 +2322,15 @@ def main(
             results = evaluator.simple_evaluate(
                 model=lm_model,
                 tasks=["piqa"] if benchmark == "debug" else benchmark.split(","),
+<<<<<<< HEAD
                 # 内置任务之外再注册 eval_tasks/（如多针 NIAH）；传入 task_manager 后
                 # metadata 只经由它到达任务。
                 task_manager=TaskManager(
                     include_path=str(Path(__file__).resolve().parent / "eval_tasks"), metadata=metadata
                 ),
+=======
+                task_manager=_task_manager(metadata),
+>>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
                 confirm_run_unsafe_code=True,
                 batch_size=1,
                 metadata=metadata,
@@ -1771,6 +2338,8 @@ def main(
                 log_samples=True,
             )
         _hb("simple_evaluate 已返回")
+        if results:
+            _drop_empty_lengths(results)
         compression_samples = lm_model.all_gather_results(lm_model.compression_metrics, tag="KV compression")
         speed_samples = lm_model.all_gather_results(
             [{"generation": lm_model.gen_metrics, "scoring": lm_model.ppl_metrics}], tag="inference speed",
@@ -1871,6 +2440,7 @@ def main(
             if output_path is not None:
                 json_output = {
                     "timestamp": ts,
+                    **_code_version(),
                     "benchmark": benchmark,
                     "checkpoint_dir": checkpoint_dir,
                     "log_kv_dense_mode": log_kv_dense_mode,
@@ -1910,6 +2480,17 @@ def main(
                     "log_kv_alpha_span_max_tokens": log_kv_alpha_span_max_tokens,
                     "log_kv_beta_novelty": log_kv_beta_novelty,
                     "log_kv_beta_adaptive_merge": log_kv_beta_adaptive_merge,
+                    "log_kv_gamma_level0_reinsert": log_kv_gamma_level0_reinsert,
+                    "log_kv_gamma_top_merge": log_kv_gamma_top_merge,
+                    "log_kv_gamma_level_slack": log_kv_gamma_level_slack,
+                    "log_kv_gamma_cue_tokens": log_kv_gamma_cue_tokens,
+                    "log_kv_gamma_literals": log_kv_gamma_literals,
+                    "log_kv_gamma_cue_guard": log_kv_gamma_cue_guard,
+                    "log_kv_gamma_query_cue": log_kv_gamma_query_cue,
+                    "log_kv_retention_heads": log_kv_retention_heads,
+                    "log_kv_gamma_surprisal": log_kv_gamma_surprisal,
+                    "log_kv_retention_tag": (lm_model._retention_heads.tag()
+                                             if getattr(lm_model, "_retention_heads", None) is not None else None),
                     "results": results,
                 }
 
@@ -1983,7 +2564,7 @@ def main(
             if _dist_ready():
                 if eval_done:
                     wait_s = _wait_all_ranks("收尾同步")
-                    print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {wait_s:.1f}s", flush=True)
+                    _eval_print(f"🤝 [{_rank_label()}] 收尾同步完成，用时 {wait_s:.1f}s", flush=True)
                 else:
                     print(f"⚠️ [{_rank_label()}] 评测未正常结束，跳过收尾 barrier", flush=True)
         finally:
@@ -2026,7 +2607,7 @@ def output_from_cache(
             print(f"缓存内容: {cache_data['results_str'][:500]}...")
             return
 
-        results = cache_data
+        results = _drop_empty_lengths(cache_data)
         print(f"✅ 从缓存读取 results: {cache_path}")
     except Exception as e:
         print(f"❌ 读取缓存失败: {e}")
@@ -2045,6 +2626,7 @@ def output_from_cache(
     if output_path is not None:
         json_output = {
             "timestamp": ts,
+            **_code_version(),
             "benchmark": benchmark,
             "checkpoint_dir": checkpoint_dir,
             "log_kv_dense_mode": log_kv_dense_mode,

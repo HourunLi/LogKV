@@ -9,7 +9,11 @@ EXP = Path(__file__).resolve().parents[1] / "exp" / "qwen1.7b-32k"
 # Script/CLI fallbacks for keys a YAML leaves unset (majob.sh, eval.sh, demo.py, eval.py).
 DEFAULTS = dict(log_kv_alpha_exact_tokens=256, log_kv_beta_novelty=True, log_kv_beta_adaptive_merge=True,
                 log_kv_semantic_unified_route=False, log_kv_semantic_anchor_mode="multi",
-                log_kv_second_order_scale=1.0, log_kv_cluster_k_max=1)
+                log_kv_second_order_scale=1.0, log_kv_cluster_k_max=1,
+                log_kv_gamma_level0_reinsert=True, log_kv_gamma_top_merge="lightest", log_kv_gamma_level_slack=2,
+                log_kv_gamma_cue_tokens=64, log_kv_gamma_literals=False, log_kv_gamma_cue_guard=False,
+                log_kv_gamma_query_cue=False, log_kv_retention_heads=None, synthetic_retrieval_prob=0.0)
+LEGACY_GAMMA = dict(log_kv_gamma_level0_reinsert=False, log_kv_gamma_top_merge="fold", log_kv_gamma_level_slack=2)
 
 
 def resolve(path):
@@ -27,6 +31,11 @@ def effective(name):
         out["log_kv_alpha_exact_tokens"] = 0
     if not out["log_kv_alpha_exact_tokens"]:
         out["log_kv_beta_novelty"] = out["log_kv_beta_adaptive_merge"] = False
+        out["log_kv_gamma_cue_tokens"] = 0
+        out["log_kv_gamma_literals"] = out["log_kv_gamma_query_cue"] = False
+        out["log_kv_retention_heads"] = None
+    if not (out["log_kv_gamma_cue_tokens"] or out["log_kv_gamma_query_cue"]):
+        out["log_kv_gamma_cue_guard"] = False
     return out
 
 
@@ -64,3 +73,305 @@ def test_earlier_experiments_keep_their_trained_settings(name, alpha, beta, unif
     assert cfg["log_kv_alpha_exact_tokens"] == alpha
     assert cfg["log_kv_beta_novelty"] is beta and cfg["log_kv_beta_adaptive_merge"] is beta
     assert bool(cfg["log_kv_semantic_unified_route"]) is unified
+
+
+# Eval-only literal runs re-evaluate Gamma checkpoints with the ladder they were trained with.
+GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
+    p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml", "eval_gamma_query*.yaml",
+                           "arc_niah_*.yaml", "eval_niah_*.yaml", "eval_gamma_surprisal*.yaml",
+                           "eval_long*_baseline.yaml", "eval_long*_word_first.yaml", "eval_full_baseline.yaml",
+                           "eval_full_word_first.yaml", "eval_long_*query.yaml", "eval_full_*query.yaml")
+    for p in EXP.glob(pattern))
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_gamma_experiments_and_the_hub_use_gamma(name):
+    """Earlier experiments keep the ladder they were trained with; new ones inherit Gamma."""
+    cfg = effective(name)
+    gamma = {key: cfg[key] for key in LEGACY_GAMMA}
+    # The SWA comparison harness follows the current default route by design.
+    if name in GAMMA or name == "arc_semantic_fast.yaml" or name.startswith("compare_niah_"):
+        assert gamma["log_kv_gamma_level0_reinsert"] is True and gamma["log_kv_gamma_top_merge"] == "lightest"
+    else:
+        assert gamma == LEGACY_GAMMA, name
+
+
+CUE = ["arc_gamma_cue_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
+       "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", "eval_gamma_cue.yaml",
+       "arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_p1024_slack0.yaml",
+       "eval_gamma_cue_guard.yaml", "eval_gamma_cue_guard_p1024_slack0.yaml",
+       "eval_gamma_cue_guard_literal_p1024_slack0.yaml", "eval_gamma_query_p1024_slack0.yaml",
+       "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml"]
+QUERY = ["eval_gamma_query_p1024_slack0.yaml", "eval_gamma_query_literal_p1024_slack0.yaml",
+         "eval_gamma_query_literal.yaml", "eval_gamma_query.yaml", "eval_gamma_query_p1024.yaml",
+         "eval_gamma_surprisal_mean_query_p1024.yaml", "eval_gamma_surprisal_mix_query_p1024.yaml",
+         "eval_gamma_surprisal_word_first_query_p1024.yaml",
+         # the query-cue long-context evaluations
+         "eval_long_query.yaml", "eval_full_query.yaml", "eval_long_word_first_query.yaml",
+         "eval_full_word_first_query.yaml"]
+LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml",
+           "eval_gamma_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_literal_p1024_slack0.yaml",
+           "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_literal_p1024.yaml"]
+GUARD = ["eval_gamma_cue_guard.yaml", "eval_gamma_cue_guard_p1024_slack0.yaml",
+         "eval_gamma_cue_guard_literal_p1024_slack0.yaml", *QUERY]
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_cue_experiments_and_the_hub_use_cues(name):
+    """Earlier experiments, the Gamma ladder runs included, keep the span scores they were trained with."""
+    cfg = effective(name)
+    if name in CUE or name == "arc_semantic_fast.yaml" or name.startswith("compare_niah_"):
+        assert cfg["log_kv_gamma_cue_tokens"] == 64, name
+    else:
+        assert cfg["log_kv_gamma_cue_tokens"] == 0, name
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_literal_experiments_use_literals(name):
+    assert effective(name)["log_kv_gamma_literals"] is (name in LITERAL), name
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_cue_guard_experiments_use_the_guard(name):
+    assert effective(name)["log_kv_gamma_cue_guard"] is (name in GUARD), name
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_query_cue_evaluations_see_the_question(name):
+    assert effective(name)["log_kv_gamma_query_cue"] is (name in QUERY), name
+
+
+@pytest.mark.parametrize("name, trained, switches", [
+    ("eval_gamma_cue_guard.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_gamma_cue_guard"}),
+    ("eval_gamma_cue_guard_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml",
+     {"log_kv_gamma_cue_guard"}),
+    ("eval_gamma_cue_guard_literal_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml",
+     {"log_kv_gamma_cue_guard", "log_kv_gamma_literals"}),
+    ("eval_gamma_query_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml",
+     {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
+    ("eval_gamma_query_literal_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml",
+     {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue", "log_kv_gamma_literals"}),
+    ("eval_gamma_query_literal.yaml", "arc_gamma_cue_k12_b128_2k.yaml",
+     {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue", "log_kv_gamma_literals"}),
+    ("eval_gamma_query.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
+    # The question alone on the retention heads' cue-free P=1024 checkpoint (the reference for heads + query).
+    ("eval_gamma_query_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml",
+     {"log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}),
+])
+def test_cue_guard_evaluations_reuse_their_checkpoint(name, trained, switches):
+    evaluated, base = effective(name), effective(trained)
+    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == switches
+
+
+def test_literal_experiments():
+    # Eval-only: each trained checkpoint with its own ladder and cue setting, literals on.
+    for name, trained in (("eval_gamma_literal.yaml", "arc_gamma_cue_k12_b128_2k.yaml"),
+                          ("eval_gamma_literal_nocue.yaml", "arc_gamma_k12_b128_2k.yaml"),
+                          ("eval_gamma_literal_p1024_slack0.yaml", "arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml"),
+                          ("eval_gamma_literal_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml")):
+        evaluated, base = effective(name), effective(trained)
+        assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {"log_kv_gamma_literals"}
+    assert effective("eval_gamma_literal_nocue.yaml")["log_kv_gamma_cue_tokens"] == 0
+
+
+def test_cue_experiments():
+    run = effective("arc_gamma_cue_k12_b128_2k.yaml")
+    ladder = effective("arc_gamma_k12_b128_2k.yaml")
+    # The training run differs from the Gamma ladder run only by the cue switch and its names.
+    names = ("expid", "save_path", "merged_state_staging_dir", "tensorboard_root", "log_kv_gamma_cue_tokens")
+    assert {k: v for k, v in run.items() if k not in names} == {k: v for k, v in ladder.items() if k not in names}
+    assert run["expid"] == "qwen1.7b-32k-gamma_cue_k12_b128_2k"
+    # Eval-only: the trained Alpha/Beta checkpoint, its ladder, and cues on.
+    evaluated, trained = effective("eval_gamma_cue.yaml"), effective("arc_attach_alpha_beta_k12_b128_2k.yaml")
+    assert evaluated["save_path"] == trained["save_path"]
+    assert {k: evaluated[k] for k in LEGACY_GAMMA} == LEGACY_GAMMA
+    assert evaluated["benchmark"] == "niah_single_2,niah_single_3"
+
+
+@pytest.mark.parametrize("name, exact, slack, budget", [
+    ("arc_gamma_k12_b128_2k.yaml", 256, 2, 128),
+    ("arc_gamma_k12_b256_2k.yaml", 256, 2, 256),
+    ("arc_gamma_k12_b128_p1024_2k.yaml", 1024, 2, 128),
+    ("arc_gamma_k12_b128_slack0_2k.yaml", 256, 0, 128),
+    ("arc_gamma_cue_k12_b128_p1024_2k.yaml", 1024, 2, 128),
+    ("arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", 1024, 0, 128),
+])
+def test_gamma_experiments(name, exact, slack, budget):
+    cfg = effective(name)
+    assert cfg["log_kv_semantic_unified_route"] is False and int(cfg["log_kv_cluster_k_max"]) == 12
+    assert cfg["log_kv_beta_novelty"] is True and cfg["log_kv_beta_adaptive_merge"] is True
+    assert cfg["log_kv_alpha_exact_tokens"] == exact and cfg["log_kv_gamma_level_slack"] == slack
+    assert int(cfg["log_kv_B"]) == budget and int(cfg["log_kv_recent_size"]) == 2048
+    assert cfg["expid"] == "qwen1.7b-32k-" + name[len("arc_"):-len(".yaml")]
+
+
+@pytest.mark.parametrize("name, parent, switches", [
+    ("arc_gamma_cue_k12_b128_p1024_2k.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_alpha_exact_tokens"}),
+    ("arc_gamma_cue_k12_b128_p1024_2k.yaml", "arc_gamma_k12_b128_p1024_2k.yaml", {"log_kv_gamma_cue_tokens"}),
+    ("arc_gamma_cue_k12_b128_p1024_slack0_2k.yaml", "arc_gamma_cue_k12_b128_p1024_2k.yaml",
+     {"log_kv_gamma_level_slack"}),
+    ("arc_gamma_cue_literal_k12_b128_2k.yaml", "arc_gamma_cue_k12_b128_2k.yaml", {"log_kv_gamma_literals"}),
+])
+def test_combined_cue_experiments_differ_from_their_parents_only_by_the_named_switches(name, parent, switches):
+    names = {"expid", "save_path", "merged_state_staging_dir", "tensorboard_root"}
+    run, base = effective(name), effective(parent)
+    assert {k for k in set(run) | set(base) if run.get(k) != base.get(k)} - names == switches
+
+
+HEADS = "/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/"
+NIAH_HEADS = {"eval_niah_heads_p1024.yaml": HEADS + "gamma_k12_b128_p1024.pth",
+              "arc_niah_heads_k12_b128_p1024_slack0_2k.yaml": HEADS + "gamma_k12_b128_p1024.pth",
+              "eval_niah_heads_refit_p1024_slack0.yaml": HEADS + "niah_heads_k12_b128_p1024_slack0.pth",
+              "eval_niah_heads_heldout_p1024.yaml": HEADS + "gamma_k12_b128_p1024_heldout.pth"}
+NIAH_SYNTH = ["arc_niah_heads_k12_b128_p1024_slack0_2k.yaml", "arc_niah_synth_k12_b128_p1024_slack0_2k.yaml",
+              "eval_niah_heads_refit_p1024_slack0.yaml"]
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_niah_experiments_use_retention_heads_and_synthetic_facts(name):
+    cfg = effective(name)
+    assert cfg["log_kv_retention_heads"] == NIAH_HEADS.get(name), name
+    assert float(cfg["synthetic_retrieval_prob"]) == (0.5 if name in NIAH_SYNTH else 0.0), name
+
+
+@pytest.mark.parametrize("name", ["arc_niah_heads_k12_b128_p1024_slack0_2k.yaml",
+                                  "arc_niah_synth_k12_b128_p1024_slack0_2k.yaml"])
+def test_niah_runs_look_only_at_the_content(name):
+    # No opening cue, no question, no hand-written literal rule: P=1024 and slack 0 at B=128.
+    cfg = effective(name)
+    assert cfg["log_kv_gamma_cue_tokens"] == 0 and not cfg["log_kv_gamma_query_cue"] and not cfg["log_kv_gamma_literals"]
+    assert cfg["log_kv_alpha_exact_tokens"] == 1024 and cfg["log_kv_gamma_level_slack"] == 0 and int(cfg["log_kv_B"]) == 128
+    assert cfg["expid"] == "qwen1.7b-32k-" + name[len("arc_"):-len(".yaml")]
+
+
+@pytest.mark.parametrize("name, parent, switches", [
+    # The heads run and its control differ only by the heads.
+    ("arc_niah_heads_k12_b128_p1024_slack0_2k.yaml", "arc_niah_synth_k12_b128_p1024_slack0_2k.yaml",
+     {"log_kv_retention_heads"}),
+    # Both differ from the cue-free P=1024 ladder run by slack 0 and the synthetic facts.
+    ("arc_niah_synth_k12_b128_p1024_slack0_2k.yaml", "arc_gamma_k12_b128_p1024_2k.yaml",
+     {"log_kv_gamma_level_slack", "synthetic_retrieval_prob"}),
+])
+def test_niah_runs_differ_from_their_controls_only_by_the_named_switches(name, parent, switches):
+    names = {"expid", "save_path", "merged_state_staging_dir", "tensorboard_root"}
+    run, base = effective(name), effective(parent)
+    assert {k for k in set(run) | set(base) if run.get(k) != base.get(k)} - names == switches
+
+
+@pytest.mark.parametrize("name, trained", [
+    ("eval_niah_heads_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml"),
+    ("eval_niah_heads_refit_p1024_slack0.yaml", "arc_niah_heads_k12_b128_p1024_slack0_2k.yaml"),
+    ("eval_niah_heads_heldout_p1024.yaml", "arc_gamma_k12_b128_p1024_2k.yaml"),
+])
+def test_niah_head_evaluations_reuse_their_checkpoint(name, trained):
+    evaluated, base = effective(name), effective(trained)
+    changed = {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)}
+    # Besides the heads, only head-training options (read by retention.sh / train_retention.py).
+    assert {k for k in changed if not k.startswith("retention_")} <= {"log_kv_retention_heads"}
+    assert evaluated["save_path"] == base["save_path"]
+
+
+def test_niah_heldout_heads_leave_out_the_uuid_and_word_values():
+    from litgpt.synthetic_retrieval import KINDS
+    heldout, heads = effective("eval_niah_heads_heldout_p1024.yaml"), effective("eval_niah_heads_p1024.yaml")
+    assert set(heldout["retention_kinds"].split(",")) == set(KINDS) - {"uuid", "word"}
+    assert heldout["retention_steps"] == heads["retention_steps"] and "retention_kinds" not in heads
+
+
+@pytest.mark.parametrize("name", sorted(p.name for p in EXP.glob("*.yaml")))
+def test_only_surprisal_evaluations_rank_by_surprisal(name):
+    expected = {"eval_gamma_surprisal_p1024.yaml": "top4", "eval_gamma_surprisal_mean_p1024.yaml": "mean",
+                "eval_gamma_surprisal_mix_p1024.yaml": "mix", "eval_gamma_surprisal_multi_p1024.yaml": "multi",
+                "eval_gamma_surprisal_mean_query_p1024.yaml": "mean", "eval_gamma_surprisal_mix_query_p1024.yaml": "mix",
+                "eval_gamma_surprisal_word_first_query_p1024.yaml": "word_first",
+                **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "word_first", "multi_word")},
+                **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k", "256k", "")},
+                "eval_full_word_first.yaml": "word_first", "eval_long_word_first_query.yaml": "word_first",
+                "eval_full_word_first_query.yaml": "word_first"}
+    assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
+
+
+@pytest.mark.parametrize("name", ["eval_gamma_surprisal_p1024.yaml", "eval_gamma_surprisal_mean_p1024.yaml",
+                                  "eval_gamma_surprisal_mix_p1024.yaml", "eval_gamma_surprisal_multi_p1024.yaml",
+                                  "eval_gamma_surprisal_word_max_p1024.yaml", "eval_gamma_surprisal_word_top2_p1024.yaml",
+                                  "eval_gamma_surprisal_word_first_p1024.yaml", "eval_gamma_surprisal_multi_word_p1024.yaml"])
+def test_surprisal_evaluations_reuse_the_cue_free_p1024_checkpoint(name):
+    evaluated, base = effective(name), effective("arc_gamma_k12_b128_p1024_2k.yaml")
+    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {"log_kv_gamma_surprisal"}
+    for score in ("mean", "mix", "word_first"):  # the query trick on top: surprisal + the guarded question cue
+        tricked = effective(f"eval_gamma_surprisal_{score}_query_p1024.yaml")
+        assert {k for k in set(tricked) | set(base) if tricked.get(k) != base.get(k)} == {
+            "log_kv_gamma_surprisal", "log_kv_gamma_cue_guard", "log_kv_gamma_query_cue"}
+
+
+LONG = {"dense": "dense_niah_base.yaml", "baseline": "arc_gamma_k12_b128_p1024_2k.yaml",
+        "word_first": "eval_gamma_surprisal_word_first_p1024.yaml"}
+
+
+@pytest.mark.parametrize("length,tokens,factor", [("64k", 65536, 2.0), ("128k", 131072, 4.0), ("256k", 262144, 8.0)])
+@pytest.mark.parametrize("name", sorted(LONG))
+def test_long_context_evaluations_change_only_the_length_settings(length, tokens, factor, name):
+    evaluated, base = effective(f"eval_long{length}_{name}.yaml"), effective(LONG[name])
+    # The base model's dense run keeps its results apart from its 32K ones.
+    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
+        "eval_max_seq_lengths", "niah_benchmark", "benchmark", "limit", "config_overrides", "long_ppl_data",
+        "long_ppl_books", "infinitebench_dir", *(("output_path",) if name == "dense" else ())}
+    assert evaluated["eval_max_seq_lengths"] == [tokens]
+    assert evaluated["benchmark"].split(",")[:2] == [f"babilong_{length}", "long_ppl_32k" if length == "64k" else
+                                                     f"long_ppl_{length}"]
+    # The book curve, several questions on one cache, LongBench v2 and InfiniteBench, all under the
+    # configuration's length.
+    assert evaluated["benchmark"].split(",")[-4:] == [f"long_ppl_books_{length}", f"niah_turns_{length}",
+                                                      f"longbench2_{length}", f"infinitebench_{length}"]
+    # All of RULER; at 256K but SQuAD, whose 1204 dev paragraphs (about 220K tokens) cannot fill the context.
+    assert "ruler_qa_hotpot" in evaluated["niah_benchmark"] and len(evaluated["niah_benchmark"]) == (
+        12 if length == "256k" else 13)
+    assert ("ruler_qa_squad" in evaluated["niah_benchmark"]) == (length != "256k")
+    overrides = evaluated["config_overrides"]
+    assert overrides["block_size"] > tokens and overrides["rope_adjustments"] == dict(
+        factor=factor, beta_fast=32, beta_slow=1, original_max_seq_len=32768)
+
+
+@pytest.mark.parametrize("name", sorted(LONG))
+def test_one_yaml_per_method_covers_every_length(name):
+    """eval_long_<method>.yaml: the same model and cache settings as the per-length YAMLs, the lengths listed
+    (eval.sh computes each pass's window, YaRN and tasks: long_eval_plan.py)."""
+    evaluated, base = effective(f"eval_long_{name}.yaml"), effective(LONG[name])
+    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
+        "eval_lengths", "limit", "long_ppl_data", "long_ppl_books", "infinitebench_dir"}
+    assert evaluated["eval_lengths"] == ["32k", "64k", "128k", "256k"] and evaluated["limit"] == 100
+    assert "config_overrides" not in evaluated
+    if name == "dense":  # passes write to its long<L> folders, where the per-length dense runs wrote
+        assert evaluated["output_path"] + "/long64k" == effective("eval_long64k_dense.yaml")["output_path"]
+
+
+
+@pytest.mark.parametrize("name", sorted(LONG))
+def test_one_yaml_per_method_runs_everything(name):
+    """eval_full_<method>.yaml: eval_long_<method>.yaml with the 32K main line first (eval.sh's default lists, no
+    limit) and long_limit samples per task in the length passes."""
+    evaluated, longs = effective(f"eval_full_{name}.yaml"), effective(f"eval_long_{name}.yaml")
+    assert {k for k in set(evaluated) | set(longs) if evaluated.get(k) != longs.get(k)} == {
+        "eval_main", "long_limit", "limit", *(("benchmark",) if name == "dense" else ("eval_tag",))}
+    assert evaluated["eval_main"] is True and evaluated["long_limit"] == 100 and evaluated.get("limit") is None
+    assert not evaluated.get("benchmark") and not evaluated.get("niah_benchmark")  # the default (full) lists
+
+
+
+@pytest.mark.parametrize("name, plain", [("query", "baseline"), ("word_first_query", "word_first")])
+def test_the_query_long_evaluations_differ_only_in_the_question(name, plain):
+    """eval_long_query / eval_long_word_first_query: the same checkpoint, lengths and tasks as eval_long_baseline /
+    eval_long_word_first, with the query-aware cue (and its guard) on; the full YAMLs likewise."""
+    for kind in ("long", "full"):
+        evaluated, other = effective(f"eval_{kind}_{name}.yaml"), effective(f"eval_{kind}_{plain}.yaml")
+        assert {k for k in set(evaluated) | set(other) if evaluated.get(k) != other.get(k)} == {
+            "log_kv_gamma_query_cue", "log_kv_gamma_cue_guard", *(("eval_tag",) if kind == "full" else ())}, kind
+        assert evaluated["log_kv_gamma_query_cue"] is True and evaluated["log_kv_gamma_cue_guard"] is True
+
+
+
+def test_methods_on_one_checkpoint_write_to_their_own_folders():
+    """baseline, word_first, query and word_first_query share a checkpoint: each full evaluation has its own folder."""
+    tags = {effective(f"eval_full_{m}.yaml")["eval_tag"] for m in ("baseline", "word_first", "query", "word_first_query")}
+    assert len(tags) == 4
+    assert effective("eval_full_dense.yaml").get("eval_tag") is None  # the base model: its own output_path already
