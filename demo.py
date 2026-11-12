@@ -1289,21 +1289,12 @@ def main(
 
         is_accumulating = (micro_batch_idx + 1) % gradient_accumulation_steps != 0
         micro_batch_idx += 1
-<<<<<<< HEAD
-        step_tokens += inputs.numel()
-        step_samples += inputs.size(0)
-        current_second_order_scale = get_log_kv_second_order_scale(
-            global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
-        )
-        model.set_log_kv_second_order_scale(current_second_order_scale)
-=======
         current_second_order_scale = 0.0
         if not log_kv_dense_mode:
             current_second_order_scale = get_log_kv_second_order_scale(
                 global_step, log_kv_second_order_warmup_steps, log_kv_second_order_scale
             )
             model.set_log_kv_second_order_scale(current_second_order_scale)
->>>>>>> 6285d9986b381cd8da945255b00b76154474ca78
 
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             # Dense uses ordinary causal attention; LogKV uses streaming replay.
