@@ -827,31 +827,100 @@ def _trace_hf_cache_resolution():
         datasets_module.load_dataset = original_load
 
 
+def _checkpoint_file_for_loading(path: Path, wait_s: float = 120.0) -> Path:
+    """Resolve checkpoint links flattened to path text by a bucket mount, without writing to that mount.
+
+    Keep the selected checkpoint: following its reference is allowed; substituting an older step is not.
+    Non-main ranks share one bounded metadata-visibility wait across the entire reference chain.
+    """
+    import socket
+
+    origin = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(str(path)))))
+    current, chain, seen = origin, [], set()
+    deadline = time.monotonic() + max(wait_s, 0) if _dist_ready() and not _is_main() else None
+
+    def details(message):
+        return (f"{message}. Requested checkpoint: {origin}; reference chain: {' -> '.join(chain)}; "
+                f"observed on host {socket.gethostname()} [{_rank_label()}]. "
+                "Copy the actual binary checkpoint as an ordinary file to the selected location; "
+                "an older step will not be substituted automatically.")
+
+    for _ in range(16):
+        name = str(current)
+        chain.append(name)
+        if name in seen:
+            raise ValueError(details("Checkpoint reference cycle"))
+        seen.add(name)
+        waited = False
+        while not (current.exists() or current.is_symlink()):
+            remaining = deadline - time.monotonic() if deadline is not None else 0
+            if remaining <= 0:
+                raise FileNotFoundError(details(f"Checkpoint file or reference target is missing: {current}"))
+            time.sleep(min(2.0, remaining))
+            waited = True
+        if waited:
+            print(f"[eval][{_rank_label()}] 共享盘元数据延迟，等待后已看到 {current}", flush=True)
+        if current.is_symlink():
+            target = os.readlink(current)
+        else:
+            if current.is_dir():
+                raise FileNotFoundError(details(
+                    f"{current} is a directory (FSDP/DCP shards); first consolidate it with "
+                    "utils.convert_and_replace_fsdp_ckpt"))
+            with open(current, "rb") as stream:
+                head = stream.read(4097)  # a path placeholder is small; never read the full weights here
+            if not head:
+                raise ValueError(details(f"Checkpoint file is empty: {current}"))
+            target = None
+            if len(head) <= 4096:
+                try:
+                    text = head.decode("utf-8").strip("\x00\r\n\t ")
+                except UnicodeDecodeError:
+                    text = ""
+                if text.startswith("version https://git-lfs.github.com/spec/v1"):
+                    raise ValueError(details(f"{current} contains a Git LFS pointer, not checkpoint weights"))
+                if (text and "://" not in text and not any(ord(c) < 32 for c in text)
+                        and (text.startswith(("/", "./", "../")) or "/" in text
+                             or text.endswith((".pth", ".pt", ".ckpt")))):
+                    target = text
+            if target is None:
+                return current
+        next_path = Path(target)
+        if not next_path.is_absolute():
+            next_path = current.parent / next_path
+        current = Path(os.path.abspath(next_path))
+        if _is_main():
+            print(f"[eval] Checkpoint reference: {name} -> {current}", flush=True)
+    raise ValueError(details("Too many checkpoint reference hops (limit 16)"))
+
+
 def _load_lit_model_checkpoint(
     checkpoint_dir: str, map_location: str | torch.device, wait_s: float = 120.0
 ) -> Any:
     """加载 ``{checkpoint_dir}/lit_model.pth``（单文件 ``torch.save``，与 demo FSDP ``state_dict_type='full'`` 一致）。
 
     多机场景下 rank 0 已经确认过文件存在（见 ``_resolve_checkpoint_dir``），但其它
-    节点的共享盘元数据缓存可能还没刷新。此时直接抛 FileNotFoundError 会让这个 rank
+    节点的共享盘元数据缓存可能还没刷新，包括路径占位文件指向的真实文件。直接抛 FileNotFoundError 会让这个 rank
     单独退出，其余 rank 卡在后续集合通信里等到超时；所以非 rank0 上先轮询等待
     ``wait_s`` 秒。单进程运行时不等待，行为与之前一致（立刻报错）。
     """
-    lit_path = Path(checkpoint_dir).expanduser() / "lit_model.pth"
-    if not lit_path.exists() and _dist_ready() and not _is_main():
-        deadline = time.time() + wait_s
-        while time.time() < deadline and not lit_path.exists():
-            time.sleep(2.0)
-        if lit_path.exists():
-            print(f"[eval][{_rank_label()}] 共享盘元数据延迟，等待后已看到 {lit_path}")
-    if not lit_path.exists():
-        raise FileNotFoundError(f"未找到 checkpoint: {lit_path}")
-    if lit_path.is_dir():
-        raise FileNotFoundError(
-            f"{lit_path} 为目录（旧版 FSDP/DCP 分片）。请先在仓库根目录对同一路径调用 "
-            "`utils.convert_and_replace_fsdp_ckpt` 合并为单文件 lit_model.pth，再跑 eval。"
-        )
-    return torch.load(str(lit_path), map_location=map_location, weights_only=False)
+    import pickle
+    import socket
+
+    requested = Path(checkpoint_dir).expanduser() / "lit_model.pth"
+    lit_path = _checkpoint_file_for_loading(requested, wait_s=wait_s)
+    if _is_main():
+        print(f"[eval] Checkpoint binary: {lit_path} ({lit_path.stat().st_size} bytes)", flush=True)
+    try:
+        return torch.load(str(lit_path), map_location=map_location, weights_only=False)
+    except (pickle.UnpicklingError, EOFError) as error:
+        with open(lit_path, "rb") as stream:
+            head = stream.read(160)
+        raise ValueError(
+            f"Checkpoint is not a readable torch.save binary: requested={requested}, actual={lit_path}, "
+            f"size={lit_path.stat().st_size}, starts={head!r}, host={socket.gethostname()}, rank={_rank_label()}. "
+            "Restore the actual binary weights as an ordinary file at this path; no older step was selected."
+        ) from error
 
 
 def _parse_csv_ints(s: str) -> list[int]:

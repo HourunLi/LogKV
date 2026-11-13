@@ -98,6 +98,10 @@ bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 `/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k/lit_model.pth`。
 `eval.sh` 从训练配置的 `save_path` 取得该目录并传入 `eval.py`；加载器优先读取目录自身的 `lit_model.pth`。
 仅当目录自身没有权重时，才选择其中最大的 `step_*` 保存点。启动日志会打印实际使用的权重路径。
+若挂载把 `lit_model.pth` 的软链接变成保存目标路径的小文本文件，加载器会只读解析其中的绝对或相对路径
+（包括末尾 NUL），沿引用链读取真实权重，不创建软链接、不移动文件。`Checkpoint weights:` 是选择的逻辑路径，
+`Checkpoint reference:` 记录引用跳转，`Checkpoint binary:` 打印实际二进制文件及大小。
+目标缺失、引用循环、空文件或 Git LFS 占位会明确报错；需恢复同一 checkpoint 的真实文件，不自动改用旧 step。
 
 | YAML 文件 | 评测方式 | 结果子目录 |
 |---|---|---|
