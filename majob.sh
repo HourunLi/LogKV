@@ -8,6 +8,7 @@ fi
 # Set caches before Python imports Hugging Face and freezes its cache paths.
 export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
 export LONGBENCH2_DIR=${LONGBENCH2_DIR:-${HF_HOME}/longbench2}
+export BABILONG_DIR=${BABILONG_DIR:-${HF_HOME}/babilong}
 export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
 export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
 export HF_MODULES_CACHE="${HF_HOME}/modules"

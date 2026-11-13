@@ -30,6 +30,7 @@ fi
 # Set caches before Python imports Hugging Face and freezes its cache paths.
 export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
 export LONGBENCH2_DIR=${LONGBENCH2_DIR:-${HF_HOME}/longbench2}
+export BABILONG_DIR=${BABILONG_DIR:-${HF_HOME}/babilong}
 export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
 export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
 export HF_MODULES_CACHE="${HF_HOME}/modules"
@@ -292,6 +293,7 @@ emit("CONFIG_LONG_PPL_DATA", cfg.get("long_ppl_data") or "")
 emit("CONFIG_LONG_PPL_BOOKS", cfg.get("long_ppl_books") or "")  # long_ppl_books_<L>: books of >= 256K tokens
 # Several lengths in one job (long_eval_plan.py): a list such as [32k, 64k, 128k, 256k].
 emit("CONFIG_EVAL_LENGTHS", ",".join(str(x) for x in (cfg.get("eval_lengths") or [])))
+emit("CONFIG_EVAL_SUITES", ",".join(str(x) for x in (cfg.get("eval_suites") or [])))
 emit("CONFIG_BABILONG_DATASET", cfg.get("babilong_dataset") or "")
 emit("CONFIG_INFINITEBENCH_DIR", cfg.get("infinitebench_dir") or "")  # eval_tasks/infinitebench
 # The full evaluation (eval_main: true): the 32K main line, then the length passes with their own samples per task.
@@ -322,6 +324,7 @@ if [ -n "${INFINITEBENCH_DIR}" ]; then export INFINITEBENCH_DIR; fi
 # lists, main and NIAH stage, the YAML's limit, into <output_path>), then the passes (long_limit samples per task),
 # which leave out what the main line measured; EVAL_LENGTHS=none keeps the main line only.
 EVAL_LENGTHS=${EVAL_LENGTHS:-${CONFIG_EVAL_LENGTHS}}
+EVAL_SUITES=${EVAL_SUITES:-${CONFIG_EVAL_SUITES}}
 case "$(printf '%s' "${EVAL_LENGTHS}" | tr '[:upper:]' '[:lower:]')" in
     none|off|false|0) EVAL_LENGTHS="" ;;
 esac

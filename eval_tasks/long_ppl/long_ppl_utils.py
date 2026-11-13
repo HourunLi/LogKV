@@ -1,4 +1,4 @@
-"""Long-document perplexity at a fixed context length (64K, 128K, 256K, and 32K for reference).
+"""Long-document perplexity at 32K through 1M, including curves on a shared long-document selection.
 
 Each document is cut to L tokens; the last TAIL tokens are scored given the L - TAIL before them, so the
 number says how well the model predicts text once most of its context is far behind it (in LogKV,
@@ -6,6 +6,8 @@ compressed). 32K / 64K / 128K share their documents: only documents of at least 
 are taken, in file order, so the three differ only in how much context precedes the same kind of tail.
 256K takes its own documents, of at least 262144 tokens (LONGEST_256K), so that the shorter lengths keep
 the documents (and caches) they had; its numbers compare methods at 256K, not lengths.
+512K and 1M both select documents of at least 1048576 tokens into the same independent cache.
+Their book curves also share that selection, using min_length in the task YAML; older curves keep 256K books.
 
 The group long_ppl_books_<L> reads another source, LONG_PPL_BOOKS (books of at least 262144 tokens, e.g.
 PG19's train set, whose test set holds only 4 such books): its tasks long_ppl_books_<L>_8k, _16k, ... _<L> take
@@ -35,6 +37,7 @@ import datasets
 
 LONGEST = 131072
 LONGEST_256K = 262144
+LONGEST_1M = 1048576
 TAIL = 4096
 COLUMNS = ("text", "content", "code")
 
@@ -166,7 +169,11 @@ def _documents(kwargs, longest: int | None = None, env: str = "LONG_PPL_DATA") -
     tmp = cache.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(docs))
     try:
-        os.replace(tmp, cache)  # several ranks may build it at once
+        if longest >= LONGEST_1M:
+            shutil.copyfile(tmp, cache)  # object mounts need no rename support for the new large caches
+            tmp.unlink()
+        else:
+            os.replace(tmp, cache)  # several ranks may build it at once
     except OSError:  # a bucket mount (OBS) refuses the rename: copy the complete file over, then drop it
         shutil.copyfile(tmp, cache)
         with contextlib.suppress(OSError):
@@ -203,6 +210,14 @@ def long_ppl_256k(**kwargs):
     return build(262144, kwargs, longest=LONGEST_256K)
 
 
+def long_ppl_512k(**kwargs):
+    return build(524288, kwargs, longest=LONGEST_1M)
+
+
+def long_ppl_1m(**kwargs):
+    return build(1048576, kwargs, longest=LONGEST_1M)
+
+
 def book_points(length: int) -> list[int]:
     """8K, 16K, ... up to ``length``: the points of long_ppl_books_<length>'s curve."""
     points, n = [], 8192
@@ -214,7 +229,8 @@ def book_points(length: int) -> list[int]:
 
 def long_ppl_books(**kwargs):
     """long_ppl_books_<L>_<point>: the books cut to ``point`` (dataset_kwargs), their last TAIL tokens scored."""
-    return build(int(kwargs["point"]), kwargs, longest=LONGEST_256K, env="LONG_PPL_BOOKS")
+    return build(int(kwargs["point"]), kwargs, longest=int(kwargs.get("min_length", LONGEST_256K)),
+                 env="LONG_PPL_BOOKS")
 
 
 def process_results(doc, results):

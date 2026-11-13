@@ -62,6 +62,14 @@ def niah_turns_256k(**kwargs):
     return build(262144, kwargs)
 
 
+def niah_turns_512k(**kwargs):
+    return build(524288, kwargs)
+
+
+def niah_turns_1m(**kwargs):
+    return build(1048576, kwargs)
+
+
 def process_results(doc, results):
     answers = results[0].split(SEPARATOR)
     answers += [""] * (TURNS - len(answers))

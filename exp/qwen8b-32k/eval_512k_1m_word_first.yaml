@@ -1,0 +1,7 @@
+# Opt-in 512K/1M evaluation of this model's own CPT checkpoint; no training.
+config: eval_long_word_first.yaml
+eval_lengths: [512k, 1m]
+eval_suites: [ruler, babilong, books, longbench2]
+eval_main: false
+limit: 100
+eval_tag: ultra_word_first

@@ -56,6 +56,9 @@ rank 的耗时，平均每卡值再除以卡数。计时同步 GPU，包含取�
 | `gen_tokens_per_sec` | 全部生成 token 数 / prefill 与 decode 总秒数 |
 | `forward_tokens_per_sec` | 选择题、PPL 的模型输入 token 数 / forward 秒数 |
 | `peak_memory_allocated_bytes` / `peak_memory_reserved_bytes` | 每次调用的 CUDA 已分配 / 保留显存峰值 |
+| `prompt_len` | 普通生成实际进入模型的 prompt token 数；多轮生成按下文的增量前缀口径 |
+| `original_prompt_len` | 普通生成截断前的完整 prompt token 数，包含任务说明和示例 |
+| `truncated_prompt_tokens` | 普通生成从 prompt 开头截去的 token 数；与 `prompt_len` 之和为 `original_prompt_len` |
 
 生成计数包含 EOS；只生成一个 token 时没有 decode，相关吞吐和每 token 耗时为 null。
 推理计时排除分词、cache 初始化/重置、压缩率统计、评分后处理和文件写入。汇总采用
@@ -89,6 +92,11 @@ RULER 的 `niah_*` 任务（含 [`eval_tasks/niah_multi/`](../eval_tasks/niah_mu
 - RULER 给每条样本补一个 `4096` 键；没有 4096 长度的样本时该值为 `-1`，不是分数。
 - `max_length` 是请求长度，样本实际长度在 `length` 字段（prompt token 数加生成预留）。essay 草堆不足时
   `length` 明显短于 `max_length`；多针任务放不下全部针的长度被跳过。两种情况都会告警。
+
+512K/1M 的 RULER 扩展样本另有 `logkv_ruler_protocol=extended-v1` 和
+`logkv_haystack_repeats`：前者标识扩展协议，后者表示背景词序列重复次数（非 essay 任务为 1）。
+`length` 沿用生成器的实际长度口径（包括生成预留），`max_length` 是请求的长度预算；
+背景循环发生在插针之前，完整协议与样本数规则见 [512K/1M 说明](eval-512k-1m.md)。
 
 ## 输出文件与可追溯性
 
