@@ -1052,7 +1052,7 @@ def summarize_inference_metrics(gen_metrics: list[dict], ppl_metrics: list[dict]
     forward_time = sum(row["forward_time_s"] for row in ppl_metrics)
     return {
         "throughput_scope": "Effective single-device throughput: sum(tokens) / sum(request stage seconds) across all ranks; not aggregate cluster throughput.",
-        "timing_scope": "Model calls only, excluding tokenization, cache setup/reset, result gathering, and file output. Prefill includes first-token sampling; decode excludes the first generated token. Generation counts include EOS; no warmup requests are discarded.",
+        "timing_scope": "Model calls only, excluding tokenization, cache setup/reset, result gathering, and file output. Prefill includes first-token sampling; decode excludes the first generated token. Each multi-turn answer is one generation request, with only newly forwarded tokens counted as its prompt. Generation counts include EOS; no warmup requests are discarded.",
         "memory_scope": "Maximum per-request CUDA allocator peak across ranks, including resident model and cache; not KV-only memory or total device memory. CPU values are null.",
         "generation": {
             "requests": len(gen_metrics),
@@ -1679,30 +1679,54 @@ class LogKVLM(LM):
                     and getattr(self.model, "log_kv_cue_stream", None) is not None):
                 self.model.set_gamma_queries([None])
             try:
-                t0 = time.perf_counter()
-                for question in asked:
+                for turn_index, question in enumerate(asked, start=1):
                     # The previous answer's last token has not been forwarded yet: it leads this chunk.
                     pending = torch.cat([pending, question])
+                    prompt_len = int(pending.numel())
                     answer = []
-                    for _ in range(max_new_tokens):
+                    _synchronize_inference_device(self._device)
+                    _reset_inference_peak_memory(self._device)
+                    generation_start = time.perf_counter()
+                    prefill_time_s = total_time_s = 0.0
+                    for step in range(max_new_tokens):
                         T = pending.numel()
                         logits = self._forward(pending, pos, T - 1)
                         pos += T
                         token = int(logits[0, -1].argmax())
+                        # Reading the sampled token synchronizes the device, as in _generate_chunked.
+                        total_time_s = time.perf_counter() - generation_start
+                        if step == 0:
+                            prefill_time_s = total_time_s
                         answer.append(token)
                         pending = torch.tensor([token], device=self._device, dtype=torch.long)
                         if token in stops:
                             break
+                    _synchronize_inference_device(self._device)
+                    peak_memory = _inference_peak_memory(self._device)
+                    gen_len = len(answer)
+                    decode_tokens = max(gen_len - 1, 0)
+                    decode_time_s = total_time_s - prefill_time_s
+                    # Each answer has its own TTFT/decode phase, while the cache stays shared across turns.
+                    self.gen_metrics.append({
+                        "request_type": "generate_turns", "rank": _global_rank(), "sample_id": sample_id,
+                        "turn_index": turn_index, "turns": len(asked), "context_len": context_len,
+                        "processed_tokens": pos, "prompt_len": prompt_len, "generated_tokens": gen_len,
+                        "total_time_s": total_time_s, "prefill_time_s": prefill_time_s,
+                        "ttft_ms": prefill_time_s * 1000,
+                        "prefill_tokens_per_sec": prompt_len / prefill_time_s if prefill_time_s > 0 else None,
+                        "decode_time_s": decode_time_s, "decode_tokens": decode_tokens,
+                        "decode_ms_per_token": decode_time_s / decode_tokens * 1000 if decode_tokens else None,
+                        "decode_tokens_per_sec": decode_tokens / decode_time_s if decode_tokens and decode_time_s > 0 else None,
+                        "gen_tokens_per_sec": gen_len / total_time_s if total_time_s > 0 else None,
+                        **peak_memory,
+                    })
                     answers.append(self.tokenizer.decode(torch.tensor(answer, dtype=torch.long)))
-                t1 = time.perf_counter()
                 self.compression_metrics.append({
                     "request_type": "generate_turns", "rank": _global_rank(), "sample_id": sample_id,
                     "prompt_len": context_len, "turns": len(asked), **cache_compression_snapshot(self.model, pos),
                 })
             finally:
                 self._reset_eval_cache()
-        self.gen_metrics.append({"prompt_len": context_len, "turns": len(asked), "processed_tokens": pos,
-                                 "total_time_s": round(t1 - t0, 4)})
         return separator.join(answers)
 
     def generate_until(self, requests):
