@@ -21,6 +21,7 @@ export HF_DATASETS_OFFLINE=1
 export HF_DATASETS_IN_MEMORY_MAX_SIZE=0
 export HF_DATASETS_TRUST_REMOTE_CODE=1
 export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
 export HF_ALLOW_CODE_EVAL=1
 
 PYTHON_BIN=$(python -c 'import sys; print(sys.executable)') || exit 1

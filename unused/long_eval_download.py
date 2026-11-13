@@ -5,8 +5,11 @@ import hashlib
 import importlib.util
 import json
 import os
+import time
 from functools import cache
 from pathlib import Path
+
+from unused.fetch_progress import run_stage, stage
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,7 +25,7 @@ def sha256(path):
 @cache
 def hub_info(repo):
     from huggingface_hub import HfApi
-    return HfApi().dataset_info(repo, files_metadata=True)
+    return HfApi().dataset_info(repo, files_metadata=True, timeout=60)
 
 
 def download_plain(repo, name, folder, lines):
@@ -30,7 +33,7 @@ def download_plain(repo, name, folder, lines):
     import requests
     from huggingface_hub import hf_hub_url
 
-    info = hub_info(repo)
+    info = run_stage(lines, f"Hub metadata {repo}", hub_info, repo)
     item = next((entry for entry in info.siblings if entry.rfilename == name), None)
     if item is None:
         raise FileNotFoundError(f"{repo}@{info.sha} has no {name}")
@@ -42,21 +45,38 @@ def download_plain(repo, name, folder, lines):
     if target.is_symlink():
         target.unlink()
 
+    digest = None
+
     def complete():
-        return (target.is_file() and (size is None or target.stat().st_size == size)
-                and (not expected_hash or sha256(target) == expected_hash))
+        nonlocal digest
+        digest = None
+        if not target.is_file() or (size is not None and target.stat().st_size != size):
+            return False
+        digest = run_stage(lines, f"SHA256 {target}", sha256, target)
+        return not expected_hash or digest == expected_hash
 
     if not complete():
         url = hf_hub_url(repo, name, repo_type="dataset", revision=info.sha)
-        with requests.get(url, stream=True, timeout=(60, 300)) as response:
-            response.raise_for_status()
-            with target.open("wb") as stream:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        stream.write(chunk)
+        total = f"{size / 1e6:.1f} MB" if size is not None else "unknown size"
+        with stage(lines, f"download {repo}/{name} ({total}) -> {target}"):
+            received, started = 0, time.monotonic()
+            last_report = started
+            with requests.get(url, stream=True, timeout=(60, 300)) as response:
+                response.raise_for_status()
+                with target.open("wb") as stream:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            stream.write(chunk)
+                            received += len(chunk)
+                            now = time.monotonic()
+                            if now - last_report >= 5:
+                                lines.append(f"download {name}: {received / 1e6:.1f} MB / {total}, "
+                                             f"{received / 1e6 / max(now - started, .001):.2f} MB/s")
+                                last_report = now
+            lines.append(f"download {name}: received {received} bytes")
         if not complete():
             raise ValueError(f"Incomplete download or SHA256 mismatch: {target}")
-    lines.append(f"ordinary file {repo}@{info.sha}/{name}: {target.stat().st_size} bytes, SHA256={sha256(target)}")
+    lines.append(f"ordinary file {repo}@{info.sha}/{name}: {target.stat().st_size} bytes, SHA256={digest}")
     return target
 
 
@@ -77,29 +97,32 @@ def prepare_babilong(length, lines):
         arrow, target = utils.plain_paths(length, split)
         name = str(target.relative_to(utils.plain_folder()))
         download_plain("RMT-team/babilong", name, utils.plain_folder(), lines)
-        source_hash = sha256(target)
+        source_hash = run_stage(lines, f"BABILong {length} {split}: hash source", sha256, target)
         manifest = arrow.with_suffix(".manifest.json")
         valid = False
         try:
             record = json.loads(manifest.read_text())
-            valid = (not arrow.is_symlink() and record["source_sha256"] == source_hash
-                     and record["arrow_sha256"] == sha256(arrow) and len(utils.load_plain(length, split)) == 100)
+            with stage(lines, f"BABILong {length} {split}: verify existing Arrow"):
+                valid = (not arrow.is_symlink() and record["source_sha256"] == source_hash
+                         and record["arrow_sha256"] == sha256(arrow) and len(utils.load_plain(length, split)) == 100)
         except (OSError, ValueError, KeyError):
             pass
         if not valid:
-            with target.open(encoding="utf-8") as stream:
-                rows = json.load(stream)
+            with stage(lines, f"BABILong {length} {split}: read JSON {target.stat().st_size / 1e6:.1f} MB"):
+                with target.open(encoding="utf-8") as stream:
+                    rows = json.load(stream)
             if (not isinstance(rows, list) or len(rows) != 100
                     or any(not isinstance(row, dict) or not {"input", "question", "target"} <= row.keys() for row in rows)):
                 raise ValueError(f"BABILong {target} must contain 100 input/question/target records")
-            table = pa.Table.from_pylist(rows)
-            if arrow.is_symlink():
-                arrow.unlink()
-            with pa.OSFile(str(arrow), "wb") as sink:
-                with ipc.new_stream(sink, table.schema) as writer:
-                    writer.write_table(table)
-            manifest.write_text(json.dumps(dict(source_sha256=source_hash, arrow_sha256=sha256(arrow), rows=100)))
-        data = utils.load_plain(length, split)
+            with stage(lines, f"BABILong {length} {split}: write 100 rows as ordinary Arrow {arrow}"):
+                table = pa.Table.from_pylist(rows)
+                if arrow.is_symlink():
+                    arrow.unlink()
+                with pa.OSFile(str(arrow), "wb") as sink:
+                    with ipc.new_stream(sink, table.schema) as writer:
+                        writer.write_table(table)
+                manifest.write_text(json.dumps(dict(source_sha256=source_hash, arrow_sha256=sha256(arrow), rows=100)))
+        data = run_stage(lines, f"BABILong {length} {split}: offline reload", utils.load_plain, length, split)
         if len(data) != 100:
             raise ValueError(f"BABILong {arrow}: expected 100 rows, found {len(data)}")
         lines.append(f"BABILong {length} {split}: {len(data)} rows, ordinary Arrow, offline reload: ok ({arrow})")
@@ -134,7 +157,7 @@ def prepare_nltk(lines):
     root = Path(os.environ.get("NLTK_DATA", str(home / "nltk_data")).split(os.pathsep)[0]).expanduser()
     if not (root / "tokenizers/punkt_tab/english/collocations.tab").is_file():
         url = "https://raw.githubusercontent.com/nltk/nltk_data/gh-pages/packages/tokenizers/punkt_tab.zip"
-        response = requests.get(url, timeout=300)
+        response = run_stage(lines, "download NLTK punkt_tab.zip", requests.get, url, timeout=300)
         response.raise_for_status()
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
             for item in archive.infolist():
