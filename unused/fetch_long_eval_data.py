@@ -4,6 +4,10 @@ eval.sh runs offline (HF_HUB_OFFLINE=1, HF_DATASETS_OFFLINE=1) with HF_HOME, HF_
 RULER_CACHE_DIR from its environment header; diag.sh sets the same paths. This script turns the offline
 switches off for itself only, then:
 
+--lengths 512k,1m prepares the official BABILong JSON plus ordinary memory-mappable Arrow copies,
+RULER's ordinary essay background/NLTK data, and shared >=1M-token PPL selections when a PPL source is given.
+The default lengths stay 32k,64k,128k,256k. --ruler-essays prepares the background independently.
+
     BABILong      RMT-team/babilong-1k-samples, configs 32k / 64k / 128k, and RMT-team/babilong (100
                   samples per length), config 256k; splits qa1 ... qa5
     RULER QA      SQuAD v2 dev and HotpotQA dev (distractor) JSON, into RULER_CACHE_DIR, where
@@ -129,7 +133,7 @@ def fetch_ruler_qa(lines: list[str]) -> None:
         lines.append(f"RULER QA {name}: {path} ({path.stat().st_size / 1e6:.1f} MB)")
 
 
-def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> tuple[list[tuple[str, str, str]], bool]:
+def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str], lengths=None) -> tuple[list[tuple[str, str, str]], bool]:
     """Each dataset group in turn; a group that fails is reported and the others still run."""
     import datasets
 
@@ -138,12 +142,21 @@ def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str]) -> tuple[
 
     apply_patch()  # as eval.py: LongBench v2 subsets from the snapshot's files when the card has no configs
     groups = []
+    lengths = tuple(lengths or (*BABILONG_LENGTHS, *BABILONG_LONG_LENGTHS))
     if babilong:
-        groups.append(("BABILong", [(BABILONG, n, s) for n in BABILONG_LENGTHS for s in QA_SPLITS]))
-        groups.append(("BABILong 256k", [(BABILONG_LONG, n, s) for n in BABILONG_LONG_LENGTHS for s in QA_SPLITS]))
+        groups.append(("BABILong", [(BABILONG, n, s) for n in BABILONG_LENGTHS if n in lengths for s in QA_SPLITS]))
+        groups.append(("BABILong 256k", [(BABILONG_LONG, n, s) for n in BABILONG_LONG_LENGTHS if n in lengths for s in QA_SPLITS]))
     if longbench2:
         groups.append(("LongBench v2", [(LONGBENCH2, name, "train") for name in longbench2_subsets()]))
     loads, ok = [], True
+    if babilong:
+        from unused.long_eval_download import prepare_babilong
+        for length in (n for n in lengths if n in ("512k", "1m")):
+            try:
+                prepare_babilong(length, lines)
+            except Exception as error:
+                ok = False
+                lines.append(f"BABILong {length}: FAILED {type(error).__name__}: {error}")
     for label, group in groups:
         try:
             if label == "LongBench v2":
@@ -299,9 +312,20 @@ def materialize_longbench2(root: str, files: list[str], lines: list[str]) -> Pat
     return target_root
 
 
-def fetch_ppl_hub(repo: str, lines: list[str]) -> str:
+def fetch_ppl_hub(repo: str, lines: list[str], ordinary: bool = False) -> str:
     """Download a dataset repository for long_ppl and return its snapshot folder (the --ppl-data)."""
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import snapshot_download, HfApi
+
+    if ordinary:
+        from unused.long_eval_download import download_plain
+        root = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "long_ppl_data" / repo.replace("/", "--")
+        names = sorted(n for n in HfApi().list_repo_files(repo, repo_type="dataset") if n.endswith((".parquet", ".jsonl")))
+        if not names:
+            raise ValueError(f"No parquet/jsonl in {repo}")
+        for name in names:
+            download_plain(repo, name, root, lines)
+        lines.append(f"  for eval.sh: export LONG_PPL_DATA={root}")
+        return str(root)
 
     root = snapshot_download(repo, repo_type="dataset")
     files = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*") if p.suffix in (".parquet", ".jsonl"))
@@ -402,7 +426,7 @@ def check_offline(loads, lines: list[str]) -> bool:
     return ok
 
 
-def cache_ppl(data: str, tokenizer: str, lines: list[str]) -> None:
+def cache_ppl(data: str, tokenizer: str, lines: list[str], lengths=None) -> None:
     """Select the long_ppl documents now (the tasks read the same caches): those of at least LONGEST tokens
     (32K-128K) and those of at least LONGEST_256K (256K). Data without the latter is reported, not an error."""
     import importlib.util
@@ -412,6 +436,12 @@ def cache_ppl(data: str, tokenizer: str, lines: list[str]) -> None:
     spec.loader.exec_module(utils)
     os.environ["LONG_PPL_DATA"] = data
     want = int(os.environ.get("LONG_PPL_DOCS", "100"))
+    if lengths and any(n in ("512k", "1m") for n in lengths):
+        docs = utils._documents({"pretrained": tokenizer}, utils.LONGEST_1M)
+        lines.append(f"long_ppl_512k/1m: {len(docs)} shared documents of >= {utils.LONGEST_1M} tokens "
+                     f"from {data} (want {want}); cache {utils.cache_dir()}")
+        if all(n in ("512k", "1m") for n in lengths):
+            return
     try:
         docs = utils._documents({"pretrained": tokenizer})
     except ValueError:
@@ -440,7 +470,8 @@ def _long_ppl_utils():
     return utils
 
 
-def fetch_ppl_books(repo: str, tokenizer: str, lines: list[str], pattern: str | None = None) -> str:
+def fetch_ppl_books(repo: str, tokenizer: str, lines: list[str], pattern: str | None = None,
+                    longest: int | None = None) -> str:
     """Download a dataset repository's train files one at a time, in name order, until enough long books are
     in them; returns the snapshot folder that holds them (the LONG_PPL_BOOKS of eval.sh)."""
     from fnmatch import fnmatch
@@ -449,6 +480,7 @@ def fetch_ppl_books(repo: str, tokenizer: str, lines: list[str], pattern: str | 
     from transformers import AutoTokenizer
 
     utils = _long_ppl_utils()
+    longest = longest or utils.LONGEST_256K
     want = int(os.environ.get("LONG_PPL_DOCS", "100"))
     files = sorted(f for f in HfApi().list_repo_files(repo, repo_type="dataset")
                    if f.endswith((".parquet", ".jsonl")) and (fnmatch(f, pattern) if pattern else "train" in f))
@@ -457,13 +489,20 @@ def fetch_ppl_books(repo: str, tokenizer: str, lines: list[str], pattern: str | 
     tok = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=True)
     found, root = 0, None
     for name in files:
-        path = Path(hf_hub_download(repo, name, repo_type="dataset"))
-        root = str(path)[:-len(name)].rstrip("/")
+        if longest >= utils.LONGEST_1M:
+            from unused.long_eval_download import download_plain
+            folder = (Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
+                      / "long_ppl_books_1m" / repo.replace("/", "--"))
+            root = os.environ.get("LONG_PPL_BOOKS") or str(folder)
+            path = download_plain(repo, name, root, lines)
+        else:
+            path = Path(hf_hub_download(repo, name, repo_type="dataset"))
+            root = str(path)[:-len(name)].rstrip("/")
         if name.endswith(".parquet") and not is_parquet(path):
             path, done = refetch(repo, name, root)
             lines.append(f"long_ppl_books {repo} {name}: not whole parquet; {done}")
-        found += len(utils.select_documents(str(path), tok, want - found, longest=utils.LONGEST_256K))
-        lines.append(f"long_ppl_books {repo} {name}: {found} books of >= {utils.LONGEST_256K} tokens so far")
+        found += len(utils.select_documents(str(path), tok, want - found, longest=longest))
+        lines.append(f"long_ppl_books {repo} {name}: {found} books of >= {longest} tokens so far")
         if found >= want:
             break
     # The tasks read every parquet / jsonl file under the folder, in name order: other files there change the books.
@@ -474,16 +513,21 @@ def fetch_ppl_books(repo: str, tokenizer: str, lines: list[str], pattern: str | 
         lines.append(f"  WARNING: the folder also holds {others[:5]} ({len(others)} files) from earlier downloads; "
                      "the tasks would read them too")
     lines.append(f"  for eval.sh: export LONG_PPL_BOOKS={root}")
+    if not found:
+        raise ValueError(f"No books of >= {longest} tokens in {repo}; select another held-out source")
+    if found < want:
+        lines.append(f"  fewer than wanted: only {found}/{want} books; all methods must use this same selection")
     return root
 
 
-def cache_ppl_books(data: str, tokenizer: str, lines: list[str]) -> None:
+def cache_ppl_books(data: str, tokenizer: str, lines: list[str], longest: int | None = None) -> None:
     """Select the long_ppl_books documents now (every long_ppl_books_<L>_<point> task reads this cache)."""
     utils = _long_ppl_utils()
+    longest = longest or utils.LONGEST_256K
     os.environ["LONG_PPL_BOOKS"] = data
     want = int(os.environ.get("LONG_PPL_DOCS", "100"))
-    docs = utils._documents({"pretrained": tokenizer}, utils.LONGEST_256K, env="LONG_PPL_BOOKS")
-    lines.append(f"long_ppl_books: {len(docs)} books of >= {utils.LONGEST_256K} tokens from {data} (want {want}); "
+    docs = utils._documents({"pretrained": tokenizer}, longest, env="LONG_PPL_BOOKS")
+    lines.append(f"long_ppl_books: {len(docs)} books of >= {longest} tokens from {data} (want {want}); "
                  f"cache {utils.cache_dir()}" + ("" if len(docs) >= want else "; fewer than wanted: give more data"))
 
 
@@ -525,6 +569,8 @@ def main():
     p.add_argument("--infinitebench", action="store_true", help="also fetch InfiniteBench (ten tasks, jsonl)")
     p.add_argument("--no-babilong", action="store_true")
     p.add_argument("--no-ruler-qa", action="store_true")
+    p.add_argument("--lengths", default="32k,64k,128k,256k", help="data lengths, including 512k,1m; 1m=1048576 tokens")
+    p.add_argument("--ruler-essays", action="store_true", help="prepare ordinary RULER essays and NLTK files")
     p.add_argument("--ppl-data", default=None, help="held-out ProLong parquet / jsonl file or directory")
     p.add_argument("--ppl-hub", default=None,
                    help="dataset repository to download and use as --ppl-data (e.g. emozilla/pg19-test)")
@@ -538,11 +584,21 @@ def main():
     p.add_argument("--out", default="fetch_long_eval_data.json")
     p.add_argument("--verify-ssl", action="store_true", help="keep HTTPS certificate checks (off by default)")
     args = p.parse_args()
+    from long_eval_plan import LENGTHS, parse_list
+    lengths = parse_list(args.lengths, LENGTHS, "--lengths")
+    ultra = any(n in ("512k", "1m") for n in lengths)
     patch_requests(args.verify_ssl)
     lines = [f"HF_HOME={os.environ.get('HF_HOME')}", f"HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE')}",
              f"RULER_CACHE_DIR={ruler_cache_dir()}",
              f"HTTPS certificate checks: {'on' if args.verify_ssl else 'off (--verify-ssl turns them on)'}"]
     ok = True
+    if args.ruler_essays or (ultra and not args.no_ruler_qa):
+        try:
+            from unused.long_eval_download import prepare_ruler_essays
+            prepare_ruler_essays(lines)
+        except Exception as error:
+            ok = False
+            lines.append(f"RULER essays: FAILED {type(error).__name__}: {error}")
     if (args.ppl_data or args.ppl_hub or args.ppl_books_hub or args.ppl_books_data) and not args.tokenizer:
         raise SystemExit("--ppl-data / --ppl-hub / --ppl-books-* need --tokenizer (the dir with tokenizer.json)")
     if not args.no_ruler_qa:
@@ -551,7 +607,7 @@ def main():
         except Exception as error:  # noqa: BLE001
             ok = False
             lines.append(f"RULER QA: FAILED {type(error).__name__}: {error}")
-    loads, fetched = fetch_datasets(not args.no_babilong, args.longbench2, lines)
+    loads, fetched = fetch_datasets(not args.no_babilong, args.longbench2, lines, lengths=lengths)
     ok = ok and fetched
     if loads:
         ok = check_offline(loads, lines) and ok
@@ -559,25 +615,26 @@ def main():
         ok = fetch_infinitebench(lines) and ok
     if args.ppl_hub:
         try:
-            args.ppl_data = fetch_ppl_hub(args.ppl_hub, lines)
+            args.ppl_data = fetch_ppl_hub(args.ppl_hub, lines, ordinary=ultra)
         except Exception as error:  # noqa: BLE001
             ok = False
             lines.append(f"long_ppl data {args.ppl_hub}: FAILED {type(error).__name__}: {str(error)[:1500]}")
     if args.ppl_data:
         try:
-            cache_ppl(args.ppl_data, args.tokenizer, lines)
+            cache_ppl(args.ppl_data, args.tokenizer, lines, lengths=lengths)
         except Exception as error:  # noqa: BLE001
             ok = False
             lines.append(f"long_ppl: FAILED {type(error).__name__}: {error}")
     if args.ppl_books_hub:
         try:
-            args.ppl_books_data = fetch_ppl_books(args.ppl_books_hub, args.tokenizer, lines, args.ppl_books_files)
+            args.ppl_books_data = fetch_ppl_books(args.ppl_books_hub, args.tokenizer, lines, args.ppl_books_files,
+                                                   longest=1048576 if ultra else None)
         except Exception as error:  # noqa: BLE001
             ok = False
             lines.append(f"long_ppl_books {args.ppl_books_hub}: FAILED {type(error).__name__}: {str(error)[:1500]}")
     if args.ppl_books_data:
         try:
-            cache_ppl_books(args.ppl_books_data, args.tokenizer, lines)
+            cache_ppl_books(args.ppl_books_data, args.tokenizer, lines, longest=1048576 if ultra else None)
         except Exception as error:  # noqa: BLE001
             ok = False
             lines.append(f"long_ppl_books: FAILED {type(error).__name__}: {error}")

@@ -39,16 +39,28 @@ def whole_parquet(path: Path) -> bool:
         return False
 
 
-def check_babilong(report) -> None:
+def check_babilong(report, lengths=None) -> None:
     import datasets
 
     for path, length in BABILONG:
+        if lengths and length not in lengths:
+            continue
         for split in (f"qa{i}" for i in range(1, 6)):
             try:
                 rows = len(datasets.load_dataset(path, name=length, split=split))
                 report(rows > 0, f"BABILong {path} {length} {split}: {rows} rows")
             except Exception as error:  # noqa: BLE001
                 report(False, f"BABILong {path} {length} {split}: {type(error).__name__}: {str(error)[:200]}")
+    if lengths:
+        from unused.long_eval_download import babi_utils
+        utils = babi_utils()
+        for length in (n for n in lengths if n in ("512k", "1m")):
+            for split in (f"qa{i}" for i in range(1, 6)):
+                try:
+                    data = utils.load_plain(length, split)
+                    report(len(data) == 100, f"BABILong {length} {split}: {len(data)} ordinary-file rows")
+                except Exception as error:
+                    report(False, f"BABILong {length} {split}: {error}")
 
 
 def check_longbench2(report) -> None:
@@ -78,13 +90,21 @@ def check_longbench2(report) -> None:
     report(total == 503, f"LongBench v2: {total} questions in {len(names)} subsets (want 503)")
 
 
-def check_ruler_qa(report) -> None:
+def check_ruler_qa(report, extended=False) -> None:
     home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
     folder = Path(os.environ.get("RULER_CACHE_DIR", os.path.join(home, "ruler_cache")))
     for name in RULER_QA:
         path = folder / name
         report(path.is_file() and path.stat().st_size > 1e6,
                f"RULER QA {path}: " + (f"{path.stat().st_size / 1e6:.1f} MB" if path.is_file() else "missing"))
+    if extended:
+        from litgpt.ruler_patch import _essay_file
+        path = _essay_file()
+        report(path.is_file() and not path.is_symlink() and path.stat().st_size > 0,
+               f"RULER extended-v1 ordinary essay background: {path}")
+        nltk = Path(os.environ.get("NLTK_DATA", str(folder.parent / "nltk_data")).split(os.pathsep)[0])
+        path = nltk / "tokenizers/punkt_tab/english/collocations.tab"
+        report(path.is_file() and not path.is_symlink(), f"RULER ordinary NLTK data: {path}")
 
 
 def check_infinitebench(report) -> None:
@@ -109,14 +129,27 @@ def check_infinitebench(report) -> None:
             report(False, f"InfiniteBench {task}: {type(error).__name__}: {str(error)[:800]}")
 
 
-def check_ppl(report, tokenizer: str | None) -> None:
+def check_ppl(report, tokenizer: str | None, lengths=None, suites=None) -> None:
     spec = importlib.util.spec_from_file_location("long_ppl_utils", ROOT / "eval_tasks" / "long_ppl" / "long_ppl_utils.py")
     utils = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(utils)
     want = int(os.environ.get("LONG_PPL_DOCS", "100"))
-    for env, longest, label, need in (("LONG_PPL_DATA", utils.LONGEST, "long_ppl 32k-128k", 1),
-                                      ("LONG_PPL_DATA", utils.LONGEST_256K, "long_ppl_256k", 1),
-                                      ("LONG_PPL_BOOKS", utils.LONGEST_256K, "long_ppl_books", want)):
+    checks = []
+    lengths = lengths or ("32k", "64k", "128k", "256k")
+    suites = suites or ("ppl", "books")
+    if "ppl" in suites:
+        if any(n in ("32k", "64k", "128k") for n in lengths):
+            checks.append(("LONG_PPL_DATA", utils.LONGEST, "long_ppl 32k-128k", 1))
+        if "256k" in lengths:
+            checks.append(("LONG_PPL_DATA", utils.LONGEST_256K, "long_ppl_256k", 1))
+        if any(n in ("512k", "1m") for n in lengths):
+            checks.append(("LONG_PPL_DATA", utils.LONGEST_1M, "long_ppl 512k/1m shared documents", 1))
+    if "books" in suites:
+        if any(n in ("32k", "64k", "128k", "256k") for n in lengths):
+            checks.append(("LONG_PPL_BOOKS", utils.LONGEST_256K, "long_ppl_books <=256k", want))
+        if any(n in ("512k", "1m") for n in lengths):
+            checks.append(("LONG_PPL_BOOKS", utils.LONGEST_1M, "long_ppl_books 512k/1m shared documents", want))
+    for env, longest, label, need in checks:
         if not os.environ.get(env):
             report(False, f"{label}: {env} is not set")
             continue
@@ -134,7 +167,12 @@ def check_ppl(report, tokenizer: str | None) -> None:
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tokenizer", default=None, help="tokenizer dir, for the long_ppl / books document counts")
+    p.add_argument("--lengths", default="32k,64k,128k,256k")
+    p.add_argument("--suites", default="ruler,babilong,longbench2,infinitebench,ppl,books")
     args = p.parse_args()
+    from long_eval_plan import LENGTHS, SUITES, parse_list
+    lengths = parse_list(args.lengths, LENGTHS, "--lengths")
+    suites = parse_list(args.suites, SUITES, "--suites")
     if os.environ.get("HF_DATASETS_OFFLINE") != "1":
         print("note: HF_DATASETS_OFFLINE is not 1; run through diag.sh to check what eval.sh will see")
     failures = []
@@ -143,9 +181,15 @@ def main():
         print(("OK       " if ok else "MISSING  ") + text, flush=True)
         if not ok:
             failures.append(text)
-    for check in (check_babilong, check_longbench2, check_ruler_qa, check_infinitebench):
-        check(report)
-    check_ppl(report, args.tokenizer)
+    if "babilong" in suites:
+        check_babilong(report, lengths)
+    if "longbench2" in suites:
+        check_longbench2(report)
+    if "ruler" in suites or "turns" in suites:
+        check_ruler_qa(report, any(n in ("512k", "1m") for n in lengths))
+    if "infinitebench" in suites:
+        check_infinitebench(report)
+    check_ppl(report, args.tokenizer, lengths, suites)
     print(f"\n{len(failures)} problem(s)" + ("" if failures else ": the long-context data is complete"))
     raise SystemExit(1 if failures else 0)
 

@@ -450,7 +450,7 @@ EVAL_TASKS_DIR = Path(__file__).resolve().parent / "eval_tasks"
 # Tasks named for a context length (eval_tasks/babilong_long, long_ppl, longbench2_long, niah_turns, infinitebench);
 # a long_ppl_books_<L>_<point> task is named for its configuration's length L.
 _LENGTH_NAMED_TASK = re.compile(
-    r"^(babilong(?:_qa\d+)?|long_ppl(?:_books)?|longbench2|niah_turns|infinitebench(?:_[a-z_]+)?)_(\d+)k(?:_\d+k)?$")
+    r"^(babilong(?:_qa\d+)?|long_ppl(?:_books)?|longbench2|niah_turns|infinitebench(?:_[a-z_]+)?)_(\d+)([km])(?:_\d+[km])?$")
 
 
 def _check_task_lengths(tasks, max_seq_length):
@@ -463,7 +463,7 @@ def _check_task_lengths(tasks, max_seq_length):
         match = _LENGTH_NAMED_TASK.match(task.strip())
         if not match:
             continue
-        length = int(match.group(2)) * 1024
+        length = int(match.group(2)) * (1024 if match.group(3) == "k" else 1024 * 1024)
         need = length + (1024 if match.group(1).startswith("infinitebench") else 0)  # long_eval_plan.MARGIN
         if max_seq_length < need or (match.group(1) == "longbench2" and max_seq_length > length + 4096):
             raise ValueError(f"task {task} needs a model window of {need} tokens"
@@ -1887,6 +1887,7 @@ class LogKVLM(LM):
             self.gen_metrics.append({
                 "rank": dp_rank, "sample_id": sample_id,
                 "prompt_len": prompt_len, "generated_tokens": gen_len,
+                "original_prompt_len": original_prompt_tokens, "truncated_prompt_tokens": prompt_token_offset,
                 "total_time_s": total_time_s,
                 "prefill_time_s": prefill_time_s,
                 "ttft_ms": prefill_time_s * 1000,

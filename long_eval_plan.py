@@ -6,7 +6,7 @@ plus a 1024-token margin for generation, RULER at that length, and that length's
 LongBench v2's context budget, so each pass's LongBench v2 is cut to its length.
 
 YARN_MODE picks the factor:
-- per_length (default): each pass the factor its length needs (32K none, 64K 2, 128K 4, 256K 8), so 32K matches
+- per_length (default): each pass the factor its length needs (32K none, 64K 2, 128K 4, 256K 8, 512K 16, 1M 32), so 32K matches
   the 32K main line and every length compares compression, not extrapolation.
 - fixed: every pass the factor of the longest length asked for, the model as deployed for that length (static
   YaRN, as vLLM serves it); shorter lengths then show what that setting costs them.
@@ -20,6 +20,8 @@ ruler_qa_squad, whose 1204 SQuAD paragraphs cannot fill it), babilong, ppl (long
 the default suites ppl, books and infinitebench are optional: eval.py leaves them out, with the reason, when
 their data is not given (or their files are not whole). LongBench v2 must run at every selected length;
 missing or incomplete data is an error with a download command. Named suites must run.
+512K/1M are opt-in. Their default task list omits InfiniteBench (registered through 256K); asking explicitly
+for InfiniteBench at these lengths is an error. RULER uses the documented extended-v1 generator protocol.
 
     python long_eval_plan.py <lengths> <suites or ""> <yarn_mode> <niah_only 0/1> <base overrides json or ""> <output dir> [skip]
 
@@ -36,7 +38,8 @@ from __future__ import annotations
 import json
 import sys
 
-LENGTHS = {"32k": 32768, "64k": 65536, "128k": 131072, "256k": 262144}
+LENGTHS = {"32k": 32768, "64k": 65536, "128k": 131072, "256k": 262144,
+           "512k": 524288, "1m": 1048576}
 SUITES = ("ruler", "babilong", "ppl", "books", "turns", "longbench2", "infinitebench")
 DATA_SUITES = ("ppl", "books", "infinitebench")  # optional with the default suites: their data may be missing
 ORIGINAL = 32768  # the trained length, YaRN's original_max_seq_len
@@ -44,6 +47,7 @@ MARGIN = 1024
 RULER = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
          "niah_multivalue", "niah_multiquery", "ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
 SQUAD_MAX = 131072  # SQuAD's document pool cannot fill longer contexts
+INFINITEBENCH_MAX = 262144  # no registered 512K/1M protocol for these fixed-length source samples
 
 
 def parse_list(text: str, allowed, what: str) -> list[str]:
@@ -85,13 +89,18 @@ def plan(lengths: str, suites: str = "", yarn_mode: str = "per_length", niah_onl
     passes = []
     for name in names:
         length = LENGTHS[name]
+        active = list(chosen)
+        if length > INFINITEBENCH_MAX and "infinitebench" in active:
+            if suites:
+                raise ValueError("InfiniteBench is registered only through 256k; select other suites for 512k/1m")
+            active.remove("infinitebench")
         factor = (length if yarn_mode == "per_length" else longest) / ORIGINAL
-        main = [t for s in chosen if s != "ruler" for t in tasks(s, name) if t not in skip]
+        main = [t for s in active if s != "ruler" for t in tasks(s, name) if t not in skip]
         niah = [t for t in RULER if (length <= SQUAD_MAX or t != "ruler_qa_squad") and f"{t}@{length}" not in skip] \
-            if "ruler" in chosen else []
+            if "ruler" in active else []
         if not main and not niah:
             continue
-        optional = [t for s in chosen if s in DATA_SUITES and not suites for t in tasks(s, name) if t in main]
+        optional = [t for s in active if s in DATA_SUITES and not suites for t in tasks(s, name) if t in main]
         folder = f"long{name}" if yarn_mode == "per_length" else f"yarn{factor:g}/long{name}"
         passes.append(dict(length=length, name=name, factor=factor, ruler_lengths=[length], main=main, niah=niah,
                            optional=optional, config_overrides=overrides_for(length, factor, base_overrides or {}),
@@ -111,6 +120,8 @@ def main(argv: list[str]) -> None:
         print(",".join(measured(argv[1], argv[2], json.loads(argv[3]))))
         return
     lengths, suites, yarn_mode, niah_only, base, output_dir, *rest = argv
+    if not suites and niah_only != "1" and any(n in ("512k", "1m") for n in lengths.lower().split(",")):
+        print("[long-eval] InfiniteBench has no registered 512K/1M protocol; omitted at those lengths", file=sys.stderr)
     skip = {t for t in (rest[0] if rest else "").split(",") if t}
     for p in plan(lengths, suites, yarn_mode or "per_length", niah_only == "1",
                   json.loads(base) if base else {}, output_dir, skip):
