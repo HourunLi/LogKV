@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from litgpt.config import Config
+from litgpt.generate.base import generate
 from litgpt.kv_compression import cache_compression_snapshot
 from litgpt.model import GPT
 
@@ -30,18 +31,27 @@ class Tokenizer:
 
 @pytest.fixture(scope="module")
 def wrapper_class():
-    cls = next(node for node in ast.parse((ROOT / "eval.py").read_text()).body
+    tree = ast.parse((ROOT / "eval.py").read_text())
+    cls = next(node for node in tree.body
                if isinstance(node, ast.ClassDef) and node.name == "LogKVLM")
     names = {"_generate_turns", "generate_until", "_reset_eval_cache", "_warn_truncation", "_prefill_chunk", "_forward",
              "_generate_chunked"}
     cls.bases, cls.decorator_list = [], []
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    scope = dict(os=__import__("os"), torch=torch, time=time, cache_compression_snapshot=cache_compression_snapshot,
+    scope = dict(os=__import__("os"), torch=torch, time=time, litgpt_generate=generate,
+                 cache_compression_snapshot=cache_compression_snapshot,
                  _eval_progress=lambda items, desc: items, _eval_verbose=lambda: False, _global_rank=lambda: 0,
                  _world_size=lambda: 1, _rank_label=lambda: "CPU",
                  _request_sample_id=lambda req, **kwargs: kwargs["global_request_index"])
-    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(ROOT / "eval.py"), "exec"), scope)
-    return scope["LogKVLM"]
+    helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {
+        "_synchronize_inference_device", "_reset_inference_peak_memory", "_inference_peak_memory",
+        "summarize_inference_metrics",
+    }]
+    exec(compile(ast.Module(body=helpers + [cls], type_ignores=[]), str(ROOT / "eval.py"), "exec"), scope)
+    old_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield scope["LogKVLM"]
+    torch.set_num_threads(old_threads)
 
 
 def make_lm(wrapper_class, backend, recent_size=64, block_size=64):
@@ -132,6 +142,84 @@ def test_a_context_longer_than_the_window_loses_its_start(wrapper_class):
     assert len(result.split(SEP)) == 2
     assert lm._truncation_counts  # warned
     assert lm.compression_metrics[0]["prompt_len"] == 24 - 3 - 2 * 2
+
+
+@pytest.mark.parametrize("backend", ["dense", "logkv"])
+@pytest.mark.parametrize("stop_after_first", [False, True])
+def test_full_eval_can_summarize_ordinary_and_multiturn_generation(wrapper_class, backend, stop_after_first):
+    lm, _ = make_lm(wrapper_class, backend)
+    with torch.no_grad():
+        lm.model.lm_head.weight.zero_()  # All answers deterministically contain token 0.
+    if stop_after_first:
+        lm.tokenizer.eos_id = 0
+        lm.tokenizer.alpha_line_end_ids = (0,)
+    requests = [
+        SimpleNamespace(args=("1 2 3", {"max_gen_toks": 3})),
+        SimpleNamespace(args=(SEP.join(["1 2 3", "4", "5 6"]),
+                              {"max_gen_toks": 3, "turn_separator": SEP})),
+    ]
+
+    results = lm.generate_until(requests)
+    summarize = lm._generate_turns.__globals__["summarize_inference_metrics"]
+    summary = summarize(lm.gen_metrics, [])["generation"]
+
+    tokens_per_answer = 1 if stop_after_first else 3
+    assert results == [" ".join(["0"] * tokens_per_answer),
+                       SEP.join([" ".join(["0"] * tokens_per_answer)] * 2)]
+    assert summary["requests"] == 3  # One ordinary request plus two answer turns.
+    assert summary["prompt_tokens"] == 3 + 4 + 3  # Later turns also forward the previous answer's last token.
+    assert summary["generated_tokens"] == 3 * tokens_per_answer
+    assert summary["decode_tokens"] == 3 * (tokens_per_answer - 1)
+    assert summary["total_time_s"] == pytest.approx(summary["prefill_time_s"] + summary["decode_time_s"])
+    assert summary["avg_ttft_ms"] == pytest.approx(1000 * summary["prefill_time_s"] / 3)
+    if stop_after_first:
+        assert summary["decode_time_s"] == 0
+        assert summary["decode_tokens_per_sec"] is summary["decode_ms_per_token"] is None
+    turns = lm.gen_metrics[1:]
+    assert [row["turn_index"] for row in turns] == [1, 2]
+    assert all(row["request_type"] == "generate_turns" and row["sample_id"] == 1
+               and row["rank"] == 0 and row["context_len"] == 3 for row in turns)
+    assert sum(row["prompt_len"] + row["decode_tokens"] for row in turns) == lm.compression_metrics[-1]["processed_tokens"]
+    assert all(row["peak_memory_allocated_bytes"] is row["peak_memory_reserved_bytes"] is None
+               for row in lm.gen_metrics)
+
+
+@pytest.mark.parametrize("backend", ["dense", "logkv"])
+@pytest.mark.parametrize("stop_after_first", [False, True])
+def test_multiturn_timing_excludes_text_decoding_and_separates_each_first_token(
+    wrapper_class, monkeypatch, backend, stop_after_first,
+):
+    lm, _ = make_lm(wrapper_class, backend)
+    with torch.no_grad():
+        lm.model.lm_head.weight.zero_()
+    if stop_after_first:
+        lm.tokenizer.alpha_line_end_ids = (0,)
+    clock = [10.]
+    forward, decode = lm._forward, lm.tokenizer.decode
+
+    def timed_forward(tokens, *args):
+        logits = forward(tokens, *args)
+        clock[0] += 4. if tokens.numel() > 1 else 2.
+        return logits
+
+    def slow_text_decode(tokens):
+        clock[0] += 100.  # Postprocessing must not inflate model timing.
+        return decode(tokens)
+
+    lm._forward, lm.tokenizer.decode = timed_forward, slow_text_decode
+    monkeypatch.setitem(lm._generate_turns.__globals__, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    lm._generate_turns(SEP.join(["1 2 3", "4", "5 6"]), SEP, 3, sample_id="timed")
+
+    assert len(lm.gen_metrics) == 2
+    for row in lm.gen_metrics:
+        count = 1 if stop_after_first else 3
+        assert row["generated_tokens"] == count
+        assert row["decode_tokens"] == count - 1
+        assert row["prefill_time_s"] == 4.
+        assert row["ttft_ms"] == 4000.
+        assert row["decode_time_s"] == 2. * (count - 1)
+        assert row["total_time_s"] == 4. + 2. * (count - 1)
+        assert row["prefill_tokens_per_sec"] == row["prompt_len"] / 4.
 
 
 class WordCounter:
