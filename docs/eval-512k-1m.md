@@ -33,6 +33,20 @@ bash diag.sh unused/check_long_eval_data.py --lengths 512k,1m \
 下载器逐 shard 扫描，直到够 `LONG_PPL_DOCS` 本或遍历完来源；不足时明确报告实际数量，
 没有任何合格长文时报错。不同方法必须使用同一目录、tokenizer 和 `LONG_PPL_DOCS`。
 
+下载日志实时打印并写入 `fetch_512k_1m.summary.txt`，可在另一终端用
+`tail -f fetch_512k_1m.summary.txt` 查看。日志显示阶段开始/结束、文件大小、已下载字节和速度、
+SHA256 校验、BABILong JSON → Arrow，以及 PG19 的 shard/文档分词和合格数量。
+耗时调用期间每 20 秒打印 `WAIT`、已耗时间和最近状态；它表示进程仍在该阶段，
+不能单凭 `WAIT` 判定远端网络在传输。读超时及重试仍按原设置执行，429 会单独报告等待时间。
+
+该命令先准备 RULER，再准备 BABILong、LongBench v2，最后扫描 PG19。
+512K/1M 的 BABILong 共 10 个大 JSON，还需写 Arrow；PG19 按文件名下载完整 shard，
+对候选长文分词后才能判断是否达到 1048576 tokens，耗时可能明显超过单次下载。
+务必保留上面的 `export LONG_PPL_DOCS=10`：不设置时目标是 100 本，可能扫描更多 shard。
+这个值也必须带到评测环境。成功下载且校验通过的普通文件会复用；中断留下的不完整文件会重新下载。
+旧版本只在结束时统一打印摘要，`python -u` 本身不能补出这些尚未打印的状态；
+拉取更新后须重新启动下载进程，已有进程不会自动获得新日志功能。
+
 可单独准备：
 
 ```bash

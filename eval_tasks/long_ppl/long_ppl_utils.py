@@ -31,6 +31,7 @@ import json
 import math
 import os
 import shutil
+import time
 from pathlib import Path
 
 import datasets
@@ -92,16 +93,26 @@ def _texts(path: Path):
 
 
 def select_documents(source: str, tokenizer, count: int, concat: bool = False,
-                     longest: int | None = None) -> list[list[int]]:
+                     longest: int | None = None, progress=None) -> list[list[int]]:
     """The first ``count`` documents of at least ``longest`` (default LONGEST) tokens, cut to it."""
     longest = longest or LONGEST
     found: list[list[int]] = []
+    report = progress if progress is not None else lambda message: None
     for path in _files(source):
+        report(f"PPL scan {path}: need {count} documents of >= {longest} tokens")
         pending: list[int] = []
-        for text in _texts(path):
+        scanned = 0
+        for scanned, text in enumerate(_texts(path), 1):
             if not concat and len(text) < longest:  # fewer characters than tokens: too short
+                if scanned % 100 == 0:
+                    report(f"PPL scan {path.name}: scanned {scanned} rows, selected {len(found)}/{count}")
                 continue
+            report(f"PPL tokenize {path.name} row {scanned}: {len(text)} characters, "
+                   f"selected {len(found)}/{count}")
+            started = time.monotonic()
             ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+            report(f"PPL tokenized {path.name} row {scanned}: {len(ids)} tokens "
+                   f"in {time.monotonic() - started:.1f}s (need >= {longest})")
             if concat:
                 pending += ids
                 if len(pending) < longest:
@@ -109,8 +120,10 @@ def select_documents(source: str, tokenizer, count: int, concat: bool = False,
                 ids, pending = pending, []
             if len(ids) >= longest:
                 found.append(ids[:longest])
+                report(f"PPL selected {len(found)}/{count} documents")
                 if len(found) >= count:
                     return found
+        report(f"PPL finished {path.name}: scanned {scanned} rows, selected {len(found)}/{count}")
     return found
 
 
@@ -145,28 +158,32 @@ def _tokenizer(kwargs):
     return name, AutoTokenizer.from_pretrained(name, trust_remote_code=True)
 
 
-def _documents(kwargs, longest: int | None = None, env: str = "LONG_PPL_DATA") -> list[list[int]]:
+def _documents(kwargs, longest: int | None = None, env: str = "LONG_PPL_DATA", progress=None) -> list[list[int]]:
     source = os.environ.get(env)
     if not source:
         raise ValueError(f"long_ppl needs {env} (a .parquet / .jsonl file or a directory, e.g. held-out "
                          f"ProLong shards; eval.sh exports the YAML's {env.lower()})")
     count = int(os.environ.get("LONG_PPL_DOCS", "100"))
     concat = os.environ.get("LONG_PPL_CONCAT", "0") == "1"
+    report = progress if progress is not None else lambda message: None
+    report(f"PPL load tokenizer: {kwargs.get('tokenizer') or kwargs.get('pretrained')}")
     name, tokenizer = _tokenizer(kwargs)
     longest = longest or LONGEST
     key = cache_key(source, name, count, concat, longest)
     cache = cache_dir() / f"{key}.json"
     if cache.is_file():
         try:
+            report(f"PPL read selection cache: {cache}")
             return json.loads(cache.read_text())
         except ValueError:  # another rank is still copying it (see below): build it here too
             pass
-    docs = select_documents(source, tokenizer, count, concat, longest)
+    docs = select_documents(source, tokenizer, count, concat, longest, progress=progress)
     if not docs:
         raise ValueError(f"no document of {longest} tokens or more in {source!r}; if its rows are pieces of longer "
                          "texts, set LONG_PPL_CONCAT=1")
     cache.parent.mkdir(parents=True, exist_ok=True)
     tmp = cache.with_suffix(f".{os.getpid()}.tmp")
+    report(f"PPL write selection cache: {len(docs)} documents -> {cache}")
     tmp.write_text(json.dumps(docs))
     try:
         if longest >= LONGEST_1M:
