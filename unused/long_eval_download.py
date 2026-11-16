@@ -1,15 +1,17 @@
-"""Ordinary-file preparation for the 512K/1M evaluations; no symlinks or rename-based publishing."""
+"""Ordinary-file preparation for long evaluations; no symlinks or rename-based publishing."""
 from __future__ import annotations
 
 import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import time
 from functools import cache
 from pathlib import Path
 
 from unused.fetch_progress import run_stage, stage
+from eval_tasks.long_ppl.input_files import resolve_input, whole_parquet
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,15 +49,41 @@ def download_plain(repo, name, folder, lines):
 
     digest = None
 
-    def complete():
+    def verified(path):
         nonlocal digest
         digest = None
-        if not target.is_file() or (size is not None and target.stat().st_size != size):
+        if not path.is_file() or (size is not None and path.stat().st_size != size):
             return False
-        digest = run_stage(lines, f"SHA256 {target}", sha256, target)
+        if name.endswith(".parquet") and not whole_parquet(path):
+            return False
+        digest = run_stage(lines, f"SHA256 {path}", sha256, path)
         return not expected_hash or digest == expected_hash
 
-    if not complete():
+    complete = verified(target)
+    if not complete and expected_hash:
+        home = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
+        hub = Path(os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE") or home / "hub")
+        cache = hub / ("datasets--" + repo.replace("/", "--"))
+        candidates = [target, cache / "snapshots" / info.sha / name]
+        if expected_hash and len(expected_hash) == 64 and all(c in "0123456789abcdef" for c in expected_hash):
+            candidates.append(cache / "blobs" / expected_hash)
+        for candidate in candidates:
+            if not candidate.exists() and not candidate.is_symlink():
+                continue
+            try:
+                source = resolve_input(candidate)
+                if source == target or not verified(source):
+                    continue
+                with stage(lines, f"copy verified cached file {source} -> {target}"):
+                    shutil.copyfile(source, target)
+                if not verified(target):
+                    raise ValueError(f"Ordinary-file copy failed size/SHA256/Parquet check: {target}")
+                lines.append(f"reused verified Hub cache bytes as ordinary file: {target}")
+                complete = True
+                break
+            except (OSError, ValueError) as error:
+                lines.append(f"cached source unusable {candidate}: {error}")
+    if not complete:
         url = hf_hub_url(repo, name, repo_type="dataset", revision=info.sha)
         total = f"{size / 1e6:.1f} MB" if size is not None else "unknown size"
         with stage(lines, f"download {repo}/{name} ({total}) -> {target}"):
@@ -74,7 +102,7 @@ def download_plain(repo, name, folder, lines):
                                              f"{received / 1e6 / max(now - started, .001):.2f} MB/s")
                                 last_report = now
             lines.append(f"download {name}: received {received} bytes")
-        if not complete():
+        if not verified(target):
             raise ValueError(f"Incomplete download or SHA256 mismatch: {target}")
     lines.append(f"ordinary file {repo}@{info.sha}/{name}: {target.stat().st_size} bytes, SHA256={digest}")
     return target

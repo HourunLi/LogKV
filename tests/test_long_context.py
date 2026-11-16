@@ -482,6 +482,7 @@ def test_the_fetch_script_downloads_book_files_until_enough_are_long(tmp_path, m
     import huggingface_hub
     import pyarrow as pa
     import pyarrow.parquet as pq
+    from unused import long_eval_download as prep
 
     spec = importlib.util.spec_from_file_location("fetch_books", ROOT / "unused" / "fetch_long_eval_data.py")
     fetch = importlib.util.module_from_spec(spec)
@@ -494,18 +495,23 @@ def test_the_fetch_script_downloads_book_files_until_enough_are_long(tmp_path, m
         pq.write_table(pa.table({"text": books}), tmp_path / name.replace("/", "_"))
     downloaded = []
 
-    def download(repo, name, repo_type=None, force_download=False):
-        target = snapshot / name
+    def download(repo, name, folder, lines):
+        target = Path(folder) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((tmp_path / name.replace("/", "_")).read_bytes())
         downloaded.append(name)
-        return str(target)
+        return target
     monkeypatch.setattr(huggingface_hub.HfApi, "list_repo_files", lambda self, repo, repo_type=None: list(names))
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    monkeypatch.setattr(prep, "download_plain", download)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *a, **kw: pytest.fail("no Hub snapshot output"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.setenv("LONG_PPL_BOOKS", str(tmp_path / "hub/datasets--someone--books/snapshots/old"))
     monkeypatch.setenv("LONG_PPL_DOCS", "3")
     monkeypatch.setenv("LONG_PPL_CACHE", str(tmp_path / "cache"))
     lines = []
     root = fetch.fetch_ppl_books("someone/books", word_tokenizer, lines)
-    assert root == str(snapshot) and downloaded == ["data/train-0.parquet", "data/train-1.parquet"]  # 1 + 2 books
+    assert root == str(tmp_path / "long_ppl_books/someone--books")
+    assert downloaded == ["data/train-0.parquet", "data/train-1.parquet"]  # 1 + 2 books
     assert lines[-2].endswith("3 books of >= 262144 tokens so far") and lines[-1].endswith(f"LONG_PPL_BOOKS={root}")
     fetch.cache_ppl_books(root, word_tokenizer, lines)
     assert lines[-1].startswith(f"long_ppl_books: 3 books of >= 262144 tokens from {root}")
@@ -513,7 +519,7 @@ def test_the_fetch_script_downloads_book_files_until_enough_are_long(tmp_path, m
     key = utils.cache_key(root, word_tokenizer, 3, False, utils.LONGEST_256K)
     assert (tmp_path / "cache" / f"{key}.json").is_file()  # what long_ppl_books_<L>_<point> read
     # A file of an earlier download in the same folder would be read too: said so.
-    download("someone/books", "data/test-0.parquet")
+    download("someone/books", "data/test-0.parquet", root, [])
     downloaded.clear()
     lines = []
     fetch.fetch_ppl_books("someone/books", word_tokenizer, lines)
