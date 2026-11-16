@@ -13,6 +13,8 @@ with LONG_PPL_DATA / LONG_PPL_BOOKS exported as for eval.sh. Each line says OK o
     long_ppl      LONG_PPL_DATA: documents of >= 131072 and >= 262144 tokens
     books         LONG_PPL_BOOKS: books of >= 262144 tokens (want LONG_PPL_DOCS, 100)
 The ppl lines need --tokenizer (they read the cached selection, or select again when it is missing).
+--storage-only checks environment paths and up to three raw files per PPL source on this host, without
+loading a tokenizer, selecting documents, downloading files, or modifying storage. Run on each job node.
 Exits 1 when anything is missing.
 """
 from __future__ import annotations
@@ -37,6 +39,71 @@ def whole_parquet(path: Path) -> bool:
             return path.stat().st_size >= 12 and head == b"PAR1" and f.read(4) == b"PAR1"
     except OSError:
         return False
+
+
+def check_storage(report):
+    """Distinguish missing job mounts/paths from PPL token-cache failures with stdlib-only reads."""
+    import itertools
+    import socket
+
+    from eval_tasks.long_ppl.input_files import describe, file_state, resolve_input
+
+    print(f"[storage] host={socket.gethostname()} rank={os.environ.get('RANK', 'unset')} "
+          f"uid={os.geteuid()} cwd={Path.cwd()}", flush=True)
+    print(f"[storage] HF_HOME={os.environ.get('HF_HOME', '<unset>')}", flush=True)
+    for env in ("LONG_PPL_BOOKS", "LONG_PPL_DATA"):
+        source = os.environ.get(env)
+        print(f"[storage] {env}={source or '<unset>'}", flush=True)
+        if not source:
+            report(False, f"{env}: not exported in this job process")
+            continue
+        path = Path(os.path.abspath(os.path.expanduser(source)))
+        nearest = path
+        try:
+            while not nearest.exists() and not nearest.is_symlink() and nearest != nearest.parent:
+                nearest = nearest.parent
+            print(f"[storage] nearest existing path: {nearest}", flush=True)
+            mount, filesystem = Path("/"), "unknown"
+            try:
+                for line in Path("/proc/self/mountinfo").read_text().splitlines():
+                    before, after = line.split(" - ", 1)
+                    candidate = Path(before.split()[4].replace("\\040", " ").replace("\\134", "\\"))
+                    if (nearest == candidate or candidate in nearest.parents) and len(candidate.parts) >= len(mount.parts):
+                        mount, filesystem = candidate, after.split()[0]
+                print(f"[storage] mount={mount} filesystem={filesystem}", flush=True)
+            except (OSError, ValueError, IndexError) as error:
+                print(f"[storage] mount info unavailable: {error}", flush=True)
+            path.stat()  # preserve PermissionError instead of reporting every failure as a missing folder
+            if path.is_file():
+                files = [path]
+            elif path.is_dir():
+                files = list(itertools.islice((p for p in path.rglob("*")
+                                              if p.suffix in (".parquet", ".jsonl")), 3))
+            else:
+                raise ValueError("not a regular file or directory")
+            if not files:
+                report(False, f"{env}: directory exists but contains no visible parquet/jsonl files: {path}")
+                continue
+            for filename in files:
+                actual = resolve_input(filename, report=lambda message: print(message, flush=True))
+                state = file_state(actual)
+                if state[0] == 0:
+                    raise ValueError(f"empty input file: {actual}")
+                if filename.suffix == ".parquet":
+                    size, head, footer = state
+                    if not (size >= 12 and head[:4] == footer == b"PAR1"):
+                        raise ValueError(f"invalid Parquet markers: {describe(actual, state)}")
+                report(True, f"{env}: readable input={filename}; {describe(actual, state)}")
+        except (OSError, ValueError, RuntimeError) as error:
+            report(False, f"{env}: {type(error).__name__}: {error}")
+            if nearest.is_dir():
+                try:
+                    children = [p.name for p in itertools.islice(nearest.iterdir(), 10)]
+                    print(f"[storage] nearest directory entries (up to 10): {children}", flush=True)
+                except OSError as listing_error:
+                    print(f"[storage] directory listing failed: {listing_error}", flush=True)
+    print("[storage] This checks visibility on this host; platform mount/data-preload errors need platform logs. "
+          "It does not verify document counts or warm the tokenizer cache.", flush=True)
 
 
 def check_babilong(report, lengths=None) -> None:
@@ -170,18 +237,23 @@ def main():
     p.add_argument("--tokenizer", default=None, help="tokenizer dir, for the long_ppl / books document counts")
     p.add_argument("--lengths", default="32k,64k,128k,256k")
     p.add_argument("--suites", default="ruler,babilong,longbench2,infinitebench,ppl,books")
+    p.add_argument("--storage-only", action="store_true", help="inspect PPL paths/files on this host, without a tokenizer")
     args = p.parse_args()
-    from long_eval_plan import LENGTHS, SUITES, parse_list
-    lengths = parse_list(args.lengths, LENGTHS, "--lengths")
-    suites = parse_list(args.suites, SUITES, "--suites")
-    if os.environ.get("HF_DATASETS_OFFLINE") != "1":
-        print("note: HF_DATASETS_OFFLINE is not 1; run through diag.sh to check what eval.sh will see")
     failures = []
 
     def report(ok, text):
         print(("OK       " if ok else "MISSING  ") + text, flush=True)
         if not ok:
             failures.append(text)
+    if args.storage_only:
+        check_storage(report)
+        print(f"\n{len(failures)} storage problem(s)", flush=True)
+        raise SystemExit(1 if failures else 0)
+    from long_eval_plan import LENGTHS, SUITES, parse_list
+    lengths = parse_list(args.lengths, LENGTHS, "--lengths")
+    suites = parse_list(args.suites, SUITES, "--suites")
+    if os.environ.get("HF_DATASETS_OFFLINE") != "1":
+        print("note: HF_DATASETS_OFFLINE is not 1; run through diag.sh to check what eval.sh will see")
     if "babilong" in suites:
         check_babilong(report, lengths)
     if "longbench2" in suites:
