@@ -70,18 +70,20 @@ def _files(source: str) -> list[Path]:
 
 def _texts(path: Path):
     if path.suffix == ".parquet":
-        import pyarrow.parquet as pq
+        from eval_tasks.long_ppl.input_files import open_parquet
 
-        pf = pq.ParquetFile(path)
-        column = next((c for c in COLUMNS if c in pf.schema_arrow.names), None)
-        if column is None:
-            return
-        for group in range(pf.num_row_groups):
-            for value in pf.read_row_group(group, columns=[column]).column(column).to_pylist():
-                if value:
-                    yield str(value)
+        with open_parquet(path) as pf:
+            column = next((c for c in COLUMNS if c in pf.schema_arrow.names), None)
+            if column is None:
+                return
+            for group in range(pf.num_row_groups):
+                for value in pf.read_row_group(group, columns=[column]).column(column).to_pylist():
+                    if value:
+                        yield str(value)
     else:
-        with open(path, encoding="utf-8") as f:
+        from eval_tasks.long_ppl.input_files import resolve_input
+
+        with open(resolve_input(path), encoding="utf-8") as f:
             for line in f:
                 try:
                     row = json.loads(line)
@@ -90,6 +92,19 @@ def _texts(path: Path):
                 value = next((row.get(c) for c in COLUMNS if row.get(c)), None) if isinstance(row, dict) else None
                 if value:
                     yield str(value)
+
+
+def validate_inputs(source):
+    """Check the raw files as well as the selection cache during an offline preflight."""
+    from eval_tasks.long_ppl.input_files import open_parquet
+
+    files = _files(source)
+    if not files:
+        raise ValueError(f"No parquet/jsonl PPL input files in {source!r}")
+    for path in files:
+        if path.suffix == ".parquet":
+            with open_parquet(path):
+                pass
 
 
 def select_documents(source: str, tokenizer, count: int, concat: bool = False,

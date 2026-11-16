@@ -338,18 +338,25 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   RULER 问答的 SQuAD 与 HotpotQA（`litgpt/ruler_patch.py` 先读的本地文件）与可选的 LongBench v2、InfiniteBench（十个 jsonl，
   进 hub 缓存，不完整的重新下载），再以离线方式重新加载
   一遍（之后可随时用 `bash diag.sh unused/check_long_eval_data.py --tokenizer <目录>` 以评测时的离线环境只读地核对：BABILong 各长度、
-  LongBench v2 快照与 20 个子集共 503 题、RULER 问答文件、InfiniteBench 十个文件的样本数、`LONG_PPL_DATA` 与 `LONG_PPL_BOOKS` 的文档数）；快照里不是完整 parquet 的文件会修好再用：hub 缓存的软链接被拷贝或同步压平成一个写着 `../../../../blobs/<sha>` 的小文件时，
-  blob 完好就重新建链接（不能建链接的文件系统上复制 blob），否则删掉这个文件、按该快照的版本强制重下（`hf_hub_download` 遇到已存在的
-  快照文件即使 `force_download` 也只刷新 blob，不替换它）；`--ppl-books-hub emozilla/pg19`（或本地的 `--ppl-books-data`）按文件名顺序逐个下载训练集文件，直到找到 100 本不短于
+  LongBench v2 普通文件与 20 个子集共 503 题、RULER 问答文件、InfiniteBench 十个文件的样本数、`LONG_PPL_DATA` 与 `LONG_PPL_BOOKS` 的文档数）。
+  PPL 在所有长度都下载为普通文件：`LONG_PPL_DATA` 使用 `$HF_HOME/long_ppl_data/<owner--name>`，
+  32K–256K 的 `LONG_PPL_BOOKS` 使用 `$HF_HOME/long_ppl_books/<owner--name>`，512K/1M 使用独立的 `long_ppl_books_1m`。
+  旧环境变量指向 Hub snapshot 时，下载器会打印新的普通目录；必须把该目录导出给评测进程。
+  缓存里的真实字节通过 Hub 大小、SHA256 和 Parquet 头尾检查后可直接复制；缺失或校验失败才重新下载，
+  不创建软链接，不用 rename 发布，也不在评测 rank 中修改共享文件。
+  `--ppl-books-hub emozilla/pg19`（或本地的 `--ppl-books-data`）按文件名顺序逐个准备训练集文件，直到找到 100 本不短于
   262144 token 的书（PG19 训练集 2.86 万本里约 4–6%），写入 `long_ppl_books` 的缓存并打印 `LONG_PPL_BOOKS` 的目录；该目录里
   若还有以前下载的其他文件也会被读到，汇总会提醒；给了 `--ppl-data` 时还选出困惑度的两批文档（不短于 131072 与 262144 token）并写入缓存（缓存键按 tokenizer 文件内容，
 与用哪个路径指向它无关），汇总给出 256K 那批选到几篇（一篇没有时只是 `long_ppl_256k` 跑不了，不算下载失败），
   `--ppl-hub <数据集仓库>` 先下载该仓库再以它为 `--ppl-data`。下载机与评测节点经桶同步时，评测前要把 BABILong 的数据集缓存、
-  该仓库的 `$HF_HOME/hub/datasets--<owner>--<name>/`（`snapshots/` 是指向 `blobs/` 的软链接，两者都要）和
+  对应的普通 PPL 目录与 LongBench v2 的 `$LONGBENCH2_DIR`，以及
   `$HF_HOME/logkv_long_ppl`（选出的文档；命中时不再读数据）同步（预热）到评测节点。桶里的 ProLong 是按文档存的短文（中位数约 1000 字符，
   最长约 4.8 万 token），没有 128K 的文档，困惑度改用 PG19 测试集的整本书（`emozilla/pg19-test`）。按 Qwen 的分词
   （约 4.06 字节/token）这 100 本书里只有 18 本不短于 131072 token、4 本不短于 262144，所以 `long_ppl_{32k,64k,128k}`
   实际是 18 篇文档的平均，`long_ppl_256k` 只有 4 篇；PG19 训练集（2.86 万本）里不短于 256K 的书有一千多本。
+  PPL 每次打开 Parquet 前打印 `[PPL input] path=... size=... head=... footer=...`。
+  读取端只读解析相对/绝对路径占位文本（含末尾 NUL）；对应 blob 缺失、链接循环或文件损坏时明确报错，
+  不跳过坏 shard。`check_long_eval_data.py` 即使命中文档选择缓存也检查原始输入，避免缓存掩盖坏文件。
   平台代理用自签证书重签 HTTPS，脚本默认不校验证书（同 `litgpt/ruler_patch.py`），下载只走 requests、不用 hf_transfer / hf_xet，
   `--verify-ssl` 恢复校验；Hub 下载的读超时默认放宽到 300 秒（`HF_HUB_DOWNLOAD_TIMEOUT` 可覆盖）。hf-mirror 的共享 Hub 限额
   用完时返回 429，每个请求按 `Retry-After`（没有时 60 秒）等待后重试，最多 10 次。

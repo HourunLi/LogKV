@@ -157,11 +157,12 @@ def check_ppl(report, tokenizer: str | None, lengths=None, suites=None) -> None:
             report(False, f"{label}: give --tokenizer to count the documents in {os.environ[env]}")
             continue
         try:
+            utils.validate_inputs(os.environ[env])
             docs = utils._documents({"pretrained": tokenizer}, longest, env=env)
             report(len(docs) >= need, f"{label}: {len(docs)} documents of >= {longest} tokens in {os.environ[env]}"
                    + ("" if len(docs) >= want else f" (want {want})"))
         except Exception as error:  # noqa: BLE001
-            report(False, f"{label}: {type(error).__name__}: {str(error)[:200]}")
+            report(False, f"{label}: {type(error).__name__}: {str(error)[:1500]}")
 
 
 def main():

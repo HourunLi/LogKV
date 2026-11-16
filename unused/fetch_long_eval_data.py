@@ -22,12 +22,13 @@ The default lengths stay 32k,64k,128k,256k. --ruler-essays prepares the backgrou
                   262144 (256K) with --tokenizer and caches both selections the long_ppl tasks use, so
                   eval ranks do not tokenize them again (no 256K document only stops long_ppl_256k);
                   --ppl-hub <dataset repo> (e.g. emozilla/pg19-test, PG19's 100 test books) downloads
-                  the repository first and uses its folder as --ppl-data (export the printed path as
-                  LONG_PPL_DATA for eval.sh)
+                  the repository first into ordinary files under <HF_HOME>/long_ppl_data/<owner--name>
+                  and uses that folder as --ppl-data (export the printed path as LONG_PPL_DATA for eval.sh)
     long_ppl_books --ppl-books-hub <dataset repo> (e.g. emozilla/pg19): downloads its train parquet files
                   one at a time, in name order, until LONG_PPL_DOCS (100) books of at least 262144 tokens are
                   found (4-6% of PG19's 28,602 train books are that long), and caches the selection the
-                  long_ppl_books_<L> tasks read (export the printed folder as LONG_PPL_BOOKS);
+                  long_ppl_books_<L> tasks read. All lengths use ordinary files; verified Hub-cache bytes
+                  are copied, otherwise files are downloaded directly (export the printed folder as LONG_PPL_BOOKS);
                   --ppl-books-data <file or folder> selects from local data instead
 
 and finally loads every dataset again in an offline subprocess, as eval.py will (skipping the
@@ -321,28 +322,20 @@ def materialize_longbench2(root: str, files: list[str], lines: list[str]) -> Pat
     return target_root
 
 
-def fetch_ppl_hub(repo: str, lines: list[str], ordinary: bool = False) -> str:
-    """Download a dataset repository for long_ppl and return its snapshot folder (the --ppl-data)."""
-    from huggingface_hub import snapshot_download, HfApi
+def fetch_ppl_hub(repo: str, lines: list[str]) -> str:
+    """Every PPL length uses ordinary files, rather than publishing a Hub snapshot path."""
+    from huggingface_hub import HfApi
+    from unused.long_eval_download import download_plain
 
-    if ordinary:
-        from unused.long_eval_download import download_plain
-        root = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "long_ppl_data" / repo.replace("/", "--")
-        names = sorted(n for n in HfApi().list_repo_files(repo, repo_type="dataset") if n.endswith((".parquet", ".jsonl")))
-        if not names:
-            raise ValueError(f"No parquet/jsonl in {repo}")
-        for name in names:
-            download_plain(repo, name, root, lines)
-        lines.append(f"  for eval.sh: export LONG_PPL_DATA={root}")
-        return str(root)
-
-    root = snapshot_download(repo, repo_type="dataset")
-    files = sorted(str(p.relative_to(root)) for p in Path(root).rglob("*") if p.suffix in (".parquet", ".jsonl"))
-    lines.append(f"long_ppl data {repo}: {root} ({len(files)} files, e.g. {files[:3]})")
-    if not repair_parquet(root, files, lines, repo):
-        raise ValueError(f"some {repo} files are still not parquet after a fresh download (above)")
+    root = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "long_ppl_data" / repo.replace("/", "--")
+    names = sorted(n for n in run_stage(lines, f"list PPL files {repo}", HfApi().list_repo_files,
+                                       repo, repo_type="dataset") if n.endswith((".parquet", ".jsonl")))
+    if not names:
+        raise ValueError(f"No parquet/jsonl in {repo}")
+    for name in names:
+        download_plain(repo, name, root, lines)
     lines.append(f"  for eval.sh: export LONG_PPL_DATA={root}")
-    return root
+    return str(root)
 
 
 def jsonl_rows(path: Path) -> int | None:
@@ -482,11 +475,13 @@ def _long_ppl_utils():
 def fetch_ppl_books(repo: str, tokenizer: str, lines: list[str], pattern: str | None = None,
                     longest: int | None = None) -> str:
     """Download a dataset repository's train files one at a time, in name order, until enough long books are
-    in them; returns the snapshot folder that holds them (the LONG_PPL_BOOKS of eval.sh)."""
+    in them; returns the ordinary folder that holds them (the LONG_PPL_BOOKS of eval.sh)."""
     from fnmatch import fnmatch
 
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import HfApi
     from transformers import AutoTokenizer
+    from eval_tasks.long_ppl.input_files import is_hub_snapshot
+    from unused.long_eval_download import download_plain
 
     utils = _long_ppl_utils()
     longest = longest or utils.LONGEST_256K
@@ -500,21 +495,19 @@ def fetch_ppl_books(repo: str, tokenizer: str, lines: list[str], pattern: str | 
         raise ValueError(f"no {'file matching ' + pattern if pattern else 'train parquet / jsonl file'} in {repo}")
     tok = run_stage(lines, f"load PPL tokenizer {tokenizer}", AutoTokenizer.from_pretrained,
                     tokenizer, trust_remote_code=True)
-    found, root = 0, None
+    subdir = "long_ppl_books_1m" if longest >= utils.LONGEST_1M else "long_ppl_books"
+    folder = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / subdir / repo.replace("/", "--")
+    configured = os.environ.get("LONG_PPL_BOOKS")
+    if configured and is_hub_snapshot(configured):
+        lines.append(f"LONG_PPL_BOOKS points to a Hub snapshot ({configured}); materializing ordinary files in {folder}")
+        configured = None
+    root = str(Path(configured).expanduser() if configured else folder)
+    found = 0
     for shard, name in enumerate(files, 1):
         lines.append(f"PPL shard {shard}/{len(files)}: {name}; selected {found}/{want} books so far")
-        if longest >= utils.LONGEST_1M:
-            from unused.long_eval_download import download_plain
-            folder = (Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser()
-                      / "long_ppl_books_1m" / repo.replace("/", "--"))
-            root = os.environ.get("LONG_PPL_BOOKS") or str(folder)
-            path = download_plain(repo, name, root, lines)
-        else:
-            path = Path(hf_hub_download(repo, name, repo_type="dataset"))
-            root = str(path)[:-len(name)].rstrip("/")
+        path = download_plain(repo, name, root, lines)
         if name.endswith(".parquet") and not is_parquet(path):
-            path, done = refetch(repo, name, root)
-            lines.append(f"long_ppl_books {repo} {name}: not whole parquet; {done}")
+            raise ValueError(f"PPL download is not whole Parquet: {path}; {describe(path)}")
         found += len(run_stage(lines, f"PPL scan/tokenize {path}", utils.select_documents,
                                str(path), tok, want - found, longest=longest, progress=_progress(lines)))
         lines.append(f"long_ppl_books {repo} {name}: {found} books of >= {longest} tokens so far")
@@ -638,7 +631,7 @@ def main():
         if args.ppl_hub:
             try:
                 args.ppl_data = run_stage(lines, "PPL source download", fetch_ppl_hub,
-                                          args.ppl_hub, lines, ordinary=ultra)
+                                          args.ppl_hub, lines)
             except Exception as error:  # noqa: BLE001
                 ok = False
                 lines.append(f"long_ppl data {args.ppl_hub}: FAILED {type(error).__name__}: {str(error)[:1500]}")
