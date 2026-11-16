@@ -91,6 +91,8 @@ class Config:
     bias: bool = True
     mlp_class_name: Literal["GptNeoxMLP", "LLaMAMLP", "GemmaMLP", "LLaMAMoE"] = "GptNeoxMLP"
     gelu_approximate: str = "none"
+    # Token-wise norm/MLP/residual chunks in eval + no-grad only; 0 preserves the original forward.
+    inference_mlp_chunk_size: int = 0
     n_expert: int = 0
     n_shared_expert: int | None = None
     n_expert_groups: int | None = None
@@ -135,6 +137,9 @@ class Config:
             assert self.n_head % self.n_query_groups == 0
         else:
             self.n_query_groups = self.n_head
+
+        if self.inference_mlp_chunk_size < 0:
+            raise ValueError("inference_mlp_chunk_size must be >= 0")
 
         # compute the intermediate size for MLP if not set
         if self.intermediate_size is None:

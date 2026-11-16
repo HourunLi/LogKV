@@ -261,9 +261,16 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   `attention_factor`，否则 mscale / mscale_all_dim，否则 0.1·ln(factor)+1。LogKV 缓存的位置编码全部来自模型的 cos/sin 表，
   所以 YaRN 同样作用于精确池与梯子的期望 RoPE。
 - 长输入分块进 LogKV 缓存：`eval.py` 的打分、生成与逐轮问在输入长于 `LOGKV_EVAL_PREFILL_CHUNK`（默认 32768，0 为一次前向）时分块预填充；
-  缓存是流式的，分块与一次前向的 logits 逐位相同（普通、语义聚类、惊异度准入与 Gamma cue 都验证过），只是激活显存有界——256K 一次前向在 80 GB 卡上会爆（MLP 中间张量单个约 3 GiB）。
+  缓存按相同状态机流式推进，测试核对普通、语义聚类、惊异度准入与 Gamma cue 的 logits 和生成结果；限制输入块大小可降低激活峰值。
   惊异度准入本来就在 `GPT.forward` 里按 recent 窗口分块。dense 仍一次前向（后续分块要建块长 × 位置的掩码）。
   每类请求结束时各 rank 打印显存峰值（`显存峰值 X / Y GiB`）；`LIMIT=2` 临时覆盖 YAML 的每任务条数，用于上长跑之前在单卡上测一下：`GPUS_PER_NODE=1 LIMIT=2 EVAL_LENGTHS=256k EVAL_SUITES=babilong,books,turns bash eval.sh <yaml>` 覆盖生成、打分与逐轮问三条路径。
+- 推理 MLP 激活分块：所有 `eval.py` 入口（包括 8B 的六份全量 YAML）默认每 2048 tokens 计算 norm/MLP/残差，
+  由 `LOGKV_EVAL_MLP_CHUNK` 覆盖，0 恢复旧整段路径；`config_overrides.inference_mlp_chunk_size` 也可设置，环境变量优先。
+  只在 `model.eval()` 且关闭梯度时启用，模型/训练默认仍为 0；注意力前向、KV 更新、LogKV 路由和完整输入长度保持原样。
+  Qwen3-8B 在 BF16、batch=1 下，256K × 12288 的单个 MLP 中间张量为 6 GiB，2048-token 块为 48 MiB；
+  这是张量大小推算，不是整卡峰值或 80 GB 硬件实测。Dense 的 O(N) KV、注意力与其他临时张量仍占显存。
+  MLP 按 token 独立计算，测试验证 FP32/BF16 数值、KV 状态和训练梯度；GEMM 形状变化可有浮点舍入差异，
+  不承诺逐位相同。Dense 与 LogKV 比速度/显存时统一该参数，实际值按 [指标口径](evaluation-metrics.md) 写入结果。
 - 稠密 KV 缓存不再分配 max_seq_length × max_seq_length 的掩码（128K 时约 17 GB）：从位置 0 开始的预填充直接是因果注意力
   （SDPA 的 is_causal），只读已写入的那部分缓存；其余调用（解码、续接的分块）按需建 T × (最大位置+1) 的掩码。
 - `eval.sh` 从 YAML 读：`eval_max_seq_lengths`（RULER / NIAH 的长度，默认 1K–32K）、`niah_benchmark`（NIAH 任务列表，命令行第

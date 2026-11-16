@@ -943,6 +943,19 @@ def _normalize_training_config_dict(d: dict[str, Any]) -> tuple[dict[str, Any], 
     return out, identity_layers
 
 
+def _configure_inference_memory(config, overrides=None):
+    """Use the same token-wise MLP budget for dense and compressed evaluation, without changing attention."""
+    value = os.environ.get("LOGKV_EVAL_MLP_CHUNK", (overrides or {}).get("inference_mlp_chunk_size", 2048))
+    try:
+        chunk = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("LOGKV_EVAL_MLP_CHUNK / inference_mlp_chunk_size must be an integer >= 0") from error
+    if chunk < 0:
+        raise ValueError("LOGKV_EVAL_MLP_CHUNK / inference_mlp_chunk_size must be an integer >= 0")
+    config.inference_mlp_chunk_size = chunk
+    return chunk
+
+
 def _config_from_yaml_and_overrides(config_path: str, overrides: dict[str, Any] | None) -> Config:
     with open(config_path, encoding="utf-8") as f:
         base = yaml.safe_load(f)
@@ -1286,6 +1299,10 @@ class LogKVLM(LM):
                 fallback_kw.update(config_overrides)
             fallback_kw = _filter_config_dict(fallback_kw)
             self.config = Config.from_name(**fallback_kw)
+
+        chunk = _configure_inference_memory(self.config, config_overrides)
+        if is_master:
+            print(f"🧩 Inference MLP chunk: {chunk} tokens (0 = full sequence); attention/KV policy is unchanged")
 
         # ==========================================
         self.log_kv_semantic_s_h = (
@@ -2427,6 +2444,7 @@ def main(
             inference_report = {
                 **inference_summary,
                 "world_size": world_size,
+                "inference_mlp_chunk_size": lm_model.config.inference_mlp_chunk_size,
                 "generate_until": gen_metrics,
                 "loglikelihood": ppl_metrics,
             }
@@ -2515,6 +2533,7 @@ def main(
                     "benchmark": benchmark,
                     "checkpoint_dir": checkpoint_dir,
                     "log_kv_dense_mode": log_kv_dense_mode,
+                    "inference_mlp_chunk_size": lm_model.config.inference_mlp_chunk_size,
                     "swa_window_size": lm_model.swa_window_size,
                     "cache_budget": lm_model.cache_budget,
                     "kv_compression": compression_report,
@@ -2602,7 +2621,9 @@ def main(
                     import pandas as pd
                     with pd.ExcelWriter(inference_xlsx) as writer:
                         pd.DataFrame([
-                            {"request_type": kind, **inference_summary[kind]}
+                            {"request_type": kind,
+                             "inference_mlp_chunk_size": lm_model.config.inference_mlp_chunk_size,
+                             **inference_summary[kind]}
                             for kind in ("generation", "scoring")
                         ]).to_excel(writer, sheet_name="speed_summary", index=False)
                         if gen_metrics:

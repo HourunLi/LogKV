@@ -56,6 +56,7 @@ rank 的耗时，平均每卡值再除以卡数。计时同步 GPU，包含取�
 | `gen_tokens_per_sec` | 全部生成 token 数 / prefill 与 decode 总秒数 |
 | `forward_tokens_per_sec` | 选择题、PPL 的模型输入 token 数 / forward 秒数 |
 | `peak_memory_allocated_bytes` / `peak_memory_reserved_bytes` | 每次调用的 CUDA 已分配 / 保留显存峰值 |
+| `inference_mlp_chunk_size` | 推理 norm/MLP/残差计算的 token 块大小，0 为整段；记录于 JSON 顶层、`inference_metrics` 和 XLSX 的 `speed_summary` |
 | `prompt_len` | 普通生成实际进入模型的 prompt token 数；多轮生成按下文的增量前缀口径 |
 | `original_prompt_len` | 普通生成截断前的完整 prompt token 数，包含任务说明和示例 |
 | `truncated_prompt_tokens` | 普通生成从 prompt 开头截去的 token 数；与 `prompt_len` 之和为 `original_prompt_len` |
@@ -66,6 +67,11 @@ rank 的耗时，平均每卡值再除以卡数。计时同步 GPU，包含取�
 汇总中的秒数也是各请求耗时之和。按 prompt 长度分桶使用相同口径。
 显存峰值包含驻留权重、cache 和临时张量，不等于 KV 大小；它是 PyTorch allocator
 口径，不含 CUDA context 等外部分配，CPU 运行记为 null。
+
+评测默认使用 2048-token 的 norm/MLP/残差分块，`LOGKV_EVAL_MLP_CHUNK` 可覆盖，0 恢复整段计算；
+也可通过 `config_overrides.inference_mlp_chunk_size` 设置，环境变量优先。只在 eval 且无梯度时启用，
+不拆分注意力或改变 KV 策略；线性层 GEMM 形状改变可能产生浮点舍入差异。
+该执行设置会影响速度和激活峰值，比较 Dense 与 LogKV 时应保持一致，并保留结果中的实际块大小。
 
 多轮 `niah_turns_*` 共用一份 cache，每轮答案单独写入一条完整的生成统计；汇总的
 `requests` 和 `avg_ttft_ms` 按答案轮次计数。明细用相同的 `rank`、`sample_id` 关联同一
