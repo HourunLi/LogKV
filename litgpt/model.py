@@ -957,6 +957,25 @@ class Block(nn.Module):
                                      **({"span_ends": span_ends} if span_ends is not None else {}))
         attention_output = self.post_attention_norm(attention_output)
 
+        chunk = self.config.inference_mlp_chunk_size
+        if not self.training and not torch.is_grad_enabled() and chunk > 0 and x.size(1) > chunk:
+            # Attention (including every KV update/routing decision) has already run exactly once.
+            # Norm and MLP act independently on each token: bound their wide activations, then
+            # accumulate into the newly allocated residual, never into the caller's input/cache.
+            shared_norm = self.config.parallel_residual and self.config.shared_attention_norm
+            mlp_source = (x_normed if shared_norm else x) if self.config.parallel_residual else None
+            residual = attention_output + x
+            del attention_output, x_normed
+            if mlp_source is None:
+                mlp_source = residual
+            for start in range(0, x.size(1), chunk):
+                end = min(start + chunk, x.size(1))
+                part = mlp_source[:, start:end]
+                if not shared_norm:
+                    part = self.norm_2(part)
+                residual[:, start:end].add_(self.post_mlp_norm(self.mlp(part.contiguous())))
+            return residual
+
         if self.config.parallel_residual:
             if not self.config.shared_attention_norm:
                 x_normed = self.norm_2(x)
