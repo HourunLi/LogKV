@@ -5,12 +5,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from litgpt.query_detector import QueryDetector
+from litgpt.query_detector import DEFAULT_MODEL_DIR, QueryDetector
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     parser.add_argument("--text-file", type=Path)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--threshold", type=float, default=0.8)

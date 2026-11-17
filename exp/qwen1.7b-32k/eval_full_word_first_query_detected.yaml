@@ -3,7 +3,7 @@ config: eval_full_word_first_query.yaml
 eval_tag: full_word_first_query_detected
 log_kv_gamma_cue_tokens: 0
 log_kv_gamma_query_pool_tokens: 512
-log_kv_gamma_query_detector: ${LOGKV_QUERY_DETECTOR_DIR:-/data/models/gliclass-instruct-edge}
+log_kv_gamma_query_detector: ${LOGKV_QUERY_DETECTOR_DIR:-/workspace/data/hf_cache/gliclass-instruct-edge}
 log_kv_gamma_query_detector_options:
   device: model
   threshold: 0.8

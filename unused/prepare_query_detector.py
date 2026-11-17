@@ -1,8 +1,10 @@
 """Download a relocatable GLiClass bundle as ordinary files, optionally with offline wheels.
 
-Online: python unused/prepare_query_detector.py --out /data/gliclass-edge --wheels
-Offline: python unused/prepare_query_detector.py --out /data/gliclass-edge --verify
+Online: python unused/prepare_query_detector.py --install-deps --wheels
+Offline: python unused/prepare_query_detector.py --verify
 Use the same Python/platform on the online and offline machines when preparing wheels.
+The default directory is hf_cache/gliclass-instruct-edge under the training platform bucket.
+HTTPS certificate verification is disabled by default; --verify-ssl enables it.
 """
 from __future__ import annotations
 
@@ -10,7 +12,9 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 import shutil
+import ssl
 import subprocess
 import sys
 import urllib.parse
@@ -19,6 +23,7 @@ from pathlib import Path
 
 MODEL_ID = "knowledgator/gliclass-instruct-edge-v1.0"
 MODEL_REVISION = "727be8a417f6a7718e591b025e07054c146d8139"
+DEFAULT_MODEL_DIR = Path("/workspace/data/hf_cache/gliclass-instruct-edge")
 VERSIONS = {"gliclass": "0.1.15", "transformers": "4.57.3"}
 
 
@@ -73,12 +78,45 @@ def wheel_requirements():
     return [f"{name}=={version}" for name, version in sorted(found.items())]
 
 
+def ssl_context(verify_ssl=False):
+    if verify_ssl:
+        return ssl.create_default_context()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def pip_tls_args(verify_ssl=False, extra_hosts=()):
+    """Skip verification for PyPI and configured mirror hosts only within these pip commands."""
+    if verify_ssl:
+        return []
+    hosts = {"pypi.org", "pypi.python.org", "files.pythonhosted.org", *extra_hosts}
+    indexes = [os.environ.get("PIP_INDEX_URL", ""), os.environ.get("PIP_EXTRA_INDEX_URL", "")]
+    config = subprocess.run([sys.executable, "-m", "pip", "config", "list"],
+                            capture_output=True, text=True, check=True)
+    # Capture config privately: index URLs may contain credentials. Only pass hostnames to pip.
+    for line in config.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.endswith("index-url"):
+            indexes.append(value.strip("'\""))
+    for index in indexes:
+        for url in index.split():
+            host = urllib.parse.urlsplit(url).hostname
+            if host:
+                hosts.add(host)
+    return [arg for host in sorted(hosts) for arg in ("--trusted-host", host)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--out", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--endpoint", default="https://huggingface.co")
     parser.add_argument("--revision", default=MODEL_REVISION)
     parser.add_argument("--wheels", action="store_true")
+    parser.add_argument("--install-deps", action="store_true", help="install fixed detector packages before export")
+    parser.add_argument("--verify-ssl", action="store_true", help="enable HTTPS certificate verification")
+    parser.add_argument("--pip-trusted-host", action="append", default=[], help="additional pip download/CDN hostname")
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
     root = args.out.expanduser().absolute()
@@ -87,12 +125,17 @@ def main():
         return
     root.mkdir(parents=True, exist_ok=True)
     regular_tree(root)
+    context = ssl_context(args.verify_ssl)
+    pip_args = pip_tls_args(args.verify_ssl, args.pip_trusted_host) if args.install_deps or args.wheels else []
+    if args.install_deps:
+        subprocess.run([sys.executable, "-m", "pip", "install", *pip_args,
+                        *(f"{name}=={version}" for name, version in VERSIONS.items())], check=True)
     endpoint = args.endpoint.rstrip("/")
     request = urllib.request.Request(
         f"{endpoint}/api/models/{MODEL_ID}/revision/{urllib.parse.quote(args.revision, safe='')}?blobs=true",
         headers={"User-Agent": "LogKV-query-detector-bundle"},
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=60, context=context) as response:
         info = json.load(response)
     revision = info["sha"]
     wanted = {"config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json",
@@ -110,7 +153,7 @@ def main():
         print(f"Downloading {name}", flush=True)
         url = f"{endpoint}/{MODEL_ID}/resolve/{revision}/{name}?download=true"
         temp = target.with_suffix(target.suffix + ".part")
-        with urllib.request.urlopen(url, timeout=300) as src, temp.open("wb") as dst:
+        with urllib.request.urlopen(url, timeout=300, context=context) as src, temp.open("wb") as dst:
             shutil.copyfileobj(src, dst, length=1024 * 1024)
         if expected and sha256(temp) != expected:
             raise ValueError(f"download checksum mismatch: {name}")
@@ -123,7 +166,7 @@ def main():
         wheels = root / "wheels"
         wheels.mkdir(exist_ok=True)
         subprocess.run([sys.executable, "-m", "pip", "download", "--no-deps", "--only-binary=:all:",
-                        "--dest", str(wheels), "-r", str(requirements)], check=True)
+                        *pip_args, "--dest", str(wheels), "-r", str(requirements)], check=True)
     regular_tree(root)
     hashes = {p.relative_to(root).as_posix(): sha256(p) for p in root.rglob("*")
               if p.is_file() and p.name != "bundle.json"}
