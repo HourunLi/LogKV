@@ -84,13 +84,37 @@ checkpoint 的 `model_config.yaml` 优先定义架构；旧 checkpoint 缺此文
 
 ```bash
 export LOGKV_QUERY_DETECTOR_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
-GPUS_PER_NODE=1 LIMIT=2 EVAL_LENGTHS=32k EVAL_SUITES=ruler,babilong,turns \
+GPUS_PER_NODE=1 EVAL_MAIN=0 LIMIT=2 EVAL_LENGTHS=32k EVAL_SUITES=ruler,babilong,turns \
   bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query_detected.yaml
 ```
 
 8B 对应 `exp/qwen8b-32k/eval_full_word_first_query_detected.yaml`。
 去掉试跑限制即沿用原有 32K–256K 全量流程。结果使用独立的 `eval_tag`。
 `eval_main`、`eval_lengths` 和任务选择遵循原入口约定。
+
+固定双池但关闭检测器的对照使用 `eval_full_word_first_query_dual.yaml`，两个模型目录均提供。
+它继承同一 checkpoint、word_first、query cue 和 cue guard，保留 512/512 双池，关闭开头 cue，
+显式将 detector 设为 `null`、options 设为 `{}`，不加载 GLiClass。
+query 沿用原提取逻辑：从 prompt 最后 64 个 token 中按换行边界提取，不做全文动态定位。
+`niah_turns` 仍不读取后续问题；固定额度不借用，无 query 时的 query 池按现有双池逻辑填充。
+
+| 入口后缀 | 精确池 | query 来源 | 结果目录标签 |
+|---|---|---|---|
+| `word_first_query` | 原单池，总计 1024 | 原末尾提取 | `full_word_first_query` |
+| `word_first_query_dual` | word_first 512 + query 512 | 原末尾提取 | `full_word_first_query_dual` |
+| `word_first_query_detected` | word_first 512 + query 512 | 动态检测 | `full_word_first_query_detected` |
+
+1.7B 只跑 32K–256K 长文本全部七组任务（每任务按继承配置默认 100 条）：
+
+```bash
+unset LIMIT LONG_EVAL_LIMIT NIAH_ONLY
+EVAL_MAIN=0 EVAL_LENGTHS=32k,64k,128k,256k YARN_MODE=per_length \
+EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench \
+  bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query_dual.yaml
+```
+
+8B 将路径中的 `qwen1.7b-32k` 换成 `qwen8b-32k`；包含原有主线时改为 `EVAL_MAIN=1`。
+需要先试跑时加 `LIMIT=2 EVAL_LENGTHS=32k`。新旧结果目录标签不同，其他两组配置保持原样。
 
 主要参数如下：
 
