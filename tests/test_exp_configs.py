@@ -80,7 +80,8 @@ GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
     p.name for pattern in ("eval_gamma_literal*.yaml", "eval_gamma_cue_guard*.yaml", "eval_gamma_query*.yaml",
                            "arc_niah_*.yaml", "eval_niah_*.yaml", "eval_gamma_surprisal*.yaml",
                            "eval_long*_baseline.yaml", "eval_long*_word_first.yaml", "eval_full_baseline.yaml",
-                           "eval_full_word_first.yaml", "eval_long_*query.yaml", "eval_full_*query.yaml")
+                           "eval_full_word_first.yaml", "eval_long_*query.yaml", "eval_full_*query.yaml",
+                           "eval_full_word_first_query_detected.yaml", "eval_512k_1m_*.yaml")
     for p in EXP.glob(pattern))
 
 
@@ -108,7 +109,8 @@ QUERY = ["eval_gamma_query_p1024_slack0.yaml", "eval_gamma_query_literal_p1024_s
          "eval_gamma_surprisal_word_first_query_p1024.yaml",
          # the query-cue long-context evaluations
          "eval_long_query.yaml", "eval_full_query.yaml", "eval_long_word_first_query.yaml",
-         "eval_full_word_first_query.yaml"]
+         "eval_full_word_first_query.yaml", "eval_full_word_first_query_detected.yaml",
+         "eval_512k_1m_query.yaml", "eval_512k_1m_word_first_query.yaml"]
 LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml",
            "eval_gamma_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_literal_p1024_slack0.yaml",
            "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_literal_p1024.yaml"]
@@ -287,7 +289,10 @@ def test_only_surprisal_evaluations_rank_by_surprisal(name):
                 **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "word_first", "multi_word")},
                 **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k", "256k", "")},
                 "eval_full_word_first.yaml": "word_first", "eval_long_word_first_query.yaml": "word_first",
-                "eval_full_word_first_query.yaml": "word_first"}
+                "eval_full_word_first_query.yaml": "word_first",
+                "eval_full_word_first_query_detected.yaml": "word_first",
+                "eval_512k_1m_word_first.yaml": "word_first",
+                "eval_512k_1m_word_first_query.yaml": "word_first"}
     assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
 
 
@@ -375,3 +380,15 @@ def test_methods_on_one_checkpoint_write_to_their_own_folders():
     tags = {effective(f"eval_full_{m}.yaml")["eval_tag"] for m in ("baseline", "word_first", "query", "word_first_query")}
     assert len(tags) == 4
     assert effective("eval_full_dense.yaml").get("eval_tag") is None  # the base model: its own output_path already
+
+
+@pytest.mark.parametrize("size", ["qwen1.7b-32k", "qwen8b-32k"])
+def test_detected_query_keeps_the_checkpoint_and_fixed_total_quota(size):
+    root = EXP.parent / size
+    new = resolve(root / "eval_full_word_first_query_detected.yaml")
+    old = resolve(root / "eval_full_word_first_query.yaml")
+    assert new["save_path"] == old["save_path"]
+    assert new["log_kv_alpha_exact_tokens"] == 1024
+    assert new["log_kv_gamma_query_pool_tokens"] == 512
+    assert new["log_kv_gamma_cue_tokens"] == 0 and new["log_kv_gamma_query_cue"]
+    assert new["log_kv_gamma_query_detector"]

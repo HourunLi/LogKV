@@ -74,6 +74,32 @@ def make_lm(wrapper_class, backend, recent_size=64, block_size=64):
     return lm, reference
 
 
+@pytest.mark.parametrize("context_length", [10, 70])
+def test_dynamic_detector_only_sees_current_context_never_future_questions(wrapper_class, context_length):
+    lm, _ = make_lm(wrapper_class, "logkv")
+    lm.model.set_alpha_span_boundary_ids([STOP], line_end_ids=[STOP])
+    lm.model.set_log_kv_cache(batch_size=1, B=4, recent_size=64, prefill_block=2,
+                              second_order_scale=0., semantic_clusters=True, cluster_k_max=2,
+                              semantic_flush_granularity=2, semantic_anchor_mode="mid",
+                              alpha_exact_tokens=4, alpha_span_max_tokens=2, gamma_query_cue=True)
+    lm.log_kv_gamma_query_detector = "local-model"
+    lm._query_line_ends = [STOP]
+    captured = []
+
+    def detect_visible(tokens, text):
+        captured.append((tokens.tolist(), text))
+        lm.model.set_gamma_queries([[]])
+
+    lm._set_gamma_query = detect_visible
+    context = " ".join(["2"] * context_length)
+    prompt = SEP.join([context, "29", "30"])
+    lm._generate_turns(prompt, SEP, max_new_tokens=1, sample_id="visibility")
+    assert len(captured) == 1
+    tokens, text = captured[0]
+    assert set(tokens) == {2} and 29 not in tokens and 30 not in tokens
+    assert text == (context if context_length == 10 else None)
+
+
 @torch.no_grad()
 def uncached_turns(model, context, questions, max_new):
     """Greedy answers when the whole transcript is run again for every token."""
