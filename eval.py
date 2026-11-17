@@ -1217,6 +1217,9 @@ class LogKVLM(LM):
         log_kv_gamma_literals: bool = False,
         log_kv_gamma_cue_guard: bool = False,
         log_kv_gamma_query_cue: bool = False,
+        log_kv_gamma_query_detector: str | None = None,
+        log_kv_gamma_query_detector_options: dict | None = None,
+        log_kv_gamma_query_pool_tokens: int = 0,
         log_kv_retention_heads: str | None = None,
         log_kv_gamma_surprisal: str | None = None,
         tokenizer_dir: str | None = None,
@@ -1273,6 +1276,15 @@ class LogKVLM(LM):
         self.log_kv_gamma_literals = bool(log_kv_gamma_literals)
         self.log_kv_gamma_cue_guard = bool(log_kv_gamma_cue_guard)
         self.log_kv_gamma_query_cue = bool(log_kv_gamma_query_cue)
+        self.log_kv_gamma_query_detector = log_kv_gamma_query_detector or None
+        self._query_detector_options = dict(log_kv_gamma_query_detector_options or {})
+        self._query_detector = None
+        self.log_kv_gamma_query_pool_tokens = int(log_kv_gamma_query_pool_tokens)
+        if self.log_kv_gamma_query_detector:
+            from litgpt.query_detector import validate_local_model
+            validate_local_model(self.log_kv_gamma_query_detector)
+            if not self.log_kv_gamma_query_cue or self.log_kv_gamma_cue_tokens:
+                raise ValueError("dynamic detector needs query_cue=true and cue_tokens=0 (no fixed head/tail cues)")
         self.log_kv_retention_heads = log_kv_retention_heads or None
         self.log_kv_gamma_surprisal = log_kv_gamma_surprisal or None
 
@@ -1437,6 +1449,7 @@ class LogKVLM(LM):
             gamma_literals=self.log_kv_gamma_literals,
             gamma_cue_guard=self.log_kv_gamma_cue_guard,
             gamma_query_cue=self.log_kv_gamma_query_cue,
+            gamma_query_pool_tokens=self.log_kv_gamma_query_pool_tokens,
             retention_head=getattr(self, "_retention_heads", None) is not None,
             gamma_surprisal=self.log_kv_gamma_surprisal,
         )
@@ -1734,10 +1747,21 @@ class LogKVLM(LM):
         table[ends] = True
         return table
 
-    def _set_gamma_query(self, prompt_tensor) -> None:
-        """Hand this request's closing question to the query-aware cue (one small host copy)."""
+    def _set_gamma_query(self, prompt_tensor, prompt_text=None) -> None:
+        """Detect visible task spans, or use the legacy closing-question cue when detection is off."""
         from litgpt.alpha_log_kv import CUE_QUERY_TOKENS, query_region
 
+        if getattr(self, "log_kv_gamma_query_detector", None):
+            from litgpt.query_detector import QueryDetector, cue_ids
+            if self._query_detector is None:
+                options = dict(self._query_detector_options)
+                if options.get("device") == "model":
+                    options["device"] = str(self._device)
+                self._query_detector = QueryDetector(self.log_kv_gamma_query_detector, **options)
+            text = self.tokenizer.decode(prompt_tensor) if prompt_text is None else prompt_text
+            spans = self._query_detector.detect(text)
+            self.model.set_gamma_queries([cue_ids(text, spans, self.tokenizer)])
+            return
         tail = prompt_tensor[-CUE_QUERY_TOKENS:].tolist()
         self.model.set_gamma_queries([query_region(tail, self._query_line_ends)])
 
@@ -1755,6 +1779,7 @@ class LogKVLM(LM):
         asked = [self.tokenizer.encode(q, device=self._device, bos=False) for q in questions]
         pending = self.tokenizer.encode(context, device=self._device)
         room = self.model.max_seq_length - sum(q.numel() for q in asked) - len(asked) * max_new_tokens
+        context_was_truncated = pending.numel() > room
         if pending.numel() > room:
             pending = pending[-max(room, 1):]
             self._warn_truncation("generate_until", pending.numel())
@@ -1763,7 +1788,11 @@ class LogKVLM(LM):
             self._set_eval_cache()
             if (getattr(self, "_query_line_ends", None) is not None
                     and getattr(self.model, "log_kv_cue_stream", None) is not None):
-                self.model.set_gamma_queries([None])
+                if getattr(self, "log_kv_gamma_query_detector", None):
+                    # Only the context visible at cache creation; never inspect future turns.
+                    self._set_gamma_query(pending, None if context_was_truncated else context)
+                else:
+                    self.model.set_gamma_queries([None])
             try:
                 for turn_index, question in enumerate(asked, start=1):
                     # The previous answer's last token has not been forwarded yet: it leads this chunk.
@@ -1863,7 +1892,7 @@ class LogKVLM(LM):
                 self._set_eval_cache()
                 if (getattr(self, "_query_line_ends", None) is not None
                         and getattr(self.model, "log_kv_cue_stream", None) is not None):
-                    self._set_gamma_query(prompt_tensor)
+                    self._set_gamma_query(prompt_tensor, prompt if prompt_token_offset == 0 else None)
                 try:
                     _synchronize_inference_device(self._device)
                     _reset_inference_peak_memory(self._device)
@@ -2091,6 +2120,9 @@ def main(
     # Gamma query-aware cue (off by default): the closing question of each generation prompt
     # (its last 64 tokens, after their first line end) is a cue too; literals then rank below cues.
     log_kv_gamma_query_cue: bool = False,
+    log_kv_gamma_query_detector: str | None = None,
+    log_kv_gamma_query_detector_options: dict | None = None,
+    log_kv_gamma_query_pool_tokens: int = 0,
     # niahLogKV learned retention heads (train_retention.py output); None = off. They score
     # Alpha's exact spans query-agnostically and hold no KV.
     log_kv_retention_heads: str | None = None,
@@ -2191,6 +2223,9 @@ def main(
     log_kv_gamma_literals = bool(_o("log_kv_gamma_literals", log_kv_gamma_literals))
     log_kv_gamma_cue_guard = bool(_o("log_kv_gamma_cue_guard", log_kv_gamma_cue_guard))
     log_kv_gamma_query_cue = bool(_o("log_kv_gamma_query_cue", log_kv_gamma_query_cue))
+    log_kv_gamma_query_detector = _o("log_kv_gamma_query_detector", log_kv_gamma_query_detector) or None
+    log_kv_gamma_query_detector_options = _o("log_kv_gamma_query_detector_options", log_kv_gamma_query_detector_options)
+    log_kv_gamma_query_pool_tokens = int(_o("log_kv_gamma_query_pool_tokens", log_kv_gamma_query_pool_tokens))
     log_kv_retention_heads = _o("log_kv_retention_heads", log_kv_retention_heads) or None
     log_kv_gamma_surprisal = _o("log_kv_gamma_surprisal", log_kv_gamma_surprisal) or None
     if not log_kv_semantic_clusters:
@@ -2201,6 +2236,8 @@ def main(
         log_kv_gamma_cue_tokens = 0
         log_kv_gamma_literals = False
         log_kv_gamma_query_cue = False
+        log_kv_gamma_query_detector = None
+        log_kv_gamma_query_pool_tokens = 0
         log_kv_retention_heads = None
         log_kv_gamma_surprisal = None
     if not (log_kv_gamma_cue_tokens or log_kv_gamma_query_cue):
@@ -2392,6 +2429,9 @@ def main(
             log_kv_gamma_literals=log_kv_gamma_literals,
             log_kv_gamma_cue_guard=log_kv_gamma_cue_guard,
             log_kv_gamma_query_cue=log_kv_gamma_query_cue,
+            log_kv_gamma_query_detector=log_kv_gamma_query_detector,
+            log_kv_gamma_query_detector_options=log_kv_gamma_query_detector_options,
+            log_kv_gamma_query_pool_tokens=log_kv_gamma_query_pool_tokens,
             log_kv_retention_heads=log_kv_retention_heads,
             log_kv_gamma_surprisal=log_kv_gamma_surprisal,
             tokenizer_dir=tokenizer_dir,
@@ -2577,6 +2617,11 @@ def main(
                     "log_kv_gamma_literals": log_kv_gamma_literals,
                     "log_kv_gamma_cue_guard": log_kv_gamma_cue_guard,
                     "log_kv_gamma_query_cue": log_kv_gamma_query_cue,
+                    "log_kv_gamma_query_detector": log_kv_gamma_query_detector,
+                    "log_kv_gamma_query_detector_options": log_kv_gamma_query_detector_options,
+                    "log_kv_gamma_query_pool_tokens": log_kv_gamma_query_pool_tokens,
+                    "query_detector_stats": (lm_model._query_detector.stats()
+                                             if getattr(lm_model, "_query_detector", None) is not None else None),
                     "log_kv_retention_heads": log_kv_retention_heads,
                     "log_kv_gamma_surprisal": log_kv_gamma_surprisal,
                     "log_kv_retention_tag": (lm_model._retention_heads.tag()
