@@ -9,77 +9,62 @@ GLiClass 每个评测 rank 懒加载一次，每个生成请求检测一次；�
 `niah_turns` 只检测缓存建立时可见的 context，不读取后续轮的问题。
 loglikelihood 和 PPL 路径不扫描待打分文本。原有配置的行为保持不变。
 
-## 1. 联网机准备普通文件和依赖
+## 1. 只下载必要模型文件
 
-联网机应与离线机使用相同 Python 版本、操作系统和 CPU 架构，以准备兼容的 wheel。
-以下命令在仓库根目录执行。已有合适的 PyTorch 时会直接复用它。
+在联网机的仓库根目录运行：
 
 ```bash
-python unused/prepare_query_detector.py --install-deps --wheels
+python unused/prepare_query_detector.py
 ```
 
-模型为 `knowledgator/gliclass-instruct-edge-v1.0`（32.7M）。脚本通过 HTTPS 直接把模型、
-tokenizer 和配置写成普通文件，不使用 Hub 的 snapshots/blob 软链接结构。
-默认固定到已验证的 commit `727be8a417f6a7718e591b025e07054c146d8139`，
-检查权重的上游 SHA256，并为所有交付文件生成 `bundle.json`。
-`--revision <commit>` 可指定固定版本；`--endpoint https://hf-mirror.com` 可更换访问入口。
-按当前环境要求，模型 API、权重下载和脚本内 pip 操作默认跳过 HTTPS 证书校验；
-`--verify-ssl` 恢复模型下载的证书校验，pip 恢复自身正常的证书配置。
-pip 会自动信任 PyPI、文件 CDN 和环境变量/pip 配置里的镜像主机；额外下载主机可加
-`--pip-trusted-host <hostname>`。这些设置只作用于本脚本的请求和子进程，不修改全局 SSL/pip 配置。
-文件的 SHA256 校验继续执行。
-文件通过复制而非 rename 发布，适用于不支持 rename 的普通对象存储挂载。
-
-`--wheels` 根据已安装的固定版本导出完整运行依赖闭包，并下载普通 wheel 文件。
-**不打包 PyTorch 及其 CUDA 依赖**，离线机继续使用已有的 `2.7 <= torch < 3` 环境。
-不使用 `--wheels` 时，模型下载和校验脚本仅需 Python 标准库。
-
-默认模型目录为：
+默认目录为：
 
 ```text
 /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
 ```
 
-下载器、smoke 工具和两份评测 YAML 使用同一默认位置，避免写到仓库的 `data/`。
-`--out <实际目录>` 仍可覆盖下载位置。目录包含 `model.safetensors`、`config.json`、`tokenizer.json`、tokenizer 配置、
-`bundle.json`、`detector-requirements.txt` 和 `wheels/`。将整个目录通过普通文件复制传到离线机。
-也可以打包后传输：
+仅下载四个运行文件：`model.safetensors`、`config.json`、`tokenizer.json`、`tokenizer_config.json`，
+并生成记录 SHA256 的 `bundle.json`。权重已有且与上游 SHA256 一致时直接复用。
+下载固定为 `knowledgator/gliclass-instruct-edge-v1.0` 的 commit
+`727be8a417f6a7718e591b025e07054c146d8139`；`--revision <commit>` 可显式覆盖。
+
+脚本只使用 Python 标准库，不调用 pip、不安装包、不下载 wheel、不改变任何依赖版本。
+旧的 `--install-deps`、`--wheels` 参数已移除，误用时会在下载之前报错。
+所有文件直接写入普通目录，不使用 Hub snapshots/blob 软链接；通过复制而非 rename 发布。
+默认跳过 HTTPS 证书校验，`--verify-ssl` 恢复；SHA256 文件校验始终执行。
+`--endpoint https://hf-mirror.com` 可更换入口，`--out <目录>` 可覆盖保存位置。
+
+将模型目录按普通文件复制到离线机即可。已下载的模型目录可以继续复用，其中旧的 wheel 文件
+不会被加载或安装，也不会被脚本自动删除。
+
+## 2. 复用现有依赖与离线检查
+
+本功能不需要安装外部 `gliclass` 包。`litgpt/gliclass_local.py` 提供仅推理适配层：
+使用现有 Transformers 的 ModernBERT 编码器，以及项目已有的 PyTorch、tokenizers、safetensors，
+读取本地权重并执行 GLiClass 的 segment embedding、投影、标签池化和分类头。
+模型参数严格加载；不匹配时明确报错，不静默改用随机参数。
+
+仓库原有 `transformers>=4.51.3,<4.57` 约束保持不变，不增加版本锁定的 detector extra。
+适配层固定使用 SDPA、关闭自动 compile，不要求额外的 Flash Attention 包。
+使用本地 JSON 构造 encoder 和 tokenizer，不访问远程基础编码器或 remote code。
+
+在现有评测环境中直接运行：
 
 ```bash
-CACHE_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
-tar -C "$CACHE_DIR" -czf "$CACHE_DIR/gliclass-instruct-edge.tar.gz" gliclass-instruct-edge
-```
-
-GLiClass 0.1.15 支持该权重需要的 segment embeddings；更新版 GLiClass 的依赖可能要求
-Transformers 5。这里固定到 Transformers 4.57.3，避免为此切换到 5.x。项目 extra 的兼容上限
-相应扩展到 `<4.58`；只开启本功能时才需要安装 `query-detector` extra。
-
-## 2. 离线机安装和检查
-
-解包或复制到实际路径后，运行：
-
-```bash
-MODEL_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
 python unused/prepare_query_detector.py --verify
-python -m pip install --no-index --findlinks "$MODEL_DIR/wheels" \
-  -r "$MODEL_DIR/detector-requirements.txt"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 python unused/query_detector_smoke.py
 ```
 
-加载器要求真实本地目录，拒绝 Hub ID、目录中的软链接和缺失文件；模型和 tokenizer 都使用
-`local_files_only=True`，不启用 remote code。模型内嵌 encoder config，无需另外下载基础编码器。
-加载缺失/额外/形状不匹配的权重时直接报错，不用随机初始化的头继续评测。
-
-可用自己的普通文本检查输出：
+下载器、smoke 工具和两份评测 YAML 使用同一默认目录。其他位置可显式指定：
 
 ```bash
-python unused/query_detector_smoke.py \
-  --text-file /data/sample_prompt.txt --device cuda:0
+python unused/query_detector_smoke.py --model-dir /actual/model/directory \
+  --text-file /actual/sample_prompt.txt --device cuda:0
 ```
 
-输出为片段起止字符、原文、分数和累计检测耗时。`--no-rules` 扫描所有片段，适合观察规则筛选的漏检。
+输出片段起止字符、原文、分数和累计检测耗时。`--no-rules` 扫描所有片段以检查规则漏检。
 
 ## 3. 评测入口
 
@@ -128,8 +113,9 @@ GPUS_PER_NODE=1 LIMIT=2 EVAL_LENGTHS=32k EVAL_SUITES=ruler,babilong,turns \
 
 ## 5. 已验证与限制
 
-已在 CPU 上完成普通文件模型下载、依赖打包、SHA256 校验，并在阻止 socket 连接的进程中
-验证本地模型加载和推理。软件测试覆盖全文中部定位、拒绝全部候选、原始 token 映射、
+已在 CPU 上完成普通文件模型下载、SHA256 校验和禁网加载/推理。
+本地适配层在隔离的 Transformers 4.51.3、4.56.2 环境验证，并与参考 GLiClass 实现
+比较真实权重的预测分数；这些兼容性检查不修改现有环境。软件测试覆盖全文中部定位、拒绝全部候选、原始 token 映射、
 双池重复保留、只归档一次、批次内不等长状态、分数预取和缓存 reset。
 
 该小模型未针对本项目训练。实际小样例中能识别直接问题和祈使任务，但也将记者引用的问题
