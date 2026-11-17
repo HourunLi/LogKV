@@ -9,6 +9,8 @@ from itertools import chain
 from pathlib import Path
 from time import perf_counter
 
+DEFAULT_MODEL_DIR = "/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge"
+
 LABELS = (
     "current question or instruction addressed to the assistant",
     "quoted question, dialogue, historical task or example inside the document",

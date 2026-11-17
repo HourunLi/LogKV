@@ -1,5 +1,11 @@
+import hashlib
 import importlib.util
+import io
 import json
+import ssl
+import subprocess
+import sys
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -75,3 +81,65 @@ def test_bundle_verifies_bytes_not_just_file_existence(tmp_path):
     artifact.write_bytes(b"wrong bytes")
     with pytest.raises(ValueError, match="corrupt"):
         module.verify(tmp_path)
+
+
+@pytest.mark.parametrize("verify_ssl", [False, True])
+def test_download_certificate_policy_covers_model_requests_pip_install_and_wheels(tmp_path, monkeypatch, verify_ssl):
+    path = Path(__file__).resolve().parents[1] / "unused/prepare_query_detector.py"
+    spec = importlib.util.spec_from_file_location("prepare_query_detector", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    files = {"config.json": b"{}", "model.safetensors": b"weights",
+             "tokenizer.json": b"{}", "tokenizer_config.json": b"{}"}
+    info = {"sha": "fixed-revision", "siblings": [
+        {"rfilename": name, "lfs": {"sha256": hashlib.sha256(content).hexdigest()}}
+        for name, content in files.items()]}
+    requests, commands = [], []
+
+    def urlopen(url, *, timeout, context):
+        requests.append(url)
+        assert context.check_hostname is verify_ssl
+        assert context.verify_mode == (ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE)
+        address = url.full_url if hasattr(url, "full_url") else url
+        body = json.dumps(info).encode() if "/api/models/" in address else files[
+            urllib.parse.urlsplit(address).path.rsplit("/", 1)[-1]]
+        return io.BytesIO(body)
+
+    def run(command, **kwargs):
+        commands.append(command)
+        if command[-2:] == ["config", "list"]:
+            return subprocess.CompletedProcess(command, 0, stdout="global.index-url='https://user:secret@mirror.example/simple'\n")
+        if "download" in command:
+            (tmp_path / "wheels" / "example.whl").write_bytes(b"wheel")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(module, "wheel_requirements", lambda: ["gliclass==0.1.15"])
+    monkeypatch.setenv("PIP_INDEX_URL", "https://env-mirror.example/simple")
+    monkeypatch.delenv("PIP_EXTRA_INDEX_URL", raising=False)
+    flags = ["--verify-ssl"] if verify_ssl else []
+    monkeypatch.setattr(sys, "argv", [str(path), "--out", str(tmp_path), "--install-deps", "--wheels", *flags])
+    module.main()
+    assert len(requests) == len(files) + 1
+    for command in commands:
+        if "install" not in command and "download" not in command:
+            continue
+        assert ("--trusted-host" not in command) is verify_ssl
+        if not verify_ssl:
+            assert {"pypi.org", "files.pythonhosted.org", "mirror.example", "env-mirror.example"} <= set(command)
+            assert all("user:secret" not in argument for argument in command)
+    assert (tmp_path / "model.safetensors").read_bytes() == b"weights"
+    module.verify(tmp_path)
+
+
+def test_download_and_smoke_default_to_the_requested_hf_cache():
+    from litgpt.query_detector import DEFAULT_MODEL_DIR
+
+    path = Path(__file__).resolve().parents[1] / "unused/prepare_query_detector.py"
+    spec = importlib.util.spec_from_file_location("prepare_query_detector", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert str(module.DEFAULT_MODEL_DIR) == DEFAULT_MODEL_DIR
+    assert DEFAULT_MODEL_DIR == (
+        "/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge")

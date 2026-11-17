@@ -15,27 +15,39 @@ loglikelihood 和 PPL 路径不扫描待打分文本。原有配置的行为保�
 以下命令在仓库根目录执行。已有合适的 PyTorch 时会直接复用它。
 
 ```bash
-python -m pip install 'gliclass==0.1.15' 'transformers==4.57.3'
-python unused/prepare_query_detector.py --out /data/gliclass-edge --wheels
+python unused/prepare_query_detector.py --install-deps --wheels
 ```
 
 模型为 `knowledgator/gliclass-instruct-edge-v1.0`（32.7M）。脚本通过 HTTPS 直接把模型、
 tokenizer 和配置写成普通文件，不使用 Hub 的 snapshots/blob 软链接结构。
 默认固定到已验证的 commit `727be8a417f6a7718e591b025e07054c146d8139`，
 检查权重的上游 SHA256，并为所有交付文件生成 `bundle.json`。
-`--revision <commit>` 可指定固定版本；`--endpoint https://hf-mirror.com` 可更换访问入口，保留 TLS 校验。
+`--revision <commit>` 可指定固定版本；`--endpoint https://hf-mirror.com` 可更换访问入口。
+按当前环境要求，模型 API、权重下载和脚本内 pip 操作默认跳过 HTTPS 证书校验；
+`--verify-ssl` 恢复模型下载的证书校验，pip 恢复自身正常的证书配置。
+pip 会自动信任 PyPI、文件 CDN 和环境变量/pip 配置里的镜像主机；额外下载主机可加
+`--pip-trusted-host <hostname>`。这些设置只作用于本脚本的请求和子进程，不修改全局 SSL/pip 配置。
+文件的 SHA256 校验继续执行。
 文件通过复制而非 rename 发布，适用于不支持 rename 的普通对象存储挂载。
 
 `--wheels` 根据已安装的固定版本导出完整运行依赖闭包，并下载普通 wheel 文件。
 **不打包 PyTorch 及其 CUDA 依赖**，离线机继续使用已有的 `2.7 <= torch < 3` 环境。
 不使用 `--wheels` 时，模型下载和校验脚本仅需 Python 标准库。
 
-目录包含 `model.safetensors`、`config.json`、`tokenizer.json`、tokenizer 配置、
+默认模型目录为：
+
+```text
+/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
+```
+
+下载器、smoke 工具和两份评测 YAML 使用同一默认位置，避免写到仓库的 `data/`。
+`--out <实际目录>` 仍可覆盖下载位置。目录包含 `model.safetensors`、`config.json`、`tokenizer.json`、tokenizer 配置、
 `bundle.json`、`detector-requirements.txt` 和 `wheels/`。将整个目录通过普通文件复制传到离线机。
 也可以打包后传输：
 
 ```bash
-tar -C /data -czf /data/gliclass-edge.tar.gz gliclass-edge
+CACHE_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
+tar -C "$CACHE_DIR" -czf "$CACHE_DIR/gliclass-instruct-edge.tar.gz" gliclass-instruct-edge
 ```
 
 GLiClass 0.1.15 支持该权重需要的 segment embeddings；更新版 GLiClass 的依赖可能要求
@@ -47,12 +59,13 @@ Transformers 5。这里固定到 Transformers 4.57.3，避免为此切换到 5.x
 解包或复制到实际路径后，运行：
 
 ```bash
-python unused/prepare_query_detector.py --out /data/gliclass-edge --verify
-python -m pip install --no-index --findlinks /data/gliclass-edge/wheels \
-  -r /data/gliclass-edge/detector-requirements.txt
+MODEL_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
+python unused/prepare_query_detector.py --verify
+python -m pip install --no-index --findlinks "$MODEL_DIR/wheels" \
+  -r "$MODEL_DIR/detector-requirements.txt"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-python unused/query_detector_smoke.py --model-dir /data/gliclass-edge
+python unused/query_detector_smoke.py
 ```
 
 加载器要求真实本地目录，拒绝 Hub ID、目录中的软链接和缺失文件；模型和 tokenizer 都使用
@@ -62,7 +75,7 @@ python unused/query_detector_smoke.py --model-dir /data/gliclass-edge
 可用自己的普通文本检查输出：
 
 ```bash
-python unused/query_detector_smoke.py --model-dir /data/gliclass-edge \
+python unused/query_detector_smoke.py \
   --text-file /data/sample_prompt.txt --device cuda:0
 ```
 
@@ -73,7 +86,7 @@ python unused/query_detector_smoke.py --model-dir /data/gliclass-edge \
 两个新增配置都继承现有相同模型大小的 `eval_full_word_first_query.yaml`，使用同一 checkpoint：
 
 ```bash
-export LOGKV_QUERY_DETECTOR_DIR=/data/gliclass-edge
+export LOGKV_QUERY_DETECTOR_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
 GPUS_PER_NODE=1 LIMIT=2 EVAL_LENGTHS=32k EVAL_SUITES=ruler,babilong,turns \
   bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query_detected.yaml
 ```
