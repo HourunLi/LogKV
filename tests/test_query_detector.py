@@ -2,15 +2,32 @@ import hashlib
 import importlib.util
 import io
 import json
-import ssl
 import sys
 import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from litgpt.query_detector import LABELS, QueryDetector, TaskSpan, candidates, cue_ids, validate_local_model
+
+
+def downloader():
+    path = Path(__file__).resolve().parents[1] / "unused/prepare_query_detector.py"
+    spec = importlib.util.spec_from_file_location("prepare_query_detector", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def download_response(url, body=b"", status=200, headers=None):
+    response = requests.Response()
+    response.status_code = status
+    response.url = url
+    response.headers.update(headers or {})
+    response.raw = io.BytesIO(body)
+    return response
 
 
 def test_detects_middle_of_long_input_preserving_offsets_and_rejecting_all():
@@ -91,30 +108,116 @@ def test_download_certificate_policy_covers_only_required_model_files(tmp_path, 
     files = {"config.json": b"{}", "model.safetensors": b"weights",
              "tokenizer.json": b"{}", "tokenizer_config.json": b"{}"}
     info = {"sha": "fixed-revision", "siblings": [
-        {"rfilename": name, "lfs": {"sha256": hashlib.sha256(content).hexdigest()}}
-        for name, content in files.items()]}
-    requests = []
+        {"rfilename": name, "size": len(content), "lfs": {"sha256": hashlib.sha256(content).hexdigest()}}
+        for name, content in files.items()] + [{"rfilename": "unused.bin", "size": 100}]}
+    calls = []
 
-    def urlopen(url, *, timeout, context):
-        requests.append(url)
-        assert context.check_hostname is verify_ssl
-        assert context.verify_mode == (ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE)
-        address = url.full_url if hasattr(url, "full_url") else url
-        assert address.startswith("https://hf-mirror.com/")
-        body = json.dumps(info).encode() if "/api/models/" in address else files[
-            urllib.parse.urlsplit(address).path.rsplit("/", 1)[-1]]
-        return io.BytesIO(body)
+    def get(session, url, *, timeout, verify, stream):
+        calls.append(url)
+        assert verify is verify_ssl and timeout == (60, 300)
+        assert session.headers["Cache-Control"] == "no-cache"
+        assert session.headers["Accept-Encoding"] == "identity"
+        assert url.startswith("https://hf-mirror.com/")
+        assert stream is ("/api/models/" not in url)
+        body = json.dumps(info).encode() if not stream else files[
+            urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]]
+        return download_response(url, body)
 
-    monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(requests.Session, "get", get)
     flags = ["--verify-ssl"] if verify_ssl else []
     monkeypatch.setattr(sys, "argv", [str(path), "--out", str(tmp_path), *flags])
     module.main()
-    assert len(requests) == len(files) + 1
+    assert len(calls) == len(files) + 1
     assert (tmp_path / "model.safetensors").read_bytes() == b"weights"
     module.verify(tmp_path)
     assert set(json.loads((tmp_path / "bundle.json").read_text())["sha256"]) == set(files)
     assert not (tmp_path / "wheels").exists()
     assert not (tmp_path / "detector-requirements.txt").exists()
+
+
+def test_403_refreshes_the_mirror_url_instead_of_reusing_signed_redirect(tmp_path, monkeypatch, capsys):
+    module = downloader()
+    url = "https://hf-mirror.com/repo/resolve/revision/model.safetensors"
+    calls, waits, responses = [], [], []
+    target = tmp_path / "model.safetensors.part"
+    target.write_bytes(b"previous partial download")
+
+    def get(address, **kwargs):
+        calls.append(address)
+        if len(calls) == 1:
+            response = download_response("https://cdn.example/weights?signature=secret", b"Forbidden", 403)
+        else:
+            assert target.read_bytes() == b"previous partial download"
+            response = download_response("https://cdn.example/weights?signature=new", b"weights")
+        responses.append(response)
+        return response
+
+    monkeypatch.setattr(module.time, "sleep", waits.append)
+    module.fetch(SimpleNamespace(get=get), url, target=target, expected_size=7,
+                 expected_hash=hashlib.sha256(b"weights").hexdigest(), retries=1)
+    assert calls[0] == url and calls[1].startswith(url + "?_logkv_retry=")
+    assert waits == [1] and target.read_bytes() == b"weights"
+    assert responses[0].raw.closed  # Release the rejected response before requesting a fresh redirect.
+    output = capsys.readouterr().out
+    assert "HTTP 403 from cdn.example" in output and "secret" not in output
+
+
+def test_429_obeys_retry_after_and_404_does_not_retry(tmp_path, monkeypatch):
+    module = downloader()
+    waits = []
+    responses = iter([download_response("https://hf-mirror.com/api", status=429, headers={"Retry-After": "7"}),
+                      download_response("https://hf-mirror.com/api", b'{"sha": "revision"}')])
+    monkeypatch.setattr(module.time, "sleep", waits.append)
+    assert module.fetch(SimpleNamespace(get=lambda *a, **k: next(responses)),
+                        "https://hf-mirror.com/api", retries=1) == {"sha": "revision"}
+    assert waits == [7]
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        module.fetch(SimpleNamespace(get=lambda *a, **k: download_response("https://hf-mirror.com/file", status=404)),
+                     "https://hf-mirror.com/file", target=tmp_path / "file.part", retries=5)
+    assert waits == [7] and not (tmp_path / "file.part").exists()
+
+
+@pytest.mark.parametrize("failure", ["stream", "size", "hash"])
+def test_failed_stream_and_integrity_errors_restart_partial_file(tmp_path, monkeypatch, failure):
+    module = downloader()
+    target = tmp_path / "model.part"
+    calls, waits = [], []
+
+    def broken_stream(**kwargs):
+        yield b"incomplete"
+        raise requests.exceptions.ChunkedEncodingError("https://cdn.example/?signature=secret")
+
+    def get(url, **kwargs):
+        calls.append(url)
+        response = download_response(url, b"weights" if len(calls) > 1 else b"badfile" if failure == "hash" else b"bad")
+        if len(calls) == 1 and failure == "stream":
+            response.iter_content = broken_stream
+        return response
+
+    monkeypatch.setattr(module.time, "sleep", waits.append)
+    module.fetch(SimpleNamespace(get=get), "https://hf-mirror.com/file", target=target,
+                 expected_size=7, expected_hash=hashlib.sha256(b"weights").hexdigest(), retries=1)
+    assert len(calls) == 2 and waits == [1] and target.read_bytes() == b"weights"
+
+
+def test_exhausted_403_is_bounded_and_preserves_completed_file(tmp_path, monkeypatch):
+    module = downloader()
+    target = tmp_path / "model.safetensors"
+    target.write_bytes(b"previous weights")
+    calls, waits = [], []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        return download_response("https://cdn.example/weights?signature=secret", b"Forbidden", 403)
+
+    monkeypatch.setattr(module.time, "sleep", waits.append)
+    names = [target.name, *sorted(module.REQUIRED_FILES - {target.name})]
+    info = {"sha": "fixed", "siblings": [{"rfilename": name} for name in names]}
+    with pytest.raises(RuntimeError, match="after 3 attempts: HTTP 403 from cdn.example"):
+        module.download_files(SimpleNamespace(get=get), info, tmp_path, "https://hf-mirror.com", {"retries": 2})
+    assert len(calls) == 3 and waits == [1, 2]
+    assert target.read_bytes() == b"previous weights"
+    assert not (tmp_path / "bundle.json").exists()
 
 
 @pytest.mark.parametrize("flag", ["--install-deps", "--wheels"])
