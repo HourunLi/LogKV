@@ -970,6 +970,16 @@ def _config_from_yaml_and_overrides(config_path: str, overrides: dict[str, Any] 
     return cfg
 
 
+def _config_for_evaluation(checkpoint_dir: str, overrides: dict[str, Any] | None = None,
+                           arch_name: str | None = None) -> Config:
+    """Prefer the saved architecture; use the explicit model name for legacy experiment directories."""
+    config_path = Path(checkpoint_dir) / "model_config.yaml"
+    if config_path.is_file():
+        return _config_from_yaml_and_overrides(str(config_path), overrides)
+    fallback = {"name": arch_name or Path(checkpoint_dir).name, **(overrides or {})}
+    return Config.from_name(**_filter_config_dict(fallback))
+
+
 # ==========================================
 # 🧩 logKV 专属：YAML --config 机制（与 demo.py 相同约定：
 # YAML 非 null 值覆盖 CLI；支持 "config:" 继承）
@@ -1224,6 +1234,7 @@ class LogKVLM(LM):
         log_kv_gamma_surprisal: str | None = None,
         tokenizer_dir: str | None = None,
         process_group=None,
+        arch_name: str | None = None,
     ):
         super().__init__()
         self.process_group = process_group
@@ -1303,14 +1314,9 @@ class LogKVLM(LM):
 
         if os.path.exists(config_path):
             if is_master: print(f"📄 发现专属架构 YAML 配置文件: {config_path}，正在自动同步架构...")
-            self.config = _config_from_yaml_and_overrides(config_path, config_overrides)
         else:
-            if is_master: print("⚠️ 未发现训练期保存的 YAML 配置文件，正在使用备用参数初始化...")
-            fallback_kw: dict[str, Any] = {"name": checkpoint_dir.split("/")[-1]}
-            if config_overrides:
-                fallback_kw.update(config_overrides)
-            fallback_kw = _filter_config_dict(fallback_kw)
-            self.config = Config.from_name(**fallback_kw)
+            if is_master: print("⚠️ 未发现训练期保存的 YAML 配置文件，使用显式架构名或已注册的目录名初始化...")
+        self.config = _config_for_evaluation(checkpoint_dir, config_overrides, arch_name)
 
         chunk = _configure_inference_memory(self.config, config_overrides)
         if is_master:
@@ -2163,6 +2169,8 @@ def main(
     log_kv_diag_second_order_max_layer: int | None = None,
     # ── 🧩 logKV：YAML config ──
     config: str | None = None,
+    # Base architecture for legacy checkpoints without model_config.yaml; never inferred from experiment tags.
+    arch_name: str | None = None,
 ):
     # ── 🧩 logKV：加载 YAML config（非 null 值覆盖 CLI，同 demo.py 约定）──
     # NOTE: `locals()[k] = v` does NOT write back to a function's real locals in
@@ -2190,6 +2198,7 @@ def main(
         return v if v is not None else current
 
     checkpoint_dir = _o("checkpoint_dir", checkpoint_dir)
+    arch_name = _o("arch_name", arch_name)
     benchmark = _o("benchmark", benchmark)
     config_overrides = _o("config_overrides", config_overrides)
     output_path = _o("output_path", output_path)
@@ -2389,6 +2398,7 @@ def main(
             checkpoint_dir,
             device=device,
             config_overrides=config_overrides,
+            arch_name=arch_name,
             log_kv_B=log_kv_B,
             log_kv_recent_size=log_kv_recent_size,
             log_kv_prefill_block=log_kv_prefill_block,
