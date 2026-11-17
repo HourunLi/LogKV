@@ -28,12 +28,19 @@ python unused/prepare_query_detector.py
 下载固定为 `knowledgator/gliclass-instruct-edge-v1.0` 的 commit
 `727be8a417f6a7718e591b025e07054c146d8139`；`--revision <commit>` 可显式覆盖。
 
-脚本只使用 Python 标准库，不调用 pip、不安装包、不下载 wheel、不改变任何依赖版本。
+下载沿用 `unused/long_eval_download.py` 的现有 `requests` 流式方式；离线 `--verify` 只需标准库。
+不调用 pip、不安装包、不下载 wheel、不改变任何依赖版本。
 旧的 `--install-deps`、`--wheels` 参数已移除，误用时会在下载之前报错。
 所有文件直接写入普通目录，不使用 Hub snapshots/blob 软链接；通过复制而非 rename 发布。
 默认跳过 HTTPS 证书校验，`--verify-ssl` 恢复；SHA256 文件校验始终执行。
-下载默认使用 `https://hf-mirror.com`，元数据和模型文件请求均走镜像，不自动回退官方站点。
+下载默认从 `https://hf-mirror.com` 发起，跟随镜像返回的 Hub/CDN 重定向，不另行切换官方 endpoint。
 `--endpoint <镜像地址>` 可显式更换镜像，`--out <目录>` 可覆盖保存位置。
+
+重定向后返回 403 时，从镜像原始地址重新请求，并添加防缓存参数以重新获取下载地址；
+429 按 `Retry-After` 等待，网络中断、临时服务错误和大小/SHA256 不符也会重试。
+默认最多重试 5 次（`--retries N` 可改）；每次失败重下临时文件，校验通过才复制到正式文件。
+日志只显示错误类型和主机，不输出带签名的下载链接。若所有重试仍为 403，会明确报错，
+不会把拒绝访问页面当模型文件保存；持续的服务端访问限制仍需由镜像/网络侧解决。
 
 将模型目录按普通文件复制到离线机即可。已下载的模型目录可以继续复用，其中旧的 wheel 文件
 不会被加载或安装，也不会被脚本自动删除。
