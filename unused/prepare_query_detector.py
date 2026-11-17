@@ -1,8 +1,7 @@
-"""Download a relocatable GLiClass bundle as ordinary files, optionally with offline wheels.
+"""Download only the GLiClass model artifacts as ordinary files; never install or change packages.
 
-Online: python unused/prepare_query_detector.py --install-deps --wheels
+Online: python unused/prepare_query_detector.py
 Offline: python unused/prepare_query_detector.py --verify
-Use the same Python/platform on the online and offline machines when preparing wheels.
 The default directory is hf_cache/gliclass-instruct-edge under the training platform bucket.
 HTTPS certificate verification is disabled by default; --verify-ssl enables it.
 """
@@ -10,13 +9,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.metadata
 import json
-import os
 import shutil
 import ssl
-import subprocess
-import sys
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -24,7 +19,7 @@ from pathlib import Path
 MODEL_ID = "knowledgator/gliclass-instruct-edge-v1.0"
 MODEL_REVISION = "727be8a417f6a7718e591b025e07054c146d8139"
 DEFAULT_MODEL_DIR = Path("/workspace/data/hf_cache/gliclass-instruct-edge")
-VERSIONS = {"gliclass": "0.1.15", "transformers": "4.57.3"}
+REQUIRED_FILES = {"config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"}
 
 
 def sha256(path):
@@ -53,31 +48,6 @@ def verify(root):
     print(f"Verified {len(manifest['sha256'])} ordinary files, revision {manifest['revision']}")
 
 
-def wheel_requirements():
-    """Export the installed runtime dependency closure, reusing the target's existing PyTorch."""
-    from packaging.requirements import Requirement
-    from packaging.utils import canonicalize_name
-
-    for name, expected in VERSIONS.items():
-        if importlib.metadata.version(name) != expected:
-            raise ValueError(f"prepare wheels with {name}=={expected}")
-    pending, found = list(VERSIONS), {}
-    while pending:
-        name = canonicalize_name(pending.pop())
-        if name == "torch" or name in found:
-            continue
-        dist = importlib.metadata.distribution(name)
-        found[name] = dist.version
-        for raw in dist.requires or ():
-            req = Requirement(raw)
-            if req.marker is None or req.marker.evaluate({"extra": ""}):
-                if canonicalize_name(req.name) != "torch":
-                    if not req.specifier.contains(importlib.metadata.version(req.name), prereleases=True):
-                        raise ValueError(f"installed dependency does not satisfy {raw}")
-                    pending.append(req.name)
-    return [f"{name}=={version}" for name, version in sorted(found.items())]
-
-
 def ssl_context(verify_ssl=False):
     if verify_ssl:
         return ssl.create_default_context()
@@ -87,36 +57,12 @@ def ssl_context(verify_ssl=False):
     return context
 
 
-def pip_tls_args(verify_ssl=False, extra_hosts=()):
-    """Skip verification for PyPI and configured mirror hosts only within these pip commands."""
-    if verify_ssl:
-        return []
-    hosts = {"pypi.org", "pypi.python.org", "files.pythonhosted.org", *extra_hosts}
-    indexes = [os.environ.get("PIP_INDEX_URL", ""), os.environ.get("PIP_EXTRA_INDEX_URL", "")]
-    config = subprocess.run([sys.executable, "-m", "pip", "config", "list"],
-                            capture_output=True, text=True, check=True)
-    # Capture config privately: index URLs may contain credentials. Only pass hostnames to pip.
-    for line in config.stdout.splitlines():
-        key, sep, value = line.partition("=")
-        if sep and key.endswith("index-url"):
-            indexes.append(value.strip("'\""))
-    for index in indexes:
-        for url in index.split():
-            host = urllib.parse.urlsplit(url).hostname
-            if host:
-                hosts.add(host)
-    return [arg for host in sorted(hosts) for arg in ("--trusted-host", host)]
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--endpoint", default="https://huggingface.co")
     parser.add_argument("--revision", default=MODEL_REVISION)
-    parser.add_argument("--wheels", action="store_true")
-    parser.add_argument("--install-deps", action="store_true", help="install fixed detector packages before export")
     parser.add_argument("--verify-ssl", action="store_true", help="enable HTTPS certificate verification")
-    parser.add_argument("--pip-trusted-host", action="append", default=[], help="additional pip download/CDN hostname")
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
     root = args.out.expanduser().absolute()
@@ -126,10 +72,6 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
     regular_tree(root)
     context = ssl_context(args.verify_ssl)
-    pip_args = pip_tls_args(args.verify_ssl, args.pip_trusted_host) if args.install_deps or args.wheels else []
-    if args.install_deps:
-        subprocess.run([sys.executable, "-m", "pip", "install", *pip_args,
-                        *(f"{name}=={version}" for name, version in VERSIONS.items())], check=True)
     endpoint = args.endpoint.rstrip("/")
     request = urllib.request.Request(
         f"{endpoint}/api/models/{MODEL_ID}/revision/{urllib.parse.quote(args.revision, safe='')}?blobs=true",
@@ -138,10 +80,8 @@ def main():
     with urllib.request.urlopen(request, timeout=60, context=context) as response:
         info = json.load(response)
     revision = info["sha"]
-    wanted = {"config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json",
-              "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt"}
-    files = {entry["rfilename"]: entry for entry in info["siblings"] if entry["rfilename"] in wanted}
-    missing = {"config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"} - files.keys()
+    files = {entry["rfilename"]: entry for entry in info["siblings"] if entry["rfilename"] in REQUIRED_FILES}
+    missing = REQUIRED_FILES - files.keys()
     if missing:
         raise ValueError(f"model repository missing required artifacts: {sorted(missing)}")
     for name, entry in files.items():
@@ -160,18 +100,10 @@ def main():
         # Copy rather than rename/link: also works on ordinary object-store mounts.
         shutil.copyfile(temp, target)
         temp.unlink()
-    if args.wheels:
-        requirements = root / "detector-requirements.txt"
-        requirements.write_text("\n".join(wheel_requirements()) + "\n")
-        wheels = root / "wheels"
-        wheels.mkdir(exist_ok=True)
-        subprocess.run([sys.executable, "-m", "pip", "download", "--no-deps", "--only-binary=:all:",
-                        *pip_args, "--dest", str(wheels), "-r", str(requirements)], check=True)
     regular_tree(root)
-    hashes = {p.relative_to(root).as_posix(): sha256(p) for p in root.rglob("*")
-              if p.is_file() and p.name != "bundle.json"}
+    hashes = {name: sha256(root / name) for name in files}
     (root / "bundle.json").write_text(json.dumps(
-        {"model_id": MODEL_ID, "revision": revision, "packages": VERSIONS, "sha256": hashes}, indent=2) + "\n")
+        {"model_id": MODEL_ID, "revision": revision, "sha256": hashes}, indent=2) + "\n")
     verify(root)
 
 

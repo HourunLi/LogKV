@@ -99,22 +99,8 @@ class QueryDetector:
         root = validate_local_model(model_dir)
         if (root / "bundle.json").is_file():
             self.revision = json.loads((root / "bundle.json").read_text()).get("revision")
-        try:
-            from gliclass import GLiClassModel, ZeroShotClassificationPipeline
-            from transformers import AutoTokenizer
-        except ImportError as exc:
-            raise ImportError("install the offline GLiClass wheel bundle; see docs/query-detector.md") from exc
-        # Embedded encoder config initializes architecture locally; all weights come from this directory.
-        model, info = GLiClassModel.from_pretrained(
-            str(root), local_files_only=True, output_loading_info=True,
-        )
-        if info.get("missing_keys") or info.get("unexpected_keys") or info.get("mismatched_keys"):
-            raise RuntimeError(f"incompatible GLiClass package/checkpoint: {info}")
-        tokenizer = AutoTokenizer.from_pretrained(str(root), local_files_only=True, trust_remote_code=False)
-        self.pipeline = ZeroShotClassificationPipeline(
-            model.eval(), tokenizer, classification_type="multi-label", device=str(device),
-            max_length=1024, progress_bar=False,
-        )
+        from litgpt.gliclass_local import LocalGLiClassPipeline
+        self.pipeline = LocalGLiClassPipeline(root, device=device)
         self.load_seconds = perf_counter() - started
 
     def detect(self, text: str) -> list[TaskSpan]:
