@@ -25,13 +25,14 @@ every node when HF_HOME is, else ~/.cache/logkv_long_ppl).
 """
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import math
 import os
 import shutil
+import tempfile
 import time
+import warnings
 from pathlib import Path
 
 import datasets
@@ -173,6 +174,30 @@ def _tokenizer(kwargs):
     return name, AutoTokenizer.from_pretrained(name, trust_remote_code=True)
 
 
+def _write_selection_cache(cache: Path, docs: list[list[int]]) -> None:
+    """Stage outside the bucket; optional publication never uses shared PID-only temp names."""
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="logkv-ppl-", suffix=".json") as tmp:
+            json.dump(docs, tmp)
+            tmp.flush()
+            # mkdir success need not make a bucket directory immediately visible to open() on this node.
+            for attempt in range(3):
+                try:
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(tmp.name, cache)  # ordinary files; no bucket rename or symlink required
+                    return
+                except FileNotFoundError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
+    except OSError as error:
+        warnings.warn(
+            f"PPL selection cache could not be saved to {cache}: {error}. "
+            "Continuing with the selected documents; set LONG_PPL_CACHE to a writable node-local directory "
+            "to reuse them across curve points.", RuntimeWarning, stacklevel=2,
+        )
+
+
 def _documents(kwargs, longest: int | None = None, env: str = "LONG_PPL_DATA", progress=None) -> list[list[int]]:
     source = os.environ.get(env)
     if not source:
@@ -186,30 +211,20 @@ def _documents(kwargs, longest: int | None = None, env: str = "LONG_PPL_DATA", p
     longest = longest or LONGEST
     key = cache_key(source, name, count, concat, longest)
     cache = cache_dir() / f"{key}.json"
-    if cache.is_file():
-        try:
-            report(f"PPL read selection cache: {cache}")
-            return json.loads(cache.read_text())
-        except ValueError:  # another rank is still copying it (see below): build it here too
-            pass
+    try:
+        report(f"PPL read selection cache: {cache}")
+        with cache.open(encoding="utf-8") as stream:
+            return json.load(stream)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as error:  # unavailable cache or a concurrent incomplete copy
+        report(f"PPL selection cache unavailable ({cache}): {error}; selecting from source")
     docs = select_documents(source, tokenizer, count, concat, longest, progress=progress)
     if not docs:
         raise ValueError(f"no document of {longest} tokens or more in {source!r}; if its rows are pieces of longer "
                          "texts, set LONG_PPL_CONCAT=1")
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache.with_suffix(f".{os.getpid()}.tmp")
     report(f"PPL write selection cache: {len(docs)} documents -> {cache}")
-    tmp.write_text(json.dumps(docs))
-    try:
-        if longest >= LONGEST_1M:
-            shutil.copyfile(tmp, cache)  # object mounts need no rename support for the new large caches
-            tmp.unlink()
-        else:
-            os.replace(tmp, cache)  # several ranks may build it at once
-    except OSError:  # a bucket mount (OBS) refuses the rename: copy the complete file over, then drop it
-        shutil.copyfile(tmp, cache)
-        with contextlib.suppress(OSError):
-            tmp.unlink()
+    _write_selection_cache(cache, docs)
     return docs
 
 
