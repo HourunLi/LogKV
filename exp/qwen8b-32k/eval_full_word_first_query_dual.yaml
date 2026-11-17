@@ -1,0 +1,7 @@
+# Fixed 512+512 pools on the same checkpoint; legacy closing-query extraction, no detector.
+config: eval_full_word_first_query.yaml
+eval_tag: full_word_first_query_dual
+log_kv_gamma_cue_tokens: 0
+log_kv_gamma_query_pool_tokens: 512
+log_kv_gamma_query_detector: null
+log_kv_gamma_query_detector_options: {}
