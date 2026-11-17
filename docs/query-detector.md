@@ -32,7 +32,8 @@ python unused/prepare_query_detector.py
 旧的 `--install-deps`、`--wheels` 参数已移除，误用时会在下载之前报错。
 所有文件直接写入普通目录，不使用 Hub snapshots/blob 软链接；通过复制而非 rename 发布。
 默认跳过 HTTPS 证书校验，`--verify-ssl` 恢复；SHA256 文件校验始终执行。
-`--endpoint https://hf-mirror.com` 可更换入口，`--out <目录>` 可覆盖保存位置。
+下载默认使用 `https://hf-mirror.com`，元数据和模型文件请求均走镜像，不自动回退官方站点。
+`--endpoint <镜像地址>` 可显式更换镜像，`--out <目录>` 可覆盖保存位置。
 
 将模型目录按普通文件复制到离线机即可。已下载的模型目录可以继续复用，其中旧的 wheel 文件
 不会被加载或安装，也不会被脚本自动删除。

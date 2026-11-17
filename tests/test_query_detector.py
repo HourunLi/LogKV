@@ -100,6 +100,7 @@ def test_download_certificate_policy_covers_only_required_model_files(tmp_path, 
         assert context.check_hostname is verify_ssl
         assert context.verify_mode == (ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE)
         address = url.full_url if hasattr(url, "full_url") else url
+        assert address.startswith("https://hf-mirror.com/")
         body = json.dumps(info).encode() if "/api/models/" in address else files[
             urllib.parse.urlsplit(address).path.rsplit("/", 1)[-1]]
         return io.BytesIO(body)
