@@ -60,7 +60,7 @@ def ssl_context(verify_ssl=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DEFAULT_MODEL_DIR)
-    parser.add_argument("--endpoint", default="https://huggingface.co")
+    parser.add_argument("--endpoint", default="https://hf-mirror.com")
     parser.add_argument("--revision", default=MODEL_REVISION)
     parser.add_argument("--verify-ssl", action="store_true", help="enable HTTPS certificate verification")
     parser.add_argument("--verify", action="store_true")
