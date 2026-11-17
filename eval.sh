@@ -229,6 +229,7 @@ for path in (tokenizer_dir, resume_dir, ckpt_dir, os.path.join("checkpoints", ar
         candidates.append(path)
 
 emit("SAVE_DIR", save_dir)
+emit("EVAL_ARCH_NAME", cfg.get("arch_name") or "")
 emit("EVAL_OUTPUT_DIR", output_path)
 emit("CONFIG_BENCHMARKS", benchmark)
 emit("LOG_KV_B", value_or("log_kv_B", 512))
@@ -432,6 +433,9 @@ for TOK_DIR in "${TOKENIZER_CANDIDATE_ARRAY[@]}"; do
 done
 
 LOG_KV_ARG_LIST=(--log_kv_dense_mode "${LOG_KV_DENSE_MODE}" --log_kv_B "${LOG_KV_B}" --log_kv_recent_size "${LOG_KV_RECENT}" --log_kv_prefill_block "${LOG_KV_PREFILL}")
+if [ -n "${EVAL_ARCH_NAME}" ]; then
+    LOG_KV_ARG_LIST+=(--arch_name "${EVAL_ARCH_NAME}")
+fi
 if [ -n "${LOG_KV_SECOND_ORDER_SCALE}" ]; then
     LOG_KV_ARG_LIST+=(--log_kv_second_order_scale "${LOG_KV_SECOND_ORDER_SCALE}")
 fi

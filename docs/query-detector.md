@@ -78,6 +78,10 @@ python unused/query_detector_smoke.py --model-dir /actual/model/directory \
 
 两个新增配置都继承现有相同模型大小的 `eval_full_word_first_query.yaml`，使用同一 checkpoint：
 
+checkpoint 的 `model_config.yaml` 优先定义架构；旧 checkpoint 缺此文件时，`eval.sh` 将继承配置中的
+`arch_name` 传入评测（1.7B / 8B 分别为 `Qwen/Qwen3-1.7B-Base` / `Qwen/Qwen3-8B-Base`），
+不会把 `qwen1.7b-32k-gamma_k12_b128_p1024_2k` 这类实验目录名当作模型架构。
+
 ```bash
 export LOGKV_QUERY_DETECTOR_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
 GPUS_PER_NODE=1 LIMIT=2 EVAL_LENGTHS=32k EVAL_SUITES=ruler,babilong,turns \
