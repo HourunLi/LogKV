@@ -583,6 +583,7 @@ class GPT(nn.Module):
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
         gamma_query_cue: bool = False,
+        gamma_query_pool_tokens: int = 0,
         retention_head: bool = False,
         gamma_surprisal: str | None = None,
     ) -> None:
@@ -687,6 +688,7 @@ class GPT(nn.Module):
                 gamma_literals=gamma_literals,
                 gamma_cue_guard=gamma_cue_guard,
                 gamma_query_cue=gamma_query_cue,
+                gamma_query_pool_tokens=gamma_query_pool_tokens,
                 retention_head=retention_head,
                 cos_cache=cos_cache,
                 sin_cache=sin_cache,
@@ -695,6 +697,8 @@ class GPT(nn.Module):
             block.attn.log_kv_prefill_block = prefill_block
             block.attn.log_kv_second_order_scale = float(second_order_scale)
         self._attach_gamma_streams(gamma_cue_tokens, gamma_literals, gamma_cue_guard, gamma_query_cue)
+        if gamma_query_pool_tokens and (gamma_surprisal != "word_first" or not gamma_query_cue):
+            raise ValueError("fixed dual pools require gamma_surprisal=word_first and gamma_query_cue=true")
         self._attach_surprisal_stream(gamma_surprisal, alpha_exact_tokens, recent_size, semantic_flush_granularity)
 
         # Drop any pre-existing mask_cache from prior set_kv_cache calls to avoid
@@ -1691,6 +1695,7 @@ class CausalSelfAttention(nn.Module):
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
         gamma_query_cue: bool = False,
+        gamma_query_pool_tokens: int = 0,
         retention_head: bool = False,
     ) -> "LogStructuredKVCache":
         """Build a log-structured KV cache with strict O(B * log(N)) memory.
@@ -1768,6 +1773,7 @@ class CausalSelfAttention(nn.Module):
             gamma_literals=gamma_literals,
             gamma_cue_guard=gamma_cue_guard,
             gamma_query_cue=gamma_query_cue,
+            gamma_query_pool_tokens=gamma_query_pool_tokens,
             retention_head=retention_head,
             cos_cache=cos_cache,
             sin_cache=sin_cache,

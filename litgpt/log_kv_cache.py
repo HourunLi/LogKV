@@ -733,6 +733,7 @@ class LogStructuredKVCache(nn.Module):
         gamma_literals: bool = False,
         gamma_cue_guard: bool = False,
         gamma_query_cue: bool = False,
+        gamma_query_pool_tokens: int = 0,
         retention_head: bool = False,
     ) -> None:
         super().__init__()
@@ -773,6 +774,14 @@ class LogStructuredKVCache(nn.Module):
         # Query-aware cue: the question of each request joins the model's CueStream
         # (CueStream(0) when there is no opening region).
         self.gamma_query_cue = bool(gamma_query_cue)
+        self.gamma_query_pool_tokens = int(gamma_query_pool_tokens)
+        if self.gamma_query_pool_tokens:
+            if (not gamma_query_cue or not semantic_clusters or
+                    min(self.gamma_query_pool_tokens, alpha_exact_tokens - self.gamma_query_pool_tokens)
+                    < alpha_span_max_tokens):
+                raise ValueError("fixed dual pools need query_cue and each quota >= alpha_span_max_tokens")
+        if self.gamma_query_pool_tokens < 0:
+            raise ValueError("gamma_query_pool_tokens must be >= 0")
         if self.gamma_query_cue and not alpha_exact_tokens:
             raise ValueError("gamma_query_cue scores Alpha's exact spans; it requires alpha_exact_tokens > 0")
         # The model's CueStream applies the guard; the cache checks it matches.
@@ -783,6 +792,8 @@ class LogStructuredKVCache(nn.Module):
         # literal (digit strings, codes) gain exact-pool value; the model owns
         # the shared LiteralStream like the CueStream.
         self.gamma_literals = bool(gamma_literals)
+        if self.gamma_query_pool_tokens and self.gamma_literals:
+            raise ValueError("fixed word/query pools do not mix in the optional literal stream")
         self.literal_stream = None
         # niahLogKV surprisal admission ("mean" | "top4" | None): GPT.set_log_kv_cache sets it
         # with the model's SurprisalStream after building the cache (eval-only; not in training).
@@ -1005,9 +1016,11 @@ class LogStructuredKVCache(nn.Module):
             self.register_buffer("alpha_valid", torch.zeros(batch_size, P, device=device, dtype=torch.bool), persistent=False)
             self._alpha_spans = [[] for _ in range(batch_size)]
             self._alpha_positions = [[] for _ in range(batch_size)]
+            self._alpha_dual_spans = [[[] for _ in range(batch_size)] for _ in range(2)]
             self._recent_span_ends = [[False] * self.recent_capacity for _ in range(batch_size)]
             self._UPDATE_DEVICE_FIELDS = (*self._UPDATE_DEVICE_FIELDS, "alpha_k_raw", "alpha_v", "alpha_pos", "alpha_valid")
             self._UPDATE_HOST_FIELDS = (*self._UPDATE_HOST_FIELDS, "_alpha_spans", "_alpha_positions", "alpha_count")
+            self._UPDATE_HOST_FIELDS = (*self._UPDATE_HOST_FIELDS, "_alpha_dual_spans")
 
         # ---- Hierarchical entries: (B, G, K_max, L_alloc, B', ·) ----
         # K_max=1 is the current single-cluster path; the indexed layout is the
@@ -4128,13 +4141,19 @@ class LogStructuredKVCache(nn.Module):
         positions_host = [row[:take] for row in self._recent_pos_host]
         span_ends = [row[:take] for row in self._recent_span_ends]
         width = self.alpha_count
-        cut = cut_spans(self._alpha_spans, self._alpha_positions, positions_host, span_ends,
-                        width, self.alpha_span_max_tokens)
+        if self.gamma_query_pool_tokens:
+            from litgpt.dual_exact import cut_dual_spans
+            cut = cut_dual_spans(self._alpha_dual_spans, self._alpha_positions, positions_host, span_ends,
+                                 width, self.alpha_span_max_tokens)
+        else:
+            cut = cut_spans(self._alpha_spans, self._alpha_positions, positions_host, span_ends,
+                            width, self.alpha_span_max_tokens)
         if cut is None:
             return
         keys = torch.cat((self.alpha_k_raw[:, :, :width], self.recent_k_raw[:, :, :take]), dim=2)
         values = torch.cat((self.alpha_v[:, :, :width], self.recent_v[:, :, :take]), dim=2)
-        device_scores = score_spans(keys, values, cut, beta_novelty=self.beta_novelty,
+        device_scores = score_spans(keys, values, cut.merged if self.gamma_query_pool_tokens else cut,
+                                    beta_novelty=self.beta_novelty,
                                     centroids=self.centroid, centroid_valid=self.alive,
                                     retention=self._retention_for_selection())
         scores = torch.empty(device_scores.shape, dtype=torch.float32, pin_memory=cuda)
@@ -4226,7 +4245,22 @@ class LogStructuredKVCache(nn.Module):
             pos = torch.cat((self.alpha_pos[:, :old_width], positions), dim=1)
             with logkv_timed("alpha_select"):
                 prefetched = self._alpha_take_prefetch(old_width, positions_host, span_ends)
-                if prefetched is not None:
+                if self.gamma_query_pool_tokens:
+                    from litgpt.alpha_log_kv import score_spans
+                    from litgpt.dual_exact import cut_dual_spans, choose_dual_spans
+                    if prefetched is not None:
+                        cut, scores = prefetched
+                    else:
+                        cut = cut_dual_spans(self._alpha_dual_spans, self._alpha_positions, positions_host,
+                                             span_ends, old_width, self.alpha_span_max_tokens)
+                        scores = score_spans(keys, values, cut.merged, beta_novelty=self.beta_novelty,
+                                             centroids=self.centroid, centroid_valid=self.alive,
+                                             retention=self._retention_for_selection()).cpu().tolist()
+                    stops = [row[-1] + 1 if len(row) else 0 for row in positions_host]
+                    selected, self._alpha_dual_spans = choose_dual_spans(
+                        cut, scores, self.alpha_exact_tokens, self.gamma_query_pool_tokens,
+                        self.surprisal_stream, self.cue_stream, stops)
+                elif prefetched is not None:
                     cut, scores = prefetched
                     if cues is not None:
                         scores = add_cue_values(cut, scores, *cues)
@@ -5287,7 +5321,7 @@ class LogStructuredKVCache(nn.Module):
                          self.alpha_exact_tokens, self.alpha_span_max_tokens,
                          self.beta_novelty, self.beta_adaptive_merge,
                          self.gamma_level0_reinsert, self.gamma_top_merge, self.gamma_level_slack,
-                         self.gamma_cue_tokens, self.gamma_literals, self.gamma_cue_guard, self.gamma_query_cue,
+                         self.gamma_cue_tokens, self.gamma_literals, self.gamma_cue_guard, self.gamma_query_cue, self.gamma_query_pool_tokens,
                          self.retention_head, self._retention_tag,
                          tuple(map(tuple, kwargs.get("span_ends") or ())))
             if self._replaying_updates:
@@ -6613,6 +6647,7 @@ class LogStructuredKVCache(nn.Module):
                 getattr(self, name).zero_()
             self._alpha_spans = [[] for _ in range(self.batch_size)]
             self._alpha_positions = [[] for _ in range(self.batch_size)]
+            self._alpha_dual_spans = [[[] for _ in range(self.batch_size)] for _ in range(2)]
             self._recent_span_ends = [[False] * self.recent_capacity for _ in range(self.batch_size)]
             self._alpha_prefetch = None
         self._route_ready = None
@@ -6694,6 +6729,9 @@ class LogStructuredKVCache(nn.Module):
                 "semantic_clusters": True,
                 "alpha_exact_tokens": self.alpha_exact_tokens,
                 "alpha_visible_slots": self.alpha_count,
+                "gamma_query_pool_tokens": self.gamma_query_pool_tokens,
+                "alpha_unique_tokens": [len(set(row)) for row in self._alpha_positions]
+                                       if self.alpha_exact_tokens else [],
                 "effective_B": self.B,
                 "target_tokens_per_cluster": target,
                 "K_max_binding_rate": float((live_counts >= self.K_max).to(torch.float32).mean().item()),
@@ -7265,7 +7303,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
             cache.alpha_exact_tokens, cache.alpha_span_max_tokens, ctx.span_ends,
             cache.beta_novelty, cache.beta_adaptive_merge,
             cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack, cache.gamma_cue_tokens,
-            cache.gamma_literals, cache.gamma_cue_guard, cache.gamma_query_cue,
+            cache.gamma_literals, cache.gamma_cue_guard, cache.gamma_query_cue, cache.gamma_query_pool_tokens,
             cache.retention_head, cache._retention_tag,
         )
         checkpoint_log = checkpoint_route_replay(cache, signature)
@@ -7346,7 +7384,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                              cache.beta_novelty, cache.beta_adaptive_merge,
                              cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack,
                              cache.gamma_cue_tokens, cache.gamma_literals, cache.gamma_cue_guard,
-                             cache.gamma_query_cue, cache.retention_head, cache._retention_tag)
+                             cache.gamma_query_cue, cache.gamma_query_pool_tokens, cache.retention_head, cache._retention_tag)
         ctx.save_for_backward(q, k, v, *([k_raw] if k_raw is not None else []), *plan_tensors,
                               *(updates.tensors if updates is not None else ()))
         ctx.has_attention_plans = cache.semantic_clusters
@@ -7379,7 +7417,7 @@ class LogKVStreamTrainingAttention(torch.autograd.Function):
                                  cache.beta_novelty, cache.beta_adaptive_merge,
                                  cache.gamma_level0_reinsert, cache.gamma_top_merge, cache.gamma_level_slack,
                                  cache.gamma_cue_tokens, cache.gamma_literals, cache.gamma_cue_guard,
-                                 cache.gamma_query_cue, cache.retention_head, cache._retention_tag):
+                                 cache.gamma_query_cue, cache.gamma_query_pool_tokens, cache.retention_head, cache._retention_tag):
             raise RuntimeError("semantic update configuration changed between forward and backward")
         updates = (_SemanticReplayUpdates(ctx.update_flushes, saved[ctx.update_tensor_offset:])
                    if ctx.update_flushes is not None else None)

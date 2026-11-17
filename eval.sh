@@ -264,6 +264,9 @@ emit("LOG_KV_GAMMA_LITERALS", str(bool(value_or("log_kv_gamma_literals", False))
 emit("LOG_KV_GAMMA_CUE_GUARD", str(bool(value_or("log_kv_gamma_cue_guard", False))).lower())
 # Gamma query-aware cue default off; YAML true also takes cues from each prompt's closing question.
 emit("LOG_KV_GAMMA_QUERY_CUE", str(bool(value_or("log_kv_gamma_query_cue", False))).lower())
+emit("LOG_KV_GAMMA_QUERY_DETECTOR", cfg.get("log_kv_gamma_query_detector") or "")
+emit("LOG_KV_GAMMA_QUERY_DETECTOR_OPTIONS", json.dumps(cfg.get("log_kv_gamma_query_detector_options") or {}))
+emit("LOG_KV_GAMMA_QUERY_POOL_TOKENS", int(value_or("log_kv_gamma_query_pool_tokens", 0)))
 # niahLogKV learned retention heads (train_retention.py output); unset = off.
 emit("LOG_KV_RETENTION_HEADS", cfg.get("log_kv_retention_heads") or "")
 emit("LOG_KV_GAMMA_SURPRISAL", cfg.get("log_kv_gamma_surprisal") or "")
@@ -469,6 +472,11 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ]; then
     fi
     if [ -n "${LOG_KV_RETENTION_HEADS}" ]; then
         LOG_KV_ARG_LIST+=(--log_kv_retention_heads "${LOG_KV_RETENTION_HEADS}")
+    fi
+    LOG_KV_ARG_LIST+=(--log_kv_gamma_query_pool_tokens "${LOG_KV_GAMMA_QUERY_POOL_TOKENS}")
+    if [ -n "${LOG_KV_GAMMA_QUERY_DETECTOR}" ]; then
+        LOG_KV_ARG_LIST+=(--log_kv_gamma_query_detector "${LOG_KV_GAMMA_QUERY_DETECTOR}"
+            --log_kv_gamma_query_detector_options "${LOG_KV_GAMMA_QUERY_DETECTOR_OPTIONS}")
     fi
     if [ -n "${LOG_KV_GAMMA_SURPRISAL}" ]; then
         LOG_KV_ARG_LIST+=(--log_kv_gamma_surprisal "${LOG_KV_GAMMA_SURPRISAL}")
