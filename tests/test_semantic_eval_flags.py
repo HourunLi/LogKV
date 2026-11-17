@@ -1,9 +1,10 @@
 """Exercise the scripts' real config readers and eval-argument builders only."""
 
+import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -34,6 +35,19 @@ def _eval_arguments(config, script):
     result = subprocess.run(["bash", "-c", shell, "bash", str(config)],
                             capture_output=True, text=True, check=True, env=env)
     return result.stdout.splitlines()
+
+
+def test_detector_path_options_and_fixed_quota_reach_eval_as_single_arguments(tmp_path):
+    config = tmp_path / "detector.yaml"
+    config.write_text("save_path: /tmp/checkpoint\nlog_kv_semantic_clusters: true\n"
+                      "log_kv_gamma_query_cue: true\nlog_kv_gamma_query_pool_tokens: 512\n"
+                      "log_kv_gamma_query_detector: '/data/model with spaces'\n"
+                      "log_kv_gamma_query_detector_options:\n  device: model\n  threshold: 0.8\n")
+    args = _eval_arguments(config, "eval.sh")
+    assert args[args.index("--log_kv_gamma_query_detector") + 1] == "/data/model with spaces"
+    options = json.loads(args[args.index("--log_kv_gamma_query_detector_options") + 1])
+    assert options == {"device": "model", "threshold": 0.8}
+    assert args[args.index("--log_kv_gamma_query_pool_tokens") + 1] == "512"
 
 
 @pytest.mark.parametrize("script", ["majob.sh", "eval.sh"])
