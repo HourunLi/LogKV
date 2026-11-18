@@ -5,6 +5,8 @@ import importlib.util
 import inspect
 import json
 import os
+import re
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -71,7 +73,6 @@ def test_eval_shell_honors_the_yamls_suites_without_loading_models(tmp_path):
 
 
 def test_named_million_token_tasks_are_checked_against_the_window():
-    import re
     source = ast.parse((ROOT / "eval.py").read_text())
     nodes = [node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == "_check_task_lengths"
              or isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "_LENGTH_NAMED_TASK" for t in node.targets)]
@@ -182,6 +183,36 @@ def test_ruler_bare_yaml_modules_receive_the_same_patch(monkeypatch):
         config = utils.load_yaml_config(str(folder / f"{name}.yaml"))
         fn = config["custom_dataset"]
         assert getattr(fn.__globals__[entry], "_logkv_long_ruler", False), name
+
+
+@pytest.mark.parametrize("length", [524288, 1048576])
+def test_long_cwe_retains_ten_answers_and_fits_the_budget(monkeypatch, length):
+    import lm_eval.utils as utils
+    from litgpt import ruler_patch as patch
+
+    monkeypatch.setenv("RULER_LONG_SAMPLES", "1")
+    monkeypatch.setattr(utils, "import_function", utils.import_function)
+    patch._patch_yaml_function_imports()
+    folder = Path(utils.__file__).parent / "tasks/ruler"
+    fn = utils.load_yaml_config(str(folder / "cwe.yaml"))["custom_dataset"]
+    generate = fn.__globals__["sys_word_pair_random"]
+
+    def tokenizer(text, *, truncation=False):
+        assert not truncation
+        return SimpleNamespace(input_ids=text.split())
+
+    [row] = generate(2, length, tokenizer=tokenizer)
+    prompt = row["input"] + "\n\n" + row["gen_prefix"]
+    assert length - 4096 <= row["length"] == len(tokenizer(prompt).input_ids) + 120 <= length
+    assert row["max_length"] == length
+    assert row["logkv_ruler_protocol"] == "extended-cwe-v1"
+    words = re.findall(r"\b\d+\. (.*?)(?= \d+\. |\nQuestion:)", row["input"])
+    counts = Counter(words)
+    answers = set(row["outputs"])
+    assert len(answers) == 10
+    assert set(dict(counts.most_common(10))) == answers
+    assert min(counts[word] for word in answers) == 10 * max(counts[word] for word in counts.keys() - answers)
+    assert generate(2, length, tokenizer=tokenizer) == [row]
 
 
 def test_long_ppl_curves_select_the_same_longer_documents(tmp_path, monkeypatch):
