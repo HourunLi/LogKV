@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import litgpt.model as model_module
 from litgpt.config import Config
 from litgpt.generate.base import generate
 from litgpt.kv_compression import cache_compression_snapshot
@@ -35,7 +36,7 @@ def wrapper_class():
     cls = next(node for node in tree.body
                if isinstance(node, ast.ClassDef) and node.name == "LogKVLM")
     names = {"_score_tokens", "generate_until", "loglikelihood_rolling", "_reset_eval_cache", "_warn_truncation",
-             "_prefill_chunk", "_forward", "_generate_chunked"}
+             "_prefill_chunk", "_forward", "_generate_chunked", "_score_dense_256k", "_set_eval_cache"}
     cls.bases, cls.decorator_list = [], []
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
     scope = dict(
@@ -48,6 +49,7 @@ def wrapper_class():
     )
     helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {
         "_synchronize_inference_device", "_reset_inference_peak_memory", "_inference_peak_memory",
+        "_score_continuation_logits",
     }]
     exec(compile(ast.Module(body=helpers + [cls], type_ignores=[]), str(source), "exec"), scope)
     old_threads = torch.get_num_threads()
@@ -165,6 +167,45 @@ def test_rolling_reports_each_window_with_rolling_request_type(wrapper_class):
     assert [record["processed_tokens"] for record in lm.compression_metrics] == [8, 8, 6]
     assert all(record["request_type"] == "loglikelihood_rolling" for record in lm.compression_metrics)
     assert all(record["kv_retention_ratio"] == 1 for record in lm.compression_metrics)
+    assert_cache_reset(lm)
+
+
+@torch.no_grad()
+def test_dense_256k_streaming_preserves_full_attention_and_scores(wrapper_class, monkeypatch):
+    lm = make_lm(wrapper_class, "dense")
+    lm.model = GPT(Config(block_size=32, n_layer=2, n_embd=32, n_head=4, n_query_groups=2,
+                          padded_vocab_size=32)).eval()
+    lm.model.set_kv_cache(batch_size=1)
+    context = list(range(1, 12))
+    continuation = list(range(12, 25))
+    request = SimpleNamespace(args=(" ".join(map(str, context)), {"max_gen_toks": 3}))
+    expected_score, expected_greedy = lm._score_tokens(context, continuation)
+    expected_generation = lm.generate_until([request])
+
+    lm._dense_256k_eval = True
+    lm._eval_cache_ready = False
+    lm._report_cache_budget = lambda: None
+    del lm._set_eval_cache  # Exercise the actual dense eval cache setup.
+    assert lm._prefill_chunk() == 2048
+    lm._prefill_chunk = lambda: 5  # Use a tiny chunk to exercise multiple calls on CPU.
+    original_attention = torch.nn.functional.scaled_dot_product_attention
+    calls = []
+
+    def attention(q, k, v, **kwargs):
+        calls.append((q.size(2), k.size(2)))
+        assert kwargs.get("enable_gqa") and q.size(1) == 4 and k.size(1) == v.size(1) == 2
+        return original_attention(q, k, v, **kwargs)
+
+    functional = SimpleNamespace(**vars(torch.nn.functional))
+    functional.scaled_dot_product_attention = attention
+    monkeypatch.setattr(model_module, "F", functional)
+    score, greedy = lm._score_tokens(context, continuation)
+    assert score == pytest.approx(expected_score, abs=1e-5)
+    assert greedy == expected_greedy
+    assert lm.generate_until([request]) == expected_generation
+    assert (5, 20) in calls and (1, 12) in calls
+    assert max(query for query, _ in calls) == 5
+    assert lm.compression_metrics[-1]["kv_retention_ratio"] == 1
     assert_cache_reset(lm)
 
 
