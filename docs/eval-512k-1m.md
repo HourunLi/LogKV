@@ -6,6 +6,17 @@
 
 ## 数据准备
 
+已有 512K/1M 评测数据时，在联网并且能访问评测共享缓存的节点只补下载 CWE 词表：
+
+```bash
+bash diag.sh unused/fetch_long_eval_data.py --lengths 512k,1m \
+  --ruler-cwe --no-babilong --no-ruler-qa --out fetch_ruler_cwe.json
+```
+
+命令在 `${RULER_CACHE_DIR}/english_words.json` 保存校验过 SHA256 的普通文件，两个长度共用。
+有可用文件时直接复用。FWE 在评测时本地生成编码词，只需已有 tokenizer。
+全量数据准备也会自动下载这份词表。
+
 下载与评测节点必须看到相同的普通文件目录。以下在仓库根目录执行，下载脚本默认绕过证书检查；
 不要加 `--verify-ssl`。Hub 的下载 URL 固定到本次查询的 revision，逐文件核对大小和 SHA256；
 新数据流程不使用 snapshot 软链接，也不使用目录重命名发布。
@@ -79,10 +90,12 @@ LongBench v2 两档共用原有 20 子集、503 道题，不另下一个长度�
 
 ## 任务口径
 
-- RULER：512K/1M 使用 `extended-v1`，其中 `ruler_cwe` 使用 `extended-cwe-v1`。essay 背景不够长时循环重复背景词序列，再由原生成器插入针；
+- RULER：512K/1M 使用 `extended-v1`。essay 背景不够长时循环重复背景词序列，再由原生成器插入针；
   不重复已插入的针，不改变答案和计分。新增档位默认每任务生成 100 条，可设 `RULER_LONG_SAMPLES`。
-  CWE 在原词表内等比例提高常见词和干扰词的重复次数，根据 tokenizer 调整词表子集大小。
-  每条样本仍有 10 个答案词，每个答案词的出现次数是单个干扰词的 10 倍。
+  CWE 的 `extended-cwe-nvidia-v1` 使用 NVIDIA RULER 的大词表，在现有模板下每个答案词出现 30 次，
+  每个干扰词出现 3 次。FWE 的 `extended-fwe-fit-v1` 保留原词频分布，按实际 token 数细化词数搜索。
+  两项的长度都包含实际答案前缀和生成预留。旧 `extended-cwe-v1` 属于等比例提高词频的历史协议。
+  运行新版超长评测时，可用派生 YAML 的 `output_path` 指向新目录来保留旧结果。
   样本长度与协议字段见 [指标口径](evaluation-metrics.md)；不足目标长度 4096 tokens 以上时报错。
   保留已有 SQuAD 排除规则，因此超长档为 12 项，不能把均值直接当成其他论文完整 13 项的均值。
   32K–256K 的生成参数保持不变。此协议必须在论文中披露，不能称为原版 128K RULER 协议。

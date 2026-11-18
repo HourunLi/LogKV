@@ -6,7 +6,7 @@ switches off for itself only, then:
 
 --lengths 512k,1m prepares the official BABILong JSON plus ordinary memory-mappable Arrow copies,
 RULER's ordinary essay background/NLTK data, and shared >=1M-token PPL selections when a PPL source is given.
-The default lengths stay 32k,64k,128k,256k. --ruler-essays prepares the background independently.
+The default lengths stay 32k,64k,128k,256k. --ruler-essays and --ruler-cwe prepare individual RULER assets.
 
     BABILong      RMT-team/babilong-1k-samples, configs 32k / 64k / 128k, and RMT-team/babilong (100
                   samples per length), config 256k; splits qa1 ... qa5
@@ -144,6 +144,8 @@ def fetch_ruler_qa(lines: list[str]) -> None:
 
 def fetch_datasets(babilong: bool, longbench2: bool, lines: list[str], lengths=None) -> tuple[list[tuple[str, str, str]], bool]:
     """Each dataset group in turn; a group that fails is reported and the others still run."""
+    if not (babilong or longbench2):
+        return [], True
     import datasets
 
     from litgpt.hf_cache_patch import leftovers
@@ -579,6 +581,7 @@ def main():
     p.add_argument("--no-ruler-qa", action="store_true")
     p.add_argument("--lengths", default="32k,64k,128k,256k", help="data lengths, including 512k,1m; 1m=1048576 tokens")
     p.add_argument("--ruler-essays", action="store_true", help="prepare ordinary RULER essays and NLTK files")
+    p.add_argument("--ruler-cwe", action="store_true", help="prepare the pinned NVIDIA word list for 512K/1M")
     p.add_argument("--ppl-data", default=None, help="held-out ProLong parquet / jsonl file or directory")
     p.add_argument("--ppl-hub", default=None,
                    help="dataset repository to download and use as --ppl-data (e.g. emozilla/pg19-test)")
@@ -606,6 +609,13 @@ def main():
                      f"HTTPS certificate checks: {'on' if args.verify_ssl else 'off (--verify-ssl turns them on)'}"]:
             lines.append(line)
         ok = True
+        if args.ruler_cwe or (ultra and not args.no_ruler_qa):
+            try:
+                from unused.long_eval_download import prepare_ruler_cwe
+                run_stage(lines, "RULER CWE word list", prepare_ruler_cwe, lines)
+            except Exception as error:
+                ok = False
+                lines.append(f"RULER CWE: FAILED {type(error).__name__}: {error}")
         if args.ruler_essays or (ultra and not args.no_ruler_qa):
             try:
                 from unused.long_eval_download import prepare_ruler_essays

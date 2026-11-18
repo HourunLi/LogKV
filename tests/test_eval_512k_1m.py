@@ -191,6 +191,8 @@ def test_long_cwe_retains_ten_answers_and_fits_the_budget(monkeypatch, length):
     from litgpt import ruler_patch as patch
 
     monkeypatch.setenv("RULER_LONG_SAMPLES", "1")
+    vocab = tuple(f"word{i:06d}" for i in range(180_000))
+    monkeypatch.setattr(patch, "_cwe_vocabulary", lambda path: vocab)
     monkeypatch.setattr(utils, "import_function", utils.import_function)
     patch._patch_yaml_function_imports()
     folder = Path(utils.__file__).parent / "tasks/ruler"
@@ -205,14 +207,84 @@ def test_long_cwe_retains_ten_answers_and_fits_the_budget(monkeypatch, length):
     prompt = row["input"] + "\n\n" + row["gen_prefix"]
     assert length - 4096 <= row["length"] == len(tokenizer(prompt).input_ids) + 120 <= length
     assert row["max_length"] == length
-    assert row["logkv_ruler_protocol"] == "extended-cwe-v1"
+    assert row["logkv_ruler_protocol"] == "extended-cwe-nvidia-v1"
     words = re.findall(r"\b\d+\. (.*?)(?= \d+\. |\nQuestion:)", row["input"])
     counts = Counter(words)
     answers = set(row["outputs"])
     assert len(answers) == 10
-    assert set(dict(counts.most_common(10))) == answers
-    assert min(counts[word] for word in answers) == 10 * max(counts[word] for word in counts.keys() - answers)
+    assert counts.keys() <= set(vocab)
+    assert {counts.pop(word) for word in answers} == {30}
+    assert set(counts.values()) == {3}
     assert generate(2, length, tokenizer=tokenizer) == [row]
+
+
+def test_long_fwe_fits_the_rendered_prompt_and_preserves_the_ranked_words(monkeypatch):
+    import lm_eval.utils as utils
+    from litgpt import ruler_patch as patch
+
+    monkeypatch.setenv("RULER_LONG_SAMPLES", "1")
+    monkeypatch.setattr(patch, "LONG_RULER_MIN", 8192)
+    monkeypatch.setattr(utils, "import_function", utils.import_function)
+    patch._patch_yaml_function_imports()
+    folder = Path(utils.__file__).parent / "tasks/ruler"
+    fn = utils.load_yaml_config(str(folder / "fwe.yaml"))["custom_dataset"]
+    generate = fn.__globals__["sys_kwext"]
+    config = fn.__globals__["CONFIG"]
+
+    def tokenizer(text, *, truncation=False):
+        assert not truncation
+        return SimpleNamespace(input_ids=text.split())
+
+    [row] = generate(tokenizer, 8192, num_samples=2)
+    prompt = row["input"] + " " + row["gen_prefix"]
+    assert 8192 - 1024 <= row["length"] == len(tokenizer(prompt).input_ids) + 50 <= 8192
+    assert row["logkv_ruler_protocol"] == "extended-fwe-fit-v1"
+    opening, question = config["template"].split("{context}")
+    counts = Counter(row["input"].removeprefix(opening).removesuffix(question).split())
+    assert counts.pop("...") > counts[row["outputs"][0]]
+    assert row["outputs"] == [word for word, count in counts.most_common(3)]
+    assert generate(tokenizer, 8192, num_samples=2) == [row]
+
+
+@pytest.mark.parametrize("entry", ["sys_word_pair_random", "sys_kwext"])
+def test_word_tasks_keep_the_upstream_generator_at_256k(monkeypatch, entry):
+    from litgpt import ruler_patch as patch
+
+    monkeypatch.setenv("RULER_LONG_SAMPLES", "1")
+
+    def generate(max_seq_length, num_samples=500):
+        return [{"length": 197521, "max_length": max_seq_length, "num_samples": num_samples}]
+
+    module = SimpleNamespace(**{entry: generate})
+    patch._patch_long_ruler_module(module)
+    assert getattr(module, entry)(262144) == generate(262144)
+
+
+def test_ruler_cwe_download_verifies_and_reuses_the_pinned_payload(tmp_path, monkeypatch):
+    import requests
+    from litgpt import ruler_patch as patch
+    from unused import long_eval_download as prep
+
+    payload = b'{"0":"apple","1":"pear"}'
+    monkeypatch.setenv("RULER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(patch, "RULER_CWE_WORDS_SHA256", hashlib.sha256(payload).hexdigest())
+    target = patch._cwe_wordlist_file()
+    fetches = []
+    response = SimpleNamespace(content=b"git-lfs pointer", raise_for_status=lambda: None)
+
+    def get(url, timeout):
+        fetches.append(url)
+        return response
+
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        prep.prepare_ruler_cwe([])
+    assert not target.exists()
+    response.content = payload
+    assert prep.prepare_ruler_cwe([]) == target
+    assert patch._cwe_vocabulary(target) == ("apple", "pear")
+    assert prep.prepare_ruler_cwe([]) == target
+    assert fetches == [patch.RULER_CWE_WORDS_URL] * 2
 
 
 def test_long_ppl_curves_select_the_same_longer_documents(tmp_path, monkeypatch):

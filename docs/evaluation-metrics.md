@@ -99,7 +99,8 @@ RULER 的 `niah_*` 任务（含 [`eval_tasks/niah_multi/`](../eval_tasks/niah_mu
 - `max_length` 是请求长度，样本实际长度在 `length` 字段（prompt token 数加生成预留）。essay 草堆不足时
   `length` 明显短于 `max_length`；多针任务放不下全部针的长度被跳过。两种情况都会告警。
 
-512K/1M 的 RULER 扩展样本另有 `logkv_ruler_protocol`（通常为 `extended-v1`，CWE 为 `extended-cwe-v1`）和
+512K/1M 的 RULER 扩展样本另有 `logkv_ruler_protocol`（通常为 `extended-v1`，CWE 为 `extended-cwe-nvidia-v1`，
+FWE 为 `extended-fwe-fit-v1`）和
 `logkv_haystack_repeats`：前者标识扩展协议，后者表示背景词序列重复次数（非 essay 任务为 1）。
 `length` 沿用生成器的实际长度口径（包括生成预留），`max_length` 是请求的长度预算；
 背景循环发生在插针之前，完整协议与样本数规则见 [512K/1M 说明](eval-512k-1m.md)。

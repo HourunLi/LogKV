@@ -156,6 +156,27 @@ def prepare_babilong(length, lines):
         lines.append(f"BABILong {length} {split}: {len(data)} rows, ordinary Arrow, offline reload: ok ({arrow})")
 
 
+def prepare_ruler_cwe(lines):
+    import requests
+
+    from litgpt.ruler_patch import RULER_CWE_WORDS_URL, _cwe_wordlist_file, _read_cwe_wordlist, _verify_cwe_wordlist
+
+    target = _cwe_wordlist_file()
+    try:
+        _read_cwe_wordlist(target)
+    except (FileNotFoundError, ValueError):
+        if target.is_symlink():
+            raise ValueError(f"RULER CWE word list must be an ordinary file: {target}") from None
+        response = run_stage(lines, "download NVIDIA CWE word list", requests.get, RULER_CWE_WORDS_URL, timeout=120)
+        response.raise_for_status()
+        _verify_cwe_wordlist(response.content, target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(response.content)
+        _read_cwe_wordlist(target)
+    lines.append(f"RULER CWE NVIDIA word list: {target}, SHA256 verified")
+    return target
+
+
 def prepare_ruler_essays(lines):
     import pyarrow.parquet as pq
     from litgpt.ruler_patch import _essay_file
