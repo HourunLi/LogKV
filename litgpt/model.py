@@ -13,6 +13,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.bias import CausalBias, causal_lower_right
 from typing_extensions import Self
 
 from litgpt.config import Config
@@ -41,6 +43,7 @@ class GPT(nn.Module):
             )
         )
         self.mask_cache: torch.Tensor | None = None
+        self._fused_dense_cache = False
         self.max_seq_length = self.config.block_size
 
     @property
@@ -176,7 +179,13 @@ class GPT(nn.Module):
                     input_pos_maxp1 = int(input_pos.max()) + 1
                 if input_pos_maxp1 > self.max_seq_length:
                     raise ValueError(f"Positions in 'input_pos' must be in [0,{self.max_seq_length})")
-                if input_pos.dim() == 1 and input_pos_maxp1 == T and int(input_pos[0]) == 0:
+                if (self._fused_dense_cache and input_pos.dim() == 1 and input_pos_maxp1 >= T
+                        and torch.equal(input_pos, torch.arange(input_pos_maxp1 - T, input_pos_maxp1,
+                                                                device=input_pos.device, dtype=input_pos.dtype))):
+                    # A contiguous suffix attends to its full prefix with causality
+                    # aligned to the bottom right. Flash never materializes this mask.
+                    mask = causal_lower_right(T, input_pos_maxp1)
+                elif input_pos.dim() == 1 and input_pos_maxp1 == T and int(input_pos[0]) == 0:
                     mask = None
                 else:
                     keys = torch.arange(input_pos_maxp1, device=input_pos.device)
@@ -498,8 +507,11 @@ class GPT(nn.Module):
         rope_cache_length: int | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        *,
+        fused_dense_attention: bool = False,
     ) -> None:
         self._alpha_enabled = False
+        self._fused_dense_cache = fused_dense_attention
         self.log_kv_cue_stream = self.log_kv_literal_stream = self.log_kv_surprisal_stream = None
         if rope_cache_length is None:
             rope_cache_length = self.rope_cache_length()
@@ -523,6 +535,7 @@ class GPT(nn.Module):
 
     def clear_kv_cache(self) -> None:
         self._alpha_enabled = False
+        self._fused_dense_cache = False
         self.log_kv_cue_stream = self.log_kv_literal_stream = self.log_kv_surprisal_stream = None
         self.mask_cache = None
         for block in self.transformer.h:
@@ -1181,6 +1194,21 @@ class CausalSelfAttention(nn.Module):
                 v = v[..., :input_pos_maxp1, :]
             # k, v: (B, nh_k, input_pos_maxp1, hs)
             # If input_pos_maxp1 is None -> max_seq_length
+
+        if isinstance(mask, CausalBias):
+            # Use native GQA so the full prefix stays at its KV-head count.
+            # On CUDA, require Flash instead of permitting a quadratic math fallback.
+            scale = 1.0 / math.sqrt(self.config.attention_scores_scalar or head_size)
+            scale *= self.mscale * self.mscale
+            attn_mask = None if T == 1 else mask
+            if q.is_cuda:
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=scale,
+                                                       enable_gqa=n_query_groups != n_head)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=scale,
+                                                   enable_gqa=n_query_groups != n_head)
+            return self.proj(y.transpose(1, 2).reshape(B, T, head_size * n_head))
 
         # Grouped queries: balance the number of heads across all three matrices.
         # NOTE: flash attention requires it in training mode.

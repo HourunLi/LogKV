@@ -956,6 +956,20 @@ def _configure_inference_memory(config, overrides=None):
     return chunk
 
 
+def _score_continuation_logits(logits, targets):
+    # Bound the fp32 log-softmax workspace while scoring every continuation token.
+    total_logprob = 0.0
+    is_greedy = True
+    for i in range(0, logits.size(0), 1024):
+        block = logits[i:i + 1024].float()
+        target = targets[i:i + 1024]
+        log_probs = torch.log_softmax(block, dim=-1)
+        total_logprob += log_probs.gather(dim=-1, index=target.unsqueeze(-1)).sum().item()
+        if is_greedy:
+            is_greedy = bool((block.argmax(dim=-1) == target).all().item())
+    return total_logprob, is_greedy
+
+
 def _config_from_yaml_and_overrides(config_path: str, overrides: dict[str, Any] | None) -> Config:
     with open(config_path, encoding="utf-8") as f:
         base = yaml.safe_load(f)
@@ -1317,10 +1331,18 @@ class LogKVLM(LM):
         else:
             if is_master: print("⚠️ 未发现训练期保存的 YAML 配置文件，使用显式架构名或已注册的目录名初始化...")
         self.config = _config_for_evaluation(checkpoint_dir, config_overrides, arch_name)
+        # The length pass reserves an extra 1024 positions for generation.
+        self._dense_256k_eval = (
+            self.log_kv_dense_mode and self.config.block_size in (262144, 263168)
+            and not self.config.latent_attention and self.config.sliding_window_size is None
+            and self.config.attention_logit_softcapping is None
+        )
 
         chunk = _configure_inference_memory(self.config, config_overrides)
         if is_master:
             print(f"🧩 Inference MLP chunk: {chunk} tokens (0 = full sequence); attention/KV policy is unchanged")
+            if self._dense_256k_eval:
+                print(f"🧩 Dense 256K: {self._prefill_chunk()} tokens per forward, fused GQA, full KV")
 
         # ==========================================
         self.log_kv_semantic_s_h = (
@@ -1403,11 +1425,13 @@ class LogKVLM(LM):
         dtype = next(self.model.parameters()).dtype
         max_seq_length = self.model.max_seq_length
         if self.log_kv_dense_mode or self.swa_window_size:
+            cache_options = {"fused_dense_attention": True} if getattr(self, "_dense_256k_eval", False) else {}
             self.model.set_kv_cache(
                 batch_size=1,
                 max_seq_length=max_seq_length,
                 device=self._device,
                 dtype=dtype,
+                **cache_options,
             )
             self._eval_cache_ready = True
             self._report_cache_budget()
@@ -1571,10 +1595,9 @@ class LogKVLM(LM):
     def _prefill_chunk(self) -> int:
         """Tokens per forward when a long input enters the LogKV cache (LOGKV_EVAL_PREFILL_CHUNK, default 32768;
         0 = one forward). The cache streams, so chunked input gives bit-identical logits (tests/test_eval_compression.py),
-        and the activations stay bounded: one forward of 256K tokens overflows an 80 GB card. Dense keeps one
-        forward (a later chunk would need a chunk x position mask)."""
+        and the activations stay bounded. Dense 256K uses bounded chunks with fused lower-right causal attention."""
         if getattr(self, "log_kv_dense_mode", False):
-            return 0
+            return 2048 if getattr(self, "_dense_256k_eval", False) else 0
         return int(os.environ.get("LOGKV_EVAL_PREFILL_CHUNK", "32768"))
 
     def _forward(self, tokens, start, lm_head_start):
@@ -1665,15 +1688,16 @@ class LogKVLM(LM):
             try:
                 _synchronize_inference_device(self._device)
                 _reset_inference_peak_memory(self._device)
-                t0 = time.perf_counter()
-                input_pos = torch.arange(seq_len, device=self._device, dtype=torch.int64)
-                # lm_head_start: materialize logits only for the scoring span
-                # [ctx_len-1, seq_len) — full-sequence logits at 32K are ~10 GB
-                # bf16, the sliced tensor is (cont_len + 1) x vocab.
-                logits = self._forward(inps[0], 0, ctx_len - 1) if self._prefill_chunk() \
-                    else self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
-                _synchronize_inference_device(self._device)
-                t1 = time.perf_counter()
+                if getattr(self, "_dense_256k_eval", False):
+                    score, is_greedy, forward_time = self._score_dense_256k(inps[0], ctx_len)
+                else:
+                    t0 = time.perf_counter()
+                    input_pos = torch.arange(seq_len, device=self._device, dtype=torch.int64)
+                    # Only the scoring span needs logits.
+                    logits = self._forward(inps[0], 0, ctx_len - 1) if self._prefill_chunk() \
+                        else self.model(inps, input_pos=input_pos, lm_head_start=ctx_len - 1)
+                    _synchronize_inference_device(self._device)
+                    forward_time = time.perf_counter() - t0
                 peak_memory = _inference_peak_memory(self._device)
                 self.compression_metrics.append({
                     "request_type": request_type, "rank": _global_rank(),
@@ -1689,11 +1713,14 @@ class LogKVLM(LM):
             "rank": _global_rank(), "request_type": request_type,
             "total_seq_len": seq_len, "context_len": ctx_len,
             "cont_len": len(cont_enc),
-            "forward_time_s": t1 - t0,
-            "forward_time_ms": (t1 - t0) * 1000,
-            "forward_tokens_per_sec": seq_len / (t1 - t0) if t1 > t0 else None,
+            "forward_time_s": forward_time,
+            "forward_time_ms": forward_time * 1000,
+            "forward_tokens_per_sec": seq_len / forward_time if forward_time > 0 else None,
             **peak_memory,
         })
+
+        if getattr(self, "_dense_256k_eval", False):
+            return score, is_greedy
 
         # ``logits`` starts at position ctx_len-1 (lm_head_start); its first
         # len(cont_enc) rows are the positions [ctx_len-1, seq_len-2] that
@@ -1701,22 +1728,29 @@ class LogKVLM(LM):
         cont_logits = logits[0, : len(cont_enc)]
         cont_targets = torch.tensor(cont_enc, dtype=torch.long, device=self._device)
 
-        # fp32 log-softmax in position-chunks: rolling-PPL requests score a
-        # full window (cont_len ~ max_seq_length), and a one-shot fp32
-        # log_softmax over cont_len x vocab would peak at ~19 GB at 32K. fp32
-        # (rather than the model's bf16) keeps per-token log-probs accurate —
-        # they are summed over thousands of tokens downstream.
-        total_logprob = 0.0
+        return _score_continuation_logits(cont_logits, cont_targets)
+
+    def _score_dense_256k(self, tokens, ctx_len):
+        """Consume each chunk's logits before prefill advances to the next chunk."""
+        total_logprob, forward_time = 0.0, 0.0
         is_greedy = True
-        step = 1024
-        for i in range(0, cont_logits.size(0), step):
-            blk = cont_logits[i : i + step].to(torch.float32)
-            tgt = cont_targets[i : i + step]
-            log_probs = torch.log_softmax(blk, dim=-1)
-            total_logprob += log_probs.gather(dim=-1, index=tgt.unsqueeze(-1)).sum().item()
-            if is_greedy:
-                is_greedy = bool((blk.argmax(dim=-1) == tgt).all().item())
-        return total_logprob, is_greedy
+        length, chunk = tokens.numel(), self._prefill_chunk()
+        for start in range(0, length, chunk):
+            end = min(start + chunk, length)
+            first = min(end, max(start, ctx_len - 1))
+            _synchronize_inference_device(self._device)
+            t0 = time.perf_counter()
+            logits = self._forward(tokens[start:end], start, first - start)
+            _synchronize_inference_device(self._device)
+            forward_time += time.perf_counter() - t0
+            # Position i predicts i+1, so the final input position is never scored.
+            stop = min(end, length - 1)
+            if first < stop:
+                score, greedy = _score_continuation_logits(logits[0, :stop - first], tokens[first + 1:stop + 1])
+                total_logprob += score
+                is_greedy &= greedy
+            del logits
+        return total_logprob, is_greedy, forward_time
 
     def loglikelihood(self, requests):
         dp_rank = _global_rank()
