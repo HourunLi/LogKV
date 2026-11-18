@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -21,11 +22,39 @@ import math
 import os
 import random
 import ssl
+import string
 import sys
 from functools import cache
 from pathlib import Path
 
 LONG_RULER_MIN = 524288
+RULER_CWE_WORDS_URL = (
+    "https://media.githubusercontent.com/media/NVIDIA/RULER/533f013bba67c21a5824d48f416c0f68df0e399d/"
+    "scripts/data/synthetic/json/english_words.json"
+)
+RULER_CWE_WORDS_SHA256 = "affcd6d45fdf3cc843d585c99c97ad615094e760e6c4756b654bab6c73bc2eca"
+
+
+def _cwe_wordlist_file() -> Path:
+    return Path(_get_ruler_cache_dir()).expanduser() / "english_words.json"
+
+
+def _verify_cwe_wordlist(payload: bytes, path: Path) -> None:
+    if hashlib.sha256(payload).hexdigest() != RULER_CWE_WORDS_SHA256:
+        raise ValueError(f"RULER CWE word list SHA256 mismatch: {path}")
+
+
+def _read_cwe_wordlist(path: Path) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(f"RULER CWE requires the NVIDIA word list as an ordinary file: {path}")
+    payload = path.read_bytes()
+    _verify_cwe_wordlist(payload, path)
+    return payload
+
+
+@cache
+def _cwe_vocabulary(path: Path) -> tuple[str, ...]:
+    return tuple(json.loads(_read_cwe_wordlist(path)).values())
 
 
 def _essay_file() -> Path:
@@ -48,61 +77,113 @@ def _expand_essay(haystack, tokenizer, target: int):
     return expanded, repeats
 
 
+def _fit_ruler_word_list(render, tokenizer, target, estimate, low, high, suffix, reserve, task):
+    """Fit complete word entries to the rendered prompt budget with bounded tokenization."""
+    count = max(low, estimate if high is None else min(estimate, high))
+    best = None
+    for _ in range(24):
+        if high is not None and low > high:
+            break
+        prompt, outputs = render(count)
+        length = len(tokenizer(prompt + suffix, truncation=False).input_ids) + reserve
+        if length <= target:
+            if best is None or length > best[2]:
+                best = prompt, outputs, length
+            if length >= target - 1024:
+                return best
+            low = count + 1
+        else:
+            high = count - 1
+        guess = round(count * (target - 512) / max(1, length))
+        if high is None:
+            count = max(low, min(guess, count * 2))
+        else:
+            count = guess if low <= guess <= high else (low + high) // 2
+    if best is not None and best[2] >= target - 4096:
+        return best
+    actual = best[2] if best is not None else "no sample within budget"
+    raise ValueError(f"RULER {task} could not fit {target} tokens (best: {actual})")
+
+
 def _generate_long_cwe(namespace, *, num_samples, max_seq_length, tokenizer,
                        remove_newline_tab, tokens_to_generate):
-    """Fit a shuffled numbered list while preserving CWE's 10:1 frequency ratio."""
+    """Use NVIDIA's expanded word pool and original 30/3 occurrence counts."""
     config = namespace["CONFIG"]
-    vocab = sorted(namespace["WORDS"])
-    if len(vocab) < 40:
-        raise ValueError("RULER CWE requires at least 40 distinct words")
+    vocab = _cwe_vocabulary(_cwe_wordlist_file())
     prefix = config["answer_prefix"].strip()
+    suffix = "\n\n" + prefix  # cwe.yaml target_delimiter
     rng = random.Random(42 + max_seq_length)
 
     def format_words(words):
         return " ".join(f"{i}. {word}" for i, word in enumerate(words, 1))
 
-    def make_input(words, common_repeats, uncommon_repeats, seed):
+    def make_input(words, common_repeats, uncommon_repeats, shuffle_seed):
         entries = words[:10] * common_repeats + words[10:] * uncommon_repeats
-        random.Random(seed).shuffle(entries)
+        random.Random(shuffle_seed).shuffle(entries)
         prompt = config["template"].format(context=format_words(entries), query="").strip()
         return " ".join(prompt.split()) if remove_newline_tab else prompt
 
-    def measure(prompt):
-        # cwe.yaml inserts two newlines before the answer prefix.
-        return len(tokenizer(prompt + "\n\n" + prefix, truncation=False).input_ids) + tokens_to_generate
-
-    baseline = measure(make_input(vocab, 30, 3, 42))
-    # Leave room for tokenizer differences between the probe and shuffled samples.
-    scale = max(1, math.ceil(1.05 * max_seq_length / baseline))
-    estimate = round(len(vocab) * max_seq_length / (scale * baseline))
-
+    probe = rng.sample(vocab, 4096)
+    probe_length = len(tokenizer(make_input(probe, 30, 3, 42) + suffix, truncation=False).input_ids)
+    estimate = round(len(probe) * max_seq_length / probe_length)
     rows = []
     for index in namespace["tqdm"](range(num_samples), desc=f"Generating CWE Samples | {max_seq_length}"):
-        words = rng.sample(vocab, len(vocab))
         seed = rng.getrandbits(64)
-        low, high = 11, len(vocab)
-        count = max(low, min(high, estimate))
-        best = None
-        while low <= high:
-            prompt = make_input(words[:count], 30 * scale, 3 * scale, seed)
-            actual = measure(prompt)
-            if actual <= max_seq_length:
-                if best is None or actual > best[1]:
-                    best = prompt, actual
-                if actual >= max_seq_length - 1024:
-                    break
-                low = count + 1
-            else:
-                high = count - 1
-            count = max(low, min(high, round(count * max_seq_length / actual)))
-        if best is None:
-            raise ValueError(f"RULER CWE could not fit a numbered list into {max_seq_length} tokens")
-        prompt, actual = best
-        example = rng.sample(vocab, 40)
+        shuffle_seed = rng.getrandbits(64)
+
+        def render(count):
+            words = random.Random(seed).sample(vocab, count)
+            return make_input(words, 30, 3, shuffle_seed), words[:10]
+
+        prompt, outputs, actual = _fit_ruler_word_list(
+            render, tokenizer, max_seq_length, estimate, 11, len(vocab), suffix, tokens_to_generate, "CWE",
+        )
+        example = rng.sample(sorted(namespace["WORDS"]), 40)
         example_prompt = make_input(example, 10, 3, rng.getrandbits(64))
         rows.append(dict(index=index, input=prompt,
                          input_example=example_prompt + config["answer_prefix"] + format_words(example[:10]),
-                         outputs=words[:10], length=actual, max_length=max_seq_length, gen_prefix=prefix))
+                         outputs=outputs, length=actual, max_length=max_seq_length, gen_prefix=prefix))
+    return rows
+
+
+def _generate_long_fwe(namespace, *, num_samples, max_seq_length, tokenizer, vocab_size,
+                       coded_wordlen, alpha, remove_newline_tab, tokens_to_generate):
+    """Keep the upstream vocabulary and Zipf counts, fitting the word-count parameter per sample."""
+    import numpy as np
+    from scipy.special import zeta
+
+    config = namespace["CONFIG"]
+    prefix = config["answer_prefix"].strip()
+    vocab_size = max_seq_length // 50 if vocab_size == -1 else vocab_size
+    if not 4 <= vocab_size <= len(string.ascii_lowercase) ** coded_wordlen or alpha <= 1:
+        raise ValueError("RULER FWE needs at least four distinct codes and alpha > 1")
+    weights = np.arange(1, vocab_size + 1) ** -float(alpha)
+    normalizer = zeta(alpha)
+    rng = random.Random(42 + max_seq_length)
+    estimate = max_seq_length // 2
+    rows = []
+    for index in namespace["tqdm"](range(num_samples), desc=f"Generating FWE Samples | {max_seq_length}"):
+        words = set()
+        while len(words) < vocab_size:
+            words.update("".join(rng.choices(string.ascii_lowercase, k=coded_wordlen))
+                         for _ in range(vocab_size - len(words)))
+        vocab = sorted(words)
+        random.Random(42).shuffle(vocab)
+        vocab[0] = "..."
+
+        def render(count):
+            entries = []
+            for word, occurrences in zip(vocab, (count * weights / normalizer).astype(int)):
+                entries.extend([word] * occurrences)
+            random.Random(42).shuffle(entries)
+            prompt = config["template"].format(context=" ".join(entries), query="").strip()
+            return (" ".join(prompt.split()) if remove_newline_tab else prompt), vocab[1:4]
+
+        prompt, outputs, actual = _fit_ruler_word_list(
+            render, tokenizer, max_seq_length, estimate, 1, None, " " + prefix, tokens_to_generate, "FWE",
+        )
+        rows.append(dict(index=index, input=prompt, outputs=outputs, length=actual,
+                         max_length=max_seq_length, gen_prefix=prefix))
     return rows
 
 
@@ -135,11 +216,12 @@ def _patch_long_ruler_module(module) -> None:
                 values["haystack"], repeats = _expand_essay(values["haystack"], values["TOKENIZER"], length)
             protocol = "extended-v1"
             if entry == "sys_word_pair_random":
-                rows = _generate_long_cwe(original.__globals__, num_samples=values["num_samples"],
-                                          max_seq_length=length, tokenizer=values["tokenizer"],
-                                          remove_newline_tab=values["remove_newline_tab"],
-                                          tokens_to_generate=values["tokens_to_generate"])
-                protocol = "extended-cwe-v1"
+                cwe_args = {key: value for key, value in values.items() if key != "incremental"}
+                rows = _generate_long_cwe(original.__globals__, **cwe_args)
+                protocol = "extended-cwe-nvidia-v1"
+            elif entry == "sys_kwext":
+                rows = _generate_long_fwe(original.__globals__, **values)
+                protocol = "extended-fwe-fit-v1"
             else:
                 rows = original(*bound.args, **bound.kwargs)
             for row in rows:

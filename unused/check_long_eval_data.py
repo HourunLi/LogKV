@@ -174,6 +174,18 @@ def check_ruler_qa(report, extended=False) -> None:
         report(path.is_file() and not path.is_symlink(), f"RULER ordinary NLTK data: {path}")
 
 
+def check_ruler_cwe(report) -> None:
+    from litgpt.ruler_patch import _cwe_wordlist_file, _read_cwe_wordlist
+
+    path = _cwe_wordlist_file()
+    try:
+        _read_cwe_wordlist(path)
+    except (OSError, ValueError) as error:
+        report(False, str(error))
+    else:
+        report(True, f"RULER CWE NVIDIA word list, SHA256 verified: {path}")
+
+
 def check_infinitebench(report) -> None:
     import json
 
@@ -258,8 +270,11 @@ def main():
         check_babilong(report, lengths)
     if "longbench2" in suites:
         check_longbench2(report)
+    extended = any(n in ("512k", "1m") for n in lengths)
     if "ruler" in suites or "turns" in suites:
-        check_ruler_qa(report, any(n in ("512k", "1m") for n in lengths))
+        check_ruler_qa(report, extended)
+    if "ruler" in suites and extended:
+        check_ruler_cwe(report)
     if "infinitebench" in suites:
         check_infinitebench(report)
     check_ppl(report, args.tokenizer, lengths, suites)
