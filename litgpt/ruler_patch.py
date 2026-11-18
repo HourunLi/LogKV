@@ -17,7 +17,9 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import math
 import os
+import random
 import ssl
 import sys
 from functools import cache
@@ -33,8 +35,6 @@ def _essay_file() -> Path:
 
 def _expand_essay(haystack, tokenizer, target: int):
     """Cyclically repeat only the distractor background; the upstream generator inserts each needle once."""
-    import math
-
     if not isinstance(haystack, list) or not haystack:
         raise ValueError("RULER essay background is empty")
     tokens = len(tokenizer(" ".join(haystack), add_special_tokens=False)["input_ids"])
@@ -46,6 +46,64 @@ def _expand_essay(haystack, tokenizer, target: int):
         repeats += 1
         expanded = haystack * repeats
     return expanded, repeats
+
+
+def _generate_long_cwe(namespace, *, num_samples, max_seq_length, tokenizer,
+                       remove_newline_tab, tokens_to_generate):
+    """Fit a shuffled numbered list while preserving CWE's 10:1 frequency ratio."""
+    config = namespace["CONFIG"]
+    vocab = sorted(namespace["WORDS"])
+    if len(vocab) < 40:
+        raise ValueError("RULER CWE requires at least 40 distinct words")
+    prefix = config["answer_prefix"].strip()
+    rng = random.Random(42 + max_seq_length)
+
+    def format_words(words):
+        return " ".join(f"{i}. {word}" for i, word in enumerate(words, 1))
+
+    def make_input(words, common_repeats, uncommon_repeats, seed):
+        entries = words[:10] * common_repeats + words[10:] * uncommon_repeats
+        random.Random(seed).shuffle(entries)
+        prompt = config["template"].format(context=format_words(entries), query="").strip()
+        return " ".join(prompt.split()) if remove_newline_tab else prompt
+
+    def measure(prompt):
+        # cwe.yaml inserts two newlines before the answer prefix.
+        return len(tokenizer(prompt + "\n\n" + prefix, truncation=False).input_ids) + tokens_to_generate
+
+    baseline = measure(make_input(vocab, 30, 3, 42))
+    # Leave room for tokenizer differences between the probe and shuffled samples.
+    scale = max(1, math.ceil(1.05 * max_seq_length / baseline))
+    estimate = round(len(vocab) * max_seq_length / (scale * baseline))
+
+    rows = []
+    for index in namespace["tqdm"](range(num_samples), desc=f"Generating CWE Samples | {max_seq_length}"):
+        words = rng.sample(vocab, len(vocab))
+        seed = rng.getrandbits(64)
+        low, high = 11, len(vocab)
+        count = max(low, min(high, estimate))
+        best = None
+        while low <= high:
+            prompt = make_input(words[:count], 30 * scale, 3 * scale, seed)
+            actual = measure(prompt)
+            if actual <= max_seq_length:
+                if best is None or actual > best[1]:
+                    best = prompt, actual
+                if actual >= max_seq_length - 1024:
+                    break
+                low = count + 1
+            else:
+                high = count - 1
+            count = max(low, min(high, round(count * max_seq_length / actual)))
+        if best is None:
+            raise ValueError(f"RULER CWE could not fit a numbered list into {max_seq_length} tokens")
+        prompt, actual = best
+        example = rng.sample(vocab, 40)
+        example_prompt = make_input(example, 10, 3, rng.getrandbits(64))
+        rows.append(dict(index=index, input=prompt,
+                         input_example=example_prompt + config["answer_prefix"] + format_words(example[:10]),
+                         outputs=words[:10], length=actual, max_length=max_seq_length, gen_prefix=prefix))
+    return rows
 
 
 def _patch_long_ruler_module(module) -> None:
@@ -75,13 +133,21 @@ def _patch_long_ruler_module(module) -> None:
             repeats = 1
             if values.get("type_haystack") == "essay":
                 values["haystack"], repeats = _expand_essay(values["haystack"], values["TOKENIZER"], length)
-            rows = original(*bound.args, **bound.kwargs)
+            protocol = "extended-v1"
+            if entry == "sys_word_pair_random":
+                rows = _generate_long_cwe(original.__globals__, num_samples=values["num_samples"],
+                                          max_seq_length=length, tokenizer=values["tokenizer"],
+                                          remove_newline_tab=values["remove_newline_tab"],
+                                          tokens_to_generate=values["tokens_to_generate"])
+                protocol = "extended-cwe-v1"
+            else:
+                rows = original(*bound.args, **bound.kwargs)
             for row in rows:
                 actual = int(row.get("length", 0))
                 if actual < length - 4096:
                     raise ValueError(f"RULER requested {length} tokens but generated only {actual}; "
                                      "the background/document pool cannot fill this length")
-                row["logkv_ruler_protocol"] = "extended-v1"
+                row["logkv_ruler_protocol"] = protocol
                 row["logkv_haystack_repeats"] = repeats
             return rows
 
