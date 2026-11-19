@@ -743,9 +743,9 @@ else
 fi
 
 # ==============================================================================
-# 长文本评测（训练后接着跑，见 long_eval_plan.py）：32K / 64K / 128K / 256K 逐档，每档窗口为长度 + 1024，YaRN 按长度取
-# 倍数（32K 不用，64K 2、128K 4、256K 8；YARN_MODE=fixed 时都用最长一档的倍数），NIAH 阶段跑该长度的 RULER，主阶段跑
-# BABILong、long_ppl、long_ppl_books、niah_turns、longbench2 与 infinitebench，每个任务 LONG_EVAL_LIMIT（默认 100）条，结果写到
+# 长文本评测（训练后接着跑，见 long_eval_plan.py）：32K–1M 逐档，每档窗口为长度 + 1024，YaRN 按长度取
+# 倍数（YARN_MODE=fixed 时都用最长一档的倍数）。NIAH 阶段跑 RULER，主阶段跑 BABILong、long_ppl、long_ppl_books、
+# niah_turns、longbench2 与 256K 及以下的 InfiniteBench，每个任务 LONG_EVAL_LIMIT（默认 100）条，结果写到
 # evaluate/long<L>（fixed：evaluate/yarn<F>/long<L>）。
 #   EVAL_LENGTHS=none 关掉；EVAL_LENGTHS=64k,256k 只测这些长度（默认 YAML 的 eval_lengths，否则全部）；
 #   EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench 只跑这些类；NIAH_ONLY=1 只跑 RULER。
@@ -761,6 +761,8 @@ import shlex
 import sys
 
 import yaml
+
+from long_eval_plan import LENGTHS
 
 
 def load(path):
@@ -778,7 +780,7 @@ done = [t for t in main.split(",") if t and main != "none"]
 done += [f"{t}@{n}" for t in niah.split(",") if t and niah != "none" for n in lengths]
 values = dict(
     TRAIN_CONTEXT=int(float(cfg.get("context_length") or cfg.get("max_seq_length") or 32768)),
-    CONFIG_EVAL_LENGTHS=",".join(str(x) for x in (cfg.get("eval_lengths") or [])),
+    CONFIG_EVAL_LENGTHS=",".join(str(x) for x in (cfg.get("eval_lengths") or LENGTHS)),
     CONFIG_LONG_PPL_DATA=cfg.get("long_ppl_data") or "",
     CONFIG_LONG_PPL_BOOKS=cfg.get("long_ppl_books") or "",
     CONFIG_BABILONG_DATASET=cfg.get("babilong_dataset") or "",
@@ -790,7 +792,7 @@ for name, value in values.items():
 LONG_EVAL_PY
 ) || exit 1
 eval "${LONG_EVAL_SETTINGS}"
-LONG_EVAL_LENGTHS=${EVAL_LENGTHS:-${CONFIG_EVAL_LENGTHS:-32k,64k,128k,256k}}
+LONG_EVAL_LENGTHS=${EVAL_LENGTHS:-${CONFIG_EVAL_LENGTHS}}
 case "$(printf '%s' "${LONG_EVAL_LENGTHS}" | tr '[:upper:]' '[:lower:]')" in
     none|off|false|0) LONG_EVAL_LENGTHS="" ;;
 esac

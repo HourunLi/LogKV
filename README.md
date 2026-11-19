@@ -86,7 +86,7 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 只训练需像上面一样将两个 benchmark 环境变量都设为 `none`。之后单独评测捞针可用
 `NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/cpt_dense.yaml`，默认全部 20 个任务。
 
-全量评测（32K 主线，再 32K / 64K / 128K / 256K 逐档的长文本评测，主线测过的不重测；任务清单与数据见
+全量评测（32K 主线，再 32K / 64K / 128K / 256K / 512K / 1M 逐档评测，主线测过的不重测；任务清单与数据见
 [NIAH 文档](docs/niah-logkv.md)的“全量评测”）：
 
 ```bash
@@ -122,11 +122,11 @@ bash eval.sh exp/qwen8b-32k/eval_full_word_first_query.yaml
 ```
 
 每份 YAML 先跑 32K 主线的常识推理、综合、LongBench v1 / LongBench-E、逐轮问与困惑度曲线，以及 1K–32K 捞针；
-再逐档跑 32K / 64K / 128K / 256K 的 RULER、BABILong、LongBench v2、逐轮问、困惑度与 InfiniteBench。
+再逐档跑 32K–1M 的 RULER、BABILong、LongBench v2、逐轮问和困惑度。InfiniteBench 跑 32K–256K 四档。
 主线不限条数，逐档默认每个任务 100 条；可用 `LIMIT=2` 先试跑。
 `eval_full_dense.yaml` 是原始 Qwen3-8B-Base 的独立对照，训练后权重的完整 KV 评测使用上表的 `eval_full_cpt_dense.yaml`。
 
-1.7B 与 8B 的全量评测均必跑 32K / 64K / 128K / 256K 的 LongBench v2；缓存缺失、缺子集或文件损坏会明确报错。
+1.7B 与 8B 的全量评测均必跑 32K–1M 的 LongBench v2。缓存缺失、缺子集或文件损坏会明确报错。
 先用相同 `HF_HOME` 准备数据，再补测已有配置的 LongBench v2（不重跑其它指标）。下载脚本还会把 20 个子集、
 503 道题复制为 `<HF_HOME>/longbench2` 下的普通 parquet 文件，逐文件校验 SHA256 和行数；已有数据完整时只需复制。
 1.7B 和 8B 的评测只读取这份副本，目录缺失或为空也不回退到 hub 快照。三个启动脚本统一导出并打印
@@ -239,7 +239,7 @@ LitGPT 通用用法见 [教程索引](tutorials/README.md)；通用 CLI 不自�
 其时间、形状和代码版本须一起解读；它们不定义当前算法。
 
 
-512K / 1M 通过 `EVAL_LENGTHS` 选择。1.7B 和 8B 的 `eval_full_<method>.yaml` 同名，
+用 `EVAL_LENGTHS=512k,1m` 可单独补跑两档。1.7B 和 8B 的 `eval_full_<method>.yaml` 同名，
 每份配置读取各自模型的权重。以下命令只跑这两档，默认选择 RULER、BABILong qa1–qa5、
 同一组 1M 长文的 PPL 曲线和 LongBench v2。完整说明见 [百万长度数据与评测](docs/eval-512k-1m.md)。
 

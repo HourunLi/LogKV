@@ -13,15 +13,15 @@ YARN_MODE picks the factor:
 YaRN's frequencies and temperature depend on the factor alone, not on the window, so a fixed pass at 32K differs
 from a per_length one only in the factor.
 
-EVAL_SUITES chooses the tasks (default all): ruler (NIAH stage: all of RULER, 12 tasks at 256K without
+EVAL_SUITES chooses the tasks (default all): ruler (NIAH stage: all of RULER, 12 tasks from 256K onward without
 ruler_qa_squad, whose 1204 SQuAD paragraphs cannot fill it), babilong, ppl (long_ppl_<L>, LONG_PPL_DATA), books
 (long_ppl_books_<L>, LONG_PPL_BOOKS), turns (niah_turns_<L>), longbench2 (longbench2_<L>) and infinitebench
 (infinitebench_<L>; INFINITEBENCH_DIR, <HF_HOME>/infinitebench or the hub cache). NIAH_ONLY=1 keeps ruler only. With
 the default suites ppl, books and infinitebench are optional: eval.py leaves them out, with the reason, when
 their data is not given (or their files are not whole). LongBench v2 must run at every selected length;
 missing or incomplete data is an error with a download command. Named suites must run.
-512K/1M are opt-in. Their default task list omits InfiniteBench (registered through 256K); asking explicitly
-for InfiniteBench at these lengths is an error. RULER uses the documented extended-v1 generator protocol.
+InfiniteBench is registered through 256K and runs only at those supported lengths. Asking for it with only
+512K/1M selected is an error. RULER uses the documented extended protocols at 512K/1M.
 
     python long_eval_plan.py <lengths> <suites or ""> <yarn_mode> <niah_only 0/1> <base overrides json or ""> <output dir> [skip]
 
@@ -48,6 +48,10 @@ RULER = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "
          "niah_multivalue", "niah_multiquery", "ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
 SQUAD_MAX = 131072  # SQuAD's document pool cannot fill longer contexts
 INFINITEBENCH_MAX = 262144  # no registered 512K/1M protocol for these fixed-length source samples
+
+
+def ruler_tasks(length: int) -> list[str]:
+    return [task for task in RULER if length <= SQUAD_MAX or task != "ruler_qa_squad"]
 
 
 def parse_list(text: str, allowed, what: str) -> list[str]:
@@ -85,19 +89,16 @@ def plan(lengths: str, suites: str = "", yarn_mode: str = "per_length", niah_onl
         raise ValueError(f"YARN_MODE must be per_length or fixed; got {yarn_mode!r}")
     if niah_only:
         chosen = [s for s in chosen if s == "ruler"] or ["ruler"]
+    if suites and "infinitebench" in chosen and all(LENGTHS[n] > INFINITEBENCH_MAX for n in names):
+        raise ValueError("InfiniteBench is registered only through 256k; select other suites for 512k/1m")
     longest = max(LENGTHS[n] for n in names)
     passes = []
     for name in names:
         length = LENGTHS[name]
-        active = list(chosen)
-        if length > INFINITEBENCH_MAX and "infinitebench" in active:
-            if suites:
-                raise ValueError("InfiniteBench is registered only through 256k; select other suites for 512k/1m")
-            active.remove("infinitebench")
+        active = [s for s in chosen if s != "infinitebench" or length <= INFINITEBENCH_MAX]
         factor = (length if yarn_mode == "per_length" else longest) / ORIGINAL
         main = [t for s in active if s != "ruler" for t in tasks(s, name) if t not in skip]
-        niah = [t for t in RULER if (length <= SQUAD_MAX or t != "ruler_qa_squad") and f"{t}@{length}" not in skip] \
-            if "ruler" in active else []
+        niah = [t for t in ruler_tasks(length) if f"{t}@{length}" not in skip] if "ruler" in active else []
         if not main and not niah:
             continue
         optional = [t for s in active if s in DATA_SUITES and not suites for t in tasks(s, name) if t in main]
