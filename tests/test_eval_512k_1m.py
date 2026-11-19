@@ -5,6 +5,7 @@ import importlib.util
 import inspect
 import json
 import os
+import random
 import re
 from collections import Counter
 from pathlib import Path
@@ -183,6 +184,55 @@ def test_ruler_bare_yaml_modules_receive_the_same_patch(monkeypatch):
         config = utils.load_yaml_config(str(folder / f"{name}.yaml"))
         fn = config["custom_dataset"]
         assert getattr(fn.__globals__[entry], "_logkv_long_ruler", False), name
+
+
+def test_long_hotpot_fits_each_question_through_yaml(monkeypatch):
+    import lm_eval.utils as utils
+    from litgpt import ruler_patch as patch
+
+    monkeypatch.setenv("RULER_LONG_SAMPLES", "2")
+    monkeypatch.setattr(patch, "LONG_RULER_MIN", 8192)
+    monkeypatch.setattr(utils, "import_function", utils.import_function)
+    patch._patch_yaml_function_imports()
+    folder = Path(utils.__file__).parent / "tasks/ruler"
+    load_hotpot = utils.load_yaml_config(str(folder / "qa_hotpot.yaml"))["custom_dataset"]
+    docs = [f"id{i} " + "word " * (1 + i % 64) for i in range(512)]
+    qas = [dict(query=f"Question {i}?", outputs=[f"Answer {i}"], context=[i, i + 500],
+                more_context=[i, i + 10]) for i in range(2)]
+
+    def tokenizer(text, *, truncation=False):
+        assert not truncation
+        return SimpleNamespace(input_ids=text.split())
+
+    monkeypatch.setitem(load_hotpot.__globals__, "read_hotpotqa", lambda: (qas, docs))
+    monkeypatch.setitem(load_hotpot.__globals__, "get_tokenizer", lambda *args: tokenizer)
+    kwargs = dict(pretrained="unused", max_seq_lengths=[8192])
+    rows = list(load_hotpot(**kwargs)["test"])
+    assert len(rows) == 2
+    for index, row in enumerate(rows):
+        assert row["index"] == index and row["max_length"] == 8192
+        assert row["logkv_ruler_protocol"] == "extended-qa-fit-v1"
+        assert row["gen_prefix"] == "Answer:"
+        assert row["outputs"] == qas[index]["outputs"]
+        assert row["input"].endswith(qas[index]["query"])
+        prompt = row["input"] + " " + row["gen_prefix"]
+        assert 8192 - 1024 <= row["length"] == len(tokenizer(prompt).input_ids) + 32 <= 8192
+        selected = [int(doc_id) for doc_id in re.findall(r"\nid(\d+) ", row["input"])]
+        assert set(qas[index]["context"] + qas[index]["more_context"]) <= set(selected)
+        assert len(selected) == len(set(selected))
+
+    random_state = random.getstate()
+    try:
+        random.seed(123)
+        assert list(load_hotpot(**kwargs)["test"]) == rows
+    finally:
+        random.setstate(random_state)
+
+    generate = load_hotpot.__globals__["generate_samples"]
+    short_rows = generate(tokenizer, docs, qas, 4096, num_samples=2)
+    assert len(short_rows) == 2 and all("logkv_ruler_protocol" not in row for row in short_rows)
+    with pytest.raises(ValueError, match=r"QA sample 0 could not fit 8192 tokens"):
+        generate(tokenizer, docs[:3], [dict(qas[0], context=[0], more_context=[])], 8192, num_samples=1)
 
 
 @pytest.mark.parametrize("length", [524288, 1048576])

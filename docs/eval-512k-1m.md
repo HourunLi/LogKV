@@ -94,7 +94,9 @@ LongBench v2 两档共用原有 20 子集、503 道题，不另下一个长度�
   不重复已插入的针，不改变答案和计分。新增档位默认每任务生成 100 条，可设 `RULER_LONG_SAMPLES`。
   CWE 的 `extended-cwe-nvidia-v1` 使用 NVIDIA RULER 的大词表，在现有模板下每个答案词出现 30 次，
   每个干扰词出现 3 次。FWE 的 `extended-fwe-fit-v1` 保留原词频分布，按实际 token 数细化词数搜索。
-  两项的长度都包含实际答案前缀和生成预留。旧 `extended-cwe-v1` 属于等比例提高词频的历史协议。
+  HotpotQA 的 `extended-qa-fit-v1` 保留原问题、参考答案和题目关联的上下文，使用固定随机种子从原文档池
+  无放回抽取干扰文档，按每条样本的实际 token 数调整文档数。这三项的长度都包含答案前缀和生成预留。
+  旧 `extended-cwe-v1` 属于等比例提高词频的历史协议。
   运行新版超长评测时，可用派生 YAML 的 `output_path` 指向新目录来保留旧结果。
   样本长度与协议字段见 [指标口径](evaluation-metrics.md)；不足目标长度 4096 tokens 以上时报错。
   保留已有 SQuAD 排除规则，因此超长档为 12 项，不能把均值直接当成其他论文完整 13 项的均值。
