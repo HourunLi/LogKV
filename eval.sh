@@ -327,12 +327,19 @@ if [ -n "${INFINITEBENCH_DIR}" ]; then export INFINITEBENCH_DIR; fi
 # The full evaluation (eval_main: true in the YAML, or EVAL_MAIN=1) runs the 32K main line first (the default task
 # lists, main and NIAH stage, the YAML's limit, into <output_path>), then the passes (long_limit samples per task),
 # which leave out what the main line measured; EVAL_LENGTHS=none keeps the main line only.
+# An explicit 512K/1M-only selection uses those passes and their standard suites by default.
+DEFAULT_EVAL_MAIN=${CONFIG_EVAL_MAIN}
+DEFAULT_EVAL_SUITES=${CONFIG_EVAL_SUITES}
+if [[ ${EVAL_LENGTHS,,} =~ ^[[:space:],]*(512k|1m)([[:space:],]+(512k|1m))*[[:space:],]*$ ]]; then
+    DEFAULT_EVAL_MAIN=0
+    DEFAULT_EVAL_SUITES=${CONFIG_EVAL_SUITES:-ruler,babilong,books,longbench2}
+fi
 EVAL_LENGTHS=${EVAL_LENGTHS:-${CONFIG_EVAL_LENGTHS}}
-EVAL_SUITES=${EVAL_SUITES:-${CONFIG_EVAL_SUITES}}
+EVAL_SUITES=${EVAL_SUITES:-${DEFAULT_EVAL_SUITES}}
 case "$(printf '%s' "${EVAL_LENGTHS}" | tr '[:upper:]' '[:lower:]')" in
     none|off|false|0) EVAL_LENGTHS="" ;;
 esac
-EVAL_MAIN=${EVAL_MAIN:-${CONFIG_EVAL_MAIN}}
+EVAL_MAIN=${EVAL_MAIN:-${DEFAULT_EVAL_MAIN}}
 if [ -n "${EVAL_LENGTHS}" ] && { [ -n "${2:-}" ] || [ -n "${3:-}" ]; }; then
     echo "ERROR: ${CONFIG_FILE} evaluates several lengths (EVAL_LENGTHS=${EVAL_LENGTHS}): choose tasks with EVAL_SUITES or NIAH_ONLY=1, not task-list arguments."
     exit 1

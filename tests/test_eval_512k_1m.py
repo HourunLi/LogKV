@@ -39,38 +39,51 @@ def test_new_passes_have_the_right_windows_factors_and_tasks():
         plan.plan("1m", suites="infinitebench")
 
 
-def test_ten_opt_in_yamls_keep_each_models_checkpoint_and_original_defaults():
+def test_both_models_have_the_same_evaluation_entries():
     def config(path):
         data = yaml.safe_load(path.read_text())
         base = config(path.parent / data.pop("config")) if data.get("config") else {}
         return {**base, **data}
 
-    for model in ("qwen1.7b-32k", "qwen8b-32k"):
-        folder = ROOT / "exp" / model
+    folders = [ROOT / "exp" / model for model in ("qwen1.7b-32k", "qwen8b-32k")]
+    for pattern in ("eval_full_*.yaml", "eval_long_*.yaml"):
+        assert {p.name for p in folders[0].glob(pattern)} == {p.name for p in folders[1].glob(pattern)}
+    for folder in folders:
+        assert not list(folder.glob("eval_512k_1m_*.yaml"))
+        assert not list(folder.glob("eval_long[0-9]*.yaml"))
         source = config(folder / "arc_gamma_k12_b128_p1024_2k.yaml")
-        for method in ("baseline", "word_first", "query", "word_first_query", "cpt_dense"):
-            data = config(folder / f"eval_512k_1m_{method}.yaml")
-            assert data["save_path"] == source["save_path"]
-            assert data["eval_lengths"] == ["512k", "1m"]
-            assert data["eval_suites"] == ["ruler", "babilong", "books", "longbench2"]
-            assert data.get("log_kv_dense_mode", False) == (method == "cpt_dense")
-            assert data["eval_main"] is False
-        assert config(folder / "eval_full_baseline.yaml")["eval_lengths"] == ["32k", "64k", "128k", "256k"]
+        for path in folder.glob("eval_full_*.yaml"):
+            data = config(path)
+            if path.name == "eval_full_dense.yaml":
+                assert data["checkpoint_dir"] == source["ckpt_dir"]
+            else:
+                assert data["save_path"] == source["save_path"]
+            assert bool(data.get("log_kv_dense_mode")) == (path.stem in {"eval_full_dense", "eval_full_cpt_dense"})
+            assert data["eval_lengths"] == ["32k", "64k", "128k", "256k"]
+            assert data["eval_main"] is True and data["long_limit"] == 100
 
 
-def test_eval_shell_honors_the_yamls_suites_without_loading_models(tmp_path):
+@pytest.mark.parametrize("model", ["qwen1.7b-32k", "qwen8b-32k"])
+def test_eval_shell_selects_only_the_requested_long_lengths(tmp_path, model):
     from test_long_eval_plan import _launcher
 
-    path = tmp_path / "ultra.yaml"
-    path.write_text("checkpoint_dir: /same-cpt\noutput_path: /out\neval_lengths: [512k, 1m]\n"
-                    "eval_suites: [ruler, babilong, books, longbench2]\nlimit: 100\n")
-    done, passes = _launcher(tmp_path, path)
+    path = ROOT / "exp" / model / "eval_full_word_first_query.yaml"
+    done, passes = _launcher(tmp_path, path, env={"EVAL_LENGTHS": "512k,1m"})
     assert done.returncode == 0, done.stderr
-    assert [p[0] for p in passes] == ["/out/long512k", "/out/long1m"]
-    for p in passes:
-        assert "long_ppl_books" in p[2] and "infinitebench" not in p[2] and "long_ppl_1m" not in p[2]
-    done, passes = _launcher(tmp_path, path, env={"EVAL_SUITES": "babilong"})
-    assert done.returncode == 0 and passes[-1][2] == "babilong_1m"
+    assert [Path(p[0]).name for p in passes] == ["long512k", "long1m"]
+    for length, entry in zip(("512k", "1m"), passes):
+        assert Path(entry[0]).parent.name == "full_word_first_query"
+        assert entry[1].endswith("--limit 100")
+        assert entry[2] == f"babilong_{length},long_ppl_books_{length},longbench2_{length}"
+        assert len(entry[3].split(",")) == 12 and "ruler_qa_hotpot" in entry[3]
+
+    done, passes = _launcher(tmp_path, path, env={"EVAL_LENGTHS": "1M, 512K", "EVAL_SUITES": "ppl,turns"})
+    assert done.returncode == 0, done.stderr
+    assert [p[2] for p in passes] == ["long_ppl_512k,niah_turns_512k", "long_ppl_1m,niah_turns_1m"]
+
+    done, passes = _launcher(tmp_path, path, env={"EVAL_LENGTHS": "512k", "EVAL_MAIN": "1"})
+    assert done.returncode == 0, done.stderr
+    assert [Path(p[0]).name for p in passes] == ["full_word_first_query", "long512k"]
 
 
 def test_named_million_token_tasks_are_checked_against_the_window():

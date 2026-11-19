@@ -239,18 +239,14 @@ LitGPT 通用用法见 [教程索引](tutorials/README.md)；通用 CLI 不自�
 其时间、形状和代码版本须一起解读；它们不定义当前算法。
 
 
-512K / 1M 评测为显式入口，现有 32K–256K 默认配置保持不变。1M 定义为 1048576 tokens，
-两档模型窗口分别为 525312、1049600，YaRN factor 分别为 16、32。完整说明见
-[百万长度数据与评测](docs/eval-512k-1m.md)。
+512K / 1M 通过 `EVAL_LENGTHS` 选择。1.7B 和 8B 的 `eval_full_<method>.yaml` 同名，
+每份配置读取各自模型的权重。以下命令只跑这两档，默认选择 RULER、BABILong qa1–qa5、
+同一组 1M 长文的 PPL 曲线和 LongBench v2。完整说明见 [百万长度数据与评测](docs/eval-512k-1m.md)。
 
 ```bash
-bash eval.sh exp/qwen8b-32k/eval_512k_1m_baseline.yaml
-bash eval.sh exp/qwen8b-32k/eval_512k_1m_word_first.yaml
-bash eval.sh exp/qwen8b-32k/eval_512k_1m_query.yaml
-bash eval.sh exp/qwen8b-32k/eval_512k_1m_word_first_query.yaml
-bash eval.sh exp/qwen8b-32k/eval_512k_1m_cpt_dense.yaml
+EVAL_LENGTHS=512k,1m bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query.yaml
+EVAL_LENGTHS=512k,1m bash eval.sh exp/qwen8b-32k/eval_full_word_first_query.yaml
 ```
 
-1.7B 使用 `exp/qwen1.7b-32k/` 下同名五份 YAML，各自只继承本模型目录的 CPT 配置。
-这些入口选择 RULER、BABILong qa1–qa5、同一组 1M 长文的 PPL 曲线和 LongBench v2；
-不重新训练。CPT dense 与压缩方法读取相同的 CPT 权重。
+CPT dense、baseline、query、word_first 和双池等评测使用对应的 `eval_full_<method>.yaml`。
+CPT dense 与压缩方法读取相同的 CPT 权重。

@@ -82,7 +82,7 @@ GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
                            "eval_long*_baseline.yaml", "eval_long*_word_first.yaml", "eval_full_baseline.yaml",
                            "eval_full_word_first.yaml", "eval_long_*query.yaml", "eval_full_*query.yaml",
                            "eval_full_word_first_query_detected.yaml", "eval_full_word_first_query_dual.yaml",
-                           "eval_512k_1m_*.yaml")
+                           "eval_full_cpt_dense.yaml")
     for p in EXP.glob(pattern))
 
 
@@ -111,8 +111,7 @@ QUERY = ["eval_gamma_query_p1024_slack0.yaml", "eval_gamma_query_literal_p1024_s
          # the query-cue long-context evaluations
          "eval_long_query.yaml", "eval_full_query.yaml", "eval_long_word_first_query.yaml",
          "eval_full_word_first_query.yaml", "eval_full_word_first_query_detected.yaml",
-         "eval_full_word_first_query_dual.yaml",
-         "eval_512k_1m_query.yaml", "eval_512k_1m_word_first_query.yaml"]
+         "eval_full_word_first_query_dual.yaml"]
 LITERAL = ["arc_gamma_cue_literal_k12_b128_2k.yaml", "eval_gamma_literal.yaml", "eval_gamma_literal_nocue.yaml",
            "eval_gamma_literal_p1024_slack0.yaml", "eval_gamma_cue_guard_literal_p1024_slack0.yaml",
            "eval_gamma_query_literal_p1024_slack0.yaml", "eval_gamma_query_literal.yaml", "eval_gamma_literal_p1024.yaml"]
@@ -289,13 +288,11 @@ def test_only_surprisal_evaluations_rank_by_surprisal(name):
                 "eval_gamma_surprisal_mean_query_p1024.yaml": "mean", "eval_gamma_surprisal_mix_query_p1024.yaml": "mix",
                 "eval_gamma_surprisal_word_first_query_p1024.yaml": "word_first",
                 **{f"eval_gamma_surprisal_{s}_p1024.yaml": s for s in ("word_max", "word_top2", "word_first", "multi_word")},
-                **{f"eval_long{n}_word_first.yaml": "word_first" for n in ("64k", "128k", "256k", "")},
-                "eval_full_word_first.yaml": "word_first", "eval_long_word_first_query.yaml": "word_first",
+                "eval_long_word_first.yaml": "word_first", "eval_full_word_first.yaml": "word_first",
+                "eval_long_word_first_query.yaml": "word_first",
                 "eval_full_word_first_query.yaml": "word_first",
                 "eval_full_word_first_query_detected.yaml": "word_first",
-                "eval_full_word_first_query_dual.yaml": "word_first",
-                "eval_512k_1m_word_first.yaml": "word_first",
-                "eval_512k_1m_word_first_query.yaml": "word_first"}
+                "eval_full_word_first_query_dual.yaml": "word_first"}
     assert effective(name).get("log_kv_gamma_surprisal") == expected.get(name), name
 
 
@@ -316,41 +313,14 @@ LONG = {"dense": "dense_niah_base.yaml", "baseline": "arc_gamma_k12_b128_p1024_2
         "word_first": "eval_gamma_surprisal_word_first_p1024.yaml"}
 
 
-@pytest.mark.parametrize("length,tokens,factor", [("64k", 65536, 2.0), ("128k", 131072, 4.0), ("256k", 262144, 8.0)])
-@pytest.mark.parametrize("name", sorted(LONG))
-def test_long_context_evaluations_change_only_the_length_settings(length, tokens, factor, name):
-    evaluated, base = effective(f"eval_long{length}_{name}.yaml"), effective(LONG[name])
-    # The base model's dense run keeps its results apart from its 32K ones.
-    assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
-        "eval_max_seq_lengths", "niah_benchmark", "benchmark", "limit", "config_overrides", "long_ppl_data",
-        "long_ppl_books", "infinitebench_dir", *(("output_path",) if name == "dense" else ())}
-    assert evaluated["eval_max_seq_lengths"] == [tokens]
-    assert evaluated["benchmark"].split(",")[:2] == [f"babilong_{length}", "long_ppl_32k" if length == "64k" else
-                                                     f"long_ppl_{length}"]
-    # The book curve, several questions on one cache, LongBench v2 and InfiniteBench, all under the
-    # configuration's length.
-    assert evaluated["benchmark"].split(",")[-4:] == [f"long_ppl_books_{length}", f"niah_turns_{length}",
-                                                      f"longbench2_{length}", f"infinitebench_{length}"]
-    # All of RULER; at 256K but SQuAD, whose 1204 dev paragraphs (about 220K tokens) cannot fill the context.
-    assert "ruler_qa_hotpot" in evaluated["niah_benchmark"] and len(evaluated["niah_benchmark"]) == (
-        12 if length == "256k" else 13)
-    assert ("ruler_qa_squad" in evaluated["niah_benchmark"]) == (length != "256k")
-    overrides = evaluated["config_overrides"]
-    assert overrides["block_size"] > tokens and overrides["rope_adjustments"] == dict(
-        factor=factor, beta_fast=32, beta_slow=1, original_max_seq_len=32768)
-
-
 @pytest.mark.parametrize("name", sorted(LONG))
 def test_one_yaml_per_method_covers_every_length(name):
-    """eval_long_<method>.yaml: the same model and cache settings as the per-length YAMLs, the lengths listed
-    (eval.sh computes each pass's window, YaRN and tasks: long_eval_plan.py)."""
+    """The long-evaluation entry preserves model and cache settings while selecting the default lengths."""
     evaluated, base = effective(f"eval_long_{name}.yaml"), effective(LONG[name])
     assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
         "eval_lengths", "limit", "long_ppl_data", "long_ppl_books", "infinitebench_dir"}
     assert evaluated["eval_lengths"] == ["32k", "64k", "128k", "256k"] and evaluated["limit"] == 100
     assert "config_overrides" not in evaluated
-    if name == "dense":  # passes write to its long<L> folders, where the per-length dense runs wrote
-        assert evaluated["output_path"] + "/long64k" == effective("eval_long64k_dense.yaml")["output_path"]
 
 
 

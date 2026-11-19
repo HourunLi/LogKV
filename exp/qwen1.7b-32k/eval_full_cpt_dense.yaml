@@ -1,0 +1,4 @@
+# Evaluate the baseline's CPT checkpoint with full KV.
+config: eval_full_baseline.yaml
+eval_tag: full_cpt_dense
+log_kv_dense_mode: true
