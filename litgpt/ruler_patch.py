@@ -77,8 +77,8 @@ def _expand_essay(haystack, tokenizer, target: int):
     return expanded, repeats
 
 
-def _fit_ruler_word_list(render, tokenizer, target, estimate, low, high, suffix, reserve, task):
-    """Fit complete word entries to the rendered prompt budget with bounded tokenization."""
+def _fit_ruler_prompt(render, tokenizer, target, estimate, low, high, suffix, reserve, task):
+    """Fit complete entries to the rendered prompt budget with bounded tokenization."""
     count = max(low, estimate if high is None else min(estimate, high))
     best = None
     for _ in range(24):
@@ -103,6 +103,57 @@ def _fit_ruler_word_list(render, tokenizer, target, estimate, low, high, suffix,
         return best
     actual = best[2] if best is not None else "no sample within budget"
     raise ValueError(f"RULER {task} could not fit {target} tokens (best: {actual})")
+
+
+def _generate_long_qa(namespace, *, tokenizer, docs, qas, max_seq_length, num_samples,
+                      tokens_to_generate, pre_samples, remove_newline_tab):
+    """Fit each question with distinct distractors while keeping its source documents."""
+    template = namespace["TEMPLATE"]
+    document_prompt = namespace["DOCUMENT_PROMPT"]
+    seed = namespace["SEED"]
+    prefix = namespace["CONFIG"]["answer_prefix"]
+    suffix = " " + prefix  # target_delimiter inherited from niah_single_1.yaml
+
+    def make_input(question, doc_ids):
+        context = "\n\n".join(document_prompt.format(i=i, document=docs[doc_id])
+                              for i, doc_id in enumerate(doc_ids, 1))
+        prompt = template.format(context=context, query=question)
+        return " ".join(prompt.split()) if remove_newline_tab else prompt
+
+    if num_samples == 0:
+        return []
+    probe = random.Random(seed).sample(range(len(docs)), min(128, len(docs)))
+    probe_length = len(tokenizer(make_input(qas[pre_samples]["query"], probe) + suffix,
+                                 truncation=False).input_ids) + tokens_to_generate
+    estimate = round(len(probe) * max_seq_length / probe_length)
+
+    rows = []
+    for index in namespace["tqdm"](range(num_samples), desc=f"Generating QA Samples | {max_seq_length}"):
+        source_index = index + pre_samples
+        qa = qas[source_index]
+        required = list(dict.fromkeys(qa["context"]))
+        related = list(dict.fromkeys(qa.get("more_context", ())))
+        required_set = set(required)
+        related = [doc_id for doc_id in related if doc_id not in required_set]
+        excluded = required_set.union(related)
+        distractors = [doc_id for doc_id in range(len(docs)) if doc_id not in excluded]
+        rng = random.Random(seed + source_index)
+        rng.shuffle(related)
+        rng.shuffle(distractors)
+        candidates = required + related + distractors
+
+        def render(count):
+            selected = candidates[:count]
+            random.Random(seed).shuffle(selected)
+            return make_input(qa["query"], selected), qa["outputs"]
+
+        prompt, outputs, actual = _fit_ruler_prompt(
+            render, tokenizer, max_seq_length, estimate, len(required), len(candidates),
+            suffix, tokens_to_generate, f"QA sample {source_index}",
+        )
+        rows.append(dict(index=index, input=prompt, outputs=outputs, length=actual,
+                         max_length=max_seq_length, gen_prefix=prefix))
+    return rows
 
 
 def _generate_long_cwe(namespace, *, num_samples, max_seq_length, tokenizer,
@@ -135,7 +186,7 @@ def _generate_long_cwe(namespace, *, num_samples, max_seq_length, tokenizer,
             words = random.Random(seed).sample(vocab, count)
             return make_input(words, 30, 3, shuffle_seed), words[:10]
 
-        prompt, outputs, actual = _fit_ruler_word_list(
+        prompt, outputs, actual = _fit_ruler_prompt(
             render, tokenizer, max_seq_length, estimate, 11, len(vocab), suffix, tokens_to_generate, "CWE",
         )
         example = rng.sample(sorted(namespace["WORDS"]), 40)
@@ -179,7 +230,7 @@ def _generate_long_fwe(namespace, *, num_samples, max_seq_length, tokenizer, voc
             prompt = config["template"].format(context=" ".join(entries), query="").strip()
             return (" ".join(prompt.split()) if remove_newline_tab else prompt), vocab[1:4]
 
-        prompt, outputs, actual = _fit_ruler_word_list(
+        prompt, outputs, actual = _fit_ruler_prompt(
             render, tokenizer, max_seq_length, estimate, 1, None, " " + prefix, tokens_to_generate, "FWE",
         )
         rows.append(dict(index=index, input=prompt, outputs=outputs, length=actual,
@@ -197,6 +248,7 @@ def _patch_long_ruler_module(module) -> None:
     original = getattr(module, entry) if entry else None
     if original is not None and not getattr(original, "_logkv_long_ruler", False):
         signature = inspect.signature(original)
+        is_qa = entry == "generate_samples" and module.__name__.rsplit(".", 1)[-1] == "qa_utils"
 
         @functools.wraps(original)
         def generate(*args, **kwargs):
@@ -222,6 +274,10 @@ def _patch_long_ruler_module(module) -> None:
             elif entry == "sys_kwext":
                 rows = _generate_long_fwe(original.__globals__, **values)
                 protocol = "extended-fwe-fit-v1"
+            elif is_qa:
+                qa_args = {key: value for key, value in values.items() if key != "incremental"}
+                rows = _generate_long_qa(original.__globals__, **qa_args)
+                protocol = "extended-qa-fit-v1"
             else:
                 rows = original(*bound.args, **bound.kwargs)
             for row in rows:
