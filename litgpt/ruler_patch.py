@@ -427,6 +427,7 @@ def _patch_yaml_function_imports() -> None:
     import functools
     from types import SimpleNamespace
     import lm_eval.utils as utils
+    from litgpt.ruler_dataset_cache import cached_builder
 
     original = utils.import_function
     if getattr(original, "_logkv_ruler_import", False):
@@ -444,7 +445,7 @@ def _patch_yaml_function_imports() -> None:
                          "sys_word_pair_random", "sys_kwext", "download_json"):
                 if name in namespace and hasattr(proxy, name):
                     namespace[name] = getattr(proxy, name)
-        return function
+        return cached_builder(function, filename)
 
     import_function._logkv_ruler_import = True
     utils.import_function = import_function

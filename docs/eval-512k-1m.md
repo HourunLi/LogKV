@@ -99,6 +99,26 @@ bash diag.sh unused/fetch_long_eval_data.py --ruler-essays --no-babilong --no-ru
 后者准备 `RULER_CACHE_DIR/paul_graham_essays.txt` 和普通 NLTK punkt_tab 文件。
 LongBench v2 两档共用原有 20 子集、503 道题，不另下一个长度版本。
 
+## 在 CPU 作业预生成 RULER 文本
+
+准备好背景文章、HotpotQA、CWE 词表和 NLTK 文件后，在 CPU 作业并行构建 RULER 和逐轮问样本。
+`TOKENIZER_DIR` 指向评测使用的 tokenizer 目录，预生成和评测使用相同仓库版本、Python 环境及数据缓存。
+
+```bash
+export RULER_DATASET_CACHE_DIR="${HF_HOME}/ruler_cache/generated"
+bash diag.sh unused/prepare_ruler_datasets.py --tokenizer "$TOKENIZER_DIR" \
+  --lengths 1m --samples 100 --workers 4 --cache-dir "$RULER_DATASET_CACHE_DIR"
+
+EVAL_LENGTHS=1m EVAL_SUITES=ruler,turns \
+  bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query.yaml
+```
+
+GPU 作业需读取同一个共享目录。缓存按生成代码、tokenizer、背景数据、长度和条数区分，
+命中后各 rank 直接映射同一个 Arrow 文件。显式设置 `RULER_DATASET_CACHE_DIR` 时，缺少匹配文件会立即报错。
+默认也会查找 `RULER_CACHE_DIR/generated`，缺失时各节点在本机临时目录只构建一份。
+`LIMIT=2` 试跑优先读取已有全量缓存，首次构建时最多生成 2 条。全量缓存保留每个任务的原始条数。
+缓存缩短样本准备阶段。GPU 推理阶段的首 token 时间和后续解码时间见评测的推理速度报告。
+
 ## 任务口径
 
 - RULER：512K/1M 的捞针与逐轮问使用 `extended-niah-fit-v1`，变量追踪使用 `extended-vt-fit-v1`。
