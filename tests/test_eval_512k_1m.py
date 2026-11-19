@@ -188,7 +188,7 @@ def test_ruler_extension_caps_only_new_lengths_and_marks_the_protocol(monkeypatc
         calls.append((len(haystack), num_samples, max_seq_length))
         return [dict(length=max_seq_length) for _ in range(num_samples)]
 
-    module = SimpleNamespace(__name__="lm_eval.tasks.ruler.prepare_niah", generate_samples=generate)
+    module = SimpleNamespace(__name__="lm_eval.tasks.ruler.niah_utils", generate_samples=generate)
     patch._patch_long_ruler_module(module)
     tok = lambda text, **kw: {"input_ids": text.split()}
     short = module.generate_samples(["a", "b"], TOKENIZER=tok, max_seq_length=32, type_haystack="essay")
@@ -210,6 +210,74 @@ def test_ruler_bare_yaml_modules_receive_the_same_patch(monkeypatch):
         config = utils.load_yaml_config(str(folder / f"{name}.yaml"))
         fn = config["custom_dataset"]
         assert getattr(fn.__globals__[entry], "_logkv_long_ruler", False), name
+
+
+def test_long_niah_uses_a_bounded_number_of_probes_and_preserves_turns(monkeypatch):
+    from lm_eval.tasks.ruler import niah_utils, prepare_niah
+    from transformers import BatchEncoding
+
+    from eval_tasks.niah_turns.niah_turns_utils import SEPARATOR, turns_of
+    from litgpt import ruler_patch as patch
+
+    monkeypatch.setattr(patch, "LONG_RULER_MIN", 32768)
+    monkeypatch.setenv("RULER_LONG_SAMPLES", "2")
+    monkeypatch.setattr(prepare_niah, "cached_sent_tokenize", lambda text: text.split(". "))
+    module = SimpleNamespace(**vars(prepare_niah))
+    patch._patch_long_ruler_module(module)
+    tokenizations = []
+
+    def tokenizer(text, **kwargs):
+        tokenizations.append(text.count(" "))
+        return BatchEncoding({"input_ids": text.split()})
+
+    haystack = ("A short sentence ends here. " * 8000).split()
+    args = dict(TOKENIZER=tokenizer, max_seq_length=32768, template=niah_utils.TEMPLATE,
+                type_haystack="essay", type_needle_k="words", type_needle_v="numbers",
+                num_needle_q=4, tokens_to_generate=384)
+    initial_state = random.getstate()
+    rows = module.generate_samples(haystack, **args)
+    assert random.getstate() == initial_state
+    assert len(tokenizations) <= 8 and len(rows) == 2
+    for row in rows:
+        assert row["logkv_ruler_protocol"] == "extended-niah-fit-v1"
+        prompt = row["input"] + " " + row["gen_prefix"]
+        assert 31744 <= row["length"] == len(prompt.split()) + 384 <= 32768
+        sample = turns_of(row)
+        context, *questions = sample["input"].split(SEPARATOR)
+        assert len(questions) == len(sample["outputs"]) == 4
+        assert all(answer in context for answer in sample["outputs"])
+
+
+def test_long_vt_fits_the_rendered_prompt_with_its_fewshot_example(monkeypatch):
+    import lm_eval.utils as utils
+    from transformers import BatchEncoding
+
+    from litgpt import ruler_patch as patch
+
+    monkeypatch.setattr(patch, "LONG_RULER_MIN", 32768)
+    monkeypatch.setenv("RULER_LONG_SAMPLES", "2")
+    monkeypatch.setattr(utils, "import_function", utils.import_function)
+    patch._patch_yaml_function_imports()
+    folder = Path(utils.__file__).parent / "tasks/ruler"
+    fn = utils.load_yaml_config(str(folder / "vt.yaml"))["custom_dataset"]
+    tokenizations = []
+
+    def tokenizer(text, **kwargs):
+        tokenizations.append(text.count(" "))
+        return BatchEncoding({"input_ids": text.split()})
+
+    monkeypatch.setitem(fn.__globals__, "get_tokenizer", lambda *args: tokenizer)
+    rows = list(fn(pretrained="unused", max_seq_lengths=[32768])["test"])
+    assert len(rows) == 2
+    # The small upstream few-shot example uses its original increment. The long
+    # examples need only a short probe and a few full-size tokenizations.
+    assert sum(n > 15000 for n in tokenizations) <= 8
+    for row in rows:
+        assert row["logkv_ruler_protocol"] == "extended-vt-fit-v1"
+        assert row["input"].count("Memorize and track") == 2
+        prompt = row["input"] + " " + row["gen_prefix"]
+        assert 31744 <= row["length"] == len(prompt.split()) + 30 <= 32768
+        assert all(answer in row["input"] for answer in row["outputs"])
 
 
 def test_long_hotpot_fits_each_question_through_yaml(monkeypatch):

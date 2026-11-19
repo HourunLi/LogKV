@@ -168,7 +168,7 @@ def check_ruler_qa(report, extended=False) -> None:
         from litgpt.ruler_patch import _essay_file
         path = _essay_file()
         report(path.is_file() and not path.is_symlink() and path.stat().st_size > 0,
-               f"RULER extended-v1 ordinary essay background: {path}")
+               f"RULER ordinary essay background: {path}")
         nltk = Path(os.environ.get("NLTK_DATA", str(folder.parent / "nltk_data")).split(os.pathsep)[0])
         path = nltk / "tokenizers/punkt_tab/english/collocations.tab"
         report(path.is_file() and not path.is_symlink(), f"RULER ordinary NLTK data: {path}")

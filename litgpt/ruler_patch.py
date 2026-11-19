@@ -24,7 +24,7 @@ import random
 import ssl
 import string
 import sys
-from functools import cache
+from functools import cache, partial
 from pathlib import Path
 
 LONG_RULER_MIN = 524288
@@ -66,15 +66,19 @@ def _expand_essay(haystack, tokenizer, target: int):
     """Cyclically repeat only the distractor background; the upstream generator inserts each needle once."""
     if not isinstance(haystack, list) or not haystack:
         raise ValueError("RULER essay background is empty")
-    tokens = len(tokenizer(" ".join(haystack), add_special_tokens=False)["input_ids"])
+    count_tokens = partial(tokenizer, add_special_tokens=False, truncation=False, verbose=False)
+    tokens = len(count_tokens(" ".join(haystack))["input_ids"])
     if not tokens:
         raise ValueError("RULER essay background tokenizes to zero tokens")
     repeats = max(1, math.ceil((target + 2048) / tokens))
-    expanded = haystack * repeats
-    while len(tokenizer(" ".join(expanded), add_special_tokens=False)["input_ids"]) < target + 1024:
+    expanded = haystack if repeats == 1 else haystack * repeats
+    if repeats > 1:
+        tokens = len(count_tokens(" ".join(expanded))["input_ids"])
+    while tokens < target + 1024:
         repeats += 1
         expanded = haystack * repeats
-    return expanded, repeats
+        tokens = len(count_tokens(" ".join(expanded))["input_ids"])
+    return expanded, repeats, tokens
 
 
 def _fit_ruler_prompt(render, tokenizer, target, estimate, low, high, suffix, reserve, task):
@@ -88,7 +92,7 @@ def _fit_ruler_prompt(render, tokenizer, target, estimate, low, high, suffix, re
         length = len(tokenizer(prompt + suffix, truncation=False).input_ids) + reserve
         if length <= target:
             if best is None or length > best[2]:
-                best = prompt, outputs, length
+                best = prompt, outputs, length, count
             if length >= target - 1024:
                 return best
             low = count + 1
@@ -103,6 +107,102 @@ def _fit_ruler_prompt(render, tokenizer, target, estimate, low, high, suffix, re
         return best
     actual = best[2] if best is not None else "no sample within budget"
     raise ValueError(f"RULER {task} could not fit {target} tokens (best: {actual})")
+
+
+def _generate_sized_ruler_rows(namespace, render, *, tokenizer, target, reserve, num_samples, low, task,
+                               estimate=None, high=None, seed=42, numpy_rng=None):
+    """Fit a rendered example and reuse its background count to size the next example."""
+    if not num_samples:
+        return []
+    tokenizer = partial(tokenizer, verbose=False)
+    rng = random.Random(seed)
+    python_state = random.getstate()
+    numpy_state = numpy_rng.get_state() if numpy_rng is not None else None
+    rows = []
+    try:
+        for index in namespace["tqdm"](range(num_samples), desc=f"Generating {task} Samples | {target}"):
+            sample_seed = rng.getrandbits(32)
+
+            def make_prompt(count):
+                # Upstream renderers use module-level RNGs. Reuse the sample's seed
+                # across sizing attempts and restore the caller's RNGs afterwards.
+                random.seed(sample_seed)
+                if numpy_rng is not None:
+                    numpy_rng.seed(sample_seed)
+                prompt, answers, prefix = render(count)
+                return prompt + " " + prefix, (prompt, answers, prefix)
+
+            if estimate is None:
+                probe = max(low, 512)
+                text, _ = make_prompt(probe)
+                length = len(tokenizer(text, truncation=False).input_ids)
+                estimate = round(probe * (target - reserve) / max(1, length))
+            _, (prompt, answers, prefix), length, estimate = _fit_ruler_prompt(
+                make_prompt, tokenizer, target, estimate, low, high, "", reserve, f"{task} sample {index}",
+            )
+            rows.append(dict(index=index, input=prompt, outputs=answers, length=length,
+                             max_length=target, gen_prefix=prefix))
+        return rows
+    finally:
+        random.setstate(python_state)
+        if numpy_rng is not None:
+            numpy_rng.set_state(numpy_state)
+
+
+def _generate_long_niah(namespace, *, haystack, TOKENIZER, max_seq_length, type_haystack, type_needle_k,
+                        type_needle_v, template, num_samples, tokens_to_generate, num_needle_v, num_needle_k,
+                        num_needle_q, remove_newline_tab, random_seed, essay_tokens):
+    num_needle_k = max(num_needle_k, num_needle_q)
+    estimate = round(len(haystack) * (max_seq_length - tokens_to_generate) / essay_tokens) if essay_tokens else None
+
+    def render(count):
+        prompt, answers, query = namespace["generate_input_output"](
+            count, haystack, type_haystack=type_haystack, num_needle_k=num_needle_k,
+            type_needle_k=type_needle_k, num_needle_v=num_needle_v, type_needle_v=type_needle_v,
+            template=template, num_needle_q=num_needle_q, random_seed=random_seed,
+        )
+        if remove_newline_tab:
+            prompt = " ".join(prompt.split())
+        if num_needle_q * num_needle_v == 1:
+            prefix = f"The special magic {type_needle_v[:-1]} for {query} mentioned in the provided text is"
+        else:
+            prefix = f"The special magic {type_needle_v} for {query} mentioned in the provided text are"
+        return prompt, answers, prefix
+
+    return _generate_sized_ruler_rows(
+        namespace, render, tokenizer=TOKENIZER, target=max_seq_length, reserve=tokens_to_generate,
+        num_samples=num_samples, low=max(1, num_needle_k * num_needle_v),
+        task=f"NIAH ({type_haystack})", estimate=estimate,
+        high=len(haystack) if type_haystack == "essay" else None, seed=random_seed,
+    )
+
+
+def _generate_long_vt(namespace, *, tokenizer, num_samples, max_seq_length, num_chains, num_hops, add_fewshot,
+                      tokens_to_generate, icl_example, remove_newline_tab):
+    config = namespace["CONFIG"]["variable_tracking"]
+    question_start = config["template"][:20]
+    answer_start = config["answer_prefix"].split("{num_v}", 1)[0]
+    example = None
+    if add_fewshot and icl_example is not None:
+        example = icl_example["input"] + " " + " ".join(icl_example["outputs"]) + "\n\n"
+
+    def render(count):
+        prompt, answers = namespace["generate_input_output"](
+            count, num_chains, num_hops, is_icl=add_fewshot and icl_example is None,
+        )
+        if example is not None:
+            cutoff = prompt.index(question_start)
+            prompt = prompt[:cutoff] + namespace["randomize_icl"](example) + "\n\n" + prompt[cutoff:]
+        if remove_newline_tab:
+            prompt = " ".join(prompt.split())
+        cutoff = prompt.rindex(answer_start)
+        prefix = prompt[cutoff:].strip()
+        return (prompt[:cutoff] if icl_example is not None else prompt), answers, prefix
+
+    return _generate_sized_ruler_rows(
+        namespace, render, tokenizer=tokenizer, target=max_seq_length, reserve=tokens_to_generate,
+        num_samples=num_samples, low=max(1, num_hops + 2), task="VT", numpy_rng=namespace["np"].random,
+    )
 
 
 def _generate_long_qa(namespace, *, tokenizer, docs, qas, max_seq_length, num_samples,
@@ -147,7 +247,7 @@ def _generate_long_qa(namespace, *, tokenizer, docs, qas, max_seq_length, num_sa
             random.Random(seed).shuffle(selected)
             return make_input(qa["query"], selected), qa["outputs"]
 
-        prompt, outputs, actual = _fit_ruler_prompt(
+        prompt, outputs, actual, _ = _fit_ruler_prompt(
             render, tokenizer, max_seq_length, estimate, len(required), len(candidates),
             suffix, tokens_to_generate, f"QA sample {source_index}",
         )
@@ -186,7 +286,7 @@ def _generate_long_cwe(namespace, *, num_samples, max_seq_length, tokenizer,
             words = random.Random(seed).sample(vocab, count)
             return make_input(words, 30, 3, shuffle_seed), words[:10]
 
-        prompt, outputs, actual = _fit_ruler_prompt(
+        prompt, outputs, actual, _ = _fit_ruler_prompt(
             render, tokenizer, max_seq_length, estimate, 11, len(vocab), suffix, tokens_to_generate, "CWE",
         )
         example = rng.sample(sorted(namespace["WORDS"]), 40)
@@ -230,7 +330,7 @@ def _generate_long_fwe(namespace, *, num_samples, max_seq_length, tokenizer, voc
             prompt = config["template"].format(context=" ".join(entries), query="").strip()
             return (" ".join(prompt.split()) if remove_newline_tab else prompt), vocab[1:4]
 
-        prompt, outputs, actual = _fit_ruler_prompt(
+        prompt, outputs, actual, _ = _fit_ruler_prompt(
             render, tokenizer, max_seq_length, estimate, 1, None, " " + prefix, tokens_to_generate, "FWE",
         )
         rows.append(dict(index=index, input=prompt, outputs=outputs, length=actual,
@@ -248,7 +348,7 @@ def _patch_long_ruler_module(module) -> None:
     original = getattr(module, entry) if entry else None
     if original is not None and not getattr(original, "_logkv_long_ruler", False):
         signature = inspect.signature(original)
-        is_qa = entry == "generate_samples" and module.__name__.rsplit(".", 1)[-1] == "qa_utils"
+        module_name = module.__name__.rsplit(".", 1)[-1] if entry == "generate_samples" else ""
 
         @functools.wraps(original)
         def generate(*args, **kwargs):
@@ -264,8 +364,11 @@ def _patch_long_ruler_module(module) -> None:
             if "num_samples" in values:
                 values["num_samples"] = min(int(values["num_samples"]), cap)
             repeats = 1
+            essay_tokens = None
             if values.get("type_haystack") == "essay":
-                values["haystack"], repeats = _expand_essay(values["haystack"], values["TOKENIZER"], length)
+                values["haystack"], repeats, essay_tokens = _expand_essay(
+                    values["haystack"], values["TOKENIZER"], length,
+                )
             protocol = "extended-v1"
             if entry == "sys_word_pair_random":
                 cwe_args = {key: value for key, value in values.items() if key != "incremental"}
@@ -274,10 +377,18 @@ def _patch_long_ruler_module(module) -> None:
             elif entry == "sys_kwext":
                 rows = _generate_long_fwe(original.__globals__, **values)
                 protocol = "extended-fwe-fit-v1"
-            elif is_qa:
+            elif module_name == "qa_utils":
                 qa_args = {key: value for key, value in values.items() if key != "incremental"}
                 rows = _generate_long_qa(original.__globals__, **qa_args)
                 protocol = "extended-qa-fit-v1"
+            elif module_name == "prepare_niah":
+                niah_args = {key: value for key, value in values.items() if key != "incremental"}
+                rows = _generate_long_niah(original.__globals__, **niah_args, essay_tokens=essay_tokens)
+                protocol = "extended-niah-fit-v1"
+            elif entry == "sys_vartrack_w_noise_random":
+                vt_args = {key: value for key, value in values.items() if key != "incremental"}
+                rows = _generate_long_vt(original.__globals__, **vt_args)
+                protocol = "extended-vt-fit-v1"
             else:
                 rows = original(*bound.args, **bound.kwargs)
             for row in rows:

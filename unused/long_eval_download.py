@@ -192,7 +192,7 @@ def prepare_ruler_essays(lines):
         target.unlink()
     target.write_text(text, encoding="utf-8")
     lines.append(f"RULER ordinary essays: {target}, {len(text)} characters, SHA256={sha256(target)}; "
-                 "512K/1M generation cycles the background and inserts each needle once (extended-v1)")
+                 "512K/1M generation cycles the background and inserts each needle once")
     prepare_nltk(lines)
 
 
