@@ -574,6 +574,7 @@ def _task_manager(metadata):
 from litgpt.generate.base import generate as litgpt_generate
 from litgpt.kv_compression import cache_compression_snapshot, summarize_compression
 from litgpt.log_kv_diag import DIAG as LOG_KV_DIAG, diag_mode
+from litgpt.ruler_dataset_cache import evaluation_sample_limit
 from litgpt.ruler_patch import apply_patch
 apply_patch()
 from litgpt.longbench2_patch import apply_patch as apply_longbench2_patch  # noqa: E402
@@ -2491,6 +2492,7 @@ def main(
         with (
             _harness_logging(),
             _trace_hf_cache_resolution(),
+            evaluation_sample_limit(limit),
             diag_mode(
                 log_kv_diag_mode,
                 exact_from_layer=log_kv_diag_exact_from_layer,

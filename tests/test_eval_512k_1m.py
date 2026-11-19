@@ -208,8 +208,56 @@ def test_ruler_bare_yaml_modules_receive_the_same_patch(monkeypatch):
     for name, entry in (("vt", "sys_vartrack_w_noise_random"), ("cwe", "sys_word_pair_random"),
                         ("fwe", "sys_kwext"), ("qa_hotpot", "generate_samples")):
         config = utils.load_yaml_config(str(folder / f"{name}.yaml"))
-        fn = config["custom_dataset"]
+        fn = inspect.unwrap(config["custom_dataset"])
         assert getattr(fn.__globals__[entry], "_logkv_long_ruler", False), name
+
+
+def test_ruler_arrow_cache_reuses_full_rows_and_rejects_an_incomplete_copy(tmp_path, monkeypatch):
+    import datasets
+
+    from litgpt import ruler_dataset_cache as cache
+
+    monkeypatch.setenv("RULER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("RULER_LONG_SAMPLES", "4")
+    monkeypatch.delenv("RULER_DATASET_CACHE_DIR", raising=False)
+    monkeypatch.delenv("RULER_DATASET_PREPARE", raising=False)
+    monkeypatch.setattr(cache.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(cache, "_generator_version", lambda: ["test"])
+    tokenizer = tmp_path / "tokenizer.json"
+    tokenizer.write_text("first vocabulary")
+    calls = []
+
+    def niah_single_1(**kwargs):
+        count = int(os.environ["RULER_LONG_SAMPLES"])
+        calls.append(count)
+        rows = [{"input": f"prompt {i}", "outputs": [str(i)], "max_length": 1048576} for i in range(count)]
+        return {"test": datasets.Dataset.from_list(rows)}
+
+    build = cache.cached_builder(niah_single_1, "/lm_eval/tasks/ruler/niah_utils.py")
+    kwargs = dict(pretrained=str(tmp_path), max_seq_lengths=[1048576])
+    with cache.evaluation_sample_limit(2):
+        assert list(build(**kwargs)["test"]["input"]) == ["prompt 0", "prompt 1"]
+        assert len(build(**kwargs)["test"]) == 2
+    assert calls == [2]
+
+    monkeypatch.setenv("RULER_DATASET_PREPARE", "1")
+    assert len(build(**kwargs)["test"]) == 4
+    monkeypatch.delenv("RULER_DATASET_PREPARE")
+    shared = cache.shared_cache_dir()
+    monkeypatch.setenv("RULER_DATASET_CACHE_DIR", str(shared))
+    with cache.evaluation_sample_limit(1):
+        assert list(build(**kwargs)["test"]["input"]) == ["prompt 0"]
+    assert calls == [2, 4]
+
+    tokenizer.write_text("different vocabulary")
+    with pytest.raises(FileNotFoundError, match="No matching RULER dataset"):
+        build(**kwargs)
+    tokenizer.write_text("first vocabulary")
+    [published] = shared.glob("*.arrow")
+    published.write_bytes(published.read_bytes()[:20])
+    with pytest.raises(FileNotFoundError, match="No matching RULER dataset"):
+        build(**kwargs)
+    assert calls == [2, 4]
 
 
 def test_long_niah_uses_a_bounded_number_of_probes_and_preserves_turns(monkeypatch):
@@ -259,7 +307,7 @@ def test_long_vt_fits_the_rendered_prompt_with_its_fewshot_example(monkeypatch):
     monkeypatch.setattr(utils, "import_function", utils.import_function)
     patch._patch_yaml_function_imports()
     folder = Path(utils.__file__).parent / "tasks/ruler"
-    fn = utils.load_yaml_config(str(folder / "vt.yaml"))["custom_dataset"]
+    fn = inspect.unwrap(utils.load_yaml_config(str(folder / "vt.yaml"))["custom_dataset"])
     tokenizations = []
 
     def tokenizer(text, **kwargs):
@@ -289,7 +337,7 @@ def test_long_hotpot_fits_each_question_through_yaml(monkeypatch):
     monkeypatch.setattr(utils, "import_function", utils.import_function)
     patch._patch_yaml_function_imports()
     folder = Path(utils.__file__).parent / "tasks/ruler"
-    load_hotpot = utils.load_yaml_config(str(folder / "qa_hotpot.yaml"))["custom_dataset"]
+    load_hotpot = inspect.unwrap(utils.load_yaml_config(str(folder / "qa_hotpot.yaml"))["custom_dataset"])
     docs = [f"id{i} " + "word " * (1 + i % 64) for i in range(512)]
     qas = [dict(query=f"Question {i}?", outputs=[f"Answer {i}"], context=[i, i + 500],
                 more_context=[i, i + 10]) for i in range(2)]
@@ -340,7 +388,7 @@ def test_long_cwe_retains_ten_answers_and_fits_the_budget(monkeypatch, length):
     monkeypatch.setattr(utils, "import_function", utils.import_function)
     patch._patch_yaml_function_imports()
     folder = Path(utils.__file__).parent / "tasks/ruler"
-    fn = utils.load_yaml_config(str(folder / "cwe.yaml"))["custom_dataset"]
+    fn = inspect.unwrap(utils.load_yaml_config(str(folder / "cwe.yaml"))["custom_dataset"])
     generate = fn.__globals__["sys_word_pair_random"]
 
     def tokenizer(text, *, truncation=False):
@@ -371,7 +419,7 @@ def test_long_fwe_fits_the_rendered_prompt_and_preserves_the_ranked_words(monkey
     monkeypatch.setattr(utils, "import_function", utils.import_function)
     patch._patch_yaml_function_imports()
     folder = Path(utils.__file__).parent / "tasks/ruler"
-    fn = utils.load_yaml_config(str(folder / "fwe.yaml"))["custom_dataset"]
+    fn = inspect.unwrap(utils.load_yaml_config(str(folder / "fwe.yaml"))["custom_dataset"])
     generate = fn.__globals__["sys_kwext"]
     config = fn.__globals__["CONFIG"]
 
