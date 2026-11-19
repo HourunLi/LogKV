@@ -1,6 +1,6 @@
 """unused/parse_lmeval_table.py reads what is pasted into its model_outputs: result tables, or whole eval logs
 (the tables eval.py prints, with whatever surrounds them), one row per model across the logs pasted under its
-name, with the long-context columns at 64K / 128K / 256K."""
+name, with the long-context columns from 32K through 1M."""
 import importlib.util
 from pathlib import Path
 
@@ -87,31 +87,37 @@ def test_pasted_tables_still_parse_as_before(parse):
 
 def test_the_header_keeps_each_length_together(parse):
     """tests/parse_lmeval_table_columns.txt is the header: the 32K main line (89 columns), then one block per length
-    (32K, 64K, 128K, 256K), each length's columns contiguous, in the same order in every block, and only the columns
+    from 32K through 1M, each length's columns contiguous, in the same order in every block, and only the columns
     that length's evaluations fill. A new column goes into the blocks of the lengths it runs at and into that file."""
     import re
+    import yaml
 
+    expected_lengths = ("32k", "64k", "128k", "256k", "512k", "1m")
     frozen = (ROOT / "tests" / "parse_lmeval_table_columns.txt").read_text().splitlines()
     header = list(parse.build_table({"m": ""}).columns)
     assert header == frozen
     assert header[89] == "AVG_NIAH_words" and header[90] == "niah_single_1_32k"  # the main line, then 32K's block
     # The task's length: the first _<length> in the name (long_ppl_books_64k_8k is 64K's curve).
-    lengths = [m.group(1) if (m := re.search(r"_(32k|64k|128k|256k)(?=_|$)", c)) else None for c in header[90:]]
+    lengths = [m.group(1) if (m := re.search(rf"_({'|'.join(expected_lengths)})(?=_|$)", c)) else None
+               for c in header[90:]]
     assert None not in lengths
     order = [n for i, n in enumerate(lengths) if i == 0 or n != lengths[i - 1]]
-    assert order == ["32k", "64k", "128k", "256k"]  # no length comes back after another
+    assert order == list(expected_lengths)
     # Every block in the same order; a block only has the columns its evaluations fill.
     shapes = {n: [re.sub(rf"_{n}(?=_|$)", "_<n>", c, count=1) for c, m in zip(header[90:], lengths) if m == n]
-              for n in ("32k", "64k", "128k", "256k")}
-    full = list(shapes["128k"])  # every column a block can have: 128K's and the 256K point of the book curve
-    full.insert(full.index("long_ppl_<n>"), "long_ppl_books_<n>_256k")
+              for n in expected_lengths}
+    full = list(shapes["128k"])
+    ppl_index = full.index("long_ppl_<n>")
+    full[ppl_index:ppl_index] = [f"long_ppl_books_<n>_{point}" for point in ("256k", "512k", "1m")]
     for n, shape in shapes.items():
         assert shape == [c for c in full if c in shape], n
-    assert len(shapes["64k"]) == 64 and len(shapes["256k"]) == 65
-    assert "AVG_InfiniteBench_<n>" in shapes["32k"] and len(shapes["32k"]) == 63
-    assert [c for c in shapes["32k"] if c.startswith("long_ppl")] == [
-        "long_ppl_books_<n>_8k", "long_ppl_books_<n>_16k", "long_ppl_books_<n>_32k", "long_ppl_<n>"]
-    assert "ruler_qa_squad_<n>" not in shapes["256k"] and "long_ppl_books_<n>_256k" in shapes["256k"]
+        books = yaml.safe_load((ROOT / f"eval_tasks/long_ppl/long_ppl_books_{n}.yaml").read_text())["task"]
+        assert [c for c in header if c.startswith(f"long_ppl_books_{n}_")] == books
+    assert [len(shapes[n]) for n in expected_lengths] == [63, 64, 65, 65, 55, 56]
+    for n in ("256k", "512k", "1m"):
+        assert "ruler_qa_squad_<n>" not in shapes[n]
+    for n in ("512k", "1m"):
+        assert not any("infinitebench" in c.lower() for c in shapes[n])
 
 
 def test_turn_and_book_curve_columns(parse):
@@ -139,15 +145,44 @@ def test_infinitebench_columns(parse):
 def test_each_average_follows_its_tasks(parse):
     """Inside a length's block the columns are grouped by task, each average right after what it averages."""
     header = list(parse.build_table({"m": ""}).columns)
-    for n in ("32k", "64k", "128k", "256k"):
-        for avg in (f"AVG_NIAH_{n}", f"AVG_NIAH_multi_{n}", f"AVG_RULER_{n}", f"AVG_babilong_{n}",
-                    f"AVG_InfiniteBench_{n}"):
+    for n in parse.BLOCK_LENGTHS:
+        averages = [f"AVG_NIAH_{n}", f"AVG_NIAH_multi_{n}", f"AVG_RULER_{n}", f"AVG_babilong_{n}"]
+        if n in parse.INFINITEBENCH_LENGTHS:
+            averages.append(f"AVG_InfiniteBench_{n}")
+        for avg in averages:
             places = sorted(header.index(t) for t in parse.AVG_GROUPS[avg])
             assert header.index(avg) == places[-1] + 1, avg
             if avg != f"AVG_RULER_{n}":  # AVG_RULER averages all of RULER, after its last group
                 assert places == list(range(places[0], places[-1] + 1)), avg  # its tasks side by side
         turns = [header.index(f"niah_turns_{n}_turn{i}") for i in range(1, 5)]
         assert header.index(f"niah_turns_{n}") == turns[-1] + 1 and turns == list(range(turns[0], turns[0] + 4))
+
+
+def test_512k_and_1m_logs_fill_their_own_task_columns(parse):
+    logs = [_table({"piqa": {"acc": 0.7}})]
+    for n, metric, score in (("512k", "524288", 0.2), ("1m", "1048576", 0.4)):
+        ruler = {task: {metric: score} for task in RULER_256K}
+        ruler["ruler_qa_squad"] = {metric: 0.9}  # invalid for both lengths
+        books = {f"long_ppl_books_{n}_{point}": {"bits_per_byte": 0.5, "ppl": 11.0}
+                 for point in parse.BOOK_POINTS[n]}
+        babi = {f"babilong_qa{i}_{n}": {"acc": score} for i in range(1, 6)}
+        lb2 = {"longbench2_code": {"acc": score + 0.05}, "longbench2_translate": {"acc": score}}
+        main = {f"longbench2_{n}": {"acc": score + 0.1}, **lb2,
+                f"niah_turns_{n}": {"turn1": score, "turn4": score, "acc": score},
+                f"long_ppl_{n}": {"bits_per_byte": 0.6, "ppl": 10.0}, **books, **babi,
+                f"infinitebench_passkey_{n}": {"score": 0.9}}
+        logs.extend([_table(ruler), _table(main, [(f"longbench2_{n}", lb2)])])
+    table = parse.build_table({"wf": _log(*logs)}).set_index("Model")
+    row = table.loc["wf"]
+    for n, score in (("512k", 0.2), ("1m", 0.4)):
+        assert row[f"ruler_qa_hotpot_{n}"] == row[f"AVG_RULER_{n}"] == score
+        assert row[f"babilong_qa3_{n}"] == row[f"AVG_babilong_{n}"] == score
+        assert row[f"longbench2_code_{n}"] == pytest.approx(score + 0.05)
+        assert row[f"LongBench2_{n}"] == pytest.approx(score + 0.1)
+        assert row[f"niah_turns_{n}_turn1"] == row[f"niah_turns_{n}"] == score
+        assert row[f"long_ppl_books_{n}_{n}"] == 11.0 and row[f"long_ppl_{n}"] == 10.0
+        assert f"ruler_qa_squad_{n}" not in table and f"infinitebench_passkey_{n}" not in table
+    assert "long_ppl_books_512k_1m" not in table and row["AVG_all"] == 0.7
 
 
 LONGBENCH2_64K = """|longbench2_64k                |      0|none  |      |acc   |↑  |0.2565|±  |0.0195|

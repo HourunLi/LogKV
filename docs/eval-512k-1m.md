@@ -1,7 +1,7 @@
 # 512K / 1M 评测
 
-对两个模型目录中同名的 `eval_full_<method>.yaml` 设置 `EVAL_LENGTHS=512k,1m`，
-即可运行 524288、1048576 tokens 两档。
+全量评测默认包含 512K 和 1M。对两个模型目录中同名的 `eval_full_<method>.yaml` 设置
+`EVAL_LENGTHS=512k,1m`，可以只跑 524288 和 1048576 tokens 两档。
 
 ```bash
 EVAL_LENGTHS=512k,1m bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query.yaml
@@ -12,7 +12,8 @@ EVAL_LENGTHS=512k,1m bash eval.sh exp/qwen8b-32k/eval_full_word_first_query.yaml
 每任务 100 条。可用 `EVAL_SUITES` 选择任务，用 `EVAL_MAIN=1` 加跑 32K 主线。
 窗口额外留 1024 tokens，YaRN 以训练长度 32768 为原长，factor 为 16、32。
 结果写到方法原目录下的 `long512k/` 和 `long1m/`。省略 `EVAL_LENGTHS` 时，
-全量配置运行 32K 主线和 32K–256K 逐档评测。
+全量配置运行 32K 主线和 32K、64K、128K、256K、512K、1M 六档，并按默认任务清单安排逐轮问和单点 PPL。
+InfiniteBench 的任务只注册到 256K。
 
 ## 数据准备
 

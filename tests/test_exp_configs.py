@@ -319,7 +319,7 @@ def test_one_yaml_per_method_covers_every_length(name):
     evaluated, base = effective(f"eval_long_{name}.yaml"), effective(LONG[name])
     assert {k for k in set(evaluated) | set(base) if evaluated.get(k) != base.get(k)} == {
         "eval_lengths", "limit", "long_ppl_data", "long_ppl_books", "infinitebench_dir"}
-    assert evaluated["eval_lengths"] == ["32k", "64k", "128k", "256k"] and evaluated["limit"] == 100
+    assert evaluated["eval_lengths"] == ["32k", "64k", "128k", "256k", "512k", "1m"] and evaluated["limit"] == 100
     assert "config_overrides" not in evaluated
 
 

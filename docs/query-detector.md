@@ -89,7 +89,7 @@ GPUS_PER_NODE=1 EVAL_MAIN=0 LIMIT=2 EVAL_LENGTHS=32k EVAL_SUITES=ruler,babilong,
 ```
 
 8B 对应 `exp/qwen8b-32k/eval_full_word_first_query_detected.yaml`。
-去掉试跑限制即沿用原有 32K–256K 全量流程。结果使用独立的 `eval_tag`。
+省略长度、条数和任务覆盖即可使用 32K–1M 全量配置。结果使用独立的 `eval_tag`。
 `eval_main`、`eval_lengths` 和任务选择遵循原入口约定。
 
 固定双池但关闭检测器的对照使用 `eval_full_word_first_query_dual.yaml`，两个模型目录均提供。

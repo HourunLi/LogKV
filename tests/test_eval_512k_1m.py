@@ -35,6 +35,10 @@ def test_new_passes_have_the_right_windows_factors_and_tasks():
         assert p["main"] == [f"{stem}_{p['name']}" for stem in
                               ("babilong", "long_ppl", "long_ppl_books", "niah_turns", "longbench2")]
     assert plan.plan("32k,64k,128k,256k")[-1]["main"][-1] == "infinitebench_256k"
+    mixed = plan.plan("256k,512k,1m", suites="infinitebench,longbench2")
+    assert [p["main"] for p in mixed] == [
+        ["longbench2_256k", "infinitebench_256k"], ["longbench2_512k"], ["longbench2_1m"],
+    ]
     with pytest.raises(ValueError, match="InfiniteBench"):
         plan.plan("1m", suites="infinitebench")
 
@@ -59,7 +63,7 @@ def test_both_models_have_the_same_evaluation_entries():
             else:
                 assert data["save_path"] == source["save_path"]
             assert bool(data.get("log_kv_dense_mode")) == (path.stem in {"eval_full_dense", "eval_full_cpt_dense"})
-            assert data["eval_lengths"] == ["32k", "64k", "128k", "256k"]
+            assert data["eval_lengths"] == ["32k", "64k", "128k", "256k", "512k", "1m"]
             assert data["eval_main"] is True and data["long_limit"] == 100
 
 
@@ -68,6 +72,15 @@ def test_eval_shell_selects_only_the_requested_long_lengths(tmp_path, model):
     from test_long_eval_plan import _launcher
 
     path = ROOT / "exp" / model / "eval_full_word_first_query.yaml"
+    done, passes = _launcher(tmp_path, path)
+    assert done.returncode == 0, done.stderr
+    assert [Path(p[0]).name for p in passes] == [
+        "full_word_first_query", "long32k", "long64k", "long128k", "long256k", "long512k", "long1m",
+    ]
+    for length, entry in zip(("512k", "1m"), passes[-2:]):
+        assert entry[2] == (f"babilong_{length},long_ppl_{length},long_ppl_books_{length},"
+                            f"niah_turns_{length},longbench2_{length}")
+
     done, passes = _launcher(tmp_path, path, env={"EVAL_LENGTHS": "512k,1m"})
     assert done.returncode == 0, done.stderr
     assert [Path(p[0]).name for p in passes] == ["long512k", "long1m"]

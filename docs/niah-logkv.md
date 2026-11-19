@@ -389,6 +389,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   | 32K 主线·NIAH 阶段 | 1K–32K | RULER 单针 3、多针 5、cue 变体 9、词值针 3 | 不限（RULER 默认 500） | `output_path` |
   | 长文本·32K 档 | 32K（不用 YaRN） | RULER 其余 5 个、BABILong、LongBench v2、`long_ppl_32k`、InfiniteBench | `long_limit`（100） | `long32k` |
   | 长文本·64K/128K/256K 档 | 该长度（YaRN 2/4/8） | RULER 13 个（256K 12 个）、BABILong、LongBench v2、`niah_turns`、书的曲线、`long_ppl`、InfiniteBench | `long_limit`（100） | `long<L>` |
+  | 长文本·512K/1M 档 | 该长度（YaRN 16/32） | RULER 12 个、BABILong、LongBench v2、`niah_turns`、书的曲线、`long_ppl` | `long_limit`（100） | `long<L>` |
 
   `eval.sh` 先用默认清单跑主线（YAML 的 `benchmark` / `niah_benchmark` 置空，`limit` 置空即不限条数；`config_overrides` 照用），
   再由 `long_eval_plan.py measured` 列出主线测过的任务（主阶段的任务名，NIAH 阶段的任务在其各长度上记作 `任务@长度`）交给
@@ -403,15 +404,15 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   `eval_gamma_surprisal_word_first_query_p1024.yaml`）。查询感知 cue 只作用于生成请求（RULER、BABILong、InfiniteBench，
   取 prompt 末尾 64 个 token 里的问题）；按似然打分的 LongBench v2、困惑度任务不给问题，`niah_turns` 缓存上下文时也不知道
   问题，这些任务上与只开 cue 保护相同。
-- 一份配置测多个长度：`eval_long_{dense,baseline,word_first}.yaml`（`eval_lengths: [32k, 64k, 128k, 256k]`）。`eval.sh` 用
+- 一份配置测多个长度：`eval_long_{dense,baseline,word_first}.yaml`（`eval_lengths: [32k, 64k, 128k, 256k, 512k, 1m]`）。`eval.sh` 用
   `long_eval_plan.py` 按长度逐档评测：每档窗口为长度 + 1024，NIAH 阶段跑该长度的 RULER，主阶段跑该长度的 `babilong_<L>`、
-  `long_ppl_<L>`、`long_ppl_books_<L>`、`niah_turns_<L>`、`longbench2_<L>` 与 `infinitebench_<L>`，结果写到
+  `long_ppl_<L>`、`long_ppl_books_<L>`、`niah_turns_<L>`、`longbench2_<L>` 与 256K 及以下的 `infinitebench_<L>`，结果写到
   `<output_path>/long<L>`。YaRN 默认按长度取倍数
-  （`YARN_MODE=per_length`：32K 不用，64K 2、128K 4、256K 8），32K 档与 32K 主线一致、各长度比较的是压缩而不是外推；
+  （`YARN_MODE=per_length`：32K 不用，64K 2、128K 4、256K 8、512K 16、1M 32），32K 档与 32K 主线一致、各长度比较的是压缩而不是外推；
   `YARN_MODE=fixed` 是附加实验：每档都用所测最长一档的倍数（按该长度部署的模型，静态 YaRN），写到 `<output_path>/yarn<F>/long<L>`。
   YaRN 的频率与温度只取决于倍数、与窗口无关，所以两种模式只差倍数，LongBench v2 的预算仍是各档自己的长度。外部变量控制范围：
   `EVAL_LENGTHS=32k,128k`（默认 YAML 的 `eval_lengths`）、`EVAL_SUITES=ruler,babilong,ppl,books,turns,longbench2,infinitebench`
-  （默认全部；LongBench v2 在四档均为必跑项，缺失子集或文件不是完整 parquet 时会在模型加载前报错，
+  （默认全部已注册任务；LongBench v2 在六档均为必跑项，缺失子集或文件不是完整 parquet 时会在模型加载前报错，
   按提示用同一 `HF_HOME` 运行 `bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong --no-ruler-qa`。
   默认时缺数据的 `ppl`、`books` 与找不到十个文件的 `infinitebench` 作为可选任务跳过并打印原因，点名的必须能跑）、`NIAH_ONLY=1`（只跑 RULER）；这种配置不接受任务清单参数。
   每档换一次窗口与 YaRN，要重新加载模型（约一分钟）。32K 档的 8 个捞针任务写进 32K 主线的同名列，其余 5 个 RULER 任务、
@@ -419,24 +420,24 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   例如 `EVAL_MAIN=0 EVAL_LENGTHS=64k bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml`。
   如需在 YaRN factor 2 下补测 32K PPL，可用 `EVAL_MAIN=0 EVAL_LENGTHS=32k,64k YARN_MODE=fixed EVAL_SUITES=ppl`。
 - 训练后自动跑：`majob.sh` 在主评测与 NIAH 阶段之后，用训练 YAML 的缓存设置对刚训好的 checkpoint 跑同样的逐档评测
-  （长度默认 YAML 的 `eval_lengths`，否则 32K–256K 全部；`EVAL_LENGTHS=none` 关闭，`EVAL_SUITES`、`YARN_MODE`、`NIAH_ONLY` 同上），
+  （长度默认 YAML 的 `eval_lengths`，否则 32K–1M 全部；`EVAL_LENGTHS=none` 关闭，`EVAL_SUITES`、`YARN_MODE`、`NIAH_ONLY` 同上），
   每个任务 `LONG_EVAL_LIMIT`（默认 100）条，结果写到 `evaluate/long<L>`。主线已经测过的不再重测（主评测的任务、NIAH 阶段在各自
   长度上的捞针，`long_eval_plan.py` 的 skip），所以 32K 档只补 BABILong、`long_ppl_32k`、LongBench v2 与其余 5 个 RULER 任务，
   主线 500 条的 32K 捞针不会被 100 条的结果覆盖。训练长度（`context_length`）不到 32K 的 checkpoint 跳过：长文本的 YaRN 以 32K
   为原长。数据取环境变量 `LONG_PPL_DATA`、`LONG_PPL_BOOKS`、`BABILONG_DATASET`、`INFINITEBENCH_DIR`，或 YAML 的同名小写键。
 - 汇总表（`unused/parse_lmeval_table.py`）：把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
   日志里 eval.py 打印的结果表会被挑出来（行首前缀会去掉），同一模型的几份日志（如 32K、128K、256K 各一份）接着贴进
-  同一个字符串，合成一行。表头按长度分块：前 89 列是 32K 主线（常识、综合、LongBench v1/E、32K 捞针），之后 32K、64K、128K、
-  256K 各一块（论文里 32K-256K 可单独成表），各块顺序相同、只列该长度的评测会产出结果的列（32K 63 列，64K 64 列，128K 与
-  256K 各 65 列），块内按任务分组、每组的平均紧跟在它的任务之后：单针 `niah_single_1-3_<长度>`、`AVG_NIAH_<长度>`；多针 5 个、
-  `AVG_NIAH_multi_<长度>`；其余 RULER 任务、`AVG_RULER_<长度>`（该长度全部 RULER 任务的平均；256K 没有 `ruler_qa_squad`，为
-  12 个）；`babilong_qa1-5_<长度>`、`AVG_babilong_<长度>`；LongBench v2 的 20 个子任务
+  同一个字符串，合成一行。表头从 `Model` 和 89 列 32K 主线开始，再按 32K、64K、128K、256K、512K、1M 分成六块，
+  分别有 63、64、65、65、55、56 列。块内按任务分组，每组的平均紧跟对应任务。先排单针 `niah_single_1-3_<长度>`、
+  `AVG_NIAH_<长度>`，再排多针 5 个、`AVG_NIAH_multi_<长度>`，然后是其余 RULER 任务与全组平均 `AVG_RULER_<长度>`。
+  `ruler_qa_squad` 只排到 128K，256K 起每档有 12 个 RULER 任务。后面是 `babilong_qa1-5_<长度>`、
+  `AVG_babilong_<长度>`，以及 LongBench v2 的 20 个子任务
   `longbench2_<子任务>_<长度>`（日志里子任务名不带长度，按它上面的组 `longbench2_<长度>` 记到该长度）、`LongBench2_<长度>`（组的总分，
   按题数加权，即全部题目的正确率）；`niah_turns_<长度>_turn1-4`、
   `niah_turns_<长度>`（四轮平均）；书的困惑度曲线 `long_ppl_books_<长度>_<8k…该长度>`，之后是 `long_ppl_<长度>`（越低越好）；
-  InfiniteBench 十个任务 `infinitebench_<任务>_<长度>`、`AVG_InfiniteBench_<长度>`。32K 块的捞针列与主线的
+  32K–256K 块末尾是 InfiniteBench 的十个任务和 `AVG_InfiniteBench_<长度>`。32K 块的捞针列与主线的
   `niah_single_1` 等是同一份结果，重复列出。这些列都不计入 `AVG_all`；不带长度的 `longbench2` 结果（上下文预算不明）不进表。
-  新列加在它所测长度的块里、所属任务组的平均之前；`tests/parse_lmeval_table_columns.txt` 记着表头（共 347 列），
+  新列加在它所测长度的块里、所属任务组的平均之前；`tests/parse_lmeval_table_columns.txt` 记着表头（共 458 列），
   测试检查各块顺序一致、各长度的列连在一起、每个平均紧跟在它的任务之后、每个平均及其任务都在表头里。按位置对齐的旧表格把日志
   重新贴进来再跑一遍即可得到新顺序。
 

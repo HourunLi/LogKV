@@ -5,10 +5,19 @@
 值可以只是结果表，也可以是整段 eval 日志：其中 eval.py 打印的结果表（每个阶段一张）会被挑出来，行首的时间戳、
 rank 等前缀会去掉，其余行忽略。同一个模型的几份日志（例如 32K、128K、256K 各一份）接着贴进同一个字符串，合成一行。
 """
-import pandas as pd
-import numpy as np
 import io
 import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from long_eval_plan import INFINITEBENCH_MAX, LENGTHS, ruler_tasks  # noqa: E402
 
 # 把你的各个模型的原始输出放在这里。这里以 Model_A 为例（填入你提供的原数据）
 model_outputs = {
@@ -608,39 +617,39 @@ ORDERED_COLUMNS = [
     # niahLogKV 泛化：值为随机英文词、不含数字的针（eval_tasks/niah_cue/*_words），取 32K。
     "niah_single_2_words", "niah_single_2_words_qend", "niah_single_2_words_paraphrase", "AVG_NIAH_words",
 ]
-LONG_LENGTHS = {"32768": "32k", "65536": "64k", "131072": "128k", "262144": "256k"}
+LONG_LENGTHS = {str(tokens): name for name, tokens in LENGTHS.items()}
 LONG_NIAH = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2",
              "niah_multikey_3", "niah_multivalue", "niah_multiquery"]
-LONG_RULER = LONG_NIAH + ["ruler_vt", "ruler_cwe", "ruler_fwe", "ruler_qa_squad", "ruler_qa_hotpot"]
-BLOCK_LENGTHS = ("32k", "64k", "128k", "256k")
+BLOCK_LENGTHS = tuple(LENGTHS)
 BABILONG_LENGTHS = PPL_LENGTHS = LONGBENCH2_LENGTHS = TURN_LENGTHS = BLOCK_LENGTHS
 TURN_TASKS = [f"niah_turns_{n}" for n in TURN_LENGTHS]
 # 书的困惑度曲线的截断点：每个配置长度只到它自己的长度（long_ppl_books_32k 为 8k、16k、32k）。
-BOOK_POINTS = {n: [f"{2 ** k}k" for k in range(3, 9) if 2 ** k <= int(n[:-1])] for n in BLOCK_LENGTHS}
+BOOK_POINT_LENGTHS = {"8k": 8192, "16k": 16384, **LENGTHS}
+BOOK_POINTS = {n: [point for point, tokens in BOOK_POINT_LENGTHS.items() if tokens <= length]
+               for n, length in LENGTHS.items()}
 # InfiniteBench 的十个任务（eval_tasks/infinitebench，32K-256K），AVG_InfiniteBench 为十个的平均（论文的 Avg）。
 INFINITEBENCH = ["passkey", "number_string", "kv_retrieval", "longbook_sum_eng", "longbook_qa_eng", "longbook_choice_eng",
                  "longbook_qa_chn", "longdialogue_qa_eng", "code_debug", "math_find"]
-INFINITEBENCH_LENGTHS = BLOCK_LENGTHS
+INFINITEBENCH_LENGTHS = tuple(n for n, length in LENGTHS.items() if length <= INFINITEBENCH_MAX)
 # LongBench v2 的 20 个子任务（lm-eval 的 longbench2_*，各长度的组 longbench2_<长度> 都是这 20 个，日志里子任务名不带长度，
 # 按它所在的组记到该长度），LongBench2_<长度> 是组的总分（按题数加权，即全部题目的正确率，lm-eval 报告的那个）。
 LONGBENCH2_SUBTASKS = ["academic_multi", "academic_single", "agent_history", "code", "detective", "dialogue_history",
                        "event_order", "fin_multi", "fin_single", "govt_multi", "govt_single", "graph", "legal_multi",
                        "legal_single", "lit_single", "many_shot", "news_multi", "table", "translate", "user_guide"]
-LONGBENCH2_GROUP = re.compile(r"longbench2_(32k|64k|128k|256k)")
-# 每个长度实际跑的 RULER 任务：256K 没有 ruler_qa_squad（SQuAD 的文档池填不满 256K）。
-RULER_AT = {n: [t for t in LONG_RULER if n != "256k" or t != "ruler_qa_squad"] for n in BLOCK_LENGTHS}
+LONGBENCH2_GROUP = re.compile(rf"longbench2_({'|'.join(LONGBENCH2_LENGTHS)})")
+RULER_AT = {n: ruler_tasks(length) for n, length in LENGTHS.items()}
 
 
-# 长文本列先按长度分块（32K 主线之后是 32K、64K、128K、256K 各一块，论文里 32K-256K 可以单独成表），块内再按任务分组、
+# 长文本列先按长度分块（32K 主线之后是 32K、64K、128K、256K、512K、1M），块内再按任务分组、
 # 每组的平均紧跟在它平均的任务之后。只列评测会产出结果的列，各块的顺序相同：
 #   RULER 单针 niah_single_1-3、AVG_NIAH；多针 niah_multikey_1-3、niah_multivalue、niah_multiquery、AVG_NIAH_multi；
-#   其余 ruler_vt、ruler_cwe、ruler_fwe、ruler_qa_squad（256K 没有）、ruler_qa_hotpot、AVG_RULER（该长度全部 RULER 任务的
-#   平均：13 个，256K 为 12 个）；BABILong qa1-qa5、AVG_babilong；
+#   其余 ruler_vt、ruler_cwe、ruler_fwe、ruler_qa_squad（至 128K）、ruler_qa_hotpot、AVG_RULER（该长度全部 RULER
+#   任务的平均：13 个，256K 起为 12 个）；BABILong qa1-qa5、AVG_babilong；
 #   LongBench v2 的 20 个子任务 longbench2_<子任务>_<长度>、LongBench2_<长度>（组的总分，按题数加权）；
 #   同一份缓存上逐轮问 niah_turns_<长度>_turn1-4、niah_turns_<长度>（四轮平均）；
 #   书的困惑度曲线 long_ppl_books_<长度>_<截断长度>（截断长度 8k 起到该长度，同一批书，越低越好），之后是同长度的
 #   long_ppl_<长度>（PG19 测试集文档末尾的困惑度，越低越好）；
-#   InfiniteBench 十个任务 infinitebench_<任务>_<长度>（官方评分）、AVG_InfiniteBench_<长度>。
+#   32K–256K 的 InfiniteBench 十个任务及 AVG_InfiniteBench_<长度>。
 # 32K 块的捞针列与 32K 主线的 niah_single_1 等是同一份结果，重复列出。都不计入 AVG_all。新列加在所属任务组里、它的平均
 # 之前，并更新 tests/parse_lmeval_table_columns.txt（测试检查各块顺序一致、各长度的列连在一起、平均紧跟其任务）。
 def _length_block(n):
@@ -794,9 +803,10 @@ def parse_single_model(model_name, markdown_text):
             except ValueError:
                 pass
             continue
-        if target_task in LONG_RULER and metric in LONG_LENGTHS:  # RULER at 32K-256K: <task>_<length>
+        ruler_length = LONG_LENGTHS.get(metric)
+        if target_task in RULER_AT.get(ruler_length, ()):
             try:
-                row_data[f"{target_task}_{LONG_LENGTHS[metric]}"] = float(value)
+                row_data[f"{target_task}_{ruler_length}"] = float(value)
             except ValueError:
                 pass
             if metric != "32768":
@@ -833,5 +843,4 @@ def build_table(outputs):
 if __name__ == "__main__":
     final_df = build_table(model_outputs)
     # 3. 清理空白，输出剪贴板友好格式
-    final_df = final_df.fillna("")
-    print(final_df.to_csv(sep=',', index=False))
+    print(final_df.to_csv(sep=',', index=False, na_rep=""), end="")

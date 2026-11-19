@@ -205,7 +205,7 @@ def test_majob_runs_the_long_passes_after_training(tmp_path):
     done, calls = _majob_long_eval(tmp_path, 32768, env=dict(LONG_PPL_BOOKS="/books"))
     assert done.returncode == 0, done.stdout + done.stderr
     assert [c["--output_path"] for c in calls] == ["/ckpt/evaluate/long32k"] * 2 + [
-        f"/ckpt/evaluate/long{n}" for n in ("64k", "64k", "128k", "128k", "256k", "256k")]
+        f"/ckpt/evaluate/long{n}" for n in ("64k", "128k", "256k", "512k", "1m") for _ in range(2)]
     # 32K: only what the main line did not measure (its main stage ran the turns and the book curve, its NIAH
     # stage the eight needles at 32768).
     assert calls[0]["--benchmark"] == "babilong_32k,long_ppl_32k,longbench2_32k,infinitebench_32k"
@@ -213,11 +213,16 @@ def test_majob_runs_the_long_passes_after_training(tmp_path):
     assert calls[2]["--benchmark"] == ("babilong_64k,long_ppl_64k,long_ppl_books_64k,niah_turns_64k,longbench2_64k,"
                                        "infinitebench_64k")
     assert len(calls[7]["--benchmark"].split(",")) == 12 and "ruler_qa_squad" not in calls[7]["--benchmark"]
+    for length, call in zip(("512k", "1m"), calls[8::2]):
+        assert call["--benchmark"] == (f"babilong_{length},long_ppl_{length},long_ppl_books_{length},"
+                                       f"niah_turns_{length},longbench2_{length}")
     overrides = [json.loads(c["--config_overrides"]) for c in calls[::2]]
-    assert [o["block_size"] for o in overrides] == [33792, 66560, 132096, 263168]
-    assert [o.get("rope_adjustments", {}).get("factor") for o in overrides] == [None, 2., 4., 8.]
+    assert [o["block_size"] for o in overrides] == [33792, 66560, 132096, 263168, 525312, 1049600]
+    assert [o.get("rope_adjustments", {}).get("factor") for o in overrides] == [None, 2., 4., 8., 16., 32.]
     assert all(c["--limit"] == "100" for c in calls)
-    assert [json.loads(c["--metadata"])["max_seq_lengths"] for c in calls[1::2]] == [[32768], [65536], [131072], [262144]]
+    assert [json.loads(c["--metadata"])["max_seq_lengths"] for c in calls[1::2]] == [
+        [32768], [65536], [131072], [262144], [524288], [1048576],
+    ]
     assert [c["--master_port"] for c in calls[:2]] == ["6001", "6002"]
     assert "BOOKS=/books" in done.stdout
 
