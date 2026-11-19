@@ -414,21 +414,16 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   （默认全部；LongBench v2 在四档均为必跑项，缺失子集或文件不是完整 parquet 时会在模型加载前报错，
   按提示用同一 `HF_HOME` 运行 `bash diag.sh unused/fetch_long_eval_data.py --longbench2 --no-babilong --no-ruler-qa`。
   默认时缺数据的 `ppl`、`books` 与找不到十个文件的 `infinitebench` 作为可选任务跳过并打印原因，点名的必须能跑）、`NIAH_ONLY=1`（只跑 RULER）；这种配置不接受任务清单参数。
-  每档换一次窗口与 YaRN，要重新加载模型（约一分钟）。注意 `long_ppl_32k` 在这里是 32K 档（不用 YaRN）测的，在
-  `eval_long64k_*.yaml` 里是 64K 配置（YaRN 2）测的；32K 档的 8 个捞针任务写进 32K 主线的同名列，其余 5 个 RULER 任务、
-  `AVG_RULER_32k` 与 `LongBench2_32k` 是新加的列。按长度拆开的 `eval_long{64k,128k,256k}_*.yaml` 保留，用于复现已有结果。
+  每档换一次窗口与 YaRN，要重新加载模型（约一分钟）。32K 档的 8 个捞针任务写进 32K 主线的同名列，其余 5 个 RULER 任务、
+  `AVG_RULER_32k` 与 `LongBench2_32k` 是新加的列。只跑单档时对同一个方法配置设置 `EVAL_LENGTHS`，
+  例如 `EVAL_MAIN=0 EVAL_LENGTHS=64k bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml`。
+  如需在 YaRN factor 2 下补测 32K PPL，可用 `EVAL_MAIN=0 EVAL_LENGTHS=32k,64k YARN_MODE=fixed EVAL_SUITES=ppl`。
 - 训练后自动跑：`majob.sh` 在主评测与 NIAH 阶段之后，用训练 YAML 的缓存设置对刚训好的 checkpoint 跑同样的逐档评测
   （长度默认 YAML 的 `eval_lengths`，否则 32K–256K 全部；`EVAL_LENGTHS=none` 关闭，`EVAL_SUITES`、`YARN_MODE`、`NIAH_ONLY` 同上），
   每个任务 `LONG_EVAL_LIMIT`（默认 100）条，结果写到 `evaluate/long<L>`。主线已经测过的不再重测（主评测的任务、NIAH 阶段在各自
   长度上的捞针，`long_eval_plan.py` 的 skip），所以 32K 档只补 BABILong、`long_ppl_32k`、LongBench v2 与其余 5 个 RULER 任务，
   主线 500 条的 32K 捞针不会被 100 条的结果覆盖。训练长度（`context_length`）不到 32K 的 checkpoint 跳过：长文本的 YaRN 以 32K
   为原长。数据取环境变量 `LONG_PPL_DATA`、`LONG_PPL_BOOKS`、`BABILONG_DATASET`、`INFINITEBENCH_DIR`，或 YAML 的同名小写键。
-- 配置：`eval_long{64k,128k,256k}_{dense,baseline,word_first}.yaml`，分别是原始 Qwen3-1.7B-Base 的 dense（未经 CPT，继承
-  `dense_niah_base.yaml`，结果写到其 `long64k` / `long128k` / `long256k` 子目录）、同 checkpoint 的 K/V 准入基线与 `word_first`，
-  与各自的基础配置只差上面几项：NIAH 阶段跑完整 RULER（256K 为上面的 12 个），主阶段跑 BABILong 与困惑度（64K 配置为 32K
-  与 64K，128K、256K 配置为各自的长度），再跑 `long_ppl_books_<L>`、`niah_turns_<L>`、`longbench2_<L>` 与 `infinitebench_<L>`，
-  每个任务 100 条。256K 的 dense KV 约 28 GiB（每 token 112 KiB）。`babilong_dataset`、`long_ppl_data`、`long_ppl_books` 与
-  `infinitebench_dir` 四个键（或同名环境变量）给出本地数据。
 - 汇总表（`unused/parse_lmeval_table.py`）：把各模型的结果表或整段 eval 日志粘进文件里的 `model_outputs`，不带参数运行；
   日志里 eval.py 打印的结果表会被挑出来（行首前缀会去掉），同一模型的几份日志（如 32K、128K、256K 各一份）接着贴进
   同一个字符串，合成一行。表头按长度分块：前 89 列是 32K 主线（常识、综合、LongBench v1/E、32K 捞针），之后 32K、64K、128K、
