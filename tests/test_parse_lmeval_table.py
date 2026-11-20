@@ -228,3 +228,11 @@ def test_longbench2_subtasks_go_to_their_groups_length(parse):
     header = list(table.columns)
     assert header.index("LongBench2_64k") == header.index("longbench2_user_guide_64k") + 1
     assert header.index("longbench2_academic_multi_64k") == header.index("AVG_babilong_64k") + 1
+
+
+def test_truthfulqa_scale_in_averages(parse):
+    rows = ("|truthfulqa_gen|3|none|0|rouge1_max|↑|25|±|0|\n"
+            "|mmlu|2|none|0|acc|↑|0.75|±|0|")
+    row = parse.build_table({"model": rows}).iloc[0]
+    assert row["truthfulqa_gen"] == 25
+    assert row["AVG_General"] == row["AVG_all"] == 0.5

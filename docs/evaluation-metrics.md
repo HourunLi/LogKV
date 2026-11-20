@@ -147,8 +147,11 @@ XLSX 导出依赖 pandas 和可用的 Excel writer；导出失败会告警，不
 
 底层流式 `generate_fn(timing=...)` 的计时会包含消费者在两次取 token 之间的停顿；
 `eval.py` 连续消费生成器。交互输出、网络流式服务或 `LLM.benchmark()` 的数字不能直接
-视为相同计时边界。当前生成评测按 EOS/长度上限结束，不能把任务里的任意 `until` 字符串
-默认视为已执行的 token 级提前停止；外部 baseline 需核对相同生成与评分规则。
+视为相同计时边界。普通生成请求按 EOS 或长度上限完成解码，评分文本截到最先出现的非空
+`until` 字符串之前。吞吐与耗时统计包含实际生成的全部 token。
+
+汇总表的 `truthfulqa_gen` 单项保留原始 ROUGE-1 F1（0–100），计算 `AVG_General` 和
+`AVG_all` 时先将该项除以 100。
 
 ## 实现依据与小检查
 
