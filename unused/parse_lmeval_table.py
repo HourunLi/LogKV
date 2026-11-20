@@ -827,16 +827,19 @@ def build_table(outputs):
     final_df = final_df.reindex(columns=['Model'] + ORDERED_COLUMNS) # 对齐格式
 
     # 2. ================= 自动计算各组平均值 =================
+    scores = final_df[ORDERED_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    # lm-eval reports TruthfulQA ROUGE F1 on a 0–100 scale.
+    scores["truthfulqa_gen"] = scores["truthfulqa_gen"] / 100
     for avg_col, sub_tasks in AVG_GROUPS.items():
         # 选出有实际成绩的列，利用 pd.to_numeric 把可能混入的字符转为 NaN 并求均值
         valid_cols = [t for t in sub_tasks if t in final_df.columns]
-        final_df[avg_col] = final_df[valid_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
+        final_df[avg_col] = scores[valid_cols].mean(axis=1).round(4)
 
     # 计算全局汇总平均 AVG_all (综合所有分组子任务的基础列)
     all_base_tasks = list(set([task for group, group_tasks in AVG_GROUPS.items() if group not in DIAGNOSTIC_GROUPS
                                for task in group_tasks]))
     valid_base_tasks = [t for t in all_base_tasks if t in final_df.columns]
-    final_df['AVG_all'] = final_df[valid_base_tasks].apply(pd.to_numeric, errors='coerce').mean(axis=1).round(4)
+    final_df['AVG_all'] = scores[valid_base_tasks].mean(axis=1).round(4)
     return final_df
 
 

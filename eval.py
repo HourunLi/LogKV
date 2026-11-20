@@ -53,6 +53,19 @@ from utils import *
 # 退出，剩下的 rank 就会等待通信超时。评测只交换 CPU 对象，使用 Gloo；
 # 保留长等待窗口以容纳不同 rank 的长上下文计算时差。
 
+def _before_stop(text, until):
+    """Return the generated text preceding the earliest nonempty lm-eval stop string."""
+    if isinstance(until, str):
+        until = [until]
+    end = len(text)
+    for stop in until or ():
+        if stop:
+            index = text.find(stop)
+            if index >= 0:
+                end = min(end, index)
+    return text[:end]
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
@@ -1988,7 +2001,7 @@ class LogKVLM(LM):
             })
 
             decoded = self.tokenizer.decode(generated_tokens)
-            results.append(decoded)
+            results.append(_before_stop(decoded, gen_args.get("until")))
 
         # 清理 CUDA 缓存，避免 all_gather 时 OOM
         torch.cuda.empty_cache()
