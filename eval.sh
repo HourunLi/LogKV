@@ -12,12 +12,12 @@
 #   DIAG_ARGS="--log_kv_diag_mode baseline --log_kv_diag_exact_from_layer 21" \
 #       bash eval.sh exp/qwen1.7b-32k/diag.yaml niah_single_1 none
 
-if [ -f /opt/conda/bin/activate ]; then
-    source /opt/conda/bin/activate torch218
+if [ -f /home/ma-user/anaconda3/bin/activate ]; then
+    source /home/ma-user/anaconda3/bin/activate torch218
 fi
 
 # Set caches before Python imports Hugging Face and freezes its cache paths.
-export HF_HOME=/workspace/data/hf_cache
+export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
 export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
 export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
 export HF_MODULES_CACHE="${HF_HOME}/modules"

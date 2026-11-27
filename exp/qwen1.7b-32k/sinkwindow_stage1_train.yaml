@@ -25,9 +25,9 @@ max_steps: 800
 enable_tensorboard: false
 
 expid: qwen1.7b-32k-cpt-sinkwindow-stage1
-save_path: /workspace/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1
-merged_state_staging_dir: /workspace/ckpt-logKV/_fsdp_staging_sinkwindow_stage1
-tensorboard_root: /workspace/tb-32k-sinkwindow-stage1
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-sinkwindow-stage1
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_sinkwindow_stage1
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb-32k-sinkwindow-stage1
 
 log_kv_sink_window_mode: true
 # base.yaml 默认打开语义聚类；SinkWindow 分支必须显式关掉（不是
