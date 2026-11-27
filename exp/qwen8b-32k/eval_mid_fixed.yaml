@@ -1,0 +1,6 @@
+config: eval_full_baseline.yaml
+eval_tag: eval_mid_fixed
+log_kv_semantic_anchor_mode: mid
+log_kv_beta_adaptive_merge: false
+eval_max_seq_lengths: [32768]
+eval_main: false

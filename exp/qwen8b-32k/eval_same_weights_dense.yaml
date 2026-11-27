@@ -1,0 +1,4 @@
+config: eval_full_cpt_dense.yaml
+eval_tag: eval_same_weights_dense
+eval_max_seq_lengths: [32768]
+eval_main: false

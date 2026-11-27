@@ -32,7 +32,7 @@ def test_each_8b_config_loads_without_other_model_configs(name, tmp_path):
     dense = name in {"dense_niah_base.yaml", "eval_long_dense.yaml", "eval_full_dense.yaml"}
     if not dense:
         assert cfg["fsdp_low_memory"] is True
-        assert cfg["global_batch_size"] == 64 and cfg["micro_batch_size"] == 1
+        assert cfg["global_batch_size"] == 128 and cfg["micro_batch_size"] == 1
         assert cfg["arch_name"] == "Qwen/Qwen3-8B-Base" and cfg["ckpt_dir"] == BASE_8B
     else:
         assert cfg["checkpoint_dir"] == cfg["tokenizer_dir"] == BASE_8B
@@ -56,7 +56,7 @@ def test_8b_batch_is_valid_for_64_ranks():
                  global_batch_size=cfg["global_batch_size"], micro_batch_size=cfg["micro_batch_size"],
                  use_fsdp=True, fsdp_low_memory=cfg["fsdp_low_memory"])
     exec(setup, scope)
-    assert scope["gradient_accumulation_steps"] == 1
+    assert scope["gradient_accumulation_steps"] == 2
 
 
 @pytest.mark.parametrize("method", sorted(METHODS))
