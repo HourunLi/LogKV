@@ -37,7 +37,7 @@ pip 会自动信任 PyPI、文件 CDN 和环境变量/pip 配置里的镜像主�
 默认模型目录为：
 
 ```text
-/workspace/data/hf_cache/gliclass-instruct-edge
+/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
 ```
 
 下载器、smoke 工具和两份评测 YAML 使用同一默认位置，避免写到仓库的 `data/`。
@@ -46,7 +46,7 @@ pip 会自动信任 PyPI、文件 CDN 和环境变量/pip 配置里的镜像主�
 也可以打包后传输：
 
 ```bash
-CACHE_DIR=/workspace/data/hf_cache
+CACHE_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
 tar -C "$CACHE_DIR" -czf "$CACHE_DIR/gliclass-instruct-edge.tar.gz" gliclass-instruct-edge
 ```
 
@@ -59,7 +59,7 @@ Transformers 5。这里固定到 Transformers 4.57.3，避免为此切换到 5.x
 解包或复制到实际路径后，运行：
 
 ```bash
-MODEL_DIR=/workspace/data/hf_cache/gliclass-instruct-edge
+MODEL_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
 python unused/prepare_query_detector.py --verify
 python -m pip install --no-index --findlinks "$MODEL_DIR/wheels" \
   -r "$MODEL_DIR/detector-requirements.txt"
@@ -86,7 +86,7 @@ python unused/query_detector_smoke.py \
 两个新增配置都继承现有相同模型大小的 `eval_full_word_first_query.yaml`，使用同一 checkpoint：
 
 ```bash
-export LOGKV_QUERY_DETECTOR_DIR=/workspace/data/hf_cache/gliclass-instruct-edge
+export LOGKV_QUERY_DETECTOR_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
 GPUS_PER_NODE=1 LIMIT=2 EVAL_LENGTHS=32k EVAL_SUITES=ruler,babilong,turns \
   bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query_detected.yaml
 ```

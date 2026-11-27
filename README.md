@@ -64,7 +64,7 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 ```
 
 `majob.sh` 与 `eval.sh` 自动检测当前进程可见的 CUDA GPU 数量，支持 1、2、4、8 卡，
-遵守 `CUDA_VISIBLE_DEVICES`；training platform 的 `MA_NUM_GPUS` 作为分配上限。
+遵守 `CUDA_VISIBLE_DEVICES`；ModelArts 的 `MA_NUM_GPUS` 作为分配上限。
 可用 `GPUS_PER_NODE=2` 限制进程数，指定数量不得超过可见卡数或分配上限。
 启动时打印检测结果，YAML 中的 `num_devices: 8` 不会覆盖 torchrun 的实际卡数。
 1.7B 配置每卡 micro batch 为 1、全局 batch 为 32，单机 1/2/4/8 卡分别累积 32/16/8/4 次；
@@ -95,7 +95,7 @@ bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 
 8B CPT 使用五个独立的全量评测 YAML，运行方式与 1.7B 相同：`bash eval.sh <yaml>`。
 五个入口均在 `exp/qwen8b-32k/` 内继承配置，并读取同一份训练产物：
-`/workspace/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k/lit_model.pth`。
+`/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k/lit_model.pth`。
 `eval.sh` 从训练配置的 `save_path` 取得该目录并传入 `eval.py`；加载器优先读取目录自身的 `lit_model.pth`。
 仅当目录自身没有权重时，才选择其中最大的 `step_*` 保存点。启动日志会打印实际使用的权重路径。
 若挂载把 `lit_model.pth` 的软链接变成保存目标路径的小文本文件，加载器会只读解析其中的绝对或相对路径
@@ -152,7 +152,7 @@ NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
 训练后仅评测 32K single2/3（`eval.sh` 从 YAML 的 `save_path` 加载产物，不转发 YAML metadata）：
 
 ```bash
-DIAG_ARGS='--metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 
@@ -166,7 +166,7 @@ LOGKV_EVAL_VERBOSE=1 bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yam
 
 该环境变量也适用于 `majob.sh` 的评测阶段和直接运行 `eval.py`。
 多卡评测各 rank 汇合时仍每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印缺席 rank，
-保留每个等待进程的低频心跳，避免 training platform 将等待误判为卡死。
+保留每个等待进程的低频心跳，避免 ModelArts 将等待误判为卡死。
 超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
 
 ### 多针 NIAH（RULER）
@@ -187,7 +187,7 @@ N=1、N=4 即 `niah_single_2` 与内置 `niah_multivalue`/`niah_multiquery`（�
 RULER 以 500 词为步长添加草堆：针数较多时 1K–2K 的草堆很少甚至为空，多针结果宜从 4K 起看。
 
 ```bash
-DIAG_ARGS='--metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768],"niah_num_samples":100}' \
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768],"niah_num_samples":100}' \
   bash eval.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml \
   niah_multivalue_n2,niah_multivalue,niah_multivalue_n8,niah_multivalue_n16,niah_multivalue_n32 none
 ```

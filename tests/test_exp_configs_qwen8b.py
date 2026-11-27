@@ -12,8 +12,8 @@ import yaml
 
 EXP = Path(__file__).resolve().parents[1] / "exp"
 QWEN8B = EXP / "qwen8b-32k"
-BASE_8B = "/workspace/checkpoints/Qwen/Qwen3-8B-Base/"
-SAVE_8B = "/workspace/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k"
+BASE_8B = "/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base/"
+SAVE_8B = "/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k"
 METHODS = ("baseline", "cpt_dense", "dense", "query", "word_first", "word_first_query")
 
 
@@ -67,7 +67,7 @@ def test_full_evaluations_read_the_8b_checkpoint_and_write_apart(method):
     assert evaluated == (BASE_8B if method == "dense" else SAVE_8B)
     if method == "dense":
         assert cfg["log_kv_dense_mode"] is True and cfg["metadata"]["pretrained"] == BASE_8B
-        assert cfg["output_path"] == "/workspace/ckpt-new/qwen8b_dense_niah_base_eval"
+        assert cfg["output_path"] == "/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-new/qwen8b_dense_niah_base_eval"
     else:
         assert cfg["arch_name"] == "Qwen/Qwen3-8B-Base" and cfg["ckpt_dir"] == BASE_8B
         assert cfg["eval_tag"] == f"full_{method}" and cfg.get("output_path") is None

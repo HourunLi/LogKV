@@ -256,7 +256,7 @@ def test_launchers_export_the_same_plain_directory(script, monkeypatch, tmp_path
         run = subprocess.run(["bash", "-c", header + '\nprintf "%s\\n" "$LONGBENCH2_DIR"'],
                              env=environment, capture_output=True, text=True)
         assert run.returncode == 0, run.stderr
-        expected = override or "/workspace/data/hf_cache/longbench2"
+        expected = override or "/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/longbench2"
         assert run.stdout.strip() == expected
 
 

@@ -1,13 +1,13 @@
 # Beta（unified 路由）对照：Base 初始化、独立 100 步 CPT。保留用于复现/复评既有
 # qwen1.7b-32k-beta-cpt100 产物；当前默认路线见 arc_attach_alpha_beta_k12_b128_2k.yaml。
 config: arc_semantic_fast.yaml
-ckpt_dir: /workspace/checkpoints/Qwen/Qwen3-1.7B-Base/
+ckpt_dir: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
 resume_dir: null
 auto_resume: true
 expid: qwen1.7b-32k-beta-cpt100
-save_path: /workspace/ckpt-logKV/qwen1.7b-32k-beta-cpt100
-merged_state_staging_dir: /workspace/ckpt-logKV/_fsdp_staging_beta_cpt100
-tensorboard_root: /workspace/tb/tb-32k-beta-cpt100
+save_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/qwen1.7b-32k-beta-cpt100
+merged_state_staging_dir: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/_fsdp_staging_beta_cpt100
+tensorboard_root: /home/ma-user/work/bucket-pangu-green/lihourun/tb/tb-32k-beta-cpt100
 
 max_steps: 100
 learning_rate: 5e-6

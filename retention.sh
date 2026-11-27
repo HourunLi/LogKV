@@ -7,13 +7,13 @@
 # 其余 retention_* 键见 train_retention.py；RETENTION_ARGS 追加命令行参数（覆盖 YAML）。
 # 已训到 retention_steps 的头直接跳过；中断后重跑从最近一次保存继续。
 # source /home/miniconda3/bin/activate megatron-lm-014
-if ! source /opt/conda/bin/activate torch218; then
+if ! source /home/ma-user/anaconda3/bin/activate torch218; then
     echo "❌ 无法激活 torch218，停止执行，避免使用错误的 Python 环境。"
     exit 1
 fi
 
 # Set caches before Python imports Hugging Face and freezes its cache paths.
-export HF_HOME=/workspace/data/hf_cache
+export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
 export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
 export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
 export HF_MODULES_CACHE="${HF_HOME}/modules"
@@ -62,7 +62,7 @@ export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
 # ==============================================================================
 # Distributed Training Setup
 # ==============================================================================
-# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); training platform
+# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); ModelArts
 # allocation is an upper bound. GPUS_PER_NODE may explicitly select fewer GPUs.
 GPUS_PER_NODE=$("${PYTHON_BIN}" - <<'PY_GPU_COUNT'
 import os

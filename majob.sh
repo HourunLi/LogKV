@@ -1,12 +1,12 @@
 #!/bin/bash
 # source /home/miniconda3/bin/activate megatron-lm-014
-if ! source /opt/conda/bin/activate torch218; then
+if ! source /home/ma-user/anaconda3/bin/activate torch218; then
     echo "❌ 无法激活 torch218，停止执行，避免使用错误的 Python 环境。"
     exit 1
 fi
 
 # Set caches before Python imports Hugging Face and freezes its cache paths.
-export HF_HOME=/workspace/data/hf_cache
+export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
 export LONGBENCH2_DIR=${LONGBENCH2_DIR:-${HF_HOME}/longbench2}
 export BABILONG_DIR=${BABILONG_DIR:-${HF_HOME}/babilong}
 export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
@@ -60,7 +60,7 @@ export NCCL_MIN_NCHANNELS=4  # Increase NCCL channels # optim0129
 # ==============================================================================
 # Distributed Training Setup
 # ==============================================================================
-# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); training platform
+# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); ModelArts
 # allocation is an upper bound. GPUS_PER_NODE may explicitly select fewer GPUs.
 GPUS_PER_NODE=$("${PYTHON_BIN}" - <<'PY_GPU_COUNT'
 import os
@@ -577,7 +577,7 @@ echo "================================================="
 
 # REPAIR_HF_CACHE=1：节点 0 先修复共享 HF 缓存（与 eval.py 的 HF_DATASETS_CACHE 相同）里不可读的
 # dataset_info.json，原件留作 *.truncated；修完才写本节点的 barrier，其他节点因此在修复结束后才开始评测。
-HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/workspace/data/hf_cache/hf_cache}
+HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache}
 if [ "${REPAIR_HF_CACHE:-0}" = "1" ] && [ "${NODE_RANK}" = "0" ]; then
     echo "🛠 [Node 0] 修复 ${HF_DATASETS_ROOT} 下不可读的 dataset_info.json"
     if ! "${PYTHON_BIN}" unused/repair_dataset_info.py --scan "${HF_DATASETS_ROOT}" --write --check; then
