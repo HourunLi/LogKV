@@ -1,7 +1,7 @@
 import json
 
 # 替换成你下载的 longabc jsonl 文件路径
-file_path = "../longdata/the-stack-smol-xl/workspace/data.json" 
+file_path = "../longdata/the-stack-smol-xl/data/ada/data.json" 
 
 with open(file_path, 'r', encoding='utf-8') as f:
     for _ in range(10):

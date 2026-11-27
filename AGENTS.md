@@ -650,7 +650,7 @@ NMS/选点算法上调参预计不会再有实质性突破（min_distance 从 64
 - 修改本地代码前，遇到"看起来是 bug"的测试预期值，先去追代码的真实语义（本次是
   `_binary_carry`），不要想当然地"以测试为准"去改生产代码——3.2 节就是反过来，测试
   错了，代码是对的。
-- 本地跑 pytest 用 conda env `mineru`（`/workspace/anaconda3/envs/mineru`,
+- 本地跑 pytest 用 conda env `mineru`（`/Users/hourunli/anaconda3/envs/mineru`,
   Python 3.12）；系统自带 Python 3.9.13 无法解析仓库里到处用的 `X | None` 类型注解。
 
 ## 8. 常用运行命令（2026-08-10 新增）
@@ -689,7 +689,7 @@ torchrun --nproc_per_node=1 eval.py --config exp/qwen1.7b-32k/eval.yaml \
   --log_kv_pin_diag_max_samples 4
 ```
 
-### 8.2 `majob.sh`：训练→评测一条龙（training platform 作业入口）
+### 8.2 `majob.sh`：训练→评测一条龙（ModelArts 作业入口）
 
 ```bash
 bash majob.sh <config.yaml>
@@ -702,18 +702,18 @@ bash majob.sh exp/qwen1.7b-32k/arc_warmup.yaml
 barrier 等所有节点就绪，再跑两次 `torchrun ... eval.py`（主 benchmark 列表一次，
 niah_single_1/2/3 一次，两次共用同一个 `MASTER_PORT`——这点跟 8.3 的 `eval.sh` 不同）。
 
-依赖的环境变量（training platform 会自动注入；本地单机手动跑时全部有默认值，不用手动设置）：
+依赖的环境变量（ModelArts 会自动注入；本地单机手动跑时全部有默认值，不用手动设置）：
 
 | 变量 | 作用 | 默认值 |
 |---|---|---|
 | `MA_NUM_GPUS` | 每节点卡数 → `GPUS_PER_NODE` | 8 |
 | `MA_NUM_HOSTS` | 节点数 → `NUM_NODES` | 1 |
-| `MASTER_ADDR` | rendezvous 地址 | `localhost`（多机必须显式可达，或靠 `MA_VJ_NAME`/`MA_TASK_NAME`/`MA_MASTER_INDEX` 拼出 training platform DNS 名） |
+| `MASTER_ADDR` | rendezvous 地址 | `localhost`（多机必须显式可达，或靠 `MA_VJ_NAME`/`MA_TASK_NAME`/`MA_MASTER_INDEX` 拼出 ModelArts DNS 名） |
 | `MASTER_PORT` | rendezvous 端口 | 6000 |
 | `VC_TASK_INDEX` | 当前节点序号 → `NODE_RANK` | 0（多机每个节点必须不同，通常由调度器注入，不要手动瞎设） |
 
-脚本开头硬编码 `source /opt/conda/bin/activate torch218`——本地非
-training platform 环境跑之前先确认这个 conda env 路径存在，或者手动改成本机的 conda 路径。
+脚本开头硬编码 `source /home/ma-user/anaconda3/bin/activate torch218`——本地非
+ModelArts 环境跑之前先确认这个 conda env 路径存在，或者手动改成本机的 conda 路径。
 
 ### 8.3 `eval.sh`：跳过训练，只跑评测（已有 checkpoint 时调参/重跑用）
 
