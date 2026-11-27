@@ -38,7 +38,7 @@
 # pin_size 只影响推理期缓存配置、不改权重（训练期 _log_kv_train_lowmem_forward
 # 从不选钉——见 log_kv_select_pins 的 defer_last_single 门控），所以 arc/pin
 # 两个训练变体的 checkpoint 对诊断来说是等价的，选 arc 的产物即可。
-checkpoint_dir: /workspace/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV
 tokenizer_dir: null
 
 # ── 只跑一小批样本：几十条足够画出 D2/D3/D5 的图，不需要跑全量 benchmark ──
@@ -49,7 +49,7 @@ benchmark: null
 metadata: null
 
 # ── 结果输出 ──
-output_path: /workspace/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV/diag
+output_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV/diag
 
 # ── logKV（须与训练 YAML 中的取值一致，pin 除外）──
 # null（不是 512）：同下面 log_kv_second_order_scale 的理由——写死非 null 会让

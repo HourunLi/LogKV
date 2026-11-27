@@ -487,7 +487,7 @@ score_s = scale·(q·k_s) + 0.5·scale²·sos·sigma2·(q·sigma_u)² + λ·log(
 `tests/test_log_kv_cache.py` 新增 `TestImportancePooling`（11 个用例：加权公式的
 闭式解核对、`compact()`/`_compact_tokens()` 的 imp 驱动 alpha 而 w 不受影响、
 `ingest_chunk`/`add_recent` 端到端流式路径含多级 carry），config `mineru`
-conda env（`/workspace/anaconda3/envs/mineru`，Python 3.12）跑
+conda env（`/Users/hourunli/anaconda3/envs/mineru`，Python 3.12）跑
 `test_log_kv_cache.py` 全量 124/124 通过（113 条既有 + 11 条新增，逐条比对过
 关闭改动前后 baseline 是 113 条不变）；③`git stash` 到干净版本重跑同一测试命令，
 确认后 14 个 collection error（`litdata`/`jsonargparse` 缺失、pytest marker 未
@@ -555,10 +555,10 @@ ACC/LongBench/LongBench_e/niah 四项上都同时不输 vanilla（多数严格�
 - 修改本地代码前，遇到"看起来是 bug"的测试预期值，先去追代码的真实语义（本次是
   `_binary_carry`），不要想当然地"以测试为准"去改生产代码——3.2 节就是反过来，测试
   错了，代码是对的。
-- 本地跑 pytest 用 conda env `mineru`（`/workspace/anaconda3/envs/mineru`,
+- 本地跑 pytest 用 conda env `mineru`（`/Users/hourunli/anaconda3/envs/mineru`,
   Python 3.12）；系统自带 Python 3.9.13 无法解析仓库里到处用的 `X | None` 类型注解。
   `source activate mineru` 有时会解析到另一个装了同名 env 的 anaconda（Python
-  3.9），不确定时直接用绝对路径 `/workspace/anaconda3/envs/mineru/bin/python`
+  3.9），不确定时直接用绝对路径 `/Users/hourunli/anaconda3/envs/mineru/bin/python`
   最保险。
 - **`log_kv_dense_mode` 测出来的数字不是"干净的能力上限"**（见 6.3）：CPT 训练
   全程走 LogKV 分块压缩前向，从没真正用稠密注意力训练过，dense_mode 推理是把
@@ -602,7 +602,7 @@ torchrun --nproc_per_node=8 eval.py \
 python eval.py --config exp/qwen1.7b-32k/eval.yaml
 ```
 
-### 8.2 `majob.sh`：训练→评测一条龙（training platform 作业入口）
+### 8.2 `majob.sh`：训练→评测一条龙（ModelArts 作业入口）
 
 ```bash
 bash majob.sh <config.yaml>
@@ -615,18 +615,18 @@ bash majob.sh exp/qwen1.7b-32k/arc_warmup.yaml
 barrier 等所有节点就绪，再跑两次 `torchrun ... eval.py`（主 benchmark 列表一次，
 niah_single_1/2/3 一次，两次共用同一个 `MASTER_PORT`——这点跟 8.3 的 `eval.sh` 不同）。
 
-依赖的环境变量（training platform 会自动注入；本地单机手动跑时全部有默认值，不用手动设置）：
+依赖的环境变量（ModelArts 会自动注入；本地单机手动跑时全部有默认值，不用手动设置）：
 
 | 变量 | 作用 | 默认值 |
 |---|---|---|
 | `MA_NUM_GPUS` | 每节点卡数 → `GPUS_PER_NODE` | 8 |
 | `MA_NUM_HOSTS` | 节点数 → `NUM_NODES` | 1 |
-| `MASTER_ADDR` | rendezvous 地址 | `localhost`（多机必须显式可达，或靠 `MA_VJ_NAME`/`MA_TASK_NAME`/`MA_MASTER_INDEX` 拼出 training platform DNS 名） |
+| `MASTER_ADDR` | rendezvous 地址 | `localhost`（多机必须显式可达，或靠 `MA_VJ_NAME`/`MA_TASK_NAME`/`MA_MASTER_INDEX` 拼出 ModelArts DNS 名） |
 | `MASTER_PORT` | rendezvous 端口 | 6000 |
 | `VC_TASK_INDEX` | 当前节点序号 → `NODE_RANK` | 0（多机每个节点必须不同，通常由调度器注入，不要手动瞎设） |
 
-脚本开头硬编码 `source /opt/conda/bin/activate torch218`——本地非
-training platform 环境跑之前先确认这个 conda env 路径存在，或者手动改成本机的 conda 路径。
+脚本开头硬编码 `source /home/ma-user/anaconda3/bin/activate torch218`——本地非
+ModelArts 环境跑之前先确认这个 conda env 路径存在，或者手动改成本机的 conda 路径。
 
 ### 8.3 `eval.sh`：跳过训练，只跑评测（已有 checkpoint 时调参/重跑用）
 

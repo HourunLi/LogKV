@@ -29,9 +29,9 @@ config: base.yaml
 
 expid: qwen1.7b-32k-cpt-logKV-warmup-importance-continue-smoketest
 
-ckpt_dir: /workspace/checkpoints/Qwen/Qwen3-1.7B-Base/
+ckpt_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
 
-resume_dir: /workspace/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
+resume_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup
 
 global_batch_size: 128
 micro_batch_size: 1
@@ -43,16 +43,16 @@ min_lr: 5e-5
 weight_decay: 0.1
 num_devices: 8
 
-data_dir: /workspace/longcontext/prolong/data
+data_dir: /home/ma-user/work/bucket-wulan-green/zhaoyusheng/longcontext/prolong/data
 num_workers: 16
 save_ckpt: true
 save_interval: 3
 # 独立目录，不与 arc_warmup_importance_continue.yaml 或 arc_warmup.yaml 共用。
-save_path: /workspace/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup-importance-continue-smoketest
-merged_state_staging_dir: /workspace/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_warmup_importance_continue_smoketest
+save_path: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/qwen1.7b-32k-cpt-logKV-warmup-importance-continue-smoketest
+merged_state_staging_dir: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/ckpt-new/_fsdp_staging_warmup_importance_continue_smoketest
 
 enable_tensorboard: true
-tensorboard_root: /workspace/${MY_REAL_NAME-default}/tb-32k-warmup-importance-continue-smoketest
+tensorboard_root: /home/ma-user/work/bucket-wulan-green/${MY_REAL_NAME-default}/tb-32k-warmup-importance-continue-smoketest
 
 log_kv_B: 512
 log_kv_recent_size: 1024
