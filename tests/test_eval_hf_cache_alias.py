@@ -167,7 +167,7 @@ def test_namespaced_cache_alias_is_followed_when_the_mount_cannot():
             # A link into the old bucket, which this job does not mount, still has the migrated copy.
             alias = root / "allenai___winogrande"
             alias.unlink()
-            alias.symlink_to("/nonexistent/workspace/data/hf_cache/hf_cache/winogrande")
+            alias.symlink_to("/nonexistent/bucket-wulan-green/wubohan/data/hf_cache/hf_cache/winogrande")
             assert datasets.load_dataset(path="allenai/winogrande", name="winogrande_xl")["train"].num_rows == 1
 
             # Never substitute the legacy directory for anything that is not an alias of it.
