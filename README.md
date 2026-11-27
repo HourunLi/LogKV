@@ -98,6 +98,10 @@ bash eval.sh exp/qwen1.7b-32k/eval_full_word_first.yaml
 `/workspace/ckpt-logKV/qwen8b-32k-gamma_k12_b128_p1024_2k/lit_model.pth`。
 `eval.sh` 从训练配置的 `save_path` 取得该目录并传入 `eval.py`；加载器优先读取目录自身的 `lit_model.pth`。
 仅当目录自身没有权重时，才选择其中最大的 `step_*` 保存点。启动日志会打印实际使用的权重路径。
+在 ModelArts 作业中，若挂载位置与 YAML 默认值不同，可将 `EVAL_CHECKPOINT_DIR` 保存为实际的 CPT 目录
+（含 `lit_model.pth` 或 `step_*/lit_model.pth`），将 `EVAL_TOKENIZER_DIR` 保存为含
+`tokenizer.json` 或 `tokenizer.model` 的目录。这两个环境变量由 `eval.sh` 读取，五个 8B 对照应使用相同的值；
+加载器会记录最终权重和 tokenizer 的路径。启动器从原位置读取 tokenizer，无需复制模型目录中的 JSON。
 若挂载把 `lit_model.pth` 的软链接变成保存目标路径的小文本文件，加载器会只读解析其中的绝对或相对路径
 （包括末尾 NUL），沿引用链读取真实权重，不创建软链接、不移动文件。`Checkpoint weights:` 是选择的逻辑路径，
 `Checkpoint reference:` 记录引用跳转，`Checkpoint binary:` 打印实际二进制文件及大小。

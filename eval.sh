@@ -221,13 +221,13 @@ def value_or(name, default):
 
 cfg = load(sys.argv[1])
 arch_name = cfg.get("arch_name", "Qwen/Qwen3-0.6B-Base")
-save_dir = cfg.get("save_path") or cfg.get("checkpoint_dir")
+save_dir = os.environ.get("EVAL_CHECKPOINT_DIR") or cfg.get("save_path") or cfg.get("checkpoint_dir")
 if not save_dir:
     raise SystemExit("Config must define save_path (training YAML) or checkpoint_dir (eval YAML).")
 
 ckpt_dir = cfg.get("ckpt_dir") or os.path.join("checkpoints", arch_name)
 resume_dir = cfg.get("resume_dir")
-tokenizer_dir = cfg.get("tokenizer_dir")
+tokenizer_dir = os.environ.get("EVAL_TOKENIZER_DIR") or cfg.get("tokenizer_dir")
 # eval_tag: methods evaluated on one checkpoint (baseline, word_first, query, ...) each get their own folder,
 # <save_path>/evaluate/<eval_tag>, instead of sharing <save_path>/evaluate; an explicit output_path wins.
 output_path = cfg.get("output_path") or os.path.join(save_dir, "evaluate", *([str(cfg["eval_tag"])] if cfg.get("eval_tag") else []))
@@ -243,7 +243,7 @@ except (TypeError, ValueError):
     num_epochs = 0
 
 candidates = []
-for path in (tokenizer_dir, resume_dir, ckpt_dir, os.path.join("checkpoints", arch_name)):
+for path in (tokenizer_dir, save_dir, resume_dir, ckpt_dir, os.path.join("checkpoints", arch_name)):
     if path and path not in candidates:
         candidates.append(path)
 
@@ -544,13 +544,12 @@ if [ "${LOG_KV_SEMANTIC}" = "true" ] && [ "${LOG_KV_ALPHA_EXACT_TOKENS}" != "0" 
     fi
     exit 1
 fi
-TOKENIZER_ARGS=""
+TOKENIZER_ARGS=()
 if [ -n "${TOKENIZER_SOURCE}" ]; then
-    TOKENIZER_ARGS="--tokenizer_dir ${TOKENIZER_SOURCE}"
+    TOKENIZER_ARGS=(--tokenizer_dir "${TOKENIZER_SOURCE}")
     echo "Tokenizer source: ${TOKENIZER_SOURCE}"
 else
-    echo "WARNING: tokenizer not found in candidates: ${TOKENIZER_CANDIDATES}"
-    echo "If eval.py fails to load a tokenizer, set tokenizer_dir in the YAML."
+    echo "Tokenizer candidates: ${TOKENIZER_CANDIDATES}; eval.py will inspect the resolved checkpoint."
 fi
 
 echo "Checkpoint: ${SAVE_DIR}"
@@ -567,30 +566,18 @@ if [ -n "${DIAG_ARGS}" ]; then
 fi
 
 if ! checkpoint_exists "${SAVE_DIR}/lit_model.pth"; then
-    echo "ERROR: checkpoint not found: ${SAVE_DIR}/lit_model.pth"
-    exit 1
-fi
-
-ensure_checkpoint_tokenizer() {
-    if has_tokenizer "${SAVE_DIR}"; then
-        return 0
+    step_found=false
+    for weights in "${SAVE_DIR}"/step_[0-9]*/lit_model.pth; do
+        if checkpoint_exists "${weights}"; then
+            step_found=true
+            break
+        fi
+    done
+    if [[ ${step_found} == false ]]; then
+        echo "ERROR: no lit_model.pth in ${SAVE_DIR} or its step_* directories on ${HOSTNAME}." >&2
+        echo "Set EVAL_CHECKPOINT_DIR to the mounted CPT directory (or a specific step)." >&2
+        exit 1
     fi
-    if [ -z "${TOKENIZER_SOURCE}" ]; then
-        return 1
-    fi
-    if [ "${NODE_RANK}" -eq 0 ]; then
-        echo "Checkpoint is missing tokenizer files; copying from ${TOKENIZER_SOURCE}"
-        mkdir -p "${SAVE_DIR}"
-        cp -f "${TOKENIZER_SOURCE}"/*.json "${SAVE_DIR}/" 2>/dev/null || true
-        cp -f "${TOKENIZER_SOURCE}"/*.model "${SAVE_DIR}/" 2>/dev/null || true
-    fi
-    return 0
-}
-
-if ! ensure_checkpoint_tokenizer; then
-    echo "ERROR: ${SAVE_DIR} has lit_model.pth but no tokenizer.json/tokenizer.model."
-    echo "Set tokenizer_dir in ${CONFIG_FILE} or copy tokenizer files into the checkpoint dir."
-    exit 1
 fi
 
 # REPAIR_HF_CACHE=1: node 0 first repairs unreadable dataset_info.json files in the shared HF cache
@@ -724,7 +711,7 @@ run_stages() {
             "${LOG_KV_ARG_LIST[@]}" \
             "${PASS_ARGS[@]}" \
             ${DIAG_ARGS} \
-            ${TOKENIZER_ARGS}
+            "${TOKENIZER_ARGS[@]}"
 
         EVAL_STATUS=$?
         if [ ${EVAL_STATUS} -ne 0 ]; then
@@ -750,7 +737,7 @@ run_stages() {
             "${LOG_KV_ARG_LIST[@]}" \
             "${PASS_ARGS[@]}" \
             ${DIAG_ARGS} \
-            ${TOKENIZER_ARGS}
+            "${TOKENIZER_ARGS[@]}"
 
         EVAL_STATUS=$?
         if [ ${EVAL_STATUS} -ne 0 ]; then

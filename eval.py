@@ -1333,6 +1333,7 @@ class LogKVLM(LM):
         resolved_tok_dir = _find_tokenizer_dir(checkpoint_dir, tokenizer_dir, group=process_group)
         if is_master:
             print(f"🔤 正在加载 tokenizer: {resolved_tok_dir}")
+        self.tokenizer_dir = resolved_tok_dir
         self.tokenizer = Tokenizer(resolved_tok_dir)
 
         # ==========================================
@@ -2440,6 +2441,7 @@ def main(
                 eval_group = dist.new_group(backend="gloo", timeout=timedelta(hours=12))
                 eval_group_owned_here = True
             _hb("评测 Gloo 通信组就绪（CPU 对象通信，超时 12 小时）")
+        requested_checkpoint_dir = checkpoint_dir
         checkpoint_dir = _resolve_checkpoint_dir(checkpoint_dir, group=eval_group)
 
         lm_model = LogKVLM(
@@ -2495,6 +2497,9 @@ def main(
             tokenizer_dir=tokenizer_dir,
             process_group=eval_group,
         )
+        if metadata and metadata.get("pretrained") == requested_checkpoint_dir:
+            # RULER and long-text datasets load the same tokenizer as the LM.
+            metadata = {**metadata, "pretrained": str(lm_model.tokenizer_dir)}
         if world_size > 1:
             _hb("checkpoint + tokenizer + 模型加载完成，即将进入 simple_evaluate")
         if benchmark != "debug":
