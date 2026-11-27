@@ -103,7 +103,7 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 训练完成后，仅评测 32K single2/3：
 
 ```bash
-DIAG_ARGS='--metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   bash eval.sh exp/qwen1.7b-32k/eval_alpha.yaml niah_single_2,niah_single_3 none
 ```
 
