@@ -5,7 +5,7 @@
 # 用法：
 #   bash scripts/diagnose_conda_tls.sh            # 快速检查，1-2 分钟
 #   bash scripts/diagnose_conda_tls.sh --full     # 额外跑一次 conda create --dry-run（真实下载路径）
-#   bash scripts/diagnose_conda_tls.sh --conda /opt/conda/bin/conda --host hf-mirror.com
+#   bash scripts/diagnose_conda_tls.sh --conda /home/ma-user/anaconda3/bin/conda --host hf-mirror.com
 #   （设置了 HF_ENDPOINT 时会自动探测它）
 #
 # 输出目录 ./conda_tls_diag_<时间戳>/：report.txt 是完整报告（贴回来即可），
@@ -40,7 +40,7 @@ echo "time=$(date '+%F %T %z')  host=$(hostname)  user=$(id -un)"
 [ -r /etc/os-release ] && grep -E '^PRETTY_NAME=' /etc/os-release
 
 if [ -z "$CONDA_BIN" ]; then
-  for c in "${CONDA_EXE:-}" "$(type -P conda 2>/dev/null)" /opt/conda/bin/conda \
+  for c in "${CONDA_EXE:-}" "$(type -P conda 2>/dev/null)" /home/ma-user/anaconda3/bin/conda \
            "$HOME/anaconda3/bin/conda" "$HOME/miniconda3/bin/conda" /opt/conda/bin/conda; do
     if [ -n "$c" ] && [ -x "$c" ]; then CONDA_BIN=$c; break; fi
   done

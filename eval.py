@@ -265,7 +265,7 @@ def extract_results_to_csv(results: dict, benchmark: str, output_path: Path) -> 
 # if 'HF_DATASETS_CACHE' not in os.environ and 'PKU' not in os.environ:
 print("设置HF_DATASETS_CACHE环境变量...")
 
-BASE = '/workspace/data/hf_cache'
+BASE = '/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache'
 os.environ['HF_HOME'] = BASE
 os.environ['HF_DATASETS_CACHE'] = f'{BASE}/hf_cache'
 os.environ['HF_EVALUATE_CACHE'] = f'{BASE}/evaluate'
@@ -1661,7 +1661,7 @@ def main(
         # 这是"评测跑完之后要等很久"的直接修复点。之前的行为是：非 rank0 跑完
         # simple_evaluate 就直接走到函数末尾、跑到解释器退出，而 rank 0 还在写
         # json/csv/xlsx；进程组从头到尾没被销毁，退出时要等 NCCL watchdog 把
-        # 通信子 abort 掉才肯收敛，启动器（torchrun / training platform）就一直挂在
+        # 通信子 abort 掉才肯收敛，启动器（torchrun / ModelArts）就一直挂在
         # "等最后一个 worker 退出"上。
         # 现在改成：rank 0 写完 → barrier 汇合 → 一起 destroy_process_group() →
         # 一起退出。

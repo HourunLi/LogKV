@@ -1,12 +1,12 @@
 #!/bin/bash
 # source /home/miniconda3/bin/activate megatron-lm-014
-if ! source /opt/conda/bin/activate torch218; then
+if ! source /home/ma-user/anaconda3/bin/activate torch218; then
     echo "❌ 无法激活 torch218，停止执行，避免使用错误的 Python 环境。"
     exit 1
 fi
 
 # Set caches before Python imports Hugging Face and freezes its cache paths.
-export HF_HOME=/workspace/data/hf_cache
+export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
 export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
 export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
 export HF_MODULES_CACHE="${HF_HOME}/modules"
