@@ -43,7 +43,7 @@ def effective(name):
 def test_config_resolves_and_alpha_settings_are_supported(name):
     cfg = effective(name)
     if cfg["log_kv_alpha_exact_tokens"]:
-        assert cfg["log_kv_semantic_anchor_mode"] == "mid"
+        assert cfg["log_kv_semantic_anchor_mode"] == ("post_rope_mean" if name.startswith("eval_post_rope_mean_") else "mid")
         assert int(cfg["log_kv_cluster_k_max"]) > 1
         assert float(cfg["log_kv_second_order_scale"]) == 0
         assert cfg.get("log_kv_seg_gap_max") is None and not cfg.get("log_kv_seg_block_level")
@@ -82,7 +82,8 @@ GAMMA = sorted(p.name for p in EXP.glob("arc_gamma_*.yaml")) + sorted(
                            "eval_long*_baseline.yaml", "eval_long*_word_first.yaml", "eval_full_baseline.yaml",
                            "eval_full_word_first.yaml", "eval_long_*query.yaml", "eval_full_*query.yaml",
                            "eval_full_word_first_query_detected.yaml", "eval_full_word_first_query_dual.yaml",
-                           "eval_full_cpt_dense.yaml")
+                           "eval_full_cpt_dense.yaml", "eval_mid_*.yaml", "eval_post_rope_mean_*.yaml",
+                           "eval_same_weights_dense.yaml")
     for p in EXP.glob(pattern))
 
 
