@@ -9,10 +9,10 @@
 # 也可以用 eval.sh：
 #   bash eval.sh exp/qwen1.7b-32k/dense_stage1_eval.yaml niah_single_1,niah_single_2,niah_single_3 none
 
-checkpoint_dir: /workspace/ckpt-logKV/qwen1.7b-32k-cpt-dense-stage1
-tokenizer_dir: &tokenizer_dir /workspace/checkpoints/Qwen/Qwen3-1.7B-Base/
+checkpoint_dir: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-dense-stage1
+tokenizer_dir: &tokenizer_dir /home/ma-user/work/bucket-wulan-green/zhaoyusheng/checkpoints/Qwen/Qwen3-1.7B-Base/
 benchmark: "niah_single_1,niah_single_2,niah_single_3"
-output_path: /workspace/ckpt-logKV/qwen1.7b-32k-cpt-dense-stage1/evaluate
+output_path: /home/ma-user/work/bucket-wulan-green/lihourun/ckpt-logKV/qwen1.7b-32k-cpt-dense-stage1/evaluate
 
 log_kv_dense_mode: true
 # 没有这一行，eval.py 不会落盘 *_niah_samples.jsonl，位置分组分析和
