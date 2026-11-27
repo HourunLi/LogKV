@@ -19,25 +19,44 @@
 #   DIAG_ARGS="--log_kv_diag_mode baseline --log_kv_diag_exact_from_layer 21" \
 #       bash eval.sh exp/qwen1.7b-32k/diag.yaml niah_single_1 none
 
-if [ -f /opt/conda/bin/activate ]; then
-    if ! source /opt/conda/bin/activate torch218; then
-        echo "ERROR: failed to activate torch218."
-        exit 1
+# An explicit interpreter wins over activation. ModelArts images may expose
+# only python3, or install conda under the job user's home directory.
+if [[ -z ${PYTHON_BIN:-} ]]; then
+    if [[ -n ${VIRTUAL_ENV:-} && -x ${VIRTUAL_ENV}/bin/python ]]; then
+        PYTHON_BIN="${VIRTUAL_ENV}/bin/python"
+    elif [[ -n ${CONDA_PREFIX:-} && ${CONDA_DEFAULT_ENV:-} != base && -x ${CONDA_PREFIX}/bin/python ]]; then
+        PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+    else
+        for prefix in /opt/conda "${HOME}/anaconda3" "${HOME}/miniconda3" /home/miniconda3; do
+            if [[ -x "${prefix}/envs/torch218/bin/python" ]]; then
+                source "${prefix}/bin/activate" torch218 || exit 1
+                PYTHON_BIN="${prefix}/envs/torch218/bin/python"
+                break
+            fi
+        done
+        # An environment listed in conda's envs_dirs can live outside its prefix.
+        if [[ -z ${PYTHON_BIN:-} && -f /opt/conda/bin/activate ]]; then
+            source /opt/conda/bin/activate torch218 || echo "torch218 unavailable; checking PATH" >&2
+        fi
+        PYTHON_BIN=${PYTHON_BIN:-$(command -v python || command -v python3)}
     fi
 fi
-
+if ! command -v -- "${PYTHON_BIN}" >/dev/null; then
+    echo "ERROR: cannot run Python '${PYTHON_BIN}'. Set PYTHON_BIN to the Python executable in your PyTorch environment." >&2
+    exit 1
+fi
 
 # Set caches before Python imports Hugging Face and freezes its cache paths.
-export HF_HOME=/workspace/data/hf_cache
+export HF_HOME="${HF_HOME:-/workspace/data/hf_cache}"
 export LONGBENCH2_DIR=${LONGBENCH2_DIR:-${HF_HOME}/longbench2}
 export BABILONG_DIR=${BABILONG_DIR:-${HF_HOME}/babilong}
-export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
-export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
-export HF_MODULES_CACHE="${HF_HOME}/modules"
-export HF_HUB_CACHE="${HF_HOME}/hub"
-export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
-export RULER_CACHE_DIR="${HF_HOME}/ruler_cache"
-export NLTK_DATA="${HF_HOME}/nltk_data"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/hf_cache}"
+export HF_EVALUATE_CACHE="${HF_EVALUATE_CACHE:-${HF_HOME}/evaluate}"
+export HF_MODULES_CACHE="${HF_MODULES_CACHE:-${HF_HOME}/modules}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HUB_CACHE}}"
+export RULER_CACHE_DIR="${RULER_CACHE_DIR:-${HF_HOME}/ruler_cache}"
+export NLTK_DATA="${NLTK_DATA:-${HF_HOME}/nltk_data}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export HF_DATASETS_IN_MEMORY_MAX_SIZE=0
@@ -45,7 +64,7 @@ export HF_DATASETS_TRUST_REMOTE_CODE=1
 export TOKENIZERS_PARALLELISM=false
 export HF_ALLOW_CODE_EVAL=1
 
-PYTHON_BIN=$(python -c 'import sys; print(sys.executable)') || exit 1
+PYTHON_BIN=$("${PYTHON_BIN}" -c 'import sys; print(sys.executable)') || exit 1
 echo "Eval Python: ${PYTHON_BIN}"
 echo "LongBench v2 data directory (ordinary files): ${LONGBENCH2_DIR}"
 

@@ -51,3 +51,24 @@ def test_launcher_selects_visible_gpus(tmp_path, script, visible, overrides, exp
         assert result.stdout.strip() == f"selected={expected}"
         assert f"visible={visible}" in result.stderr
         assert f"using={expected}" in result.stderr
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_eval_starts_with_only_python3_and_custom_caches(tmp_path, explicit):
+    # Exercise the real entry point through GPU detection, stopping before a model is loaded.
+    python = tmp_path / ("job python" if explicit else "python3")
+    python.symlink_to(sys.executable)
+    (tmp_path / "torch.py").write_text(
+        "import os\nfrom types import SimpleNamespace\n"
+        "assert os.environ['HF_HOME'] == '/shared/hf'\n"
+        "assert os.environ['HF_HUB_CACHE'] == '/shared/hub'\n"
+        "cuda = SimpleNamespace(device_count=lambda: 1)\n"
+    )
+    env = dict(PATH=str(tmp_path), HOME=str(tmp_path), PYTHONPATH=str(tmp_path),
+               HF_HOME="/shared/hf", HF_HUB_CACHE="/shared/hub")
+    if explicit:
+        env["PYTHON_BIN"] = str(python)
+    result = subprocess.run(["/bin/bash", str(ROOT / "eval.sh")], env=env,
+                            capture_output=True, text=True)
+    assert "GPU detection: visible=1" in result.stderr, result.stderr
+    assert "ERROR: missing YAML config." in result.stdout
