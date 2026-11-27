@@ -6,7 +6,7 @@
 # （PG19 测试集：fetch_long_eval_data.py --ppl-hub emozilla/pg19-test 打印的路径）。要加 LongBench v2：bash eval.sh <本文件> babilong_64k,long_ppl_32k,long_ppl_64k,longbench2
 #   bash eval.sh exp/qwen1.7b-32k/eval_long64k_dense.yaml
 config: dense_niah_base.yaml
-output_path: /workspace/ckpt-new/dense_niah_base_eval/long64k
+output_path: /home/ma-user/work/bucket-pangu-green/lihourun/ckpt-new/dense_niah_base_eval/long64k
 eval_max_seq_lengths: [65536]
 niah_benchmark: [niah_single_1, niah_single_2, niah_single_3, niah_multikey_1, niah_multikey_2, niah_multikey_3,
   niah_multivalue, niah_multiquery, ruler_vt, ruler_cwe, ruler_fwe, ruler_qa_squad, ruler_qa_hotpot]

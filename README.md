@@ -62,7 +62,7 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 ```
 
 `majob.sh` 与 `eval.sh` 自动检测当前进程可见的 CUDA GPU 数量，支持 1、2、4、8 卡，
-遵守 `CUDA_VISIBLE_DEVICES`；training platform 的 `MA_NUM_GPUS` 作为分配上限。
+遵守 `CUDA_VISIBLE_DEVICES`；ModelArts 的 `MA_NUM_GPUS` 作为分配上限。
 可用 `GPUS_PER_NODE=2` 限制进程数，指定数量不得超过可见卡数或分配上限。
 启动时打印检测结果，YAML 中的 `num_devices: 8` 不会覆盖 torchrun 的实际卡数。
 当前每卡 micro batch 为 1、全局 batch 为 32，单机 1/2/4/8 卡分别累积 32/16/8/4 次；
@@ -82,7 +82,7 @@ NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
 训练后仅评测 32K single2/3（`eval.sh` 从 YAML 的 `save_path` 加载产物，不转发 YAML metadata）：
 
 ```bash
-DIAG_ARGS='--metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 
@@ -96,7 +96,7 @@ LOGKV_EVAL_VERBOSE=1 bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yam
 
 该环境变量也适用于 `majob.sh` 的评测阶段和直接运行 `eval.py`。
 多卡评测各 rank 汇合时仍每 `LOGKV_EVAL_SYNC_HEARTBEAT_S`（默认 300s）打印缺席 rank，
-保留每个等待进程的低频心跳，避免 training platform 将等待误判为卡死。
+保留每个等待进程的低频心跳，避免 ModelArts 将等待误判为卡死。
 超过 `LOGKV_EVAL_SYNC_TIMEOUT_S`（默认 7200s）报错；长上下文生成负载差距更大时调高后者。
 
 ### KV 槽位压缩率
@@ -104,7 +104,7 @@ LOGKV_EVAL_VERBOSE=1 bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yam
 `eval.sh` 默认同时报告有效 KV 槽位压缩，无需重新训练或增加开关。先用 4 条 32K 样本检查输出：
 
 ```bash
-DIAG_ARGS='--limit 4 --metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--limit 4 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   bash eval.sh exp/qwen1.7b-32k/arc_attach_alpha_beta_k12_b128_2k.yaml niah_single_2 none
 ```
 
