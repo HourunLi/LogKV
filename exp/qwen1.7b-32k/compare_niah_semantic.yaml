@@ -7,5 +7,5 @@ limit: null
 log_kv_dense_mode: false
 swa_window_size: null
 metadata:
-  pretrained: /workspace/checkpoints/Qwen/Qwen3-1.7B-Base/
+  pretrained: /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/
   max_seq_lengths: [32768]

@@ -181,7 +181,7 @@ token 之后，加保护后这一变体不用 cue，表现回到不开 cue 的�
 （同一 checkpoint 再开字面量）。现有 cue checkpoint 训练时 cue 在普通训练文本上照常触发，结论以重训为准。
 
 ```bash
-DIAG_ARGS='--limit 100 --metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_cue_guard_p1024_slack0.yaml
 ```
 
@@ -251,7 +251,7 @@ cue checkpoint 开保护、问题与字面量：`AVG_NIAH_cue` 0.9993，`niah_mu
 [`eval_gamma_query_literal.yaml`](../exp/qwen1.7b-32k/eval_gamma_query_literal.yaml)（同一 checkpoint 再开字面量）。
 
 ```bash
-DIAG_ARGS='--limit 100 --metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_query_p1024_slack0.yaml
 ```
 
@@ -261,7 +261,7 @@ DIAG_ARGS='--limit 100 --metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwe
 checkpoint（B=128，旧梯子）只打开 cue；换 B=256 的 checkpoint 改其 `config:` 一行。
 
 ```bash
-DIAG_ARGS='--metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   bash eval.sh exp/qwen1.7b-32k/eval_gamma_cue.yaml niah_single_2,niah_single_3 none
 
 BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml
@@ -293,7 +293,7 @@ single_1/2/3 的 5.7 倍；`NIAH_BENCHMARKS=<逗号分隔的任务>`（`eval.sh`
 每个任务先看前 100 条（去掉 `--limit` 即为全部 500 条）：
 
 ```bash
-DIAG_ARGS='--limit 100 --metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   bash eval.sh exp/qwen1.7b-32k/arc_gamma_cue_k12_b128_2k.yaml none
 ```
 
@@ -377,7 +377,7 @@ cue + P=1024 + `level_slack: 0` 的 checkpoint 上再开字面量。训练配置
 与 cue 默认配置只差字面量。
 
 ```bash
-DIAG_ARGS='--limit 100 --metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--limit 100 --metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   NIAH_ONLY=1 bash eval.sh exp/qwen1.7b-32k/eval_gamma_literal.yaml
 
 BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_gamma_cue_literal_k12_b128_2k.yaml
@@ -405,7 +405,7 @@ P=1024（`_b128_p1024_2k`，B′ 125→116）和 `level_slack: 0`（`_b128_slack
 ```bash
 BENCHMARKS=none NIAH_BENCHMARKS=none bash majob.sh exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml
 
-DIAG_ARGS='--metadata {"pretrained":"/workspace/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
+DIAG_ARGS='--metadata {"pretrained":"/home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-1.7B-Base/","max_seq_lengths":[32768]}' \
   bash eval.sh exp/qwen1.7b-32k/arc_gamma_k12_b128_2k.yaml niah_single_2,niah_single_3 none
 ```
 

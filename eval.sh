@@ -14,8 +14,8 @@
 #   DIAG_ARGS="--log_kv_diag_mode baseline --log_kv_diag_exact_from_layer 21" \
 #       bash eval.sh exp/qwen1.7b-32k/diag.yaml niah_single_1 none
 
-if [ -f /opt/conda/bin/activate ]; then
-    if ! source /opt/conda/bin/activate torch218; then
+if [ -f /home/ma-user/anaconda3/bin/activate ]; then
+    if ! source /home/ma-user/anaconda3/bin/activate torch218; then
         echo "ERROR: failed to activate torch218."
         exit 1
     fi
@@ -23,7 +23,7 @@ fi
 
 
 # Set caches before Python imports Hugging Face and freezes its cache paths.
-export HF_HOME=/workspace/data/hf_cache
+export HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
 export HF_DATASETS_CACHE="${HF_HOME}/hf_cache"
 export HF_EVALUATE_CACHE="${HF_HOME}/evaluate"
 export HF_MODULES_CACHE="${HF_HOME}/modules"
@@ -66,7 +66,7 @@ export LOGKV_ROUTE_OVERLAP=${LOGKV_ROUTE_OVERLAP:-0}
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_MIN_NCHANNELS=4
 
-# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); training platform
+# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); ModelArts
 # allocation is an upper bound. GPUS_PER_NODE may explicitly select fewer GPUs.
 GPUS_PER_NODE=$("${PYTHON_BIN}" - <<'PY_GPU_COUNT'
 import os
@@ -456,7 +456,7 @@ fi
 # REPAIR_HF_CACHE=1: node 0 first repairs unreadable dataset_info.json files in the shared HF cache
 # (eval.py's HF_DATASETS_CACHE), keeping originals as *.truncated. Its barrier file comes after, so the
 # other nodes start evaluating only once the repair is done.
-HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/workspace/data/hf_cache/hf_cache}
+HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache}
 if [ "${REPAIR_HF_CACHE:-0}" = "1" ] && [ "${NODE_RANK}" = "0" ]; then
     echo "Node 0: repairing unreadable dataset_info.json under ${HF_DATASETS_ROOT}"
     if ! "${PYTHON_BIN}" unused/repair_dataset_info.py --scan "${HF_DATASETS_ROOT}" --write --check; then
