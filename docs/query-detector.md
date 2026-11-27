@@ -20,7 +20,7 @@ python unused/prepare_query_detector.py
 默认目录为：
 
 ```text
-/workspace/data/hf_cache/gliclass-instruct-edge
+/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
 ```
 
 仅下载四个运行文件：`model.safetensors`、`config.json`、`tokenizer.json`、`tokenizer_config.json`，
@@ -83,7 +83,7 @@ checkpoint 的 `model_config.yaml` 优先定义架构；旧 checkpoint 缺此文
 不会把 `qwen1.7b-32k-gamma_k12_b128_p1024_2k` 这类实验目录名当作模型架构。
 
 ```bash
-export LOGKV_QUERY_DETECTOR_DIR=/workspace/data/hf_cache/gliclass-instruct-edge
+export LOGKV_QUERY_DETECTOR_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge
 GPUS_PER_NODE=1 EVAL_MAIN=0 LIMIT=2 EVAL_LENGTHS=32k EVAL_SUITES=ruler,babilong,turns \
   bash eval.sh exp/qwen1.7b-32k/eval_full_word_first_query_detected.yaml
 ```

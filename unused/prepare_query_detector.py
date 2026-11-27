@@ -2,7 +2,7 @@
 
 Online: python unused/prepare_query_detector.py
 Offline: python unused/prepare_query_detector.py --verify
-The default directory is hf_cache/gliclass-instruct-edge under the training platform bucket.
+The default directory is hf_cache/gliclass-instruct-edge under the ModelArts bucket.
 HTTPS certificate verification is disabled by default; --verify-ssl enables it.
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from pathlib import Path
 
 MODEL_ID = "knowledgator/gliclass-instruct-edge-v1.0"
 MODEL_REVISION = "727be8a417f6a7718e591b025e07054c146d8139"
-DEFAULT_MODEL_DIR = Path("/workspace/data/hf_cache/gliclass-instruct-edge")
+DEFAULT_MODEL_DIR = Path("/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge")
 REQUIRED_FILES = {"config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"}
 
 

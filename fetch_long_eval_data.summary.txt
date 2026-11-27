@@ -1,8 +1,8 @@
-HF_HOME=/workspace/data/hf_cache
-HF_DATASETS_CACHE=/workspace/data/hf_cache/hf_cache
-RULER_CACHE_DIR=/workspace/data/hf_cache/ruler_cache
+HF_HOME=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache
+HF_DATASETS_CACHE=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache
+RULER_CACHE_DIR=/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/ruler_cache
 HTTPS certificate checks: off (--verify-ssl turns them on)
-LongBench v2 snapshot /workspace/data/hf_cache/hub/datasets--recursal--longbench-v2/snapshots/380536fcbe7aac4a1d3e3b6502c2abd612399231: 20 data files, e.g. ['data/academic_multi/train-00000-of-00001.parquet', 'data/academic_single/train-00000-of-00001.parquet', 'data/agent_history_qa/train-00000-of-00001.parquet', 'data/code_repo_qa/train-00000-of-00001.parquet']
+LongBench v2 snapshot /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hub/datasets--recursal--longbench-v2/snapshots/380536fcbe7aac4a1d3e3b6502c2abd612399231: 20 data files, e.g. ['data/academic_multi/train-00000-of-00001.parquet', 'data/academic_single/train-00000-of-00001.parquet', 'data/agent_history_qa/train-00000-of-00001.parquet', 'data/code_repo_qa/train-00000-of-00001.parquet']
 recursal/longbench-v2 files: all whole parquet
 LongBench v2 plain academic_multi: 50 rows, SHA256 verified
 LongBench v2 plain academic_single: 44 rows, SHA256 verified
@@ -24,7 +24,7 @@ LongBench v2 plain multinews: 23 rows, SHA256 verified
 LongBench v2 plain new_language_translation: 20 rows, SHA256 verified
 LongBench v2 plain table_qa: 18 rows, SHA256 verified
 LongBench v2 plain user_guide_qa: 40 rows, SHA256 verified
-LongBench v2 plain files: /workspace/data/hf_cache/longbench2 (20 subsets, 503 questions; no cache links)
+LongBench v2 plain files: /home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/longbench2 (20 subsets, 503 questions; no cache links)
 recursal/longbench-v2 academic_multi train: 50 rows
 recursal/longbench-v2 academic_single train: 44 rows
 recursal/longbench-v2 agent_history_qa train: 20 rows

@@ -221,7 +221,7 @@ def test_combined_cue_experiments_differ_from_their_parents_only_by_the_named_sw
     assert {k for k in set(run) | set(base) if run.get(k) != base.get(k)} - names == switches
 
 
-HEADS = "/workspace/ckpt-logKV/retention_heads/"
+HEADS = "/home/ma-user/work/bucket-pangu-green/lihourun/ckpt-logKV/retention_heads/"
 NIAH_HEADS = {"eval_niah_heads_p1024.yaml": HEADS + "gamma_k12_b128_p1024.pth",
               "arc_niah_heads_k12_b128_p1024_slack0_2k.yaml": HEADS + "gamma_k12_b128_p1024.pth",
               "eval_niah_heads_refit_p1024_slack0.yaml": HEADS + "niah_heads_k12_b128_p1024_slack0.pth",

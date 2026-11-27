@@ -248,4 +248,4 @@ def test_download_and_smoke_default_to_the_requested_hf_cache():
     spec.loader.exec_module(module)
     assert str(module.DEFAULT_MODEL_DIR) == DEFAULT_MODEL_DIR
     assert DEFAULT_MODEL_DIR == (
-        "/workspace/data/hf_cache/gliclass-instruct-edge")
+        "/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/gliclass-instruct-edge")

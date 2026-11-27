@@ -27,7 +27,7 @@ if [[ -z ${PYTHON_BIN:-} ]]; then
     elif [[ -n ${CONDA_PREFIX:-} && ${CONDA_DEFAULT_ENV:-} != base && -x ${CONDA_PREFIX}/bin/python ]]; then
         PYTHON_BIN="${CONDA_PREFIX}/bin/python"
     else
-        for prefix in /opt/conda "${HOME}/anaconda3" "${HOME}/miniconda3" /home/miniconda3; do
+        for prefix in /home/ma-user/anaconda3 /opt/conda "${HOME}/anaconda3" "${HOME}/miniconda3" /home/miniconda3; do
             if [[ -x "${prefix}/envs/torch218/bin/python" ]]; then
                 source "${prefix}/bin/activate" torch218 || exit 1
                 PYTHON_BIN="${prefix}/envs/torch218/bin/python"
@@ -35,8 +35,8 @@ if [[ -z ${PYTHON_BIN:-} ]]; then
             fi
         done
         # An environment listed in conda's envs_dirs can live outside its prefix.
-        if [[ -z ${PYTHON_BIN:-} && -f /opt/conda/bin/activate ]]; then
-            source /opt/conda/bin/activate torch218 || echo "torch218 unavailable; checking PATH" >&2
+        if [[ -z ${PYTHON_BIN:-} && -f /home/ma-user/anaconda3/bin/activate ]]; then
+            source /home/ma-user/anaconda3/bin/activate torch218 || echo "torch218 unavailable; checking PATH" >&2
         fi
         PYTHON_BIN=${PYTHON_BIN:-$(command -v python || command -v python3)}
     fi
@@ -47,7 +47,7 @@ if ! command -v -- "${PYTHON_BIN}" >/dev/null; then
 fi
 
 # Set caches before Python imports Hugging Face and freezes its cache paths.
-export HF_HOME="${HF_HOME:-/workspace/data/hf_cache}"
+export HF_HOME="${HF_HOME:-/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache}"
 export LONGBENCH2_DIR=${LONGBENCH2_DIR:-${HF_HOME}/longbench2}
 export BABILONG_DIR=${BABILONG_DIR:-${HF_HOME}/babilong}
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/hf_cache}"
@@ -93,7 +93,7 @@ export LOGKV_ROUTE_OVERLAP=${LOGKV_ROUTE_OVERLAP:-0}
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_MIN_NCHANNELS=4
 
-# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); training platform
+# Detect GPUs visible to this job (including CUDA_VISIBLE_DEVICES); ModelArts
 # allocation is an upper bound. GPUS_PER_NODE may explicitly select fewer GPUs.
 GPUS_PER_NODE=$("${PYTHON_BIN}" - <<'PY_GPU_COUNT'
 import os
@@ -583,7 +583,7 @@ fi
 # REPAIR_HF_CACHE=1: node 0 first repairs unreadable dataset_info.json files in the shared HF cache
 # (eval.py's HF_DATASETS_CACHE), keeping originals as *.truncated. Its barrier file comes after, so the
 # other nodes start evaluating only once the repair is done.
-HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/workspace/data/hf_cache/hf_cache}
+HF_DATASETS_ROOT=${HF_DATASETS_ROOT:-/home/ma-user/work/bucket-pangu-green/lihourun/data/hf_cache/hf_cache}
 if [ "${REPAIR_HF_CACHE:-0}" = "1" ] && [ "${NODE_RANK}" = "0" ]; then
     echo "Node 0: repairing unreadable dataset_info.json under ${HF_DATASETS_ROOT}"
     if ! "${PYTHON_BIN}" unused/repair_dataset_info.py --scan "${HF_DATASETS_ROOT}" --write --check; then
@@ -592,7 +592,7 @@ if [ "${REPAIR_HF_CACHE:-0}" = "1" ] && [ "${NODE_RANK}" = "0" ]; then
     fi
 fi
 
-# One barrier folder per job (MA_VJ_NAME names the training platform job, MASTER_ADDR elsewhere): evals of the same
+# One barrier folder per job (MA_VJ_NAME names the ModelArts job, MASTER_ADDR elsewhere): evals of the same
 # checkpoint may run at once, and node 0 of one must not count or remove another's node files, nor a
 # failed run's leftovers.
 BARRIER_DIR="${SAVE_DIR}/.eval_only_barrier_d/${MA_VJ_NAME:-${MASTER_ADDR}}"

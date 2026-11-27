@@ -372,7 +372,7 @@ beta_slow 1，与 Qwen 的 `rope_scaling` 相同），dense 与 LogKV 用同一�
   此模式只用标准库，不要求 tokenizer，不读取文档选择缓存，不下载或创建目录；文件可见不等于全量内容已验证。
   `MISSING ... not exported` 表示作业环境变量未传入；路径缺失时核对 OBS 对象前缀、作业数据挂载路径与读取权限；
   目录存在但没有 parquet/jsonl，说明可见目录没有数据文件；文件头尾异常则按上述普通文件流程校验修复。
-  脚本的文档缓存预热不负责 training platform 的挂载或对象同步。下载端可见、作业端不可见时，需先确认真实普通文件已写入 OBS，
+  脚本的文档缓存预热不负责 ModelArts 的挂载或对象同步。下载端可见、作业端不可见时，需先确认真实普通文件已写入 OBS，
   再通过作业的数据通道/挂载使其在各节点可读，环境变量填写作业实际的本地路径。不要用创建空目录代替挂载。
   平台代理用自签证书重签 HTTPS，脚本默认不校验证书（同 `litgpt/ruler_patch.py`），下载只走 requests、不用 hf_transfer / hf_xet，
   `--verify-ssl` 恢复校验；Hub 下载的读超时默认放宽到 300 秒（`HF_HUB_DOWNLOAD_TIMEOUT` 可覆盖）。hf-mirror 的共享 Hub 限额
