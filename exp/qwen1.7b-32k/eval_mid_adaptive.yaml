@@ -1,0 +1,3 @@
+config: eval_full_baseline.yaml
+eval_tag: eval_mid_adaptive
+eval_max_seq_lengths: [32768]

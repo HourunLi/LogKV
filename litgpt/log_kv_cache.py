@@ -814,7 +814,7 @@ class LogStructuredKVCache(nn.Module):
         if self.alpha_exact_tokens < 0:
             raise ValueError("alpha_exact_tokens must be >= 0")
         if self.alpha_exact_tokens:
-            if not (semantic_clusters and semantic_anchor_mode == "mid"
+            if not (semantic_clusters and semantic_anchor_mode in ("mid", "post_rope_mean")
                     and not allocate_second_order and cluster_k_max > 1):
                 raise ValueError("AlphaLogKV requires semantic clusters, K > 1, mid anchors and no second-order allocation")
             if semantic_legacy_route or semantic_cluster_chunk_size:
@@ -823,8 +823,10 @@ class LogStructuredKVCache(nn.Module):
                 raise ValueError("AlphaLogKV requires disabled segment gaps/padding for delayed archival")
             if not 1 <= self.alpha_span_max_tokens <= self.alpha_exact_tokens:
                 raise ValueError("alpha_span_max_tokens must be in [1, alpha_exact_tokens]")
-        if semantic_anchor_mode not in ("mid", "multi"):
-            raise ValueError("semantic_anchor_mode must be 'mid' or 'multi'")
+        if semantic_anchor_mode == "post_rope_mean" and not alpha_exact_tokens:
+            raise ValueError("post_rope_mean requires the first-order Alpha cache")
+        if semantic_anchor_mode not in ("mid", "multi", "post_rope_mean"):
+            raise ValueError("semantic_anchor_mode must be 'mid', 'post_rope_mean' or 'multi'")
         if semantic_pack_backend not in ("auto", "torch", "triton"):
             raise ValueError("semantic_pack_backend must be 'auto', 'torch', or 'triton'")
         self.semantic_anchor_mode = semantic_anchor_mode
@@ -2474,6 +2476,19 @@ class LogStructuredKVCache(nn.Module):
         if record:
             self._record_op(b, g, LOG_KV_OP_NEW_CLUSTER, c, 0, int(token_idx))
 
+    def _ladder_token_keys(self, keys, positions):
+        """Convert fresh archive rows only. Centroids always use the raw keys."""
+        if self.semantic_anchor_mode != "post_rope_mean":
+            return keys
+        return materialize_anchor_keys(keys, positions[..., None], self.cos_cache,
+                                       self.sin_cache, self.rope_n_elem).squeeze(-2)
+
+    def _ladder_read_keys(self, keys, anchors):
+        if self.semantic_anchor_mode == "post_rope_mean":
+            return keys
+        return materialize_anchor_keys(keys, anchors[..., None], self.cos_cache,
+                                       self.sin_cache, self.rope_n_elem).squeeze(-2)
+
     def _semantic_new_clusters(self, jobs, k_raw, v, positions, positions_host, *, record):
         """Initialize independent slots and append their first exact token together."""
         if not jobs:
@@ -2486,7 +2501,7 @@ class LogStructuredKVCache(nn.Module):
         self.centroid.flatten(0, 2).index_copy_(0, ids, key.float())
         self.n_eff.flatten().index_fill_(0, ids, 1.)
         n = len(jobs)
-        block = (key, value, self.level_w.new_ones(n), *self._empty_stats(key, value),
+        block = (self._ladder_token_keys(key, pos), value, self.level_w.new_ones(n), *self._empty_stats(key, value),
                  pos, pos, pos, self.level_order.new_zeros(n), self.pad_mask.new_zeros(n))
         self._semantic_append_entries_batched(lanes, [1] * n, block)
         first = [positions_host[b][i] for b, _, _, i in jobs]
@@ -4002,12 +4017,12 @@ class LogStructuredKVCache(nn.Module):
         n_head = int(lengths[~late].sum())
         block = self._semantic_stage_block(n_head + n_all, k_raw.dtype, v.dtype)
         fused = self._semantic_fused_stage(k_raw, v)
-        if fused is not None:
+        if fused is not None and self.semantic_anchor_mode != "post_rope_mean":
             fused.stage(block, fields, k_raw, v, positions, (bi, gi, ti), phase_t, start=n_head,
                         ladder_rows=src_t, perm=order)
         else:
             nv = v[bi, gi, ti]
-            new = (nk, nv, self.level_w.new_ones(n_new), *self._empty_stats(nk, nv),
+            new = (self._ladder_token_keys(nk, np_), nv, self.level_w.new_ones(n_new), *self._empty_stats(nk, nv),
                    np_, np_, np_, self.level_order.new_zeros(n_new), self.pad_mask.new_zeros(n_new))
             for i, (out, field, value) in enumerate(zip(block, fields, new)):
                 if out is not None:
@@ -4639,14 +4654,14 @@ class LogStructuredKVCache(nn.Module):
             if n_tok != total:
                 raise RuntimeError("a join tail cannot follow padded rows")
             fused = self._semantic_fused_stage(k_raw, v)
-            if fused is not None:
+            if fused is not None and self.semantic_anchor_mode != "post_rope_mean":
                 fused.stage(block, self._semantic_flat_level_fields(), k_raw, v, positions, (bi, gi, ti), order_t)
                 k_sel = block[0][:n_tok]
             else:
                 k_sel = k_raw.detach()[bi, gi, ti]
                 v_sel = v.detach()[bi, gi, ti]
                 p_sel = positions[bi, ti].to(torch.int64)
-                head = (k_sel, v_sel, self.level_w.new_ones(total), *self._empty_stats(k_sel, v_sel),
+                head = (self._ladder_token_keys(k_sel, p_sel), v_sel, self.level_w.new_ones(total), *self._empty_stats(k_sel, v_sel),
                         p_sel, p_sel, p_sel, order_t, self.pad_mask.new_zeros(total))
                 for out, value in zip(block, head):
                     if out is not None:
@@ -4660,7 +4675,7 @@ class LogStructuredKVCache(nn.Module):
             # no pads, `at` is the identity: gathered payloads ARE the staging block.
             # All staging fields are read-only until copied to separate cache fields.
             if n_tok == total:
-                block_k, block_v, block_p = k_sel, v_sel, p_sel
+                block_k, block_v, block_p = self._ladder_token_keys(k_sel, p_sel), v_sel, p_sel
                 block_w = self.level_w.new_ones(total)
                 block_pad = self.pad_mask.new_zeros(total)
             else:
@@ -5315,7 +5330,7 @@ class LogStructuredKVCache(nn.Module):
                 raise RuntimeError("update replay CPU positions do not match the flush shape")
             key = tuple(tuple(row) for row in host)
             signature = (k.shape, v.shape, k.dtype, v.dtype, k.device,
-                         self.semantic_centroid_backend, self.second_order,
+                         self.semantic_centroid_backend, self.semantic_anchor_mode, self.second_order,
                          self.semantic_unified_route, self.semantic_merge_passes,
                          self.K_max, self.B, self.L_alloc, self.recent_size, self.semantic_flush_granularity,
                          self.alpha_exact_tokens, self.alpha_span_max_tokens,
@@ -6316,7 +6331,7 @@ class LogStructuredKVCache(nn.Module):
     @logkv_timed("plan")
     def _semantic_attention_plan(self):
         """Immutable slot indices and anchor metadata; no K/V payload is retained."""
-        if self.semantic_anchor_mode == "mid":
+        if self.semantic_anchor_mode != "multi":
             return self._semantic_mid_attention_plan()
         shape = (self.batch_size, self.n_groups, -1)
         entry_w = self.level_w.flip(3).reshape(shape)
@@ -6382,9 +6397,7 @@ class LogStructuredKVCache(nn.Module):
             return torch.gather(x.reshape_as(entry_w), 2, physical_idx)
 
         if pooled_slots:
-            slot_k = materialize_anchor_keys(
-                gather_entry(self.level_k), anchor_sel.unsqueeze(-1), self.cos_cache, self.sin_cache, self.rope_n_elem
-            ).squeeze(-2)
+            slot_k = self._ladder_read_keys(gather_entry(self.level_k), anchor_sel)
             slot_v = gather_entry(self.level_v)
             slot_w = gather_scalar(entry_w)
         else:
@@ -7192,7 +7205,7 @@ def log_kv_chunk_attention(
     causal_tail = q_b.size(2) if causal_tail is None else causal_tail
     if causal_tail and causal_tail != q_b.size(2):
         raise ValueError("causal_tail must equal query length or be zero")
-    if second_order_scale == 0.0 and cache.semantic_clusters and cache.semantic_anchor_mode == "mid":
+    if second_order_scale == 0.0 and cache.semantic_clusters and cache.semantic_anchor_mode != "multi":
         out = _mid_chunk_attention(cache, q_b, k_b, v_b, scale, causal_tail, attention_plan, reuse_prefix)
         if out is not None:
             return out

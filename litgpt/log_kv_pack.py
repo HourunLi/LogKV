@@ -43,10 +43,7 @@ def _pack_torch(cache, plan, k, v, dim, buffers=None, skip_pooled=False, recent_
                 x = x.flatten(2, 4)
                 return x.gather(2, indices[..., None].expand(*indices.shape, x.size(-1)))
 
-            keys = materialize_anchor_keys(
-                gather(cache.level_k), anchors[..., None], cache.cos_cache,
-                cache.sin_cache, cache.rope_n_elem,
-            ).squeeze(-2)
+            keys = cache._ladder_read_keys(gather(cache.level_k), anchors)
             ka[:, :, :pooled, :k.size(-1)] = keys.masked_fill(~valid[..., None], 0)
             va[:, :, :pooled, :v.size(-1)] = gather(cache.level_v).masked_fill(~valid[..., None], 0)
             weights = cache.level_w.flatten(2).gather(2, indices)
@@ -107,7 +104,7 @@ def pack_mid_kv(cache, plan, k, v, dim, *, backend=None, buffers=None, skip_pool
     backend = cache.semantic_pack_backend if backend is None else backend
     if backend not in ("auto", "torch", "triton"):
         raise ValueError("packing backend must be 'auto', 'torch' or 'triton'")
-    if cache.semantic_anchor_mode != "mid":
+    if cache.semantic_anchor_mode == "multi":
         raise ValueError("mid packer requires semantic_anchor_mode='mid'")
     if (k.ndim != 4 or v.ndim != 4 or k.shape[:3] != v.shape[:3]
             or k.shape[:2] != (cache.batch_size, cache.n_groups)

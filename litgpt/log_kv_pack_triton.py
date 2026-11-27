@@ -21,7 +21,7 @@ def _pack(
     CKB, CKG, CKT, CKD,
     CVB, CVG, CVT, CVD,
     COS0: tl.constexpr, COS1: tl.constexpr, SIN0: tl.constexpr, SIN1: tl.constexpr,
-    ROPE_FP32: tl.constexpr,
+    ROPE_FP32: tl.constexpr, POST_MEAN: tl.constexpr,
     BT: tl.constexpr, BD: tl.constexpr,
 ):
     # Promote before multiplication: large batch/sequence strides can exceed int32.
@@ -62,7 +62,10 @@ def _pack(
         if not ROPE_FP32:
             a = a.to(LK.dtype.element_ty).to(tl.float32)
             b = b.to(LK.dtype.element_ty).to(tl.float32)
-        raw = tl.where((d < DR)[None, :], a + b, raw)
+        rotate = (d < DR)[None, :]
+        if POST_MEAN:
+            rotate = rotate & (~in_pool)[:, None]
+        raw = tl.where(rotate, a + b, raw)
     kval = raw
     vval = tl.load(vp + d[None, :],
                    (in_prefix & valid)[:, None] & (d < DV)[None, :], 0).to(tl.float32)
@@ -119,6 +122,7 @@ def pack(cache, plan, k, v, dim, buffers=None, skip_pooled=False, recent_start=0
             COS0=cache.cos_cache.stride(0), COS1=cache.cos_cache.stride(1),
             SIN0=cache.sin_cache.stride(0), SIN1=cache.sin_cache.stride(1),
             ROPE_FP32=cache.cos_cache.dtype == torch.float32 or k.dtype == torch.float32,
+            POST_MEAN=cache.semantic_anchor_mode == "post_rope_mean",
             BT=16, BD=triton.next_power_of_2(dim),
             num_warps=4, enable_fp_fusion=False,
         )

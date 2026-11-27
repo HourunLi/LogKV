@@ -229,7 +229,7 @@ def semantic_budget(k_max, b_prime, n):
     b_prime = max(int(b_prime), 1)
     l_alloc = max(2, math.ceil(math.log2(n / max(k_max * b_prime, 1) + 1.0)) + 2)
     persistent = k_max * l_alloc * b_prime
-    anchors = 1 if cfg.get("log_kv_semantic_anchor_mode") == "mid" else 3
+    anchors = 1 if cfg.get("log_kv_semantic_anchor_mode") in ("mid", "post_rope_mean") else 3
     return l_alloc, persistent, persistent * anchors
 
 

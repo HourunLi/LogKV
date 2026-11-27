@@ -350,13 +350,16 @@ def test_alpha_rejects_routes_and_layouts_it_cannot_archive_into(overrides):
 @pytest.mark.parametrize("route,merge_passes", [("attach", 1), ("unified", 1), ("unified", 4)])
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("gamma", [False, True])
-def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(route, merge_passes, beta, gamma):
+@pytest.mark.parametrize("anchor", ["mid", "post_rope_mean"])
+def test_backward_replays_exact_pool_without_reselection_and_matches_naive_gradients(route, merge_passes, beta, gamma, anchor):
     torch.manual_seed(31)
     originals = [torch.randn(2, 2, 40, 8) for _ in range(3)]
     results, grads = [], []
     ends = boundaries(40)
     for lowmem in (False, True):
-        c = cache_for(route=route, semantic_merge_passes=merge_passes, beta_novelty=beta, beta_adaptive_merge=beta,
+        phase = torch.arange(128).float()[:, None].expand(-1, 8) * .2
+        c = cache_for(route=route, semantic_anchor_mode=anchor, cos_cache=phase.cos(), sin_cache=phase.sin(),
+                      semantic_merge_passes=merge_passes, beta_novelty=beta, beta_adaptive_merge=beta,
                       gamma_level0_reinsert=gamma, gamma_top_merge="lightest" if gamma else "fold")
         q, k, v = [x.clone().requires_grad_() for x in originals]
         if lowmem:
@@ -511,3 +514,35 @@ def test_score_prefetch_reproduces_on_demand_selection(route, beta, cues):
         torch.testing.assert_close(value, caches[1].get_buffer(name), rtol=0, atol=0, msg=name)
     assert caches[0]._alpha_spans == caches[1]._alpha_spans
     assert caches[0]._alpha_positions == caches[1]._alpha_positions
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"))])
+@pytest.mark.parametrize("beta", [False, True])
+def test_post_rope_mean_matches_independently_rotated_values(device, beta):
+    torch.manual_seed(2026)
+    phase = torch.arange(128, device=device)[:, None] * torch.tensor([.13, .73], device=device)
+    phase = phase.repeat(1, 2)
+    c = cache_for(device=device, semantic_anchor_mode="post_rope_mean", rope_n_elem=4,
+                  cos_cache=phase.cos(), sin_cache=phase.sin(), gamma_level0_reinsert=True,
+                  beta_adaptive_merge=beta, beta_novelty=True, gamma_top_merge="lightest")
+    raw = torch.randn(2, 2, 96, 8, device=device)
+    r = raw[..., :4]
+    rotated = torch.cat((r * phase[:96].cos() + torch.cat((-r[..., 2:], r[..., :2]), -1)
+                         * phase[:96].sin(), raw[..., 4:]), -1)
+    ends = boundaries(96)
+    for start in range(0, 96, 8):
+        part = slice(start, start+8)
+        c.add_recent(rotated[:, :, part], rotated[:, :, part], k_raw=raw[:, :, part],
+                     span_ends=[row[part] for row in ends])
+    assert c.level_w.max() > 1
+    torch.testing.assert_close(c.level_k, c.level_v)
+    for b in range(2):
+        archived = sorted(set(range(96)) - set(c._alpha_positions[b]) - set(c._recent_pos_host[b][:c.recent_count]))
+        raw_sum = (c.centroid[b] * c.n_total[b, ..., None]).sum(1)
+        torch.testing.assert_close(raw_sum, raw[b, :, archived].sum(1), atol=2e-5, rtol=2e-5)
+    state = c.get_attention_state(with_stats=False)
+    torch.testing.assert_close(state.slot_k, state.slot_v)
+    chunk = rotated[:, :, -1:]
+    for backend in (("torch", "triton") if device == "cuda" else ("torch",)):
+        k, v = pack_mid_kv(c, c._semantic_attention_plan(), chunk, chunk, 16, backend=backend)
+        torch.testing.assert_close(k[..., :8], v[..., :8])

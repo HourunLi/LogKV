@@ -1,0 +1,5 @@
+config: eval_full_baseline.yaml
+eval_tag: eval_post_rope_mean_fixed
+log_kv_semantic_anchor_mode: post_rope_mean
+log_kv_beta_adaptive_merge: false
+eval_max_seq_lengths: [32768]
