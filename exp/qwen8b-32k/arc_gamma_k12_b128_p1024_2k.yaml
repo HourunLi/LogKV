@@ -1,6 +1,6 @@
 # Qwen3-8B-Base 的独立 32K LogKV P=1024 训练配置。
 # 本文件完整声明训练与 LogKV 参数；本目录的评测入口复用这份配置。
-# 全局 batch 64、每卡 micro batch 1：64 个训练进程时每步更新一次；更少进程按比例累积。
+# Global batch 128, microbatch 1 per rank: accumulate two microbatches at 64 ranks.
 # CPT 训练目标为 2000 个优化器步；中断后从本实验的 checkpoint 自动续训。
 # 先转换底模，再从仓库根目录启动训练：
 #   python -m litgpt convert_to_litgpt /home/ma-user/work/bucket-pangu-green/lihourun/checkpoints/Qwen/Qwen3-8B-Base

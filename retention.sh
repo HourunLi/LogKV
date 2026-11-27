@@ -144,6 +144,7 @@ def expand_string(text):
         inner = match.group(1)
         if ":-" in inner:
             name, default = inner.split(":-", 1)
+            return os.environ.get(name) or default
         elif "-" in inner:
             name, default = inner.split("-", 1)
         else:

@@ -71,8 +71,8 @@ BENCHMARKS=none NIAH_BENCHMARKS=none \
 多机按全部进程数计算。无法整除时在加载模型前报错，不静默改变全局 batch。
 
 8B 训练配置 `exp/qwen8b-32k/arc_gamma_k12_b128_p1024_2k.yaml` 完整声明训练与 LogKV 参数，
-8B 的训练与评测配置只在 `exp/qwen8b-32k/` 内继承。全局 batch 为 64、每卡 micro batch 为 1，
-64 个训练进程时累积 1 次，单机 1/2/4/8 卡分别累积 64/32/16/8 次。
+8B 的训练与评测配置只在 `exp/qwen8b-32k/` 内继承。The global batch is 128 with one sample per rank per microbatch.
+At 64 ranks each update accumulates 2 microbatches. With 1/2/4/8 ranks it accumulates 128/64/32/16.
 8B CPT 的训练目标为 2000 个优化器步（`max_steps: 2000`）；中断后从本实验 checkpoint 自动续训。
 
 8B 启用 `fsdp_low_memory: true`：使用 `FULL_SHARD`，前向后重新分片参数，并在每个 micro-batch
