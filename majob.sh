@@ -1,6 +1,6 @@
 #!/bin/bash
 # source /home/miniconda3/bin/activate megatron-lm-014
-source /opt/conda/bin/activate torch218
+source /home/ma-user/anaconda3/bin/activate torch218
 # DeepSeek 3Bv2 Sandwich Training Script with YAML Configuration
 # Optimized for H200 GPUs (141GB VRAM)
 
